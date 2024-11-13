@@ -2,61 +2,237 @@ import hashlib
 import json
 import time
 import random
-import struct
+import logging
 import rsa
-import socket
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from cryptography.hazmat.primitives.asymmetric import rsa as cryptography_rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+import base64
 
-# Constants for Proof of Work
+# Constants for Proof of Work and Tokenomics
 INITIAL_DIFFICULTY = 4
-DIFFICULTY_ADJUSTMENT_INTERVAL = 10  # Number of blocks after which difficulty is adjusted
-BLOCK_REWARD = 50  # Initial block reward for mining
-HALVING_INTERVAL = 210000  # Number of blocks after which the block reward is halved
-TRANSACTION_FEE = 1  # Transaction fee
+BLOCK_REWARD = 50
+TOTAL_SUPPLY = 21000000
+DIFFICULTY_ADJUSTMENT_INTERVAL = 10
+HALVING_INTERVAL = 210000
+MAX_BLOCKS = 21000000
+TRANSACTION_FEE = 0.01
 
-# Update tokenomics for 500,000,000 token supply
-TOTAL_SUPPLY = 500_000_000  # Total supply of tokens
-MAX_BLOCKS = 10_000_000  # Example: how many blocks until the token supply runs out (this could be adjusted)
+# Generate private RSA key using cryptography package
+def generate_private_key():
+    return cryptography_rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
 
-# ProgPoW algorithm
+# Save the private key to a file
+def save_private_key(private_key, filename="private_key.pem"):
+    with open(filename, 'wb') as private_file:
+        private_file.write(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+        )
+
+# Save the public key to a file
+def save_public_key(public_key, filename="public_key.pem"):
+    with open(filename, 'wb') as public_file:
+        public_file.write(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
+
+class Wallet:
+    def __init__(self, private_key=None):
+        if private_key:
+            self.private_key = private_key
+            self.public_key = private_key.public_key()
+        else:
+            self.private_key = self.generate_private_key()
+            self.public_key = self.private_key.public_key()
+        self.balance = 0
+
+    def generate_private_key(self):
+        # Use cryptography to generate an RSA private key
+        return cryptography_rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+
+    def get_public_key(self):
+        # Return the public key in PEM format (a readable format)
+        pem = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return pem.decode('utf-8')
+
+    def update_balance(self, amount):
+        # Update the wallet balance
+        self.balance += amount
+
+    def sign_transaction(self, transaction):
+        # Sign the transaction using the private key
+        transaction_bytes = json.dumps(transaction, sort_keys=True).encode()
+        signature = self.private_key.sign(
+            transaction_bytes,
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        return signature
+
+    def verify_transaction(self, transaction, signature):
+        # Verify a transaction using the public key
+        try:
+            transaction_bytes = json.dumps(transaction, sort_keys=True).encode()
+            self.public_key.verify(
+                signature,
+                transaction_bytes,
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+            return True
+        except Exception as e:
+            print(f"Transaction verification failed: {e}")
+            return False
+
+class Block:
+    def __init__(self, index, previous_hash, timestamp, transactions, nonce=0):
+        self.index = index
+        self.previous_hash = previous_hash
+        self.timestamp = timestamp
+        self.transactions = transactions
+        self.nonce = nonce
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        block_string = f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}"
+        return progpow_algorithm(block_string, self.nonce)
+
+class Blockchain:
+    def __init__(self):
+        self.chain = [self.create_genesis_block()]
+        self.pending_transactions = []
+        self.difficulty = INITIAL_DIFFICULTY
+        self.block_reward = BLOCK_REWARD
+        self.lock = threading.Lock()
+        self.token_supply = TOTAL_SUPPLY
+        self.blocks_mined = 0
+        self.wallets = {}  # Dictionary to store wallets by public key
+
+    def create_genesis_block(self):
+        return Block(0, "0", int(time.time()), [], 0)
+
+    def add_block(self, new_block):
+        with self.lock:
+            self.chain.append(new_block)
+            self.adjust_difficulty()
+            self.update_block_reward()
+
+    def adjust_difficulty(self):
+        if len(self.chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
+            expected_time = DIFFICULTY_ADJUSTMENT_INTERVAL * 10  # Expected time in seconds
+            actual_time = self.chain[-1].timestamp - self.chain[-DIFFICULTY_ADJUSTMENT_INTERVAL].timestamp
+            if actual_time < expected_time / 2:
+                self.difficulty += 1
+            elif actual_time > expected_time * 2:
+                self.difficulty -= 1
+
+    def update_block_reward(self):
+        if len(self.chain) % HALVING_INTERVAL == 0:
+            self.block_reward /= 2
+
+    def mine_pending_transactions(self, miner_wallet):
+        block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
+        block.nonce = self.mine_block(block)
+        self.add_block(block)
+        miner_wallet.update_balance(self.block_reward)  # Reward for mining a block
+        self.pending_transactions = []
+
+    def mine_block(self, block):
+        while True:
+            if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
+                return block.nonce
+            block.nonce += 1
+            if self.blocks_mined >= MAX_BLOCKS:
+                print("Max blocks reached! Token supply exhausted.")
+                exit()  # Exit when the total supply is mined
+            self.blocks_mined += 1
+
+    def validate_block(self, block):
+        if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
+            for transaction in block.transactions:
+                if not self.validate_transaction(transaction):
+                    return False
+            return True
+        return False
+
+    def validate_transaction(self, transaction):
+        # Check transaction format
+        required_fields = {'sender', 'recipient', 'amount', 'signature'}
+        if not all(field in transaction for field in required_fields):
+            print("Transaction format is invalid.")
+            return False
+
+        sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
+        if not sender_wallet:
+            print(f"Sender wallet not found for public key: {transaction['sender']}")
+            return False
+
+        # Verify sender has enough balance
+        if sender_wallet.balance < transaction['amount']:
+            print(f"Insufficient funds in sender's wallet: {transaction['sender']}")
+            return False
+
+        # Check the signature
+        if not sender_wallet.verify_transaction(transaction, transaction['signature']):
+            print(f"Invalid signature for transaction: {transaction}")
+            return False
+
+        # Ensure the transaction includes the correct fee
+        if transaction['amount'] < TRANSACTION_FEE:
+            print("Transaction amount is less than the required fee.")
+            return False
+
+        # All checks passed
+        return True
+
+    def find_wallet_by_public_key(self, public_key):
+        return self.wallets.get(public_key)  # Map to actual wallet objects
+
+    def register_wallet(self, wallet):
+        """Register a wallet in the blockchain."""
+        self.wallets[wallet.get_public_key()] = wallet
+        print(f"Wallet registered with public key: {wallet.get_public_key()}")
+
+# Helper functions for ProgPoW (this part remains largely unchanged)
+def progpow_algorithm(block_string, nonce):
+    program = random_program()
+    return progpow_hash(block_string, nonce, program)
+
 def random_program():
     operations = ['+', '-', '*', '^', '|', '&']
     program = []
     for _ in range(64):
         op = random.choice(operations)
-        reg = random.randint(0, 15)
-        program.append((op, reg))
+        num = random.randint(1, 10)
+        program.append(f"{num}{op}")
     return program
 
 def progpow_hash(block_string, nonce, program):
-    hash_input = f"{block_string}{nonce}".encode('utf-8')
-    h = hashlib.sha256(hash_input).digest()
-    state = list(struct.unpack('<8I', h))  # Convert to list
+    # Example of how a hash could be computed, but this is simplified
+    hash_input = f"{block_string}{nonce}{''.join(program)}"
+    return hashlib.sha256(hash_input.encode()).hexdigest()
 
-    for op, reg in program:
-        if op == '+':
-            state[reg % 8] += state[(reg + 1) % 8]
-        elif op == '-':
-            state[reg % 8] -= state[(reg + 1) % 8]
-        elif op == '*':
-            state[reg % 8] *= state[(reg + 1) % 8]
-        elif op == '^':
-            state[reg % 8] ^= state[(reg + 1) % 8]
-        elif op == '|':
-            state[reg % 8] |= state[(reg + 1) % 8]
-        elif op == '&':
-            state[reg % 8] &= state[(reg + 1) % 8]
-        state[reg % 8] &= (16 * 1024 // 4) - 1
-
-    final_state = struct.pack('<8I', *state)
-    return hashlib.sha256(final_state).hexdigest()
-
-def progpow_algorithm(block_string, nonce):
-    program = random_program()
-    return progpow_hash(block_string, nonce, program)
-
-# Block and Blockchain structure
 class Block:
     def __init__(self, index, previous_hash, timestamp, transactions, nonce=0):
         self.index = index
@@ -102,271 +278,214 @@ class Blockchain:
         if len(self.chain) % HALVING_INTERVAL == 0:
             self.block_reward /= 2
 
-    def mine_pending_transactions(self, miner_wallet):
-        block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
-        block.nonce = self.mine_block(block)
-        self.add_block(block)
-        miner_wallet.receive_payment(self.block_reward)  # Reward for mining a block
-        self.pending_transactions = []
+def mine_pending_transactions(self, miner_wallet):
+    block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
+    block.nonce = self.mine_block(block)
+    self.add_block(block)
+    miner_wallet.receive_payment(self.block_reward)  # Reward for mining a block
+    self.pending_transactions = []
 
-    def mine_block(self, block):
-        while True:
-            if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
-                return block.nonce
-            block.nonce += 1
-            if self.blocks_mined >= MAX_BLOCKS:
-                print("Max blocks reached! Token supply exhausted.")
-                exit()  # Exit when the total supply is mined
-            self.blocks_mined += 1
+def mine_block(self, block):
+    while True:
+        if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
+            return block.nonce
+        block.nonce += 1
+        if self.blocks_mined >= MAX_BLOCKS:
+            print("Max blocks reached! Token supply exhausted.")
+            exit()  # Exit when the total supply is mined
+        self.blocks_mined += 1
 
-    def create_transaction(self, sender_wallet, recipient_wallet, amount):
-        if sender_wallet.send_payment(amount, recipient_wallet):
-            transaction = {"from": sender_wallet.public_key, "to": recipient_wallet.public_key, "amount": amount}
-            self.pending_transactions.append(transaction)
-            return True
-        return False
+    # Store public keys in PEM format instead of raw RSA objects
+    transaction = {
+        'sender': sender_wallet.get_public_key(),
+        'recipient': recipient_wallet.get_public_key(),
+        'amount': amount
+    }
 
-    def validate_block(self, block):
-        if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
-            for transaction in block.transactions:
-                if not self.validate_transaction(transaction):
-                    return False
-            return True
-        return False
+    sender_wallet.balance -= amount
+    recipient_wallet.balance += amount
+    self.pending_transactions.append(transaction)
+    print(f"Transaction created: {transaction}")
 
-    def validate_transaction(self, transaction):
-        # Placeholder for transaction validation logic
+def validate_block(self, block):
+    if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
+        for transaction in block.transactions:
+            if not self.validate_transaction(transaction):
+                return False
         return True
+    return False
 
-    def display_chain(self):
-        for block in self.chain:
-            print(f"Block #{block.index} Hash: {block.hash}\nTransactions: {block.transactions}\n")
-
-# Wallet system with private-public keys
-class Wallet:
-    def __init__(self):
-        self.balance = 0
-        self.private_key, self.public_key = self.generate_keys()
-
-    def generate_keys(self):
-        (public_key, private_key) = rsa.newkeys(2048)  # RSA keys with 2048-bit
-        return private_key, public_key
-
-    def sign_transaction(self, transaction):
-        try:
-            transaction_string = json.dumps(transaction, sort_keys=True)
-            return rsa.sign(transaction_string.encode('utf-8'), self.private_key, 'SHA-256')
-        except Exception as e:
-            print(f"Error signing transaction: {e}")
-            return None
-
-    def verify_transaction(self, transaction, signature):
-        try:
-            transaction_string = json.dumps(transaction, sort_keys=True)
-            rsa.verify(transaction_string.encode('utf-8'), signature, self.public_key)
-            return True
-        except rsa.pkcs1.VerificationError:
-            return False
-        except Exception as e:
-            print(f"Error verifying transaction: {e}")
-            return False
-
-    def receive_payment(self, amount):
-        self.balance += amount
-
-    def send_payment(self, amount, recipient_wallet):
-        if self.balance >= amount + TRANSACTION_FEE:
-            self.balance -= amount + TRANSACTION_FEE
-            recipient_wallet.receive_payment(amount)
-            return True
+def validate_transaction(self, transaction):
+    # Check transaction format
+    required_fields = {'sender', 'recipient', 'amount', 'signature'}
+    if not all(field in transaction for field in required_fields):
+        print("Transaction format is invalid.")
+        return False
+    
+    sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
+    if not sender_wallet:
+        print(f"Sender wallet not found for public key: {transaction['sender']}")
         return False
 
-# Node improvements with Gossip Protocol and P2P Network
-class GossipProtocol:
-    def broadcast_block(self, block_data):
-        # Implement gossip broadcast for blocks
-        pass
+    # Verify sender has enough balance
+    if sender_wallet.balance < transaction['amount']:
+        print(f"Insufficient funds in sender's wallet: {transaction['sender']}")
+        return False
 
-    def broadcast_transaction(self, transaction_data):
-        # Implement gossip broadcast for transactions
-        pass
+    # Check the signature
+    if not sender_wallet.verify_transaction(transaction, transaction['signature']):
+        print(f"Invalid signature for transaction: {transaction}")
+        return False
 
-# In the Node class, add more print statements
+    # Ensure the transaction includes the correct fee
+    if transaction['amount'] < TRANSACTION_FEE:
+        print("Transaction amount is less than the required fee.")
+        return False
+
+    # All checks passed
+    return True
+
+def find_wallet_by_public_key(self, public_key):
+    for block in self.chain:
+        for transaction in block.transactions:
+            if transaction['sender'] == public_key:
+                return transaction['sender']  # Or map this to actual wallet objects
+    return None
+
 class Node:
-    def __init__(self, blockchain, is_miner=False):
-        self.blockchain = blockchain
-        self.peers = []  # List of peer node addresses
-        self.node_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.node_socket.bind(('localhost', 5003))  # Change port for secondary node
-        self.node_socket.listen(5)
-        self.executor = ThreadPoolExecutor(max_workers=5)
-        self.gossip_protocol = GossipProtocol()  # Placeholder for gossip implementation
-        self.is_miner = is_miner  # Flag indicating if this node mines
-        self.connected_peers = []  # List of connected peers
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.peers = set()
+        self.server = None
+        self.lock = threading.Lock()
 
     def start(self):
-        print("Node is starting...")
-        threading.Thread(target=self.listen_for_clients).start()
-        if self.is_miner:
-            threading.Thread(target=self.mine_blocks).start()
-        print("Listening for incoming connections...")
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((self.host, self.port))
+        self.server.listen(5)
+        print(f"Node started at {self.host}:{self.port}")
+        threading.Thread(target=self.accept_connections).start()
 
-        # Add known peer addresses to the peer list
-        self.peers = [
-            ('localhost', 5001),  # Example peer address
-            # ... other peer addresses
-        ]
-
-        # Start a thread to periodically connect to peers
-        threading.Thread(target=self.connect_to_peers).start()
-
-    def listen_for_clients(self):
-        try:
-            while True:
-                print("Waiting for incoming connections...")
-                client_socket, client_address = self.node_socket.accept()
-                print(f"Connection from {client_address} has been established!")
-                self.executor.submit(self.handle_client, client_socket)
-        except Exception as e:
-            print(f"Error in start: {e}")
-        finally:
-            self.executor.shutdown(wait=True)
+    def accept_connections(self):
+        while True:
+            client_socket, _ = self.server.accept()
+            threading.Thread(target=self.handle_client, args=(client_socket,)).start()
 
     def handle_client(self, client_socket):
-        try:
-            print("Handling client...")
-            data = client_socket.recv(1024).decode('utf-8')
-            message = json.loads(data)
-            if message["type"] == "new_block":
-                self.handle_new_block(message["block"])
-            elif message["type"] == "new_transaction":
-                self.handle_new_transaction(message["transaction"])
-            client_socket.close()
-        except Exception as e:
-            print(f"Error handling client: {e}")
+        request = client_socket.recv(1024).decode('utf-8')
+        print(f"Received message: {request}")
+        if request.startswith('GET /peers'):
+            self.send_peers(client_socket)
+        elif request.startswith('POST /transaction'):
+            self.receive_transaction(client_socket, request)
+        client_socket.close()
 
-    def mine_blocks(self):
+    def send_peers(self, client_socket):
+        """Send the list of peers to a connected node."""
+        with self.lock:
+            peers_list = list(self.peers)
+        client_socket.send(json.dumps(peers_list).encode('utf-8'))
+
+    def receive_transaction(self, client_socket, request):
+        """Receive a transaction from a connected node."""
+        transaction_data = request.split("\n")[-1]  # assuming the transaction is the last line
+        transaction = json.loads(transaction_data)
+        print(f"Received transaction: {transaction}")
+
+        # Here you could validate and process the transaction as necessary
+        client_socket.send("Transaction received".encode('utf-8'))
+
+    def add_peer(self, peer_address):
+        """Add a peer to the network."""
+        with self.lock:
+            self.peers.add(peer_address)
+
+    def remove_peer(self, peer_address):
+        """Remove a peer from the network."""
+        with self.lock:
+            self.peers.discard(peer_address)
+
+class BlockchainNode:
+    def __init__(self, blockchain):
+        self.blockchain = blockchain
+
+    def start_mining(self, miner_wallet):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.submit(self.blockchain.mine_pending_transactions, miner_wallet)
+
+    def submit_transaction(self, sender_wallet, recipient_wallet, amount):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.submit(self.blockchain.create_transaction, sender_wallet, recipient_wallet, amount)
+
+    def run(self):
+        print("Blockchain Node started...")
         while True:
+            time.sleep(1)  # Simulate time passing, potentially for new transactions or blocks
             if self.blockchain.pending_transactions:
-                print("Mining new block...")
-                self.blockchain.mine_pending_transactions(self)
-                self.gossip_protocol.broadcast_block(self.blockchain.chain[-1].__dict__)
-                time.sleep(5)
+                self.start_mining(miner_wallet)
 
-    def connect_to_peers(self):
-        while True:
-            for peer in self.peers:
-                try:
-                    print(f"Connecting to peer: {peer}")
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                        sock.connect(peer)
-                        message = {"type": "get_blockchain"}
-                        sock.send(json.dumps(message).encode('utf-8'))
-                except Exception as e:
-                    print(f"Error connecting to peer {peer}: {e}")
-            time.sleep(60)  # Try reconnecting every 60 seconds
-
-    def handle_new_block(self, block_data):
-        try:
-            print(f"Handling new block: {block_data['hash']}")
-            # Add the new block to the blockchain
-            new_block = Block(
-                block_data["index"],
-                block_data["previous_hash"],
-                block_data["timestamp"],
-                block_data["transactions"],
-                block_data["nonce"]
-            )
-            if self.blockchain.validate_block(new_block):
-                self.blockchain.add_block(new_block)
-                print(f"Block #{block_data['index']} added successfully.")
-            else:
-                print("Block validation failed.")
-        except Exception as e:
-            print(f"Error handling new block: {e}")
-
-    def handle_new_transaction(self, transaction_data):
-        try:
-            print(f"Handling new transaction: {transaction_data}")
-            sender_wallet = Wallet()  # Simulate the sender's wallet (replace with real wallet handling)
-            recipient_wallet = Wallet()  # Simulate the recipient's wallet
-            amount = transaction_data["amount"]
-            if self.blockchain.create_transaction(sender_wallet, recipient_wallet, amount):
-                print(f"Transaction from {transaction_data['from']} to {transaction_data['to']} added successfully.")
-            else:
-                print("Transaction validation failed.")
-        except Exception as e:
-            print(f"Error handling new transaction: {e}")
-
-    def broadcast_transaction(self, transaction_data):
-        for peer in self.connected_peers:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.connect(peer)
-                    message = {"type": "new_transaction", "transaction": transaction_data}
-                    sock.send(json.dumps(message).encode('utf-8'))
-                    print(f"Transaction broadcasted to {peer}")
-            except Exception as e:
-                print(f"Error broadcasting transaction to {peer}: {e}")
-
-    def broadcast_block(self, block_data):
-        for peer in self.connected_peers:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.connect(peer)
-                    message = {"type": "new_block", "block": block_data}
-                    sock.send(json.dumps(message).encode('utf-8'))
-                    print(f"Block broadcasted to {peer}")
-            except Exception as e:
-                print(f"Error broadcasting block to {peer}: {e}")
-
-    def start_mining(self):
-        if not self.is_miner:
-            print("This node is not a miner.")
-            return
-        print("Mining started...")
-        self.mine_blocks()
-
-    def connect_to_peers(self):
-        while True:
-            for peer in self.peers:
-                try:
-                    print(f"Connecting to peer: {peer}")
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                        sock.connect(peer)
-                        message = {"type": "get_blockchain"}
-                        sock.send(json.dumps(message).encode('utf-8'))
-                except Exception as e:
-                    print(f"Error connecting to peer {peer}: {e}")
-            time.sleep(60)  # Try reconnecting every 60 seconds
-
-# Example of how to run the node and blockchain system
-def main():
-    blockchain = Blockchain()
-    node = Node(blockchain, is_miner=True)  # Create a miner node
-    node.start()
-
-    # Simulate a wallet
-    miner_wallet = Wallet()
-
-    # Simulate mining process
-    node.mine_pending_transactions(miner_wallet)
-    
-    # Simulate transactions
-    sender_wallet = Wallet()
-    recipient_wallet = Wallet()
-    blockchain.create_transaction(sender_wallet, recipient_wallet, 10)
-
-    # Simulate broadcasting transactions and blocks
-    transaction_data = {
-        "from": sender_wallet.public_key,
-        "to": recipient_wallet.public_key,
-        "amount": 10
-    }
-    node.broadcast_transaction(transaction_data)
-
-    block_data = blockchain.chain[-1].__dict__
-    node.broadcast_block(block_data)
+# Logging improvements for better debugging and monitoring
+logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Create wallets for the sender, recipient, and a new wallet
+        sender_wallet = Wallet()
+        recipient_wallet = Wallet()
+        new_wallet = Wallet()  # A new wallet to be registered in the blockchain
+
+        # Initialize sender wallet with balance for testing
+        sender_wallet.update_balance(100)  # Example balance
+
+        # Print out the public keys (addresses) in PEM format
+        print(f"Sender Wallet Address: {sender_wallet.get_public_key()}")
+        print(f"Recipient Wallet Address: {recipient_wallet.get_public_key()}")
+        print(f"New Wallet Address: {new_wallet.get_public_key()}")  # Print new wallet address
+
+        # Set up blockchain and node
+        blockchain = Blockchain()
+        
+        # Register sender, recipient, and new wallet in the blockchain
+        blockchain.register_wallet(sender_wallet)  
+        blockchain.register_wallet(recipient_wallet)  
+        blockchain.register_wallet(new_wallet)  # Register new wallet
+
+        blockchain_node = BlockchainNode(blockchain)
+
+        # Display initial blockchain state
+        print("Initial Blockchain:")
+        for block in blockchain.chain:
+            print(f"Block {block.index}: {block.transactions}")
+
+        # Create and validate a few transactions
+        # First transaction attempt (sender to recipient, 10 units)
+        transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, 10)
+        if not transaction_success:
+            print(f"Insufficient funds for transaction: 10 units from sender to recipient")
+
+        # Second transaction attempt (sender to recipient, 20 units)
+        transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, 20)
+        if not transaction_success:
+            print(f"Insufficient funds for transaction: 20 units from sender to recipient")
+
+        # Simulate mining the pending transactions
+        miner_wallet = Wallet()  # A wallet to receive the mining reward
+        blockchain_node.start_mining(miner_wallet)
+
+        # Show blockchain and wallets after mining
+        print("Blockchain after mining:")
+        for block in blockchain.chain:
+            print(f"Block {block.index}: {block.transactions}")
+
+        print(f"Miner Wallet Balance: {miner_wallet.balance}")
+        print(f"Sender Wallet Balance: {sender_wallet.balance}")
+        print(f"Recipient Wallet Balance: {recipient_wallet.balance}")
+        print(f"New Wallet Balance: {new_wallet.balance}")  # Print new wallet balance
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Optional: Keep the console open for a bit longer to see results
+    import time
+    time.sleep(5)  # Keeps the console open for 5 seconds after execution
