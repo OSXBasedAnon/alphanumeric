@@ -5,6 +5,7 @@ import random
 import logging
 import rsa
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from cryptography.hazmat.primitives.asymmetric import rsa as cryptography_rsa
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -81,21 +82,24 @@ class Wallet:
         self.balance += amount
 
     def sign_transaction(self, transaction):
-        # Sign the transaction using the private key
-        transaction_bytes = json.dumps(transaction, sort_keys=True).encode()
+        transaction_copy = transaction.copy()
+        transaction_copy.pop('signature', None)  # Remove signature field if it exists
+        transaction_bytes = json.dumps(transaction_copy, sort_keys=True).encode()
         signature = self.private_key.sign(
             transaction_bytes,
             padding.PKCS1v15(),
             hashes.SHA256()
         )
-        return signature
+        return base64.b64encode(signature).decode('utf-8')
 
     def verify_transaction(self, transaction, signature):
-        # Verify a transaction using the public key
         try:
-            transaction_bytes = json.dumps(transaction, sort_keys=True).encode()
+            transaction_copy = transaction.copy()
+            transaction_copy.pop('signature', None)  # Remove signature field if it exists
+            transaction_bytes = json.dumps(transaction_copy, sort_keys=True).encode()
+            decoded_signature = base64.b64decode(signature)
             self.public_key.verify(
-                signature,
+                decoded_signature,
                 transaction_bytes,
                 padding.PKCS1v15(),
                 hashes.SHA256()
@@ -104,6 +108,16 @@ class Wallet:
         except Exception as e:
             print(f"Transaction verification failed: {e}")
             return False
+
+    def save_wallet(self, private_filename="private_key.pem", public_filename="public_key.pem"):
+        save_private_key(self.private_key, private_filename)
+        save_public_key(self.public_key, public_filename)
+
+    def load_wallet(self, private_filename="private_key.pem"):
+        with open(private_filename, 'rb') as private_file:
+            private_key_data = private_file.read()
+            self.private_key = serialization.load_pem_private_key(private_key_data, password=None, backend=default_backend())
+            self.public_key = self.private_key.public_key()
 
 class Block:
     def __init__(self, index, previous_hash, timestamp, transactions, nonce=0):
@@ -214,6 +228,12 @@ class Blockchain:
         self.wallets[wallet.get_public_key()] = wallet
         print(f"Wallet registered with public key: {wallet.get_public_key()}")
 
+def create_wallet(self):
+    private_key = generate_private_key()
+    wallet = Wallet(private_key)
+    self.register_wallet(wallet)
+    return wallet
+
 # Helper functions for ProgPoW (this part remains largely unchanged)
 def progpow_algorithm(block_string, nonce):
     program = random_program()
@@ -255,6 +275,7 @@ class Blockchain:
         self.lock = threading.Lock()
         self.token_supply = TOTAL_SUPPLY
         self.blocks_mined = 0
+        self.wallets = {}  # Dictionary to store wallets by public key
 
     def create_genesis_block(self):
         return Block(0, "0", int(time.time()), [], 0)
@@ -278,79 +299,116 @@ class Blockchain:
         if len(self.chain) % HALVING_INTERVAL == 0:
             self.block_reward /= 2
 
-def mine_pending_transactions(self, miner_wallet):
-    block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
-    block.nonce = self.mine_block(block)
-    self.add_block(block)
-    miner_wallet.receive_payment(self.block_reward)  # Reward for mining a block
-    self.pending_transactions = []
+    def register_wallet(self, wallet):
+        """Register a wallet in the blockchain."""
+        self.wallets[wallet.get_public_key()] = wallet
+        print(f"Wallet registered with public key: {wallet.get_public_key()}")
 
-def mine_block(self, block):
-    while True:
-        if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
-            return block.nonce
-        block.nonce += 1
-        if self.blocks_mined >= MAX_BLOCKS:
-            print("Max blocks reached! Token supply exhausted.")
-            exit()  # Exit when the total supply is mined
-        self.blocks_mined += 1
+    def create_transaction(self, sender_wallet, recipient_wallet, amount):
+        """Create a transaction from sender to recipient."""
+        if sender_wallet.balance < amount + TRANSACTION_FEE:
+            print(f"Insufficient funds for transaction: {amount} units from sender to recipient")
+            return False
 
-    # Store public keys in PEM format instead of raw RSA objects
-    transaction = {
-        'sender': sender_wallet.get_public_key(),
-        'recipient': recipient_wallet.get_public_key(),
-        'amount': amount
-    }
+        transaction = {
+            'sender': sender_wallet.get_public_key(),
+            'recipient': recipient_wallet.get_public_key(),
+            'amount': amount
+        }
+        transaction['signature'] = sender_wallet.sign_transaction(transaction)
 
-    sender_wallet.balance -= amount
-    recipient_wallet.balance += amount
-    self.pending_transactions.append(transaction)
-    print(f"Transaction created: {transaction}")
+        # Verify the transaction is valid before adding it to the pending transactions
+        if self.validate_transaction(transaction):
+            self.pending_transactions.append(transaction)
+            sender_wallet.update_balance(-amount - TRANSACTION_FEE)
+            recipient_wallet.update_balance(amount)
+            return True
+        else:
+            return False
 
-def validate_block(self, block):
-    if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
-        for transaction in block.transactions:
-            if not self.validate_transaction(transaction):
-                return False
+    def mine_pending_transactions(self, miner_wallet):
+        block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
+        block.nonce = self.mine_block(block)
+        self.add_block(block)
+        miner_wallet.update_balance(self.block_reward)  # Reward for mining a block
+        self.pending_transactions = []
+
+    def mine_block(self, block):
+        while True:
+            if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
+                return block.nonce
+            block.nonce += 1
+            if self.blocks_mined >= MAX_BLOCKS:
+                print("Max blocks reached! Token supply exhausted.")
+                exit()  # Exit when the total supply is mined
+            self.blocks_mined += 1
+
+    def validate_block(self, block):
+        if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
+            for transaction in block.transactions:
+                if not self.validate_transaction(transaction):
+                    return False
+            return True
+        return False
+
+    def validate_transaction(self, transaction):
+        # Check transaction format
+        required_fields = {'sender', 'recipient', 'amount', 'signature'}
+        if not all(field in transaction for field in required_fields):
+            print("Transaction format is invalid.")
+            return False
+
+        sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
+        if not sender_wallet:
+            print(f"Sender wallet not found for public key: {transaction['sender']}")
+            return False
+
+        # Verify sender has enough balance
+        if sender_wallet.balance < transaction['amount']:
+            print(f"Insufficient funds in sender's wallet: {transaction['sender']}")
+            return False
+
+        # Check the signature
+        if not sender_wallet.verify_transaction(transaction, transaction['signature']):
+            print(f"Invalid signature for transaction: {transaction}")
+            return False
+
+        # Ensure the transaction includes the correct fee
+        if transaction['amount'] < TRANSACTION_FEE:
+            print("Transaction amount is less than the required fee.")
+            return False
+
+        # All checks passed
         return True
-    return False
 
-def validate_transaction(self, transaction):
-    # Check transaction format
-    required_fields = {'sender', 'recipient', 'amount', 'signature'}
-    if not all(field in transaction for field in required_fields):
-        print("Transaction format is invalid.")
-        return False
-    
-    sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
-    if not sender_wallet:
-        print(f"Sender wallet not found for public key: {transaction['sender']}")
-        return False
+    def find_wallet_by_public_key(self, public_key):
+        return self.wallets.get(public_key)  # Map to actual wallet objects
 
-    # Verify sender has enough balance
-    if sender_wallet.balance < transaction['amount']:
-        print(f"Insufficient funds in sender's wallet: {transaction['sender']}")
-        return False
+    def save_blockchain(self, filename="blockchain.json"):
+        with open(filename, 'w') as file:
+            json_chain = [block.__dict__ for block in self.chain]
+            json.dump(json_chain, file, indent=4)
 
-    # Check the signature
-    if not sender_wallet.verify_transaction(transaction, transaction['signature']):
-        print(f"Invalid signature for transaction: {transaction}")
-        return False
-
-    # Ensure the transaction includes the correct fee
-    if transaction['amount'] < TRANSACTION_FEE:
-        print("Transaction amount is less than the required fee.")
-        return False
-
-    # All checks passed
-    return True
-
-def find_wallet_by_public_key(self, public_key):
-    for block in self.chain:
-        for transaction in block.transactions:
-            if transaction['sender'] == public_key:
-                return transaction['sender']  # Or map this to actual wallet objects
-    return None
+    def load_blockchain(self, filename="blockchain.json"):
+        try:
+            with open(filename, 'r') as file:
+                json_chain = json.load(file)
+                self.chain = []
+                for block_data in json_chain:
+                    block = Block(
+                        index=block_data['index'],
+                        previous_hash=block_data['previous_hash'],
+                        timestamp=block_data['timestamp'],
+                        transactions=block_data['transactions'],
+                        nonce=block_data['nonce']
+                    )
+                    block.hash = block_data['hash']
+                    self.chain.append(block)
+        except FileNotFoundError:
+            self.chain = [self.create_genesis_block()]
+        except Exception as e:
+            print(f"Error loading blockchain: {e}")
+            self.chain = [self.create_genesis_block()]
 
 class Node:
     def __init__(self, host, port):
@@ -435,6 +493,11 @@ if __name__ == "__main__":
         recipient_wallet = Wallet()
         new_wallet = Wallet()  # A new wallet to be registered in the blockchain
 
+        # Save wallets
+        sender_wallet.save_wallet("sender_private_key.pem", "sender_public_key.pem")
+        recipient_wallet.save_wallet("recipient_private_key.pem", "recipient_public_key.pem")
+        new_wallet.save_wallet("new_private_key.pem", "new_public_key.pem")
+
         # Initialize sender wallet with balance for testing
         sender_wallet.update_balance(100)  # Example balance
 
@@ -443,9 +506,10 @@ if __name__ == "__main__":
         print(f"Recipient Wallet Address: {recipient_wallet.get_public_key()}")
         print(f"New Wallet Address: {new_wallet.get_public_key()}")  # Print new wallet address
 
-        # Set up blockchain and node
+        # Set up blockchain and load if exists
         blockchain = Blockchain()
-        
+        blockchain.load_blockchain()
+
         # Register sender, recipient, and new wallet in the blockchain
         blockchain.register_wallet(sender_wallet)  
         blockchain.register_wallet(recipient_wallet)  
@@ -453,39 +517,74 @@ if __name__ == "__main__":
 
         blockchain_node = BlockchainNode(blockchain)
 
+        # Initialize miner wallet (for demonstration purposes, use the new wallet)
+        miner_wallet = new_wallet
+
         # Display initial blockchain state
         print("Initial Blockchain:")
         for block in blockchain.chain:
             print(f"Block {block.index}: {block.transactions}")
 
-        # Create and validate a few transactions
-        # First transaction attempt (sender to recipient, 10 units)
-        transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, 10)
-        if not transaction_success:
-            print(f"Insufficient funds for transaction: 10 units from sender to recipient")
+        # Command-line interface for interaction
+        while True:
+            print("\nAvailable Commands:")
+            print("1. Create Transaction (format: create sender recipient amount)")
+            print("2. Mine Pending Transactions (format: mine miner_wallet)")
+            print("3. Show Blockchain (format: show)")
+            print("4. Exit")
 
-        # Second transaction attempt (sender to recipient, 20 units)
-        transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, 20)
-        if not transaction_success:
-            print(f"Insufficient funds for transaction: 20 units from sender to recipient")
+            command = input("\nEnter command: ")
 
-        # Simulate mining the pending transactions
-        miner_wallet = Wallet()  # A wallet to receive the mining reward
-        blockchain_node.start_mining(miner_wallet)
+            if command.startswith("create"):
+                _, sender, recipient, amount = command.split()
+                amount = float(amount)
 
-        # Show blockchain and wallets after mining
-        print("Blockchain after mining:")
-        for block in blockchain.chain:
-            print(f"Block {block.index}: {block.transactions}")
+                sender_wallet = blockchain.find_wallet_by_public_key(sender)
+                recipient_wallet = blockchain.find_wallet_by_public_key(recipient)
 
-        print(f"Miner Wallet Balance: {miner_wallet.balance}")
-        print(f"Sender Wallet Balance: {sender_wallet.balance}")
-        print(f"Recipient Wallet Balance: {recipient_wallet.balance}")
-        print(f"New Wallet Balance: {new_wallet.balance}")  # Print new wallet balance
+                if sender_wallet and recipient_wallet:
+                    transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, amount)
+                    if transaction_success:
+                        print(f"Transaction created: {amount} units from {sender} to {recipient}")
+                    else:
+                        print(f"Failed to create transaction: {amount} units from {sender} to {recipient}")
+                else:
+                    print("Invalid sender or recipient wallet address.")
+
+            elif command.startswith("mine"):
+                _, miner = command.split()
+                miner_wallet = blockchain.find_wallet_by_public_key(miner)
+                if miner_wallet:
+                    blockchain_node.start_mining(miner_wallet)
+                    print(f"Mining started for wallet: {miner}")
+                else:
+                    print("Invalid miner wallet address.")
+
+            elif command.startswith("show"):
+                print("Blockchain after mining:")
+                for block in blockchain.chain:
+                    print(f"Block {block.index}: {block.transactions}")
+                print(f"Miner Wallet Balance: {miner_wallet.balance}")
+                print(f"Sender Wallet Balance: {sender_wallet.balance}")
+                print(f"Recipient Wallet Balance: {recipient_wallet.balance}")
+                print(f"New Wallet Balance: {new_wallet.balance}")
+
+            elif command == "exit":
+                # Save blockchain and wallets before exiting
+                blockchain.save_blockchain()
+                sender_wallet.save_wallet("sender_private_key.pem", "sender_public_key.pem")
+                recipient_wallet.save_wallet("recipient_private_key.pem", "recipient_public_key.pem")
+                new_wallet.save_wallet("new_private_key.pem", "new_public_key.pem")
+                break
+
+            else:
+                print("Invalid command. Please try again.")
 
     except Exception as e:
         print(f"An error occurred: {e}")
 
-    # Optional: Keep the console open for a bit longer to see results
-    import time
-    time.sleep(5)  # Keeps the console open for 5 seconds after execution
+    finally:
+        print("Exiting the program.")
+        # Optional: Keep the console open for a bit longer to see results
+        import time
+        time.sleep(5)  # Keeps the console open for 5 seconds after execution
