@@ -1,0 +1,26 @@
+{
+    "chain": [
+        {
+            "index": 0,
+            "previous_hash": "0",
+            "timestamp": 1731640268,
+            "transactions": [],
+            "nonce": 0,
+            "hash": "43e17a5e02d587deeb3d63e1eaddac2c2e7d78bf92d177fef266e39c6925bbb3"
+        },
+        {
+            "index": 0,
+            "previous_hash": "0",
+            "timestamp": 1731640268,
+            "transactions": [],
+            "nonce": 0,
+            "hash": "43e17a5e02d587deeb3d63e1eaddac2c2e7d78bf92d177fef266e39c6925bbb3"
+        }
+    ],
+    "pending_transactions": [],
+    "difficulty": 4,
+    "block_reward": 50,
+    "token_supply": 21000000,
+    "blocks_mined": 0,
+    "wallets": {}
+}
