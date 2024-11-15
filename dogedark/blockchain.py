@@ -72,7 +72,7 @@ class Wallet:
         self.public_key = self.private_key.public_key()
         self.balance = 0
         logging.info(f"Wallet created. Public Key Type: {type(self.public_key)}")
-        
+
     def get_public_key_pem(self):
         """Get the public key in PEM format as bytes."""
         public_key_pem = self.public_key.public_bytes(
@@ -116,7 +116,7 @@ class Wallet:
 
     def update_balance(self, amount):
         self.balance += amount
-        
+
 def to_dict(self):
     return {
         'balance': self.balance,
@@ -136,7 +136,9 @@ class Block:
 
     def calculate_hash(self):
         # Calculates the hash (example using SHA-256)
-        return hashlib.sha256(f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}{self.nonce}".encode('utf-8')).hexdigest()
+        return hashlib.sha256(
+            f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}{self.nonce}".encode('utf-8')
+        ).hexdigest()
 
     def __getitem__(self, key):
         # Allows subscript access to Block attributes (e.g., block['index'])
@@ -233,42 +235,46 @@ class Blockchain:
         return self.chain[-1]
 
     def is_valid_chain(self, chain=None):
-        """Validate the entire blockchain."""
+        """ Validates the entire blockchain """
         if chain is None:
             chain = self.chain
 
         if len(chain) == 0:
-            return False
+            return False  # If the chain is empty, it's invalid
 
         for i in range(1, len(chain)):
             current_block = chain[i]
             previous_block = chain[i - 1]
 
-            # Verify block hash
+            # Verify block hash and block link
             if current_block.hash != current_block.calculate_hash():
-                return False
-
-            # Verify block link
+                print(f"Invalid hash at block {current_block.index}")
+                return False  # Block's hash is invalid
             if current_block.previous_hash != previous_block.hash:
-                return False
+                print(f"Invalid link at block {current_block.index}")
+                return False  # Previous block's hash does not match the link
 
-            # Verify transactions in block
+            # Verify transactions within the block
             for transaction in current_block.transactions:
                 if not self.validate_transaction(transaction):
-                    return False
+                    print(f"Invalid transaction in block {current_block.index}")
+                    return False  # If any transaction fails validation, invalidate the block
 
-        return True
+        return True  # All blocks and transactions are valid
 
     def create_genesis_block(self):
+        """Create the first block in the blockchain."""
         return Block(0, "0", int(time.time()), [], 0)
 
     def add_block(self, new_block):
+        """Add a new block to the blockchain."""
         with self.lock:
             self.chain.append(new_block)
             self.adjust_difficulty()
             self.update_block_reward()
 
     def adjust_difficulty(self):
+        """Adjust the mining difficulty periodically."""
         if len(self.chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
             expected_time = DIFFICULTY_ADJUSTMENT_INTERVAL * 10  # Expected time in seconds
             actual_time = self.chain[-1].timestamp - self.chain[-DIFFICULTY_ADJUSTMENT_INTERVAL].timestamp
@@ -278,10 +284,12 @@ class Blockchain:
                 self.difficulty -= 1
 
     def update_block_reward(self):
+        """Update block reward periodically."""
         if len(self.chain) % HALVING_INTERVAL == 0:
             self.block_reward /= 2
 
     def mine_pending_transactions(self, miner_wallet):
+        """Mine pending transactions and reward the miner."""
         block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
         block.nonce = self.mine_block(block)
         self.add_block(block)
@@ -289,16 +297,20 @@ class Blockchain:
         self.pending_transactions = []
 
     def mine_block(self, block):
+        """Mine the block by finding the correct nonce."""
         while True:
-            if block.calculate_hash()[:self.difficulty] == '0' * self.difficulty:
-                return block.nonce
+            # Attempt mining with the current nonce and check if it satisfies the difficulty condition
+            block_hash = block.calculate_hash()
+            if block_hash[:self.difficulty] == '0' * self.difficulty:
+                return block.nonce  # Return the correct nonce if it matches the difficulty
             block.nonce += 1
-            if self.blocks_mined >= MAX_BLOCKS:
+            if self.blocks_mined >= MAX_BLOCKS:  # Ensure you stop mining when max blocks are reached
                 print("Max blocks reached! Token supply exhausted.")
-                exit()
+                exit()  # Exit if you exceed the maximum allowed blocks
             self.blocks_mined += 1
 
     def validate_block(self, block):
+        """Validate a single block."""
         if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
             for transaction in block.transactions:
                 if not self.validate_transaction(transaction):
@@ -307,10 +319,11 @@ class Blockchain:
         return False
 
     def validate_transaction(self, transaction):
+        """Validate a single transaction."""
         required_fields = {'sender', 'recipient', 'amount', 'signature'}
         if not all(field in transaction for field in required_fields):
             print("Transaction format is invalid.")
-            return False
+            return False  # Early exit if required fields are missing
 
         sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
         if not sender_wallet:
@@ -329,25 +342,25 @@ class Blockchain:
             print("Transaction amount is less than the required fee.")
             return False
 
-        return True
+        return True  # Return True if all validations pass
 
     def find_wallet_by_public_key(self, public_key):
+        """Find a wallet by its public key."""
         return self.wallets.get(public_key)
 
     def register_wallet(self, wallet):
-        # Convert the public key to its string representation in PEM format
+        """Register a wallet in the blockchain."""
         public_key_str = wallet.get_public_key()
-        
-        # Now use the PEM format as the dictionary key
         self.wallets[public_key_str] = wallet
 
     def create_wallet(self):
+        """Create and register a new wallet."""
         wallet = Wallet()
         self.register_wallet(wallet)
         return wallet
 
     def save_blockchain(self, filename='blockchain_state.json'):
-        """Save the current state of the blockchain to a file."""
+        """Save the blockchain state to a file."""
         state = {
             'chain': [block.to_dict() for block in self.chain],
             'pending_transactions': self.pending_transactions,
@@ -355,7 +368,7 @@ class Blockchain:
             'block_reward': self.block_reward,
             'token_supply': self.token_supply,
             'blocks_mined': self.blocks_mined,
-            'wallets': {k: w.to_dict() for k, w in self.wallets.items()}
+            'wallets': {k: w.to_dict() for k, w in self.wallets.items()}  # Ensure wallets are serialized properly
         }
 
         try:
@@ -364,3 +377,5 @@ class Blockchain:
             print(f"Blockchain state saved to {filename}")
         except Exception as e:
             print(f"Error saving blockchain state: {e}")
+
+
