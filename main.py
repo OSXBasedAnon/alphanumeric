@@ -8,103 +8,90 @@ import hashlib
 import base58
 import json
 
-
 def check_and_load_wallet(filename, create_new=False):
-    """Check if a wallet file exists, and load or create a new one"""
+    wallet = None
     if os.path.exists(filename):
-        with open(filename, "rb") as f:
-            private_key = f.read()
-        wallet = Wallet()
-        wallet.load_wallet(private_key)
-        print(f"Loaded wallet from {filename}")
+        try:
+            wallet = Wallet.load_wallet(filename)  # Load the wallet properly
+            print(f"Loaded wallet from {filename}")
+        except Exception as e:
+            print(f"Failed to load wallet from {filename}: {e}")
     else:
         if create_new:
             wallet = Wallet()
-            wallet.save_wallet(filename)
-            print(f"Created and saved new wallet to {filename}")
-        else:
-            wallet = None
+            try:
+                wallet.save_wallet(filename)
+                print(f"Created and saved new wallet to {filename}")
+            except Exception as e:
+                print(f"Failed to save new wallet to {filename}: {e}")
     return wallet
 
-
 def save_public_key(wallet, filename):
-    """Helper function to save public key in PEM format"""
-    with open(filename, "wb") as f:
-        public_key = wallet.get_public_key()
-        f.write(public_key.encode('utf-8'))
-
+    try:
+        with open(filename, "wb") as f:
+            public_key = wallet.get_public_key()
+            f.write(public_key.encode('utf-8'))
+        print(f"Public key saved to {filename}")
+    except Exception as e:
+        print(f"Failed to save public key to {filename}: {e}")
 
 def download_blockchain_from_node(blockchain, blockchain_node):
-    """Fetch blockchain from node if it doesn't exist locally"""
-    if not blockchain.check_if_loaded():  # Change is_loaded() to check_if_loaded()
-        print("Downloading blockchain from the node...")
-        blockchain_data = blockchain_node.get_blockchain()
-        blockchain.load_blockchain_data(blockchain_data)
-        print("Blockchain downloaded successfully.")
-
+    if not blockchain.check_if_loaded():
+        print("Blockchain not loaded locally. Attempting to download...")
+        try:
+            blockchain.load_blockchain_from_file()
+            if not blockchain.check_if_loaded():
+                blockchain_data = blockchain_node.get_blockchain()
+                blockchain.load_from_dict(blockchain_data)
+                blockchain.save_blockchain_to_file()
+            print("Blockchain downloaded and loaded successfully.")
+        except Exception as e:
+            print(f"Failed to download blockchain: {e}")
 
 def generate_wallet_address(public_key):
-    """Generate a human-readable wallet address (like Bitcoin) from the public key."""
-    # Perform SHA-256 hashing
     sha256_hash = hashlib.sha256(public_key.encode('utf-8')).digest()
-    # Perform RIPEMD-160 hashing
     ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
-    # Base58 encode the hash
     address = base58.b58encode(ripemd160_hash).decode('utf-8')
     return address
 
-
 def show_balance(wallet):
-    """Show balance and wallet ID (public key as address)"""
-    wallet_address = generate_wallet_address(wallet.get_public_key())
-    print(f"Wallet Address: {wallet_address}")
+    if not hasattr(wallet, "cached_address"):
+        wallet.cached_address = generate_wallet_address(wallet.get_public_key())
+    print(f"Wallet Address: {wallet.cached_address}")
     print(f"Balance: {wallet.get_balance()} units")
-
 
 if __name__ == "__main__":
     try:
-        # Check and load wallets or create new ones if not found
-        sender_wallet = check_and_load_wallet("sender_private_key.pem", create_new=True)
-        recipient_wallet = check_and_load_wallet("recipient_private_key.pem", create_new=True)
-        new_wallet = check_and_load_wallet("new_private_key.pem", create_new=True)
+        sender_wallet = check_and_load_wallet("sender_private_key.json", create_new=True)
+        recipient_wallet = check_and_load_wallet("recipient_private_key.json", create_new=True)
+        new_wallet = check_and_load_wallet("new_private_key.json", create_new=True)
 
-        # Save public keys
         save_public_key(sender_wallet, "sender_public_key.pem")
         save_public_key(recipient_wallet, "recipient_public_key.pem")
         save_public_key(new_wallet, "new_public_key.pem")
 
-        # Initialize sender wallet with balance for testing
-        sender_wallet.set_balance(100)
-
-        # Print out the public keys (addresses) in PEM format
         print(f"Sender Wallet Address: {generate_wallet_address(sender_wallet.get_public_key())}")
         print(f"Recipient Wallet Address: {generate_wallet_address(recipient_wallet.get_public_key())}")
         print(f"New Wallet Address: {generate_wallet_address(new_wallet.get_public_key())}")
 
-        # Set up blockchain and load it
         blockchain = Blockchain()
-        blockchain.load_blockchain_from_file()  # This should call the correct method
+        blockchain.load_blockchain_from_file()
 
-        # Initialize blockchain node (assuming localhost and port 5000)
         blockchain_node = Node(host="localhost", port=5000, blockchain=blockchain)
 
-        # Download blockchain from node if it isn't already loaded
         download_blockchain_from_node(blockchain, blockchain_node)
 
-        # Register sender, recipient, and new wallet in the blockchain
+        # Register wallets with the blockchain
         blockchain.register_wallet(sender_wallet)
         blockchain.register_wallet(recipient_wallet)
         blockchain.register_wallet(new_wallet)
 
-        # Initialize miner wallet (for demonstration purposes, use the new wallet)
         miner_wallet = new_wallet
 
-        # Display initial blockchain state
         print("Initial Blockchain:")
         for block in blockchain.chain:
-            print(f"Block {block['index']}: {block['transactions']}")
+            print(f"Block {block.index}: {block.transactions}")
 
-        # Command-line interface for interaction
         while True:
             print("\nAvailable Commands:")
             print("1. Create Transaction (format: create sender recipient amount)")
@@ -120,8 +107,8 @@ if __name__ == "__main__":
                     _, sender, recipient, amount = command.split()
                     amount = float(amount)
 
-                    sender_wallet = blockchain.find_wallet_by_public_key(sender)
-                    recipient_wallet = blockchain.find_wallet_by_public_key(recipient)
+                    sender_wallet = blockchain.find_wallet_by_address(sender)
+                    recipient_wallet = blockchain.find_wallet_by_address(recipient)
 
                     if sender_wallet and recipient_wallet:
                         transaction_success = blockchain.create_transaction(sender_wallet, recipient_wallet, amount)
@@ -134,9 +121,9 @@ if __name__ == "__main__":
 
                 elif command.startswith("mine"):
                     _, miner = command.split()
-                    miner_wallet = blockchain.find_wallet_by_public_key(miner)
+                    miner_wallet = blockchain.find_wallet_by_address(miner)
                     if miner_wallet:
-                        blockchain_node.mine_pending_transactions(miner_wallet)
+                        blockchain.mine_pending_transactions(miner_wallet.wallet_address)
                         print(f"Mining started for wallet: {miner}")
                     else:
                         print("Invalid miner wallet address.")
@@ -144,7 +131,7 @@ if __name__ == "__main__":
                 elif command.startswith("show"):
                     print("Blockchain after mining:")
                     for block in blockchain.chain:
-                        print(f"Block {block['index']}: {block['transactions']}")
+                        print(f"Block {block.index}: {block.transactions}")
                     print(f"Miner Wallet Balance: {miner_wallet.get_balance()}")
                     print(f"Sender Wallet Balance: {sender_wallet.get_balance()}")
                     print(f"Recipient Wallet Balance: {recipient_wallet.get_balance()}")
@@ -157,13 +144,13 @@ if __name__ == "__main__":
                     show_balance(new_wallet)
 
                 elif command == "exit":
-                    blockchain.save_blockchain()
+                    blockchain.save_blockchain_to_file()
                     save_public_key(sender_wallet, "sender_public_key.pem")
                     save_public_key(recipient_wallet, "recipient_public_key.pem")
                     save_public_key(new_wallet, "new_public_key.pem")
-                    sender_wallet.save_wallet("sender_private_key.pem")
-                    recipient_wallet.save_wallet("recipient_private_key.pem")
-                    new_wallet.save_wallet("new_private_key.pem")
+                    sender_wallet.save_wallet("sender_private_key.json")
+                    recipient_wallet.save_wallet("recipient_private_key.json")
+                    new_wallet.save_wallet("new_private_key.json")
                     print("Blockchain saved and program exited.")
                     break
 
