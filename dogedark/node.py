@@ -164,7 +164,7 @@ class Node:
 
     def send_blockchain(self, client_socket):
         """Send blockchain data to requesting peer."""
-        chain_data = self.blockchain.to_dict()
+        chain_data = self.get_blockchain()  # Use the new get_blockchain method
         response = json.dumps(chain_data)
         client_socket.send(response.encode('utf-8'))
 
@@ -199,6 +199,10 @@ class Node:
             if peer_address not in self.peers and peer_address != (self.host, self.port):
                 self.peers.add(peer_address)
                 logging.info(f"Added peer: {peer_address}")
+
+    def get_blockchain(self):
+        """Return the current blockchain data."""
+        return self.blockchain.to_dict()  # Return the blockchain in dictionary format
 
 def main():
     # Example bootstrap nodes

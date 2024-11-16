@@ -1,15 +1,18 @@
-# dogedark/__init__.py
 from dogedark.blockchain import Blockchain
 from dogedark.wallet import Wallet
 from dogedark.node import Node
 
 version = '1.0.0'
 
-# Initialize the node
+# Initialize the blockchain object
+blockchain = Blockchain()
+
+# Initialize the node, passing the blockchain object
 node = Node(
     host="localhost",
     port=5000,
-    bootstrap_nodes=[('localhost', 5001), ('localhost', 5002)]
+    blockchain=blockchain,  # Pass the blockchain instance here
+    bootstrap_nodes=[('localhost', 5001), ('localhost', 5002)]  # Example of bootstrap nodes
 )
 
 def start_server():

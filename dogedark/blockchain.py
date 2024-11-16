@@ -1,13 +1,13 @@
 import hashlib
 import time
-import random
 import logging
 import threading
 import json
 import os
+import random
+from dogedark.wallet import Wallet
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.exceptions import InvalidSignature
 
 # Constants
@@ -15,139 +15,54 @@ INITIAL_DIFFICULTY = 4
 BLOCK_REWARD = 50
 TOTAL_SUPPLY = 21000000
 DIFFICULTY_ADJUSTMENT_INTERVAL = 10
-HALVING_INTERVAL = 210000
-MAX_BLOCKS = 21000000
-TRANSACTION_FEE = 0.01
+BLOCKCHAIN_FILE_PATH = 'blockchain_state.json'
 
-# ProgPoW functions
-def progpow_algorithm(block_string, nonce):
-    print("progpow_algorithm function called")
-    start_time = time.time()
-    program = random_program()
-    result = progpow_hash(block_string, nonce, program)
-    end_time = time.time()
-    print(f"Hash computation took: {end_time - start_time:.6f} seconds")
-    return result
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def random_program(length=64):
-    print("random_program function called")
+# ProgPoW functions (streamlined)
+def progpow_algorithm(block_string, nonce, difficulty):
+    """Simulates a ProgPoW algorithm with difficulty."""
+    program = deterministic_program(block_string, nonce)
+    hash_result = progpow_hash(block_string, nonce, program)
+    
+    # Difficulty: hash must have certain leading zeros
+    target = '0' * difficulty
+    while not hash_result.startswith(target):
+        nonce += 1
+        program = deterministic_program(block_string, nonce)
+        hash_result = progpow_hash(block_string, nonce, program)
+    
+    return hash_result, nonce  # Return the valid hash and the nonce used
+
+def deterministic_program(block_string, nonce, length=64):
+    """Generates a deterministic sequence of operations based on block data."""
     operations = ['+', '-', '*', '^', '|', '&']
-    program = []
-    for _ in range(length):
-        op = random.choice(operations)
-        num = random.randint(1, 10)
-        program.append(f"{num}{op}")
-    return program
+    return [f"{(hashlib.sha256((block_string + str(nonce)).encode()).hexdigest()[i % 64])}{random.choice(operations)}" for i in range(length)]
 
 def progpow_hash(block_string, nonce, program):
-    print("progpow_hash function called")
+    """Generates a hash using SHA-256."""
     hash_input = f"{block_string}{nonce}{''.join(program)}"
-    hash_output = hashlib.sha256(hash_input.encode()).hexdigest()
-    print(f"Program: {''.join(program)}\nHash: {hash_output}")
-    return hash_output
-
-def efficient_random_program(length=64, seed=None):
-    print("efficient_random_program function called")
-    if seed is not None:
-        random.seed(seed)
-    operations = ['+', '-', '*', '^', '|', '&']
-    return [f"{random.randint(1, 10)}{random.choice(operations)}" for _ in range(length)]
-
-def optimized_progpow_hash(block_string, nonce, program):
-    print("optimized_progpow_hash function called")
-    hash_input = f"{block_string}{nonce}{''.join(program)}"
-    hasher = hashlib.sha256()
-    hasher.update(hash_input.encode())
-    return hasher.hexdigest()
-
-class Wallet:
-    def __init__(self, private_key=None):
-        if private_key is None:
-            self.private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048
-            )
-        else:
-            self.private_key = private_key
-        self.public_key = self.private_key.public_key()
-        self.balance = 0
-        logging.info(f"Wallet created. Public Key Type: {type(self.public_key)}")
-
-    def get_public_key_pem(self):
-        """Get the public key in PEM format as bytes."""
-        public_key_pem = self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        logging.info(f"Retrieved Public Key PEM: {public_key_pem}")
-        return public_key_pem
-
-    def get_public_key(self):
-        """Get the public key in PEM format as string."""
-        return self.get_public_key_pem().decode('utf-8')
-
-    def sign_transaction(self, transaction):
-        transaction_string = json.dumps(transaction, sort_keys=True)
-        signature = self.private_key.sign(
-            transaction_string.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return signature
-
-    def verify_transaction(self, transaction, signature):
-        try:
-            transaction_string = json.dumps(transaction, sort_keys=True)
-            self.public_key.verify(
-                signature,
-                transaction_string.encode(),
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            return True
-        except InvalidSignature:
-            return False
-
-    def update_balance(self, amount):
-        self.balance += amount
-
-def to_dict(self):
-    return {
-        'balance': self.balance,
-        'public_key': self.get_public_key_pem().decode('utf-8')  # Ensure it's in PEM format
-    }
-
-import hashlib
+    return hashlib.sha256(hash_input.encode()).hexdigest()
 
 class Block:
+    """Represents a block in the blockchain."""
     def __init__(self, index, previous_hash, timestamp, transactions, nonce=0, hash=None):
         self.index = index
         self.previous_hash = previous_hash
         self.timestamp = timestamp
         self.transactions = transactions
         self.nonce = nonce
-        self.hash = hash if hash else self.calculate_hash()  # Use provided hash, else calculate it
+        self.hash = hash or self.calculate_hash()
 
     def calculate_hash(self):
-        # Calculates the hash (example using SHA-256)
+        """Calculates the hash for the block."""
         return hashlib.sha256(
             f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}{self.nonce}".encode('utf-8')
         ).hexdigest()
 
-    def __getitem__(self, key):
-        # Allows subscript access to Block attributes (e.g., block['index'])
-        return getattr(self, key)
-
-    def __str__(self):
-        return f"Block(index={self.index}, transactions={self.transactions}, nonce={self.nonce})"
-
     def to_dict(self):
+        """Convert block to dictionary."""
         return {
             'index': self.index,
             'previous_hash': self.previous_hash,
@@ -159,223 +74,169 @@ class Block:
 
     @classmethod
     def from_dict(cls, block_dict):
-        block = cls(
+        """Create a Block object from dictionary."""
+        return cls(
             block_dict['index'],
             block_dict['previous_hash'],
             block_dict['timestamp'],
             block_dict['transactions'],
-            block_dict['nonce']
+            block_dict['nonce'],
+            block_dict.get('hash')
         )
-        block.hash = block_dict['hash']
-        return block
+
+    def __str__(self):
+        """String representation for logging and debugging."""
+        return f"Block(index={self.index}, hash={self.hash}, previous_hash={self.previous_hash}, transactions={self.transactions}, nonce={self.nonce})"
 
 class Blockchain:
+    """Represents the blockchain structure with mining difficulty adjustments."""
     def __init__(self):
         self.chain = [self.create_genesis_block()]
         self.pending_transactions = []
-        self.difficulty = INITIAL_DIFFICULTY
+        self.difficulty = INITIAL_DIFFICULTY  # Starting difficulty
         self.block_reward = BLOCK_REWARD
         self.lock = threading.Lock()
-        self.token_supply = TOTAL_SUPPLY
-        self.blocks_mined = 0
-        self.wallets = {}
-        self._is_loaded = False  # Private attribute to track if blockchain is loaded
+        self.wallets = {}  # Holds wallets indexed by public key
+        self.loaded = False  # Flag to track if blockchain has been loaded
 
-    def load_blockchain_from_file(self, filename='blockchain_state.json'):
-        """Load the blockchain state from a file."""
-        try:
-            if not os.path.exists(filename):
-                print(f"No saved state found at {filename}")
-                return False
+    def create_genesis_block(self):
+        """Generate the first block in the blockchain."""
+        return Block(0, "0", int(time.time()), "Genesis Block")
 
-            with open(filename, 'r') as f:
-                state = json.load(f)
+    def add_block(self, new_block):
+        """Add a block to the blockchain."""
+        with self.lock:
+            self.chain.append(new_block)
+            logging.info(f"Block added: {new_block.to_dict()}")  # Use to_dict() here
+            self.save_blockchain_to_file()  # Save after adding the block
 
-            self.chain = [Block.from_dict(block_dict) for block_dict in state['chain']]
-            self.pending_transactions = state['pending_transactions']
-            self.difficulty = state['difficulty']
-            self.block_reward = state['block_reward']
-            self.token_supply = state['token_supply']
-            self.blocks_mined = state['blocks_mined']
+    def mine_block(self, wallet_address):
+        """Mine a new block, adjusting difficulty and using ProgPoW."""
+        new_block = Block(
+            len(self.chain),
+            self.chain[-1].hash,
+            int(time.time()),
+            self.pending_transactions,
+            nonce=0
+        )
+        
+        # Add block reward transaction
+        wallet = self.find_wallet_by_address(wallet_address)
+        if not wallet:
+            logging.error(f"Wallet not found for address: {wallet_address}")
+            return
 
-            print(f"Blockchain state loaded from {filename}")
-            self._is_loaded = True  # Set to True after loading successfully
-            return True
-        except Exception as e:
-            print(f"Error loading blockchain state: {e}")
+        reward_transaction = {"from": "Network", "to": wallet.get_public_key(), "amount": self.block_reward}
+        new_block.transactions.append(reward_transaction)
+        
+        # Mine block with ProgPoW algorithm
+        nonce = 0
+        block_string = f"{new_block.index}{new_block.previous_hash}{new_block.timestamp}{new_block.transactions}{new_block.nonce}"
+        hash_result, nonce = progpow_algorithm(block_string, nonce, self.difficulty)
+        
+        new_block.nonce = nonce
+        new_block.hash = hash_result
+        
+        self.add_block(new_block)
+        wallet.update_balance(self.block_reward)  # Update wallet balance
+        self.pending_transactions = []  # Clear pending transactions
+        logging.info(f"Mining completed for wallet: {wallet_address}. Reward: {self.block_reward} units.")
+        self.save_blockchain_to_file()  # Save after mining
+
+    def mine_pending_transactions(self, miner_wallet_address):
+        """Mine all pending transactions, rewarding the miner."""
+        logging.info(f"Starting mining for wallet: {miner_wallet_address}")
+        self.mine_block(miner_wallet_address)
+
+    def adjust_difficulty(self):
+        """Adjust the difficulty periodically (e.g., after every DIFFICULTY_ADJUSTMENT_INTERVAL blocks)."""
+        if len(self.chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
+            last_block = self.chain[-1]
+            previous_block = self.chain[-DIFFICULTY_ADJUSTMENT_INTERVAL]
+            time_taken = last_block.timestamp - previous_block.timestamp
+            # Adjust difficulty based on time taken
+            if time_taken < 10:  # Blocks mined too quickly, increase difficulty
+                self.difficulty += 1
+            elif time_taken > 20:  # Blocks mined too slowly, decrease difficulty
+                self.difficulty -= 1
+            logging.info(f"Difficulty adjusted: {self.difficulty}")
+
+    def create_wallet(self):
+        """Create and register a new wallet directly."""
+        wallet = Wallet()
+        public_key = wallet.get_public_key()
+        self.wallets[public_key] = wallet  # Register wallet with static address
+        logging.info(f"Wallet created and registered with Public Key: {public_key}")
+        return wallet
+
+    def create_transaction(self, sender_wallet, recipient_wallet, amount):
+        """Create a new transaction and add it to the pending transactions."""
+        if sender_wallet.get_balance() < amount:
+            logging.error(f"Transaction failed: Insufficient funds. Sender balance: {sender_wallet.get_balance()}, amount: {amount}")
             return False
+        
+        transaction = {
+            'from': sender_wallet.get_public_key(),
+            'to': recipient_wallet.get_public_key(),
+            'amount': amount
+        }
+        sender_wallet.update_balance(-amount)  # Deduct amount from sender's balance
+        recipient_wallet.update_balance(amount)  # Add amount to recipient's balance
+        self.pending_transactions.append(transaction)
+        logging.info(f"Transaction added: {transaction}")
+        self.save_blockchain_to_file()  # Save after adding the transaction
+        return True
 
-    def check_if_loaded(self):
-        """Check if the blockchain has been loaded."""
-        return self._is_loaded
+    def find_wallet_by_address(self, wallet_address):
+        """Find and return a wallet using its address."""
+        for wallet in self.wallets.values():
+            if wallet.get_wallet_address() == wallet_address:
+                logging.info(f"Wallet found for address: {wallet_address}")
+                return wallet
+        logging.warning(f"Wallet not found for address: {wallet_address}")
+        return None
+
+    def register_wallet(self, wallet):
+        """Register a wallet by its address."""
+        self.wallets[wallet.wallet_address] = wallet
+        logging.info(f"Registered Wallet: {wallet.wallet_address}")
 
     def to_dict(self):
-        """Convert blockchain to dictionary for serialization."""
+        """Convert blockchain to dictionary."""
         return {
-            'chain': [block.to_dict() for block in self.chain],
+            'chain': [block.to_dict() for block in self.chain],  # Use to_dict() for each block
             'pending_transactions': self.pending_transactions,
-            'difficulty': self.difficulty,
-            'block_reward': self.block_reward,
-            'token_supply': self.token_supply,
-            'blocks_mined': self.blocks_mined
+            'difficulty': self.difficulty
         }
 
     def load_from_dict(self, data):
         """Load blockchain from dictionary data."""
         with self.lock:
-            self.chain = [Block.from_dict(block_data) for block_data in data['chain']]
+            self.chain = [Block.from_dict(block) for block in data['chain']]
             self.pending_transactions = data['pending_transactions']
             self.difficulty = data['difficulty']
-            self.block_reward = data['block_reward']
-            self.token_supply = data['token_supply']
-            self.blocks_mined = data['blocks_mined']
+            self.loaded = True  # Set loaded flag to True after loading data
 
-    def get_latest_block(self):
-        """Get the most recent block in the chain."""
-        return self.chain[-1]
+    def load_blockchain_from_file(self, file_path=BLOCKCHAIN_FILE_PATH):
+        """Load blockchain from a file."""
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                self.load_from_dict(data)
+            logging.info(f"Blockchain loaded from {file_path}")
+        else:
+            logging.warning(f"Blockchain file not found at {file_path}. Starting fresh.")
 
-    def is_valid_chain(self, chain=None):
-        """ Validates the entire blockchain """
-        if chain is None:
-            chain = self.chain
-
-        if len(chain) == 0:
-            return False  # If the chain is empty, it's invalid
-
-        for i in range(1, len(chain)):
-            current_block = chain[i]
-            previous_block = chain[i - 1]
-
-            # Verify block hash and block link
-            if current_block.hash != current_block.calculate_hash():
-                print(f"Invalid hash at block {current_block.index}")
-                return False  # Block's hash is invalid
-            if current_block.previous_hash != previous_block.hash:
-                print(f"Invalid link at block {current_block.index}")
-                return False  # Previous block's hash does not match the link
-
-            # Verify transactions within the block
-            for transaction in current_block.transactions:
-                if not self.validate_transaction(transaction):
-                    print(f"Invalid transaction in block {current_block.index}")
-                    return False  # If any transaction fails validation, invalidate the block
-
-        return True  # All blocks and transactions are valid
-
-    def create_genesis_block(self):
-        """Create the first block in the blockchain."""
-        return Block(0, "0", int(time.time()), [], 0)
-
-    def add_block(self, new_block):
-        """Add a new block to the blockchain."""
-        with self.lock:
-            self.chain.append(new_block)
-            self.adjust_difficulty()
-            self.update_block_reward()
-
-    def adjust_difficulty(self):
-        """Adjust the mining difficulty periodically."""
-        if len(self.chain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
-            expected_time = DIFFICULTY_ADJUSTMENT_INTERVAL * 10  # Expected time in seconds
-            actual_time = self.chain[-1].timestamp - self.chain[-DIFFICULTY_ADJUSTMENT_INTERVAL].timestamp
-            if actual_time < expected_time / 2:
-                self.difficulty += 1
-            elif actual_time > expected_time * 2:
-                self.difficulty -= 1
-
-    def update_block_reward(self):
-        """Update block reward periodically."""
-        if len(self.chain) % HALVING_INTERVAL == 0:
-            self.block_reward /= 2
-
-    def mine_pending_transactions(self, miner_wallet):
-        """Mine pending transactions and reward the miner."""
-        block = Block(len(self.chain), self.chain[-1].hash, int(time.time()), self.pending_transactions)
-        block.nonce = self.mine_block(block)
-        self.add_block(block)
-        miner_wallet.update_balance(self.block_reward)
-        self.pending_transactions = []
-
-    def mine_block(self, block):
-        """Mine the block by finding the correct nonce."""
-        while True:
-            # Attempt mining with the current nonce and check if it satisfies the difficulty condition
-            block_hash = block.calculate_hash()
-            if block_hash[:self.difficulty] == '0' * self.difficulty:
-                return block.nonce  # Return the correct nonce if it matches the difficulty
-            block.nonce += 1
-            if self.blocks_mined >= MAX_BLOCKS:  # Ensure you stop mining when max blocks are reached
-                print("Max blocks reached! Token supply exhausted.")
-                exit()  # Exit if you exceed the maximum allowed blocks
-            self.blocks_mined += 1
-
-    def validate_block(self, block):
-        """Validate a single block."""
-        if block.previous_hash == self.chain[-1].hash and block.hash == block.calculate_hash():
-            for transaction in block.transactions:
-                if not self.validate_transaction(transaction):
-                    return False
-            return True
-        return False
-
-    def validate_transaction(self, transaction):
-        """Validate a single transaction."""
-        required_fields = {'sender', 'recipient', 'amount', 'signature'}
-        if not all(field in transaction for field in required_fields):
-            print("Transaction format is invalid.")
-            return False  # Early exit if required fields are missing
-
-        sender_wallet = self.find_wallet_by_public_key(transaction['sender'])
-        if not sender_wallet:
-            print(f"Sender wallet not found for public key: {transaction['sender']}")
-            return False
-
-        if sender_wallet.balance < transaction['amount']:
-            print(f"Insufficient funds in sender's wallet: {transaction['sender']}")
-            return False
-
-        if not sender_wallet.verify_transaction(transaction, transaction['signature']):
-            print(f"Invalid signature for transaction: {transaction}")
-            return False
-
-        if transaction['amount'] < TRANSACTION_FEE:
-            print("Transaction amount is less than the required fee.")
-            return False
-
-        return True  # Return True if all validations pass
-
-    def find_wallet_by_public_key(self, public_key):
-        """Find a wallet by its public key."""
-        return self.wallets.get(public_key)
-
-    def register_wallet(self, wallet):
-        """Register a wallet in the blockchain."""
-        public_key_str = wallet.get_public_key()
-        self.wallets[public_key_str] = wallet
-
-    def create_wallet(self):
-        """Create and register a new wallet."""
-        wallet = Wallet()
-        self.register_wallet(wallet)
-        return wallet
-
-    def save_blockchain(self, filename='blockchain_state.json'):
-        """Save the blockchain state to a file."""
-        state = {
-            'chain': [block.to_dict() for block in self.chain],
-            'pending_transactions': self.pending_transactions,
-            'difficulty': self.difficulty,
-            'block_reward': self.block_reward,
-            'token_supply': self.token_supply,
-            'blocks_mined': self.blocks_mined,
-            'wallets': {k: w.to_dict() for k, w in self.wallets.items()}  # Ensure wallets are serialized properly
-        }
-
+    def save_blockchain_to_file(self, file_path=BLOCKCHAIN_FILE_PATH):
+        """Save blockchain to a file."""
         try:
-            with open(filename, 'w') as f:
-                json.dump(state, f, indent=4)
-            print(f"Blockchain state saved to {filename}")
+            with open(file_path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=4)
+            logging.info(f"Blockchain saved to {file_path}")
         except Exception as e:
-            print(f"Error saving blockchain state: {e}")
+            logging.error(f"Failed to save blockchain to {file_path}: {e}")
 
+    def check_if_loaded(self):
+        """Check if the blockchain has been loaded."""
+        return self.loaded
 
