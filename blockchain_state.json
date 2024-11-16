@@ -15,12 +15,103 @@
             "transactions": [],
             "nonce": 0,
             "hash": "43e17a5e02d587deeb3d63e1eaddac2c2e7d78bf92d177fef266e39c6925bbb3"
+        },
+        {
+            "index": 2,
+            "previous_hash": "43e17a5e02d587deeb3d63e1eaddac2c2e7d78bf92d177fef266e39c6925bbb3",
+            "timestamp": 1731721835,
+            "transactions": [
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 12809,
+            "hash": "000075cc890c984c5fbab7ed8daca3a15c6f3783787d0262d3e07c562d5ae00c"
+        },
+        {
+            "index": 3,
+            "previous_hash": "000075cc890c984c5fbab7ed8daca3a15c6f3783787d0262d3e07c562d5ae00c",
+            "timestamp": 1731722037,
+            "transactions": [
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 16528,
+            "hash": "0000b0e36ecef2ad5ffcb73f7e620209112311ed906b35ed3c9a3433e9fffb7f"
+        },
+        {
+            "index": 4,
+            "previous_hash": "0000b0e36ecef2ad5ffcb73f7e620209112311ed906b35ed3c9a3433e9fffb7f",
+            "timestamp": 1731722702,
+            "transactions": [
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 67140,
+            "hash": "00003ffa145200690480f20c542cac1a6312767989323960aa31c171b23bf442"
+        },
+        {
+            "index": 5,
+            "previous_hash": "00003ffa145200690480f20c542cac1a6312767989323960aa31c171b23bf442",
+            "timestamp": 1731723179,
+            "transactions": [
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 94461,
+            "hash": "0000f781c096f0983d9ea60a12b06a8b9409629f1cf5e98e2697902d1bd043f0"
+        },
+        {
+            "index": 6,
+            "previous_hash": "0000f781c096f0983d9ea60a12b06a8b9409629f1cf5e98e2697902d1bd043f0",
+            "timestamp": 1731724040,
+            "transactions": [
+                {
+                    "from": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkD4kr3mrDIoQCDvbRkla\n9Lq7po6OlX2dSin7QN8AZtazwVgGdTpZZ5BReum395BeW49TsekDV5Ccg5IVyr6f\nQliXp5/VMgrsDcxBdWBIR2lNl3H8o2pwsyDDjkjMRBfffOIyaAGN7t7Psjwtp+DV\nwp7JAbuBTzSyLQsS8quJ9oK7POhOPRmrw0tmbOnTzBcLWyKGeSh7B5JLQ13KH71r\nxAevWdqec6OzFHd8uWbz2rjH79+y3Rybnmersa2+FSE6JC7qpg7hEdNoD3G0bQtY\npFuIaokKtu0bkufjNqrDPTyk9x8uu3bi4JMjY274PAjsdynmRW+y1eZzrqnPWcAx\ndwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 10.0
+                },
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 31605,
+            "hash": "0000a778e4bcdd1d8a6ac166b9f37c60696f3f2fce3299ab8579dbc5fd45a18e"
+        },
+        {
+            "index": 7,
+            "previous_hash": "0000a778e4bcdd1d8a6ac166b9f37c60696f3f2fce3299ab8579dbc5fd45a18e",
+            "timestamp": 1731724444,
+            "transactions": [
+                {
+                    "from": "Network",
+                    "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+                    "amount": 50
+                }
+            ],
+            "nonce": 18106,
+            "hash": "000045c3e6fff14c5e505538403e26e28f2b4f5a8f7f6c669b3dba30b03c26f0"
         }
     ],
-    "pending_transactions": [],
-    "difficulty": 4,
-    "block_reward": 50,
-    "token_supply": 21000000,
-    "blocks_mined": 0,
-    "wallets": {}
+    "pending_transactions": [
+        {
+            "from": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0q25IpJVZKlJJQpFNjVV\n8DgeJikHuk4LebNIx/J6quXHWnN4rSEPv/YzqllBX0iSfYqFqdj0sX8xB09KdIk2\nvxDzRDfvdzyPB4ON+0YU4wbMHNf4+9+lP4hfzhYhQhTGFXq2hR9VBCF7o5LQoYz4\n+uBU79F4JzUlIxiUTPx925ExMIh/BEAgLrFeIntCpJ9NV1bTpj/lkexjaxi3X0tB\nWbKEJtIb/u42/KOV2CKHE3u4fZ+gDPaosTWg8w6TXWvO+Fw8khBke915ou3stOkY\nIulKQ3Hqce3pQrRqS13SCl2H1NNLRtzVR0TsnrZyKn2kF9bqJMH3CIpJIBE9D9KU\nYwIDAQAB\n-----END PUBLIC KEY-----\n",
+            "to": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkD4kr3mrDIoQCDvbRkla\n9Lq7po6OlX2dSin7QN8AZtazwVgGdTpZZ5BReum395BeW49TsekDV5Ccg5IVyr6f\nQliXp5/VMgrsDcxBdWBIR2lNl3H8o2pwsyDDjkjMRBfffOIyaAGN7t7Psjwtp+DV\nwp7JAbuBTzSyLQsS8quJ9oK7POhOPRmrw0tmbOnTzBcLWyKGeSh7B5JLQ13KH71r\nxAevWdqec6OzFHd8uWbz2rjH79+y3Rybnmersa2+FSE6JC7qpg7hEdNoD3G0bQtY\npFuIaokKtu0bkufjNqrDPTyk9x8uu3bi4JMjY274PAjsdynmRW+y1eZzrqnPWcAx\ndwIDAQAB\n-----END PUBLIC KEY-----\n",
+            "amount": 10.0
+        }
+    ],
+    "difficulty": 4
 }
