@@ -12,14 +12,51 @@ from cryptography.exceptions import InvalidSignature
 import numpy as np
 
 # Constants
+INITIAL_REWARD = 50
+HALVING_INTERVAL = 100000000
+MIN_REWARD = 1
 INITIAL_DIFFICULTY = 4
 BLOCK_REWARD = 50
-TOTAL_SUPPLY = 21000000
+SUPPLY = 210000000
 DIFFICULTY_ADJUSTMENT_INTERVAL = 10
 BLOCKCHAIN_FILE_PATH = 'blockchain_state.json'
 
+constants_dict = {
+    "INITIAL_REWARD": INITIAL_REWARD,
+    "HALVING_INTERVAL": HALVING_INTERVAL,
+    "MIN_REWARD": MIN_REWARD,
+    "SUPPLY": SUPPLY,
+    "DIFFICULTY_ADJUSTMENT_INTERVAL": DIFFICULTY_ADJUSTMENT_INTERVAL
+}
+
+constants_json = json.dumps(constants_dict, sort_keys=True).encode('utf-8')
+constants_hash = hashlib.sha256(constants_json).hexdigest()
+
+# Store this hash in the genesis block or as part of your blockchain's state
+print(f"Hash of Constants: {constants_hash}")
+
 # Logging configuration
+import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Function to get the current block reward
+def GetBlockReward(nHeight):
+    halvings = nHeight // HALVING_INTERVAL  # Calculate how many halvings have occurred
+    reward = INITIAL_REWARD >> halvings  # Right shift by number of halvings (equivalent to halving the reward)
+    
+    # Ensure that reward does not go below the minimum
+    if reward < MIN_REWARD:
+        reward = MIN_REWARD
+    
+    return reward
+
+# Function to calculate the cumulative supply (optional)
+def CalculateCumulativeSupply(block_height):
+    supply = 0
+    for height in range(0, block_height, HALVING_INTERVAL):
+        reward = GetBlockReward(height)
+        supply += reward * HALVING_INTERVAL  # Add reward for each block in the halving period
+    return supply
 
 # ProgPoW functions (streamlined)
 def progpow_algorithm(block_string, nonce, difficulty):
@@ -39,6 +76,10 @@ def progpow_algorithm(block_string, nonce, difficulty):
 
 def deterministic_program(block_string, nonce, length=64):
     """Generates a simpler memory-hard program with reduced CPU and memory demands."""
+    import numpy as np
+    import hashlib
+    import random
+    
     operations = ['+', '-', '*', '^', '|', '&', '%', '<<', '>>']
     
     # Reduce matrix size for faster computation
@@ -73,19 +114,32 @@ def progpow_hash(block_string, nonce, program):
     return final_hash
 
 class Block:
-    """Represents a block in the blockchain."""
     def __init__(self, index, previous_hash, timestamp, transactions, nonce=0, hash=None):
         self.index = index
         self.previous_hash = previous_hash
         self.timestamp = timestamp
         self.transactions = transactions
         self.nonce = nonce
-        self.hash = hash or self.calculate_hash()
+        self.constants_hash = constants_hash  # Set the constants_hash before calculating the hash
+        self.reward = self.calculate_block_reward()  # Calculate reward for this block
+        self.hash = hash or self.calculate_hash()  # Now that constants_hash is set, calculate the block hash
+
+    def calculate_block_reward(self):
+        """Calculate the reward for the block based on the number of halvings."""
+        halvings = self.index // HALVING_INTERVAL  # Calculate how many halvings have occurred
+        reward = INITIAL_REWARD >> halvings  # Right shift by number of halvings (equivalent to halving the reward)
+        
+        # Ensure that reward does not go below the minimum
+        if reward < MIN_REWARD:
+            reward = MIN_REWARD
+        
+        return reward
 
     def calculate_hash(self):
         """Calculates the hash for the block."""
+        # Including constants_hash to ensure integrity
         return hashlib.sha256(
-            f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}{self.nonce}".encode('utf-8')
+            f"{self.index}{self.previous_hash}{self.timestamp}{self.transactions}{self.nonce}{self.constants_hash}".encode('utf-8')
         ).hexdigest()
 
     def to_dict(self):
@@ -96,13 +150,15 @@ class Block:
             'timestamp': self.timestamp,
             'transactions': self.transactions,
             'nonce': self.nonce,
-            'hash': self.hash
+            'hash': self.hash,
+            'reward': self.reward,  # Add reward to the block dictionary
+            'constants_hash': self.constants_hash  # Include constants hash in the block dictionary
         }
 
     @classmethod
     def from_dict(cls, block_dict):
         """Create a Block object from dictionary."""
-        return cls(
+        block = cls(
             block_dict['index'],
             block_dict['previous_hash'],
             block_dict['timestamp'],
@@ -110,10 +166,13 @@ class Block:
             block_dict['nonce'],
             block_dict.get('hash')
         )
+        block.reward = block_dict.get('reward', block.calculate_block_reward())  # Handle reward in from_dict
+        block.constants_hash = block_dict.get('constants_hash', constants_hash)  # Retrieve constants_hash if available
+        return block
 
     def __str__(self):
         """String representation for logging and debugging."""
-        return f"Block(index={self.index}, hash={self.hash}, previous_hash={self.previous_hash}, transactions={self.transactions}, nonce={self.nonce})"
+        return f"Block(index={self.index}, hash={self.hash}, previous_hash={self.previous_hash}, transactions={self.transactions}, nonce={self.nonce}, reward={self.reward}, constants_hash={self.constants_hash})"
 
 class Blockchain:
     """Represents the blockchain structure with mining difficulty adjustments."""
@@ -332,3 +391,4 @@ class Blockchain:
     def check_if_loaded(self):
         """Check if the blockchain has been loaded successfully."""
         return self.loaded
+
