@@ -6,45 +6,105 @@ import base58
 from dogedark.blockchain import Blockchain
 from dogedark.wallet import Wallet
 from dogedark.node import Node
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
-
-def check_and_load_wallet(filename, create_new=False):
-    """Load an existing wallet from a file or create a new one."""
-    wallet = None
+def load_wallets():
+    filename = "wallet.json"
     if os.path.exists(filename):
         try:
             with open(filename, 'r') as f:
-                wallet_data = json.load(f)
-                wallet = Wallet.from_dict(wallet_data)  # Assuming you have a `from_dict` method to load wallet
-            print(f"Loaded wallet from {filename}")
+                wallets_data = json.load(f)
+                wallets = {name: Wallet.from_dict(data) for name, data in wallets_data.items()}
+            print(f"Loaded wallets from {filename}")
+            return wallets
         except Exception as e:
-            print(f"Failed to load wallet from {filename}: {e}")
+            print(f"Failed to load wallets from {filename}: {e}")
+            return {}
     else:
-        if create_new:
-            wallet = Wallet()
-            try:
-                wallet_data = wallet.to_dict()  # Assuming `to_dict` method to save wallet info in dictionary format
-                with open(filename, 'w') as f:
-                    json.dump(wallet_data, f)
-                print(f"Created and saved new wallet to {filename}")
-            except Exception as e:
-                print(f"Failed to save new wallet to {filename}: {e}")
+        return {}
+
+def to_dict(self):
+    return {
+        'balance': self.balance,
+        'public_key': self.get_public_key(),
+        'wallet_address': self.wallet_address,
+        'private_key': self.get_private_key()
+    }
+
+@classmethod
+def from_dict(cls, wallet_dict):
+    private_key_pem = wallet_dict.get('private_key')
+    private_key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+    wallet = cls(private_key)
+    wallet.balance = wallet_dict.get('balance', 0)
+    wallet.wallet_address = wallet_dict.get('wallet_address')
     return wallet
 
+def get_private_key(self):
+    private_key_pem = self.private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    return private_key_pem.decode('utf-8')
 
-def save_public_key(wallet, filename):
-    """Save the public key of a wallet to a file."""
+def save_wallets(wallets):
+    filename = "wallet.json"
     try:
-        public_key = wallet.get_public_key()
-        with open(filename, "w") as f:
-            f.write(public_key)
-        print(f"Public key saved to {filename}")
+        wallets_data = {name: wallet.to_dict() for name, wallet in wallets.items()}
+        with open(filename, 'w') as f:
+            json.dump(wallets_data, f)
+        print(f"Saved wallets to {filename}")
     except Exception as e:
-        print(f"Failed to save public key to {filename}: {e}")
+        print(f"Failed to save wallets to {filename}: {e}")
 
+def create_wallet():
+    wallet = Wallet()
+    return wallet
+
+def generate_wallet_address(wallet):
+    public_key = wallet.get_public_key()
+    sha256_hash = hashlib.sha256(public_key.encode('utf-8')).digest()
+    ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
+    address = base58.b58encode(ripemd160_hash).decode('utf-8')
+    wallet.address = address  # Store the address in the wallet instance
+    return address
+
+def create_wallet():
+    wallet = Wallet()
+    wallet.generate_keys()  # Ensure unique key generation
+    generate_wallet_address(wallet)  # Generate address and assign it to the wallet
+    return wallet
+
+def show_balance(wallet):
+    if not hasattr(wallet, "cached_address"):
+        wallet.cached_address = generate_wallet_address(wallet.get_public_key())
+    print(f"Wallet Address: {wallet.cached_address}")
+    print(f"Balance: {wallet.get_balance()} units")
+
+def get_public_ip():
+    try:
+        response = requests.get("https://api.ipify.org")
+        public_ip = response.text
+        print(f"Public IP Address: {public_ip}")
+        return public_ip
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching public IP: {e}")
+        return "localhost"
+
+def format_transaction_data(transaction):
+    return {
+        'From': transaction.get('from', 'Unknown'),
+        'To': transaction.get('to', 'Unknown'),
+        'Amount': transaction.get('amount', 'Unknown'),
+    }
+
+def print_blockchain_info(blockchain):
+    print(f"Blockchain loaded with {len(blockchain.chain)} blocks.")
 
 def download_blockchain_from_node(blockchain, blockchain_node):
-    """Download the blockchain from a node if not loaded locally."""
     if not blockchain.check_if_loaded():
         print("Blockchain not loaded locally. Attempting to download...")
         try:
@@ -57,68 +117,45 @@ def download_blockchain_from_node(blockchain, blockchain_node):
         except Exception as e:
             print(f"Failed to download blockchain: {e}")
 
+def get_public_key(self):
+    """Return the public key as a string."""
+    if self.public_key is None:
+        raise ValueError("Public key not generated.")
+    return self.public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode('utf-8')
 
-def generate_wallet_address(public_key):
-    """Generate a wallet address from a public key."""
-    sha256_hash = hashlib.sha256(public_key.encode('utf-8')).digest()
-    ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
-    address = base58.b58encode(ripemd160_hash).decode('utf-8')
-    return address
+def generate_new_address(wallets):
+    """Generate a completely new address by creating a new Wallet instance."""
+    new_wallet = create_wallet()  # Create a fresh wallet
+    new_address = new_wallet.address  # Get the address from the newly created wallet
 
+    # Save the new wallet to the wallets dictionary
+    wallet_name = f"wallet_{len(wallets) + 1}"
+    wallets[wallet_name] = new_wallet
 
-def show_balance(wallet):
-    """Display the balance of a wallet."""
-    if not hasattr(wallet, "cached_address"):
-        wallet.cached_address = generate_wallet_address(wallet.get_public_key())
-    print(f"Wallet Address: {wallet.cached_address}")
-    print(f"Balance: {wallet.get_balance()} units")
-
-
-def get_public_ip():
-    """Fetch the public IP address of the system."""
-    try:
-        response = requests.get("https://api.ipify.org")
-        public_ip = response.text
-        print(f"Public IP Address: {public_ip}")
-        return public_ip
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching public IP: {e}")
-        return "localhost"
-
-
-def format_transaction_data(transaction):
-    """Format the transaction data for better readability."""
-    return {
-        'From': transaction.get('from', 'Unknown'),
-        'To': transaction.get('to', 'Unknown'),
-        'Amount': transaction.get('amount', 'Unknown'),
-    }
-
-
-def print_blockchain_info(blockchain):
-    """Display the blockchain data in a cleaner format."""
-    for block in blockchain.chain:
-        print(f"Block {block.index}:")
-        for transaction in block.transactions:
-            formatted_tx = format_transaction_data(transaction)
-            print(f"  - {formatted_tx['From']} -> {formatted_tx['To']} : {formatted_tx['Amount']} units")
-
+    print(f"Generated new address: {new_address}")
+    print(f"New wallet created with name: {wallet_name}")
+    
+    return new_address
 
 def main():
     try:
-        # Initialize wallets
-        sender_wallet = check_and_load_wallet("wallets/sender_wallet.json", create_new=True)
-        recipient_wallet = check_and_load_wallet("wallets/recipient_wallet.json", create_new=True)
-        new_wallet = check_and_load_wallet("wallets/new_wallet.json", create_new=True)
+        # Load wallets from file
+        wallets = load_wallets()
+        if "sender_wallet" not in wallets:
+            wallets["sender_wallet"] = create_wallet()
+        if "recipient_wallet" not in wallets:
+            wallets["recipient_wallet"] = create_wallet()
+        if "new_wallet" not in wallets:
+            wallets["new_wallet"] = create_wallet()
+        
+        save_wallets(wallets)
 
-        # Save public keys
-        save_public_key(sender_wallet, "sender_public_key.txt")
-        save_public_key(recipient_wallet, "recipient_public_key.txt")
-        save_public_key(new_wallet, "new_public_key.txt")
-
-        print(f"Sender Wallet Address: {generate_wallet_address(sender_wallet.get_public_key())}")
-        print(f"Recipient Wallet Address: {generate_wallet_address(recipient_wallet.get_public_key())}")
-        print(f"New Wallet Address: {generate_wallet_address(new_wallet.get_public_key())}")
+        print(f"Sender Wallet Address: {generate_wallet_address(wallets['sender_wallet'])}")
+        print(f"Recipient Wallet Address: {generate_wallet_address(wallets['recipient_wallet'])}")
+        print(f"New Wallet Address: {generate_wallet_address(wallets['new_wallet'])}")
 
         # Initialize blockchain
         blockchain = Blockchain()
@@ -134,11 +171,11 @@ def main():
         download_blockchain_from_node(blockchain, blockchain_node)
 
         # Register wallets with the blockchain
-        blockchain.register_wallet(sender_wallet)
-        blockchain.register_wallet(recipient_wallet)
-        blockchain.register_wallet(new_wallet)
+        blockchain.register_wallet(wallets["sender_wallet"])
+        blockchain.register_wallet(wallets["recipient_wallet"])
+        blockchain.register_wallet(wallets["new_wallet"])
 
-        miner_wallet = new_wallet
+        miner_wallet = wallets["new_wallet"]
 
         # Display initial blockchain info
         print("Initial Blockchain:")
@@ -150,7 +187,8 @@ def main():
             print("2. Mine Pending Transactions (format: mine miner_wallet)")
             print("3. Show Blockchain (format: show)")
             print("4. Show Balance (format: balance)")
-            print("5. Exit")
+            print("5. Create New Wallet Address (format: new)")
+            print("6. Exit")
 
             command = input("\nEnter command: ")
 
@@ -183,28 +221,23 @@ def main():
                 elif command.startswith("show"):
                     print("Blockchain after mining:")
                     print_blockchain_info(blockchain)
-                    print(f"Miner Wallet Balance: {miner_wallet.get_balance()}")
-                    print(f"Sender Wallet Balance: {sender_wallet.get_balance()}")
-                    print(f"Recipient Wallet Balance: {recipient_wallet.get_balance()}")
-                    print(f"New Wallet Balance: {new_wallet.get_balance()}")
+                    print(f"Wallet Balance: {miner_wallet.get_balance()}")
 
                 elif command.startswith("balance"):
-                    print("\nWallet Balances and Addresses:")
-                    show_balance(sender_wallet)
-                    show_balance(recipient_wallet)
-                    show_balance(new_wallet)
+                    print("\nWallet Balances:")
+                    show_balance(wallets["sender_wallet"])  # Pass the wallet object instead of address
+
+                elif command.startswith("new"):
+                    for wallet_name, wallet in wallets.items():
+                        new_address = generate_wallet_address(wallet)  # Explicitly generate the address
+                        print(f"New address for wallet '{wallet_name}': {new_address}")
+                    
+                    # Save wallets with new addresses
+                    save_wallets(wallets)
 
                 elif command == "exit":
                     blockchain.save_blockchain_to_file()
-                    save_public_key(sender_wallet, "sender_public_key.txt")
-                    save_public_key(recipient_wallet, "recipient_public_key.txt")
-                    save_public_key(new_wallet, "new_public_key.txt")
-                    with open("wallets/sender_wallet.json", 'w') as f:
-                        json.dump(sender_wallet.to_dict(), f)
-                    with open("wallets/recipient_wallet.json", 'w') as f:
-                        json.dump(recipient_wallet.to_dict(), f)
-                    with open("wallets/new_wallet.json", 'w') as f:
-                        json.dump(new_wallet.to_dict(), f)
+                    save_wallets(wallets)
                     print("Blockchain saved and program exited.")
                     break
 
@@ -217,6 +250,12 @@ def main():
     except Exception as e:
         print(f"An error occurred during setup: {e}")
 
+# Function to show wallet balances
+def show_balance(wallet):
+    if not hasattr(wallet, "cached_address"):
+        wallet.cached_address = generate_wallet_address(wallet)  # Correctly uses the Wallet object
+    print(f"Wallet Address: {wallet.cached_address}")
+    print(f"Balance: {wallet.get_balance()} units")
 
 if __name__ == "__main__":
     main()
