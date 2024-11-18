@@ -29,6 +29,10 @@ class Node:
         self.sync_interval = 10  # Sync blockchain every 10 seconds (adaptive)
         logging.info(f"Node initialized with ID: {self.node_id}")
 
+    def get_blockchain(self):
+        """Returns the current blockchain object."""
+        return self.blockchain
+
     def init_wallet(self):
         """Initialize the wallet for the node."""
         self.wallet = self.blockchain.create_wallet()

@@ -712,23 +712,30 @@ class Blockchain:
             return None
 
     def get_wallet_state(self, address):
-        """Retrieve wallet state by address."""
-        wallet_state = {}  # Initialize wallet_state as an empty dictionary
+        wallet_state = {'total_balance': 0.0, 'transaction_history': []}
         try:
-            # Example logic to retrieve wallet state
-            for block in self.chain:
-                for transaction in block.transactions:
-                    if transaction['to'] == address or transaction['from'] == address:
-                        # Update wallet_state with transaction data as needed
-                        # For example, track total balance and other wallet info
-                        if transaction['to'] == address:
-                            wallet_state['total_balance'] = wallet_state.get('total_balance', 0) + transaction['amount']
-                        elif transaction['from'] == address:
-                            wallet_state['total_balance'] = wallet_state.get('total_balance', 0) - transaction['amount']
+            wallet = self.wallets.get(address)
+            if not wallet:
+                return wallet_state
+
+            transactions = [t for block in self.chain for t in block.transactions if t['to'] == address or t['from'] == address]
+            for transaction in transactions:
+                if transaction['to'] == address:
+                    wallet_state['total_balance'] += transaction['amount']
+                elif transaction['from'] == address:
+                    wallet_state['total_balance'] -= transaction['amount']
+                wallet_state['transaction_history'].append({
+                    'type': 'received' if transaction['to'] == address else 'sent',
+                    'amount': transaction['amount'],
+                    'from': transaction.get('from'),
+                    'to': transaction.get('to'),
+                    'block': transaction.get('block')
+                })
+
             return wallet_state
         except Exception as e:
             logging.error(f"Error retrieving wallet state for address {address}: {e}")
-            return wallet_state  # Return the empty wallet_state if an error occurs
+            return wallet_state
 
     def force_sync(self):
         """Force an immediate wallet synchronization."""
@@ -893,7 +900,7 @@ class Blockchain:
             self.wallets = {}
             for address, wallet_dict in wallet_data.items():
                 try:
-                    self.wallets[address] = Wallet.from_dict(self, wallet_dict)
+                    self.wallets[address] = Wallet.from_dict(wallet_dict)
                 except Exception as e:
                     logging.error(f"Error loading wallet {address}: {e}")
                     continue

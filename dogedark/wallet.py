@@ -12,8 +12,16 @@ from cryptography.exceptions import InvalidSignature
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Wallet:
-    def __init__(self, private_key=None):
-        """Initialize the wallet, either loading or generating keys."""
+    def __init__(self, blockchain, private_key=None):
+        """Initialize the wallet with blockchain reference.
+        
+        Args:
+            blockchain: Reference to the blockchain instance
+            private_key: Optional private key to initialize wallet
+        """
+        self.blockchain = blockchain
+        
+        # Initialize keys
         if private_key is None:
             if os.path.exists('private_key.pem'):
                 try:
@@ -38,82 +46,149 @@ class Wallet:
                     raise
         else:
             self.private_key = private_key
-            logging.info("Private key provided directly.")
 
         self.public_key = self.private_key.public_key()
-        self.wallet_address = self.get_wallet_address()
-        self.balance = self.load_balance()
-        logging.info(f"Wallet created. Public Key Type: {type(self.public_key)}")
+        self.address = self.generate_address()
+        logging.info(f"Wallet initialized with address: {self.address}")
 
-    def generate_keys(self):
-        """Generate a unique set of RSA keys for the wallet."""
-        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.private_key = private_key
-        self.public_key = private_key.public_key()
+    def generate_address(self):
+        """Generate deterministic wallet address from public key."""
+        public_key_bytes = self.get_public_key().encode('utf-8')
+        sha256_hash = hashlib.sha256(public_key_bytes).digest()
+        ripemd160 = hashlib.new('ripemd160')
+        ripemd160.update(sha256_hash)
+        return base58.b58encode(ripemd160.digest()).decode('utf-8')
 
-        # Convert the public key to PEM format (as a string)
-        pem = self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        logging.info("RSA keys generated for wallet.")
-        return pem
+    def get_transaction_history(self):
+        """Get transaction history from blockchain."""
+        try:
+            history = []
+            for block in self.blockchain.chain:
+                for tx in block.transactions:
+                    if tx.get('to') == self.address or tx.get('from') == self.address:
+                        history.append({
+                            'block': block.index,
+                            'timestamp': block.timestamp,
+                            'type': 'receive' if tx.get('to') == self.address else 'send',
+                            'amount': tx.get('amount', 0),
+                            'from': tx.get('from'),
+                            'to': tx.get('to'),
+                            'transaction_type': tx.get('type', 'transfer')
+                        })
+            return history
+        except Exception as e:
+            logging.error(f"Error getting transaction history: {e}")
+            return []
 
-    def get_private_key(self):
-        """Return private key in PEM format."""
-        private_key_pem = self.private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        return private_key_pem.decode('utf-8')
+    def create_transaction(self, recipient_address, amount, fee=0):
+        """Create a new transaction."""
+        try:
+            current_balance = self.get_balance()
+            if current_balance < amount + fee:
+                logging.error("Insufficient balance for transaction")
+                return None
+
+            transaction = {
+                'timestamp': int(time.time()),
+                'from': self.address,
+                'to': recipient_address,
+                'amount': amount,
+                'fee': fee,
+                'public_key': self.get_public_key()
+            }
+
+            # Sign transaction
+            signature = self.sign_transaction(transaction)
+            transaction['signature'] = base58.b58encode(signature).decode('utf-8')
+            
+            return transaction
+
+        except Exception as e:
+            logging.error(f"Error creating transaction: {e}")
+            return None
+
+    def sign_transaction(self, transaction):
+        """Sign a transaction using the private key."""
+        try:
+            # Create deterministic transaction string
+            tx_string = json.dumps(transaction, sort_keys=True)
+            signature = self.private_key.sign(
+                tx_string.encode(),
+                padding=PKCS1v15(),
+                algorithm=hashes.SHA256()
+            )
+            return signature
+        except Exception as e:
+            logging.error(f"Error signing transaction: {e}")
+            raise
+
+    def verify_transaction(self, transaction, signature):
+        """Verify a transaction's signature."""
+        try:
+            tx_string = json.dumps(transaction, sort_keys=True)
+            decoded_signature = base58.b58decode(signature.encode('utf-8'))
+            
+            self.public_key.verify(
+                decoded_signature,
+                tx_string.encode(),
+                padding=PKCS1v15(),
+                algorithm=hashes.SHA256()
+            )
+            return True
+        except InvalidSignature:
+            logging.warning("Invalid transaction signature")
+            return False
+        except Exception as e:
+            logging.error(f"Error verifying transaction: {e}")
+            return False
 
     def get_public_key(self):
-        """Return the public key in PEM format."""
+        """Get public key in PEM format."""
         return self.public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ).decode('utf-8')
 
-    def get_wallet_address(self):
-        """Generate wallet address from public key."""
-        sha256_hash = hashlib.sha256(self.get_public_key().encode('utf-8')).digest()
-        ripemd160 = hashlib.new('ripemd160')
-        ripemd160.update(sha256_hash)
-        wallet_address = base58.b58encode(ripemd160.digest()).decode('utf-8')
-        logging.info(f"Generated Wallet Address: {wallet_address}")
-        return wallet_address
+    def get_private_key(self):
+        """Get private key in PEM format."""
+        return self.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode('utf-8')
 
-    def load_balance(self):
-        """Load balance from wallet data."""
-        if os.path.exists('wallet.json'):
-            try:
-                with open('wallet.json', 'r') as f:
-                    wallet_data = json.load(f)
-                    balance = wallet_data.get('balance', 0)
-                    logging.info(f"Loaded balance: {balance}")
-                    return balance
-            except json.JSONDecodeError as e:
-                logging.error(f"Failed to decode wallet data: {e}")
-            except Exception as e:
-                logging.error(f"Failed to load wallet balance: {e}")
-        else:
-            logging.warning("No wallet file found. Defaulting balance to 0.")
-        return 0
+    def export_wallet(self):
+        """Export wallet data for backup."""
+        return {
+            'address': self.address,
+            'public_key': self.get_public_key(),
+            'private_key': self.get_private_key()
+        }
 
-    def update_balance(self, amount):
-        """Update the wallet balance."""
-        self.balance += amount
-        self.save_wallet()
+    @classmethod
+    def import_wallet(cls, blockchain, wallet_data):
+        """Import wallet from backup data."""
+        try:
+            private_key = serialization.load_pem_private_key(
+                wallet_data['private_key'].encode(),
+                password=None
+            )
+            return cls(blockchain, private_key)
+        except Exception as e:
+            logging.error(f"Error importing wallet: {e}")
+            raise
 
-    def get_balance(self):
-        """Return the wallet's balance."""
-        return self.balance
-
-    def set_balance(self, amount):
-        """Set the wallet's balance."""
-        self.balance = amount
-        self.save_wallet()
+    def get_pending_transactions(self):
+        """Get pending transactions for this wallet."""
+        try:
+            pending = []
+            for tx in self.blockchain.pending_transactions:
+                if tx.get('to') == self.address or tx.get('from') == self.address:
+                    pending.append(tx)
+            return pending
+        except Exception as e:
+            logging.error(f"Error getting pending transactions: {e}")
+            return []
 
     def save_wallet(self, filename='wallet.json'):
         """Save wallet data to a file."""
@@ -129,56 +204,48 @@ class Wallet:
     def to_dict(self):
         """Convert wallet instance to dictionary."""
         return {
-            'balance': self.balance,
+            'balance': str(self.get_balance()),  # Ensure balance is a string
+            'address': self.address,
             'public_key': self.get_public_key(),
-            'wallet_address': self.wallet_address,
             'private_key': self.get_private_key()
         }
 
     @classmethod
-    def from_dict(cls, wallet_dict):
+    def from_dict(cls, blockchain, wallet_dict):
         """Create a Wallet instance from a dictionary."""
-        private_key_pem = wallet_dict.get('private_key')
-        private_key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
-        wallet = cls(private_key)
-        wallet.balance = wallet_dict.get('balance', 0)
-        wallet.wallet_address = wallet_dict.get('wallet_address')
-        return wallet
-
-    def sign_transaction(self, transaction):
-        """Sign a transaction using the private key."""
         try:
-            transaction_string = json.dumps(transaction, sort_keys=True)
-            signature = self.private_key.sign(
-                transaction_string.encode(),
-                padding=PKCS1v15(),
-                algorithm=serialization.hazmat.primitives.hashes.SHA256()
-            )
-            return signature
-        except Exception as e:
-            logging.error(f"Error signing transaction: {e}")
-            raise
+            required_keys = ['private_key', 'address']
+            if not all(key in wallet_dict for key in required_keys):
+                raise ValueError("Missing required keys in wallet data")
 
-    def verify_transaction(self, transaction, signature):
-        """Verify a transaction's signature using the public key."""
+            private_key_pem = wallet_dict['private_key']
+            private_key = serialization.load_pem_private_key(
+                private_key_pem.encode(),
+                password=None
+            )
+
+            wallet = cls(blockchain, private_key)
+            wallet.address = wallet_dict['address'].strip()  # Set the address properly
+            return wallet
+        except ValueError as e:
+            logging.warning(f"Invalid wallet data: {e}")
+        except Exception as e:
+            logging.error(f"Error creating wallet from dict: {e}")
+            raise
+            
+    def get_balance(self):
+        """Get current balance from blockchain."""
         try:
-            transaction_string = json.dumps(transaction, sort_keys=True)
-            self.public_key.verify(
-                signature,
-                transaction_string.encode(),
-                padding=PKCS1v15(),
-                algorithm=serialization.hazmat.primitives.hashes.SHA256()
-            )
-            return True
-        except InvalidSignature:
-            logging.warning("Invalid signature detected.")
-            return False
+            # Get the wallet state (which should be a dictionary)
+            wallet_state = self.blockchain.get_wallet_state(self.address)
+
+            # If wallet_state is a dictionary and contains 'total_balance', return it
+            if isinstance(wallet_state, dict):
+                return wallet_state.get('total_balance', 0)
+
+            # If wallet_state is not found or is not in expected format
+            logging.warning(f"Unexpected wallet state format for address {self.address}")
+            return 0
         except Exception as e:
-            logging.error(f"Error verifying transaction: {e}")
-            raise
-
-
-def show_balance(wallet):
-    """Display the balance of a wallet."""
-    print(f"Wallet Address: {wallet.wallet_address}")
-    print(f"Balance: {wallet.get_balance()} units")
+            logging.error(f"Error getting balance: {e}")
+            return 0
