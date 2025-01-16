@@ -6,7 +6,7 @@ alphanumeric is an advanced, high-performance blockchain written in Rust. It inc
 
 - **Rust Architecture**: Built with Rust for memory safety, concurrency, and performance 
 - **SHA-256 & BLAKE3 Hashing**: Uses industry standard SHA-256 for proof-of-work and BLAKE3 for fast, secure hashing
-- **ProgPoW Consensus**: Implements ProgPoW (Programmatic Proof-of-Work) for ASIC resistance 
+- **CPUPoW Consensus**: Implements ProgPoW for CPU (Programmatic Proof-of-Work) ASIC resistance 
 - **CRYSTALS-Dilithium Quantum DSS**: Post-quantum ready digital signature scheme for future-proof security
 - **BPoS Sentinel**: Unique BFT-based Proof-of-Stake consensus layer for validator security
 - **Velocity Block Propagation**: Optimized block propagation protocol using erasure coding and subnet peer selection
@@ -59,7 +59,7 @@ https://discord.gg/D3r7TRcj9t
 This project is licensed under the MIT License.
 
 ## Acknowledgments
-- The Rust programming language community
+- The Rust community
 - Claude
 - Gemini
 - Microsoft
