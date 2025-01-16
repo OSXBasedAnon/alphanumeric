@@ -49,6 +49,12 @@ alphanumeric provides an interactive command line interface for blockchain manag
 - Rust (stable toolchain)
 - Cargo
 
+## Website
+https://www.empiremonster.com/p/alphanumeric.html
+
+## Discord
+https://discord.gg/D3r7TRcj9t
+
 ## License
 This project is licensed under the MIT License.
 
@@ -57,9 +63,3 @@ This project is licensed under the MIT License.
 - Claude
 - Gemini
 - Microsoft
-
-## Website
-https://www.empiremonster.com/p/alphanumeric.html
-
-## Discord
-https://discord.gg/D3r7TRcj9t
