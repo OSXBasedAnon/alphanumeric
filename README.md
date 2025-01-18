@@ -45,6 +45,13 @@ alphanumeric provides an interactive command line interface for blockchain manag
 - `diagnostics`: Run blockchain diagnostic checks and display metrics
 
 ## Getting Started
+To allow other nodes to connect to your blockchain node, you need to open port 7177 (TCP) in your Windows Firewall. Follow these steps:
+
+1.  Open PowerShell as an administrator (right-click on PowerShell and select "Run as administrator").
+2.  Run the following command:
+
+```powershell
+New-NetFirewallRule -Name "alphanumeric Node Port" -DisplayName "alphanumeric Node (TCP 7177)" -Protocol TCP -LocalPort 7177 -Direction Inbound -Action Allow
 
 ### Prerequisites
 - Rust (stable toolchain)
