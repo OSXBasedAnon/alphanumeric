@@ -52,7 +52,7 @@ To allow other nodes to connect to your blockchain node, you need to open port 7
 
 ```powershell
 New-NetFirewallRule -Name "alphanumeric Node Port" -DisplayName "alphanumeric Node (TCP 7177)" -Protocol TCP -LocalPort 7177 -Direction Inbound -Action Allow
-
+```
 ### Prerequisites
 - Rust (stable toolchain)
 - Cargo
