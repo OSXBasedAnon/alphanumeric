@@ -45,7 +45,9 @@ alphanumeric provides an interactive command line interface for blockchain manag
 - `diagnostics`: Run blockchain diagnostic checks and display metrics
 
 ## Getting Started
-To allow other nodes to connect to your blockchain node, you need to open port 7177 (TCP) in your Windows Firewall. Follow these steps:
+To allow other nodes to connect to your blockchain node, you need to open port 7177 (TCP) in your router. You have to configure your server to accept incoming and outgoing connections for port 7177.
+
+For **local connections in your Windows Firewall. Follow these steps:
 
 1.  Open PowerShell as an administrator (right-click on PowerShell and select "Run as administrator").
 2.  Run the following command:
