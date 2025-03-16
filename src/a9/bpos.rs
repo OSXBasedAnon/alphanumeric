@@ -2230,6 +2230,14 @@ impl HeaderSentinel {
         }
     }
 
+    pub fn spawn_add_verified_header(sentinel: Arc<HeaderSentinel>, header_info: BlockHeaderInfo) {
+        tokio::spawn(async move {
+            if let Err(e) = sentinel.add_verified_header(header_info).await {
+                warn!("Failed to add verified header: {}", e);
+            }
+        });
+    }
+
     pub async fn verify_header(&self, header: &BlockHeaderInfo) -> bool {
         if let Some(last_header) = self.headers.read().await.back() {
             // Verify hash chain

@@ -419,13 +419,13 @@ tokio::task::spawn_local(async move {
         pb.inc(1);
 
         // Staking
-let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
-    blockchain.clone(),
-    Arc::clone(&node)
-)));
+        let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
+        blockchain.clone(),
+        Arc::clone(&node)
+        )));
 
         // Whisper
-let whisper_module = Arc::new(RwLock::new(WhisperModule::new()));
+        let whisper_module = Arc::new(RwLock::new(WhisperModule::new()));
 
         // Mining params
         pb.set_message("Setting up mining parameters...");
@@ -1185,7 +1185,9 @@ None => println!("Please enter a command."),
 .await
 }
 
-async fn handle_chain_sync(node: &Node) -> Result<()> {
+async fn handle_chain_sync(
+    node: &Node,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const PARALLEL_BATCH_SIZE: usize = 32768;
     const MAX_PARALLEL_DOWNLOADS: usize = 128;
     const QUEUE_SIZE: usize = 32768;
@@ -1256,7 +1258,7 @@ async fn handle_chain_sync(node: &Node) -> Result<()> {
     let current_height = Arc::new(AtomicU32::new(local_height));
     let processed_height = Arc::new(AtomicU32::new(local_height));
 
-    // Spawn download tasks
+    // Modified download task with better error handling
     let download_tasks: Vec<_> = sync_peers
         .iter()
         .take(target_peers)
@@ -1271,24 +1273,37 @@ async fn handle_chain_sync(node: &Node) -> Result<()> {
                 while curr_height < target_height {
                     let batch_end = (curr_height + PARALLEL_BATCH_SIZE as u32).min(target_height);
 
+                    // Wrap the request in a recoverable error type
                     match node.request_blocks(peer, curr_height, batch_end).await {
                         Ok(blocks) => {
+                            let mut sent_count = 0;
                             for block in blocks {
                                 if block.index > curr_height && block.index <= target_height {
-                                    if tx.send(block).await.is_err() {
-                                        return Ok::<(), Box<dyn Error + Send + Sync>>(());
+                                    // Use try_send to avoid awaiting during error paths
+                                    if tx.try_send(block).is_err() {
+                                        break;
                                     }
+                                    sent_count += 1;
                                 }
                             }
-                            current_height.fetch_add(PARALLEL_BATCH_SIZE as u32, Ordering::Release);
+
+                            if sent_count > 0 {
+                                current_height
+                                    .fetch_add(PARALLEL_BATCH_SIZE as u32, Ordering::Release);
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
                         }
                         Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
+
                     curr_height = current_height.load(Ordering::Acquire);
                 }
-                Ok::<(), Box<dyn Error + Send + Sync>>(())
+
+                // We need to return a result type that's Send + Sync
+                Ok::<(), String>(())
             })
         })
         .collect();
@@ -1331,15 +1346,27 @@ async fn handle_chain_sync(node: &Node) -> Result<()> {
                     main_pb.inc(1);
                 }
             }
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
+            Ok::<(), String>(())
         })
     };
 
+    // Wait for completion with timeout
     match tokio::time::timeout(SYNC_TIMEOUT, async {
-        futures::future::join_all(download_tasks).await;
-        drop(tx);
-        process_handle.await??;
-        Ok::<(), Box<dyn Error + Send + Sync>>(())
+        // Only collect results, don't propagate individual task errors
+        for task in download_tasks {
+            let _ = task.await;
+        }
+        drop(tx); // Drop sender to signal process_handle to finish
+
+        // Wait for processor but convert errors to strings
+        if let Err(e) = process_handle.await {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Process task error: {}", e),
+            )));
+        }
+
+        Ok(())
     })
     .await
     {
@@ -1668,7 +1695,7 @@ fn print_ascii_intro() {
     // Replace with your ASCII art
     let ascii_art = r#"
 
-                        -++-    -++-                                  alphanumeric beta 7.2.1
+                        -++-    -++-                                  alphanumeric beta 7.2.7
                        -+++.   .+++
                 .++++++++++++++++++++++-                              Architecture: Rust
                 -####++++#####++++#####+                              Algorithm: SHA-256

@@ -49,6 +49,14 @@ pub enum VelocityError {
     Encoding(String),
     #[error("Rate limit exceeded")]
     RateLimit,
+    #[error("No shreds found")]
+    NoShredsFound,
+    #[error("Hash mismatch")]
+    HashMismatch,
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+    #[error("Reconstruction error: {0}")]
+    ReconstructionError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +321,72 @@ impl VelocityManager {
             pending_requests: Arc::new(DashMap::new()),
             request_tx,
             request_rx,
+        }
+    }
+
+    pub async fn process_shreds(
+        &self,
+        block_hash: [u8; 32],
+        shreds: Vec<Shred>,
+    ) -> Result<Option<Block>, VelocityError> {
+        // Track shreds in the cache
+        for shred in &shreds {
+            self.shred_cache.add_shred(shred.clone());
+        }
+
+        // Check if we can reconstruct the block
+        if self.is_block_complete(&block_hash).await {
+            return self.try_reconstruct_block(&block_hash).await;
+        }
+
+        Ok(None)
+    }
+
+    async fn reconstruct_block(&self, block_hash: &[u8; 32]) -> Result<Block, VelocityError> {
+        let cache = self.shred_cache.cache.lock();
+
+        if let Some(shreds) = cache.peek(block_hash) {
+            if shreds.iter().all(|s| s.is_some()) {
+                // All shreds available, reconstruct block
+                let shards: Vec<Option<Vec<u8>>> = shreds
+                    .iter()
+                    .map(|s| s.as_ref().map(|s| s.data.to_vec()))
+                    .collect();
+
+                drop(cache); // Release lock before potentially lengthy operation
+
+                let data = self.erasure_manager.decode(shards)?;
+
+                // Deserialize the block
+                return match bincode::deserialize(&data) {
+                    Ok(block) => {
+                        // Verify hash matches
+                        let reconstructed_block: Block = block;
+                        if reconstructed_block.calculate_hash_for_block() != *block_hash {
+                            Err(VelocityError::HashMismatch)
+                        } else {
+                            Ok(reconstructed_block)
+                        }
+                    }
+                    Err(e) => Err(VelocityError::DeserializationError(e.to_string())),
+                };
+            }
+        }
+
+        Err(VelocityError::NoShredsFound)
+    }
+
+    pub async fn get_block_shreds(
+        &self,
+        block_hash: &[u8; 32],
+    ) -> Result<Vec<Shred>, VelocityError> {
+        let cache = self.shred_cache.cache.lock();
+
+        if let Some(shreds) = cache.peek(block_hash) {
+            let result: Vec<_> = shreds.iter().filter_map(|s| s.clone()).collect();
+            Ok(result)
+        } else {
+            Ok(Vec::new())
         }
     }
 
