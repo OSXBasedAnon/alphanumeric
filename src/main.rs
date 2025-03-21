@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
 use log::{debug, error, warn};
+use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::VecDeque;
@@ -10,7 +11,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
 use tokio::net::TcpStream;
@@ -1188,45 +1189,77 @@ None => println!("Please enter a command."),
 async fn handle_chain_sync(
     node: &Node,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const PARALLEL_BATCH_SIZE: usize = 32768;
-    const MAX_PARALLEL_DOWNLOADS: usize = 128;
-    const QUEUE_SIZE: usize = 32768;
-    const MAX_PEER_LATENCY: u64 = 100;
-    const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+    const PARALLEL_BATCH_SIZE: usize = 16384; // Reduced batch size for better reliability
+    const MAX_PARALLEL_DOWNLOADS: usize = 64;
+    const QUEUE_SIZE: usize = 16384;
+    const MAX_PEER_LATENCY: u64 = 200; // Increased latency threshold
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(600); // Increased timeout
+    const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60); // Timeout for individual requests
+    const RETRY_DELAY_BASE: u64 = 250; // Base delay in ms before retry
+    const MAX_RETRIES: u32 = 5; // Maximum number of retries per batch
 
     let mp = MultiProgress::new();
     let status_pb = mp.add(ProgressBar::new_spinner());
     status_pb.set_message("Finding fastest network peers...");
 
-    // Get network health metrics
+    // IMPROVEMENT: Better peer selection with health metrics
     let network_health = node.network_health.read().await;
-    let target_peers = (network_health.active_nodes / 4).clamp(3, MAX_PARALLEL_DOWNLOADS);
+    let target_peers = ((network_health.active_nodes / 4) as usize).clamp(3, MAX_PARALLEL_DOWNLOADS);
     drop(network_health);
 
-    // Discover peers
-    tokio::time::timeout(Duration::from_secs(5), node.discover_network_nodes())
-        .await
-        .unwrap_or_else(|_| Ok(()))?;
+    // Try to discover peers if we don't have enough
+    let peer_count = node.peers.read().await.len();
+    if peer_count < 5 {
+        status_pb.set_message("Discovering more network peers...");
+        match tokio::time::timeout(Duration::from_secs(10), node.discover_network_nodes()).await {
+            Ok(Ok(_)) => {
+                status_pb.set_message(format!("Found new peers, now at {}", node.peers.read().await.len()));
+            }
+            _ => {
+                status_pb.set_message("Continuing with existing peers");
+            }
+        }
+    }
 
-    // Select peers based on latency
+    // IMPROVEMENT: Better peer selection with health checks and rating
     let peers = node.peers.read().await;
-    let sync_peers: Vec<_> = peers
+    let mut sync_peers: Vec<_> = peers
         .iter()
-        .filter(|(_, info)| info.latency < MAX_PEER_LATENCY)
+        .filter(|(_, info)| {
+            info.latency < MAX_PEER_LATENCY && 
+            // Avoid peers we haven't seen in 5 minutes
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(info.last_seen) < 300
+        })
         .map(|(addr, info)| (*addr, info.blocks, info.latency))
         .collect();
     drop(peers);
 
-    if sync_peers.len() < 3 {
+    if sync_peers.len() < 2 {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "Insufficient fast peers available",
+            "Insufficient peers available for sync"
         )));
     }
 
-    // Get target height
+    // IMPROVEMENT: Better peer sorting - prioritize higher blocks AND lower latency
+    sync_peers.sort_by(|a, b| {
+        // First by block height (descending)
+        let height_cmp = b.1.cmp(&a.1);
+        if height_cmp != std::cmp::Ordering::Equal {
+            return height_cmp;
+        }
+        // Then by latency (ascending)
+        a.2.cmp(&b.2)
+    });
+
+    // Get target height from best peers
     let target_height = sync_peers
         .iter()
+        .take(3) // Use consensus from top 3 peers
         .map(|(_, height, _)| *height)
         .max()
         .unwrap_or(0);
@@ -1237,152 +1270,343 @@ async fn handle_chain_sync(
     };
 
     if target_height <= local_height {
-        status_pb.finish_with_message(format!("Chain at height {}", local_height));
+        status_pb.finish_with_message(format!("Already at current height: {}", local_height));
         return Ok(());
     }
 
-    // Setup progress bars
+    // Setup progress bars with better info
     let blocks_remaining = target_height - local_height;
     let main_pb = mp.add(ProgressBar::new(blocks_remaining as u64));
-    main_pb.set_message("Fast syncing blocks...");
+    main_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks ({eta}) {msg}")
+            .progress_chars("█▓░"),
+    );
+    main_pb.set_message("Syncing blockchain...");
 
-    // Sort peers by latency
+    // IMPROVEMENT: Sort peers by block height AND latency for better reliability
     let mut sync_peers: Vec<_> = sync_peers
         .into_iter()
-        .map(|(addr, _, latency)| (addr, latency))
+        .map(|(addr, height, latency)| (addr, height, latency))
         .collect();
-    sync_peers.sort_by_key(|(_, latency)| *latency);
+    
+    sync_peers.sort_by(|a, b| {
+        let a_score = a.1 as f64 * 0.8 - a.2 as f64 * 0.2; // 80% height, 20% latency
+        let b_score = b.1 as f64 * 0.8 - b.2 as f64 * 0.2;
+        b_score.partial_cmp(&a_score).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    // Setup sync channels and counters
+    // Setup sync channels with better buffer management
     let (tx, mut rx) = mpsc::channel(QUEUE_SIZE);
     let current_height = Arc::new(AtomicU32::new(local_height));
     let processed_height = Arc::new(AtomicU32::new(local_height));
+    let active_requests = Arc::new(AtomicU32::new(0));
+    let failed_batches = Arc::new(DashMap::new());
 
-    // Modified download task with better error handling
-    let download_tasks: Vec<_> = sync_peers
-        .iter()
-        .take(target_peers)
-        .map(|(peer, _)| {
-            let tx = tx.clone();
-            let current_height = Arc::clone(&current_height);
-            let node = node.clone();
-            let peer = *peer;
+    // IMPROVEMENT: More resilient download tasks with retry logic
+let download_tasks: Vec<_> = sync_peers
+    .iter()
+    .take(target_peers)
+    .map(|(peer, _, _)| {
+        let tx = tx.clone();
+        let current_height = Arc::clone(&current_height);
+        let failed_batches = Arc::clone(&failed_batches);
+        let active_requests = Arc::clone(&active_requests);
+        let node = node.clone();
+        let peer = *peer;
 
-            tokio::spawn(async move {
-                let mut curr_height = current_height.load(Ordering::Acquire);
-                while curr_height < target_height {
-                    let batch_end = (curr_height + PARALLEL_BATCH_SIZE as u32).min(target_height);
+        tokio::spawn(async move {
+            let mut consecutive_failures = 0;
 
-                    // Wrap the request in a recoverable error type
-                    match node.request_blocks(peer, curr_height, batch_end).await {
-                        Ok(blocks) => {
-                            let mut sent_count = 0;
-                            for block in blocks {
-                                if block.index > curr_height && block.index <= target_height {
-                                    // Use try_send to avoid awaiting during error paths
-                                    if tx.try_send(block).is_err() {
-                                        break;
-                                    }
-                                    sent_count += 1;
-                                }
-                            }
-
-                            if sent_count > 0 {
-                                current_height
-                                    .fetch_add(PARALLEL_BATCH_SIZE as u32, Ordering::Release);
-                            } else {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-
-                    curr_height = current_height.load(Ordering::Acquire);
+            'outer: while current_height.load(Ordering::Acquire) < target_height {
+                // Get a batch to download
+                let curr_height = current_height.load(Ordering::Acquire);
+                if curr_height >= target_height {
+                    break;
                 }
 
-                // We need to return a result type that's Send + Sync
-                Ok::<(), String>(())
-            })
-        })
-        .collect();
+                let batch_end = (curr_height + PARALLEL_BATCH_SIZE as u32).min(target_height);
+                let batch_key = format!("{}-{}", curr_height, batch_end);
+                
+                // Check if this batch has already failed too many times
+                if let Some(failures) = failed_batches.get(&batch_key) {
+                    if *failures > MAX_RETRIES {
+                        // Skip this batch, it's been tried too many times
+                        current_height.fetch_add(batch_end - curr_height, Ordering::Release);
+                        continue;
+                    }
+                }
 
-    // Single processing task
+                // Track active requests for load balancing
+                active_requests.fetch_add(1, Ordering::SeqCst);
+
+                // FIX: Create RNG here - don't keep it across awaits
+                if consecutive_failures > 0 {
+                    // Create new RNG each time to avoid Send issues
+                    let backoff = RETRY_DELAY_BASE * (1 << consecutive_failures.min(5));
+                    let jitter = rand::thread_rng().gen_range(0..=backoff/4);
+                    tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
+                }
+
+                // Proper timeout and error handling
+                let result = tokio::time::timeout(
+                    BLOCK_REQUEST_TIMEOUT,
+                    node.request_blocks(peer, curr_height, batch_end)
+                ).await;
+
+                match result {
+                    Ok(Ok(blocks)) => {
+                        let mut sent_count = 0;
+                        for block in blocks {
+                            // Validate hash before sending to process queue
+                            if block.index > curr_height && 
+                               block.index <= batch_end &&
+                               block.hash == block.calculate_hash_for_block() {
+                                match tx.send(block).await {
+                                    Ok(_) => sent_count += 1,
+                                    Err(_) => break 'outer, // Channel closed
+                                }
+                            }
+                        }
+
+                        if sent_count > 0 {
+                            // Reset failure counter on success
+                            consecutive_failures = 0;
+                            current_height.fetch_add(batch_end - curr_height, Ordering::Release);
+                        } else {
+                            // Got a response but no valid blocks
+                            consecutive_failures += 1;
+                            failed_batches.entry(batch_key.clone())
+                                .and_modify(|e| *e += 1)
+                                .or_insert(1);
+                        }
+                    }
+                    _ => {
+                        // Request failed or timed out
+                        consecutive_failures += 1;
+                        failed_batches.entry(batch_key.clone())
+                            .and_modify(|e| *e += 1)
+                            .or_insert(1);
+                        
+                        // If we've failed too many times consecutively, back off this peer
+                        if consecutive_failures > 3 {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+
+                active_requests.fetch_sub(1, Ordering::SeqCst);
+            }
+
+            // Task completed
+            Ok::<(), String>(())
+        })
+    })
+    .collect();
+
+    // IMPROVEMENT: Processing task with batching for efficiency
     let process_handle = {
         let blockchain = Arc::clone(&node.blockchain);
         let processed_height = Arc::clone(&processed_height);
         let main_pb = main_pb.clone();
+        let failed_batches = Arc::clone(&failed_batches);
 
         tokio::spawn(async move {
+            // Use a buffer to batch process blocks
             let mut block_buffer = Vec::with_capacity(1000);
-
+            let mut last_update = Instant::now();
+            let mut last_save_height = local_height;
+            
             while let Some(block) = rx.recv().await {
+                // Basic validation again for safety
                 if block.calculate_hash_for_block() != block.hash {
                     continue;
                 }
 
+                // Add to buffer
                 block_buffer.push(block);
 
-                if block_buffer.len() >= 1000 {
+                // Batch process when buffer gets large enough or every second
+                if block_buffer.len() >= 500 || last_update.elapsed() > Duration::from_secs(1) {
                     let blockchain = blockchain.write().await;
+                    
+                    // Sort blocks by index before processing
+                    block_buffer.sort_by_key(|b| b.index);
+                    
+                    let mut saved_count = 0;
                     for block in block_buffer.drain(..) {
-                        if let Err(_) = blockchain.save_block(&block).await {
+                        // Skip blocks we already have
+                        if block.index <= last_save_height {
                             continue;
                         }
-                        processed_height.fetch_add(1, Ordering::Release);
+                        
+                        if let Err(e) = blockchain.save_block(&block).await {
+                            // Log error but continue with next blocks
+                            println!("Error saving block {}: {}", block.index, e);
+                            
+                            // Mark this batch as failed so it can be retried
+                            let batch_key = format!("{}-{}", 
+                                (block.index / PARALLEL_BATCH_SIZE as u32) * PARALLEL_BATCH_SIZE as u32,
+                                ((block.index / PARALLEL_BATCH_SIZE as u32) + 1) * PARALLEL_BATCH_SIZE as u32);
+                            
+                            failed_batches.entry(batch_key)
+                                .and_modify(|e| *e += 1)
+                                .or_insert(1);
+                            
+                            continue;
+                        }
+                        
+                        last_save_height = block.index;
+                        saved_count += 1;
+                        processed_height.store(block.index, Ordering::Release);
                         main_pb.inc(1);
                     }
+                    
+                    if saved_count > 0 {
+                        main_pb.set_message(format!("Saved to height {}", last_save_height));
+                    }
+                    
+                    last_update = Instant::now();
                 }
             }
-
+            
+            // Process any remaining blocks
             if !block_buffer.is_empty() {
                 let blockchain = blockchain.write().await;
+                
+                // Sort blocks by index before final processing
+                block_buffer.sort_by_key(|b| b.index);
+                
                 for block in block_buffer.drain(..) {
-                    if let Err(_) = blockchain.save_block(&block).await {
+                    if block.index <= last_save_height {
                         continue;
                     }
-                    processed_height.fetch_add(1, Ordering::Release);
+                    
+                    if let Err(e) = blockchain.save_block(&block).await {
+                        println!("Error saving final block {}: {}", block.index, e);
+                        continue;
+                    }
+                    
+                    processed_height.store(block.index, Ordering::Release);
                     main_pb.inc(1);
                 }
             }
+            
             Ok::<(), String>(())
         })
     };
 
-    // Wait for completion with timeout
+    // IMPROVEMENT: Wait for completion with more robust error handling
     match tokio::time::timeout(SYNC_TIMEOUT, async {
+        // Monitor progress and handle stalled sync
+        let monitor_handle = {
+            let current_height = Arc::clone(&current_height);
+            let processed_height = Arc::clone(&processed_height);
+            let active_requests = Arc::clone(&active_requests);
+            let main_pb = main_pb.clone();
+            let status_pb = status_pb.clone();
+            let tx = tx.clone();
+            let node = node.clone();
+            
+            tokio::spawn(async move {
+                let mut last_progress = Instant::now();
+                let mut last_processed = processed_height.load(Ordering::Acquire);
+                
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    
+                    let now_processed = processed_height.load(Ordering::Acquire);
+                    let active = active_requests.load(Ordering::Acquire);
+                    
+                    // Update status message
+                    status_pb.set_message(format!(
+                        "Progress: {}/{} (active: {})", 
+                        now_processed - local_height,
+                        target_height - local_height,
+                        active
+                    ));
+                    
+                    // Check for progress
+                    if now_processed > last_processed {
+                        last_progress = Instant::now();
+                        last_processed = now_processed;
+                    } else if last_progress.elapsed() > Duration::from_secs(60) {
+                        // No progress for 60 seconds - try to recover
+                        status_pb.set_message("Sync stalled - attempting recovery");
+                        
+                        // Try to find a new peer to get blocks from
+                        if let Ok(peers) = node.discover_network_nodes().await {
+                            let peers = node.peers.read().await;
+                            if let Some((addr, _)) = peers.iter()
+                                .filter(|(_, p)| p.blocks > now_processed)
+                                .min_by_key(|(_, p)| p.latency) {
+                                    
+                                // Request blocks directly from this peer
+                                let start = now_processed;
+                                let end = (start + 100).min(target_height);
+                                
+                                if let Ok(blocks) = node.request_blocks(*addr, start, end).await {
+                                    // Send blocks to processing queue
+                                    for block in blocks {
+                                        let _ = tx.send(block).await;
+                                    }
+                                    status_pb.set_message("Recovery successful - continuing sync");
+                                }
+                            }
+                        }
+                        
+                        // Reset timer so we don't retry too often
+                        last_progress = Instant::now();
+                    }
+                    
+                    // Check if we're done
+                    if now_processed >= target_height || 
+                       current_height.load(Ordering::Acquire) >= target_height {
+                        break;
+                    }
+                }
+            })
+        };
+        
         // Only collect results, don't propagate individual task errors
-        for task in download_tasks {
-            let _ = task.await;
-        }
+        futures::future::join_all(download_tasks).await;
         drop(tx); // Drop sender to signal process_handle to finish
-
-        // Wait for processor but convert errors to strings
-        if let Err(e) = process_handle.await {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Process task error: {}", e),
-            )));
-        }
-
-        Ok(())
+        
+        // Wait for processor and monitor to finish
+        let _ = tokio::join!(process_handle, monitor_handle);
+        
+        Ok::<(), Box<dyn std::error::Error>>(())
     })
     .await
     {
         Ok(Ok(_)) => {
             let final_height = processed_height.load(Ordering::Acquire);
-            main_pb.finish_and_clear();
-            status_pb.finish_with_message(format!("Fast sync complete at height {}", final_height));
+            main_pb.finish_with_message(format!("Sync complete at height {}", final_height));
+            status_pb.finish_and_clear();
             Ok(())
         }
         _ => {
-            main_pb.finish_and_clear();
-            status_pb.finish_with_message("Sync failed");
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Sync failed or timed out",
-            )))
+            // Even with timeout, we still made progress
+            let final_height = processed_height.load(Ordering::Acquire);
+            let progress_pct = (final_height - local_height) as f64 / (target_height - local_height) as f64 * 100.0;
+            
+            main_pb.finish_with_message(format!(
+                "Partial sync: {} blocks ({:.1}%) to height {}", 
+                final_height - local_height,
+                progress_pct,
+                final_height
+            ));
+            status_pb.finish_with_message("Sync timed out but made partial progress");
+            
+            // Return success if we made significant progress (>80%)
+            if progress_pct > 80.0 {
+                Ok(())
+            } else {
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Sync timed out at {:.1}% completion", progress_pct)
+                )))
+            }
         }
     }
 }

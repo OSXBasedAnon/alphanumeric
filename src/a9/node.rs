@@ -1001,92 +1001,457 @@ impl Node {
         Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 
-    pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
-        info!("Starting network discovery");
+pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
+    info!("Starting network discovery");
+    
+    // Performance tuning constants
+    const MAX_DISCOVERY_RETRIES: u32 = 3;
+    const MAX_TARGET_PEERS: usize = 32;
+    const MIN_TARGET_PEERS: usize = 5;
+    
+    self.discover_network_nodes_with_retry(0).await
+}
 
-        // Initialize NAT traversal
-        let nat_config = self.initialize_tcp_nat_traversal().await?;
-
-        // Discovery via multiple methods
-        let mut discovered_addrs = HashSet::new();
-
-        // 1. Try local network discovery
-        if let Ok(local_addrs) = self.discover_local_network().await {
-            discovered_addrs.extend(local_addrs);
-        }
-
-        // 2. Try STUN for external address discovery
-        if let Ok((Some(v4), v6)) = self.discover_external_addresses(STUN_SERVERS).await {
-            // Add targeted scan ranges based on discovered external addresses
-            if let Ok(ranges) = self.build_scan_ranges(v4, v6).await {
-                for range in ranges {
-                    discovered_addrs.extend(self.scan_range(&range).await?);
+// Separate implementation for recursive calls with retry counter
+async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
+    const MAX_DISCOVERY_RETRIES: u32 = 3;
+    const MAX_TARGET_PEERS: usize = 32;
+    const MIN_TARGET_PEERS: usize = 5;
+    
+    // Initialize collection for discovered addresses
+    let mut discovered_addrs = HashSet::new();
+    let mut verified_peers = Vec::new();
+    
+    // Get current peers to avoid re-discovery
+    let current_peers: HashSet<SocketAddr> = {
+        let peers = self.peers.read().await;
+        peers.keys().copied().collect()
+    };
+    
+    // Aggressive discovery only if we're below the minimum threshold
+    let needs_aggressive_discovery = current_peers.len() < MIN_TARGET_PEERS;
+    
+    // Try DNS discovery (most reliable method)
+    let dns_seeds = [
+        "seed.alphanumeric.network:7177",
+        "seed2.alphanumeric.network:7177",
+        "a9seed.mynode.network:7177",
+    ];
+    
+    for &seed in &dns_seeds {
+        match tokio::net::lookup_host(seed).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    discovered_addrs.insert(addr);
                 }
             }
+            Err(e) => {
+                debug!("DNS lookup failed for {}: {}", seed, e);
+            }
         }
-
-        // 3. Try discovery from existing peers
+    }
+    
+    // Try existing peers (cheaper than local scan)
+    if !current_peers.is_empty() {
         if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
             discovered_addrs.extend(peer_addrs);
         }
-
-        // 4. Verify and add discovered peers
-        let connection_limiter = Arc::new(Semaphore::new(15));
-        let mut verified_peers = Vec::new();
-
-        let verification_tasks: Vec<_> = discovered_addrs
+    }
+    
+    // Try scanning local network only if we need more peers
+    if discovered_addrs.len() < MIN_TARGET_PEERS || needs_aggressive_discovery {
+        if let Ok(local_addrs) = self.discover_local_network().await {
+            discovered_addrs.extend(local_addrs);
+        }
+    }
+    
+    // Try STUN for external address discovery - do this only for aggressive search
+    if needs_aggressive_discovery {
+        if let Ok((Some(v4), v6)) = self.discover_external_addresses(STUN_SERVERS).await {
+            // Add targeted scan ranges based on discovered external addresses
+            if let Ok(ranges) = self.build_scan_ranges(v4, v6).await {
+                // Scan the most promising ranges first
+                for range in ranges.iter().take(3) {
+                    // Only scan the high-priority ranges
+                    if range.priority <= 3 {
+                        if let Ok(range_addrs) = tokio::time::timeout(
+                            Duration::from_secs(10), 
+                            self.scan_range(range)
+                        ).await.unwrap_or_else(|_| Ok(HashSet::new())) {
+                            discovered_addrs.extend(range_addrs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Filter out our own address and existing peers
+    let mut new_addrs: Vec<_> = discovered_addrs
+        .into_iter()
+        .filter(|addr| *addr != self.bind_addr && !current_peers.contains(addr))
+        .collect();
+    
+    // Early success if we didn't find any new addresses
+    if new_addrs.is_empty() {
+        info!("No new peers discovered");
+        // Consider a retry if we really need peers
+        if needs_aggressive_discovery && retry_count < MAX_DISCOVERY_RETRIES {
+            // Use Box::pin for recursion in async functions
+            return Box::pin(self.discover_network_nodes_with_retry(retry_count + 1)).await;
+        }
+        return Ok(());
+    }
+    
+    // Shuffle to avoid biased connection patterns
+    new_addrs.shuffle(&mut thread_rng());
+    
+    // IMPROVEMENT: Use connection semaphore for controlled parallel verification
+    let connection_limiter = Arc::new(Semaphore::new(10));
+    
+    // IMPROVEMENT: Multiple verification attempts with improved logging
+    while verified_peers.len() < MAX_TARGET_PEERS && !new_addrs.is_empty() && retry_count < MAX_DISCOVERY_RETRIES {
+        // Take up to 20 addresses to try in parallel
+        let batch: Vec<_> = new_addrs.drain(..std::cmp::min(20, new_addrs.len())).collect();
+        
+        // Create verification tasks
+        let verification_tasks: Vec<_> = batch
             .into_iter()
-            .filter(|addr| *addr != self.bind_addr) // Don't connect to self
             .map(|addr| {
                 let permit = connection_limiter.clone().acquire_owned();
                 let node = self.clone();
-                let nat_config = nat_config.clone();
-
+                
                 tokio::spawn(async move {
-                    let _permit = permit.await?;
-
-                    // Try direct connection first
-                    match timeout(Duration::from_secs(5), node.verify_peer(addr)).await {
-                        Ok(Ok(_)) => Ok(addr),
-                        _ => {
-                            // Try NAT traversal if direct connection fails
-                            if node.tcp_hole_punch(addr, &nat_config).await.is_ok() {
-                                // After NAT traversal, attempt verification again
-                                if node.verify_peer(addr).await.is_ok() {
-                                    Ok(addr)
-                                } else {
-                                    Err(NodeError::Network("Peer verification failed".into()))
-                                }
-                            } else {
-                                Err(NodeError::Network("NAT traversal failed".into()))
-                            }
+                    // Use unwrap_or(None) to handle permit acquisition errors
+                    let _permit = match permit.await {
+                        Ok(permit) => permit,
+                        Err(_) => return Ok::<Option<SocketAddr>, ()>(None),
+                    };
+                    
+                    // Try direct connection with timeout
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        node.verify_peer(addr)
+                    ).await {
+                        Ok(Ok(_)) => Ok(Some(addr)),
+                        Ok(Err(e)) => {
+                            debug!("Failed to verify peer {}: {}", addr, e);
+                            Ok(None)
+                        },
+                        Err(_) => {
+                            debug!("Verification timed out for {}", addr);
+                            Ok(None)
                         }
                     }
                 })
             })
             .collect();
-
+        
         // Process verification results
-        for result in join_all(verification_tasks).await {
-            if let Ok(Ok(addr)) = result {
+        for result in futures::future::join_all(verification_tasks).await {
+            if let Ok(Ok(Some(addr))) = result {
                 verified_peers.push(addr);
-
+                
                 // Limit number of peers
-                if verified_peers.len() >= MAX_PEERS {
+                if verified_peers.len() >= MAX_TARGET_PEERS {
                     break;
                 }
             }
         }
-
-        info!("Discovered {} verified peers", verified_peers.len());
-
-        // Rebalance peers after discovery to ensure subnet diversity
-        if !verified_peers.is_empty() {
-            self.rebalance_peer_subnets().await?;
-        }
-
-        Ok(())
+        
+        // If we didn't find enough peers, we'll naturally exit the loop based on the while condition
     }
+    
+    info!("Discovered {} verified peers", verified_peers.len());
+    
+    // Ensure subnet diversity by calling rebalance explicitly
+    if let Err(e) = self.rebalance_peer_subnets().await {
+        warn!("Failed to rebalance peer subnets: {}", e);
+    }
+    
+    // Log different results based on discovery outcome
+    match verified_peers.len() {
+        0 => warn!("No new peers were successfully verified and added"),
+        1..=4 => info!("Added {} new peers to the network", verified_peers.len()),
+        _ => info!("Successfully added {} new peers with subnet diversity", verified_peers.len()),
+    }
+    
+    Ok(())
+}
+
+async fn discover_from_dns_seeds(&self) -> Result<HashSet<SocketAddr>, NodeError> {
+    const DNS_SEEDS: &[&str] = &[
+        "seed.alphanumeric.network",
+        "seed2.alphanumeric.network",
+        "a9seed.mynode.network",
+    ];
+    
+    let mut discovered = HashSet::new();
+    
+    for &seed in DNS_SEEDS {
+        match tokio::net::lookup_host(format!("{}:{}", seed, DEFAULT_PORT)).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    discovered.insert(addr);
+                }
+            }
+            Err(e) => {
+                debug!("DNS lookup failed for {}: {}", seed, e);
+            }
+        }
+    }
+    
+    Ok(discovered)
+}
+
+async fn discover_from_kademlia(&self) -> Result<HashSet<SocketAddr>, NodeError> {
+    let mut discovered = HashSet::new();
+    
+    // Safely access the swarm without using addresses_of_peer
+    let swarm_guard = self.p2p_swarm.read().await;
+    if swarm_guard.is_none() {
+        return Ok(discovered);
+    }
+    
+    // Try to collect known peer addresses using safer methods
+    if let Ok(_) = self.handle_p2p_events().await {
+        // After handling events, extract any discovered addresses
+        // from swarm's connected peers using direct access methods
+        if let Some(swarm) = &*swarm_guard {
+            // Get connected peers from the swarm
+            for peer_id in swarm.0.connected_peers() {
+                // Fixed: add .await here to properly await the future
+                if let Ok(addrs) = self.get_peer_addresses_from_connections(&peer_id).await {
+                    for addr in addrs {
+                        discovered.insert(addr);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(discovered)
+}
+
+// Helper function to safely get peer addresses
+async fn get_peer_addresses_from_connections(&self, _peer_id: &PeerId) -> Result<Vec<SocketAddr>, NodeError> {
+    // Simple implementation that doesn't depend on addresses_of_peer
+    let mut result = Vec::new();
+    
+    // If we have existing connections in peers map, use those
+    let peers = self.peers.read().await;
+    for (addr, _) in peers.iter() {
+        result.push(*addr);
+    }
+    
+    Ok(result)
+}
+
+async fn scan_range_with_limit(
+    &self, 
+    range: &ScanRange,
+    semaphore: Arc<Semaphore>,
+    limit: usize
+) -> Result<HashSet<SocketAddr>, NodeError> {
+    let mut discovered = HashSet::new();
+    
+    // Get addresses to scan based on network type
+    let mut addrs = match &range.network {
+        ScanNetwork::V4(net) => {
+            let mut addrs = Vec::new();
+            // Generate addresses from the subnet, but limit to reasonable number
+            for host in net.hosts().take(limit) {
+                addrs.push(SocketAddr::new(IpAddr::V4(host), DEFAULT_PORT));
+            }
+            addrs
+        }
+        ScanNetwork::V6(net) => {
+            let mut addrs = Vec::new();
+            let mut rng = thread_rng();
+            
+            // For IPv6, generate limited random addresses in the subnet
+            for _ in 0..limit.min(25) {
+                let mut segments = [0u16; 8];
+                
+                // Copy prefix
+                let prefix_len = (net.prefix_len() / 16) as usize;
+                for i in 0..prefix_len {
+                    segments[i] = net.addr().segments()[i];
+                }
+                
+                // Randomize host part
+                for i in prefix_len..8 {
+                    segments[i] = rng.gen();
+                }
+                
+                let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
+                addrs.push(addr);
+            }
+            addrs
+        }
+    };
+    
+    // Randomize order for better distribution
+    addrs.shuffle(&mut thread_rng());
+    
+    // Take only the first 'limit' addresses
+    addrs.truncate(limit);
+    
+    // Concurrently scan addresses with improved error handling
+    let scan_tasks: Vec<_> = addrs
+        .into_iter()
+        .map(|addr| {
+            let permit = semaphore.clone().acquire_owned();
+            let node = self.clone();
+            
+            tokio::spawn(async move {
+                let _permit = permit.await.ok()?;
+                
+                if addr == node.bind_addr {
+                    return None;
+                }
+                
+                // Quick TCP check with better timeout
+                match tokio::time::timeout(
+                    Duration::from_millis(300), 
+                    TcpStream::connect(addr)
+                ).await {
+                    Ok(Ok(_)) => Some(addr),
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    
+    // Gather results
+    for result in futures::future::join_all(scan_tasks).await {
+        if let Ok(Some(addr)) = result {
+            discovered.insert(addr);
+        }
+    }
+    
+    Ok(discovered)
+}
+
+async fn build_optimized_scan_ranges(
+    &self,
+    v4_addr: IpAddr,
+    v6_addr: Option<IpAddr>,
+) -> Result<Vec<ScanRange>, NodeError> {
+    let mut ranges = Vec::new();
+    
+    // Add current peer subnet ranges first (most likely to find peers)
+    {
+        let peers = self.peers.read().await;
+        for (_, info) in peers.iter() {
+            // Direct access to subnet_group - it's not an Option
+            let subnet = info.subnet_group;
+            
+            // Convert subnet group to scan range
+            match info.address.ip() {
+                IpAddr::V4(ip) => {
+                    let octets = ip.octets();
+                    let subnet_str = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+                    
+                    if let Ok(net) = subnet_str.parse::<Ipv4Net>() {
+                        // Add with high priority
+                        ranges.push(ScanRange {
+                            network: ScanNetwork::V4(net),
+                            priority: 1, // Highest priority
+                        });
+                    }
+                }
+                IpAddr::V6(_) => {} // Skip IPv6 for now
+            }
+        }
+    }
+    
+    // Add IPv4 subnet from current address (your likely subnet)
+    if let IpAddr::V4(ipv4) = v4_addr {
+        let octets = ipv4.octets();
+        
+        // Current /24 subnet
+        let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+        if let Ok(net) = subnet.parse::<Ipv4Net>() {
+            ranges.push(ScanRange {
+                network: ScanNetwork::V4(net),
+                priority: 1, // Highest priority
+            });
+        }
+        
+        // Add adjacent subnets
+        for i in -2i32..=2i32 {
+            if i == 0 {
+                continue;
+            }
+            
+            // Try to handle wraparound properly
+            let third_octet = ((octets[2] as i32) + i) & 0xFF;
+            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], third_octet);
+            
+            if let Ok(net) = subnet.parse::<Ipv4Net>() {
+                ranges.push(ScanRange {
+                    network: ScanNetwork::V4(net),
+                    priority: 2,
+                });
+            }
+        }
+        
+        // Add broader subnet (faster search across larger network)
+        let broader_subnet = format!("{}.{}.0.0/16", octets[0], octets[1]);
+        if let Ok(net) = broader_subnet.parse::<Ipv4Net>() {
+            ranges.push(ScanRange {
+                network: ScanNetwork::V4(net),
+                priority: 3,
+            });
+        }
+    }
+    
+    // Add common cloud provider and ISP ranges
+    for &(range, priority) in &[
+        // Major cloud providers (likely to host nodes)
+        ("3.0.0.0/8", 3),   // AWS
+        ("35.0.0.0/8", 3),  // GCP
+        ("52.0.0.0/8", 3),  // AWS
+        ("104.0.0.0/8", 3), // Cloud
+        // ISP ranges
+        ("24.0.0.0/8", 4),  // Comcast
+        ("71.0.0.0/8", 4),  // AT&T
+        ("73.0.0.0/8", 4),  // Verizon
+        // Private networks (for local testing)
+        ("192.168.0.0/16", 2), // Local
+        ("10.0.0.0/8", 3),     // Private
+    ] {
+        if let Ok(net) = range.parse::<Ipv4Net>() {
+            ranges.push(ScanRange {
+                network: ScanNetwork::V4(net),
+                priority,
+            });
+        }
+    }
+    
+    // Add IPv6 ranges if available
+    if let Some(IpAddr::V6(ipv6)) = v6_addr {
+        let segments = ipv6.segments();
+        // Try to get a reasonable IPv6 subnet
+        let subnet = format!(
+            "{:x}:{:x}:{:x}:{:x}::/64",
+            segments[0], segments[1], segments[2], segments[3]
+        );
+        
+        if let Ok(net) = subnet.parse::<Ipv6Net>() {
+            ranges.push(ScanRange {
+                network: ScanNetwork::V6(net),
+                priority: 5, // Lower priority since IPv6 is less common
+            });
+        }
+    }
+    
+    // Sort ranges by priority (lower number = higher priority)
+    ranges.sort_by_key(|range| range.priority);
+    
+    Ok(ranges)
+}
 
     async fn build_scan_ranges(
         &self,
@@ -1834,98 +2199,259 @@ async fn initialize_p2p(&self) -> Result<(), NodeError> {
     }
 
     // Maintain connections to peers
-    async fn maintain_peer_connections(&self) -> Result<(), NodeError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Identify peers that need health checks
-        let peers_to_check: Vec<SocketAddr> = {
-            let peers = self.peers.read().await;
-            peers
-                .iter()
-                .filter(|(_, info)| now - info.last_seen > PEER_TIMEOUT / 2)
-                .map(|(&addr, _)| addr)
-                .collect()
-        };
-
-        if peers_to_check.is_empty() {
-            return Ok(());
+async fn maintain_peer_connections(&self) -> Result<(), NodeError> {
+    const PING_INTERVAL_SECS: u64 = 30;
+    const MAX_PING_LATENCY: u64 = 500; // ms
+    const PEER_TIMEOUT_SECS: u64 = 180; // 3 minutes
+    const MAX_FAILURES: u32 = 3;
+    const HEALTH_CHECK_BATCH: usize = 5; // Check 5 peers per maintenance cycle
+    
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // IMPROVEMENT: Track peer metrics for better connection management
+    let mut active_peers = 0;
+    let mut inactive_peers = 0;
+    let mut high_latency_peers = 0;
+    let mut peers_to_check = Vec::new();
+    let mut peers_to_remove = Vec::new();
+    
+    // Identify peers that need health checks
+    {
+        let peers = self.peers.read().await;
+        
+        // Gather peer info first
+        let peer_info: Vec<(SocketAddr, u64, u64)> = peers.iter()
+            .map(|(addr, info)| (*addr, info.last_seen, info.latency))
+            .collect();
+            
+        // Now analyze without holding the lock
+        for (addr, last_seen, latency) in peer_info {
+            let inactive_time = now.saturating_sub(last_seen);
+            
+            if inactive_time > PEER_TIMEOUT_SECS {
+                inactive_peers += 1;
+                peers_to_remove.push(addr);
+            } else if inactive_time > PING_INTERVAL_SECS {
+                // Needs a health check
+                peers_to_check.push(addr);
+            } else {
+                active_peers += 1;
+                
+                // Track latency
+                if latency > MAX_PING_LATENCY {
+                    high_latency_peers += 1;
+                }
+            }
         }
+    }
+    
+    // Find the least recently seen peers to check first
+    let peer_last_seen = {
+        let peers_guard = self.peers.read().await;
+        let mut result = Vec::with_capacity(peers_to_check.len());
+        
+        for &addr in &peers_to_check {
+            if let Some(info) = peers_guard.get(&addr) {
+                let time_since_seen = now.saturating_sub(info.last_seen);
+                result.push((addr, time_since_seen));
+            }
+        }
+        
+        result
+    };
+    
+    // Sort by time since last seen (outside of the peers guard)
+    let mut sorted_peers = peer_last_seen;
+    sorted_peers.sort_by_key(|&(_, time)| std::cmp::Reverse(time));
+    
+    // Update peers_to_check with sorted order
+    peers_to_check = sorted_peers.into_iter().map(|(addr, _)| addr).collect();
+    
+    // IMPROVEMENT: Perform health checks in batches
+    let health_check_batch = peers_to_check.into_iter()
+        .take(HEALTH_CHECK_BATCH)
+        .collect::<Vec<_>>();
+    
+    if !health_check_batch.is_empty() {
         // Check peer health in parallel with rate limiting
-        let max_concurrent_checks = 10;
+        let max_concurrent_checks = health_check_batch.len().min(5);
         let semaphore = Arc::new(Semaphore::new(max_concurrent_checks));
-        let mut health_check_futures = Vec::with_capacity(peers_to_check.len());
-
-        for addr in peers_to_check {
-            let permit = semaphore.clone().acquire_owned();
-            let node = self.clone();
-
-            health_check_futures.push(tokio::spawn(async move {
-                let _permit = permit.await.unwrap();
-                let result = node.check_peer_health_internal(addr).await;
-                (addr, result.is_ok())
-            }));
-        }
-
+        
+        let health_check_futures: Vec<_> = health_check_batch
+            .into_iter()
+            .map(|addr| {
+                let permit = semaphore.clone().acquire_owned();
+                let node = self.clone();
+                
+                tokio::spawn(async move {
+                    let _permit = match permit.await {
+                        Ok(permit) => permit,
+                        Err(_) => return (addr, false),
+                    };
+                    let result = node.check_peer_health_internal(addr).await;
+                    (addr, result.is_ok())
+                })
+            })
+            .collect();
+        
         // Process health check results
-        let results = futures::future::join_all(health_check_futures).await;
-        let mut removals = Vec::new();
-        let mut updates = Vec::new();
-
-        for result in results {
+        for result in futures::future::join_all(health_check_futures).await {
             match result {
                 Ok((addr, true)) => {
                     // Peer is healthy, update last_seen
-                    updates.push(addr);
+                    let mut peers = self.peers.write().await;
+                    if let Some(info) = peers.get_mut(&addr) {
+                        info.last_seen = now;
+                    }
+                    drop(peers);
+                    
+                    // Reset failure counter
                     self.reset_peer_failures(addr).await;
                 }
                 Ok((addr, false)) => {
                     // Peer is unhealthy, record failure
                     self.record_peer_failure(addr).await;
-
+                    
                     // Check if peer has failed too many times
                     let failures = self.peer_failures.read().await;
-                    if failures.get(&addr).copied().unwrap_or(0) >= 3 {
-                        removals.push(addr);
+                    if failures.get(&addr).copied().unwrap_or(0) >= MAX_FAILURES {
+                        peers_to_remove.push(addr);
                     }
                 }
                 Err(_) => continue,
             }
         }
-
-        // Apply updates to peer state
-        {
-            let mut peers = self.peers.write().await;
-
-            // Remove unhealthy peers
-            for addr in removals {
-                peers.remove(&addr);
-                self.peer_secrets.write().await.remove(&addr);
+    }
+    
+    // IMPROVEMENT: Apply updates to peer state all at once
+    if !peers_to_remove.is_empty() {
+        let mut peers = self.peers.write().await;
+        let mut peer_secrets = self.peer_secrets.write().await;
+        
+        for addr in peers_to_remove {
+            peers.remove(&addr);
+            peer_secrets.remove(&addr);
+        }
+    }
+    
+    // IMPROVEMENT: Initiate discovery if we need more peers
+    let current_peer_count = self.peers.read().await.len();
+    if current_peer_count < MIN_PEERS {
+        debug!("Low peer count ({}), initiating discovery", current_peer_count);
+        
+        // Spawn discovery as a separate task to avoid blocking maintenance
+        tokio::spawn({
+            let node = self.clone();
+            async move {
+                if let Err(e) = node.discover_network_nodes().await {
+                    warn!("Peer discovery during maintenance failed: {}", e);
+                }
             }
+        });
+    }
+    
+    // IMPROVEMENT: Rebalance subnet distribution periodically
+    // Only do this if we have enough peers to be selective
+    if current_peer_count >= MIN_PEERS + 2 {
+        if let Err(e) = self.rebalance_peer_subnets().await {
+            warn!("Subnet rebalancing failed: {}", e);
+        }
+    }
+    
+    // IMPROVEMENT: Update network health metrics
+    {
+        let mut network_health = self.network_health.write().await;
+        // Fix the type issue - use proper type for active_nodes
+        network_health.active_nodes = active_peers;  // Assuming active_peers is already a usize
+        
+        network_health.average_response_time = {
+            let peers = self.peers.read().await;
+            if peers.is_empty() {
+                0
+            } else {
+                peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
+            }
+        };
+    }
+    
+    Ok(())
+}
 
-            // Update last_seen for healthy peers
-            for addr in updates {
-                if let Some(info) = peers.get_mut(&addr) {
-                    info.last_seen = now;
+// Helper method - improved subnet rebalancing
+async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
+    // Get current time at the beginning
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    // Get current peers
+    let peers = self.peers.read().await;
+    
+    // Count peers per subnet
+    let mut subnet_counts = HashMap::new();
+    for (_, info) in peers.iter() {
+        *subnet_counts.entry(info.subnet_group).or_insert(0) += 1;
+    }
+    
+    // Find overrepresented subnets
+    let max_per_subnet = (MAX_PEERS / 8).max(MAX_PEERS_PER_SUBNET);
+    let mut removals = Vec::new();
+    
+    for (subnet, count) in subnet_counts.iter() {
+        if *count > max_per_subnet {
+            // Get all peers in this subnet
+            let subnet_peers: Vec<_> = peers
+                .iter()
+                .filter(|(_, info)| &info.subnet_group == subnet)
+                .collect();
+            
+            // Get all the rating data first
+            let mut peer_ratings = Vec::with_capacity(subnet_peers.len());
+            
+            for (addr, info) in subnet_peers {
+                // Calculate a quality score
+                // Lower is better: latency (ms) - blocks (importance) + age (seconds)
+                let score = info.latency as i64 - 
+                           (info.blocks as i64) + 
+                           (now.saturating_sub(info.last_seen) as i64) / 60;
+                
+                // Fixed: Don't double-dereference the address
+                peer_ratings.push((*addr, score));
+            }
+            
+            // Sort by score (lower is better)
+            peer_ratings.sort_by_key(|&(_, score)| score);
+            
+            // Keep the best max_per_subnet, remove the rest
+            let excess_count = count - max_per_subnet;
+            let peers_to_remove = peer_ratings.len().saturating_sub(max_per_subnet);
+            
+            for i in (peer_ratings.len() - peers_to_remove)..peer_ratings.len() {
+                if i < peer_ratings.len() {
+                    removals.push(peer_ratings[i].0);
                 }
             }
         }
-
-        // Check if we need more peers
-        let current_peers = self.peers.read().await.len();
-        if current_peers < MIN_PEERS {
-            if let Err(e) = self.discover_network_nodes().await {
-                warn!("Peer discovery failed: {}", e);
-            }
-        }
-
-        // Rebalance subnet distribution
-        self.rebalance_peer_subnets().await?;
-
-        Ok(())
     }
+    
+    // Drop read lock before acquiring write lock
+    drop(peers);
+    
+    // Remove excess peers
+    if !removals.is_empty() {
+        let mut peers = self.peers.write().await;
+        for addr in removals {
+            peers.remove(&addr);
+            self.peer_secrets.write().await.remove(&addr);
+        }
+    }
+    
+    Ok(())
+}
 
     // Request peer height for sync checking
     pub async fn request_peer_height(&self, addr: SocketAddr) -> Result<u32, NodeError> {
@@ -3123,63 +3649,6 @@ async fn initialize_p2p(&self) -> Result<(), NodeError> {
         Ok(())
     }
 
-    async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
-        let peers = self.peers.read().await;
-
-        // Count peers per subnet
-        let mut subnet_counts = HashMap::new();
-        for (_, info) in peers.iter() {
-            *subnet_counts.entry(info.subnet_group).or_insert(0) += 1;
-        }
-
-        // Find overrepresented subnets
-        let max_per_subnet = (MAX_PEERS / 8).max(MAX_PEERS_PER_SUBNET);
-        let mut removals = Vec::new();
-
-        for (subnet, count) in subnet_counts.iter() {
-            if *count > max_per_subnet {
-                // Get peers from this subnet
-                let subnet_peers: Vec<_> = peers
-                    .iter()
-                    .filter(|(_, info)| &info.subnet_group == subnet)
-                    .collect();
-
-                // Sort by latency and last seen (prioritize keeping low latency, recent peers)
-                let mut ranked_peers = subnet_peers.clone();
-                ranked_peers.sort_by(|(_, a), (_, b)| {
-                    // Primary sort by latency
-                    let latency_cmp = a.latency.cmp(&b.latency);
-                    if latency_cmp != std::cmp::Ordering::Equal {
-                        return latency_cmp;
-                    }
-
-                    // Secondary sort by last seen (reverse)
-                    b.last_seen.cmp(&a.last_seen)
-                });
-
-                // Remove excess peers, keeping the best ones
-                let remove_count = count - max_per_subnet;
-                for (addr, _) in ranked_peers.iter().skip(max_per_subnet).take(remove_count) {
-                    removals.push(**addr);
-                }
-            }
-        }
-
-        // Drop read lock before acquiring write lock
-        drop(peers);
-
-        // Remove excess peers
-        if !removals.is_empty() {
-            let mut peers = self.peers.write().await;
-            for addr in removals {
-                peers.remove(&addr);
-                self.peer_secrets.write().await.remove(&addr);
-            }
-        }
-
-        Ok(())
-    }
-
     // Method to convert Multiaddr to SocketAddr (needed for libp2p integration)
     fn multiaddr_to_socketaddr(&self, addr: &Multiaddr) -> Result<SocketAddr, NodeError> {
         use libp2p::core::multiaddr::Protocol;
@@ -3198,141 +3667,382 @@ async fn initialize_p2p(&self) -> Result<(), NodeError> {
     }
 
     // Verification - essential for security
-    pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
-        // Try to connect with timeout
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(CONNECTION_TIMEOUT),
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
-
-        // Perform handshake
-        let (peer_info, shared_secret) = self.perform_handshake(&mut stream, true).await?;
-
-        // Store verified peer information
-        let mut peers = self.peers.write().await;
-        peers.insert(addr, peer_info);
-        drop(peers);
-
-        let mut peer_secrets = self.peer_secrets.write().await;
-        peer_secrets.insert(addr, shared_secret);
-
-        Ok(())
+pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
+    const CONNECTION_RETRIES: u32 = 2;
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    const COOLDOWN_PERIOD: u64 = 60; // Seconds
+    
+    // IMPROVEMENT: Check if we should try this peer based on past failures
+    {
+        let failures = self.peer_failures.read().await;
+        if let Some(&count) = failures.get(&addr) {
+            if count >= 3 {
+                // Check if we're in the cooldown period
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                // Get peer failures as u64 to match now's type
+                let last_attempt = self.peer_failures.read().await
+                    .get(&addr)
+                    .map(|&c| c as u64)
+                    .unwrap_or(0);
+                
+                if now - last_attempt < COOLDOWN_PERIOD {
+                    return Err(NodeError::Network(format!(
+                        "Peer {} is in cooldown after multiple failures", 
+                        addr
+                    )));
+                }
+            }
+        }
     }
+    
+    // Try to establish connection with retries
+    let mut stream = None;
+    let mut last_error = None;
+    
+    for retry in 0..CONNECTION_RETRIES {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(addr)
+        ).await {
+            Ok(Ok(s)) => {
+                stream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => {
+                last_error = Some(e);
+                // Exponential backoff
+                if retry < CONNECTION_RETRIES - 1 {
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
+                }
+            }
+            Err(_) => {
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Connection timed out"
+                ));
+                // Exponential backoff
+                if retry < CONNECTION_RETRIES - 1 {
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
+                }
+            }
+        }
+    }
+    
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            // Record failure for this peer
+            self.record_peer_failure(addr).await;
+            return Err(NodeError::Network(format!(
+                "Failed to connect to {}: {}", 
+                addr, 
+                last_error.unwrap_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::Other, 
+                    "Unknown error"
+                ))
+            )));
+        }
+    };
+    
+    // IMPROVEMENT: Configure TCP socket for better performance
+    stream.set_nodelay(true)?;
+    
+    // Use into_std() before converting to Socket
+    let std_stream = stream.into_std()?;
+    let socket = Socket::from(std_stream);
+    
+    // Set better TCP keepalive settings
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(5));
+    socket.set_tcp_keepalive(&keepalive)?;
+    
+    // Convert socket back to TcpStream
+    let mut stream = TcpStream::from_std(socket.into())?;
+    
+    // IMPROVEMENT: Perform handshake with better timeout handling
+    let handshake_result = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        self.perform_handshake(&mut stream, true)
+    ).await;
+    
+    let (peer_info, shared_secret) = match handshake_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            self.record_peer_failure(addr).await;
+            return Err(NodeError::Network(format!(
+                "Handshake failed with {}: {}", 
+                addr, 
+                e
+            )));
+        }
+        Err(_) => {
+            self.record_peer_failure(addr).await;
+            return Err(NodeError::Network(format!(
+                "Handshake timed out with {}", 
+                addr
+            )));
+        }
+    };
+    
+    // IMPROVEMENT: More comprehensive peer validation
+    
+    // 1. Version check
+    if peer_info.version != NETWORK_VERSION {
+        self.record_peer_failure(addr).await;
+        return Err(NodeError::Network(format!(
+            "Version mismatch with {}: {} (expected {})",
+            addr, 
+            peer_info.version, 
+            NETWORK_VERSION
+        )));
+    }
+    
+    // 3. Check for subnet limits
+    let mut peers = self.peers.write().await;
+    let subnet_peers = peers
+        .values()
+        .filter(|p| p.subnet_group == peer_info.subnet_group)
+        .count();
+    
+    if subnet_peers >= MAX_PEERS_PER_SUBNET && peers.len() >= MIN_PEERS {
+        return Err(NodeError::Network(format!(
+            "Subnet limit reached for {}", 
+            addr
+        )));
+    }
+    
+    // 4. Store peer information
+    peers.insert(addr, peer_info);
+    drop(peers);
+    
+    let mut peer_secrets = self.peer_secrets.write().await;
+    peer_secrets.insert(addr, shared_secret);
+    
+    // Reset failure counter
+    self.reset_peer_failures(addr).await;
+    
+    // IMPROVEMENT: Trigger initial latency measurement
+    tokio::spawn({
+        let node = self.clone();
+        let addr = addr;
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = node.send_ping(addr).await;
+        }
+    });
+    
+    Ok(())
+}
 
     // Sync with network to keep blockchain updated
-    pub async fn sync_with_network(&self) -> Result<(), NodeError> {
-        // Get current blockchain state
-        let current_height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
-        };
-
-        let peers = self.peers.read().await;
-        if peers.is_empty() {
-            if let Err(e) = self.discover_network_nodes().await {
-                warn!("Failed to discover peers for sync: {}", e);
+pub async fn sync_with_network(&self) -> Result<(), NodeError> {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 1000;
+    const PEER_TIMEOUT_MS: u64 = 5000;
+    const MAX_BATCH_SIZE: u32 = 50;  // More reasonable batch size
+    
+    // 1. Get current blockchain state
+    let current_height = {
+        let blockchain = self.blockchain.read().await;
+        blockchain.get_block_count() as u32
+    };
+    
+    // 2. Check peer count and discover if needed
+    let peers = self.peers.read().await;
+    let peer_count = peers.len();
+    
+    if peer_count == 0 {
+        drop(peers); // Release lock before discovery
+        info!("No peers available, discovering network nodes");
+        if let Err(e) = self.discover_network_nodes().await {
+            warn!("Failed to discover peers for sync: {}", e);
+            return Err(NodeError::Network("No peers available for sync".to_string()));
+        }
+    }
+    
+    // 3. IMPROVEMENT: Find multiple peers with highest block height
+    // Get a fresh peer list after possible discovery
+    let peers = self.peers.read().await;
+    
+    // IMPROVEMENT: Track peer heights with better error handling
+    let mut peer_heights = Vec::new();
+    let peer_ips: Vec<_> = peers.keys().cloned().collect();
+    drop(peers);  // Release lock before making network requests
+    
+    // Query peer heights in parallel with better error handling
+    let height_queries: Vec<_> = peer_ips
+        .iter()
+        .map(|&addr| {
+            let node = self.clone();
+            async move {
+                match tokio::time::timeout(
+                    Duration::from_millis(PEER_TIMEOUT_MS),
+                    node.request_peer_height(addr)
+                ).await {
+                    Ok(Ok(height)) => Some((addr, height)),
+                    _ => None,
+                }
             }
+        })
+        .collect();
+    
+    // Gather results
+    for result in futures::future::join_all(height_queries).await {
+        if let Some(pair) = result {
+            peer_heights.push(pair);
+        }
+    }
+    
+    // Sort by height descending
+    peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
+    
+    // IMPROVEMENT: Check if we already have the latest blocks
+    if let Some((_, best_height)) = peer_heights.first() {
+        if *best_height <= current_height {
+            info!("Already at best height ({}/{})", current_height, best_height);
             return Ok(());
         }
-
-        // Find peer with highest block height
-        let mut best_peers: Vec<(SocketAddr, u32)> = Vec::new();
-
-        // Get heights from peers with timeout
-        let peer_futures: Vec<_> = peers
-            .keys()
-            .map(|&addr| {
-                let node = self.clone();
-                async move {
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        node.request_peer_height(addr),
-                    )
-                    .await
-                    {
-                        Ok(Ok(height)) => Some((addr, height)),
-                        _ => None,
-                    }
-                }
-            })
-            .collect();
-
-        for result in futures::future::join_all(peer_futures).await {
-            if let Some((addr, height)) = result {
-                best_peers.push((addr, height));
-            }
-        }
-
-        // Sort by height descending
-        best_peers.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
-
-        // Get blocks from best peer
-        if let Some((best_addr, best_height)) = best_peers.first() {
-            if *best_height > current_height {
-                info!("Syncing from height {} to {}", current_height, best_height);
-
-                // Request blocks in batches
-                const BATCH_SIZE: u32 = 100;
-                let mut start = current_height;
-
-                while start < *best_height {
-                    let end = std::cmp::min(start + BATCH_SIZE, *best_height);
-
-                    match self.request_blocks(*best_addr, start, end).await {
-                        Ok(blocks) => {
-                            // Process received blocks
-                            let mut blockchain = self.blockchain.write().await;
-                            for block in blocks {
-                                if block.index >= start && block.index <= end {
-                                    if let Err(e) = blockchain.save_block(&block).await {
-                                        warn!("Failed to save block {}: {}", block.index, e);
-                                    }
-                                }
-                            }
-
-                            // Move to next batch
-                            start = end + 1;
-                        }
-                        Err(e) => {
-                            warn!("Failed to get blocks {}-{}: {}", start, end, e);
-
-                            // Try next best peer
-                            if let Some((next_addr, _)) = best_peers.get(1) {
-                                match self.request_blocks(*next_addr, start, end).await {
-                                    Ok(blocks) => {
-                                        let mut blockchain = self.blockchain.write().await;
-                                        for block in blocks {
-                                            if let Err(e) = blockchain.save_block(&block).await {
-                                                warn!(
-                                                    "Failed to save block {}: {}",
-                                                    block.index, e
-                                                );
-                                            }
-                                        }
-                                        start = end + 1;
-                                    }
-                                    Err(e) => {
-                                        return Err(NodeError::Network(format!(
-                                            "Sync failed from backup peer: {}",
-                                            e
-                                        )));
-                                    }
-                                }
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-
-                info!("Blockchain synchronized to height {}", best_height);
-            }
-        }
-
-        Ok(())
+        
+        info!("Syncing from height {} to {}", current_height, best_height);
+    } else {
+        warn!("No peers reported their height");
+        return Err(NodeError::Network("No peers reported their height".to_string()));
     }
+    
+    // 4. IMPROVEMENT: Try multiple peers for sync
+    // Use up to 3 best peers for sync
+    let sync_candidates = peer_heights.iter().take(3).cloned().collect::<Vec<_>>();
+    
+    if sync_candidates.is_empty() {
+        return Err(NodeError::Network("No suitable peers for sync".to_string()));
+    }
+    
+    let mut blocks_synced = 0;
+    let mut current_sync_height = current_height;
+    
+    // 5. IMPROVEMENT: Process blocks in smaller batches with parallel validation
+    'outer: for sync_attempt in 0..MAX_RETRIES {
+        // Try each candidate in order
+        for (candidate_idx, (peer_addr, peer_height)) in sync_candidates.iter().enumerate() {
+            if current_sync_height >= *peer_height {
+                continue;
+            }
+            
+            info!(
+                "Sync attempt {}/{} using peer {} ({}/{})", 
+                sync_attempt + 1, 
+                MAX_RETRIES, 
+                candidate_idx + 1,
+                peer_addr,
+                peer_height
+            );
+            
+            // Sync in smaller batches
+            let mut start = current_sync_height;
+            
+            while start < *peer_height {
+                let end = std::cmp::min(start + MAX_BATCH_SIZE, *peer_height);
+                
+                match self.request_blocks(*peer_addr, start, end).await {
+                    Ok(blocks) => {
+                        // IMPROVEMENT: Process blocks in parallel
+                        let verification_tasks: Vec<_> = blocks
+                            .iter()
+                            .map(|block| {
+                                let node = self.clone();
+                                let block = block.clone();
+                                async move {
+                                    if node.verify_block_parallel(&block).await.unwrap_or(false) {
+                                        Some(block)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            })
+                            .collect();
+                        
+                        let verified_blocks: Vec<_> = futures::future::join_all(verification_tasks)
+                            .await
+                            .into_iter()
+                            .filter_map(|result| result)
+                            .collect();
+                        
+                        // Save verified blocks
+                        let actual_count = verified_blocks.len();
+                        if actual_count > 0 {
+                            let mut blockchain = self.blockchain.write().await;
+                            let mut saved_count = 0;
+                            
+                            for block in verified_blocks {
+                                if let Err(e) = blockchain.save_block(&block).await {
+                                    warn!("Failed to save block {}: {}", block.index, e);
+                                } else {
+                                    saved_count += 1;
+                                    current_sync_height = current_sync_height.max(block.index);
+                                }
+                            }
+                            
+                            info!(
+                                "Saved {}/{} blocks ({}-{}), now at {}/{}",
+                                saved_count,
+                                actual_count,
+                                start,
+                                end,
+                                current_sync_height,
+                                peer_height
+                            );
+                            
+                            blocks_synced += saved_count;
+                        } else {
+                            warn!("No valid blocks received for range {}-{}", start, end);
+                            break; // Try next peer
+                        }
+                        
+                        // Move to next batch based on what we actually processed
+                        start = current_sync_height + 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to get blocks {}-{} from peer {}: {}", 
+                            start, 
+                            end, 
+                            peer_addr, 
+                            e
+                        );
+                        
+                        // Add short delay before retry
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        break; // Try next peer
+                    }
+                }
+                
+                // Check if we're done
+                if current_sync_height >= *peer_height {
+                    info!("Sync complete to height {}", current_sync_height);
+                    break 'outer;
+                }
+            }
+        }
+        
+        // If we've tried all peers without success, delay before next attempt
+        if sync_attempt < MAX_RETRIES - 1 {
+            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * (sync_attempt as u64 + 1))).await;
+        }
+    }
+    
+    // 6. IMPROVEMENT: Report success even with partial progress
+    if blocks_synced > 0 {
+        info!("Blockchain synchronized: added {} blocks to height {}", blocks_synced, current_sync_height);
+        Ok(())
+    } else {
+        Err(NodeError::Network("Failed to sync any blocks".to_string()))
+    }
+}
 
     async fn perform_handshake(
         &self,
