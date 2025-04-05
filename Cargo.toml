@@ -3,6 +3,13 @@ name = "alphanumeric"
 version = "0.1.0"
 edition = "2021"
 
+[build-script]
+path = "build.rs"
+
+[build-dependencies]
+bindgen = "0.64"
+winres = "0.1.12"
+
 [dependencies]
 argon2 = "0.3"
 arrayref = "0.3"
@@ -51,6 +58,8 @@ async-trait = "0.1.74"
 sled = "0.34.0"
 env_logger = "0.10"
 
-[build-dependencies]
-bindgen = "0.64"
-winres = "0.1.12"
+[target.'cfg(unix)'.dependencies]
+nix = "0.14.0"
+
+[target.aarch64-apple-darwin]
+rustflags = ["-Ctarget-cpu=aarch64"]

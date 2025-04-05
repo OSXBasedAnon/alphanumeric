@@ -448,6 +448,7 @@ println!("3. Show Balance (format: balance)");
 println!("4. Make New Wallet (format: new [wallet_name])");
 println!("5. Account Lookup (format: account address)");
 println!("6. Mine Block (format: mine miner_wallet_name)");
+println!("7. Mine Blocks Continuously (format: mining miner_wallet_name)");
 println!("7. Exit");
 
 let mut command = String::new();
@@ -678,19 +679,36 @@ println!("Wallet renamed successfully");
 }
 }
 }
-Some("mine") => {
-let parts: Vec<&str> = command.split_whitespace().collect();
-if parts.len() != 2 {
-println!("Usage: mine <miner_wallet_name>");
-continue;
+
+Some("mine") => { // Single mine functionality
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    
+    if parts.len() != 2 {
+        println!("Usage: mine <miner_wallet_name>");
+        continue;
+    }
+
+    if let Err(e) = mgmt.handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc).await { 
+        println!("Mining error: {}", e);
+    }
 }
-if let Err(e) = mgmt
-.handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
-.await
-{
-println!("Mining error: {}", e);
+
+Some("mining") => { // Continuous mining functionality
+    let parts: Vec<&str> = command.split_whitespace().collect();
+
+    if parts.len() != 2 {
+        println!("Usage: mining <miner_wallet_name>");
+        continue;
+    }
+
+    loop {
+        if let Err(e) = mgmt.handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc).await {
+            println!("Mining error: {}", e);
+            break;
+        }
+    }
 }
-}
+
 Some("whisper") => {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let whisper = whisper_module.read().await;
