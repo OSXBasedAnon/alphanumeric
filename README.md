@@ -61,9 +61,6 @@ New-NetFirewallRule -Name "Alphanumeric Network" -DisplayName "Alphanumeric Netw
 - Rust (stable toolchain)
 - Cargo
 
-## Website
-https://www.empiremonster.com/p/alphanumeric.html
-
 ## Discord
 https://discord.gg/D3r7TRcj9t
 
