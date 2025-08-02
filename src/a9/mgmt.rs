@@ -735,14 +735,7 @@ impl Mgmt {
         write!(stdout, " wallet state...")?;
         stdout.flush()?;
 
-        // Sync wallets
-        {
-            let blockchain_guard = blockchain.write().await;
-            let mut blockchain_wallets = blockchain_guard.wallets.write().await;
-            for (_, wallet) in wallets.iter() {
-                blockchain_wallets.insert(wallet.address.clone(), wallet.clone());
-            }
-        }
+        // Wallets are already loaded and available for transaction creation
 
         // Get sender wallet
         let sender_wallet = match wallets
@@ -839,6 +832,8 @@ impl Mgmt {
             timestamp,
             Some(signature),
         );
+
+        // No wallet registry needed - transactions are self-contained with public keys
 
         match blockchain.read().await.add_transaction(transaction).await {
             Ok(_) => {

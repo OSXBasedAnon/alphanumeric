@@ -398,16 +398,20 @@ impl VelocityManager {
         const FAST_PATH_SIZE: usize = 150_000;
         const MAX_PARALLEL_SENDS: usize = 24;
         const MIN_LATENCY: u64 = 100;
-        const PROPAGATION_TIMEOUT: u64 = 2;
-        const MIN_SUCCESS_RATIO: f64 = 0.75;
+        const PROPAGATION_TIMEOUT: u64 = 5; // Increased for production stability
+        const MIN_SUCCESS_RATIO: f64 = 0.60; // Reduced for better reliability on slower networks
         const SUBNET_PEER_LIMIT: usize = 3;
 
         // Calculate block size
         let block_bytes =
             bincode::serialize(&block).map_err(|e| VelocityError::Encoding(e.to_string()))?;
 
+        log::debug!("Velocity: Processing block {} ({} bytes) with {} peers", 
+            hex::encode(&block.hash[..8]), block_bytes.len(), peers.len());
+        
         // Fast path for small blocks
         if block_bytes.len() < FAST_PATH_SIZE {
+            log::debug!("Velocity: Using fast path for small block");
             let mut fast_peers: Vec<_> = peers
                 .iter()
                 .filter(|(_, info)| info.latency < MIN_LATENCY)
@@ -446,16 +450,23 @@ impl VelocityManager {
                 successes = results.iter().filter(|r| r.is_ok()).count();
 
                 if successes >= min_confirmations {
+                    log::info!("Velocity: Fast path successful, {} confirmations", successes);
                     return Ok(());
+                } else {
+                    log::warn!("Velocity: Fast path failed, {} confirmations (needed {})", 
+                        successes, min_confirmations);
                 }
             }
         }
 
         // Regular path with erasure coding
+        log::debug!("Velocity: Using erasure coding path");
         let shards = self
             .erasure_manager
             .encode(&block_bytes)
             .map_err(|e| VelocityError::Encoding(e.to_string()))?;
+        
+        log::debug!("Velocity: Created {} shards for block propagation", shards.len());
 
         let mut subnet_peers: HashMap<IpAddr, Vec<(SocketAddr, u64)>> =
             HashMap::with_capacity(peers.len() / 4);
@@ -539,8 +550,12 @@ impl VelocityManager {
             / results.len().max(1) as f64;
 
         if success_ratio >= MIN_SUCCESS_RATIO {
+            log::info!("Velocity: Block propagation successful, {:.1}% success rate", 
+                success_ratio * 100.0);
             Ok(())
         } else {
+            log::error!("Velocity: Block propagation failed, {:.1}% success rate (needed {:.1}%)", 
+                success_ratio * 100.0, MIN_SUCCESS_RATIO * 100.0);
             Err(VelocityError::ShredValidation(format!(
                 "Insufficient propagation: {:.1}%",
                 success_ratio * 100.0
@@ -583,8 +598,40 @@ impl VelocityManager {
     }
 
     async fn send_shred(&self, peer: SocketAddr, shred: Shred) -> Result<(), VelocityError> {
-        // Implement actual network send
-        // This would integrate with your existing networking code
+        use tokio::net::TcpStream;
+        use tokio::io::{AsyncWriteExt, AsyncReadExt};
+        use crate::a9::node::{NetworkMessage, MAX_MESSAGE_SIZE};
+        
+        const TIMEOUT: Duration = Duration::from_secs(3);
+        
+        // Create network message
+        let message = NetworkMessage::Shred(shred);
+        
+        // Serialize message
+        let data = bincode::serialize(&message)
+            .map_err(|e| VelocityError::Encoding(e.to_string()))?;
+        
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(VelocityError::Network("Shred too large".into()));
+        }
+        
+        // Connect with timeout
+        let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(peer))
+            .await
+            .map_err(|_| VelocityError::Network(format!("Connection timeout to {}", peer)))?
+            .map_err(|e| VelocityError::Network(format!("Failed to connect to {}: {}", peer, e)))?;
+        
+        // Send message with length prefix
+        tokio::time::timeout(TIMEOUT, async {
+            stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&data).await?;
+            stream.flush().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| VelocityError::Network(format!("Send timeout to {}", peer)))?
+        .map_err(|e| VelocityError::Network(format!("Send error to {}: {}", peer, e)))?;
+        
         Ok(())
     }
 
@@ -770,8 +817,40 @@ impl VelocityManager {
         block_hash: [u8; 32],
         shreds: Vec<Shred>,
     ) -> Result<(), VelocityError> {
-        // Implement actual network send
-        // This would integrate with your existing networking code
+        use tokio::net::TcpStream;
+        use tokio::io::{AsyncWriteExt, AsyncReadExt};
+        use crate::a9::node::{NetworkMessage, MAX_MESSAGE_SIZE};
+        
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        
+        // Create response message
+        let message = NetworkMessage::ShredResponse { block_hash, shreds };
+        
+        // Serialize message
+        let data = bincode::serialize(&message)
+            .map_err(|e| VelocityError::Encoding(e.to_string()))?;
+        
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(VelocityError::Network("Response too large".into()));
+        }
+        
+        // Connect with timeout
+        let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(to))
+            .await
+            .map_err(|_| VelocityError::Network(format!("Connection timeout to {}", to)))?
+            .map_err(|e| VelocityError::Network(format!("Failed to connect to {}: {}", to, e)))?;
+        
+        // Send message with length prefix
+        tokio::time::timeout(TIMEOUT, async {
+            stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&data).await?;
+            stream.flush().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| VelocityError::Network(format!("Send timeout to {}", to)))?
+        .map_err(|e| VelocityError::Network(format!("Send error to {}: {}", to, e)))?;
+        
         Ok(())
     }
 

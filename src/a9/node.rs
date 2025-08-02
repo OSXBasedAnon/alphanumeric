@@ -106,7 +106,7 @@ const MAX_BLOCK_SIZE: usize = 2000;
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
 const MAX_CONCURRENT_CONNECTIONS: usize = 100;
-const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
+pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
@@ -864,7 +864,11 @@ impl Node {
             .map(|b| b.hash)
             .unwrap_or_default();
 
-        let velocity_manager = Some(Arc::new(VelocityManager::new()));
+        let velocity_manager = {
+            let vm = Arc::new(VelocityManager::new());
+            vm.clone().start_request_processor();
+            Some(vm)
+        };
 
         Ok(Self {
             db,
@@ -2865,15 +2869,40 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
 
-                    // Broadcast to peers
-                    let peers = self.peers.read().await;
-                    let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
-                    for &addr in &selected_peers {
-                        if let Err(e) = self
-                            .send_message(addr, &NetworkMessage::Block(block.clone()))
-                            .await
-                        {
-                            warn!("Failed to broadcast block to {}: {}", addr, e);
+                    // Broadcast to peers using velocity protocol if available
+                    if let Some(velocity) = &self.velocity_manager {
+                        let peers = self.peers.read().await;
+                        let peer_map: std::collections::HashMap<SocketAddr, PeerInfo> = peers
+                            .iter()
+                            .map(|(&addr, info)| (addr, info.clone()))
+                            .collect();
+                        
+                        // Try velocity protocol first for efficient block propagation
+                        if let Err(e) = velocity.process_block(&block, &peer_map).await {
+                            warn!("Velocity broadcast failed, falling back to traditional: {}", e);
+                            
+                            // Fallback to traditional broadcast
+                            let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
+                            for &addr in &selected_peers {
+                                if let Err(e) = self
+                                    .send_message(addr, &NetworkMessage::Block(block.clone()))
+                                    .await
+                                {
+                                    warn!("Failed to broadcast block to {}: {}", addr, e);
+                                }
+                            }
+                        }
+                    } else {
+                        // Traditional broadcast method
+                        let peers = self.peers.read().await;
+                        let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
+                        for &addr in &selected_peers {
+                            if let Err(e) = self
+                                .send_message(addr, &NetworkMessage::Block(block.clone()))
+                                .await
+                            {
+                                warn!("Failed to broadcast block to {}: {}", addr, e);
+                            }
                         }
                     }
                 }
@@ -2974,7 +3003,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         addr: SocketAddr,
         tx: &mpsc::Sender<NetworkEvent>,
     ) -> Result<(), NodeError> {
-        const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
+        pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
 
         if data.len() > MAX_MESSAGE_SIZE {
             self.record_peer_failure(addr).await;
@@ -3212,6 +3241,17 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                                     warn!("Failed to process block {}: {}", height, e);
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            NetworkMessage::ShredResponse { block_hash, shreds } => {
+                if let Some(velocity) = &self.velocity_manager {
+                    // Process each shred in the response
+                    for shred in shreds {
+                        if let Err(e) = velocity.handle_shred(shred, addr).await {
+                            warn!("Failed to handle shred response from {}: {}", addr, e);
                         }
                     }
                 }

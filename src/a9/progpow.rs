@@ -405,9 +405,8 @@ impl MiningManager {
                     current_network_difficulty,
                 )?;
 
-                new_block.hash = hash
-                    .try_into()
-                    .map_err(|_| MiningError::InvalidHashFormat)?;
+                // Use the hash found during mining (which met the target)
+                new_block.hash = hash.try_into().map_err(|_| MiningError::InvalidHashFormat)?;
 
                 match blockchain_lock
                     .finalize_block(new_block, miner_address.clone())

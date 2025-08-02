@@ -31,7 +31,9 @@ use crate::a9::{
     progpow::{Miner, MiningManager},
     whisper::WhisperModule,
 };
+use crate::config::AppConfig;
 mod a9;
+mod config;
 
 const KEY_FILE_PATH: &str = "private.key";
 
@@ -46,12 +48,21 @@ impl std::fmt::Display for Blockchain {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+    // Initialize logging with ERROR level during startup to avoid UI interference
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Error)
+        .init();
+
     print_ascii_intro();
+
+    // Load configuration from environment variables
+    let config = AppConfig::from_env();
+    config.log_config();
 
     let pb = ProgressBar::new(9);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {msg}")
+            .template("\r{spinner:.green} [{bar:40.cyan/blue}] {msg}")
             .progress_chars("█▓░"),
     );
 
@@ -141,6 +152,8 @@ let node = match Node::new(Arc::new(db.clone()), blockchain.clone(), key_pair, b
 };
 
 pb.inc(1);
+
+// Complete the progress bar and clear the line
 pb.finish_and_clear();
 
 // Spawn node task with integrated monitoring
@@ -948,9 +961,7 @@ Ok(whisper_tx) => {
     // Drop blockchain guard before getting write lock
     drop(blockchain_guard);
     let blockchain_guard = blockchain.write().await;
-    // Add wallet to blockchain state if not present
-    blockchain_guard.wallets.write().await.entry(sender_wallet.address.clone())
-        .or_insert_with(|| sender_wallet.clone());
+    // No wallet registry needed - transactions are self-contained with public keys
     match blockchain_guard.add_transaction(whisper_tx.clone()).await {
         Ok(_) => {
 let mut stdout = StandardStream::stdout(ColorChoice::Always);
