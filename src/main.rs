@@ -68,97 +68,96 @@ async fn main() -> Result<()> {
 
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
+        // Database init
+        pb.set_message("Initializing database...");
+        let db = match sled::open("blockchain.db") {
+            Ok(db) => db,
+            Err(e) => {
+                error!("Error opening database: {}", e);
+                return Err(Box::new(e) as Box<dyn Error>);
+            }
+        };
+        let db_arc = Arc::new(RwLock::new(db.clone()));
+        pb.inc(1);
 
-// Database init
-pb.set_message("Initializing database...");
-let db = match sled::open("blockchain.db") {
-    Ok(db) => db,
-    Err(e) => {
-        error!("Error opening database: {}", e);
-        return Err(Box::new(e) as Box<dyn Error>);
-    }
-};
-let db_arc = Arc::new(RwLock::new(db.clone()));
-pb.inc(1);
+        pb.set_message("Creating blockchain...");
+        let rate_limiter = Arc::new(RateLimiter::new(60, 100));
+        let difficulty = Arc::new(Mutex::new(0_u64));
 
-pb.set_message("Creating blockchain...");
-let rate_limiter = Arc::new(RateLimiter::new(60, 100));
-let difficulty = Arc::new(Mutex::new(0_u64));
+        let blockchain = Arc::new(RwLock::new(Blockchain::new(
+            db.clone(),
+            0.000563063063,
+            50.0,
+            100,
+            5,
+            rate_limiter.clone(),
+            difficulty.clone(), // Pass in the Arc<Mutex>
+        )));
 
-let blockchain = Arc::new(RwLock::new(Blockchain::new(
-    db.clone(),
-    0.000563063063,
-    50.0,
-    100,
-    5,
-    rate_limiter.clone(),
-    difficulty.clone(), // Pass in the Arc<Mutex>
-)));
+        pb.inc(1);
 
-pb.inc(1);
+        // Set specific message for balance verification
+        pb.set_message("Verifying blockchain state...");
+        if let Err(e) = blockchain.write().await.initialize().await {
+            error!("Failed to initialize blockchain: {}", e);
+            return Err(Box::new(e));
+        }
+        pb.inc(1);
 
-// Set specific message for balance verification
-pb.set_message("Verifying blockchain state...");
-if let Err(e) = blockchain.write().await.initialize().await {
-    error!("Failed to initialize blockchain: {}", e);
-    return Err(Box::new(e));
-}
-pb.inc(1);
+        // Continue with rest of initialization
+        pb.set_message("Setting up management...");
+        let (transaction_fee, mining_reward, difficulty_adjustment_interval, block_time) = {
+            let blockchain_lock = blockchain.read().await;
+            (
+                blockchain_lock.transaction_fee,
+                blockchain_lock.mining_reward,
+                blockchain_lock.difficulty_adjustment_interval,
+                blockchain_lock.block_time,
+            )
+        }; // blockchain_lock is dropped here
 
-// Continue with rest of initialization
-pb.set_message("Setting up management...");
-let (transaction_fee, mining_reward, difficulty_adjustment_interval, block_time) = {
-    let blockchain_lock = blockchain.read().await;
-    (
-        blockchain_lock.transaction_fee,
-        blockchain_lock.mining_reward,
-        blockchain_lock.difficulty_adjustment_interval,
-        blockchain_lock.block_time,
-    )
-}; // blockchain_lock is dropped here
+        let mgmt = Box::new(Mgmt::new(
+            db.clone(),
+            blockchain.clone(),
+        ));
+        pb.inc(1);
 
-let mgmt = Box::new(Mgmt::new(
-    db.clone(),
-    blockchain.clone(),
-));
-pb.inc(1);
+        // First generate the keypair
+        pb.set_message("Generating node keypair...");
+        let rng = SystemRandom::new();
+        let key_pair = Ed25519KeyPair::generate_pkcs8(&rng)
+            .map_err(|e| format!("Failed to generate key pair: {}", e))?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(key_pair.as_ref())
+            .map_err(|e| format!("Failed to create key pair from PKCS8: {}", e))?;
+        let public_key = key_pair.public_key().as_ref();
+        pb.inc(1);
 
-// First generate the keypair
-pb.set_message("Generating node keypair...");
-let rng = SystemRandom::new();
-let key_pair = Ed25519KeyPair::generate_pkcs8(&rng)
-    .map_err(|e| format!("Failed to generate key pair: {}", e))?;
-let key_pair = Ed25519KeyPair::from_pkcs8(key_pair.as_ref())
-    .map_err(|e| format!("Failed to create key pair from PKCS8: {}", e))?;
-let public_key = key_pair.public_key().as_ref();
-pb.inc(1);
+        // Then create the node (single instance)
+        pb.set_message("Creating node...");
+        let bind_addr = match Node::get_bind_address() {
+            Ok(ip) => Some(SocketAddr::new(ip, DEFAULT_PORT)),
+            Err(e) => {
+                error!("Failed to determine bind address: {}", e);
+                None
+            }
+        };
 
-// Then create the node (single instance)
-pb.set_message("Creating node...");
-let bind_addr = match Node::get_bind_address() {
-    Ok(ip) => Some(SocketAddr::new(ip, DEFAULT_PORT)),
-    Err(e) => {
-        error!("Failed to determine bind address: {}", e);
-        None
-    }
-};
+        let node = match Node::new(Arc::new(db.clone()), blockchain.clone(), key_pair, bind_addr).await {
+            Ok(node) => Arc::new(node),
+            Err(e) => {
+                error!("Failed to create node: {}", e);
+                return Err(e.into());
+            }
+        };
 
-let node = match Node::new(Arc::new(db.clone()), blockchain.clone(), key_pair, bind_addr).await {
-    Ok(node) => Arc::new(node),
-    Err(e) => {
-        error!("Failed to create node: {}", e);
-        return Err(e.into());
-    }
-};
+        pb.inc(1);
 
-pb.inc(1);
+        // Complete the progress bar and clear the line
+        pb.finish_and_clear();
 
-// Complete the progress bar and clear the line
-pb.finish_and_clear();
-
-// Spawn node task with integrated monitoring
-let node_clone = Arc::clone(&node);
-tokio::task::spawn_local(async move {
+        // Spawn node task with integrated monitoring
+        let node_clone = Arc::clone(&node);
+        tokio::task::spawn_local(async move {
     let local = tokio::task::LocalSet::new();
 
     local.spawn_local(async move {
@@ -412,18 +411,18 @@ tokio::task::spawn_local(async move {
         let passphrase = String::new();
         let mut wallet_encryption_state: Option<Vec<u8>> = None;
 
-    if !wallet_data.is_empty() {
-        println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
+        if !wallet_data.is_empty() {
+            println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
 
-        let passphrase = Password::new("Passphrase:")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .prompt()
-            .unwrap_or_default();
+            let passphrase = Password::new("Passphrase:")
+                .with_display_mode(PasswordDisplayMode::Masked)
+                .prompt()
+                .unwrap_or_default();
 
-        if !passphrase.trim().is_empty() {
-            wallet_encryption_state = Some(passphrase.trim().as_bytes().to_vec());
+            if !passphrase.trim().is_empty() {
+                wallet_encryption_state = Some(passphrase.trim().as_bytes().to_vec());
+            }
         }
-    }
 
         let mut wallets = if wallet_encryption_state.is_some() {
             mgmt.load_wallets(&db_arc, wallet_encryption_state.as_deref()).await?
@@ -434,8 +433,8 @@ tokio::task::spawn_local(async move {
 
         // Staking
         let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
-        blockchain.clone(),
-        Arc::clone(&node)
+            blockchain.clone(),
+            Arc::clone(&node)
         )));
 
         // Whisper
@@ -447,40 +446,40 @@ tokio::task::spawn_local(async move {
         let miner = Miner::new(blockchain.clone(), mining_manager);
         pb.inc(1);
 
-loop {
-let mut stdout = StandardStream::stdout(ColorChoice::Always);
-let mut color_spec = ColorSpec::new();
-color_spec.set_fg(Some(Color::White)).set_bold(true);
-stdout.set_color(&color_spec).unwrap();
-print!("αlphanumeric:");
-stdout.reset().unwrap();
-println!();
-println!("1. Create Transaction (format: create sender recipient amount)");
-println!("2. Whisper Code (format: whisper address msg)");
-println!("3. Show Balance (format: balance)");
-println!("4. Make New Wallet (format: new [wallet_name])");
-println!("5. Account Lookup (format: account address)");
-println!("6. Mine Block (format: mine miner_wallet_name)");
-println!("7. Exit");
+        loop {
+            let mut stdout = StandardStream::stdout(ColorChoice::Always);
+            let mut color_spec = ColorSpec::new();
+            color_spec.set_fg(Some(Color::White)).set_bold(true);
+            stdout.set_color(&color_spec).unwrap();
+            print!("αlphanumeric:");
+            stdout.reset().unwrap();
+            println!();
+            println!("1. Create Transaction (format: create sender recipient amount)");
+            println!("2. Whisper Code (format: whisper address msg)");
+            println!("3. Show Balance (format: balance)");
+            println!("4. Make New Wallet (format: new [wallet_name])");
+            println!("5. Account Lookup (format: account address)");
+            println!("6. Mine Block (format: mine miner_wallet_name)");
+            println!("7. Exit");
 
-let mut command = String::new();
-std::io::stdin().read_line(&mut command)?;
-let command = command.trim();
+            let mut command = String::new();
+            std::io::stdin().read_line(&mut command)?;
+            let command = command.trim();
 
-match command.split_whitespace().next() {
-    Some("create") | Some("send") | Some("transfer") => {
-// Handle the creation of the transaction
-if let Err(e) = mgmt
-.handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
-.await
-{
-println!("Error: {}", e);
-println!("Failed to create transaction: {}", e);
-}
-}
-Some("info") => {
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let mut color_spec = ColorSpec::new();
+            match command.split_whitespace().next() {
+                Some("create") | Some("send") | Some("transfer") => {
+                    // Handle the creation of the transaction
+                    if let Err(e) = mgmt
+                        .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
+                        .await
+                    {
+                        println!("Error: {}", e);
+                        println!("Failed to create transaction: {}", e);
+                    }
+                }
+                Some("info") => {
+                    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+                    let mut color_spec = ColorSpec::new();
 
     // Get total wallets and balance first
     let mut total_balance = 0.0;
