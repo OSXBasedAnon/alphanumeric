@@ -240,10 +240,10 @@ impl BloomFilter {
         let mut was_new = false;
         for i in 0..self.num_hashes {
             let hash = Self::hash(item, i);
-            let idx = (hash >> 6) as usize % self.bits.len();
-            let bit = 1u64 << (hash & 63);
-            let old = self.bits[idx].load(Ordering::Relaxed);
-            was_new |= old == false;
+            let idx = (hash as usize) % self.bits.len();
+            // CRITICAL FIX: Actually set the bit!
+            let old = self.bits[idx].swap(true, Ordering::Relaxed);
+            was_new |= !old; // Track if any bit was newly set
         }
         was_new
     }

@@ -17,10 +17,7 @@ use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use ipnet::Ipv4Net;
 use std::collections::HashSet;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
 
 use crate::a9::{
     blockchain::{Blockchain, RateLimiter, Transaction},
@@ -199,7 +196,6 @@ async fn main() -> Result<()> {
                 let mut sync_attempts: u32 = 0;
                 let mut discovery_failures: u32 = 0;
                 let mut consecutive_timeouts: u32 = 0;
-                let peer_state: DashMap<SocketAddr, PeerInfo> = DashMap::new();
 
                 loop {
                     tokio::select! {
@@ -222,7 +218,6 @@ async fn main() -> Result<()> {
 
                                 // Reset validation state
                                 node.validation_pool.active_validations.store(0, Ordering::SeqCst);
-                                peer_state.clear();
 
                                 // Attempt immediate network recovery
                                 if let Err(e) = node.discover_network_nodes().await {
@@ -408,7 +403,6 @@ async fn main() -> Result<()> {
         let key_data = fs::read_to_string(KEY_FILE_PATH).await.unwrap_or_else(|_| "[]".to_string());
         let wallet_data: Vec<WalletKeyData> = serde_json::from_str(&key_data).unwrap_or_else(|_| Vec::new());
 
-        let passphrase = String::new();
         let mut wallet_encryption_state: Option<Vec<u8>> = None;
 
         if !wallet_data.is_empty() {
@@ -1437,7 +1431,7 @@ let download_tasks: Vec<_> = sync_peers
                 block_buffer.push(block);
 
                 // Batch process when buffer gets large enough or every second
-                if block_buffer.len() >= 500 || last_update.elapsed() > Duration::from_secs(1) {
+                if block_buffer.len() >= 1000 || last_update.elapsed() > Duration::from_secs(1) {
                     let blockchain = blockchain.write().await;
                     
                     // Sort blocks by index before processing

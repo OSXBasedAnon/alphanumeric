@@ -1,4 +1,3 @@
-use dashmap::DashSet;
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -141,44 +140,43 @@ impl Mempool {
     }
 
     pub fn get_transactions_for_block(&self) -> Vec<Transaction> {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+
         let mut selected = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
         let mut total_size = 0;
-        let mut processed_senders = dashmap::DashSet::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
+        let mut processed_senders = HashSet::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
 
-        // Collect and sort transaction metadata in one pass
-        let mut tx_metadata: Vec<_> = self
-            .transactions
-            .iter()
-            .flat_map(|entry| {
-                let sender = entry.key().to_string();
-                entry
-                    .value()
-                    .iter()
-                    .map(|tx| {
-                        (
-                            sender.clone(),
-                            tx.fee_per_byte,
-                            tx.timestamp,
-                            tx.size,
-                            tx.transaction.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // Use a max-heap to efficiently get highest fee transactions
+        // Store metadata in heap, not the full transaction (avoids needing Ord on Transaction)
+        let mut heap: BinaryHeap<(FeePerByte, Reverse<u64>, String, usize)> =
+            BinaryHeap::with_capacity(MAX_TRANSACTIONS_PER_BLOCK * 2);
 
-        // Sort by fee rate (descending) and timestamp (ascending)
-        tx_metadata.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        // Collect only the best transaction per sender into the heap
+        // Store just the metadata for sorting, we'll fetch the transaction later
+        for entry in self.transactions.iter() {
+            let sender = entry.key();
 
-        // Single pass selection with optimal memory usage
-        for (sender, _, _, size, tx) in tx_metadata {
+            // Get the highest fee transaction from this sender
+            if let Some(best_tx) = entry.value().iter().max_by_key(|tx| tx.fee_per_byte) {
+                heap.push((best_tx.fee_per_byte, Reverse(best_tx.timestamp), sender.clone(), best_tx.size));
+            }
+        }
+
+        // Extract transactions from heap until we fill the block
+        while let Some((_, Reverse(timestamp), sender, size)) = heap.pop() {
             if selected.len() >= MAX_TRANSACTIONS_PER_BLOCK || total_size >= MAX_BLOCK_SIZE {
                 break;
             }
 
-            if processed_senders.insert(sender) && total_size + size <= MAX_BLOCK_SIZE {
-                selected.push(tx);
-                total_size += size;
+            if processed_senders.insert(sender.clone()) && total_size + size <= MAX_BLOCK_SIZE {
+                // Fetch the actual transaction from the map
+                if let Some(txs) = self.transactions.get(&sender) {
+                    if let Some(entry) = txs.iter().find(|e| e.timestamp == timestamp) {
+                        selected.push(entry.transaction.clone());
+                        total_size += size;
+                    }
+                }
             }
         }
 
@@ -207,29 +205,41 @@ impl Mempool {
     }
 
     fn evict_lowest_fee_transactions(&mut self, required_space: usize) {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+
         let mut space_freed = 0;
-        let mut to_evict = Vec::new();
 
-        // Work with references in first phase
-        for ref_multi in self.transactions.iter() {
-            if space_freed >= required_space {
-                break;
+        // Use a min-heap to efficiently find lowest fee transactions across all senders
+        // Store (fee, timestamp, sender, size) - removed idx as it's not used
+        let mut candidates = BinaryHeap::new();
+
+        for entry in self.transactions.iter() {
+            let sender = entry.key();
+            for tx in entry.value().iter() {
+                // Push with Reverse for min-heap behavior
+                candidates.push(Reverse((tx.fee_per_byte, tx.timestamp, sender.clone(), tx.size)));
             }
+        }
 
-            if let Some(lowest_fee_tx) = ref_multi.value().iter().min_by_key(|tx| tx.fee_per_byte) {
-                space_freed += lowest_fee_tx.size;
-                // Only clone what we absolutely need
-                to_evict.push((ref_multi.key().clone(), lowest_fee_tx.timestamp));
+        // Evict lowest fee transactions until we have enough space
+        let mut to_remove: Vec<(String, u64, usize)> = Vec::new();
+
+        while space_freed < required_space {
+            if let Some(Reverse((_, timestamp, sender, size))) = candidates.pop() {
+                to_remove.push((sender, timestamp, size));
+                space_freed += size;
+            } else {
+                break;
             }
         }
 
         // Batch removals
-        for (addr, timestamp) in to_evict {
+        for (addr, timestamp, size) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 if let Some(pos) = txs.iter().position(|tx| tx.timestamp == timestamp) {
-                    let removed = txs.remove(pos);
-                    self.total_size
-                        .fetch_sub(removed.size, AtomicOrdering::SeqCst);
+                    txs.remove(pos);
+                    self.total_size.fetch_sub(size, AtomicOrdering::SeqCst);
                 }
             }
         }

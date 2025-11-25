@@ -1,20 +1,15 @@
-use aes_gcm::KeyInit;
-use byteorder::{ByteOrder, LittleEndian};
-use futures_util::TryFutureExt;
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
-use num_bigint::{BigUint, ToBigUint};
+use num_bigint::BigUint;
 use num_cpus;
 use num_traits::ToPrimitive;
-use pqcrypto_traits::sign::DetachedSignature;
-use rand::Rng;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -316,22 +311,43 @@ impl MiningManager {
                     let end_nonce = start_nonce + nonces_per_thread;
                     let target = Arc::clone(&target);
 
+                    // CRITICAL OPTIMIZATION: Clone transactions ONCE per thread, not per hash
+                    let transactions_ref = transactions.clone();
+
                     for nonce in start_nonce..end_nonce {
                         if found.load(Ordering::Relaxed) {
                             return Ok(());
                         }
 
-                        let mut new_block = Block::new(
-                            local_header.number,
-                            previous_block_hash.clone(),
-                            previous_block_timestamp,
-                            transactions.clone(),
-                            nonce,
-                            current_network_difficulty,
-                        )?;
+                        // Don't create full Block - just calculate hash directly
+                        // We only need the full block when we find a valid nonce
+                        let hash = {
+                            let mut header_data = [0u8; 92];
+                            let mut offset = 0;
 
-                        let hash = new_block.calculate_hash_for_block();
-                        new_block.hash = hash;
+                            header_data[offset..offset+4].copy_from_slice(&local_header.number.to_le_bytes());
+                            offset += 4;
+
+                            header_data[offset..offset+32].copy_from_slice(&previous_block_hash);
+                            offset += 32;
+
+                            let timestamp = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            header_data[offset..offset+8].copy_from_slice(&timestamp.to_le_bytes());
+                            offset += 8;
+
+                            header_data[offset..offset+8].copy_from_slice(&nonce.to_le_bytes());
+                            offset += 8;
+
+                            header_data[offset..offset+8].copy_from_slice(&current_network_difficulty.to_le_bytes());
+                            offset += 8;
+
+                            header_data[offset..offset+32].copy_from_slice(&merkle_root);
+
+                            *blake3::hash(&header_data).as_bytes()
+                        };
 
                         let hash_int = BigUint::from_bytes_be(&hash);
                         if hash_int <= *target {

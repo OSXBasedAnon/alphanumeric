@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
 use log::error;
-use num_bigint::{BigUint, ToBigUint};
+use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use pqcrypto_dilithium::dilithium5::{
     detached_sign, keypair as dilithium_keypair, verify_detached_signature, DetachedSignature,
@@ -450,15 +450,29 @@ impl Block {
     }
 
     pub fn calculate_hash_for_block(&self) -> [u8; 32] {
-        let mut header_data = Vec::with_capacity(128);
-        header_data.extend_from_slice(&self.index.to_le_bytes());
-        header_data.extend_from_slice(&self.previous_hash);
-        header_data.extend_from_slice(&self.timestamp.to_le_bytes());
-        header_data.extend_from_slice(&self.nonce.to_le_bytes());
-        header_data.extend_from_slice(&self.difficulty.to_le_bytes());
-        header_data.extend_from_slice(&self.merkle_root); // ONLY the Merkle root
+        // Use a fixed-size array to avoid heap allocation
+        // Total: 4 + 32 + 8 + 8 + 8 + 32 = 92 bytes (fits on stack)
+        let mut header_data = [0u8; 92];
+        let mut offset = 0;
 
-        *blake3::hash(&header_data).as_bytes() // Hash the header data ONLY
+        header_data[offset..offset+4].copy_from_slice(&self.index.to_le_bytes());
+        offset += 4;
+
+        header_data[offset..offset+32].copy_from_slice(&self.previous_hash);
+        offset += 32;
+
+        header_data[offset..offset+8].copy_from_slice(&self.timestamp.to_le_bytes());
+        offset += 8;
+
+        header_data[offset..offset+8].copy_from_slice(&self.nonce.to_le_bytes());
+        offset += 8;
+
+        header_data[offset..offset+8].copy_from_slice(&self.difficulty.to_le_bytes());
+        offset += 8;
+
+        header_data[offset..offset+32].copy_from_slice(&self.merkle_root);
+
+        *blake3::hash(&header_data).as_bytes()
     }
 
     pub async fn validate_transactions_batch(
@@ -530,14 +544,13 @@ impl Block {
     }
 
     pub fn hash_to_hex_string(&self) -> String {
-        self.hash.iter().map(|b| format!("{:02x}", b)).collect()
+        // Use hex::encode which is optimized for this exact use case
+        hex::encode(&self.hash)
     }
 
     pub fn previous_hash_to_hex_string(&self) -> String {
-        self.previous_hash
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        // Use hex::encode which is optimized for this exact use case
+        hex::encode(&self.previous_hash)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -683,10 +696,18 @@ impl RateLimiter {
             .entry(address.to_string())
             .or_insert_with(Vec::new);
 
-        times.retain(|&t| {
-            let duration = now - t;
-            chrono::Duration::from_std(duration).unwrap_or_default() < self.window_size
-        });
+        // Optimization: Only cleanup if we have entries to clean
+        // Most of the time, the vector will be small and all entries valid
+        let window_secs = self.window_size.num_seconds() as u64;
+        let cutoff = now - std::time::Duration::from_secs(window_secs);
+
+        // Fast path: check if we need to cleanup at all
+        if !times.is_empty() && times[0] < cutoff {
+            // Binary search to find first valid entry
+            let first_valid = times.iter().position(|&t| t >= cutoff).unwrap_or(times.len());
+            // Efficiently remove old entries by draining
+            times.drain(0..first_valid);
+        }
 
         if times.len() >= self.max_requests {
             return false;
