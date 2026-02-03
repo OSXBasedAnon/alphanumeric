@@ -66,9 +66,3 @@ https://discord.gg/D3r7TRcj9t
 
 ## License
 This project is licensed under the MIT License.
-
-## Acknowledgments
-- The Rust community
-- Claude
-- Gemini
-- Microsoft
