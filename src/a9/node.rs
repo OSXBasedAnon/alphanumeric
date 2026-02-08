@@ -34,7 +34,7 @@ use rayon::prelude::*;
 use ring::{
     aead, hkdf,
     rand::SecureRandom,
-    signature::{Ed25519KeyPair, KeyPair},
+    signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -755,7 +755,8 @@ pub struct Node {
 
     // Security
     network_id: [u8; 32],
-    private_key_der: Vec<u8>,
+    handshake_public_key: Vec<u8>,
+    handshake_key_bytes: Arc<Vec<u8>>,
 
     // Filesystem
     pub lock_path: Arc<String>,
@@ -796,10 +797,12 @@ impl Node {
     pub async fn new(
         db: Arc<Db>,
         blockchain: Arc<RwLock<Blockchain>>,
-        private_key: Ed25519KeyPair,
+        handshake_key_bytes: Vec<u8>,
         bind_addr: Option<SocketAddr>,
     ) -> Result<Self, NodeError> {
         let (tx, _) = broadcast::channel(1000);
+        let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
         let p2p_key = identity::Keypair::generate_ed25519();
         let peer_id = PeerId::from(p2p_key.public()).to_string();
         let temporal_verification = Arc::new(TemporalVerification::new());
@@ -818,7 +821,7 @@ impl Node {
 
         let lock_path = lock_dir.join(format!(
             "{}.lock",
-            hex::encode(private_key.public_key().as_ref())
+            hex::encode(keypair.public_key().as_ref())
         ));
 
         // Check for existing lock
@@ -875,7 +878,7 @@ impl Node {
             peers: Arc::new(RwLock::new(HashMap::new())),
             blockchain,
             network_health: Arc::new(RwLock::new(NetworkHealth::new())),
-            node_id: hex::encode(private_key.public_key().as_ref()),
+            node_id: hex::encode(keypair.public_key().as_ref()),
             tx,
             start_time,
             validation_pool: Arc::new(ValidationPool::new()),
@@ -889,12 +892,13 @@ impl Node {
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             temporal_verification,
-            header_sentinel: None,
+            header_sentinel: Some(Arc::new(HeaderSentinel::new())),
             lock_path: Arc::new(lock_path.to_string_lossy().into_owned()),
             velocity_manager,
             network_id,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
-            private_key_der: Self::get_private_key_bytes(&private_key)?,
+            handshake_public_key: keypair.public_key().as_ref().to_vec(),
+            handshake_key_bytes: Arc::new(handshake_key_bytes),
         })
     }
 
@@ -963,11 +967,6 @@ impl Node {
         Ok((addr, listener))
     }
 
-    fn get_private_key_bytes(private_key: &Ed25519KeyPair) -> Result<Vec<u8>, NodeError> {
-        let key_bytes = private_key.public_key().as_ref().to_vec();
-        Ok(key_bytes)
-    }
-
     pub fn id(&self) -> &str {
         &self.node_id
     }
@@ -975,6 +974,34 @@ impl Node {
     // Get public key implementation
     pub fn get_public_key(&self) -> String {
         self.node_id.clone()
+    }
+
+    pub fn header_sentinel(&self) -> Option<Arc<HeaderSentinel>> {
+        self.header_sentinel.clone()
+    }
+
+    fn handshake_payload(message: &HandshakeMessage) -> Result<Vec<u8>, NodeError> {
+        let mut msg = message.clone();
+        msg.signature = Vec::new();
+        Ok(bincode::serialize(&msg)?)
+    }
+
+    fn sign_handshake(&self, message: &HandshakeMessage) -> Result<Vec<u8>, NodeError> {
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        let payload = Self::handshake_payload(message)?;
+        Ok(keypair.sign(&payload).as_ref().to_vec())
+    }
+
+    fn verify_handshake(&self, message: &HandshakeMessage) -> Result<(), NodeError> {
+        if message.public_key.len() != 32 || message.signature.len() != 64 {
+            return Err(NodeError::Network("Invalid handshake key/signature length".into()));
+        }
+        let payload = Self::handshake_payload(message)?;
+        let public_key = UnparsedPublicKey::new(&ED25519, &message.public_key);
+        public_key
+            .verify(&payload, &message.signature)
+            .map_err(|_| NodeError::Network("Invalid handshake signature".into()))
     }
 
     //----------------------------------------------------------------------
@@ -4104,16 +4131,17 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             .as_secs();
 
         // Create our handshake message
-        let our_handshake = HandshakeMessage {
+        let mut our_handshake = HandshakeMessage {
             version: NETWORK_VERSION,
             timestamp: now,
             nonce: local_nonce,
-            public_key: self.private_key_der.clone(),
+            public_key: self.handshake_public_key.clone(),
             node_id: self.node_id.clone(),
             network_id: self.network_id,
             blockchain_height,
-            signature: Vec::new(), // Will sign later
+            signature: Vec::new(), // Will sign below
         };
+        our_handshake.signature = self.sign_handshake(&our_handshake)?;
 
         if is_initiator {
             // Send our handshake first
@@ -4140,6 +4168,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             if peer_handshake.network_id != self.network_id {
                 return Err(NodeError::Network("Network ID mismatch".into()));
             }
+            self.verify_handshake(&peer_handshake)?;
 
             // Create and return PeerInfo
             let peer_info = PeerInfo {
@@ -4178,6 +4207,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             if peer_handshake.network_id != self.network_id {
                 return Err(NodeError::Network("Network ID mismatch".into()));
             }
+            self.verify_handshake(&peer_handshake)?;
 
             // Send our response
             let data = bincode::serialize(&our_handshake)?;

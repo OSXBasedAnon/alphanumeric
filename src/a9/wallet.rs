@@ -73,6 +73,8 @@ pub struct Wallet {
     pub encrypted_private_key: Option<Vec<u8>>,
     #[serde(skip)]
     keypair: Option<Arc<Mutex<WalletKeys>>>,
+    #[serde(skip)]
+    pub is_encrypted: bool,
 }
 
 impl Wallet {
@@ -114,6 +116,45 @@ impl Wallet {
             name: wallet_name,
             encrypted_private_key: Some(private_key),
             keypair: Some(Arc::new(Mutex::new(keys))),
+            is_encrypted: passphrase.map(|p| !p.is_empty()).unwrap_or(false),
+        })
+    }
+
+    pub fn from_key_bytes(
+        name: String,
+        wallet_address: String,
+        encrypted_private_key: Vec<u8>,
+        passphrase: Option<&[u8]>,
+        is_encrypted: bool,
+    ) -> Result<Self, String> {
+        let combined_bytes = if is_encrypted {
+            let pass = passphrase.ok_or("Passphrase required for encrypted wallet")?;
+            Self::decrypt_private_key(encrypted_private_key.clone(), pass)?
+        } else {
+            encrypted_private_key.clone()
+        };
+
+        if combined_bytes.len() < 4896 {
+            return Err("Invalid key data".to_string());
+        }
+
+        let (secret_bytes, public_bytes) = combined_bytes.split_at(4896);
+
+        let address_binary = hex::decode(&wallet_address)
+            .map_err(|_| "Invalid wallet address".to_string())?;
+
+        let keys = WalletKeys {
+            dilithium_secret_key_bytes: secret_bytes.to_vec(),
+            dilithium_public_key_bytes: public_bytes.to_vec(),
+        };
+
+        Ok(Self {
+            address_binary,
+            address: wallet_address,
+            name,
+            encrypted_private_key: Some(encrypted_private_key),
+            keypair: Some(Arc::new(Mutex::new(keys))),
+            is_encrypted,
         })
     }
 
@@ -199,6 +240,7 @@ impl Wallet {
             name: temp_wallet.name,
             encrypted_private_key: temp_wallet.encrypted_private_key,
             keypair: Some(Arc::new(Mutex::new(keys))),
+            is_encrypted: passphrase.map(|p| !p.is_empty()).unwrap_or(false),
         })
     }
 

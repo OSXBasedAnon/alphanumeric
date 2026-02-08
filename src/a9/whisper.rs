@@ -396,6 +396,8 @@ impl WhisperModule {
             fee: total_fee,
             timestamp,
             signature: Some(signature),
+            pub_key: wallet.get_public_key_hex().await,
+            sig_hash: None,
         };
 
         Ok(tx)
@@ -534,6 +536,8 @@ impl WhisperModule {
                                 amount: info.amount,
                                 timestamp: info.timestamp,
                                 signature: None,
+                                pub_key: None,
+                                sig_hash: None,
                             }),
                             timestamp: info.timestamp,
                             amount: info.amount,

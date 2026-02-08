@@ -115,28 +115,7 @@ impl Mgmt {
         let existing_data = fs::read_to_string(KEY_FILE_PATH).await?;
         let existing_keys = serde_json::from_str::<Vec<WalletKeyData>>(&existing_data)?;
 
-        // Get encryption state from first wallet (which we know exists)
-        let is_encrypted = existing_keys[0].is_encrypted;
-
-        // Validate encryption state consistency
-        if is_encrypted && passphrase.is_none() {
-            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-            writeln!(
-                stdout,
-                "\nError: Cannot create unencrypted wallet when default is encrypted"
-            )?;
-            stdout.reset()?;
-            return Err("Cannot mix encrypted and unencrypted wallets".into());
-        }
-        if !is_encrypted && passphrase.is_some() {
-            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-            writeln!(
-                stdout,
-                "\nError: Cannot create encrypted wallet when default is unencrypted"
-            )?;
-            stdout.reset()?;
-            return Err("Cannot mix encrypted and unencrypted wallets".into());
-        }
+        let is_encrypted = passphrase.map(|p| !p.is_empty()).unwrap_or(false);
 
         // Generate name for the new wallet
         let name = wallet_name.unwrap_or_else(|| format!("wallet_{}", wallets.len() + 1));
@@ -447,29 +426,27 @@ impl Mgmt {
                     let wallet_name = wallet_data.wallet_name.clone();
 
                     if let Some(private_key) = wallet_data.private_key {
-                        let mut wallet = Wallet::new(None)?;
-                        wallet.name = wallet_name.clone();
-                        wallet.address = wallet_data.wallet_address.clone();
-                        wallet.encrypted_private_key = Some(private_key);
-
-                        if !wallet_data.is_encrypted {
-                            wallets.insert(wallet_name.clone(), wallet);
+                        if wallet_data.is_encrypted && passphrase.is_none() {
+                            println!(
+                                "Failed to load encrypted wallet {}: passphrase required",
+                                wallet_name
+                            );
                             continue;
                         }
 
-                        // For encrypted wallets, trim the passphrase
-                        if let Some(pass) = passphrase {
-                            match wallet.sync_private_key(db_arc, pass).await {
-                                Ok(_) => {
-                                    wallets.insert(wallet_name.clone(), wallet);
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "Failed to load encrypted wallet {}: {}",
-                                        wallet_name, e
-                                    );
-                                    continue;
-                                }
+                        match Wallet::from_key_bytes(
+                            wallet_name.clone(),
+                            wallet_data.wallet_address.clone(),
+                            private_key,
+                            passphrase,
+                            wallet_data.is_encrypted,
+                        ) {
+                            Ok(wallet) => {
+                                wallets.insert(wallet_name.clone(), wallet);
+                            }
+                            Err(e) => {
+                                println!("Failed to load wallet {}: {}", wallet_name, e);
+                                continue;
                             }
                         }
                     }
@@ -495,7 +472,7 @@ impl Mgmt {
                     name.clone(),
                     wallet.address.clone(),
                     wallet.encrypted_private_key.clone(),
-                    wallet.encrypted_private_key.is_some(),
+                    wallet.is_encrypted,
                 )
             })
             .collect();
@@ -569,13 +546,23 @@ impl Mgmt {
         db_arc: &Arc<RwLock<Db>>,
     ) -> Result<()> {
         if command.len() < 2 {
-            return Err("Usage: mine <wallet_address>".into());
+            return Err("Usage: mine <wallet_name_or_address>".into());
         }
 
-        let wallet_address = command[1].to_string();
-        let miner_wallet = wallets
-            .get(&wallet_address)
-            .ok_or_else(|| format!("No wallet found with address: {}", wallet_address))?;
+        let wallet_input = command[1].to_string();
+        let miner_wallet = if let Some(w) = wallets.get(&wallet_input) {
+            w
+        } else {
+            wallets
+                .values()
+                .find(|w| w.address == wallet_input)
+                .ok_or_else(|| {
+                    format!(
+                        "No wallet found with name or address: {}",
+                        wallet_input
+                    )
+                })?
+        };
 
         let (transactions, last_hash, block_count, difficulty, mining_reward) = {
             let blockchain_guard = blockchain.read().await;
@@ -627,6 +614,8 @@ impl Mgmt {
                 amount: tx.amount.clone(),
                 timestamp: tx.timestamp.clone(),
                 signature: tx.signature.clone(),
+                pub_key: tx.pub_key.clone(),
+                sig_hash: tx.sig_hash.clone(),
             })
             .collect();
 
@@ -824,7 +813,7 @@ impl Mgmt {
         write!(stdout, " to blockchain...\n")?;
         stdout.flush()?;
 
-        let transaction = Transaction::new(
+        let mut transaction = Transaction::new(
             sender_address.clone(),
             recipient_address.clone(),
             amount,
@@ -832,6 +821,7 @@ impl Mgmt {
             timestamp,
             Some(signature),
         );
+        transaction.pub_key = sender_wallet.get_public_key_hex().await;
 
         // No wallet registry needed - transactions are self-contained with public keys
 

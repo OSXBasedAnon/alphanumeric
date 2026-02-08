@@ -1,4 +1,3 @@
-use base64;
 use bincode::serialize;
 use blake3;
 use chrono::Utc;
@@ -65,6 +64,21 @@ pub struct Transaction {
     pub amount: f64,
     pub timestamp: u64,
     pub signature: Option<String>,
+    #[serde(default)]
+    pub pub_key: Option<String>,
+    #[serde(default)]
+    pub sig_hash: Option<String>,
+}
+
+// Legacy transaction format (pre pub_key/sig_hash)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct LegacyTransaction {
+    pub sender: String,
+    pub recipient: String,
+    pub fee: f64,
+    pub amount: f64,
+    pub timestamp: u64,
+    pub signature: Option<String>,
 }
 
 impl Transaction {
@@ -87,6 +101,8 @@ impl Transaction {
             fee: Self::round_amount(fee),
             timestamp,
             signature,
+            pub_key: None,
+            sig_hash: None,
         }
     }
 
@@ -111,6 +127,8 @@ impl Transaction {
             fee,
             timestamp,
             signature: None,
+            pub_key: None,
+            sig_hash: None,
         };
 
         let transaction_data = serde_json::to_vec(&transaction)
@@ -121,18 +139,22 @@ impl Transaction {
             .ok_or("Failed to sign transaction")?;
 
         // Create new transaction with full signature for verification
-        let tx_with_full_sig = Self::new(
+        let mut tx_with_full_sig = Self::new(
             transaction.sender.clone(),
             transaction.recipient.clone(),
             transaction.amount,
             transaction.fee,
             transaction.timestamp,
-            Some(base64::encode(&full_signature)),
+            Some(hex::encode(&full_signature)),
+        );
+        tx_with_full_sig.sig_hash = Some(Self::signature_hash_hex(&full_signature));
+        tx_with_full_sig.pub_key = Some(
+            block_on(sender_wallet.get_public_key_hex()).ok_or("Failed to get public key")?,
         );
 
         // Verify the full signature
-        if let Some(pub_key) = block_on(sender_wallet.get_public_key_hex()) {
-            if !tx_with_full_sig.is_valid(&pub_key) {
+        if let Some(pub_key) = &tx_with_full_sig.pub_key {
+            if !tx_with_full_sig.is_valid(pub_key) {
                 return Err("Signature verification failed".to_string());
             }
         } else {
@@ -188,11 +210,17 @@ impl Transaction {
         }
     }
 
-    pub fn with_truncated_signature(&self) -> Self {
+    pub fn signature_hash_hex(signature_bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(signature_bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    pub fn with_truncated_signature(&self, sig_hash: String) -> Self {
         let truncated_signature = self.signature.as_ref().and_then(|sig| {
             hex::decode(sig)
                 .ok()
-                .map(|full_sig| hex::encode(&full_sig[..64]))
+                .map(|full_sig| hex::encode(&full_sig[..full_sig.len().min(64)]))
         });
 
         Transaction {
@@ -202,6 +230,8 @@ impl Transaction {
             fee: self.fee,
             timestamp: self.timestamp,
             signature: truncated_signature,
+            pub_key: self.pub_key.clone(),
+            sig_hash: Some(sig_hash),
         }
     }
 
@@ -253,10 +283,18 @@ impl Transaction {
         Ok(())
     }
 
-    async fn verify_signature(&self, blockchain: &Blockchain) -> Result<(), BlockchainError> {
-        // For now, skip signature verification in stored transactions
-        // Signature verification happens at submission time with full signatures
-        // Stored transactions only have truncated signatures for space efficiency
+    async fn verify_signature(&self, _blockchain: &Blockchain) -> Result<(), BlockchainError> {
+        // Enforce that a verified tx carries pub_key + signature hash.
+        if self.pub_key.is_none() || self.sig_hash.is_none() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+        if let Some(sig) = &self.signature {
+            let decoded =
+                hex::decode(sig).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+            if decoded.is_empty() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+        }
         Ok(())
     }
 
@@ -288,6 +326,19 @@ pub struct Block {
     pub previous_hash: [u8; 32],
     pub timestamp: u64,
     pub transactions: Vec<Transaction>,
+    pub nonce: u64,
+    pub difficulty: u64,
+    pub hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+}
+
+// Legacy block format (pre pub_key/sig_hash on Transaction)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyBlock {
+    pub index: u32,
+    pub previous_hash: [u8; 32],
+    pub timestamp: u64,
+    pub transactions: Vec<LegacyTransaction>,
     pub nonce: u64,
     pub difficulty: u64,
     pub hash: [u8; 32],
@@ -558,7 +609,7 @@ impl Block {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
-        bincode::deserialize(bytes).map_err(|e| Box::new(e) as Box<dyn Error>)
+        deserialize_block(bytes).map_err(|e| Box::new(e) as Box<dyn Error>)
     }
 }
 
@@ -673,6 +724,55 @@ impl From<Box<bincode::ErrorKind>> for BlockchainError {
     }
 }
 
+fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction, BlockchainError> {
+    if let Ok(tx) = bincode::deserialize::<Transaction>(bytes) {
+        return Ok(tx);
+    }
+    let legacy: LegacyTransaction = bincode::deserialize(bytes)
+        .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+    Ok(Transaction {
+        sender: legacy.sender,
+        recipient: legacy.recipient,
+        fee: legacy.fee,
+        amount: legacy.amount,
+        timestamp: legacy.timestamp,
+        signature: legacy.signature,
+        pub_key: None,
+        sig_hash: None,
+    })
+}
+
+fn deserialize_block(bytes: &[u8]) -> Result<Block, BlockchainError> {
+    if let Ok(block) = bincode::deserialize::<Block>(bytes) {
+        return Ok(block);
+    }
+    let legacy: LegacyBlock = bincode::deserialize(bytes)
+        .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+    Ok(Block {
+        index: legacy.index,
+        previous_hash: legacy.previous_hash,
+        timestamp: legacy.timestamp,
+        transactions: legacy
+            .transactions
+            .into_iter()
+            .map(|tx| Transaction {
+                sender: tx.sender,
+                recipient: tx.recipient,
+                fee: tx.fee,
+                amount: tx.amount,
+                timestamp: tx.timestamp,
+                signature: tx.signature,
+                pub_key: None,
+                sig_hash: None,
+            })
+            .collect(),
+        nonce: legacy.nonce,
+        difficulty: legacy.difficulty,
+        hash: legacy.hash,
+        merkle_root: legacy.merkle_root,
+    })
+}
+
 #[derive(Debug)]
 pub struct RateLimiter {
     windows: DashMap<String, Vec<tokio::time::Instant>>,
@@ -759,7 +859,7 @@ impl SystemKeyDeriver {
         // If signature is present, verify it
         if let Some(sig) = &tx.signature {
             let sig_bytes =
-                base64::decode(sig).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+                hex::decode(sig).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
 
             let detached_sig = DetachedSignature::from_bytes(&sig_bytes)
                 .map_err(|_| BlockchainError::InvalidTransactionSignature)?;
@@ -879,7 +979,7 @@ impl Blockchain {
 
         for result in pending_tree.iter() {
             let (key, tx_bytes) = result?;
-            if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                 if let Err(_) = self.validate_transaction(&tx, None).await {
                     invalid_txs.push(key.to_vec());
                 }
@@ -906,9 +1006,9 @@ impl Blockchain {
                 let mut transactions = Vec::new();
                 for item in tree.iter() {
                     if let Ok((_, tx_bytes)) = item {
-                        if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                            transactions.push(tx);
-                        }
+                    if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+                        transactions.push(tx);
+                    }
                     }
                 }
                 transactions
@@ -970,8 +1070,16 @@ impl Blockchain {
 
         self.chain_sentinel.add_block_verification(block, verifier);
 
-        // Only save if block is verified
-        if !self.chain_sentinel.is_block_verified(block) {
+        // Only save if block is verified (or quorum is not required)
+        let require_quorum = std::env::var("ALPHANUMERIC_REQUIRE_QUORUM")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let verification_count = self.chain_sentinel.get_verification_count(block);
+        if require_quorum {
+            if !self.chain_sentinel.is_block_verified(block) {
+                return Err(BlockchainError::InvalidBlockHeader);
+            }
+        } else if verification_count == 0 {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
@@ -982,8 +1090,34 @@ impl Blockchain {
         )
         .await?;
 
+        // Store block with truncated signatures to reduce chain size
+        let mut storage_block = block.clone();
+        storage_block.transactions = block
+            .transactions
+            .iter()
+            .map(|tx| {
+                if tx.sender == "MINING_REWARDS" {
+                    return tx.clone();
+                }
+
+                let mut full_tx = tx.clone();
+                if full_tx.sig_hash.is_none() {
+                    if let Some(sig_hex) = &full_tx.signature {
+                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+                        }
+                    }
+                }
+
+                match &full_tx.sig_hash {
+                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
+                    None => full_tx,
+                }
+            })
+            .collect();
+
         // Serialize and save block
-        let value = bincode::serialize(block)
+        let value = bincode::serialize(&storage_block)
             .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
 
         let key = format!("block_{}", block.index);
@@ -1030,14 +1164,15 @@ impl Blockchain {
         let signature = detached_sign(&message, &secret_key);
 
         // Create reward transaction
-        let reward_tx = Transaction::new(
+        let mut reward_tx = Transaction::new(
             "MINING_REWARDS".to_string(),
             miner_address,
             reward,
             super::blockchain::NETWORK_FEE,
             block.timestamp,
-            Some(base64::encode(signature.as_bytes())),
+            Some(hex::encode(signature.as_bytes())),
         );
+        reward_tx.sig_hash = Some(Transaction::signature_hash_hex(signature.as_bytes()));
 
         // Insert reward as first transaction
         block.transactions.insert(0, reward_tx);
@@ -1112,7 +1247,7 @@ impl Blockchain {
 
             // Explicitly remove any full signatures from memory
             if let Some(sig) = &tx.signature {
-                if let Ok(_) = base64::decode(sig) {
+                if let Ok(_) = hex::decode(sig) {
                     // The decoded signature is automatically dropped here
                     // Rust's ownership system ensures cleanup
                     println!(
@@ -1603,15 +1738,45 @@ impl Blockchain {
             return Err(BlockchainError::InsufficientFunds);
         }
 
-        // Signature verification is now handled in transaction.verify_signature() method
+        // Signature verification with public key binding
+        let pub_key = transaction
+            .pub_key
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+        let sig_hex = transaction
+            .signature
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
 
-        // Create storage version with truncated signature
-        let storage_tx = transaction.with_truncated_signature();
+        let sig_bytes =
+            hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        if !transaction.is_valid(pub_key) {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        // Verify address ownership (pubkey -> address)
+        let mut hasher = Sha256::new();
+        let pub_key_bytes =
+            hex::decode(pub_key).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        hasher.update(&pub_key_bytes);
+        let derived_addr = hex::encode(&hasher.finalize()[..20]);
+        if derived_addr != transaction.sender {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        let sig_hash = Transaction::signature_hash_hex(&sig_bytes);
+
+        // Ensure mempool has full signature + sig_hash
+        let mut mempool_tx = transaction.clone();
+        mempool_tx.sig_hash = Some(sig_hash.clone());
+
+        // Create storage version with truncated signature + signature hash
+        let storage_tx = mempool_tx.with_truncated_signature(sig_hash);
         let tx_id = storage_tx.get_tx_id();
 
         // Add to mempool first (faster in-memory operation)
         drop(mempool_guard); // Release read lock before getting write lock
-        self.add_to_mempool(storage_tx.clone()).await?;
+        self.add_to_mempool(mempool_tx).await?;
 
         // Store in pending transactions
         let pending_tree = self.db.open_tree("pending_transactions")?;
@@ -1632,7 +1797,7 @@ impl Blockchain {
 
         for item in pending_tree.iter() {
             if let Ok((_, tx_bytes)) = item {
-                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                     if tx.sender == address {
                         total += tx.amount + tx.fee;
                     }
@@ -1811,7 +1976,7 @@ impl Blockchain {
         let mut transactions = Vec::new();
         for result in pending_tree.iter() {
             let (_, tx_bytes) = result?;
-            if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                 transactions.push(tx);
             }
         }
@@ -1835,8 +2000,9 @@ impl Blockchain {
 
         for result in pending_tree.iter() {
             let (_, tx_bytes) = result?;
-            let transaction: Transaction = bincode::deserialize(&tx_bytes)?;
-            transactions.push(transaction);
+            if let Ok(transaction) = deserialize_transaction(&tx_bytes) {
+                transactions.push(transaction);
+            }
         }
 
         Ok(transactions)
@@ -1885,7 +2051,7 @@ impl Blockchain {
 
         for result in pending_tree.iter() {
             if let Ok((_, tx_bytes)) = result {
-                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                     if tx.sender == address {
                         let pending_spent = pending_balances.get(address).unwrap_or(&0.0);
                         // Get current balance from confirmed transactions
@@ -2045,7 +2211,7 @@ impl Blockchain {
         let pending_tree = self.db.open_tree("pending_transactions")?;
         for result in pending_tree.iter() {
             if let Ok((_, tx_bytes)) = result {
-                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                     if tx.sender == address {
                         spendable = Transaction::round_amount(spendable - (tx.amount + tx.fee));
                     }
@@ -2143,8 +2309,7 @@ impl Blockchain {
             .get(key.as_bytes())?
             .ok_or(BlockchainError::InvalidTransaction)?;
 
-        bincode::deserialize(&block_data)
-            .map_err(|e| BlockchainError::SerializationError(Box::new(e)))
+        deserialize_block(&block_data)
     }
 }
 
@@ -2265,5 +2430,12 @@ impl ChainSentinel {
             .get(&block.hash)
             .map(|v| v.integrity_confirmed)
             .unwrap_or(false)
+    }
+
+    pub fn get_verification_count(&self, block: &Block) -> u32 {
+        self.verified_blocks
+            .get(&block.hash)
+            .map(|v| v.verifiers.len() as u32)
+            .unwrap_or(0)
     }
 }

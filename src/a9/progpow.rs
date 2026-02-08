@@ -126,6 +126,8 @@ pub struct ProgPowTransaction {
     pub amount: f64,
     pub timestamp: u64,
     pub signature: Option<String>,
+    pub pub_key: Option<String>,
+    pub sig_hash: Option<String>,
 }
 
 impl From<ProgPowTransaction> for Transaction {
@@ -137,6 +139,8 @@ impl From<ProgPowTransaction> for Transaction {
             fee: p.fee,
             timestamp: p.timestamp,
             signature: p.signature,
+            pub_key: p.pub_key,
+            sig_hash: p.sig_hash,
         }
     }
 }
@@ -205,14 +209,17 @@ impl MiningManager {
         let transactions: Vec<Transaction> = transactions
             .iter()
             .map(|ptx| {
-                Transaction::new(
+                let mut tx = Transaction::new(
                     ptx.sender.clone(),
                     ptx.recipient.clone(),
                     ptx.amount,
                     ptx.fee,
                     ptx.timestamp,
                     ptx.signature.clone(),
-                )
+                );
+                tx.pub_key = ptx.pub_key.clone();
+                tx.sig_hash = ptx.sig_hash.clone();
+                tx
             })
             .collect();
 
@@ -361,7 +368,7 @@ impl MiningManager {
                         }
 
                         if nonce % update_interval == 0 {
-                            if let Ok(pb) = progress_bar.lock() {
+                            if let Ok(pb) = progress_bar.try_lock() {
                                 pb.set_position(nonce - current_nonce);
                                 let hash_hex = hex::encode(&hash);
                                 pb.set_message(format!(
@@ -371,16 +378,8 @@ impl MiningManager {
                                 ));
                             }
 
-                            let check_height = tokio::task::block_in_place(|| {
-                                futures::executor::block_on(async {
-                                    let guard = blockchain.read().await;
-                                    guard.get_block_count() as u32
-                                })
-                            });
-
-                            if check_height > current_header_number {
-                                return Ok(());
-                            }
+                            // Avoid blocking inside rayon threads; height changes will be picked
+                            // up on the next outer loop iteration.
                         }
                     }
                     Ok(())

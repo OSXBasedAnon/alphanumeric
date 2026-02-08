@@ -4,7 +4,7 @@ use inquire::{Password, PasswordDisplayMode};
 use log::{debug, error, warn};
 use rand::Rng;
 use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use ring::signature::Ed25519KeyPair;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io::Write;
@@ -23,7 +23,7 @@ use crate::a9::{
     blockchain::{Blockchain, RateLimiter, Transaction},
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
-    node::{Node, NodeError, PeerInfo, DEFAULT_PORT},
+    node::{Node, NodeError, DEFAULT_PORT},
     oracle::DifficultyOracle,
     progpow::{Miner, MiningManager},
     whisper::WhisperModule,
@@ -122,11 +122,8 @@ async fn main() -> Result<()> {
         // First generate the keypair
         pb.set_message("Generating node keypair...");
         let rng = SystemRandom::new();
-        let key_pair = Ed25519KeyPair::generate_pkcs8(&rng)
+        let key_pair_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|e| format!("Failed to generate key pair: {}", e))?;
-        let key_pair = Ed25519KeyPair::from_pkcs8(key_pair.as_ref())
-            .map_err(|e| format!("Failed to create key pair from PKCS8: {}", e))?;
-        let public_key = key_pair.public_key().as_ref();
         pb.inc(1);
 
         // Then create the node (single instance)
@@ -139,7 +136,13 @@ async fn main() -> Result<()> {
             }
         };
 
-        let node = match Node::new(Arc::new(db.clone()), blockchain.clone(), key_pair, bind_addr).await {
+        let node = match Node::new(
+            Arc::new(db.clone()),
+            blockchain.clone(),
+            key_pair_pkcs8.as_ref().to_vec(),
+            bind_addr,
+        )
+        .await {
             Ok(node) => Arc::new(node),
             Err(e) => {
                 error!("Failed to create node: {}", e);
@@ -426,9 +429,13 @@ async fn main() -> Result<()> {
         pb.inc(1);
 
         // Staking
+        let header_sentinel = node.header_sentinel().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Missing header sentinel")
+        })?;
         let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
             blockchain.clone(),
-            Arc::clone(&node)
+            Arc::clone(&node),
+            header_sentinel,
         )));
 
         // Whisper
@@ -439,6 +446,29 @@ async fn main() -> Result<()> {
 
         let miner = Miner::new(blockchain.clone(), mining_manager);
         pb.inc(1);
+
+        // Initialize BPoS sentinel at startup
+        {
+            let sentinel = staking_node.write().await;
+            if let Err(e) = sentinel.initialize().await {
+                error!("Failed to initialize staking sentinel: {}", e);
+            } else {
+                let blockchain_guard = blockchain.read().await;
+                for wallet in wallets.values() {
+                    let balance = blockchain_guard
+                        .get_wallet_balance(&wallet.address)
+                        .await
+                        .unwrap_or(0.0);
+                    if let Err(e) = sentinel.register_wallet_metrics(&wallet.address, balance).await
+                    {
+                        error!(
+                            "Failed to register metrics for wallet {}: {}",
+                            wallet.address, e
+                        );
+                    }
+                }
+            }
+        }
 
         loop {
             let mut stdout = StandardStream::stdout(ColorChoice::Always);

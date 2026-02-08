@@ -176,6 +176,7 @@ pub struct BPoSSentinel {
     node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     peer_sentinels: Arc<RwLock<DashMap<String, Vec<u8>>>>,
     verified_headers: Arc<RwLock<VecDeque<(u32, [u8; 32])>>>,
+    initialized: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BPoSSentinel {
@@ -185,7 +186,11 @@ impl BPoSSentinel {
     const MAX_VERIFIED_BLOCKS: usize = 200;
     const MAX_ANOMALIES: usize = 100;
 
-    pub fn new(blockchain: Arc<RwLock<Blockchain>>, node: Arc<Node>) -> Self {
+    pub fn new(
+        blockchain: Arc<RwLock<Blockchain>>,
+        node: Arc<Node>,
+        header_sentinel: Arc<HeaderSentinel>,
+    ) -> Self {
         Self {
             blockchain,
             node,
@@ -194,7 +199,7 @@ impl BPoSSentinel {
             network_health: Arc::new(RwLock::new(NetworkHealth::new())),
             stats: Arc::new(RwLock::new(SentinelStats::default())),
             controller: BPoSController::new(BPoSConfig::default()),
-            header_sentinel: Arc::new(HeaderSentinel::new()),
+            header_sentinel,
             anomaly_detector: Arc::new(RwLock::new(AnomalyDetector {
                 recent_anomalies: VecDeque::with_capacity(1000),
                 detection_thresholds: HashMap::new(),
@@ -208,10 +213,17 @@ impl BPoSSentinel {
             node_sentinel: None,
             peer_sentinels: Arc::new(RwLock::new(DashMap::new())),
             verified_headers: Arc::new(RwLock::new(VecDeque::new())),
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub async fn initialize(&self) -> Result<(), String> {
+        if self
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
         // Removed info log for production - initialization is implicit
 
         // Start independent monitoring tasks
@@ -2146,6 +2158,7 @@ impl Clone for BPoSSentinel {
             node_sentinel: self.node_sentinel.clone(),
             peer_sentinels: Arc::clone(&self.peer_sentinels),
             verified_headers: Arc::clone(&self.verified_headers),
+            initialized: Arc::clone(&self.initialized),
         }
     }
 }

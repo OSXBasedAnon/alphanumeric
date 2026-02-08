@@ -182,7 +182,7 @@ impl ShredCache {
 
     pub fn add_shred(&self, shred: Shred) -> bool {
         let key = Self::create_shred_key(&shred);
-        if !self.bloom.check(&key) {
+        if self.bloom.check(&key) {
             return false;
         }
 
