@@ -1274,10 +1274,7 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
 
-        let ip = match self.get_external_ip().await {
-            Some(ip) => ip.to_string(),
-            None => return Ok(()), // Skip announce if we can't determine a usable IP
-        };
+        let ip = self.get_external_ip().await.map(|ip| ip.to_string());
 
         let height = {
             let blockchain = self.blockchain.read().await;
@@ -1285,7 +1282,7 @@ impl Node {
         };
 
         let message = json!({
-            "ip": ip,
+            "ip": ip.clone().unwrap_or_default(),
             "port": self.bind_addr.port(),
             "node_id": &self.node_id,
             "public_key": &self.node_id,
@@ -1301,7 +1298,7 @@ impl Node {
         let signature = keypair.sign(canonical.as_bytes());
 
         let payload = json!({
-            "ip": ip,
+            "ip": ip.unwrap_or_default(),
             "port": self.bind_addr.port(),
             "node_id": &self.node_id,
             "public_key": &self.node_id,

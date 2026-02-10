@@ -74,6 +74,25 @@ async fn main() -> Result<()> {
                 return Err(Box::new(e) as Box<dyn Error>);
             }
         };
+        {
+            let db_for_signal = db.clone();
+            if let Err(e) = ctrlc::set_handler(move || {
+                let _ = db_for_signal.flush();
+                eprintln!("Shutting down cleanly...");
+                std::process::exit(0);
+            }) {
+                error!("Failed to set Ctrl-C handler: {}", e);
+            }
+        }
+        {
+            let db_for_signal = db.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = db_for_signal.flush();
+                eprintln!("Shutting down cleanly...");
+                std::process::exit(0);
+            });
+        }
         let db_arc = Arc::new(RwLock::new(db.clone()));
         pb.inc(1);
 
