@@ -7,7 +7,7 @@ use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -33,6 +33,7 @@ mod a9;
 mod config;
 
 const KEY_FILE_PATH: &str = "private.key";
+const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -66,8 +67,12 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         // Database init
-        pb.set_message("Initializing database...");
+        pb.set_message("Checking bootstrap snapshot...");
         let db_path = "blockchain.db";
+        if let Err(e) = ensure_bootstrap_db(db_path).await {
+            error!("Bootstrap failed: {}", e);
+        }
+        pb.set_message("Initializing database...");
         ensure_db_lock(db_path)?;
         let db = match sled::Config::new()
             .path(db_path)
@@ -752,6 +757,77 @@ if pending_txs.len() > 0 {
     color_spec.set_fg(Some(Color::Rgb(180, 219, 210)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Total Pending Fees: {:.8} ♦\n", pending_fees)?;
+}
+
+async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
+    let path = std::path::Path::new(db_path);
+    if path.exists() && path.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(path) {
+            if entries.next().is_some() {
+                return Ok(());
+            }
+        }
+    }
+
+    let url = std::env::var("ALPHANUMERIC_BOOTSTRAP_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string());
+
+    if url.is_empty() {
+        return Ok(());
+    }
+
+    let required = std::env::var("ALPHANUMERIC_BOOTSTRAP_REQUIRED")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let res = reqwest::get(&url).await;
+    let res = match res {
+        Ok(r) => r,
+        Err(e) => {
+            if required {
+                return Err(Box::new(e));
+            }
+            return Ok(());
+        }
+    };
+
+    if !res.status().is_success() {
+        if required {
+            return Err(format!("Bootstrap download failed: {}", res.status()).into());
+        }
+        return Ok(());
+    }
+
+    let bytes = res.bytes().await?;
+    let zip_path = format!("{}.zip", db_path);
+    fs::write(&zip_path, &bytes).await?;
+
+    let extract_path = db_path.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&zip_path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        std::fs::create_dir_all(&extract_path)?;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let outpath = std::path::Path::new(&extract_path).join(file.name());
+            if file.name().ends_with('/') {
+                std::fs::create_dir_all(&outpath)?;
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut outfile = std::fs::File::create(&outpath)?;
+                std::io::copy(&mut file, &mut outfile)?;
+            }
+        }
+        std::fs::remove_file(&zip_path).ok();
+        Ok(())
+    })
+    .await??;
+
+    Ok(())
 }
     stdout.reset()?;
 },

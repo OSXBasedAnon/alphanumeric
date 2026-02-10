@@ -47,7 +47,8 @@ alphanumeric provides an interactive command line interface for blockchain manag
 - `diagnostics`: Run blockchain diagnostic checks and display metrics
 
 ## Getting Started
-You will need the blockchain.db for the application to run, make sure the blockchain.db folder is in the root directory.
+On first launch, the node will attempt to download a bootstrap snapshot from `https://alphanumeric.blue/bootstrap/blockchain.db.zip`.
+If a local `blockchain.db` already exists, it will use that instead.
 
 To allow other nodes to connect to your blockchain node, you need to open port 7177 (TCP) in your router. You have to configure your server to accept incoming and outgoing connections for port 7177.
 
