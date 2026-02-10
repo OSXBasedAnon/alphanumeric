@@ -1468,6 +1468,7 @@ impl Node {
             let blockchain = self.blockchain.read().await;
             blockchain.calculate_network_hashrate().await
         };
+        let hashrate_ths_str = format!("{:.6}", hashrate_ths);
 
         let peers = self.peers.read().await.len() as u32;
         let uptime_secs = SystemTime::now()
@@ -1481,7 +1482,7 @@ impl Node {
             "public_key": &self.node_id,
             "height": height,
             "difficulty": difficulty,
-            "hashrate_ths": hashrate_ths,
+            "hashrate_ths": hashrate_ths_str,
             "last_block_time": last_block_time,
             "peers": peers,
             "version": format!("rust-{}", NETWORK_VERSION),
@@ -1498,7 +1499,7 @@ impl Node {
             "public_key": &self.node_id,
             "height": height,
             "difficulty": difficulty,
-            "hashrate_ths": hashrate_ths,
+            "hashrate_ths": hashrate_ths_str,
             "last_block_time": last_block_time,
             "peers": peers,
             "version": format!("rust-{}", NETWORK_VERSION),
