@@ -304,7 +304,7 @@ async fn main() -> Result<()> {
                             let peers = node.peers.read().await;
                             let active_peers = peers.len();
 
-                            if active_peers >= MIN_VIABLE_PEERS {
+                            if active_peers > 0 {
                                 // Calculate network health with safe division
                                 let avg_latency = peers.iter()
                                     .filter(|(_, info)| info.latency >= MIN_PEER_LATENCY)
