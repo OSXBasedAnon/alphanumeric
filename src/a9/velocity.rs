@@ -599,7 +599,7 @@ impl VelocityManager {
 
     async fn send_shred(&self, peer: SocketAddr, shred: Shred) -> Result<(), VelocityError> {
         use tokio::net::TcpStream;
-        use tokio::io::{AsyncWriteExt, AsyncReadExt};
+        use tokio::io::AsyncWriteExt;
         use crate::a9::node::{NetworkMessage, MAX_MESSAGE_SIZE};
         
         const TIMEOUT: Duration = Duration::from_secs(3);
@@ -818,7 +818,7 @@ impl VelocityManager {
         shreds: Vec<Shred>,
     ) -> Result<(), VelocityError> {
         use tokio::net::TcpStream;
-        use tokio::io::{AsyncWriteExt, AsyncReadExt};
+        use tokio::io::AsyncWriteExt;
         use crate::a9::node::{NetworkMessage, MAX_MESSAGE_SIZE};
         
         const TIMEOUT: Duration = Duration::from_secs(5);

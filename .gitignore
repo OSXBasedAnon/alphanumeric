@@ -1,0 +1,12 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local data
+/blockchain.db/
+/private.key
+/path/
+
+# OS
+.DS_Store
+Thumbs.db

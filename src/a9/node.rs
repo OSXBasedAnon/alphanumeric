@@ -1,4 +1,5 @@
 use arrayref::array_ref;
+use axum::{extract::State, routing::get, Json, Router};
 use bytes::{BufMut, BytesMut};
 use dashmap::DashMap;
 use futures_util::{
@@ -7,7 +8,6 @@ use futures_util::{
     TryFutureExt,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
-use lazy_static::lazy_static;
 use libp2p::{
     core::{
         connection::ConnectedPoint, muxing::StreamMuxerBox, transport::upgrade, upgrade::Version,
@@ -31,12 +31,14 @@ use log::{debug, error, info, trace, warn};
 use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rayon::prelude::*;
+use reqwest::Client;
 use ring::{
     aead, hkdf,
     rand::SecureRandom,
     signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sled::Db;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -96,6 +98,17 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // seconds
 const SYNC_TIMEOUT: u64 = 60; // seconds
 const DISCOVERY_INTERVAL: u64 = 1800; // 30 minutes
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
+const ANNOUNCE_INTERVAL: u64 = 60; // seconds
+const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
+const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_DISCOVERY_BASE: &str = "https://alphanumeric.blue";
+const DEFAULT_DNS_SEEDS: &[&str] = &[
+    "seed.alphanumeric.network:7177",
+    "seed2.alphanumeric.network:7177",
+    "a9seed.mynode.network:7177",
+];
+const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
+const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
 // Protocol
 const NETWORK_VERSION: u32 = 1;
@@ -739,8 +752,11 @@ pub struct Node {
     peer_failures: Arc<RwLock<HashMap<SocketAddr, u32>>>,
     peer_secrets: Arc<RwLock<HashMap<SocketAddr, Vec<u8>>>>,
     pub rate_limiter: Arc<RateLimiter>,
+    http_client: Client,
     p2p_swarm: Arc<RwLock<Option<HybridSwarm>>>,
     peer_id: String,
+    inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
+    peer_cache_path: Arc<String>,
 
     // Consensus state
     block_response_channels: Arc<RwLock<HashMap<Uuid, mpsc::Sender<NetworkMessage>>>>,
@@ -781,6 +797,36 @@ struct ValidationCacheEntry {
     pub verification_count: u32,
 }
 
+#[derive(Clone)]
+struct StatsState {
+    blockchain: Arc<RwLock<Blockchain>>,
+    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
+    start_time: u64,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    height: u32,
+    difficulty: u64,
+    hashrate_ths: f64,
+    last_block_time: u64,
+    peers: usize,
+    version: String,
+    uptime_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryResponse {
+    ok: bool,
+    peers: Vec<DiscoveryPeer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryPeer {
+    ip: String,
+    port: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ConsensusMessage {
     PrepareRequest(Block),
@@ -810,6 +856,14 @@ impl Node {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
+        let http_client = Client::builder()
+            .timeout(Duration::from_millis(DISCOVERY_HTTP_TIMEOUT_MS))
+            .build()
+            .map_err(|e| NodeError::Network(format!("HTTP client error: {}", e)))?;
+        let peer_cache_path = std::env::var("ALPHANUMERIC_PEER_CACHE_PATH").unwrap_or_else(|_| {
+            let path = std::env::temp_dir().join("alphanumeric_peers.json");
+            path.to_string_lossy().into_owned()
+        });
 
         // Initialize socket and listener
         let (bind_addr, listener) = Self::initialize_listener(bind_addr)?;
@@ -889,6 +943,7 @@ impl Node {
             bind_addr,
             listener,
             p2p_swarm: Arc::new(RwLock::new(None)),
+            http_client,
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             temporal_verification,
@@ -899,6 +954,8 @@ impl Node {
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             handshake_public_key: keypair.public_key().as_ref().to_vec(),
             handshake_key_bytes: Arc::new(handshake_key_bytes),
+            inbound_attempts: Arc::new(RwLock::new(HashMap::new())),
+            peer_cache_path: Arc::new(peer_cache_path),
         })
     }
 
@@ -1004,6 +1061,425 @@ impl Node {
             .map_err(|_| NodeError::Network("Invalid handshake signature".into()))
     }
 
+    fn canonicalize_json(value: &Value) -> Value {
+        match value {
+            Value::Array(items) => {
+                Value::Array(items.iter().map(Self::canonicalize_json).collect())
+            }
+            Value::Object(map) => {
+                let mut keys: Vec<_> = map.keys().cloned().collect();
+                keys.sort();
+                let mut new_map = serde_json::Map::new();
+                for key in keys {
+                    if let Some(v) = map.get(&key) {
+                        new_map.insert(key, Self::canonicalize_json(v));
+                    }
+                }
+                Value::Object(new_map)
+            }
+            _ => value.clone(),
+        }
+    }
+
+    fn canonical_json_string(value: &Value) -> Result<String, NodeError> {
+        let canonical = Self::canonicalize_json(value);
+        serde_json::to_string(&canonical)
+            .map_err(|e| NodeError::Serialization(format!("JSON canonicalization error: {}", e)))
+    }
+
+    fn dns_seeds() -> Vec<&'static str> {
+        let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS").ok();
+        if let Some(seeds) = override_seeds {
+            let parsed: Vec<String> = seeds
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Store in leaked static to satisfy lifetime; minimal footprint.
+            if !parsed.is_empty() {
+                let leaked: Vec<&'static str> = parsed
+                    .into_iter()
+                    .map(|s| Box::leak(s.into_boxed_str()))
+                    .collect();
+                return leaked;
+            }
+        }
+        DEFAULT_DNS_SEEDS.to_vec()
+    }
+
+    fn discovery_bases() -> Vec<String> {
+        let bases = std::env::var("ALPHANUMERIC_DISCOVERY_BASES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if !bases.is_empty() {
+            return bases;
+        }
+
+        vec![std::env::var("ALPHANUMERIC_DISCOVERY_BASE").unwrap_or_else(|_| {
+            DEFAULT_DISCOVERY_BASE.to_string()
+        })]
+    }
+
+    fn discovery_peers_urls() -> Vec<String> {
+        if let Ok(url) = std::env::var("ALPHANUMERIC_DISCOVERY_URL") {
+            return vec![url];
+        }
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/peers", base))
+            .collect()
+    }
+
+    fn discovery_announce_urls() -> Vec<String> {
+        if let Ok(url) = std::env::var("ALPHANUMERIC_ANNOUNCE_URL") {
+            return vec![url];
+        }
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/announce", base))
+            .collect()
+    }
+
+    fn discovery_headers_urls() -> Vec<String> {
+        if let Ok(url) = std::env::var("ALPHANUMERIC_HEADERS_URL") {
+            return vec![url];
+        }
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/headers", base))
+            .collect()
+    }
+
+    async fn get_external_ip(&self) -> Option<IpAddr> {
+        // Prefer a concrete bind address if available
+        let ip = self.bind_addr.ip();
+        if !ip.is_unspecified() && !ip.is_loopback() {
+            return Some(ip);
+        }
+
+        if let Ok((v4, _v6)) = self.discover_external_addresses(STUN_SERVERS).await {
+            if let Some(ip) = v4 {
+                return Some(ip);
+            }
+        }
+
+        None
+    }
+
+    async fn fetch_discovery_peers(&self) -> Result<Vec<SocketAddr>, NodeError> {
+        let mut all_addrs = Vec::new();
+        let mut any_ok = false;
+
+        for url in Self::discovery_peers_urls() {
+            let res = self.http_client.get(url).send().await;
+            let res = match res {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if !res.status().is_success() {
+                continue;
+            }
+
+            let body = res.json::<DiscoveryResponse>().await;
+            let body = match body {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            if !body.ok {
+                continue;
+            }
+
+            any_ok = true;
+            for peer in body.peers {
+                if let Ok(ip) = peer.ip.parse::<IpAddr>() {
+                    all_addrs.push(SocketAddr::new(ip, peer.port));
+                }
+            }
+        }
+
+        if !any_ok {
+            return Err(NodeError::Network("Discovery fetch failed".into()));
+        }
+
+        Ok(all_addrs)
+    }
+
+    async fn connect_discovery_peers(&self, limit: usize) -> Result<(), NodeError> {
+        let mut addrs = self.fetch_discovery_peers().await?;
+        addrs.retain(|addr| *addr != self.bind_addr);
+        addrs.shuffle(&mut thread_rng());
+
+        let mut connected = 0usize;
+        for addr in addrs.into_iter().take(limit) {
+            match timeout(Duration::from_secs(5), self.verify_peer(addr)).await {
+                Ok(Ok(_)) => {
+                    connected += 1;
+                }
+                _ => {}
+            }
+        }
+
+        if connected > 0 {
+            info!("Connected to {} peer(s) via discovery service", connected);
+        }
+
+        Ok(())
+    }
+
+    fn load_peer_cache(&self) -> Vec<SocketAddr> {
+        let path = &*self.peer_cache_path;
+        let data = std::fs::read_to_string(path);
+        if data.is_err() {
+            return Vec::new();
+        }
+        let data = data.unwrap_or_default();
+        let list: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
+        list.into_iter()
+            .filter_map(|s| s.parse::<SocketAddr>().ok())
+            .collect()
+    }
+
+    fn save_peer_cache(&self, peers: &[SocketAddr]) -> Result<(), NodeError> {
+        let path = &*self.peer_cache_path;
+        let tmp_path = format!("{}.tmp", path);
+        let list: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+        let data = serde_json::to_string(&list)
+            .map_err(|e| NodeError::Serialization(format!("Peer cache error: {}", e)))?;
+        std::fs::write(&tmp_path, data)
+            .map_err(|e| NodeError::Io(format!("Peer cache write error: {}", e)))?;
+        let _ = std::fs::rename(&tmp_path, path);
+        Ok(())
+    }
+
+    fn score_peer_for_cache(peer: &PeerInfo, now: u64) -> f64 {
+        let age = now.saturating_sub(peer.last_seen) as f64;
+        let latency = peer.latency as f64;
+        let height = peer.blocks as f64;
+        // Higher is better
+        height * 0.002 - age * 0.02 - latency * 0.005
+    }
+
+    async fn announce_to_discovery(&self) -> Result<(), NodeError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let ip = match self.get_external_ip().await {
+            Some(ip) => ip.to_string(),
+            None => return Ok(()), // Skip announce if we can't determine a usable IP
+        };
+
+        let height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_block_count() as u32
+        };
+
+        let message = json!({
+            "ip": ip,
+            "port": self.bind_addr.port(),
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "version": format!("rust-{}", NETWORK_VERSION),
+            "height": height,
+            "last_seen": now,
+            "latency_ms": 0
+        });
+
+        let canonical = Self::canonical_json_string(&message)?;
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        let signature = keypair.sign(canonical.as_bytes());
+
+        let payload = json!({
+            "ip": ip,
+            "port": self.bind_addr.port(),
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "version": format!("rust-{}", NETWORK_VERSION),
+            "height": height,
+            "last_seen": now,
+            "latency_ms": 0,
+            "signature": hex::encode(signature.as_ref())
+        });
+
+        let mut any_ok = false;
+        for url in Self::discovery_announce_urls() {
+            let res = self.http_client.post(url).json(&payload).send().await;
+            match res {
+                Ok(res) if res.status().is_success() => any_ok = true,
+                Ok(res) => warn!("Discovery announce failed: {}", res.status()),
+                Err(e) => warn!("Discovery announce error: {}", e),
+            }
+        }
+
+        if !any_ok {
+            warn!("Discovery announce failed on all endpoints");
+        }
+
+        Ok(())
+    }
+
+    async fn post_header_snapshot(&self) -> Result<(), NodeError> {
+        let blockchain = self.blockchain.read().await;
+        let height = blockchain.get_block_count() as u32;
+        if height == 0 {
+            return Ok(());
+        }
+
+        let start = height.saturating_sub(20);
+        let mut headers = Vec::new();
+        for h in start..=height {
+            if let Ok(block) = blockchain.get_block(h) {
+                headers.push(json!({
+                    "height": block.index,
+                    "hash": hex::encode(block.hash),
+                    "prev_hash": hex::encode(block.previous_hash),
+                    "timestamp": block.timestamp
+                }));
+            }
+        }
+
+        let last_block_time = headers
+            .last()
+            .and_then(|h| h.get("timestamp"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let message = json!({
+            "height": height,
+            "network_id": hex::encode(self.network_id),
+            "last_block_time": last_block_time,
+            "headers": headers,
+            "node_id": &self.node_id,
+            "public_key": &self.node_id
+        });
+
+        let canonical = Self::canonical_json_string(&message)?;
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        let signature = keypair.sign(canonical.as_bytes());
+
+        let payload = json!({
+            "height": height,
+            "network_id": hex::encode(self.network_id),
+            "last_block_time": last_block_time,
+            "headers": message["headers"],
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "signature": hex::encode(signature.as_ref())
+        });
+
+        let mut any_ok = false;
+        for url in Self::discovery_headers_urls() {
+            let res = self.http_client.post(url).json(&payload).send().await;
+            match res {
+                Ok(res) if res.status().is_success() => any_ok = true,
+                Ok(res) => warn!("Header snapshot post failed: {}", res.status()),
+                Err(e) => warn!("Header snapshot error: {}", e),
+            }
+        }
+
+        if !any_ok {
+            warn!("Header snapshot post failed on all endpoints");
+        }
+
+        Ok(())
+    }
+
+    async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
+        let height = {
+            let blockchain = state.blockchain.read().await;
+            blockchain.get_block_count() as u32
+        };
+
+        let last_block_time = {
+            let blockchain = state.blockchain.read().await;
+            blockchain.get_last_block().map(|b| b.timestamp).unwrap_or(0)
+        };
+
+        let difficulty = {
+            let blockchain = state.blockchain.read().await;
+            blockchain.get_current_difficulty().await
+        };
+
+        let hashrate_ths = {
+            let blockchain = state.blockchain.read().await;
+            blockchain.calculate_network_hashrate().await
+        };
+
+        let peers = state.peers.read().await.len();
+        let uptime_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(state.start_time);
+
+        Json(StatsResponse {
+            height,
+            difficulty,
+            hashrate_ths,
+            last_block_time,
+            peers,
+            version: format!("rust-{}", NETWORK_VERSION),
+            uptime_secs,
+        })
+    }
+
+    async fn health_handler() -> Json<Value> {
+        Json(json!({
+            "ok": true,
+            "time": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        }))
+    }
+
+    async fn start_stats_server(&self) -> Result<(), NodeError> {
+        let bind_ip = std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let port: u16 = std::env::var("ALPHANUMERIC_STATS_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(8787);
+
+        let addr: SocketAddr = format!("{}:{}", bind_ip, port)
+            .parse()
+            .map_err(|e| NodeError::Network(format!("Stats bind error: {}", e)))?;
+
+        let state = StatsState {
+            blockchain: Arc::clone(&self.blockchain),
+            peers: Arc::clone(&self.peers),
+            start_time: self.start_time,
+        };
+
+        let app = Router::new()
+            .route("/stats", get(Self::stats_handler))
+            .route("/health", get(Self::health_handler))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            if let Err(e) = axum::Server::bind(&addr)
+                .serve(app.into_make_service())
+                .await
+            {
+                error!("Stats server error: {}", e);
+            }
+        });
+
+        info!("Stats API listening on {}", addr);
+        Ok(())
+    }
+
     //----------------------------------------------------------------------
     // Network Discovery
     //----------------------------------------------------------------------
@@ -1044,7 +1520,7 @@ pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
 }
 
 // Separate implementation for recursive calls with retry counter
-async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
+    async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
     const MAX_DISCOVERY_RETRIES: u32 = 3;
     const MAX_TARGET_PEERS: usize = 32;
     const MIN_TARGET_PEERS: usize = 5;
@@ -1062,12 +1538,14 @@ async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<()
     // Aggressive discovery only if we're below the minimum threshold
     let needs_aggressive_discovery = current_peers.len() < MIN_TARGET_PEERS;
     
+    // Try cached peers first
+    let cached = self.load_peer_cache();
+    for addr in cached {
+        discovered_addrs.insert(addr);
+    }
+
     // Try DNS discovery (most reliable method)
-    let dns_seeds = [
-        "seed.alphanumeric.network:7177",
-        "seed2.alphanumeric.network:7177",
-        "a9seed.mynode.network:7177",
-    ];
+    let dns_seeds = Self::dns_seeds();
     
     for &seed in &dns_seeds {
         match tokio::net::lookup_host(seed).await {
@@ -1079,6 +1557,13 @@ async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<()
             Err(e) => {
                 debug!("DNS lookup failed for {}: {}", seed, e);
             }
+        }
+    }
+
+    // Try discovery service (serverless gateway)
+    if let Ok(peer_addrs) = self.fetch_discovery_peers().await {
+        for addr in peer_addrs {
+            discovered_addrs.insert(addr);
         }
     }
     
@@ -1896,6 +2381,16 @@ async fn build_optimized_scan_ranges(
         // Initialize P2P services
         self.initialize_p2p().await?;
 
+        // Start stats API (optional)
+        if std::env::var("ALPHANUMERIC_STATS_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true)
+        {
+            if let Err(e) = self.start_stats_server().await {
+                warn!("Stats server failed to start: {}", e);
+            }
+        }
+
         // Create message processing channel
         let (msg_tx, mut msg_rx) = mpsc::channel(1000);
         let node = self.clone();
@@ -1988,6 +2483,65 @@ async fn build_optimized_scan_ranges(
                     if let Err(e) = node_clone.discover_network_nodes().await {
                         warn!("Peer discovery error: {}", e);
                     }
+                }
+            }
+        });
+
+        // Initial discovery boost via serverless gateway
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(3)).await;
+            if let Err(e) = node_clone.connect_discovery_peers(8).await {
+                warn!("Discovery connect error: {}", e);
+            }
+        });
+
+        // Periodic announce to discovery service
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_INTERVAL));
+            loop {
+                announce_interval.tick().await;
+                if let Err(e) = node_clone.announce_to_discovery().await {
+                    debug!("Announce error: {}", e);
+                }
+            }
+        });
+
+        // Periodic header snapshot submissions
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut header_interval = interval(Duration::from_secs(HEADER_SNAPSHOT_INTERVAL));
+            loop {
+                header_interval.tick().await;
+                if let Err(e) = node_clone.post_header_snapshot().await {
+                    debug!("Header snapshot error: {}", e);
+                }
+            }
+        });
+
+        // Periodic peer cache persistence
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut cache_interval = interval(Duration::from_secs(120));
+            loop {
+                cache_interval.tick().await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let peers: Vec<SocketAddr> = {
+                    let peers = node_clone.peers.read().await;
+                    let mut scored: Vec<(SocketAddr, f64)> = peers
+                        .iter()
+                        .map(|(addr, info)| (*addr, Self::score_peer_for_cache(info, now)))
+                        .filter(|(_, score)| *score >= -5.0)
+                        .collect();
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.into_iter().take(200).map(|(addr, _)| addr).collect()
+                };
+                if let Err(e) = node_clone.save_peer_cache(&peers) {
+                    debug!("Peer cache save error: {}", e);
                 }
             }
         });
@@ -3460,6 +4014,30 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         addr: SocketAddr,
         tx: mpsc::Sender<NetworkEvent>,
     ) -> Result<(), NodeError> {
+        // Rate limit handshake attempts per IP
+        let rate_key = format!("handshake_{}", addr.ip());
+        if !self.rate_limiter.check_limit(&rate_key) {
+            return Err(NodeError::RateLimit("Handshake rate limit exceeded".into()));
+        }
+
+        // Enforce max inbound attempts per IP in a short window
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut attempts = self.inbound_attempts.write().await;
+            let entry = attempts.entry(addr.ip()).or_insert((0, now));
+            if now.saturating_sub(entry.1) > INBOUND_ATTEMPT_WINDOW {
+                *entry = (0, now);
+            }
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = now;
+            if entry.0 > MAX_INBOUND_ATTEMPTS_PER_IP {
+                return Err(NodeError::RateLimit("Too many inbound attempts".into()));
+            }
+        }
+
         // Configure TCP socket
         stream.set_nodelay(true)?;
 
@@ -3483,6 +4061,12 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         )
         .await
         .map_err(|_| NodeError::Network("Handshake timeout".into()))??;
+
+        // Reset inbound attempts on successful handshake
+        {
+            let mut attempts = self.inbound_attempts.write().await;
+            attempts.remove(&addr.ip());
+        }
 
         // Version check
         if peer_info.version != NETWORK_VERSION {

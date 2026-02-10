@@ -42,7 +42,7 @@ impl DifficultyOracle {
             .difficulty_history
             .iter()
             .zip(self.difficulty_history.iter().skip(1))
-            .map(|(a, b)| (*b as f64 / *a as f64))
+            .map(|(a, b)| *b as f64 / *a as f64)
             .collect();
 
         let mut sorted_changes = changes.clone();
