@@ -6,6 +6,7 @@
 /blockchain.db/
 /private.key
 /path/
+/alphanumeric_serverless_plan.txt
 
 # OS
 .DS_Store
