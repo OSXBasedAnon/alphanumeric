@@ -3604,7 +3604,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 // Validate transaction before adding
                 if self.validate_transaction(&tx, None).await? {
                     // Add to blockchain
-                    let mut blockchain = self.blockchain.write().await;
+                    let blockchain = self.blockchain.read().await;
                     blockchain.add_transaction(tx.clone()).await?;
 
                     // Broadcast to subset of peers
@@ -3631,7 +3631,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 // Verify block before processing
                 if self.verify_block_parallel(&block).await? {
                     // Save block to blockchain
-                    self.blockchain.write().await.save_block(&block).await?;
+                    self.blockchain.read().await.save_block(&block).await?;
 
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
@@ -3747,7 +3747,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkEvent::ChainResponse(blocks) => {
-                let mut blockchain = self.blockchain.write().await;
+                let blockchain = self.blockchain.read().await;
                 for block in blocks {
                     if self.verify_block_parallel(&block).await? {
                         if let Err(e) = blockchain.save_block(&block).await {
@@ -3871,7 +3871,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 // Verify and propagate block
                 if self.verify_block_parallel(&block_ref).await? {
                     // Save block to blockchain
-                    self.blockchain.write().await.save_block(&block_ref).await?;
+                    self.blockchain.read().await.save_block(&block_ref).await?;
 
                     // Send network event
                     tx.send(NetworkEvent::NewBlock((*block_ref).clone()))
@@ -3955,7 +3955,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                     if let Ok(Some(block)) = velocity.handle_shred(shred, addr).await {
                         let block_ref = Arc::new(block);
                         if self.verify_block_parallel(&block_ref).await? {
-                            self.blockchain.write().await.save_block(&block_ref).await?;
+                            self.blockchain.read().await.save_block(&block_ref).await?;
                         }
                     }
                 }
@@ -4809,7 +4809,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
                         // Save verified blocks
                         let actual_count = verified_blocks.len();
                         if actual_count > 0 {
-                            let mut blockchain = self.blockchain.write().await;
+                            let blockchain = self.blockchain.read().await;
                             let mut saved_count = 0;
                             
                             for block in verified_blocks {

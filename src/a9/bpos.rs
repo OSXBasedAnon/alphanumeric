@@ -1193,7 +1193,7 @@ impl BPoSSentinel {
 
     async fn enforce_canonical_chain(&self, canonical: Block) -> Result<(), String> {
         // Simple enforcement - just save the canonical block
-        let blockchain = self.blockchain.write().await;
+        let blockchain = self.blockchain.read().await;
         blockchain
             .save_block(&canonical)
             .await
@@ -1297,7 +1297,7 @@ impl BPoSSentinel {
     }
 
     async fn replace_chain_section(&self, consensus_chain: Vec<Block>) -> Result<(), String> {
-        let blockchain = self.blockchain.write().await;
+        let blockchain = self.blockchain.read().await;
 
         // Verify chain section
         for window in consensus_chain.windows(2) {
@@ -1607,7 +1607,7 @@ impl BPoSSentinel {
             let consensus_block = self.select_consensus_block(valid_blocks)?;
 
             // Replace block in blockchain
-            let blockchain = self.blockchain.write().await;
+            let blockchain = self.blockchain.read().await;
             blockchain
                 .save_block(&consensus_block)
                 .await

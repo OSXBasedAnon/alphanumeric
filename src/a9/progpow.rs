@@ -459,29 +459,7 @@ impl MiningManager {
                 }
 
                 set_finalize_stage(0);
-                let lock_start = Instant::now();
-                let mut blockchain_lock = loop {
-                    match tokio::time::timeout(Duration::from_millis(500), self.blockchain.write()).await {
-                        Ok(guard) => break guard,
-                        Err(_) => {
-                            if let Ok(pb) = progress_bar.lock() {
-                                pb.set_message("Waiting for blockchain lock...");
-                            }
-                            if lock_start.elapsed() > Duration::from_secs(60) {
-                                let stage_name = finalize_stage_name(current_finalize_stage());
-                                warn!(
-                                    "Block finalization stalled waiting for lock (stage: {})",
-                                    stage_name
-                                );
-                                return Err(MiningError::BlockchainError(format!(
-                                    "Block finalization stalled waiting for lock ({})",
-                                    stage_name
-                                )));
-                            }
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                    }
-                };
+                let blockchain_lock = self.blockchain.read().await;
 
                 let finalize_future = async {
                     let tip = blockchain_lock.get_last_block();
