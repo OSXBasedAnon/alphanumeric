@@ -1181,6 +1181,17 @@ impl Node {
         None
     }
 
+    fn is_private_ip(addr: &IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(ip) => {
+                ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local()
+            }
+        }
+    }
+
     async fn fetch_discovery_peers(&self) -> Result<Vec<SocketAddr>, NodeError> {
         let mut all_addrs = Vec::new();
         let mut any_ok = false;
@@ -1282,7 +1293,18 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
 
-        let ip = self.get_external_ip().await.map(|ip| ip.to_string());
+        let ip = if let Ok(public_ip) = std::env::var("ALPHANUMERIC_PUBLIC_IP") {
+            if !public_ip.trim().is_empty() {
+                Some(public_ip.trim().to_string())
+            } else {
+                None
+            }
+        } else {
+            self.get_external_ip()
+                .await
+                .filter(|addr| !Self::is_private_ip(addr))
+                .map(|addr| addr.to_string())
+        };
 
         let height = {
             let blockchain = self.blockchain.read().await;
