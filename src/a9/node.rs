@@ -1448,6 +1448,82 @@ impl Node {
         Ok(())
     }
 
+    async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
+        let height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_block_count() as u32
+        };
+
+        let last_block_time = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_last_block().map(|b| b.timestamp).unwrap_or(0)
+        };
+
+        let difficulty = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_current_difficulty().await
+        };
+
+        let hashrate_ths = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.calculate_network_hashrate().await
+        };
+
+        let peers = self.peers.read().await.len() as u32;
+        let uptime_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(self.start_time);
+
+        let message = json!({
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "height": height,
+            "difficulty": difficulty,
+            "hashrate_ths": hashrate_ths,
+            "last_block_time": last_block_time,
+            "peers": peers,
+            "version": format!("rust-{}", NETWORK_VERSION),
+            "uptime_secs": uptime_secs
+        });
+
+        let canonical = Self::canonical_json_string(&message)?;
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        let signature = keypair.sign(canonical.as_bytes());
+
+        let payload = json!({
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "height": height,
+            "difficulty": difficulty,
+            "hashrate_ths": hashrate_ths,
+            "last_block_time": last_block_time,
+            "peers": peers,
+            "version": format!("rust-{}", NETWORK_VERSION),
+            "uptime_secs": uptime_secs,
+            "signature": hex::encode(signature.as_ref())
+        });
+
+        let mut any_ok = false;
+        for base in Self::discovery_bases() {
+            let url = format!("{}/api/stats", base);
+            let res = self.http_client.post(url).json(&payload).send().await;
+            match res {
+                Ok(res) if res.status().is_success() => any_ok = true,
+                Ok(res) => warn!("Stats snapshot post failed: {}", res.status()),
+                Err(e) => warn!("Stats snapshot error: {}", e),
+            }
+        }
+
+        if !any_ok {
+            warn!("Stats snapshot post failed on all endpoints");
+        }
+
+        Ok(())
+    }
+
     async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
         let height = {
             let blockchain = state.blockchain.read().await;
@@ -2611,6 +2687,18 @@ async fn build_optimized_scan_ranges(
                 header_interval.tick().await;
                 if let Err(e) = node_clone.post_header_snapshot().await {
                     debug!("Header snapshot error: {}", e);
+                }
+            }
+        });
+
+        // Periodic stats snapshot submissions (push)
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut stats_interval = interval(Duration::from_secs(30));
+            loop {
+                stats_interval.tick().await;
+                if let Err(e) = node_clone.post_stats_snapshot().await {
+                    debug!("Stats snapshot error: {}", e);
                 }
             }
         });
