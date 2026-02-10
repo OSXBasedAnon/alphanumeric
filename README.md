@@ -1,4 +1,6 @@
 # alphanumeric
+https://www.alphanumeric.blue/
+
 ![Screenshot_2025-01-04_213726](https://github.com/user-attachments/assets/0b5c747c-53f7-4e09-82c8-0e9bfbd8cd89)
 
 alphanumeric is an advanced, high-performance blockchain written in Rust. It incorporates cutting-edge cryptographic and consensus algorithms to provide a secure, decentralized ledger.
