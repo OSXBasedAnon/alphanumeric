@@ -2009,16 +2009,15 @@ impl Blockchain {
                 (count + 1, volume + tx.amount, fees + tx.fee)
             });
 
-        // Calculate volume and count factors with optimized scaling
-        let volume_factor = ((1.0 + (total_volume / 100.0).ln()).max(0.0) / 20.0).min(1.0); // Scaled and bounded
-        let count_factor = ((tx_count as f64).ln().max(0.0) / 5.0).min(1.0); // Ensure non-negative and bounded
+        // Fee-weighted reward to avoid incentivizing spammy tx counts.
+        let fee_target = (current_max * 0.05).max(0.0001);
+        let fee_factor = (total_fees / fee_target).clamp(0.0, 1.0);
 
         // Base reward calculation
         let base_reward = if tx_count == 0 {
             current_max * 0.2 // 20% of max reward for empty blocks
         } else {
-            let weighted_reward = (volume_factor * 0.4) + (count_factor * 0.3) + 0.3;
-            MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * weighted_reward)
+            MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
         };
 
         // Add transaction fees to the base reward
