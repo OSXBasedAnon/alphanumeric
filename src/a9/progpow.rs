@@ -1,7 +1,6 @@
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
-use log::warn;
 use num_bigint::BigUint;
 use num_cpus;
 use num_traits::ToPrimitive;
@@ -10,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -245,41 +244,6 @@ impl MiningManager {
 
         let mut current_nonce = 0;
         let update_interval = 1000;
-        let last_progress = Arc::new(AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ));
-        let progress_nonce = Arc::new(AtomicU64::new(0));
-        let watchdog_stop = Arc::new(AtomicBool::new(false));
-
-        // Watchdog: report if progress stalls (no behavior change)
-        {
-            let last_progress = Arc::clone(&last_progress);
-            let progress_nonce = Arc::clone(&progress_nonce);
-            let watchdog_stop = Arc::clone(&watchdog_stop);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(15));
-                let mut last_nonce = 0u64;
-                loop {
-                    interval.tick().await;
-                    if watchdog_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let last = last_progress.load(Ordering::Relaxed);
-                    let current_nonce = progress_nonce.load(Ordering::Relaxed);
-                    if now.saturating_sub(last) >= 30 && current_nonce == last_nonce {
-                        warn!("Mining watchdog: no progress for {}s at nonce {}", now - last, current_nonce);
-                    }
-                    last_nonce = current_nonce;
-                }
-            });
-        }
 
         loop {
             let (
@@ -353,8 +317,6 @@ impl MiningManager {
                     let start_nonce = current_nonce + (thread_id * nonces_per_thread);
                     let end_nonce = start_nonce + nonces_per_thread;
                     let target = Arc::clone(&target);
-                    let last_progress = Arc::clone(&last_progress);
-                    let progress_nonce = Arc::clone(&progress_nonce);
 
                     // CRITICAL OPTIMIZATION: Clone transactions ONCE per thread, not per hash
                     let transactions_ref = transactions.clone();
@@ -406,14 +368,6 @@ impl MiningManager {
                         }
 
                         if nonce % update_interval == 0 {
-                            last_progress.store(
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                Ordering::Relaxed,
-                            );
-                            progress_nonce.store(nonce, Ordering::Relaxed);
                             if let Ok(pb) = progress_bar.try_lock() {
                                 pb.set_position(nonce - current_nonce);
                                 let hash_hex = hex::encode(&hash);
@@ -435,7 +389,6 @@ impl MiningManager {
                 if let Ok(pb) = progress_bar.lock() {
                     pb.finish_with_message("Mining error occurred");
                 }
-                watchdog_stop.store(true, Ordering::Relaxed);
                 return Err(MiningError::MiningFailed(
                     "Mining operation failed".to_string(),
                 ));
@@ -478,14 +431,12 @@ impl MiningManager {
                         if let Ok(pb) = progress_bar.lock() {
                             pb.finish_with_message("Block mined successfully!");
                         }
-                        watchdog_stop.store(true, Ordering::Relaxed);
                         return Ok((nonce, hash_string));
                     }
                     Err(e) => {
                         if let Ok(pb) = progress_bar.lock() {
                             pb.finish_with_message("Block finalization failed");
                         }
-                        watchdog_stop.store(true, Ordering::Relaxed);
                         return Err(MiningError::BlockchainError(e.to_string()));
                     }
                 }

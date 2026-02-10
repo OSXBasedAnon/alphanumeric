@@ -67,11 +67,36 @@ async fn main() -> Result<()> {
     local.run_until(async move {
         // Database init
         pb.set_message("Initializing database...");
-        let db = match sled::open("blockchain.db") {
+        let db_path = "blockchain.db";
+        let db = match sled::open(db_path) {
             Ok(db) => db,
             Err(e) => {
-                error!("Error opening database: {}", e);
-                return Err(Box::new(e) as Box<dyn Error>);
+                let is_corruption = matches!(e, sled::Error::Corruption { .. })
+                    || e.to_string().contains("Corruption");
+                if is_corruption {
+                    warn!("Sled reported corruption. Attempting snapshot cleanup...");
+                    if let Err(clean_err) = cleanup_sled_snapshots(db_path) {
+                        error!("Snapshot cleanup failed: {}", clean_err);
+                    }
+                    match sled::open(db_path) {
+                        Ok(db) => db,
+                        Err(reopen_err) => {
+                            warn!("Reopen failed after cleanup: {}", reopen_err);
+                            let quarantined = quarantine_db(db_path);
+                            if let Err(q_err) = quarantined {
+                                error!("Failed to quarantine DB: {}", q_err);
+                                return Err(Box::new(reopen_err) as Box<dyn Error>);
+                            }
+                            sled::open(db_path).map_err(|fresh_err| {
+                                error!("Failed to open fresh DB: {}", fresh_err);
+                                Box::new(fresh_err) as Box<dyn Error>
+                            })?
+                        }
+                    }
+                } else {
+                    error!("Error opening database: {}", e);
+                    return Err(Box::new(e) as Box<dyn Error>);
+                }
             }
         };
         {
@@ -2002,4 +2027,34 @@ fn print_ascii_intro() {
     }
 
     stdout.reset().unwrap();
+}
+
+fn cleanup_sled_snapshots(path: &str) -> std::io::Result<()> {
+    let dir = std::path::Path::new(path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with("snap.") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_db(path: &str) -> std::io::Result<()> {
+    let dir = std::path::Path::new(path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine_path = format!("{}.corrupt.{}", path, ts);
+    std::fs::rename(dir, quarantine_path)?;
+    Ok(())
 }
