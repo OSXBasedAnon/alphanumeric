@@ -2220,6 +2220,8 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     .await
     .map_err(|e| e.to_string())?;
 
-    extract_result.map_err(|e| e.into())?;
+    if let Err(e) = extract_result {
+        return Err(Box::<dyn Error>::from(e));
+    }
     Ok(())
 }
