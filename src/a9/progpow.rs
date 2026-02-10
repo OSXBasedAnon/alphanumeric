@@ -6,14 +6,16 @@ use num_cpus;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use log::warn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio::time::interval;
 
-use crate::a9::blockchain::BlockchainError;
+use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, BlockchainError};
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
 
@@ -225,6 +227,7 @@ impl MiningManager {
 
         let found = Arc::new(AtomicBool::new(false));
         let result_nonce = Arc::new(AtomicU64::new(0));
+        let result_timestamp = Arc::new(AtomicU64::new(0));
         let hash_result = Arc::new(Mutex::new(Vec::with_capacity(32)));
 
         let num_threads = std::cmp::min(num_cpus::get(), 32);
@@ -308,6 +311,7 @@ impl MiningManager {
                 MAX_TARGET.clone() / divisor
             };
             let target = Arc::new(target);
+            let result_timestamp = Arc::clone(&result_timestamp);
 
             let mining_result: Result<(), MiningError> = (0..num_threads as u64)
                 .into_par_iter()
@@ -328,6 +332,10 @@ impl MiningManager {
 
                         // Don't create full Block - just calculate hash directly
                         // We only need the full block when we find a valid nonce
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let hash = {
                             let mut header_data = [0u8; 92];
                             let mut offset = 0;
@@ -338,10 +346,6 @@ impl MiningManager {
                             header_data[offset..offset+32].copy_from_slice(&previous_block_hash);
                             offset += 32;
 
-                            let timestamp = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
                             header_data[offset..offset+8].copy_from_slice(&timestamp.to_le_bytes());
                             offset += 8;
 
@@ -360,6 +364,7 @@ impl MiningManager {
                         if hash_int <= *target {
                             if !found.swap(true, Ordering::Relaxed) {
                                 result_nonce.store(nonce, Ordering::Release);
+                                result_timestamp.store(timestamp, Ordering::Release);
                                 if let Ok(mut hash_guard) = hash_result.lock() {
                                     *hash_guard = hash.to_vec();
                                 }
@@ -396,48 +401,124 @@ impl MiningManager {
 
             if found.load(Ordering::Relaxed) {
                 let nonce = result_nonce.load(Ordering::Acquire);
+                let found_timestamp = result_timestamp.load(Ordering::Acquire);
                 let hash = hash_result.lock().unwrap().clone();
                 let hash_string = hex::encode(&hash);
 
-                let blockchain_lock = self.blockchain.write().await;
                 let mut valid_transactions = Vec::with_capacity(transactions.len());
-
-                for transaction in &transactions {
-                    let sender_balance = blockchain_lock
-                        .get_confirmed_balance(&transaction.sender)
-                        .await?;
-                    if sender_balance >= transaction.amount + transaction.fee {
-                        valid_transactions.push(transaction.clone());
+                {
+                    let blockchain_lock = self.blockchain.read().await;
+                    for transaction in &transactions {
+                        let sender_balance = blockchain_lock
+                            .get_confirmed_balance(&transaction.sender)
+                            .await?;
+                        if sender_balance >= transaction.amount + transaction.fee {
+                            valid_transactions.push(transaction.clone());
+                        }
                     }
                 }
 
-                let mut new_block = Block::new(
-                    header.number,
-                    previous_block_hash.clone(),
-                    previous_block_timestamp,
-                    valid_transactions,
+                let mut new_block = Block {
+                    index: header.number,
+                    previous_hash: previous_block_hash.clone(),
+                    timestamp: found_timestamp,
+                    transactions: valid_transactions,
                     nonce,
-                    current_network_difficulty,
-                )?;
+                    difficulty: current_network_difficulty,
+                    hash: [0u8; 32],
+                    merkle_root,
+                };
 
                 // Use the hash found during mining (which met the target)
                 new_block.hash = hash.try_into().map_err(|_| MiningError::InvalidHashFormat)?;
 
-                match blockchain_lock
-                    .finalize_block(new_block, miner_address.clone())
-                    .await
+                // Separate verification step with timeout and logging
+                match tokio::time::timeout(Duration::from_secs(8), async {
+                    let blockchain_lock = self.blockchain.read().await;
+                    blockchain_lock.validate_new_block(&new_block).await
+                })
+                .await
                 {
-                    Ok(_) => {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
                         if let Ok(pb) = progress_bar.lock() {
-                            pb.finish_with_message("Block mined successfully!");
+                            pb.finish_with_message("Block verification failed");
                         }
-                        return Ok((nonce, hash_string));
-                    }
-                    Err(e) => {
-                        if let Ok(pb) = progress_bar.lock() {
-                            pb.finish_with_message("Block finalization failed");
-                        }
+                        warn!("Block verification failed: {}", e);
                         return Err(MiningError::BlockchainError(e.to_string()));
+                    }
+                    Err(_) => {
+                        if let Ok(pb) = progress_bar.lock() {
+                            pb.finish_with_message("Block verification timed out");
+                        }
+                        warn!("Block verification timed out");
+                        return Err(MiningError::BlockchainError(
+                            "Block verification timed out".to_string(),
+                        ));
+                    }
+                }
+
+                let finalize_future = async {
+                    let mut blockchain_lock = self.blockchain.write().await;
+
+                    let tip = blockchain_lock.get_last_block();
+                    if let Some(tip_block) = tip {
+                        if tip_block.hash != previous_block_hash
+                            || tip_block.index + 1 != new_block.index
+                        {
+                            return Err(BlockchainError::InvalidBlockHeader);
+                        }
+                    }
+
+                    blockchain_lock
+                        .finalize_block(new_block, miner_address.clone())
+                        .await
+                };
+                tokio::pin!(finalize_future);
+                let mut ticker = interval(Duration::from_millis(750));
+                let finalize_start = Instant::now();
+                loop {
+                    tokio::select! {
+                        res = &mut finalize_future => {
+                            match res {
+                                Ok(()) => {
+                                    if let Ok(pb) = progress_bar.lock() {
+                                        pb.finish_with_message("Block mined successfully!");
+                                    }
+                                    return Ok((nonce, hash_string));
+                                }
+                                Err(e) => {
+                                    if let Ok(pb) = progress_bar.lock() {
+                                        pb.finish_with_message("Block finalization failed");
+                                    }
+                                    warn!("Block finalization failed: {}", e);
+                                    return Err(MiningError::BlockchainError(e.to_string()));
+                                }
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            if finalize_start.elapsed() > Duration::from_secs(15) {
+                                let stage = current_finalize_stage();
+                                let stage_name = finalize_stage_name(stage);
+                                if let Ok(pb) = progress_bar.lock() {
+                                    pb.finish_with_message(format!(
+                                        "Block finalization timed out (stage: {})",
+                                        stage_name
+                                    ));
+                                }
+                                warn!(
+                                    "Block finalization timed out at stage {} ({})",
+                                    stage, stage_name
+                                );
+                                return Err(MiningError::BlockchainError(format!(
+                                    "Block finalization timed out at stage {} ({})",
+                                    stage, stage_name
+                                )));
+                            }
+                            if let Ok(pb) = progress_bar.lock() {
+                                pb.set_message("Finalizing block...");
+                            }
+                        }
                     }
                 }
             }

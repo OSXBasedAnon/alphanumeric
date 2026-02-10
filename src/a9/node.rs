@@ -32,6 +32,7 @@ use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use rayon::prelude::*;
 use reqwest::Client;
+use igd_next::{search_gateway, PortMappingProtocol};
 use ring::{
     aead, hkdf,
     rand::SecureRandom,
@@ -797,6 +798,13 @@ struct ValidationCacheEntry {
     pub verification_count: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PortMappingResult {
+    upnp: bool,
+    nat_pmp: bool,
+    external_port: Option<u16>,
+}
+
 #[derive(Clone)]
 struct StatsState {
     blockchain: Arc<RwLock<Blockchain>>,
@@ -1328,10 +1336,11 @@ impl Node {
 
     async fn post_header_snapshot(&self) -> Result<(), NodeError> {
         let blockchain = self.blockchain.read().await;
-        let height = blockchain.get_block_count() as u32;
-        if height == 0 {
-            return Ok(());
-        }
+        let last_block = match blockchain.get_last_block() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let height = last_block.index;
 
         let start = height.saturating_sub(20);
         let mut headers = Vec::new();
@@ -1346,11 +1355,21 @@ impl Node {
             }
         }
 
+        if headers.is_empty() {
+            // Fallback to last block if indexed fetch failed
+            headers.push(json!({
+                "height": last_block.index,
+                "hash": hex::encode(last_block.hash),
+                "prev_hash": hex::encode(last_block.previous_hash),
+                "timestamp": last_block.timestamp
+            }));
+        }
+
         let last_block_time = headers
             .last()
             .and_then(|h| h.get("timestamp"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .unwrap_or(last_block.timestamp);
 
         let message = json!({
             "height": height,
@@ -2290,13 +2309,13 @@ async fn build_optimized_scan_ranges(
 
     pub async fn initialize_tcp_nat_traversal(&self) -> Result<TcpNatConfig, NodeError> {
         // Setup port mapping
-        self.setup_port_mapping(self.bind_addr.port()).await?;
+        let mapping = self.setup_port_mapping(self.bind_addr.port()).await?;
 
         // Create simplified config
         let config = TcpNatConfig {
-            external_port: self.bind_addr.port(),
-            supports_upnp: false,
-            supports_nat_pmp: false,
+            external_port: mapping.external_port.unwrap_or(self.bind_addr.port()),
+            supports_upnp: mapping.upnp,
+            supports_nat_pmp: mapping.nat_pmp,
             connect_timeout: Duration::from_secs(5),
             mapping_lifetime: Duration::from_secs(3600),
             max_retries: 3,
@@ -2326,7 +2345,7 @@ async fn build_optimized_scan_ranges(
         Err(NodeError::Network("TCP hole punching failed".into()))
     }
 
-    async fn setup_port_mapping(&self, port: u16) -> Result<(), NodeError> {
+    async fn setup_port_mapping(&self, port: u16) -> Result<PortMappingResult, NodeError> {
         // Configure the TCP socket for hole punching
         let socket = self
             .configure_tcp_socket(TcpStream::connect(format!("0.0.0.0:{}", port)).await?)
@@ -2349,7 +2368,50 @@ async fn build_optimized_scan_ranges(
 
         sock.set_tcp_keepalive(&keepalive)?;
 
-        Ok(())
+        let enable_upnp = std::env::var("ALPHANUMERIC_ENABLE_UPNP")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+
+        let mut upnp_ok = false;
+        let mut external_port = None;
+
+        if enable_upnp {
+            let bind_ip = match self.bind_addr.ip() {
+                IpAddr::V4(ip) if ip != Ipv4Addr::UNSPECIFIED => IpAddr::V4(ip),
+                IpAddr::V6(ip) if !ip.is_unspecified() => IpAddr::V6(ip),
+                _ => Node::get_bind_address().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            };
+
+            let mapping_res = tokio::task::spawn_blocking(move || {
+                let gateway = search_gateway(Default::default())
+                    .map_err(|e| NodeError::Network(format!("UPnP search error: {}", e)))?;
+                let socket = SocketAddr::new(bind_ip, port);
+                gateway
+                    .add_port(PortMappingProtocol::TCP, port, socket, 3600, "alphanumeric node")
+                    .map_err(|e| NodeError::Network(format!("UPnP add port error: {}", e)))?;
+                Ok::<(), NodeError>(())
+            })
+            .await;
+
+            match mapping_res {
+                Ok(Ok(_)) => {
+                    upnp_ok = true;
+                    external_port = Some(port);
+                }
+                Ok(Err(e)) => {
+                    warn!("UPnP port mapping failed: {}", e);
+                }
+                Err(e) => {
+                    warn!("UPnP mapping task failed: {}", e);
+                }
+            }
+        }
+
+        Ok(PortMappingResult {
+            upnp: upnp_ok,
+            nat_pmp: false,
+            external_port,
+        })
     }
 
     async fn configure_tcp_socket(&self, socket: TcpStream) -> Result<TcpStream, NodeError> {

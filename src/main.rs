@@ -68,7 +68,12 @@ async fn main() -> Result<()> {
         // Database init
         pb.set_message("Initializing database...");
         let db_path = "blockchain.db";
-        let db = match sled::open(db_path) {
+        ensure_db_lock(db_path)?;
+        let db = match sled::Config::new()
+            .path(db_path)
+            .flush_every_ms(Some(1000))
+            .open()
+        {
             Ok(db) => db,
             Err(e) => {
                 let is_corruption = matches!(e, sled::Error::Corruption { .. })
@@ -78,7 +83,11 @@ async fn main() -> Result<()> {
                     if let Err(clean_err) = cleanup_sled_snapshots(db_path) {
                         error!("Snapshot cleanup failed: {}", clean_err);
                     }
-                    match sled::open(db_path) {
+                    match sled::Config::new()
+                        .path(db_path)
+                        .flush_every_ms(Some(1000))
+                        .open()
+                    {
                         Ok(db) => db,
                         Err(reopen_err) => {
                             warn!("Reopen failed after cleanup: {}", reopen_err);
@@ -87,7 +96,11 @@ async fn main() -> Result<()> {
                                 error!("Failed to quarantine DB: {}", q_err);
                                 return Err(Box::new(reopen_err) as Box<dyn Error>);
                             }
-                            sled::open(db_path).map_err(|fresh_err| {
+                            sled::Config::new()
+                                .path(db_path)
+                                .flush_every_ms(Some(1000))
+                                .open()
+                                .map_err(|fresh_err| {
                                 error!("Failed to open fresh DB: {}", fresh_err);
                                 Box::new(fresh_err) as Box<dyn Error>
                             })?
@@ -101,8 +114,10 @@ async fn main() -> Result<()> {
         };
         {
             let db_for_signal = db.clone();
+            let lock_path = format!("{}.lock", db_path);
             if let Err(e) = ctrlc::set_handler(move || {
                 let _ = db_for_signal.flush();
+                let _ = remove_db_lock(&lock_path);
                 eprintln!("Shutting down cleanly...");
                 std::process::exit(0);
             }) {
@@ -111,11 +126,23 @@ async fn main() -> Result<()> {
         }
         {
             let db_for_signal = db.clone();
+            let lock_path = format!("{}.lock", db_path);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
                 let _ = db_for_signal.flush();
+                let _ = remove_db_lock(&lock_path);
                 eprintln!("Shutting down cleanly...");
                 std::process::exit(0);
+            });
+        }
+        {
+            let db_for_flush = db.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let _ = db_for_flush.flush();
+                }
             });
         }
         let db_arc = Arc::new(RwLock::new(db.clone()));
@@ -147,7 +174,7 @@ async fn main() -> Result<()> {
 
         // Continue with rest of initialization
         pb.set_message("Setting up management...");
-        let (transaction_fee, mining_reward, difficulty_adjustment_interval, block_time) = {
+        let (transaction_fee, mining_reward, _difficulty_adjustment_interval, block_time) = {
             let blockchain_lock = blockchain.read().await;
             (
                 blockchain_lock.transaction_fee,
@@ -2057,4 +2084,61 @@ fn quarantine_db(path: &str) -> std::io::Result<()> {
     let quarantine_path = format!("{}.corrupt.{}", path, ts);
     std::fs::rename(dir, quarantine_path)?;
     Ok(())
+}
+
+fn ensure_db_lock(path: &str) -> std::io::Result<()> {
+    let lock_path = format!("{}.lock", path);
+    if std::path::Path::new(&lock_path).exists() {
+        let allow = std::env::var("ALPHANUMERIC_IGNORE_DB_LOCK")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if !allow {
+            if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if !is_process_alive(pid) {
+                        let _ = std::fs::remove_file(&lock_path);
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Database lock exists. Another instance may be running.",
+                        ));
+                    }
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Database lock exists. Another instance may be running.",
+                    ));
+                }
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Database lock exists. Another instance may be running.",
+                ));
+            }
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)?;
+    let pid = std::process::id();
+    use std::io::Write;
+    writeln!(file, "{}", pid)?;
+    Ok(())
+}
+
+fn remove_db_lock(path: &str) -> std::io::Result<()> {
+    if std::path::Path::new(path).exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes();
+    sys.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
