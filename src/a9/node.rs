@@ -1099,7 +1099,7 @@ impl Node {
             if !parsed.is_empty() {
                 let leaked: Vec<&'static str> = parsed
                     .into_iter()
-                    .map(|s| Box::leak(s.into_boxed_str()))
+                    .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
                     .collect();
                 return leaked;
             }
