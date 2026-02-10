@@ -1289,6 +1289,18 @@ impl Node {
             blockchain.get_block_count() as u32
         };
 
+        let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        let stats_port: Option<u16> = if stats_enabled {
+            std::env::var("ALPHANUMERIC_STATS_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .or(Some(8787))
+        } else {
+            None
+        };
+
         let message = json!({
             "ip": ip.clone().unwrap_or_default(),
             "port": self.bind_addr.port(),
@@ -1297,7 +1309,8 @@ impl Node {
             "version": format!("rust-{}", NETWORK_VERSION),
             "height": height,
             "last_seen": now,
-            "latency_ms": 0
+            "latency_ms": 0,
+            "stats_port": stats_port
         });
 
         let canonical = Self::canonical_json_string(&message)?;
@@ -1314,6 +1327,7 @@ impl Node {
             "height": height,
             "last_seen": now,
             "latency_ms": 0,
+            "stats_port": stats_port,
             "signature": hex::encode(signature.as_ref())
         });
 

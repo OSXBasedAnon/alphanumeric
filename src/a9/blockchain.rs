@@ -4,7 +4,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
-use log::{error, warn};
+use log::error;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use pqcrypto_dilithium::dilithium5::{
@@ -25,9 +25,8 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{sleep, timeout};
 
 use crate::a9::mempool::{Mempool, TemporalVerification};
 use crate::a9::oracle::DifficultyOracle;
@@ -35,6 +34,8 @@ use crate::a9::progpow::MiningManager;
 use crate::a9::wallet::Wallet;
 
 const BLOCKCHAIN_PATH: &str = "blockchain.db";
+const BALANCES_TREE: &str = "balances";
+const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const NONCE_MAGIC: u128 = 0xA5A5A5A5A5A5A5A5A;
 const DIFFICULTY_MAGIC: u128 = 0x5A5A5A5A5A5A5A5A5A5A5A5A5A;
 const MIN_TRANSACTION_AMOUNT: f64 = 0.00000564;
@@ -57,8 +58,13 @@ pub fn current_finalize_stage() -> usize {
     FINALIZE_STAGE.load(Ordering::Acquire)
 }
 
+pub fn set_finalize_stage(stage: usize) {
+    FINALIZE_STAGE.store(stage, Ordering::Release);
+}
+
 pub fn finalize_stage_name(stage: usize) -> &'static str {
     match stage {
+        0 => "waiting_lock",
         1 => "derive_keys",
         2 => "calc_reward",
         3 => "sign_reward",
@@ -68,7 +74,7 @@ pub fn finalize_stage_name(stage: usize) -> &'static str {
         7 => "validate_batch",
         8 => "apply_batch",
         9 => "db_insert",
-        10 => "db_flush",
+        10 => "balances_height",
         _ => "unknown",
     }
 }
@@ -961,67 +967,77 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
-    async fn flush_tree_with_retry(
-        tree: &sled::Tree,
-        label: &str,
+    fn get_balances_height(tree: &sled::Tree) -> Result<Option<u64>, BlockchainError> {
+        if let Some(raw) = tree.get(BALANCES_HEIGHT_KEY)? {
+            let height: u64 = bincode::deserialize(&raw)?;
+            Ok(Some(height))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn set_balances_height(tree: &sled::Tree, height: u64) -> Result<(), BlockchainError> {
+        tree.insert(BALANCES_HEIGHT_KEY, bincode::serialize(&height)?)?;
+        Ok(())
+    }
+
+    pub async fn ensure_balances_index(&self) -> Result<(), BlockchainError> {
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let tip = self.get_latest_block_index();
+        let force_rebuild = std::env::var("ALPHANUMERIC_REBUILD_BALANCES")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let current_height = Self::get_balances_height(&balances_tree)?;
+        let needs_rebuild = force_rebuild
+            || current_height.is_none()
+            || current_height.unwrap_or(0) != tip;
+
+        if needs_rebuild {
+            self.rebuild_balances_index(&balances_tree).await?;
+            Self::set_balances_height(&balances_tree, tip)?;
+        }
+
+        Ok(())
+    }
+
+    async fn rebuild_balances_index(
+        &self,
+        balances_tree: &sled::Tree,
     ) -> Result<(), BlockchainError> {
-        const MAX_RETRIES: usize = 3;
-        const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+        balances_tree.clear()?;
 
-        for attempt in 1..=MAX_RETRIES {
-            match timeout(FLUSH_TIMEOUT, tree.flush_async()).await {
-                Ok(Ok(_)) => return Ok(()),
-                Ok(Err(e)) => {
-                    warn!(
-                        "flush_async failed for {} (attempt {}/{}): {}",
-                        label, attempt, MAX_RETRIES, e
-                    );
+        let mut blocks: Vec<Block> = self
+            .db
+            .scan_prefix(b"block_")
+            .filter_map(|entry| {
+                let (_, value) = entry.ok()?;
+                Block::from_bytes(value.as_ref()).ok()
+            })
+            .collect();
+        blocks.sort_unstable_by_key(|b| b.index);
+
+        let mut balances: HashMap<String, f64> = HashMap::new();
+        for block in blocks {
+            for tx in block.transactions {
+                if tx.sender != "MINING_REWARDS" {
+                    let debit = tx.amount + tx.fee;
+                    let entry = balances.entry(tx.sender).or_insert(0.0);
+                    *entry = Transaction::round_amount(*entry - debit);
                 }
-                Err(_) => {
-                    warn!(
-                        "flush_async timed out for {} (attempt {}/{})",
-                        label, attempt, MAX_RETRIES
-                    );
-                }
+                let entry = balances.entry(tx.recipient).or_insert(0.0);
+                *entry = Transaction::round_amount(*entry + tx.amount);
             }
-            sleep(Duration::from_millis(150 * attempt as u64)).await;
         }
 
-        Err(BlockchainError::FlushError(format!(
-            "flush_async failed for {} after {} attempts",
-            label, MAX_RETRIES
-        )))
-    }
-
-    async fn flush_db_with_retry(db: &sled::Db, label: &str) -> Result<(), BlockchainError> {
-        const MAX_RETRIES: usize = 3;
-        const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
-
-        for attempt in 1..=MAX_RETRIES {
-            match timeout(FLUSH_TIMEOUT, db.flush_async()).await {
-                Ok(Ok(_)) => return Ok(()),
-                Ok(Err(e)) => {
-                    warn!(
-                        "db flush_async failed for {} (attempt {}/{}): {}",
-                        label, attempt, MAX_RETRIES, e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "db flush_async timed out for {} (attempt {}/{})",
-                        label, attempt, MAX_RETRIES
-                    );
-                }
-            }
-            sleep(Duration::from_millis(150 * attempt as u64)).await;
+        let mut batch = sled::Batch::default();
+        for (address, balance) in balances {
+            batch.insert(address.as_bytes(), bincode::serialize(&balance)?);
         }
+        balances_tree.apply_batch(batch)?;
 
-        Err(BlockchainError::FlushError(format!(
-            "db flush_async failed for {} after {} attempts",
-            label, MAX_RETRIES
-        )))
+        Ok(())
     }
-
     pub fn new(
         db: Db,
         transaction_fee: f64,
@@ -1063,6 +1079,9 @@ impl Blockchain {
 
         // Sync mempool with sled
         self.sync_mempool_with_sled().await?;
+
+        // Ensure balances index is valid (rebuild if needed)
+        self.ensure_balances_index().await?;
 
         let pending_tree = self.db.open_tree("pending_transactions")?;
         let mut invalid_txs = Vec::new();
@@ -1255,12 +1274,12 @@ impl Blockchain {
         trace_step("start");
 
         // Derive block's system keys
-        FINALIZE_STAGE.store(1, Ordering::Release);
+        set_finalize_stage(1);
         let (secret_key, _) = SystemKeyDeriver::derive_block_keys(&block)?;
         trace_step("derive_keys");
 
         // Calculate mining reward first
-        FINALIZE_STAGE.store(2, Ordering::Release);
+        set_finalize_stage(2);
         let reward = self.calculate_block_reward(&block)?;
         trace_step("calc_reward");
 
@@ -1276,7 +1295,7 @@ impl Blockchain {
 
         // Sign with block's key
         let signature = detached_sign(&message, &secret_key);
-        FINALIZE_STAGE.store(3, Ordering::Release);
+        set_finalize_stage(3);
         trace_step("sign_reward");
 
         // Create reward transaction
@@ -1292,11 +1311,11 @@ impl Blockchain {
 
         // Insert reward as first transaction
         block.transactions.insert(0, reward_tx);
-        FINALIZE_STAGE.store(4, Ordering::Release);
+        set_finalize_stage(4);
         trace_step("insert_reward");
 
         // Recalculate merkle root with reward included
-        FINALIZE_STAGE.store(5, Ordering::Release);
+        set_finalize_stage(5);
         block.merkle_root = Self::calculate_merkle_root(&block.transactions)?;
         trace_step("merkle");
 
@@ -1313,7 +1332,7 @@ impl Blockchain {
                 }
             }
         }
-        FINALIZE_STAGE.store(6, Ordering::Release);
+        set_finalize_stage(6);
         trace_step("prefetch_balances");
 
         // Second pass: Validate transactions and track effects
@@ -1335,7 +1354,7 @@ impl Blockchain {
             *pending_effects.entry(tx.sender.clone()).or_default() += required;
             *pending_effects.entry(tx.recipient.clone()).or_default() -= tx.amount;
         }
-        FINALIZE_STAGE.store(7, Ordering::Release);
+        set_finalize_stage(7);
         trace_step("validate_batch");
 
         // Process transactions atomically
@@ -1344,18 +1363,19 @@ impl Blockchain {
             TransactionContext::BlockValidation,
         )
         .await?;
-        FINALIZE_STAGE.store(8, Ordering::Release);
+        set_finalize_stage(8);
         trace_step("apply_batch");
 
         // Save block
         let value = bincode::serialize(&block)?;
         let key = format!("block_{}", block.index);
         self.db.insert(key.as_bytes(), value)?;
-        FINALIZE_STAGE.store(9, Ordering::Release);
+        set_finalize_stage(9);
         trace_step("db_insert");
-        Self::flush_db_with_retry(&self.db, "blockchain").await?;
-        FINALIZE_STAGE.store(10, Ordering::Release);
-        trace_step("db_flush");
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        Self::set_balances_height(&balances_tree, block.index as u64)?;
+        set_finalize_stage(10);
+        trace_step("balances_height");
 
         Ok(())
     }
@@ -1545,7 +1565,7 @@ impl Blockchain {
     }
 
     pub async fn calculate_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
-        let balances_tree = self.db.open_tree("balances")?;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
 
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
             let balance: f64 = bincode::deserialize(&balance_bytes)
@@ -2211,7 +2231,7 @@ impl Blockchain {
         transactions: Vec<Transaction>,
         context: TransactionContext,
     ) -> Result<(), BlockchainError> {
-        let balances_tree = self.db.open_tree("balances")?;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let pending_tree = self.db.open_tree("pending_transactions")?;
 
         // Track cumulative balance changes
@@ -2264,7 +2284,6 @@ impl Blockchain {
 
         // Commit changes
         balances_tree.apply_batch(batch)?;
-        Self::flush_tree_with_retry(&balances_tree, "balances").await?;
 
         // Clear processed transactions from pending
         if context == TransactionContext::BlockValidation {
@@ -2274,7 +2293,6 @@ impl Blockchain {
                     pending_tree.remove(tx_id.as_bytes())?;
                 }
             }
-            Self::flush_tree_with_retry(&pending_tree, "pending_transactions").await?;
         }
 
         Ok(())
@@ -2297,7 +2315,7 @@ impl Blockchain {
     }
 
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
-        let balances_tree = self.db.open_tree("balances")?;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
             let balance: f64 = bincode::deserialize(&balance_bytes)
                 .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
@@ -2345,11 +2363,7 @@ impl Blockchain {
         }
 
         let balance = Transaction::round_amount(balance);
-        balances_tree.insert(
-            address.as_bytes(),
-            bincode::serialize(&balance)?,
-        )?;
-        Self::flush_tree_with_retry(&balances_tree, "balances").await?;
+        balances_tree.insert(address.as_bytes(), bincode::serialize(&balance)?)?;
         Ok(balance)
     }
 
@@ -2380,7 +2394,7 @@ impl Blockchain {
         address: &str,
         amount: f64,
     ) -> Result<(), BlockchainError> {
-        let balances_tree = self.db.open_tree("balances")?;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
 
         // Get current balance
         let current_balance = match balances_tree.get(address.as_bytes())? {
@@ -2396,8 +2410,6 @@ impl Blockchain {
             address.as_bytes(),
             bincode::serialize(&new_balance).map_err(|_| BlockchainError::InvalidTransaction)?,
         )?;
-
-        Self::flush_tree_with_retry(&balances_tree, "balances").await?;
 
         Ok(())
     }

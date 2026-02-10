@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
-use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, BlockchainError};
+use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError};
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
 
@@ -459,6 +459,7 @@ impl MiningManager {
                 }
 
                 let finalize_future = async {
+                    set_finalize_stage(0);
                     let mut blockchain_lock = self.blockchain.write().await;
 
                     let tip = blockchain_lock.get_last_block();

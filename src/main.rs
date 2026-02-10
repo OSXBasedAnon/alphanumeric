@@ -2024,7 +2024,7 @@ fn print_ascii_intro() {
     // Replace with your ASCII art
     let ascii_art = r#"
 
-                        -++-    -++-                                  alphanumeric beta 7.2.7
+                        -++-    -++-                                  alphanumeric beta 7.3.3
                        -+++.   .+++
                 .++++++++++++++++++++++-                              Architecture: Rust
                 -####++++#####++++#####+                              Algorithm: SHA-256
