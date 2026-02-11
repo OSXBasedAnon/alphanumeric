@@ -12,7 +12,8 @@ use bincode;
 use crate::a9::blockchain::{Blockchain, BlockchainError, Transaction};
 use crate::a9::bpos::BlockHeaderInfo;
 
-const MEMPOOL_MAX_SIZE: usize = 50_000;
+const MEMPOOL_MAX_BYTES: usize = 50_000_000;
+const MEMPOOL_MAX_TRANSACTIONS: usize = 50_000;
 const MEMPOOL_MAX_PER_ADDRESS: usize = 100;
 const MAX_CHECKPOINT_HEADERS: usize = 1_000;
 const CHECKPOINT_INTERVAL: u64 = 300; // 5 minutes
@@ -69,6 +70,7 @@ impl Eq for MempoolEntry {}
 pub struct Mempool {
     transactions: DashMap<String, Vec<MempoolEntry>>,
     total_size: AtomicUsize,
+    total_count: AtomicUsize,
     address_counts: DashMap<String, usize>,
 }
 
@@ -77,6 +79,7 @@ impl Mempool {
         Self {
             transactions: DashMap::new(),
             total_size: AtomicUsize::new(0),
+            total_count: AtomicUsize::new(0),
             address_counts: DashMap::new(),
         }
     }
@@ -84,7 +87,8 @@ impl Mempool {
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
         // Quick checks first
         let current_total_size = self.total_size.load(AtomicOrdering::SeqCst);
-        if current_total_size >= MEMPOOL_MAX_SIZE {
+        let current_total_count = self.total_count.load(AtomicOrdering::SeqCst);
+        if current_total_size >= MEMPOOL_MAX_BYTES || current_total_count >= MEMPOOL_MAX_TRANSACTIONS {
             // If mempool is full, try eviction before more expensive checks
             self.evict_lowest_fee_transactions(MAX_BLOCK_SIZE);
         }
@@ -110,7 +114,8 @@ impl Mempool {
 
         // Final size check after eviction
         let final_size = self.total_size.load(AtomicOrdering::SeqCst) + tx_size;
-        if final_size > MEMPOOL_MAX_SIZE {
+        let final_count = self.total_count.load(AtomicOrdering::SeqCst) + 1;
+        if final_size > MEMPOOL_MAX_BYTES || final_count > MEMPOOL_MAX_TRANSACTIONS {
             return Err(BlockchainError::RateLimitExceeded("Mempool is full".into()));
         }
 
@@ -135,6 +140,7 @@ impl Mempool {
             .and_modify(|e| *e += 1)
             .or_insert(1);
         self.total_size.fetch_add(tx_size, AtomicOrdering::SeqCst);
+        self.total_count.fetch_add(1, AtomicOrdering::SeqCst);
 
         Ok(())
     }
@@ -203,6 +209,7 @@ impl Mempool {
     fn recalculate_metrics(&mut self) {
         self.address_counts.clear();
         self.total_size = AtomicUsize::new(0);
+        self.total_count = AtomicUsize::new(0);
 
         for entry in &self.transactions {
             let addr = entry.key();
@@ -212,6 +219,8 @@ impl Mempool {
                 txs.iter().map(|tx| tx.size).sum::<usize>(),
                 AtomicOrdering::SeqCst,
             );
+            self.total_count
+                .fetch_add(txs.len(), AtomicOrdering::SeqCst);
         }
     }
 
@@ -251,6 +260,7 @@ impl Mempool {
                 if let Some(pos) = txs.iter().position(|tx| tx.timestamp == timestamp) {
                     txs.remove(pos);
                     self.total_size.fetch_sub(size, AtomicOrdering::SeqCst);
+                    self.total_count.fetch_sub(1, AtomicOrdering::SeqCst);
                 }
             }
         }

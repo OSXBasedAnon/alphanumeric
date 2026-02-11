@@ -2345,14 +2345,17 @@ impl Blockchain {
     }
 
     pub async fn process_pending_transactions(&self) -> Result<(), BlockchainError> {
-        let pending_transactions = self.db.get("pending_transactions")?;
+        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let mut transactions = Vec::new();
 
-        if let Some(transactions_bytes) = pending_transactions {
-            // Deserialize the bytes into Vec<Transaction>
-            let transactions: Vec<Transaction> = bincode::deserialize(&transactions_bytes)
-                .map_err(|e| BlockchainError::SerializationError(e))?;
+        for result in pending_tree.iter() {
+            let (_, tx_bytes) = result?;
+            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+                transactions.push(tx);
+            }
+        }
 
-            // Process the transactions batch
+        if !transactions.is_empty() {
             self.process_transactions_batch(transactions, TransactionContext::Standard)
                 .await?;
         }

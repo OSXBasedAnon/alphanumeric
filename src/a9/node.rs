@@ -445,7 +445,7 @@ pub enum NetworkEvent {
         start: u32,
         end: u32,
         requester: SocketAddr,
-        response_channel: oneshot::Sender<Vec<Block>>,
+        response_channel: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Vec<Block>>>>>,
     },
     ChainResponse {
         blocks: Vec<Block>,
@@ -465,9 +465,17 @@ impl Clone for NetworkEvent {
                 blocks: blocks.clone(),
                 sender: *sender,
             },
-            NetworkEvent::ChainRequest { .. } => {
-                panic!("Cannot clone ChainRequest")
-            }
+            NetworkEvent::ChainRequest {
+                start,
+                end,
+                requester,
+                response_channel,
+            } => NetworkEvent::ChainRequest {
+                start: *start,
+                end: *end,
+                requester: *requester,
+                response_channel: response_channel.clone(),
+            },
         }
     }
 }
@@ -3588,10 +3596,14 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             .get_mempool_transaction_by_id(&tx_id)
             .await
         {
-            self.tx_witness_cache
-                .lock()
-                .put(tx_id.clone(), mempool_tx.clone());
-            return Ok(Some(mempool_tx));
+            if let Some(sig_hex) = &mempool_tx.signature {
+                if !Self::is_signature_truncated(sig_hex) {
+                    self.tx_witness_cache
+                        .lock()
+                        .put(tx_id.clone(), mempool_tx.clone());
+                    return Ok(Some(mempool_tx));
+                }
+            }
         }
 
         if let Some(peer_addr) = peer {
@@ -3901,8 +3913,15 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 };
 
                 // Send response through dedicated channel
-                if let Err(_) = response_channel.send(blocks.clone()) {
-                    warn!("Failed to send chain response through channel");
+                {
+                    let mut channel_guard = response_channel.lock().await;
+                    if let Some(sender) = channel_guard.take() {
+                        if sender.send(blocks.clone()).is_err() {
+                            warn!("Failed to send chain response through channel");
+                        }
+                    } else {
+                        warn!("Chain response channel already consumed");
+                    }
                 }
 
                 // Also send through network message
@@ -4106,13 +4125,14 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
                 // Create response channel
                 let (response_tx, response_rx) = oneshot::channel();
+                let response_channel = Arc::new(tokio::sync::Mutex::new(Some(response_tx)));
 
                 // Send request event
                 tx.send(NetworkEvent::ChainRequest {
                     start,
                     end,
                     requester: addr,
-                    response_channel: response_tx,
+                    response_channel,
                 })
                 .await
                 .map_err(|e| NodeError::Network(format!("Failed to send chain request: {}", e)))?;

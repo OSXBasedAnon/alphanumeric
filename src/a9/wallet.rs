@@ -220,18 +220,21 @@ impl Wallet {
             return Err("Passphrase required for encrypted wallet".to_string());
         }
 
-        let secret_key_bytes = if passphrase.is_some() {
+        let combined_bytes = if passphrase.is_some() {
             Self::decrypt_private_key(encrypted_key.to_vec(), passphrase.unwrap())?
         } else {
             encrypted_key.to_vec()
         };
 
-        // Create new dilithium keypair
-        let (public_key, _) = dilithium_keypair();
+        if combined_bytes.len() < 4896 {
+            return Err("Invalid key data".to_string());
+        }
+
+        let (secret_bytes, public_bytes) = combined_bytes.split_at(4896);
 
         let keys = WalletKeys {
-            dilithium_secret_key_bytes: secret_key_bytes,
-            dilithium_public_key_bytes: PqPublicKey::as_bytes(&public_key).to_vec(),
+            dilithium_secret_key_bytes: secret_bytes.to_vec(),
+            dilithium_public_key_bytes: public_bytes.to_vec(),
         };
 
         Ok(Self {
