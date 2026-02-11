@@ -189,6 +189,17 @@ impl Mempool {
         }
     }
 
+    pub fn find_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
+        for entry in self.transactions.iter() {
+            for tx in entry.value().iter() {
+                if tx.transaction.get_tx_id() == tx_id {
+                    return Some(tx.transaction.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn recalculate_metrics(&mut self) {
         self.address_counts.clear();
         self.total_size = AtomicUsize::new(0);

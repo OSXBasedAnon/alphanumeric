@@ -945,7 +945,7 @@ impl VelocityProtocol for Node {
         if let Some(block) = velocity.handle_shred(shred, from).await? {
             // Process reconstructed block through regular validation
             if self
-                .verify_block_parallel(&block)
+                .verify_block_with_witness(&block, Some(from))
                 .await
                 .map_err(|e| VelocityError::BlockReconstruction(e.to_string()))?
             {

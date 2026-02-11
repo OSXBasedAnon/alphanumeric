@@ -1658,6 +1658,47 @@ impl Blockchain {
         Ok(())
     }
 
+    pub fn verify_transaction_signature(&self, tx: &Transaction) -> Result<(), BlockchainError> {
+        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            return Ok(());
+        }
+
+        let pub_key = tx
+            .pub_key
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+        let sig_hex = tx
+            .signature
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+
+        let sig_bytes =
+            hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+
+        if !tx.is_valid(pub_key) {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        // Verify address ownership (pubkey -> address)
+        let mut hasher = Sha256::new();
+        let pub_key_bytes =
+            hex::decode(pub_key).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        hasher.update(&pub_key_bytes);
+        let derived_addr = hex::encode(&hasher.finalize()[..20]);
+        if derived_addr != tx.sender {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        if let Some(expected_hash) = &tx.sig_hash {
+            let actual_hash = Transaction::signature_hash_hex(&sig_bytes);
+            if &actual_hash != expected_hash {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn get_block_by_timestamp(&self, timestamp: u64) -> Result<Block, BlockchainError> {
         self.get_blocks()
             .into_iter()
@@ -1968,6 +2009,10 @@ impl Blockchain {
 
     pub async fn get_mempool_transactions(&self) -> Result<Vec<Transaction>, BlockchainError> {
         Ok(self.mempool.read().await.get_transactions_for_block())
+    }
+
+    pub async fn get_mempool_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
+        self.mempool.read().await.find_transaction_by_id(tx_id)
     }
 
     pub async fn add_to_mempool(&self, tx: Transaction) -> Result<(), BlockchainError> {

@@ -66,13 +66,16 @@ use tokio::{
     time::{interval, sleep, timeout},
 };
 use uuid::Uuid;
+use lru::LruCache;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 
-use crate::a9::blockchain::{Block, Blockchain, BlockchainError, RateLimiter, Transaction};
+use crate::a9::blockchain::{
+    Block, Blockchain, BlockchainError, RateLimiter, Transaction, SYSTEM_ADDRESSES,
+};
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::mempool::TemporalVerification;
 use crate::a9::oracle::DifficultyOracle;
@@ -366,6 +369,13 @@ pub enum NetworkMessage {
     },
     Block(Block),
     Transaction(Transaction),
+    TxRequest {
+        tx_id: String,
+    },
+    TxResponse {
+        tx_id: String,
+        tx: Option<Transaction>,
+    },
     GetBlocks {
         start: u32,
         end: u32,
@@ -437,7 +447,10 @@ pub enum NetworkEvent {
         requester: SocketAddr,
         response_channel: oneshot::Sender<Vec<Block>>,
     },
-    ChainResponse(Vec<Block>),
+    ChainResponse {
+        blocks: Vec<Block>,
+        sender: SocketAddr,
+    },
 }
 
 // For use with clone(), as ChainRequest has a oneshot channel
@@ -448,7 +461,10 @@ impl Clone for NetworkEvent {
             NetworkEvent::NewBlock(block) => NetworkEvent::NewBlock(block.clone()),
             NetworkEvent::PeerJoin(addr) => NetworkEvent::PeerJoin(*addr),
             NetworkEvent::PeerLeave(addr) => NetworkEvent::PeerLeave(*addr),
-            NetworkEvent::ChainResponse(blocks) => NetworkEvent::ChainResponse(blocks.clone()),
+            NetworkEvent::ChainResponse { blocks, sender } => NetworkEvent::ChainResponse {
+                blocks: blocks.clone(),
+                sender: *sender,
+            },
             NetworkEvent::ChainRequest { .. } => {
                 panic!("Cannot clone ChainRequest")
             }
@@ -761,6 +777,8 @@ pub struct Node {
 
     // Consensus state
     block_response_channels: Arc<RwLock<HashMap<Uuid, mpsc::Sender<NetworkMessage>>>>,
+    tx_response_channels: Arc<RwLock<HashMap<String, oneshot::Sender<Option<Transaction>>>>>,
+    tx_witness_cache: Arc<PLMutex<LruCache<String, Transaction>>>,
     pub validation_pool: Arc<ValidationPool>,
     validation_cache: Arc<DashMap<String, ValidationCacheEntry>>,
     tx: broadcast::Sender<NetworkEvent>,
@@ -858,6 +876,8 @@ impl Node {
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
             .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
         let p2p_key = identity::Keypair::generate_ed25519();
+
+        let witness_cache_capacity = Self::witness_cache_capacity();
         let peer_id = PeerId::from(p2p_key.public()).to_string();
         let temporal_verification = Arc::new(TemporalVerification::new());
         let start_time = SystemTime::now()
@@ -946,6 +966,8 @@ impl Node {
             validation_pool: Arc::new(ValidationPool::new()),
             validation_cache: Arc::new(DashMap::with_capacity(10000)),
             block_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
+            tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
+            tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
             bind_addr,
@@ -3417,20 +3439,25 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
     // Core verification method for blocks
     pub async fn verify_block_parallel(&self, block: &Block) -> Result<bool, NodeError> {
-        // First check cache to avoid redundant work
+        self.verify_block_with_witness(block, None).await
+    }
+
+    pub async fn verify_block_with_witness(
+        &self,
+        block: &Block,
+        peer: Option<SocketAddr>,
+    ) -> Result<bool, NodeError> {
         let block_hash = hex::encode(&block.hash);
 
         if let Some(entry) = self.validation_cache.get(&block_hash) {
             if SystemTime::now()
                 .duration_since(entry.timestamp)
                 .map_or(true, |d| d.as_secs() < 3600)
-            // Cache valid for 1 hour
             {
                 return Ok(entry.valid);
             }
         }
 
-        // Acquire a validation permit with timeout
         let _permit = match tokio::time::timeout(
             Duration::from_millis(500),
             self.validation_pool.acquire_validation_permit(),
@@ -3439,15 +3466,11 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         {
             Ok(permit) => permit?,
             Err(_) => {
-                // If we can't get a permit quickly, assume the block is invalid
-                // to prevent DoS attacks that could overwhelm the validation pool
                 return Ok(false);
             }
         };
 
-        // Perform basic validation cheaply before acquiring blockchain lock
         if block.calculate_hash_for_block() != block.hash || !block.verify_pow() {
-            // Update cache with negative result
             self.validation_cache.insert(
                 block_hash,
                 ValidationCacheEntry {
@@ -3459,13 +3482,57 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             return Ok(false);
         }
 
-        // Perform full validation with blockchain lock
+        for tx in &block.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+
+            let mut full_tx = match self.resolve_full_tx_for_block(tx, peer).await? {
+                Some(tx) => tx,
+                None => return Ok(false),
+            };
+
+            if full_tx.get_tx_id() != tx.get_tx_id() {
+                return Ok(false);
+            }
+
+            if tx.pub_key.is_some() && full_tx.pub_key.is_some() && tx.pub_key != full_tx.pub_key {
+                return Ok(false);
+            }
+
+            if full_tx.pub_key.is_none() {
+                full_tx.pub_key = tx.pub_key.clone();
+            }
+
+            if full_tx.sig_hash.is_none() {
+                if let Some(sig_hex) = &full_tx.signature {
+                    let sig_bytes = hex::decode(sig_hex)
+                        .map_err(|_| NodeError::InvalidTransaction("Invalid signature bytes".into()))?;
+                    full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+                }
+            }
+
+            if let Some(expected_hash) = &tx.sig_hash {
+                if full_tx.sig_hash.as_ref() != Some(expected_hash) {
+                    return Ok(false);
+                }
+            }
+
+            let signature_ok = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.verify_transaction_signature(&full_tx).is_ok()
+            };
+
+            if !signature_ok {
+                return Ok(false);
+            }
+        }
+
         let validation_result = {
             let blockchain = self.blockchain.read().await;
             blockchain.validate_block(block).await.is_ok()
         };
 
-        // Update cache with result
         self.validation_cache.insert(
             block_hash,
             ValidationCacheEntry {
@@ -3475,7 +3542,6 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             },
         );
 
-        // Update header sentinel if available and block is valid
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
                 let header_info = BlockHeaderInfo {
@@ -3486,7 +3552,6 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 };
                 let node_id = self.node_id.clone();
 
-                // Record this node's verification asynchronously to avoid blocking
                 let sentinel = sentinel.clone();
                 tokio::spawn(async move {
                     let _ = sentinel.verify_and_add_header(header_info, &node_id, Vec::new()).await;
@@ -3495,6 +3560,94 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         }
 
         Ok(validation_result)
+    }
+
+    async fn resolve_full_tx_for_block(
+        &self,
+        tx: &Transaction,
+        peer: Option<SocketAddr>,
+    ) -> Result<Option<Transaction>, NodeError> {
+        let tx_id = tx.get_tx_id();
+        if let Some(cached) = self.tx_witness_cache.lock().get(&tx_id).cloned() {
+            return Ok(Some(cached));
+        }
+
+        if let Some(sig_hex) = &tx.signature {
+            if !Self::is_signature_truncated(sig_hex) {
+                self.tx_witness_cache
+                    .lock()
+                    .put(tx_id.clone(), tx.clone());
+                return Ok(Some(tx.clone()));
+            }
+        }
+
+        if let Some(mempool_tx) = self
+            .blockchain
+            .read()
+            .await
+            .get_mempool_transaction_by_id(&tx_id)
+            .await
+        {
+            self.tx_witness_cache
+                .lock()
+                .put(tx_id.clone(), mempool_tx.clone());
+            return Ok(Some(mempool_tx));
+        }
+
+        if let Some(peer_addr) = peer {
+            let fetched = self.request_tx_witness(peer_addr, &tx_id).await?;
+            if let Some(ref full_tx) = fetched {
+                self.tx_witness_cache
+                    .lock()
+                    .put(tx_id.clone(), full_tx.clone());
+            }
+            return Ok(fetched);
+        }
+
+        Ok(None)
+    }
+
+    fn is_signature_truncated(sig_hex: &str) -> bool {
+        match hex::decode(sig_hex) {
+            Ok(bytes) => bytes.len() <= 64,
+            Err(_) => true,
+        }
+    }
+
+    async fn request_tx_witness(
+        &self,
+        addr: SocketAddr,
+        tx_id: &str,
+    ) -> Result<Option<Transaction>, NodeError> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut channels = self.tx_response_channels.write().await;
+            channels.insert(tx_id.to_string(), tx);
+        }
+
+        let send_result = self
+            .send_message(
+                addr,
+                &NetworkMessage::TxRequest {
+                    tx_id: tx_id.to_string(),
+                },
+            )
+            .await;
+
+        if let Err(e) = send_result {
+            let mut channels = self.tx_response_channels.write().await;
+            channels.remove(tx_id);
+            return Err(e);
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(3), rx).await;
+        let mut channels = self.tx_response_channels.write().await;
+        channels.remove(tx_id);
+
+        match result {
+            Ok(Ok(tx_opt)) => Ok(tx_opt),
+            _ => Ok(None),
+        }
     }
 
     pub async fn validate_transaction(
@@ -3558,6 +3711,16 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
 
         Ok(())
+    }
+
+    fn witness_cache_capacity() -> NonZeroUsize {
+        let default_size = 20_000usize;
+        let size = std::env::var("ALPHANUMERIC_TX_WITNESS_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default_size);
+        NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(default_size).unwrap())
     }
 
     // Process incoming network messages from other nodes
@@ -3751,10 +3914,10 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 }
             }
 
-            NetworkEvent::ChainResponse(blocks) => {
+            NetworkEvent::ChainResponse { blocks, sender } => {
                 let blockchain = self.blockchain.read().await;
                 for block in blocks {
-                    if self.verify_block_parallel(&block).await? {
+                    if self.verify_block_with_witness(&block, Some(sender)).await? {
                         if let Err(e) = blockchain.save_block(&block).await {
                             warn!("Failed to save valid block {}: {}", block.index, e);
                         }
@@ -3801,10 +3964,38 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             return Err(NodeError::Network("Rate limit exceeded".into()));
         }
 
-        match message {
-            NetworkMessage::Transaction(tx_data) => {
-                let tx_ref = Arc::new(tx_data);
-                let tx_hash = tx_ref.create_hash();
+            match message {
+                NetworkMessage::TxRequest { tx_id } => {
+                    let tx_opt = self
+                        .blockchain
+                        .read()
+                        .await
+                        .get_mempool_transaction_by_id(&tx_id)
+                        .await;
+
+                    let response = NetworkMessage::TxResponse { tx_id, tx: tx_opt };
+                    self.send_message(addr, &response).await?;
+                }
+
+                NetworkMessage::TxResponse { tx_id, tx } => {
+                    if let Some(ref full_tx) = tx {
+                        let mut cache = self.tx_witness_cache.lock();
+                        cache.put(tx_id.clone(), full_tx.clone());
+                    }
+
+                    let sender = {
+                        let mut channels = self.tx_response_channels.write().await;
+                        channels.remove(&tx_id)
+                    };
+
+                    if let Some(sender) = sender {
+                        let _ = sender.send(tx);
+                    }
+                }
+
+                NetworkMessage::Transaction(tx_data) => {
+                    let tx_ref = Arc::new(tx_data);
+                    let tx_hash = tx_ref.create_hash();
 
                 // Check validation cache
                 if let Some(cached) = self.validation_cache.get(&tx_hash) {
@@ -3874,7 +4065,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 }
 
                 // Verify and propagate block
-                if self.verify_block_parallel(&block_ref).await? {
+                if self.verify_block_with_witness(&block_ref, Some(addr)).await? {
                     // Save block to blockchain
                     self.blockchain.read().await.save_block(&block_ref).await?;
 
@@ -3934,7 +4125,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkMessage::Blocks(blocks) => {
-                tx.send(NetworkEvent::ChainResponse(blocks))
+                tx.send(NetworkEvent::ChainResponse { blocks, sender: addr })
                     .await
                     .map_err(|e| {
                         NodeError::Network(format!("Failed to send chain response event: {}", e))
@@ -3959,7 +4150,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 if let Some(velocity) = &self.velocity_manager {
                     if let Ok(Some(block)) = velocity.handle_shred(shred, addr).await {
                         let block_ref = Arc::new(block);
-                        if self.verify_block_parallel(&block_ref).await? {
+                        if self.verify_block_with_witness(&block_ref, Some(addr)).await? {
                             self.blockchain.read().await.save_block(&block_ref).await?;
                         }
                     }
@@ -4795,8 +4986,13 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
                             .map(|block| {
                                 let node = self.clone();
                                 let block = block.clone();
+                                let peer_addr = *peer_addr;
                                 async move {
-                                    if node.verify_block_parallel(&block).await.unwrap_or(false) {
+                                    if node
+                                        .verify_block_with_witness(&block, Some(peer_addr))
+                                        .await
+                                        .unwrap_or(false)
+                                    {
                                         Some(block)
                                     } else {
                                         None

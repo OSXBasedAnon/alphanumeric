@@ -1,4 +1,5 @@
 use inquire::{Password, PasswordDisplayMode};
+use hex;
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -573,8 +574,22 @@ impl Mgmt {
                 .initialize_from_blockchain(&blockchain_guard)
                 .await?;
 
-            // Get pending transactions
-            let regular_transactions = blockchain_guard.get_pending_transactions().await?;
+            // Get mempool transactions (full signatures only)
+            let mempool_transactions = blockchain_guard.get_mempool_transactions().await?;
+            let regular_transactions: Vec<Transaction> = mempool_transactions
+                .into_iter()
+                .filter(|tx| {
+                    if tx.sender == "MINING_REWARDS" {
+                        return false;
+                    }
+                    if let Some(sig_hex) = &tx.signature {
+                        if let Ok(bytes) = hex::decode(sig_hex) {
+                            return bytes.len() > 64;
+                        }
+                    }
+                    false
+                })
+                .collect();
 
             // Calculate mining reward
             let mining_reward = blockchain_guard.get_block_reward(&regular_transactions);
