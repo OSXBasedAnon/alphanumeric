@@ -596,18 +596,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize sentinel and register metrics
+    // Initialize sentinel and register metrics for this node
     {
         let sentinel = staking_node.write().await;
         if let Err(e) = sentinel.initialize().await {
             error!("Failed to initialize staking sentinel: {}", e);
         } else {
-            // Register metrics for all wallets
-            for wallet in wallets.values() {
-                let balance = blockchain_guard.get_wallet_balance(&wallet.address).await.unwrap_or(0.0);
-                if let Err(e) = sentinel.register_wallet_metrics(&wallet.address, balance).await {
-                    error!("Failed to register metrics for wallet {}: {}", wallet.address, e);
-                }
+            let node_id = node.id().to_string();
+            if let Err(e) = sentinel.register_wallet_metrics(&node_id, total_balance).await {
+                error!("Failed to register metrics for node {}: {}", node_id, e);
             }
         }
     }
@@ -632,8 +629,9 @@ async fn main() -> Result<()> {
 
     // Node Status
     let sentinel = staking_node.read().await;
-    if let Some(wallet) = wallets.values().next() {
-        if let Ok(metrics) = sentinel.get_node_metrics(&wallet.address).await {
+    {
+        let node_id = node.id().to_string();
+        if let Ok(metrics) = sentinel.get_node_metrics(&node_id).await {
             color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
             stdout.set_color(&color_spec)?;
             writeln!(stdout, "\n Node Status ")?;

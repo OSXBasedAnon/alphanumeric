@@ -45,6 +45,7 @@ pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
 pub const MAX_BLOCK_REWARD: f64 = 50.0;
 pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
+pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
@@ -2011,7 +2012,8 @@ impl Blockchain {
 
         // Fee-weighted reward to avoid incentivizing spammy tx counts.
         let fee_target = (current_max * 0.05).max(0.0001);
-        let fee_factor = (total_fees / fee_target).clamp(0.0, 1.0);
+        let effective_fees = total_fees * (1.0 - MINT_CLIP);
+        let fee_factor = (effective_fees / fee_target).clamp(0.0, 1.0);
 
         // Base reward calculation
         let base_reward = if tx_count == 0 {
@@ -2022,7 +2024,7 @@ impl Blockchain {
 
         // Add transaction fees to the base reward
         let final_reward = Transaction::round_amount(
-            (base_reward + total_fees).clamp(MIN_BLOCK_REWARD, current_max),
+            (base_reward + effective_fees).clamp(MIN_BLOCK_REWARD, current_max),
         );
 
         Ok(final_reward)

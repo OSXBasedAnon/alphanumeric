@@ -3484,9 +3484,13 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                     prev_hash: block.previous_hash,
                     timestamp: block.timestamp,
                 };
+                let node_id = self.node_id.clone();
 
-                // Process asynchronously to avoid blocking
-                HeaderSentinel::spawn_add_verified_header(sentinel.clone(), header_info);
+                // Record this node's verification asynchronously to avoid blocking
+                let sentinel = sentinel.clone();
+                tokio::spawn(async move {
+                    let _ = sentinel.verify_and_add_header(header_info, &node_id, Vec::new()).await;
+                });
             }
         }
 
