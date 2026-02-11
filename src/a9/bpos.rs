@@ -228,6 +228,7 @@ impl BPoSSentinel {
 
         // Start independent monitoring tasks
         self.start_monitoring_tasks();
+        self.start_header_verification();
 
         // Initial state verification
         self.verify_chain_state().await?;
@@ -396,7 +397,7 @@ impl BPoSSentinel {
     fn start_monitoring_tasks(&self) {
         // BPoS chain monitoring with Dilithium verification
         let sentinel = self.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             let mut interval = interval(Duration::from_secs(CHAIN_VERIFICATION_INTERVAL));
             let mut last_height = 0u32;
 
@@ -419,7 +420,7 @@ impl BPoSSentinel {
 
         // BPoS metrics and health monitoring
         let sentinel = self.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             let mut interval = interval(Duration::from_secs(SENTINEL_CHECK_INTERVAL));
             let mut last_metrics_update = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -455,7 +456,7 @@ impl BPoSSentinel {
 
         // Add daily wallet pruning task
         let sentinel = self.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             // Wallet pruning is no longer needed since we removed the wallet registry
             
             // Run periodic tasks every 24 hours
@@ -468,7 +469,7 @@ impl BPoSSentinel {
 
         // Add cleanup task
         let sentinel = self.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             let mut interval = interval(Duration::from_secs(3600)); // Hourly cleanup
             loop {
                 interval.tick().await;

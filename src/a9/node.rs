@@ -4316,6 +4316,36 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 }
             }
 
+            NetworkMessage::HeaderVerification {
+                header,
+                node_id,
+                signature,
+            } => {
+                if let Some(ref sentinel) = self.header_sentinel {
+                    if let Err(e) = sentinel
+                        .verify_and_add_header(header, &node_id, signature)
+                        .await
+                    {
+                        debug!("Header verification rejected from {}: {}", addr, e);
+                    }
+                }
+            }
+
+            NetworkMessage::HeaderSync {
+                headers,
+                node_id,
+                signature,
+            } => {
+                if let Some(ref sentinel) = self.header_sentinel {
+                    if let Err(e) = sentinel
+                        .verify_headers_batch(headers, &node_id, signature)
+                        .await
+                    {
+                        debug!("Header sync rejected from {}: {}", addr, e);
+                    }
+                }
+            }
+
             // Handle other message types with default implementation
             _ => {}
         }
