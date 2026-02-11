@@ -2071,11 +2071,15 @@ impl Blockchain {
     }
 
     pub async fn get_transactions_for_block(&self) -> Vec<Transaction> {
-        self.mempool.read().await.get_transactions_for_block()
+        let mut mempool = self.mempool.write().await;
+        mempool.prune_expired();
+        mempool.get_transactions_for_block()
     }
 
     pub async fn get_mempool_transactions(&self) -> Result<Vec<Transaction>, BlockchainError> {
-        Ok(self.mempool.read().await.get_transactions_for_block())
+        let mut mempool = self.mempool.write().await;
+        mempool.prune_expired();
+        Ok(mempool.get_transactions_for_block())
     }
 
     pub async fn get_mempool_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {

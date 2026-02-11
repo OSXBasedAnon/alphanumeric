@@ -75,6 +75,19 @@ pub struct Mempool {
 }
 
 impl Mempool {
+    fn mempool_ttl_secs() -> Option<u64> {
+        const DEFAULT_TTL_SECS: u64 = 600;
+        let ttl = std::env::var("ALPHANUMERIC_MEMPOOL_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TTL_SECS);
+        if ttl == 0 {
+            None
+        } else {
+            Some(ttl)
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             transactions: DashMap::new(),
@@ -85,23 +98,7 @@ impl Mempool {
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
-        // Quick checks first
-        let current_total_size = self.total_size.load(AtomicOrdering::SeqCst);
-        let current_total_count = self.total_count.load(AtomicOrdering::SeqCst);
-        if current_total_size >= MEMPOOL_MAX_BYTES || current_total_count >= MEMPOOL_MAX_TRANSACTIONS {
-            // If mempool is full, try eviction before more expensive checks
-            self.evict_lowest_fee_transactions(MAX_BLOCK_SIZE);
-        }
-
-        // Rate limit check (cheap)
-        let addr_count = match self.address_counts.get(&tx.sender) {
-            Some(count) if *count >= MEMPOOL_MAX_PER_ADDRESS => {
-                return Err(BlockchainError::RateLimitExceeded(
-                    "Too many transactions from this address".into(),
-                ))
-            }
-            _ => 0,
-        };
+        self.prune_expired();
 
         // Now do the expensive serialization
         let tx_size = bincode::serialize(&tx)
@@ -110,6 +107,28 @@ impl Mempool {
 
         if tx_size > MAX_BLOCK_SIZE {
             return Err(BlockchainError::InvalidTransaction);
+        }
+
+        // Quick checks first
+        let current_total_size = self.total_size.load(AtomicOrdering::SeqCst);
+        let current_total_count = self.total_count.load(AtomicOrdering::SeqCst);
+        let required_bytes =
+            current_total_size.saturating_add(tx_size).saturating_sub(MEMPOOL_MAX_BYTES);
+        let required_count = current_total_count
+            .saturating_add(1)
+            .saturating_sub(MEMPOOL_MAX_TRANSACTIONS);
+        if required_bytes > 0 || required_count > 0 {
+            self.evict_lowest_fee_transactions(required_bytes, required_count);
+        }
+
+        // Rate limit check (cheap)
+        match self.address_counts.get(&tx.sender) {
+            Some(count) if *count >= MEMPOOL_MAX_PER_ADDRESS => {
+                return Err(BlockchainError::RateLimitExceeded(
+                    "Too many transactions from this address".into(),
+                ))
+            }
+            _ => {}
         }
 
         // Final size check after eviction
@@ -191,7 +210,29 @@ impl Mempool {
 
     pub fn clear_transaction(&mut self, tx: &Transaction) {
         if let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) {
+            let mut removed = 0usize;
+            let mut removed_size = 0usize;
+            for entry in addr_txs.iter() {
+                if entry.transaction == *tx {
+                    removed += 1;
+                    removed_size += entry.size;
+                }
+            }
+            if removed == 0 {
+                return;
+            }
             addr_txs.retain(|entry| entry.transaction != *tx);
+            if removed > 0 {
+                self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
+                self.total_size
+                    .fetch_sub(removed_size, AtomicOrdering::SeqCst);
+                if let Some(mut count) = self.address_counts.get_mut(&tx.sender) {
+                    *count = count.saturating_sub(removed);
+                    if *count == 0 {
+                        self.address_counts.remove(&tx.sender);
+                    }
+                }
+            }
         }
     }
 
@@ -224,11 +265,64 @@ impl Mempool {
         }
     }
 
-    fn evict_lowest_fee_transactions(&mut self, required_space: usize) {
+    pub fn prune_expired(&mut self) -> usize {
+        let Some(ttl_secs) = Self::mempool_ttl_secs() else {
+            return 0;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut to_remove: Vec<(String, String, usize)> = Vec::new();
+        for entry in self.transactions.iter() {
+            let sender = entry.key();
+            for tx in entry.value().iter() {
+                if now.saturating_sub(tx.timestamp) > ttl_secs {
+                    to_remove.push((
+                        sender.clone(),
+                        tx.transaction.get_tx_id(),
+                        tx.size,
+                    ));
+                }
+            }
+        }
+
+        if to_remove.is_empty() {
+            return 0;
+        }
+
+        let mut removed = 0usize;
+        for (addr, tx_id, size) in to_remove {
+            if let Some(mut txs) = self.transactions.get_mut(&addr) {
+                let before = txs.len();
+                txs.retain(|entry| entry.transaction.get_tx_id() != tx_id);
+                let removed_here = before.saturating_sub(txs.len());
+                if removed_here > 0 {
+                    removed += removed_here;
+                    self.total_count
+                        .fetch_sub(removed_here, AtomicOrdering::SeqCst);
+                    self.total_size
+                        .fetch_sub(size.saturating_mul(removed_here), AtomicOrdering::SeqCst);
+                    if let Some(mut count) = self.address_counts.get_mut(&addr) {
+                        *count = count.saturating_sub(removed_here);
+                        if *count == 0 {
+                            self.address_counts.remove(&addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        removed
+    }
+
+    fn evict_lowest_fee_transactions(&mut self, required_space: usize, required_count: usize) {
         use std::collections::BinaryHeap;
         use std::cmp::Reverse;
 
         let mut space_freed = 0;
+        let mut count_freed = 0;
 
         // Use a min-heap to efficiently find lowest fee transactions across all senders
         // Store (fee, timestamp, sender, size) - removed idx as it's not used
@@ -237,30 +331,46 @@ impl Mempool {
         for entry in self.transactions.iter() {
             let sender = entry.key();
             for tx in entry.value().iter() {
-                // Push with Reverse for min-heap behavior
-                candidates.push(Reverse((tx.fee_per_byte, tx.timestamp, sender.clone(), tx.size)));
+                candidates.push(Reverse((
+                    tx.fee_per_byte,
+                    tx.timestamp,
+                    sender.clone(),
+                    tx.transaction.get_tx_id(),
+                    tx.size,
+                )));
             }
         }
 
         // Evict lowest fee transactions until we have enough space
-        let mut to_remove: Vec<(String, u64, usize)> = Vec::new();
+        let mut to_remove: Vec<(String, String, usize)> = Vec::new();
 
-        while space_freed < required_space {
-            if let Some(Reverse((_, timestamp, sender, size))) = candidates.pop() {
-                to_remove.push((sender, timestamp, size));
+        while space_freed < required_space || count_freed < required_count {
+            if let Some(Reverse((_, _timestamp, sender, tx_id, size))) = candidates.pop() {
+                to_remove.push((sender, tx_id, size));
                 space_freed += size;
+                count_freed += 1;
             } else {
                 break;
             }
         }
 
         // Batch removals
-        for (addr, timestamp, size) in to_remove {
+        for (addr, tx_id, size) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
-                if let Some(pos) = txs.iter().position(|tx| tx.timestamp == timestamp) {
-                    txs.remove(pos);
-                    self.total_size.fetch_sub(size, AtomicOrdering::SeqCst);
-                    self.total_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                let before = txs.len();
+                txs.retain(|entry| entry.transaction.get_tx_id() != tx_id);
+                let removed_here = before.saturating_sub(txs.len());
+                if removed_here > 0 {
+                    self.total_size
+                        .fetch_sub(size.saturating_mul(removed_here), AtomicOrdering::SeqCst);
+                    self.total_count
+                        .fetch_sub(removed_here, AtomicOrdering::SeqCst);
+                    if let Some(mut count) = self.address_counts.get_mut(&addr) {
+                        *count = count.saturating_sub(removed_here);
+                        if *count == 0 {
+                            self.address_counts.remove(&addr);
+                        }
+                    }
                 }
             }
         }
