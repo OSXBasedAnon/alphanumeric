@@ -6,6 +6,7 @@ pub struct NetworkConfig {
     pub port: u16,
     pub bind_ip: IpAddr,
     pub max_peers: usize,
+    pub max_connections: usize,
     pub seed_nodes: Vec<String>,
     pub velocity_enabled: bool,
     pub max_shred_size: usize,
@@ -19,6 +20,7 @@ impl Default for NetworkConfig {
             port: 7177,
             bind_ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             max_peers: 50,
+            max_connections: 200,
             seed_nodes: vec![
                 "seed.alphanumeric.network:7177".to_string(),
                 "seed2.alphanumeric.network:7177".to_string(),
@@ -51,6 +53,12 @@ impl NetworkConfig {
         if let Ok(max_peers) = env::var("ALPHANUMERIC_MAX_PEERS") {
             if let Ok(max_peers) = max_peers.parse::<usize>() {
                 config.max_peers = max_peers;
+            }
+        }
+
+        if let Ok(max_connections) = env::var("ALPHANUMERIC_MAX_CONNECTIONS") {
+            if let Ok(max_connections) = max_connections.parse::<usize>() {
+                config.max_connections = max_connections;
             }
         }
 
@@ -196,10 +204,11 @@ impl AppConfig {
             format!(" mining={}", self.mining.enabled)
         };
         
-        print!("Alphanumeric port={} bind={} peers={} velocity={} seeds={} db={}{}", 
+        print!("Alphanumeric port={} bind={} peers={} conns={} velocity={} seeds={} db={}{}", 
             self.network.port, 
             self.network.bind_ip, 
             self.network.max_peers, 
+            self.network.max_connections,
             self.network.velocity_enabled, 
             self.network.seed_nodes.len(), 
             self.database.path,

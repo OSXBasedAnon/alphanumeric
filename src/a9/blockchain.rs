@@ -2371,6 +2371,17 @@ impl Blockchain {
 
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let auto_rebuild = std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(true);
+
+        if auto_rebuild {
+            let tip = self.get_block_count() as u64;
+            let index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);
+            if index_height < tip {
+                self.ensure_balances_index().await?;
+            }
+        }
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
             let balance: f64 = bincode::deserialize(&balance_bytes)
                 .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;

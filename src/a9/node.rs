@@ -772,6 +772,8 @@ pub struct Node {
 
     // Network state
     pub peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
+    max_peers: usize,
+    max_connections: usize,
     pub network_health: Arc<RwLock<NetworkHealth>>,
     network_bloom: Arc<NetworkBloom>,
     peer_failures: Arc<RwLock<HashMap<SocketAddr, u32>>>,
@@ -880,6 +882,8 @@ impl Node {
         handshake_key_bytes: Vec<u8>,
         bind_addr: Option<SocketAddr>,
         velocity_enabled: bool,
+        max_peers: usize,
+        max_connections: usize,
     ) -> Result<Self, NodeError> {
         let (tx, _) = broadcast::channel(1000);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
@@ -969,6 +973,8 @@ impl Node {
         Ok(Self {
             db,
             peers: Arc::new(RwLock::new(HashMap::new())),
+            max_peers: max_peers.max(MIN_PEERS),
+            max_connections: max_connections.max(10),
             blockchain,
             network_health: Arc::new(RwLock::new(NetworkHealth::new())),
             node_id: hex::encode(keypair.public_key().as_ref()),
@@ -2610,7 +2616,7 @@ async fn build_optimized_scan_ranges(
                 info!("Starting connection handler on {}", node_clone.bind_addr);
 
                 // Connection limiter to prevent DOS
-                let connection_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+                let connection_limiter = Arc::new(Semaphore::new(node_clone.max_connections));
 
                 loop {
                     // Try to acquire a connection slot
@@ -3200,7 +3206,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     }
     
     // Find overrepresented subnets
-    let max_per_subnet = (MAX_PEERS / 8).max(MAX_PEERS_PER_SUBNET);
+    let max_per_subnet = (self.max_peers / 8).max(MAX_PEERS_PER_SUBNET);
     let mut removals = Vec::new();
     
     for (subnet, count) in subnet_counts.iter() {
@@ -4481,7 +4487,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         // Verify peer slots and subnet diversity
         {
             let mut peers = self.peers.write().await;
-            if peers.len() >= MAX_PEERS {
+            if peers.len() >= self.max_peers {
                 return Err(NodeError::Network("Maximum peers reached".into()));
             }
 

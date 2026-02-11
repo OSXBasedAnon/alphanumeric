@@ -223,6 +223,8 @@ async fn main() -> Result<()> {
             key_pair_pkcs8.as_ref().to_vec(),
             bind_addr,
             config.network.velocity_enabled,
+            config.network.max_peers,
+            config.network.max_connections,
         )
         .await {
             Ok(node) => Arc::new(node),
@@ -522,6 +524,30 @@ async fn main() -> Result<()> {
 
         // Whisper
         let whisper_module = Arc::new(RwLock::new(WhisperModule::new_with_db(Arc::new(db.clone()))));
+        let wallet_addresses: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(
+            wallets.values().map(|w| w.address.clone()).collect(),
+        ));
+
+        {
+            let whisper_module = whisper_module.clone();
+            let wallet_addresses = wallet_addresses.clone();
+            let blockchain = blockchain.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(15));
+                loop {
+                    interval.tick().await;
+                    let addresses = wallet_addresses.read().await.clone();
+                    if addresses.is_empty() {
+                        continue;
+                    }
+                    let blockchain_guard = blockchain.read().await;
+                    let whisper = whisper_module.read().await;
+                    for addr in &addresses {
+                        let _ = whisper.sync_index_for_wallet(addr, &blockchain_guard).await;
+                    }
+                }
+            });
+        }
 
         // Mining params
         pb.set_message("Setting up mining parameters...");
@@ -778,6 +804,10 @@ println!("Error creating wallet: {}", e);
 } else {
 if let Err(e) = mgmt.save_wallets(&db_arc, &wallets, wallet_encryption_state.as_deref()).await {
 error!("Failed to save wallets after creation: {}", e);
+}
+{
+    let mut addresses = wallet_addresses.write().await;
+    *addresses = wallets.values().map(|w| w.address.clone()).collect();
 }
 }
 }

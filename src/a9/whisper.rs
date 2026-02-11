@@ -187,6 +187,14 @@ impl WhisperModule {
         Ok(())
     }
 
+    pub async fn sync_index_for_wallet(
+        &self,
+        address: &str,
+        blockchain: &Blockchain,
+    ) -> Result<(), BlockchainError> {
+        self.ensure_wallet_indexed(address, blockchain).await
+    }
+
     async fn update_wallet_index(
         &self,
         address: &str,
