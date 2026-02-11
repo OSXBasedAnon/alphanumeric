@@ -971,6 +971,45 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
+    fn pending_tx_ttl_secs() -> Option<u64> {
+        const DEFAULT_TTL_SECS: u64 = 600;
+        let raw = std::env::var("ALPHANUMERIC_PENDING_TX_TTL_SECS").ok();
+        let ttl = raw
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TTL_SECS);
+        if ttl == 0 {
+            None
+        } else {
+            Some(ttl)
+        }
+    }
+
+    fn prune_pending_transactions(&self) -> Result<usize, BlockchainError> {
+        let Some(ttl_secs) = Self::pending_tx_ttl_secs() else {
+            return Ok(0);
+        };
+        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut removed = 0usize;
+        for result in pending_tree.iter() {
+            let (key, tx_bytes) = result?;
+            let remove = match deserialize_transaction(&tx_bytes) {
+                Ok(tx) => now.saturating_sub(tx.timestamp) > ttl_secs,
+                Err(_) => true,
+            };
+            if remove {
+                pending_tree.remove(key)?;
+                removed += 1;
+            }
+        }
+        pending_tree.flush()?;
+        Ok(removed)
+    }
     fn signature_cache_capacity() -> NonZeroUsize {
         let default_size = 50_000usize;
         let size = std::env::var("ALPHANUMERIC_SIG_CACHE_SIZE")
@@ -1094,6 +1133,7 @@ impl Blockchain {
         self.get_network_difficulty().await?;
 
         // Sync mempool with sled
+        let _ = self.prune_pending_transactions();
         self.sync_mempool_with_sled().await?;
 
         // Ensure balances index is valid (rebuild if needed)
@@ -2196,6 +2236,7 @@ impl Blockchain {
         let mut mempool = self.mempool.write().await;
 
         // Get pending transactions from sled
+        let _ = self.prune_pending_transactions();
         let pending_tree = self.db.open_tree("pending_transactions")?;
 
         // Collect all transactions from sled
