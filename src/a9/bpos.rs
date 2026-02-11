@@ -263,7 +263,7 @@ impl BPoSSentinel {
             .unwrap_or_default()
             .as_secs();
 
-        let total_blocks = {
+        let _total_blocks = {
             let blockchain = self.blockchain.read().await;
             blockchain.get_block_count() as u64
         };
@@ -455,7 +455,6 @@ impl BPoSSentinel {
         });
 
         // Add daily wallet pruning task
-        let sentinel = self.clone();
         tokio::task::spawn(async move {
             // Wallet pruning is no longer needed since we removed the wallet registry
             
@@ -1341,8 +1340,7 @@ impl BPoSSentinel {
 
     async fn calculate_network_load(&self) -> Result<f64, String> {
         // Take a single atomic read of both blockchain and headers
-        let (blockchain_guard, headers_guard) =
-            tokio::join!(self.blockchain.read(), self.header_cache.read());
+        let headers_guard = self.header_cache.read().await;
 
         // Early return if no blocks to analyze
         if headers_guard.is_empty() {
@@ -1453,8 +1451,7 @@ impl BPoSSentinel {
         use rayon::prelude::*;
 
         // Prepare validation context
-        let blockchain = self.blockchain.read().await;
-        let total_blocks = blocks.len();
+        let _blockchain = self.blockchain.read().await;
 
         // Convert blocks to validation tasks
         let validation_tasks: Vec<_> = blocks
@@ -1708,9 +1705,6 @@ impl BPoSSentinel {
         }
 
         // Clone the necessary data for each verification task
-        let peer_sentinels = self.peer_sentinels.clone();
-        let node_sentinel = self.node_sentinel.clone();
-
         // Process verifications in parallel
         let verification_results = futures::future::join_all(verifications.into_iter().map(
             |(addr, challenge)| async move {
@@ -2002,7 +1996,7 @@ impl NodeMetrics {
         self.performance_score
     }
 
-    pub fn verify_and_prune_actions(&mut self, now: u64) -> (u64, u64) {
+    pub fn verify_and_prune_actions(&mut self, _now: u64) -> (u64, u64) {
         const MAX_HISTORY: usize = 1000;
         const PRUNE_THRESHOLD: usize = 900;
 
@@ -2265,7 +2259,7 @@ impl HeaderSentinel {
         &self,
         headers: Vec<BlockHeaderInfo>,
         node_id: &str,
-        signature: Vec<u8>,
+        _signature: Vec<u8>,
     ) -> Result<usize, String> {
         let mut valid_count = 0;
         let now = SystemTime::now()
@@ -2444,7 +2438,7 @@ impl HeaderSentinel {
         &self,
         header: BlockHeaderInfo,
         node_id: &str,
-        signature: Vec<u8>,
+        _signature: Vec<u8>,
     ) -> Result<bool, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2509,7 +2503,7 @@ impl HeaderSentinel {
             &pub_key,
         ) {
             Ok(_) => Ok(true),
-            Err(e) => Ok(false),
+            Err(_) => Ok(false),
         }
     }
 

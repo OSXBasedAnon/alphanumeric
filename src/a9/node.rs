@@ -30,7 +30,6 @@ use libp2p::{
 use log::{debug, error, info, trace, warn};
 use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use rand::{seq::SliceRandom, thread_rng, Rng};
-use rayon::prelude::*;
 use reqwest::Client;
 use igd_next::{search_gateway, PortMappingProtocol};
 use ring::{
