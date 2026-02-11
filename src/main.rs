@@ -204,19 +204,25 @@ async fn main() -> Result<()> {
 
         // Then create the node (single instance)
         pb.set_message("Creating node...");
-        let bind_addr = match Node::get_bind_address() {
-            Ok(ip) => Some(SocketAddr::new(ip, DEFAULT_PORT)),
-            Err(e) => {
-                error!("Failed to determine bind address: {}", e);
-                None
+        let bind_ip = if std::env::var("ALPHANUMERIC_BIND_IP").is_ok() {
+            config.network.bind_ip
+        } else {
+            match Node::get_bind_address() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    error!("Failed to determine bind address: {}", e);
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                }
             }
         };
+        let bind_addr = Some(SocketAddr::new(bind_ip, config.network.port));
 
         let node = match Node::new(
             Arc::new(db.clone()),
             blockchain.clone(),
             key_pair_pkcs8.as_ref().to_vec(),
             bind_addr,
+            config.network.velocity_enabled,
         )
         .await {
             Ok(node) => Arc::new(node),
@@ -515,7 +521,7 @@ async fn main() -> Result<()> {
         )));
 
         // Whisper
-        let whisper_module = Arc::new(RwLock::new(WhisperModule::new()));
+        let whisper_module = Arc::new(RwLock::new(WhisperModule::new_with_db(Arc::new(db.clone()))));
 
         // Mining params
         pb.set_message("Setting up mining parameters...");

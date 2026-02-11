@@ -879,6 +879,7 @@ impl Node {
         blockchain: Arc<RwLock<Blockchain>>,
         handshake_key_bytes: Vec<u8>,
         bind_addr: Option<SocketAddr>,
+        velocity_enabled: bool,
     ) -> Result<Self, NodeError> {
         let (tx, _) = broadcast::channel(1000);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
@@ -957,10 +958,12 @@ impl Node {
             .map(|b| b.hash)
             .unwrap_or_default();
 
-        let velocity_manager = {
+        let velocity_manager = if velocity_enabled {
             let vm = Arc::new(VelocityManager::new());
             vm.clone().start_request_processor();
             Some(vm)
+        } else {
+            None
         };
 
         Ok(Self {

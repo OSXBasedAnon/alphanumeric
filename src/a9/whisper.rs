@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use sled::Db;
+use bincode;
 
 use crate::a9::blockchain::{
     Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
@@ -40,7 +42,7 @@ const FREQUENCY_TABLE: &[(char, f64)] = &[
     ('m', 0.024),
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FeeInfo {
     pub fee: f64,
     pub amount: f64,
@@ -49,7 +51,7 @@ pub struct FeeInfo {
     pub timestamp: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct WalletIndex {
     last_scanned_block: u32,
     fee_cache: Vec<FeeInfo>,
@@ -71,15 +73,27 @@ pub struct WhisperModule {
     wallet_indices: DashMap<String, WalletIndex>,
     last_height: Arc<RwLock<u32>>,
     pending_amounts: DashMap<String, f64>,
+    db: Option<Arc<Db>>,
 }
 
 impl WhisperModule {
+    const INDEX_TREE: &'static str = "whisper_index";
+    const MAX_INDEX_MESSAGES: usize = 2000;
+
     pub fn new() -> Self {
         Self {
             frequency_map: Self::build_frequency_map(),
             wallet_indices: DashMap::new(),
             last_height: Arc::new(RwLock::new(0)),
             pending_amounts: DashMap::new(),
+            db: None,
+        }
+    }
+
+    pub fn new_with_db(db: Arc<Db>) -> Self {
+        Self {
+            db: Some(db),
+            ..Self::new()
         }
     }
 
@@ -150,19 +164,24 @@ impl WhisperModule {
                 should_update = true;
             }
         } else {
+            // Try to load from persisted index first
+            if let Some(index) = self.load_index_from_db(address) {
+                self.wallet_indices.insert(address.to_string(), index);
+            } else {
+                // Initialize new wallet index with empty fee_cache
+                self.wallet_indices.insert(
+                    address.to_string(),
+                    WalletIndex {
+                        last_scanned_block: 0,
+                        fee_cache: Vec::new(),
+                    },
+                );
+            }
             should_update = true;
-            // Initialize new wallet index with empty fee_cache
-            self.wallet_indices.insert(
-                address.to_string(),
-                WalletIndex {
-                    last_scanned_block: 0,
-                    fee_cache: Vec::new(),
-                },
-            );
         }
 
         if should_update {
-            self.update_wallet_index(address, blockchain, true).await?;
+            self.update_wallet_index(address, blockchain, false).await?;
         }
 
         Ok(())
@@ -180,7 +199,7 @@ impl WhisperModule {
         // Get or create index
         if !force_full_scan {
             if let Some(index) = self.wallet_indices.get(address) {
-                start_height = index.last_scanned_block;
+                start_height = index.last_scanned_block.saturating_add(1);
                 if start_height >= current_height {
                     return Ok(());
                 }
@@ -224,11 +243,55 @@ impl WhisperModule {
             address.to_string(),
             WalletIndex {
                 last_scanned_block: current_height,
-                fee_cache,
+                fee_cache: Self::prune_fee_cache(fee_cache),
             },
         );
 
+        self.save_index_to_db(address);
+
         Ok(())
+    }
+
+    fn prune_fee_cache(mut fee_cache: Vec<FeeInfo>) -> Vec<FeeInfo> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub((MESSAGE_HISTORY_HOURS as u64) * 3600);
+
+        fee_cache.retain(|entry| entry.timestamp >= cutoff);
+        fee_cache.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        if fee_cache.len() > Self::MAX_INDEX_MESSAGES {
+            fee_cache.drain(0..fee_cache.len() - Self::MAX_INDEX_MESSAGES);
+        }
+
+        fee_cache
+    }
+
+    fn load_index_from_db(&self, address: &str) -> Option<WalletIndex> {
+        let db = self.db.as_ref()?;
+        let tree = db.open_tree(Self::INDEX_TREE).ok()?;
+        let key = format!("idx:{}", address);
+        let bytes = tree.get(key.as_bytes()).ok()??;
+        bincode::deserialize(&bytes).ok()
+    }
+
+    fn save_index_to_db(&self, address: &str) {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+        let tree = match db.open_tree(Self::INDEX_TREE) {
+            Ok(tree) => tree,
+            Err(_) => return,
+        };
+        if let Some(index) = self.wallet_indices.get(address) {
+            if let Ok(bytes) = bincode::serialize(&*index) {
+                let key = format!("idx:{}", address);
+                let _ = tree.insert(key.as_bytes(), bytes);
+            }
+        }
     }
 
     fn calculate_transaction_hash(&self, tx: &Transaction) -> String {
