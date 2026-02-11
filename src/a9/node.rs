@@ -123,6 +123,9 @@ const MAX_BLOCK_SIZE: usize = 2000;
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
 const MAX_CONCURRENT_CONNECTIONS: usize = 100;
+const EVENT_QUEUE_CAPACITY: usize = 1000;
+const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
+const EVENT_BROADCAST_CAPACITY: usize = 1000;
 pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
@@ -885,7 +888,7 @@ impl Node {
         max_peers: usize,
         max_connections: usize,
     ) -> Result<Self, NodeError> {
-        let (tx, _) = broadcast::channel(1000);
+        let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
             .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
         let p2p_key = identity::Keypair::generate_ed25519();
@@ -2603,7 +2606,7 @@ async fn build_optimized_scan_ranges(
         }
 
         // Create message processing channel
-        let (msg_tx, mut msg_rx) = mpsc::channel(1000);
+        let (msg_tx, mut msg_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let node = self.clone();
 
         // Start connection handler for incoming connections
@@ -2765,6 +2768,35 @@ async fn build_optimized_scan_ranges(
                 };
                 if let Err(e) = node_clone.save_peer_cache(&peers) {
                     debug!("Peer cache save error: {}", e);
+                }
+            }
+        });
+
+        // Periodic backpressure metrics
+        let metrics_node = node.clone();
+        let metrics_tx = msg_tx.clone();
+        tokio::spawn(async move {
+            let mut metrics_interval = interval(Duration::from_secs(15));
+            loop {
+                metrics_interval.tick().await;
+                let remaining = metrics_tx.capacity();
+                let in_flight = EVENT_QUEUE_CAPACITY.saturating_sub(remaining);
+                let broadcast_len = metrics_node.tx.len();
+                let receivers = metrics_node.tx.receiver_count();
+                let peer_count = metrics_node.peers.read().await.len();
+
+                if in_flight >= EVENT_QUEUE_WARN_THRESHOLD
+                    || broadcast_len >= (EVENT_BROADCAST_CAPACITY * 8 / 10)
+                {
+                    warn!(
+                        "Backpressure: event_queue={} broadcast_backlog={} peers={} receivers={}",
+                        in_flight, broadcast_len, peer_count, receivers
+                    );
+                } else {
+                    debug!(
+                        "Backpressure: event_queue={} broadcast_backlog={} peers={} receivers={}",
+                        in_flight, broadcast_len, peer_count, receivers
+                    );
                 }
             }
         });

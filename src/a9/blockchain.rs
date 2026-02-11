@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
 use log::error;
+use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use pqcrypto_dilithium::dilithium5::{
@@ -23,10 +24,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
+use parking_lot::Mutex as PLMutex;
 
 use crate::a9::mempool::{Mempool, TemporalVerification};
 use crate::a9::oracle::DifficultyOracle;
@@ -965,9 +968,20 @@ pub struct Blockchain {
     mempool: Arc<RwLock<Mempool>>,
     pub chain_sentinel: Arc<ChainSentinel>,
     pub temporal_verification: TemporalVerification,
+    signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
 }
 
 impl Blockchain {
+    fn signature_cache_capacity() -> NonZeroUsize {
+        let default_size = 50_000usize;
+        let size = std::env::var("ALPHANUMERIC_SIG_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default_size);
+        NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(default_size).unwrap())
+    }
+
     fn get_balances_height(tree: &sled::Tree) -> Result<Option<u64>, BlockchainError> {
         if let Some(raw) = tree.get(BALANCES_HEIGHT_KEY)? {
             let height: u64 = bincode::deserialize(&raw)?;
@@ -1049,6 +1063,7 @@ impl Blockchain {
         difficulty: Arc<Mutex<u64>>, // Add difficulty parameter
     ) -> Self {
         let chain_sentinel = Arc::new(ChainSentinel::new());
+        let signature_cache = Arc::new(PLMutex::new(LruCache::new(Self::signature_cache_capacity())));
 
         // Create the blockchain instance using passed in difficulty
         let blockchain = Self {
@@ -1062,6 +1077,7 @@ impl Blockchain {
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_sentinel,
             temporal_verification: TemporalVerification::new(),
+            signature_cache,
         };
 
         // Initialize the pending transactions tree if it doesn't exist
@@ -1674,6 +1690,12 @@ impl Blockchain {
 
         let sig_bytes =
             hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        let actual_hash = Transaction::signature_hash_hex(&sig_bytes);
+        let cache_key = format!("{}:{}:{}", tx.get_tx_id(), pub_key, actual_hash);
+
+        if let Some(true) = self.signature_cache.lock().get(&cache_key).copied() {
+            return Ok(());
+        }
 
         if !tx.is_valid(pub_key) {
             return Err(BlockchainError::InvalidTransactionSignature);
@@ -1690,12 +1712,12 @@ impl Blockchain {
         }
 
         if let Some(expected_hash) = &tx.sig_hash {
-            let actual_hash = Transaction::signature_hash_hex(&sig_bytes);
             if &actual_hash != expected_hash {
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
         }
 
+        self.signature_cache.lock().put(cache_key, true);
         Ok(())
     }
 
@@ -2375,16 +2397,22 @@ impl Blockchain {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true);
 
+        let mut index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);
         if auto_rebuild {
-            let tip = self.get_block_count() as u64;
-            let index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);
+            let tip = self.get_latest_block_index() as u64;
             if index_height < tip {
                 self.ensure_balances_index().await?;
+                index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(tip);
             }
         }
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
             let balance: f64 = bincode::deserialize(&balance_bytes)
                 .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+            return Ok(balance);
+        }
+        if auto_rebuild && index_height >= self.get_latest_block_index() as u64 {
+            let balance = 0.0;
+            balances_tree.insert(address.as_bytes(), bincode::serialize(&balance)?)?;
             return Ok(balance);
         }
         // Slow path: calculate from blocks, then cache in balances tree.
