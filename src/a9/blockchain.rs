@@ -972,7 +972,7 @@ pub struct Blockchain {
 
 impl Blockchain {
     fn pending_tx_ttl_secs() -> Option<u64> {
-        const DEFAULT_TTL_SECS: u64 = 600;
+        const DEFAULT_TTL_SECS: u64 = 7200;
         let raw = std::env::var("ALPHANUMERIC_PENDING_TX_TTL_SECS").ok();
         let ttl = raw
             .as_deref()
