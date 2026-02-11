@@ -1761,6 +1761,12 @@ impl Blockchain {
         // First validate block header
         block.validate_header()?;
 
+        // Verify merkle root matches transactions
+        let expected_root = Blockchain::calculate_merkle_root(&block.transactions)?;
+        if expected_root != block.merkle_root {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+
         // Check the hash meets the difficulty requirement
         if !self.is_valid_hash_with_difficulty(&block.hash, block.difficulty) {
             return Err(BlockchainError::InvalidHash);
