@@ -120,18 +120,6 @@ async fn main() -> Result<()> {
         {
             let db_for_signal = db.clone();
             let lock_path = format!("{}.lock", db_path);
-            if let Err(e) = ctrlc::set_handler(move || {
-                let _ = db_for_signal.flush();
-                let _ = remove_db_lock(&lock_path);
-                eprintln!("Shutting down cleanly...");
-                std::process::exit(0);
-            }) {
-                error!("Failed to set Ctrl-C handler: {}", e);
-            }
-        }
-        {
-            let db_for_signal = db.clone();
-            let lock_path = format!("{}.lock", db_path);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
                 let _ = db_for_signal.flush();

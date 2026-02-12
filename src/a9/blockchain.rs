@@ -2314,9 +2314,8 @@ impl Blockchain {
             if tx.sender == "MINING_REWARDS" && tx.recipient == address {
                 balance += tx.amount;
             } else if tx.sender == address {
-                if !tx.is_valid(&tx.sender) {
-                    continue;
-                }
+                // Transactions in confirmed blocks are assumed validated at acceptance time.
+                // Do not re-check signatures here with sender address input.
                 balance -= tx.amount + tx.fee;
             } else if tx.recipient == address {
                 balance += tx.amount;

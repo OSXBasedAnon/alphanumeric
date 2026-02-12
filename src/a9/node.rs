@@ -93,12 +93,7 @@ const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
 const SUBNET_MASK_IPV6: u8 = 64; // /64 subnet
 
 // Timeouts and intervals
-const PING_INTERVAL: u64 = 30; // seconds
 const PEER_TIMEOUT: u64 = 300; // seconds
-const CONNECTION_TIMEOUT: u64 = 10; // seconds
-const HANDSHAKE_TIMEOUT: u64 = 5; // seconds
-const SYNC_TIMEOUT: u64 = 60; // seconds
-const DISCOVERY_INTERVAL: u64 = 1800; // 30 minutes
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const ANNOUNCE_INTERVAL: u64 = 60; // seconds
 const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
@@ -120,7 +115,6 @@ const MAX_BLOCK_SIZE: usize = 2000;
 
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
-const MAX_CONCURRENT_CONNECTIONS: usize = 100;
 const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
@@ -1699,90 +1693,96 @@ impl Node {
 
 pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
     info!("Starting network discovery");
-    
-    // Performance tuning constants
-    const MAX_DISCOVERY_RETRIES: u32 = 3;
-    const MAX_TARGET_PEERS: usize = 32;
-    const MIN_TARGET_PEERS: usize = 5;
-    
+
     self.discover_network_nodes_with_retry(0).await
 }
 
 // Separate implementation for recursive calls with retry counter
-    async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
+async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
     const MAX_DISCOVERY_RETRIES: u32 = 3;
     const MAX_TARGET_PEERS: usize = 32;
     const MIN_TARGET_PEERS: usize = 5;
-    
-    // Initialize collection for discovered addresses
+    const VERIFY_BATCH_SIZE: usize = 24;
+    const VERIFY_CONCURRENCY: usize = 12;
+
+    let gateway_only = std::env::var("ALPHANUMERIC_DISCOVERY_GATEWAY_ONLY")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let enable_dns_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_DNS_FALLBACK")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let enable_aggressive_discovery = std::env::var("ALPHANUMERIC_ENABLE_AGGRESSIVE_DISCOVERY")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
     let mut discovered_addrs = HashSet::new();
     let mut verified_peers = Vec::new();
-    
-    // Get current peers to avoid re-discovery
+
     let current_peers: HashSet<SocketAddr> = {
         let peers = self.peers.read().await;
         peers.keys().copied().collect()
     };
-    
-    // Aggressive discovery only if we're below the minimum threshold
-    let needs_aggressive_discovery = current_peers.len() < MIN_TARGET_PEERS;
-    
-    // Try cached peers first
-    let cached = self.load_peer_cache();
-    for addr in cached {
-        discovered_addrs.insert(addr);
+
+    let needs_more_peers = current_peers.len() < MIN_TARGET_PEERS;
+
+    // Priority 1: alphanumeric.blue discovery service
+    let mut gateway_ok = false;
+    match self.fetch_discovery_peers().await {
+        Ok(peer_addrs) => {
+            gateway_ok = true;
+            discovered_addrs.extend(peer_addrs);
+            debug!("Discovery gateway provided {} candidate peers", discovered_addrs.len());
+        }
+        Err(e) => {
+            warn!("Discovery gateway unavailable: {}", e);
+        }
     }
 
-    // Try DNS discovery (most reliable method)
-    let dns_seeds = Self::dns_seeds();
-    
-    for &seed in &dns_seeds {
-        match tokio::net::lookup_host(seed).await {
-            Ok(addrs) => {
-                for addr in addrs {
-                    discovered_addrs.insert(addr);
+    // Fallbacks are only used when gateway is unavailable, or explicitly allowed.
+    let allow_fallback = !gateway_ok || !gateway_only;
+    if allow_fallback {
+        discovered_addrs.extend(self.load_peer_cache());
+
+        if !current_peers.is_empty() {
+            if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
+                discovered_addrs.extend(peer_addrs);
+            }
+        }
+
+        if enable_dns_fallback {
+            for seed in Self::dns_seeds() {
+                match tokio::net::lookup_host(seed).await {
+                    Ok(addrs) => discovered_addrs.extend(addrs),
+                    Err(e) => debug!("DNS lookup failed for {}: {}", seed, e),
                 }
             }
-            Err(e) => {
-                debug!("DNS lookup failed for {}: {}", seed, e);
+        }
+
+        if enable_kad_fallback {
+            if let Ok(kad_addrs) = self.discover_from_kademlia().await {
+                discovered_addrs.extend(kad_addrs);
             }
         }
     }
 
-    // Try discovery service (serverless gateway)
-    if let Ok(peer_addrs) = self.fetch_discovery_peers().await {
-        for addr in peer_addrs {
-            discovered_addrs.insert(addr);
-        }
-    }
-    
-    // Try existing peers (cheaper than local scan)
-    if !current_peers.is_empty() {
-        if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
-            discovered_addrs.extend(peer_addrs);
-        }
-    }
-    
-    // Try scanning local network only if we need more peers
-    if discovered_addrs.len() < MIN_TARGET_PEERS || needs_aggressive_discovery {
+    // Heavy scan mode is strictly opt-in and only when connectivity is weak.
+    if enable_aggressive_discovery && needs_more_peers && !gateway_ok {
         if let Ok(local_addrs) = self.discover_local_network().await {
             discovered_addrs.extend(local_addrs);
         }
-    }
-    
-    // Try STUN for external address discovery - do this only for aggressive search
-    if needs_aggressive_discovery {
+
         if let Ok((Some(v4), v6)) = self.discover_external_addresses(STUN_SERVERS).await {
-            // Add targeted scan ranges based on discovered external addresses
             if let Ok(ranges) = self.build_scan_ranges(v4, v6).await {
-                // Scan the most promising ranges first
                 for range in ranges.iter().take(3) {
-                    // Only scan the high-priority ranges
                     if range.priority <= 3 {
-                        if let Ok(range_addrs) = tokio::time::timeout(
-                            Duration::from_secs(10), 
-                            self.scan_range(range)
-                        ).await.unwrap_or_else(|_| Ok(HashSet::new())) {
+                        if let Ok(range_addrs) =
+                            tokio::time::timeout(Duration::from_secs(8), self.scan_range(range))
+                                .await
+                                .unwrap_or_else(|_| Ok(HashSet::new()))
+                        {
                             discovered_addrs.extend(range_addrs);
                         }
                     }
@@ -1790,97 +1790,78 @@ pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
             }
         }
     }
-    
-    // Filter out our own address and existing peers
+
     let mut new_addrs: Vec<_> = discovered_addrs
         .into_iter()
         .filter(|addr| *addr != self.bind_addr && !current_peers.contains(addr))
         .collect();
-    
-    // Early success if we didn't find any new addresses
+
     if new_addrs.is_empty() {
         info!("No new peers discovered");
-        // Consider a retry if we really need peers
-        if needs_aggressive_discovery && retry_count < MAX_DISCOVERY_RETRIES {
-            // Use Box::pin for recursion in async functions
+        if needs_more_peers && retry_count < MAX_DISCOVERY_RETRIES {
+            let backoff_ms = 300_u64.saturating_mul(1_u64 << retry_count.min(4));
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             return Box::pin(self.discover_network_nodes_with_retry(retry_count + 1)).await;
         }
         return Ok(());
     }
-    
-    // Shuffle to avoid biased connection patterns
+
     new_addrs.shuffle(&mut thread_rng());
-    
-    // IMPROVEMENT: Use connection semaphore for controlled parallel verification
-    let connection_limiter = Arc::new(Semaphore::new(10));
-    
-    // IMPROVEMENT: Multiple verification attempts with improved logging
-    while verified_peers.len() < MAX_TARGET_PEERS && !new_addrs.is_empty() && retry_count < MAX_DISCOVERY_RETRIES {
-        // Take up to 20 addresses to try in parallel
-        let batch: Vec<_> = new_addrs.drain(..std::cmp::min(20, new_addrs.len())).collect();
-        
-        // Create verification tasks
+    new_addrs.truncate(MAX_TARGET_PEERS.saturating_mul(2));
+
+    let connection_limiter = Arc::new(Semaphore::new(VERIFY_CONCURRENCY));
+    for batch in new_addrs.chunks(VERIFY_BATCH_SIZE) {
+        if verified_peers.len() >= MAX_TARGET_PEERS {
+            break;
+        }
+
         let verification_tasks: Vec<_> = batch
-            .into_iter()
+            .iter()
+            .copied()
             .map(|addr| {
                 let permit = connection_limiter.clone().acquire_owned();
                 let node = self.clone();
-                
                 tokio::spawn(async move {
-                    // Use unwrap_or(None) to handle permit acquisition errors
                     let _permit = match permit.await {
                         Ok(permit) => permit,
-                        Err(_) => return Ok::<Option<SocketAddr>, ()>(None),
+                        Err(_) => return None,
                     };
-                    
-                    // Try direct connection with timeout
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        node.verify_peer(addr)
-                    ).await {
-                        Ok(Ok(_)) => Ok(Some(addr)),
+                    match tokio::time::timeout(Duration::from_secs(5), node.verify_peer(addr)).await {
+                        Ok(Ok(_)) => Some(addr),
                         Ok(Err(e)) => {
                             debug!("Failed to verify peer {}: {}", addr, e);
-                            Ok(None)
-                        },
+                            None
+                        }
                         Err(_) => {
                             debug!("Verification timed out for {}", addr);
-                            Ok(None)
+                            None
                         }
                     }
                 })
             })
             .collect();
-        
-        // Process verification results
+
         for result in futures::future::join_all(verification_tasks).await {
-            if let Ok(Ok(Some(addr))) = result {
+            if let Ok(Some(addr)) = result {
                 verified_peers.push(addr);
-                
-                // Limit number of peers
                 if verified_peers.len() >= MAX_TARGET_PEERS {
                     break;
                 }
             }
         }
-        
-        // If we didn't find enough peers, we'll naturally exit the loop based on the while condition
     }
-    
-    info!("Discovered {} verified peers", verified_peers.len());
-    
-    // Ensure subnet diversity by calling rebalance explicitly
+
+    info!(
+        "Discovery cycle complete: verified {} new peer(s), gateway_ok={}, fallback_used={}",
+        verified_peers.len(),
+        gateway_ok,
+        allow_fallback
+    );
+
     if let Err(e) = self.rebalance_peer_subnets().await {
         warn!("Failed to rebalance peer subnets: {}", e);
     }
-    
-    // Log different results based on discovery outcome
-    match verified_peers.len() {
-        0 => warn!("No new peers were successfully verified and added"),
-        1..=4 => info!("Added {} new peers to the network", verified_peers.len()),
-        _ => info!("Successfully added {} new peers with subnet diversity", verified_peers.len()),
-    }
-    
+
     Ok(())
 }
 

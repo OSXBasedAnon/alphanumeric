@@ -1,8 +1,8 @@
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
-use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+use argon2::{password_hash::SaltString, Argon2};
 use pqcrypto_dilithium::dilithium5::{
     detached_sign, keypair as dilithium_keypair, DetachedSignature, PublicKey, SecretKey,
 };
@@ -78,6 +78,14 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    fn derive_aes_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], String> {
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(passphrase, salt, &mut key)
+            .map_err(|e| format!("Argon2 key derivation error: {}", e))?;
+        Ok(key)
+    }
+
     pub fn new(passphrase: Option<&[u8]>) -> Result<Self, String> {
         // Generate dilithium keypair
         let (public_key, secret_key) = dilithium_keypair();
@@ -272,16 +280,9 @@ impl Wallet {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        let hash = argon2
-            .hash_password(passphrase, &salt)
-            .map_err(|e| e.to_string())?;
-
-        let hashed_passphrase = hash
-            .hash
-            .ok_or_else(|| "Failed to hash passphrase".to_string())?;
-        let key = Key::<Aes256Gcm>::from_slice(hashed_passphrase.as_bytes());
-        let cipher = Aes256Gcm::new(key);
+        let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         let encrypted_data = cipher
             .encrypt(nonce, &*serde_json::to_vec(data).unwrap())
@@ -345,21 +346,11 @@ impl Wallet {
         rng.try_fill_bytes(&mut salt_bytes)
             .map_err(|e| format!("Failed to generate salt: {}", e))?;
 
-        let argon2 = Argon2::default();
         let salt = SaltString::b64_encode(&salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
-
-        // Rest of encryption remains the same...
-        let hash = argon2
-            .hash_password(passphrase, &salt)
-            .map_err(|e| e.to_string())?;
-
-        let hashed_passphrase = hash
-            .hash
-            .ok_or_else(|| "Failed to hash passphrase".to_string())?;
-
-        let key = Key::<Aes256Gcm>::from_slice(hashed_passphrase.as_bytes());
-        let cipher = Aes256Gcm::new(key);
+        let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         let mut nonce_bytes = [0u8; 12];
         rng.try_fill_bytes(&mut nonce_bytes)
@@ -386,19 +377,11 @@ impl Wallet {
         let salt_bytes = &encrypted_data[12..28];
         let ciphertext = &encrypted_data[28..];
 
-        let argon2 = Argon2::default();
         let salt = SaltString::b64_encode(salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
-        let hash = argon2
-            .hash_password(passphrase, &salt)
-            .map_err(|e| format!("Argon2 hash error: {}", e))?;
-
-        let hashed_passphrase = hash
-            .hash
-            .ok_or_else(|| "Failed to hash passphrase".to_string())?;
-
-        let key = Key::<Aes256Gcm>::from_slice(hashed_passphrase.as_bytes());
-        let cipher = Aes256Gcm::new(key);
+        let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         cipher
             .decrypt(nonce, ciphertext)
