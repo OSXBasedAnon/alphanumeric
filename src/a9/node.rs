@@ -64,7 +64,6 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
     time::{interval, sleep, timeout},
 };
-use uuid::Uuid;
 use lru::LruCache;
 
 #[cfg(unix)]
@@ -796,7 +795,6 @@ pub struct Node {
     peer_cache_path: Arc<String>,
 
     // Consensus state
-    block_response_channels: Arc<RwLock<HashMap<Uuid, mpsc::Sender<NetworkMessage>>>>,
     tx_response_channels: Arc<RwLock<HashMap<String, oneshot::Sender<Option<Transaction>>>>>,
     tx_witness_cache: Arc<PLMutex<LruCache<String, Transaction>>>,
     pub validation_pool: Arc<ValidationPool>,
@@ -1004,7 +1002,6 @@ impl Node {
             start_time,
             validation_pool: Arc::new(ValidationPool::new()),
             validation_cache: Arc::new(DashMap::with_capacity(10000)),
-            block_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
             tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
             tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
@@ -4520,15 +4517,6 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkMessage::Blocks(blocks) => {
-                // Fan-out to any internal waiters (best effort) for compatibility with
-                // channel-based block wait paths.
-                {
-                    let channels = self.block_response_channels.read().await;
-                    for sender in channels.values() {
-                        let _ = sender.try_send(NetworkMessage::Blocks(blocks.clone()));
-                    }
-                }
-
                 tx.send(NetworkEvent::ChainResponse { blocks, sender: addr })
                     .await
                     .map_err(|e| {
@@ -5639,62 +5627,6 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
 
             Ok((peer_info, shared_secret))
         }
-    }
-
-    // Methods for block operations
-    async fn wait_for_blocks(&self) -> Result<Vec<Block>, NodeError> {
-        const TIMEOUT: Duration = Duration::from_secs(30);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let request_id = Uuid::new_v4();
-
-        // Register channel for responses
-        {
-            let mut channels = self.block_response_channels.write().await;
-            channels.insert(request_id, tx);
-        }
-
-        let start_time = Instant::now();
-        let mut blocks = Vec::new();
-
-        // Wait for blocks with timeout
-        while start_time.elapsed() < TIMEOUT {
-            match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-                Ok(Some(NetworkMessage::Blocks(new_blocks))) => {
-                    // Validate and add blocks
-                    for block in new_blocks.iter() {
-                        if self.verify_block_parallel(block).await? {
-                            blocks.push(block.clone());
-                        }
-                    }
-
-                    if !blocks.is_empty() {
-                        break;
-                    }
-                }
-                Ok(None) => break, // Channel closed
-                Err(_) => {
-                    // Timeout on single receive, continue waiting
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                _ => continue, // Other message types
-            }
-        }
-
-        // Clean up channel
-        {
-            let mut channels = self.block_response_channels.write().await;
-            channels.remove(&request_id);
-        }
-
-        if blocks.is_empty() {
-            return Err(NodeError::Network("No valid blocks received".to_string()));
-        }
-
-        // Sort blocks by index
-        blocks.sort_by_key(|b| b.index);
-        Ok(blocks)
     }
 
     // Encryption/decryption utilities
