@@ -603,7 +603,12 @@ impl Block {
                 let reward_tx = reward_txs[0];
 
                 // Verify reward transaction is the first transaction in block
-                if block.transactions.first().unwrap().sender != "MINING_REWARDS" {
+                if block
+                    .transactions
+                    .first()
+                    .map(|tx| tx.sender.as_str())
+                    != Some("MINING_REWARDS")
+                {
                     return Err(BlockchainError::InvalidTransaction);
                 }
 
@@ -1017,7 +1022,9 @@ impl Blockchain {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(default_size);
-        NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(default_size).unwrap())
+        NonZeroUsize::new(size)
+            .or_else(|| NonZeroUsize::new(default_size))
+            .unwrap_or(NonZeroUsize::MIN)
     }
 
     fn get_balances_height(tree: &sled::Tree) -> Result<Option<u64>, BlockchainError> {

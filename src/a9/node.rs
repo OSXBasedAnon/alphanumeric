@@ -61,7 +61,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{broadcast, mpsc, oneshot, RwLock, Semaphore},
+    sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
     time::{interval, sleep, timeout},
 };
 use uuid::Uuid;
@@ -126,6 +126,10 @@ const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
 pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
+const OUTBOUND_POOL_IDLE_SECS: u64 = 90;
+const OUTBOUND_POOL_MAX_FACTOR: usize = 2;
+const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 30;
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
@@ -148,7 +152,7 @@ pub enum NodeError {
     Network(String),
 
     #[error("Blockchain error: {0}")]
-    Blockchain(#[from] BlockchainError),
+    Blockchain(String),
 
     #[error("Database error: {0}")]
     Database(#[from] sled::Error),
@@ -219,9 +223,11 @@ impl From<VelocityError> for NodeError {
     }
 }
 
-// Ensure thread safety
-unsafe impl Send for NodeError {}
-unsafe impl Sync for NodeError {}
+impl From<BlockchainError> for NodeError {
+    fn from(err: BlockchainError) -> Self {
+        NodeError::Blockchain(err.to_string())
+    }
+}
 
 impl From<Box<bincode::ErrorKind>> for NodeError {
     fn from(err: Box<bincode::ErrorKind>) -> Self {
@@ -780,6 +786,8 @@ pub struct Node {
     network_bloom: Arc<NetworkBloom>,
     peer_failures: Arc<RwLock<HashMap<SocketAddr, u32>>>,
     peer_secrets: Arc<RwLock<HashMap<SocketAddr, Vec<u8>>>>,
+    outbound_connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<OutboundConnection>>>>>,
+    outbound_circuit_breakers: Arc<RwLock<HashMap<SocketAddr, OutboundCircuitState>>>,
     pub rate_limiter: Arc<RateLimiter>,
     http_client: Client,
     p2p_swarm: Arc<RwLock<Option<HybridSwarm>>>,
@@ -826,6 +834,18 @@ struct ValidationCacheEntry {
     pub valid: bool,
     pub timestamp: SystemTime,
     pub verification_count: u32,
+}
+
+#[derive(Debug)]
+struct OutboundConnection {
+    stream: TcpStream,
+    last_used: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundCircuitState {
+    consecutive_failures: u32,
+    open_until: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1001,6 +1021,8 @@ impl Node {
             velocity_manager,
             network_id,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
+            outbound_connections: Arc::new(RwLock::new(HashMap::new())),
+            outbound_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             handshake_public_key: keypair.public_key().as_ref().to_vec(),
             handshake_key_bytes: Arc::new(handshake_key_bytes),
             inbound_attempts: Arc::new(RwLock::new(HashMap::new())),
@@ -2604,6 +2626,19 @@ async fn build_optimized_scan_ranges(
             }
         }
 
+        // Keep libp2p swarm events flowing for the lifetime of the node.
+        let p2p_node = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = p2p_node.handle_p2p_events().await {
+                    warn!("P2P event pump cycle failed: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        });
+
         // Create message processing channel
         let (msg_tx, mut msg_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let node = self.clone();
@@ -2621,8 +2656,8 @@ async fn build_optimized_scan_ranges(
                 let connection_limiter = Arc::new(Semaphore::new(node_clone.max_connections));
 
                 loop {
-                    // Try to acquire a connection slot
-                    match connection_limiter.clone().try_acquire() {
+                    // Acquire a connection slot before accepting another socket.
+                    match connection_limiter.clone().acquire_owned().await {
                         Ok(permit) => {
                             match listener_clone.accept().await {
                                 Ok((stream, addr)) => {
@@ -2640,6 +2675,7 @@ async fn build_optimized_scan_ranges(
                                     let permit_owned = permit;
 
                                     tokio::spawn(async move {
+                                        let _permit = permit_owned;
                                         let result = timeout(
                                             Duration::from_secs(30),
                                             node.handle_connection(stream, addr, tx),
@@ -2665,13 +2701,14 @@ async fn build_optimized_scan_ranges(
                                 }
                                 Err(e) => {
                                     error!("Accept error: {}", e);
+                                    drop(permit);
                                     sleep(Duration::from_secs(1)).await;
                                 }
                             }
                         }
-                        Err(_) => {
-                            warn!("Connection limit reached, waiting for slots to free up");
-                            sleep(Duration::from_secs(1)).await;
+                        Err(e) => {
+                            warn!("Connection limiter error: {}", e);
+                            sleep(Duration::from_millis(200)).await;
                         }
                     }
                 }
@@ -2691,6 +2728,7 @@ async fn build_optimized_scan_ranges(
                 if let Err(e) = node_clone.maintain_peer_connections().await {
                     warn!("Peer maintenance error: {}", e);
                 }
+                node_clone.cleanup_outbound_connections().await;
 
                 if node_clone.peers.read().await.len() < MIN_PEERS {
                     if let Err(e) = node_clone.discover_network_nodes().await {
@@ -2882,7 +2920,9 @@ async fn initialize_p2p(&self) -> Result<(), NodeError> {
     
     // Configure Kademlia DHT
     let mut cfg = KademliaConfig::default();
-    cfg.set_parallelism(NonZeroUsize::new(32).unwrap());
+    if let Some(parallelism) = NonZeroUsize::new(32) {
+        cfg.set_parallelism(parallelism);
+    }
     cfg.set_query_timeout(Duration::from_secs(60));
     let store = MemoryStore::new(local_peer_id);
     let mut kademlia = Kademlia::with_config(local_peer_id, store, cfg);
@@ -3167,12 +3207,30 @@ async fn maintain_peer_connections(&self) -> Result<(), NodeError> {
     
     // IMPROVEMENT: Apply updates to peer state all at once
     if !peers_to_remove.is_empty() {
-        let mut peers = self.peers.write().await;
-        let mut peer_secrets = self.peer_secrets.write().await;
-        
-        for addr in peers_to_remove {
-            peers.remove(&addr);
-            peer_secrets.remove(&addr);
+        let remove_list = peers_to_remove.clone();
+        {
+            let mut peers = self.peers.write().await;
+            for addr in &remove_list {
+                peers.remove(addr);
+            }
+        }
+        {
+            let mut peer_secrets = self.peer_secrets.write().await;
+            for addr in &remove_list {
+                peer_secrets.remove(addr);
+            }
+        }
+        {
+            let mut pool = self.outbound_connections.write().await;
+            for addr in &remove_list {
+                pool.remove(addr);
+            }
+        }
+        {
+            let mut breakers = self.outbound_circuit_breakers.write().await;
+            for addr in &remove_list {
+                breakers.remove(addr);
+            }
         }
     }
     
@@ -3282,10 +3340,29 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     
     // Remove excess peers
     if !removals.is_empty() {
-        let mut peers = self.peers.write().await;
-        for addr in removals {
-            peers.remove(&addr);
-            self.peer_secrets.write().await.remove(&addr);
+        {
+            let mut peers = self.peers.write().await;
+            for addr in &removals {
+                peers.remove(addr);
+            }
+        }
+        {
+            let mut peer_secrets = self.peer_secrets.write().await;
+            for addr in &removals {
+                peer_secrets.remove(addr);
+            }
+        }
+        {
+            let mut pool = self.outbound_connections.write().await;
+            for addr in &removals {
+                pool.remove(addr);
+            }
+        }
+        {
+            let mut breakers = self.outbound_circuit_breakers.write().await;
+            for addr in &removals {
+                breakers.remove(addr);
+            }
         }
     }
     
@@ -3335,7 +3412,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 timestamp,
                 node_id: _,
             } => {
-                if timestamp == now {
+                if now.abs_diff(timestamp) <= 5 {
                     Ok(())
                 } else {
                     Err(NodeError::Network("Invalid timestamp in pong".into()))
@@ -3373,18 +3450,45 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         const MAX_BATCH_SIZE: u32 = 500; // Limit batch size to avoid timeouts
         const MAX_RETRIES: u32 = 3;
 
-        let message = NetworkMessage::GetBlocks { start, end };
+        // Batch large requests so peers with strict range limits can still serve us.
+        if end.saturating_sub(start) + 1 > MAX_BATCH_SIZE {
+            let mut all_blocks = Vec::new();
+            let mut batch_start = start;
+            while batch_start <= end {
+                let batch_end = batch_start
+                    .saturating_add(MAX_BATCH_SIZE - 1)
+                    .min(end);
+                let mut batch = self
+                    .request_blocks_batch(addr, batch_start, batch_end, MAX_RETRIES)
+                    .await?;
+                all_blocks.append(&mut batch);
+                if batch_end == u32::MAX {
+                    break;
+                }
+                batch_start = batch_end.saturating_add(1);
+            }
+            all_blocks.sort_by_key(|b| b.index);
+            all_blocks.dedup_by_key(|b| b.index);
+            return Ok(all_blocks);
+        }
 
-        // Try to send request with retries
+        self.request_blocks_batch(addr, start, end, MAX_RETRIES).await
+    }
+
+    async fn request_blocks_batch(
+        &self,
+        addr: SocketAddr,
+        start: u32,
+        end: u32,
+        max_retries: u32,
+    ) -> Result<Vec<Block>, NodeError> {
+        let message = NetworkMessage::GetBlocks { start, end };
         let mut retries = 0;
-        while retries < MAX_RETRIES {
+        while retries < max_retries {
             match self.send_message_with_response(addr, &message).await {
                 Ok(NetworkMessage::Blocks(blocks)) => {
-                    // Verify blocks immediately to avoid storing invalid data
                     let mut valid_blocks = Vec::with_capacity(blocks.len());
-
                     for block in blocks {
-                        // Basic validation only - full validation happens during save
                         if block.index >= start
                             && block.index <= end
                             && block.calculate_hash_for_block() == block.hash
@@ -3392,20 +3496,17 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                             valid_blocks.push(block);
                         }
                     }
-
                     return Ok(valid_blocks);
                 }
                 Ok(_) => {
-                    // Wrong response type, retry
                     retries += 1;
                     tokio::time::sleep(Duration::from_millis(500 * retries as u64)).await;
                 }
                 Err(e) => {
-                    // Failed to get response, retry
                     retries += 1;
                     warn!(
                         "Failed to get blocks from {}, attempt {}/{}: {}",
-                        addr, retries, MAX_RETRIES, e
+                        addr, retries, max_retries, e
                     );
                     tokio::time::sleep(Duration::from_millis((500 * retries).into())).await;
                 }
@@ -3414,8 +3515,137 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
         Err(NodeError::Network(format!(
             "Failed to get blocks from {} after {} attempts",
-            addr, MAX_RETRIES
+            addr, max_retries
         )))
+    }
+
+    async fn remove_outbound_connection(&self, addr: SocketAddr) {
+        self.outbound_connections.write().await.remove(&addr);
+    }
+
+    async fn check_outbound_circuit(&self, addr: SocketAddr) -> Result<(), NodeError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let breakers = self.outbound_circuit_breakers.read().await;
+        if let Some(state) = breakers.get(&addr) {
+            if let Some(until) = state.open_until {
+                if until > now {
+                    return Err(NodeError::Network(format!(
+                        "Outbound circuit open for {} (retry in {}s)",
+                        addr,
+                        until.saturating_sub(now)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_outbound_failure(&self, addr: SocketAddr) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut breakers = self.outbound_circuit_breakers.write().await;
+        let state = breakers.entry(addr).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= OUTBOUND_CIRCUIT_FAILURE_THRESHOLD {
+            state.open_until = Some(now.saturating_add(OUTBOUND_CIRCUIT_OPEN_SECS));
+        }
+    }
+
+    async fn record_outbound_success(&self, addr: SocketAddr) {
+        let mut breakers = self.outbound_circuit_breakers.write().await;
+        breakers.remove(&addr);
+    }
+
+    async fn cleanup_outbound_connections(&self) {
+        let pool_snapshot: Vec<(SocketAddr, Arc<Mutex<OutboundConnection>>)> = {
+            let pool = self.outbound_connections.read().await;
+            pool.iter().map(|(addr, conn)| (*addr, Arc::clone(conn))).collect()
+        };
+
+        let now = Instant::now();
+        let idle = Duration::from_secs(OUTBOUND_POOL_IDLE_SECS);
+        let mut remove_addrs = Vec::new();
+
+        for (addr, conn) in pool_snapshot {
+            let conn_guard = conn.lock().await;
+            if now.duration_since(conn_guard.last_used) > idle {
+                remove_addrs.push(addr);
+            }
+        }
+
+        if !remove_addrs.is_empty() {
+            let mut pool = self.outbound_connections.write().await;
+            for addr in remove_addrs {
+                pool.remove(&addr);
+            }
+        }
+    }
+
+    async fn evict_lru_outbound_connection(&self) {
+        let snapshot: Vec<(SocketAddr, Arc<Mutex<OutboundConnection>>)> = {
+            let pool = self.outbound_connections.read().await;
+            pool.iter().map(|(addr, conn)| (*addr, Arc::clone(conn))).collect()
+        };
+
+        let mut lru: Option<(SocketAddr, Instant)> = None;
+        for (addr, conn) in snapshot {
+            let conn_guard = conn.lock().await;
+            match lru {
+                Some((_, oldest)) if conn_guard.last_used >= oldest => {}
+                _ => {
+                    lru = Some((addr, conn_guard.last_used));
+                }
+            }
+        }
+
+        if let Some((addr, _)) = lru {
+            self.outbound_connections.write().await.remove(&addr);
+        }
+    }
+
+    async fn get_or_create_outbound_connection(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<Arc<Mutex<OutboundConnection>>, NodeError> {
+        if let Some(existing) = self.outbound_connections.read().await.get(&addr).cloned() {
+            return Ok(existing);
+        }
+
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+            .await
+            .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
+        stream.set_nodelay(true)?;
+
+        let connection = Arc::new(Mutex::new(OutboundConnection {
+            stream,
+            last_used: Instant::now(),
+        }));
+
+        let max_pool_size = (self.max_connections.saturating_mul(OUTBOUND_POOL_MAX_FACTOR)).max(32);
+        if self.outbound_connections.read().await.len() >= max_pool_size {
+            self.evict_lru_outbound_connection().await;
+        }
+
+        {
+            let mut pool = self.outbound_connections.write().await;
+            if let Some(existing) = pool.get(&addr).cloned() {
+                return Ok(existing);
+            }
+            if pool.len() >= max_pool_size {
+                let eviction_key = pool.keys().copied().find(|peer| *peer != addr);
+                if let Some(key) = eviction_key {
+                    pool.remove(&key);
+                }
+            }
+            pool.insert(addr, Arc::clone(&connection));
+        }
+
+        Ok(connection)
     }
 
     pub async fn send_message_with_response(
@@ -3425,20 +3655,13 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     ) -> Result<NetworkMessage, NodeError> {
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+        const MAX_ATTEMPTS: u32 = 2;
 
         // Rate limit check
         let rate_key = format!("msg_to_{}", addr);
         if !self.rate_limiter.check_limit(&rate_key) {
             return Err(NodeError::Network("Rate limit exceeded".to_string()));
         }
-
-        // Connect with timeout
-        let mut stream = tokio::time::timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
-
-        // Configure socket
-        stream.set_nodelay(true)?;
 
         // Encrypt message if we have a shared secret
         let shared_secret = self.peer_secrets.read().await.get(&addr).cloned();
@@ -3447,42 +3670,97 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         } else {
             bincode::serialize(message)?
         };
-
-        // Send request with length prefix
-        tokio::time::timeout(CONNECTION_TIMEOUT, async {
-            stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
-            stream.write_all(&data).await?;
-            stream.flush().await?;
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
-
-        // Read response with timeout
-        let mut len_bytes = [0u8; 4];
-        tokio::time::timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut len_bytes))
-            .await
-            .map_err(|_| NodeError::Network(format!("Response timeout from {}", addr)))??;
-
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        if len > 100 * 1024 * 1024 {
-            // 100MB max
-            return Err(NodeError::Network("Response too large".to_string()));
+        if data.is_empty() {
+            return Err(NodeError::Network("Refusing to send empty request".to_string()));
+        }
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(NodeError::Network("Outgoing message too large".to_string()));
         }
 
-        let mut response_data = vec![0u8; len];
-        tokio::time::timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut response_data))
-            .await
-            .map_err(|_| NodeError::Network(format!("Response data timeout from {}", addr)))??;
+        let mut last_error = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if let Err(e) = self.check_outbound_circuit(addr).await {
+                return Err(e);
+            }
 
-        // Decrypt response if needed
-        let response = if let Some(ref secret) = shared_secret {
-            self.decrypt_message(&response_data, &secret)?
-        } else {
-            bincode::deserialize(&response_data)?
-        };
+            let conn = match self.get_or_create_outbound_connection(addr).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.record_outbound_failure(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
 
-        Ok(response)
+            let mut stream_guard = conn.lock().await;
+            let result: Result<NetworkMessage, NodeError> = async {
+                tokio::time::timeout(CONNECTION_TIMEOUT, async {
+                    stream_guard
+                        .stream
+                        .write_all(&(data.len() as u32).to_be_bytes())
+                        .await?;
+                    stream_guard.stream.write_all(&data).await?;
+                    stream_guard.stream.flush().await?;
+                    Ok::<_, std::io::Error>(())
+                })
+                .await
+                .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
+
+                let mut len_bytes = [0u8; 4];
+                tokio::time::timeout(RESPONSE_TIMEOUT, stream_guard.stream.read_exact(&mut len_bytes))
+                    .await
+                    .map_err(|_| NodeError::Network(format!("Response timeout from {}", addr)))??;
+
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                if len == 0 {
+                    return Err(NodeError::Network("Empty response".to_string()));
+                }
+                if len > MAX_MESSAGE_SIZE {
+                    return Err(NodeError::Network("Response too large".to_string()));
+                }
+
+                let mut response_data = vec![0u8; len];
+                tokio::time::timeout(
+                    RESPONSE_TIMEOUT,
+                    stream_guard.stream.read_exact(&mut response_data),
+                )
+                .await
+                .map_err(|_| NodeError::Network(format!("Response data timeout from {}", addr)))??;
+
+                let response = if let Some(ref secret) = shared_secret {
+                    self.decrypt_message(&response_data, secret)?
+                } else {
+                    bincode::deserialize(&response_data)?
+                };
+                Ok(response)
+            }
+            .await;
+            stream_guard.last_used = Instant::now();
+            drop(stream_guard);
+
+            match result {
+                Ok(response) => {
+                    self.record_outbound_success(addr).await;
+                    return Ok(response);
+                }
+                Err(e) => {
+                    self.record_outbound_failure(addr).await;
+                    self.remove_outbound_connection(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            NodeError::Network(format!("Failed request to {} after retries", addr))
+        }))
     }
 
     // Core verification method for blocks
@@ -3730,17 +4008,13 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         message: &NetworkMessage,
     ) -> Result<(), NodeError> {
         const TIMEOUT: Duration = Duration::from_secs(5);
+        const MAX_ATTEMPTS: u32 = 2;
 
         // Rate limit check
         let rate_key = format!("send_to_{}", addr);
         if !self.rate_limiter.check_limit(&rate_key) {
             return Err(NodeError::Network("Rate limit exceeded".to_string()));
         }
-
-        // Connect with timeout
-        let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
 
         // Get shared secret if available
         let shared_secret = self.peer_secrets.read().await.get(&addr).cloned();
@@ -3751,18 +4025,67 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         } else {
             bincode::serialize(message)?
         };
+        if data.is_empty() {
+            return Err(NodeError::Network("Refusing to send empty message".to_string()));
+        }
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(NodeError::Network("Outgoing message too large".to_string()));
+        }
 
-        // Send message with length prefix
-        tokio::time::timeout(TIMEOUT, async {
-            stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
-            stream.write_all(&data).await?;
-            stream.flush().await?;
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
+        let mut last_error = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if let Err(e) = self.check_outbound_circuit(addr).await {
+                return Err(e);
+            }
 
-        Ok(())
+            let conn = match self.get_or_create_outbound_connection(addr).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.record_outbound_failure(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            let mut stream_guard = conn.lock().await;
+            let result: Result<(), NodeError> = tokio::time::timeout(TIMEOUT, async {
+                stream_guard
+                    .stream
+                    .write_all(&(data.len() as u32).to_be_bytes())
+                    .await?;
+                stream_guard.stream.write_all(&data).await?;
+                stream_guard.stream.flush().await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await
+            .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))?
+            .map_err(NodeError::from);
+            stream_guard.last_used = Instant::now();
+            drop(stream_guard);
+
+            match result {
+                Ok(()) => {
+                    self.record_outbound_success(addr).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.record_outbound_failure(addr).await;
+                    self.remove_outbound_connection(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            NodeError::Network(format!("Failed to send message to {} after retries", addr))
+        }))
     }
 
     fn witness_cache_capacity() -> NonZeroUsize {
@@ -3772,7 +4095,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(default_size);
-        NonZeroUsize::new(size).unwrap_or(NonZeroUsize::new(default_size).unwrap())
+        NonZeroUsize::new(size).or_else(|| NonZeroUsize::new(default_size)).unwrap_or(NonZeroUsize::MIN)
     }
 
     // Process incoming network messages from other nodes
@@ -3791,6 +4114,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             .map_err(|_| NodeError::Network(format!("Read timeout from {}", addr)))??;
 
         let len = u32::from_be_bytes(len_bytes) as usize;
+        if len == 0 {
+            return Err(NodeError::Network("Empty message".to_string()));
+        }
         if len > MAX_MESSAGE_SIZE {
             return Err(NodeError::Network("Message too large".to_string()));
         }
@@ -3894,11 +4220,18 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
             NetworkEvent::PeerJoin(addr) => {
                 // Add new peer only if not already present
-                let mut peers = self.peers.write().await;
-                if !peers.contains_key(&addr) {
-                    peers.insert(addr, PeerInfo::new(addr));
+                let should_monitor = {
+                    let mut peers = self.peers.write().await;
+                    if !peers.contains_key(&addr) {
+                        peers.insert(addr, PeerInfo::new(addr));
+                        true
+                    } else {
+                        false
+                    }
+                };
 
-                    // Start connection monitoring
+                // Start connection monitoring outside the peers write lock
+                if should_monitor {
                     let node = self.clone();
                     tokio::spawn(async move {
                         if let Err(e) = node.monitor_peer_connection(addr).await {
@@ -3912,6 +4245,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 // Remove peer and clean up
                 self.peers.write().await.remove(&addr);
                 self.peer_secrets.write().await.remove(&addr);
+                self.outbound_connections.write().await.remove(&addr);
+                self.outbound_circuit_breakers.write().await.remove(&addr);
 
                 // Clear from validation cache
                 let peer_key = format!("peer_{}", addr);
@@ -3974,9 +4309,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkEvent::ChainResponse { blocks, sender } => {
-                let blockchain = self.blockchain.read().await;
                 for block in blocks {
                     if self.verify_block_with_witness(&block, Some(sender)).await? {
+                        let blockchain = self.blockchain.read().await;
                         if let Err(e) = blockchain.save_block(&block).await {
                             warn!("Failed to save valid block {}: {}", block.index, e);
                         }
@@ -4185,6 +4520,15 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkMessage::Blocks(blocks) => {
+                // Fan-out to any internal waiters (best effort) for compatibility with
+                // channel-based block wait paths.
+                {
+                    let channels = self.block_response_channels.read().await;
+                    for sender in channels.values() {
+                        let _ = sender.try_send(NetworkMessage::Blocks(blocks.clone()));
+                    }
+                }
+
                 tx.send(NetworkEvent::ChainResponse { blocks, sender: addr })
                     .await
                     .map_err(|e| {
@@ -4374,7 +4718,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             let node = self.clone();
 
             async move {
-                let _permit = permit.await.unwrap();
+                let _permit = permit.await.map_err(|e| {
+                    NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
+                })?;
                 node.send_message(peer, &NetworkMessage::Transaction((*tx).clone()))
                     .await
             }
@@ -4594,6 +4940,11 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
             // Parse message length and validate
             let message_len = u32::from_be_bytes(len_bytes) as usize;
+            if message_len == 0 {
+                warn!("Empty message frame from {}", addr);
+                self.record_peer_failure(addr).await;
+                break;
+            }
             if message_len > MAX_MESSAGE_SIZE {
                 warn!("Oversized message from {}: {} bytes", addr, message_len);
                 self.record_peer_failure(addr).await;
@@ -4693,6 +5044,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         // Cleanup
         self.peers.write().await.remove(&addr);
         self.peer_secrets.write().await.remove(&addr);
+        self.outbound_connections.write().await.remove(&addr);
+        self.outbound_circuit_breakers.write().await.remove(&addr);
 
         // Notify disconnect
         tx.send(NetworkEvent::PeerLeave(addr))
@@ -4790,31 +5143,17 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
     const CONNECTION_RETRIES: u32 = 2;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-    const COOLDOWN_PERIOD: u64 = 60; // Seconds
     
-    // IMPROVEMENT: Check if we should try this peer based on past failures
+    // Best-effort failure gating:
+    // keep trying peers even after prior failures so transient outages can recover.
     {
         let failures = self.peer_failures.read().await;
         if let Some(&count) = failures.get(&addr) {
             if count >= 3 {
-                // Check if we're in the cooldown period
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                // Get peer failures as u64 to match now's type
-                let last_attempt = self.peer_failures.read().await
-                    .get(&addr)
-                    .map(|&c| c as u64)
-                    .unwrap_or(0);
-                
-                if now - last_attempt < COOLDOWN_PERIOD {
-                    return Err(NodeError::Network(format!(
-                        "Peer {} is in cooldown after multiple failures", 
-                        addr
-                    )));
-                }
+                debug!(
+                    "Peer {} had {} prior failures; retrying with backoff",
+                    addr, count
+                );
             }
         }
     }
@@ -5174,6 +5513,8 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         stream: &mut TcpStream,
         is_initiator: bool,
     ) -> Result<(PeerInfo, Vec<u8>), NodeError> {
+        const MAX_HANDSHAKE_SIZE: usize = 1024;
+
         // Generate random nonce for this handshake
         let mut local_nonce = [0u8; 32];
         thread_rng().fill(&mut local_nonce);
@@ -5204,6 +5545,9 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         if is_initiator {
             // Send our handshake first
             let data = bincode::serialize(&our_handshake)?;
+            if data.len() == 0 || data.len() > MAX_HANDSHAKE_SIZE {
+                return Err(NodeError::Network("Invalid handshake size".into()));
+            }
             stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
             stream.write_all(&data).await?;
             stream.flush().await?;
@@ -5213,7 +5557,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             stream.read_exact(&mut len_bytes).await?;
             let len = u32::from_be_bytes(len_bytes) as usize;
 
-            if len > 1024 {
+            if len == 0 || len > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Handshake too large".into()));
             }
 
@@ -5252,7 +5596,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             stream.read_exact(&mut len_bytes).await?;
             let len = u32::from_be_bytes(len_bytes) as usize;
 
-            if len > 1024 {
+            if len == 0 || len > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Handshake too large".into()));
             }
 
@@ -5269,6 +5613,9 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
 
             // Send our response
             let data = bincode::serialize(&our_handshake)?;
+            if data.len() == 0 || data.len() > MAX_HANDSHAKE_SIZE {
+                return Err(NodeError::Network("Invalid handshake size".into()));
+            }
             stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
             stream.write_all(&data).await?;
             stream.flush().await?;
