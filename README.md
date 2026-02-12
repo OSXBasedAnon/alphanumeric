@@ -3,24 +3,55 @@ https://www.alphanumeric.blue/
 
 ![Screenshot_2025-01-04_213726](https://github.com/user-attachments/assets/0b5c747c-53f7-4e09-82c8-0e9bfbd8cd89)
 
+[![Rust](https://img.shields.io/badge/Rust-stable-orange)](#build-and-run)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue)](#operations-checklist)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
+
 `alphanumeric` is a Rust blockchain node runtime with integrated networking, wallet management, mining, and diagnostics tooling.
 
-## Why This Exists
+## Quick Nav
 
-This project aims to provide a single-node binary that can:
+- [System Goals](#system-goals)
+- [Technical Architecture](#technical-architecture)
+- [Build and Run](#build-and-run)
+- [Configuration via Environment Variables](#configuration-via-environment-variables)
+- [CLI Surface](#cli-surface)
+- [Security Posture](#security-posture)
 
-- maintain chain state locally (`sled`)
-- discover and connect to peers
-- propagate transactions/blocks
-- mine blocks
-- expose operational stats
-- support wallet and message workflows from an interactive CLI
+## System Goals
+
+`alphanumeric` is designed as a single-node executable that bundles the full operational stack needed to participate in a live network:
+
+- deterministic local chain-state persistence (`sled`)
+- bounded, framed P2P messaging with peer lifecycle management
+- block/transaction propagation and sync workflows
+- integrated mining path
+- wallet/key workflows plus operator CLI
+- local operational telemetry and diagnostics
+
+## Non-Goals (Current)
+
+- protocol stability guarantees across all commits
+- audited production security claims
+- strict long-term API/CLI compatibility guarantees
 
 ## Current Status
 
 - Active development.
 - Interfaces and internals can change between commits.
 - Not a formally audited production system.
+
+## Capability Matrix
+
+| Capability | Scope |
+| --- | --- |
+| Node runtime | Listener, peer connect/disconnect, maintenance loops |
+| P2P transport | Length-prefixed framed messaging, bounded payloads |
+| Sync | Peer block-range requests and ingestion |
+| Persistence | Embedded `sled` storage and local bootstrap |
+| Mining | Local mining manager and miner workflows |
+| Wallet ops | Create/rename/list/history/account + transaction creation |
+| Ops visibility | Status/sync/connect/discovery commands + stats server hooks |
 
 ## Technical Architecture
 
@@ -46,6 +77,17 @@ Runtime shape:
    - sync
    - optional stats
 5. process interactive commands and network events
+
+```mermaid
+flowchart LR
+    CLI[CLI / main.rs] --> NODE[Node Runtime / node.rs]
+    NODE --> P2P[P2P Transport]
+    NODE --> SYNC[Sync + Discovery]
+    NODE --> CHAIN[Blockchain / blockchain.rs]
+    CHAIN --> DB[(sled)]
+    CLI --> MGMT[Wallet Mgmt / mgmt.rs]
+    CLI --> MINER[Mining / progpow.rs]
+```
 
 ## Network and Protocol Notes
 
