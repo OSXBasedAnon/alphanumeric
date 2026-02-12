@@ -1431,6 +1431,8 @@ impl Node {
             None => return Ok(()),
         };
         let height = last_block.index;
+        let difficulty = blockchain.get_current_difficulty().await;
+        let hashrate_ths = blockchain.calculate_network_hashrate().await;
 
         let start = height.saturating_sub(20);
         let mut headers = Vec::new();
@@ -1465,6 +1467,8 @@ impl Node {
             "height": height,
             "network_id": hex::encode(self.network_id),
             "last_block_time": last_block_time,
+            "difficulty": difficulty,
+            "hashrate_ths": hashrate_ths,
             "headers": headers,
             "node_id": &self.node_id,
             "public_key": &self.node_id
@@ -1479,6 +1483,8 @@ impl Node {
             "height": height,
             "network_id": hex::encode(self.network_id),
             "last_block_time": last_block_time,
+            "difficulty": difficulty,
+            "hashrate_ths": hashrate_ths,
             "headers": message["headers"],
             "node_id": &self.node_id,
             "public_key": &self.node_id,
