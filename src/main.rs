@@ -2235,15 +2235,34 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&extract_path).map_err(|e| e.to_string())?;
+        let base_dir = std::fs::canonicalize(&extract_path).map_err(|e| e.to_string())?;
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let outpath = std::path::Path::new(&extract_path).join(file.name());
+            let entry_name = file.name();
+            let relative = std::path::Path::new(entry_name);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!("Unsafe bootstrap archive entry path: {}", entry_name));
+            }
+            let outpath = std::path::Path::new(&extract_path).join(relative);
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let canonical_parent = std::fs::canonicalize(
+                outpath
+                    .parent()
+                    .ok_or_else(|| "Invalid archive entry parent path".to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if !canonical_parent.starts_with(&base_dir) {
+                return Err(format!("Blocked bootstrap archive escape path: {}", entry_name));
+            }
             if file.name().ends_with('/') {
                 std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
             } else {
-                if let Some(parent) = outpath.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
                 let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
                 std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
             }
