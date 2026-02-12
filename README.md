@@ -1,71 +1,75 @@
 # alphanumeric
+
 https://www.alphanumeric.blue/
 
 ![Screenshot_2025-01-04_213726](https://github.com/user-attachments/assets/0b5c747c-53f7-4e09-82c8-0e9bfbd8cd89)
 
-alphanumeric is an advanced, high-performance blockchain written in Rust. It incorporates cutting-edge cryptographic and consensus algorithms to provide a secure, decentralized ledger.
+Rust-based blockchain node implementation with integrated networking, mining, wallet management, and diagnostics tooling.
 
-## Key Features
+## Project Status
 
-- **Rust Architecture**: Built with Rust for memory safety, concurrency, and performance 
-- **SHA-256 & BLAKE3 Hashing**: Uses industry standard SHA-256 for proof-of-work and BLAKE3 for fast, secure hashing
-- **CPUPoW Consensus**: Implements ProgPoW for CPU (Programmatic Proof-of-Work) ASIC resistance 
-- **CRYSTALS-Dilithium Quantum DSS**: Post-quantum ready digital signature scheme for future-proof security
-- **BPoS Sentinel**: Unique BFT-based Proof-of-Stake consensus layer for validator security
-- **Velocity Block Propagation**: Optimized block propagation protocol using erasure coding and subnet peer selection
-- **Temporal Verification**: Time-based blockchain analysis for anomaly detection and fork resolution
-- **Whisper Messaging**: Built-in peer-to-peer encrypted messaging with vanity fee codes
-- **Sled Database**: Utilizes sled, a modern embedded database, for efficient blockchain storage
-- **Argon2 Encrypted Wallets**: Wallet private keys encrypted using memory-hard Argon2 hashing
+This repository is under active development. Interfaces and internals may change between commits.
 
-## Command Line Interface
+## Highlights
 
-alphanumeric provides an interactive command line interface for blockchain management:
+- Rust codebase focused on performance and memory safety
+- P2P node runtime with peer discovery, sync, and propagation
+- Proof-of-work mining path
+- Wallet management and transaction flow
+- Embedded storage via `sled`
+- Optional stats and discovery integrations
 
-### Wallet Commands
-- `create <sender> <recipient> <amount>`: Create a new transaction
-- `whisper <address> <msg>`: Send an encrypted message (vanity fee code can be added after amount)
-- `balance`: Show all wallet balances  
-- `new [wallet_name]`: Create a new wallet
-- `account <address>`: Show detailed account information
-- `history`: Display transaction history for loaded wallets
-- `rename <old_name> <new_name>`: Rename an existing wallet
+## Quick Start
 
-### Mining Commands  
-- `mine <wallet_name>`: Mine a new block with the specified miner wallet
+### Prerequisites
 
-### Network Commands
-- `--status` or `-s`: Show network connection status
-- `--sync`: Perform a blockchain sync with the network  
-- `--sync --force`: Force a full blockchain resync
-- `--connect <ip:port>`: Manually connect to a network peer
-- `--getpeers`: List all currently connected peers
-- `--discover`: Actively search for new network peers
+- Rust (stable)
+- Cargo
 
-### Blockchain Commands
-- `info`: Display detailed blockchain status including difficulty, hashrate, and more 
-- `diagnostics`: Run blockchain diagnostic checks and display metrics
+### Run
 
-## Getting Started
-On first launch, the node will attempt to download a bootstrap snapshot from `https://alphanumeric.blue/bootstrap/blockchain.db.zip`.
-If a local `blockchain.db` already exists, it will use that instead.
+```powershell
+cargo run --release
+```
 
-To allow other nodes to connect to your blockchain node, you need to open port 7177 (TCP) in your router. You have to configure your server to accept incoming and outgoing connections for port 7177.
+On first startup, the node can bootstrap from:
 
-For **local connections in your Windows Firewall. Follow these steps:
+- `https://alphanumeric.blue/bootstrap/blockchain.db.zip`
 
-1.  Open PowerShell as an administrator (right-click on PowerShell and select "Run as administrator").
-2.  Run the following command:
+If a local `blockchain.db` is present, it will use local state instead.
+
+## Network Notes
+
+- Default node port: `7177` (TCP)
+- To accept inbound peers, allow TCP `7177` on your host/firewall/router
+
+Windows firewall example (PowerShell as Administrator):
 
 ```powershell
 New-NetFirewallRule -Name "Alphanumeric Network" -DisplayName "Alphanumeric Network (Port 7177)" -Protocol TCP -LocalPort 7177 -Direction Inbound,Outbound -Action Allow
 ```
-### Prerequisites
-- Rust (stable toolchain)
-- Cargo
 
-## Discord
-https://discord.gg/D3r7TRcj9t
+## Configuration (Environment)
+
+Examples used by the runtime include:
+
+- `ALPHANUMERIC_BIND_IP`
+- `ALPHANUMERIC_BOOTSTRAP_URL`
+- `ALPHANUMERIC_BOOTSTRAP_REQUIRED`
+- `ALPHANUMERIC_STATS_ENABLED`
+- `ALPHANUMERIC_STATS_PORT`
+- `ALPHANUMERIC_DISCOVERY_BASE`
+
+## Security Notes
+
+- Treat `private.key` and wallet key material as sensitive secrets.
+- Do not commit secrets to git.
+- Use encrypted storage and hardened host access controls in production.
+
+## Community
+
+- Discord: https://discord.gg/D3r7TRcj9t
 
 ## License
-This project is licensed under the MIT License.
+
+MIT
