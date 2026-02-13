@@ -565,7 +565,7 @@ impl Mgmt {
                 })?
         };
 
-        let (transactions, last_hash, block_count, difficulty, mining_reward) = {
+        let (transactions, last_hash, next_block_index, difficulty, mining_reward) = {
             let blockchain_guard = blockchain.read().await;
 
             // Initialize temporal verification
@@ -597,14 +597,17 @@ impl Mgmt {
             // Pass as slice to calculate_merkle_root
             let merkle_root = Blockchain::calculate_merkle_root(&regular_transactions)?;
 
-            let last_hash = blockchain_guard.get_last_block_hash()?;
-            let block_count = blockchain_guard.get_block_count();
+            let tip = blockchain_guard
+                .get_last_block()
+                .ok_or_else(|| "No tip block found".to_string())?;
+            let last_hash = tip.hash;
+            let next_block_index = tip.index.saturating_add(1);
             let difficulty = blockchain_guard.get_current_difficulty().await;
 
             (
                 regular_transactions,
                 last_hash,
-                block_count,
+                next_block_index,
                 difficulty,
                 mining_reward,
             )
@@ -612,7 +615,7 @@ impl Mgmt {
 
         // Ensure header uses a slice of transactions
         let mut header = ProgPowHeader {
-            number: block_count as u32,
+            number: next_block_index,
             parent_hash: last_hash,
             timestamp: Self::get_current_timestamp()?,
             merkle_root: Blockchain::calculate_merkle_root(&transactions[..])?,

@@ -1841,18 +1841,11 @@ impl Blockchain {
     }
 
     pub async fn get_network_difficulty(&self) -> Result<u64, BlockchainError> {
-        // Get the latest block index directly
-        let block_count = self.get_block_count();
-        if block_count > 0 {
-            // Get last block by index
-            let last_block = self.get_block((block_count - 1) as u32)?;
-
-            // Update cached difficulty
+        if let Some(last_block) = self.get_last_block() {
             let mut difficulty_lock = self.difficulty.lock().await;
             *difficulty_lock = last_block.difficulty;
             Ok(last_block.difficulty)
         } else {
-            // No blocks exist yet
             Ok(*self.difficulty.lock().await)
         }
     }

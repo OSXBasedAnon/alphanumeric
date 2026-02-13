@@ -263,7 +263,7 @@ impl MiningManager {
                     blockchain_guard.get_current_difficulty().await,
                     previous_block.hash.clone(),
                     previous_block.timestamp,
-                    blockchain_guard.get_block_count() as u32,
+                    previous_block.index.saturating_add(1),
                 )
             };
 

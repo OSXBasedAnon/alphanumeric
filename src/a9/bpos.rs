@@ -1047,14 +1047,11 @@ impl BPoSSentinel {
         }
 
         if force_full_update || (now - health.last_update > 300) {
-            let (active_nodes, total_nodes) = {
-                let metrics = self.node_metrics.iter().collect::<Vec<_>>();
-                let active = metrics
-                    .iter()
-                    .filter(|m| m.current_tier != ValidatorTier::Inactive)
-                    .count();
-                (active, metrics.len())
-            };
+            let peer_count = self.node.peers.read().await.len();
+            // Active nodes should reflect live network participants (self + connected peers),
+            // not wallet metric entries.
+            let active_nodes = peer_count.saturating_add(1);
+            let total_nodes = active_nodes.max(1);
 
             let network_load = {
                 let blockchain = self.blockchain.read().await;
@@ -1065,7 +1062,7 @@ impl BPoSSentinel {
             health.active_nodes = active_nodes.max(1);
             health.participation_rate = (active_nodes as f64 / total_nodes.max(1) as f64).min(1.0);
             health.network_load = network_load;
-            health.average_peer_count = self.node.peers.read().await.len() as f64; // Fixed: using self.node.peers
+            health.average_peer_count = peer_count as f64;
             health.last_update = now;
         }
 

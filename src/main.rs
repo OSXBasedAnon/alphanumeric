@@ -549,21 +549,6 @@ async fn main() -> Result<()> {
             let sentinel = staking_node.write().await;
             if let Err(e) = sentinel.initialize().await {
                 error!("Failed to initialize staking sentinel: {}", e);
-            } else {
-                let blockchain_guard = blockchain.read().await;
-                for wallet in wallets.values() {
-                    let balance = blockchain_guard
-                        .get_wallet_balance(&wallet.address)
-                        .await
-                        .unwrap_or(0.0);
-                    if let Err(e) = sentinel.register_wallet_metrics(&wallet.address, balance).await
-                    {
-                        error!(
-                            "Failed to register metrics for wallet {}: {}",
-                            wallet.address, e
-                        );
-                    }
-                }
             }
         }
 
@@ -617,16 +602,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize sentinel and register metrics for this node
+    // Initialize sentinel
     {
         let sentinel = staking_node.write().await;
         if let Err(e) = sentinel.initialize().await {
             error!("Failed to initialize staking sentinel: {}", e);
-        } else {
-            let node_id = node.id().to_string();
-            if let Err(e) = sentinel.register_wallet_metrics(&node_id, total_balance).await {
-                error!("Failed to register metrics for node {}: {}", node_id, e);
-            }
         }
     }
 
@@ -696,7 +676,7 @@ async fn main() -> Result<()> {
     if let Ok(health) = sentinel.get_network_metrics().await {
         let peers = node.peers.read().await;
         let active_peers = peers.len();
-        let active_nodes = health.active_nodes.max(active_peers).max(processed_wallets);
+        let active_nodes = health.active_nodes.max(active_peers);
 
         color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
         stdout.set_color(&color_spec)?;
