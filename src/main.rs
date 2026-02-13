@@ -2208,33 +2208,14 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
-    let force_bootstrap = std::env::var("ALPHANUMERIC_FORCE_BOOTSTRAP")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !force_bootstrap && has_local_block_data(db_path) {
+    // Simple and safe: only bootstrap if the DB does not already contain blocks.
+    if has_local_block_data(db_path) {
         return Ok(());
     }
 
-    let url = std::env::var("ALPHANUMERIC_BOOTSTRAP_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string());
-
-    if url.is_empty() {
-        return Ok(());
-    }
-
-    let required = std::env::var("ALPHANUMERIC_BOOTSTRAP_REQUIRED")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    // Optional: signed manifest verification.
-    // When ALPHANUMERIC_BOOTSTRAP_PUBLISHER_PUBKEY is set, we require a valid ed25519 signature
-    // over the manifest returned by ALPHANUMERIC_BOOTSTRAP_MANIFEST_URL.
-    let publisher_pubkey = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISHER_PUBKEY")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+    // Always bootstrap from the canonical site; do not allow override URLs.
+    // If the manifest fetch fails, fall back to the default static zip URL.
+    let manifest_url = "https://alphanumeric.blue/api/bootstrap/manifest";
 
     #[derive(serde::Deserialize)]
     struct ManifestResponse {
@@ -2242,7 +2223,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         manifest: BootstrapManifest,
     }
 
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
+    #[derive(serde::Deserialize, Clone)]
     struct BootstrapManifest {
         url: String,
         #[serde(default)]
@@ -2258,134 +2239,35 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         updated_at: u64,
     }
 
-    let mut download_url = url.clone();
-    let mut expected_sha256: Option<String> = None;
-
-    if let Some(expected_pubkey_hex) = publisher_pubkey {
-        let manifest_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_MANIFEST_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/manifest".to_string());
-
-        let manifest_res = reqwest::get(&manifest_url).await;
-        let manifest_res = match manifest_res {
-            Ok(r) => r,
-            Err(e) => {
-                if required {
-                    return Err(Box::new(e));
+    // Try to use the latest manifest.
+    let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
+        Ok(r) if r.status().is_success() => {
+            let body = r.bytes().await?;
+            if let Ok(parsed) = serde_json::from_slice::<ManifestResponse>(&body) {
+                if parsed.ok && !parsed.manifest.url.trim().is_empty() {
+                    (parsed.manifest.url.clone(), parsed.manifest.sha256.clone())
+                } else {
+                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
                 }
-                return Ok(());
+            } else {
+                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
             }
-        };
-        if !manifest_res.status().is_success() {
-            if required {
-                return Err(format!(
-                    "Bootstrap manifest fetch failed: {}",
-                    manifest_res.status()
-                )
-                .into());
-            }
-            return Ok(());
         }
+        _ => (DEFAULT_BOOTSTRAP_URL.to_string(), None),
+    };
 
-        let body = manifest_res.bytes().await?;
-        let parsed: ManifestResponse = serde_json::from_slice(&body)?;
-        if !parsed.ok {
-            if required {
-                return Err("Bootstrap manifest response not ok".into());
-            }
-            return Ok(());
-        }
-
-        let manifest = parsed.manifest;
-        if manifest.url.trim().is_empty() {
-            if required {
-                return Err("Bootstrap manifest missing url".into());
-            }
-            return Ok(());
-        }
-
-        // Signature check over the canonical JSON form of the manifest fields.
-        // We sign exactly the JSON.stringify output used by the publisher (field insertion order).
-        // To mirror that, we rebuild a minimal ordered struct and serialize it.
-        #[derive(serde::Serialize)]
-        struct SignedFields<'a> {
-            url: &'a String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            height: &'a Option<u64>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            tip_hash: &'a Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sha256: &'a Option<String>,
-            updated_at: u64,
-        }
-
-        let signed_fields = SignedFields {
-            url: &manifest.url,
-            height: &manifest.height,
-            tip_hash: &manifest.tip_hash,
-            sha256: &manifest.sha256,
-            updated_at: manifest.updated_at,
-        };
-        let msg = serde_json::to_vec(&signed_fields)?;
-
-        let sig_hex = manifest
-            .manifest_sig
-            .as_ref()
-            .ok_or("Bootstrap manifest missing manifest_sig")?
-            .trim()
-            .to_string();
-        let pub_hex = manifest
-            .publisher_pubkey
-            .as_ref()
-            .ok_or("Bootstrap manifest missing publisher_pubkey")?
-            .trim()
-            .to_string();
-
-        if pub_hex.to_ascii_lowercase() != expected_pubkey_hex.to_ascii_lowercase() {
-            return Err("Bootstrap manifest publisher_pubkey does not match expected".into());
-        }
-
-        let sig_bytes = hex::decode(sig_hex).map_err(|_| "Bootstrap manifest sig hex invalid")?;
-        let pub_bytes = hex::decode(pub_hex).map_err(|_| "Bootstrap manifest pubkey hex invalid")?;
-
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let vk = VerifyingKey::from_bytes(
-            pub_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "Bootstrap manifest pubkey wrong length")?,
-        )
-        .map_err(|_| "Bootstrap manifest pubkey parse failed")?;
-        let sig = Signature::from_slice(&sig_bytes).map_err(|_| "Bootstrap manifest sig parse failed")?;
-        vk.verify_strict(&msg, &sig)
-            .map_err(|_| "Bootstrap manifest signature invalid")?;
-
-        download_url = manifest.url.clone();
-        expected_sha256 = manifest.sha256.clone();
-    }
-
-    let res = reqwest::get(&download_url).await;
-    let res = match res {
+    let res = match reqwest::get(&download_url).await {
         Ok(r) => r,
-        Err(e) => {
-            if required {
-                return Err(Box::new(e));
-            }
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     if !res.status().is_success() {
-        if required {
-            return Err(format!("Bootstrap download failed: {}", res.status()).into());
-        }
         return Ok(());
     }
 
     let bytes = res.bytes().await?;
 
-    // If a signed manifest provided sha256, enforce it. Otherwise fall back to optional env pin.
+    // If the manifest provided sha256, enforce it.
     if let Some(expected) = expected_sha256
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase())
@@ -2400,20 +2282,6 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 expected, actual
             )
             .into());
-        }
-    } else if let Ok(expected_hash) = std::env::var("ALPHANUMERIC_BOOTSTRAP_SHA256") {
-        let expected = expected_hash.trim().to_ascii_lowercase();
-        if !expected.is_empty() {
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let actual = hex::encode(hasher.finalize());
-            if actual != expected {
-                return Err(format!(
-                    "Bootstrap SHA-256 mismatch: expected {}, got {}",
-                    expected, actual
-                )
-                .into());
-            }
         }
     }
     let zip_path = format!("{}.zip", db_path);
@@ -2494,25 +2362,10 @@ fn has_local_block_data(db_path: &str) -> bool {
 }
 
 async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockchain>>, token: String) {
-    let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
-
-    let cooldown_secs = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(3600);
-
-    let min_delta = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(10);
-
-    let stable_secs = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(180);
+    let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
+    let cooldown_secs = 3600u64;
+    let min_delta = 10u64;
+    let stable_secs = 180u64;
 
     let db = { blockchain.read().await.db.clone() };
     let (mut last_published_at, mut last_published_height) =
@@ -2736,7 +2589,7 @@ async fn publish_bootstrap_snapshot(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         return Err(format!(
-            "bootstrap publish URL redirected ({}). Set ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL to the final host (e.g. https://alphanumeric.blue/api/bootstrap/publish). Location={}",
+            "bootstrap publish URL redirected ({}). Fix your alphanumeric.blue canonical domain routing (no redirect on /api/bootstrap/publish). Location={}",
             resp.status(),
             loc
         )
@@ -2816,7 +2669,7 @@ async fn publish_bootstrap_snapshot(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         return Err(format!(
-            "bootstrap pointer URL redirected ({}). Use https://alphanumeric.blue/api/bootstrap/pointer. Location={}",
+            "bootstrap pointer URL redirected ({}). Fix your alphanumeric.blue canonical domain routing (no redirect on /api/bootstrap/pointer). Location={}",
             pointer_resp.status(),
             loc
         )
@@ -2876,10 +2729,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
         return Err("push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set".into());
     }
 
-    let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
+    let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
 
     let cooldown_secs = 3600u64;
     let now_secs = SystemTime::now()
