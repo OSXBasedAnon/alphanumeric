@@ -169,6 +169,20 @@ async fn main() -> Result<()> {
         }
         pb.inc(1);
 
+        // Optional: run a dedicated bootstrap publisher loop (intended for ONE canonical node).
+        // Single env var enables it:
+        // - ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN
+        if let Ok(token) = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN") {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                let db_path_for_publish = db_path.clone();
+                let blockchain_for_publish = blockchain.clone();
+                tokio::spawn(async move {
+                    bootstrap_publish_loop(db_path_for_publish, blockchain_for_publish, token).await;
+                });
+            }
+        }
+
         // Continue with rest of initialization
         pb.set_message("Setting up management...");
         let (transaction_fee, mining_reward, _difficulty_adjustment_interval, block_time) = {
@@ -2468,4 +2482,260 @@ fn has_local_block_data(db_path: &str) -> bool {
     };
 
     db.scan_prefix("block_").next().is_some()
+}
+
+async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockchain>>, token: String) {
+    let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
+
+    let cooldown_secs = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3600);
+
+    let min_delta = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(10);
+
+    let stable_secs = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(180);
+
+    let mut last_tip_hash: Option<String> = None;
+    let mut last_tip_change = Instant::now();
+    let mut last_published_height: u64 = 0;
+    let mut last_publish_at = Instant::now() - Duration::from_secs(cooldown_secs);
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let (height, tip_hash_hex) = {
+            let bc = blockchain.read().await;
+            let h = bc.get_latest_block_index() as u64;
+            let tip = bc.get_latest_block_hash();
+            (h, hex::encode(tip))
+        };
+
+        if last_tip_hash.as_deref() != Some(tip_hash_hex.as_str()) {
+            last_tip_hash = Some(tip_hash_hex.clone());
+            last_tip_change = Instant::now();
+        }
+
+        if last_publish_at.elapsed().as_secs() < cooldown_secs {
+            continue;
+        }
+
+        if height < last_published_height.saturating_add(min_delta) {
+            continue;
+        }
+
+        if last_tip_change.elapsed().as_secs() < stable_secs {
+            continue;
+        }
+
+        if let Err(e) =
+            publish_bootstrap_snapshot(&db_path, height, &tip_hash_hex, &publish_url, &token).await
+        {
+            error!("bootstrap publish failed: {}", e);
+            continue;
+        }
+
+        last_published_height = height;
+        last_publish_at = Instant::now();
+    }
+}
+
+async fn publish_bootstrap_snapshot(
+    db_path: &str,
+    height: u64,
+    tip_hash_hex: &str,
+    publish_url: &str,
+    token: &str,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct PublishLatest {
+        url: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PublishResponse {
+        ok: bool,
+        latest: PublishLatest,
+    }
+
+    #[derive(serde::Serialize)]
+    struct SignedFields {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tip_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        updated_at: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct PointerUpdate {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tip_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        updated_at: u64,
+        publisher_pubkey: String,
+        manifest_sig: String,
+    }
+
+    let db_dir = std::path::Path::new(db_path);
+    if !db_dir.exists() {
+        return Err("db path does not exist".into());
+    }
+
+    let tmp = std::env::temp_dir();
+    let zip_path = tmp.join(format!("alphanumeric-bootstrap-{}.zip", height));
+    let zip_path_string = zip_path.to_string_lossy().to_string();
+    let db_path_string = db_path.to_string();
+
+    // Build a zip of the sled directory with no compression to avoid CPU spikes.
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+        let file = std::fs::File::create(&zip_path_string).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+
+        fn add_dir(
+            zip: &mut zip::ZipWriter<std::fs::File>,
+            base: &std::path::Path,
+            path: &std::path::Path,
+            options: zip::write::FileOptions,
+        ) -> std::result::Result<(), String> {
+            for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let p = entry.path();
+                let rel = p
+                    .strip_prefix(base)
+                    .map_err(|e| format!("strip_prefix: {}", e))?;
+                let name = rel.to_string_lossy().replace('\\', "/");
+                if p.is_dir() {
+                    let dir_name = if name.ends_with('/') { name } else { format!("{}/", name) };
+                    zip.add_directory(dir_name, options).map_err(|e| e.to_string())?;
+                    add_dir(zip, base, &p, options)?;
+                } else if p.is_file() {
+                    zip.start_file(name, options).map_err(|e| e.to_string())?;
+                    let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        }
+
+        let base = std::path::Path::new(&db_path_string);
+        add_dir(&mut zip, base, base, options)?;
+        zip.finish().map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("zip task failed: {}", e))??;
+
+    let bytes = fs::read(&zip_path).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let sha256 = hex::encode(hasher.finalize());
+
+    // Step 1: upload snapshot to blue (server will store in Blob and return final blob URL).
+    let upload_url = format!(
+        "{}?height={}&tip={}&sha256={}",
+        publish_url, height, tip_hash_hex, sha256
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&upload_url)
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/zip")
+        .body(bytes)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let _ = fs::remove_file(&zip_path).await;
+        return Err(format!("bootstrap publish failed: {}", resp.status()).into());
+    }
+
+    let parsed: PublishResponse = resp.json().await?;
+    if !parsed.ok || parsed.latest.url.trim().is_empty() {
+        let _ = fs::remove_file(&zip_path).await;
+        return Err("bootstrap publish response invalid".into());
+    }
+
+    // Step 2: sign the manifest (with final blob URL) and update pointer in KV.
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let signed_fields = SignedFields {
+        url: parsed.latest.url.clone(),
+        height: Some(height),
+        tip_hash: Some(tip_hash_hex.to_string()),
+        sha256: Some(sha256),
+        updated_at,
+    };
+    let msg = serde_json::to_vec(&signed_fields)?;
+
+    // Derive a deterministic ed25519 keypair from the publish token so one secret enables:
+    // - API authorization
+    // - manifest signing
+    let mut t_hasher = Sha256::new();
+    t_hasher.update(token.as_bytes());
+    let seed = t_hasher.finalize();
+    let seed_bytes: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "failed to derive signing seed")?;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing = SigningKey::from_bytes(&seed_bytes);
+    let pub_hex = hex::encode(signing.verifying_key().to_bytes());
+    let sig = signing.sign(&msg);
+    let sig_hex = hex::encode(sig.to_bytes());
+
+    let pointer_url = if publish_url.contains("/api/bootstrap/publish") {
+        publish_url.replace("/api/bootstrap/publish", "/api/bootstrap/pointer")
+    } else {
+        format!("{}/api/bootstrap/pointer", publish_url.trim_end_matches('/'))
+    };
+
+    let pointer_update = PointerUpdate {
+        url: signed_fields.url,
+        height: signed_fields.height,
+        tip_hash: signed_fields.tip_hash,
+        sha256: signed_fields.sha256,
+        updated_at: signed_fields.updated_at,
+        publisher_pubkey: pub_hex,
+        manifest_sig: sig_hex,
+    };
+
+    let pointer_resp = client
+        .post(&pointer_url)
+        .header("authorization", format!("Bearer {}", token))
+        .json(&pointer_update)
+        .send()
+        .await?;
+
+    // Best-effort cleanup of temp zip file.
+    let _ = fs::remove_file(&zip_path).await;
+
+    if !pointer_resp.status().is_success() {
+        return Err(format!("bootstrap pointer update failed: {}", pointer_resp.status()).into());
+    }
+
+    Ok(())
 }
