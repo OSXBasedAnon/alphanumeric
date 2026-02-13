@@ -5,6 +5,7 @@
 # Local data
 /blockchain.db/
 /blockchain.db.lock
+.alphanumeric.instance.lock
 /private.key
 /path/
 /alphanumeric_serverless_plan.txt

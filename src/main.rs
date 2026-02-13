@@ -586,7 +586,6 @@ async fn main() -> Result<()> {
             println!("4. Make New Wallet (format: new [wallet_name])");
             println!("5. Account Lookup (format: account address)");
             println!("6. Mine Block (format: mine miner_wallet_name)");
-            println!("8. Push Snapshot (format: push)");
             println!("7. Exit");
 
             let mut command = String::new();
@@ -2618,18 +2617,37 @@ async fn publish_bootstrap_snapshot(
         manifest_sig: String,
     }
 
-    let db_dir = std::path::Path::new(db_path);
-    if !db_dir.exists() {
-        return Err("db path does not exist".into());
-    }
-
     let tmp = std::env::temp_dir();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let zip_path = tmp.join(format!("alphanumeric-bootstrap-{}.zip", height));
     let zip_path_string = zip_path.to_string_lossy().to_string();
-    let db_path_string = db_path.to_string();
+    let export_dir = tmp.join(format!("alphanumeric-bootstrap-export-{}-{}", height, now_secs));
+    let export_dir_string = export_dir.to_string_lossy().to_string();
 
-    // Build a zip of the sled directory with no compression to avoid CPU spikes.
+    // Clone DB handle for spawn_blocking.
+    let db_clone = db.clone();
+
+    // Build a zip of a re-imported sled database in a temp directory (not the live DB dir)
+    // to avoid Windows file locks (os error 33) when reading active log files.
     tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+        let export_path = std::path::Path::new(&export_dir_string);
+        if export_path.exists() {
+            std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
+
+        // Flush and logically export/import into a temp DB directory.
+        db_clone.flush().map_err(|e| e.to_string())?;
+        let export = db_clone.export();
+        let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
+        // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
+        tmp_db.import(export);
+        tmp_db.flush().map_err(|e| e.to_string())?;
+        drop(tmp_db);
+
         let file = std::fs::File::create(&zip_path_string).map_err(|e| e.to_string())?;
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::FileOptions::default()
@@ -2662,9 +2680,11 @@ async fn publish_bootstrap_snapshot(
             Ok(())
         }
 
-        let base = std::path::Path::new(&db_path_string);
-        add_dir(&mut zip, base, base, options)?;
+        add_dir(&mut zip, export_path, export_path, options)?;
         zip.finish().map_err(|e| e.to_string())?;
+
+        // Best-effort cleanup of export directory.
+        let _ = std::fs::remove_dir_all(export_path);
         Ok(())
     })
     .await

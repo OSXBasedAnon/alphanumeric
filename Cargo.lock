@@ -103,6 +103,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "dashmap",
+ "ed25519-dalek",
  "env_logger",
  "futures",
  "futures-util",

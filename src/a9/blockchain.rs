@@ -980,6 +980,69 @@ impl Blockchain {
         self.db.open_tree(PENDING_DEBITS_TREE).map_err(Into::into)
     }
 
+    fn get_orphan_block_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>, BlockchainError> {
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let hash_hex = Self::orphan_hash_key(hash);
+        let Some(raw) = orphan_blocks.get(hash_hex.as_bytes())? else {
+            return Ok(None);
+        };
+        let entry: OrphanStoredBlock = bincode::deserialize(&raw)?;
+        Ok(Some(entry.block))
+    }
+
+    fn get_parent_block_for(&self, block: &Block) -> Result<Option<Block>, BlockchainError> {
+        if block.index == 0 {
+            return Ok(None);
+        }
+
+        // Fast path: canonical at height-1 matches prev hash.
+        if let Ok(parent) = self.get_block(block.index.saturating_sub(1)) {
+            if parent.hash == block.previous_hash {
+                return Ok(Some(parent));
+            }
+        }
+
+        // Otherwise, parent might currently be in the orphan pool.
+        self.get_orphan_block_by_hash(&block.previous_hash)
+    }
+
+    async fn prevalidate_unattached_block_strict(&self, block: &Block) -> Result<(), BlockchainError> {
+        // Basic header checks include hash self-consistency + PoW proof.
+        block.validate_header()?;
+
+        // Merkle must match the normalized tx encoding.
+        let expected_root = Blockchain::calculate_merkle_root(&block.transactions)?;
+        if expected_root != block.merkle_root {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+
+        // Enforce transaction invariants and full signature presence. Do NOT enforce parent-linked
+        // difficulty adjustment here because parent may be missing during out-of-order receipt.
+        for tx in &block.transactions {
+            if tx.sender == "MINING_REWARDS" {
+                continue;
+            }
+            if tx.amount < MIN_TRANSACTION_AMOUNT {
+                return Err(BlockchainError::InvalidTransactionAmount);
+            }
+            if tx.signature.is_none() || tx.pub_key.is_none() || tx.sig_hash.is_none() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+            let sig_hex = tx
+                .signature
+                .as_ref()
+                .ok_or(BlockchainError::InvalidTransactionSignature)?;
+            let sig_bytes =
+                hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+            if sig_bytes.len() <= 64 {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+            self.verify_transaction_signature(tx)?;
+        }
+
+        Ok(())
+    }
+
     async fn get_pending_debit_for(&self, address: &str) -> Result<f64, BlockchainError> {
         let tree = self.open_pending_debits_tree()?;
         if let Some(raw) = tree.get(address.as_bytes())? {
@@ -1241,14 +1304,12 @@ impl Blockchain {
             let Some(branch_tip) = branch.last() else {
                 continue;
             };
-            if branch_tip.index <= tip.index {
-                continue;
-            }
+            // Branch may be same-height competitor or longer. Adoption decision is based on work.
 
             let fork_height = branch[0].index;
-            let canonical_overlap_work = self.canonical_work_range(fork_height, tip.index)?;
-            let branch_overlap_work = Self::branch_work_to_height(&branch, tip.index);
-            let advantage = branch_overlap_work as i128 - canonical_overlap_work as i128;
+            let canonical_work = self.canonical_work_range(fork_height, tip.index)?;
+            let branch_work = Self::branch_work_to_height(&branch, branch_tip.index);
+            let advantage = branch_work as i128 - canonical_work as i128;
 
             // Deterministic adoption rule:
             // 1) positive overlap work advantage
@@ -1273,6 +1334,11 @@ impl Blockchain {
         };
         if best_overlap_advantage < 0 {
             return Ok(false);
+        }
+
+        // Validate the selected branch (including parent-linked difficulty adjustment) before applying.
+        for b in &branch {
+            self.validate_block_strict(b).await?;
         }
 
         // Apply reorg by rewriting canonical block slots with the selected branch.
@@ -1773,6 +1839,10 @@ impl Blockchain {
     }
 
     pub async fn save_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        // Always do basic validation before admitting blocks into orphan storage.
+        // This prevents trivial junk from occupying orphan capacity.
+        self.prevalidate_unattached_block_strict(block).await?;
+
         // Enforce linear tip extension and park out-of-order blocks as orphans.
         match self.highest_block_index() {
             None => {
@@ -2320,14 +2390,21 @@ impl Blockchain {
             return Err(BlockchainError::InvalidHash);
         }
 
-        // Enhanced difficulty validation for non-genesis blocks
+        // Enhanced difficulty + linkage validation for non-genesis blocks.
+        // IMPORTANT: validate against the referenced parent by hash (canonical or orphan), not "whatever is at height-1".
         if block.index > 0 {
-            let previous_block = self.get_block(block.index - 1)?;
+            let parent = self
+                .get_parent_block_for(block)?
+                .ok_or(BlockchainError::InvalidBlockHeader)?;
+            if parent.hash != block.previous_hash {
+                return Err(BlockchainError::InvalidBlockHeader);
+            }
+
             let expected_difficulty = Block::adjust_dynamic_difficulty(
-                previous_block.difficulty,
-                block.timestamp.saturating_sub(previous_block.timestamp),
+                parent.difficulty,
+                block.timestamp.saturating_sub(parent.timestamp),
                 block.index,
-                &mut DifficultyOracle::new(), // Create difficulty oracle once
+                &mut DifficultyOracle::new(),
                 block.timestamp,
             );
 
