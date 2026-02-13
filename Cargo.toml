@@ -61,3 +61,13 @@ sysinfo = "0.30"
 [build-dependencies]
 bindgen = "0.64"
 winres = "0.1.12"
+
+# NOTE:
+# Windows Defender ML detections are often triggered by small, stripped, unsigned binaries
+# that do heavy filesystem + networking (like bootstrap publish). Keep symbols and avoid
+# aggressive LTO/stripping in release builds until the binary is code-signed.
+[profile.release]
+debug = 1
+strip = "none"
+lto = false
+panic = "unwind"

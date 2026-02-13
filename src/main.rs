@@ -75,9 +75,8 @@ async fn main() -> Result<()> {
     local.run_until(async move {
         // Database init
         pb.set_message("Checking bootstrap snapshot...");
-        if let Err(e) = ensure_bootstrap_db(&db_path).await {
-            error!("Bootstrap failed: {}", e);
-        }
+        // Fail closed: if there are no local blocks, bootstrap must succeed.
+        ensure_bootstrap_db(&db_path).await?;
         pb.set_message("Initializing database...");
         ensure_instance_lock()?;
         ensure_db_lock(&db_path)?;
@@ -2239,7 +2238,8 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         updated_at: u64,
     }
 
-    // Try to use the latest manifest.
+    // Prefer the latest manifest (recent snapshot URL + sha256). Fall back to the static zip URL if
+    // the manifest fetch/parsing fails, but still require the final download to succeed.
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
         Ok(r) if r.status().is_success() => {
             let body = r.bytes().await?;
@@ -2253,16 +2253,17 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 (DEFAULT_BOOTSTRAP_URL.to_string(), None)
             }
         }
-        _ => (DEFAULT_BOOTSTRAP_URL.to_string(), None),
+        Ok(r) => {
+            // Manifest endpoint returned non-2xx.
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+        }
+        Err(_) => (DEFAULT_BOOTSTRAP_URL.to_string(), None),
     };
 
-    let res = match reqwest::get(&download_url).await {
-        Ok(r) => r,
-        Err(_) => return Ok(()),
-    };
+    let res = reqwest::get(&download_url).await?;
 
     if !res.status().is_success() {
-        return Ok(());
+        return Err(format!("Bootstrap download failed: {}", res.status()).into());
     }
 
     let bytes = res.bytes().await?;
