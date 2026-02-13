@@ -3140,11 +3140,38 @@ impl Blockchain {
             return Ok(hasher.finalize().into());
         }
 
+        // Consensus merkle root must be stable across:
+        // - in-memory full-signature transactions (used for admission verification)
+        // - on-disk truncated-signature blocks (used for storage efficiency)
+        //
+        // So we hash a normalized transaction encoding where non-system signatures are always truncated to 64 bytes
+        // and a `sig_hash` is present (or derivable) for identity binding.
         let mut current_level: Vec<[u8; 32]> = transactions
             .iter()
             .map(|tx| {
-                let tx_bytes =
-                    serialize(tx).map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+                let tx_for_merkle = if tx.sender == "MINING_REWARDS" {
+                    tx.clone()
+                } else {
+                    let mut full_tx = tx.clone();
+                    if full_tx.sig_hash.is_none() {
+                        if let Some(sig_hex) = &full_tx.signature {
+                            if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                                if !sig_bytes.is_empty() {
+                                    full_tx.sig_hash =
+                                        Some(Transaction::signature_hash_hex(&sig_bytes));
+                                }
+                            }
+                        }
+                    }
+
+                    match &full_tx.sig_hash {
+                        Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
+                        None => full_tx,
+                    }
+                };
+
+                let tx_bytes = serialize(&tx_for_merkle)
+                    .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
                 let mut hasher = Sha256::new();
                 hasher.update(&tx_bytes);
                 Ok(hasher.finalize().into())
