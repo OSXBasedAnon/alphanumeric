@@ -20,6 +20,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::a9::blockchain::Blockchain;
 
+const DILITHIUM5_SECRET_KEY_BYTES: usize = 4896;
+const DILITHIUM5_PUBLIC_KEY_BYTES: usize = 2592;
+const DILITHIUM5_COMBINED_KEY_BYTES: usize =
+    DILITHIUM5_SECRET_KEY_BYTES + DILITHIUM5_PUBLIC_KEY_BYTES;
+
 #[derive(Error, Debug)]
 pub enum WalletError {
     #[error("Failed to parse JSON: {0}")]
@@ -78,6 +83,37 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    fn split_combined_key_bytes(combined_bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
+        if combined_bytes.len() < DILITHIUM5_COMBINED_KEY_BYTES {
+            return Err(format!(
+                "Invalid key data: expected at least {} bytes (secret+public), got {}",
+                DILITHIUM5_COMBINED_KEY_BYTES,
+                combined_bytes.len()
+            ));
+        }
+
+        let (secret_bytes, rest) = combined_bytes.split_at(DILITHIUM5_SECRET_KEY_BYTES);
+
+        if SecretKey::from_bytes(secret_bytes).is_err() {
+            return Err("Invalid key data: malformed Dilithium secret key".to_string());
+        }
+
+        if rest.len() < DILITHIUM5_PUBLIC_KEY_BYTES {
+            return Err(format!(
+                "Invalid key data: expected {} public key bytes, got {}",
+                DILITHIUM5_PUBLIC_KEY_BYTES,
+                rest.len()
+            ));
+        }
+
+        let public_bytes = &rest[..DILITHIUM5_PUBLIC_KEY_BYTES];
+        if PublicKey::from_bytes(public_bytes).is_err() {
+            return Err("Invalid key data: malformed Dilithium public key".to_string());
+        }
+
+        Ok((secret_bytes, public_bytes))
+    }
+
     fn derive_aes_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], String> {
         let mut key = [0u8; 32];
         Argon2::default()
@@ -142,11 +178,7 @@ impl Wallet {
             encrypted_private_key.clone()
         };
 
-        if combined_bytes.len() < 4896 {
-            return Err("Invalid key data".to_string());
-        }
-
-        let (secret_bytes, public_bytes) = combined_bytes.split_at(4896);
+        let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
         let address_binary = hex::decode(&wallet_address)
             .map_err(|_| "Invalid wallet address".to_string())?;
@@ -234,11 +266,7 @@ impl Wallet {
             encrypted_key.to_vec()
         };
 
-        if combined_bytes.len() < 4896 {
-            return Err("Invalid key data".to_string());
-        }
-
-        let (secret_bytes, public_bytes) = combined_bytes.split_at(4896);
+        let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
         let keys = WalletKeys {
             dilithium_secret_key_bytes: secret_bytes.to_vec(),
@@ -298,6 +326,9 @@ impl Wallet {
     pub async fn get_public_key_hex(&self) -> Option<String> {
         let keypair = self.keypair.as_ref()?;
         let keypair = keypair.lock().await;
+        if keypair.dilithium_public_key_bytes.is_empty() {
+            return None;
+        }
         Some(hex::encode(&keypair.dilithium_public_key_bytes))
     }
 
@@ -319,8 +350,7 @@ impl Wallet {
             Self::decrypt_private_key(private_key, passphrase)?
         };
 
-        // Split back into secret and public parts
-        let (secret_bytes, public_bytes) = combined_bytes.split_at(4896);
+        let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
         let keys = WalletKeys {
             dilithium_secret_key_bytes: secret_bytes.to_vec(),

@@ -840,6 +840,21 @@ impl Mgmt {
             Some(signature),
         );
         transaction.pub_key = sender_wallet.get_public_key_hex().await;
+        if transaction.pub_key.is_none() {
+            writeln!(stdout)?;
+            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+            write!(stdout, "error")?;
+            stdout.reset()?;
+            writeln!(
+                stdout,
+                ": wallet key material is missing a Dilithium public key"
+            )?;
+            writeln!(
+                stdout,
+                "wallet data appears incomplete; restore a full key backup or recreate this wallet"
+            )?;
+            return Err("Wallet key data missing Dilithium public key".into());
+        }
 
         // No wallet registry needed - transactions are self-contained with public keys
 

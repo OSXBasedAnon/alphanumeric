@@ -66,19 +66,19 @@ async fn main() -> Result<()> {
             .progress_chars("█▓░"),
     );
 
+    let db_path = config.database.path.clone();
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         // Database init
         pb.set_message("Checking bootstrap snapshot...");
-        let db_path = "blockchain.db";
-        if let Err(e) = ensure_bootstrap_db(db_path).await {
+        if let Err(e) = ensure_bootstrap_db(&db_path).await {
             error!("Bootstrap failed: {}", e);
         }
         pb.set_message("Initializing database...");
         ensure_instance_lock()?;
-        ensure_db_lock(db_path)?;
+        ensure_db_lock(&db_path)?;
         let db = match sled::Config::new()
-            .path(db_path)
+            .path(&db_path)
             .flush_every_ms(Some(1000))
             .open()
         {
@@ -88,24 +88,24 @@ async fn main() -> Result<()> {
                     || e.to_string().contains("Corruption");
                 if is_corruption {
                     warn!("Sled reported corruption. Attempting snapshot cleanup...");
-                    if let Err(clean_err) = cleanup_sled_snapshots(db_path) {
+                    if let Err(clean_err) = cleanup_sled_snapshots(&db_path) {
                         error!("Snapshot cleanup failed: {}", clean_err);
                     }
                     match sled::Config::new()
-                        .path(db_path)
+                        .path(&db_path)
                         .flush_every_ms(Some(1000))
                         .open()
                     {
                         Ok(db) => db,
                         Err(reopen_err) => {
                             warn!("Reopen failed after cleanup: {}", reopen_err);
-                            let quarantined = quarantine_db(db_path);
+                            let quarantined = quarantine_db(&db_path);
                             if let Err(q_err) = quarantined {
                                 error!("Failed to quarantine DB: {}", q_err);
                                 return Err(Box::new(reopen_err) as Box<dyn Error>);
                             }
                             sled::Config::new()
-                                .path(db_path)
+                                .path(&db_path)
                                 .flush_every_ms(Some(1000))
                                 .open()
                                 .map_err(|fresh_err| {
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         };
         {
             let db_for_signal = db.clone();
-            let lock_path = format!("{}.lock", db_path);
+            let lock_path = format!("{}.lock", &db_path);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
                 let _ = db_for_signal.flush();
@@ -2185,13 +2185,11 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
-    let path = std::path::Path::new(db_path);
-    if path.exists() && path.is_dir() {
-        if let Ok(mut entries) = std::fs::read_dir(path) {
-            if entries.next().is_some() {
-                return Ok(());
-            }
-        }
+    let force_bootstrap = std::env::var("ALPHANUMERIC_FORCE_BOOTSTRAP")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !force_bootstrap && has_local_block_data(db_path) {
+        return Ok(());
     }
 
     let url = std::env::var("ALPHANUMERIC_BOOTSTRAP_URL")
@@ -2244,6 +2242,10 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let zip_path = format!("{}.zip", db_path);
     fs::write(&zip_path, &bytes).await?;
 
+    if std::path::Path::new(db_path).exists() {
+        let _ = std::fs::remove_dir_all(db_path);
+    }
+
     let extract_path = db_path.to_string();
     let zip_path_clone = zip_path.clone();
     let extract_result = tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
@@ -2292,4 +2294,24 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         return Err(Box::<dyn Error>::from(e));
     }
     Ok(())
+}
+
+fn has_local_block_data(db_path: &str) -> bool {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() || !path.is_dir() {
+        return false;
+    }
+
+    // Only treat DB as initialized when at least one block key exists.
+    // This avoids skipping bootstrap when sled created internal files only.
+    let db = match sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .open()
+    {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+
+    db.scan_prefix("block_").next().is_some()
 }

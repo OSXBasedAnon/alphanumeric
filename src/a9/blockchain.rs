@@ -34,6 +34,10 @@ use crate::a9::wallet::Wallet;
 const BLOCKCHAIN_PATH: &str = "blockchain.db";
 const BALANCES_TREE: &str = "balances";
 const PENDING_DEBITS_TREE: &str = "pending_debits";
+const PENDING_TRANSACTIONS_TREE: &str = "pending_transactions";
+// Full Dilithium signatures are intentionally NOT stored in the main tx record on disk.
+// We keep them in a sidecar tree for pending/mempool durability across restarts, and prune with the same TTL.
+const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
@@ -87,6 +91,14 @@ pub fn finalize_stage_name(stage: usize) -> &'static str {
 pub enum TransactionContext {
     BlockValidation,
     Standard,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SignatureValidationMode {
+    /// For blocks received/constructed in-memory where full signatures must be present.
+    RequireFull,
+    /// For blocks loaded from local storage where signatures may be truncated by design.
+    AllowTruncatedStored,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -317,14 +329,8 @@ impl Transaction {
     }
 
     async fn verify_signature(&self, _blockchain: &Blockchain) -> Result<(), BlockchainError> {
-        let allow_legacy = std::env::var("ALPHANUMERIC_ALLOW_LEGACY_TX")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
         // Enforce that a verified tx carries pub_key + signature hash.
         if self.pub_key.is_none() || self.sig_hash.is_none() {
-            if allow_legacy {
-                return Ok(());
-            }
             return Err(BlockchainError::InvalidTransactionSignature);
         }
         if let Some(sig) = &self.signature {
@@ -999,7 +1005,7 @@ impl Blockchain {
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let debits_tree = self.open_pending_debits_tree()?;
         debits_tree.clear()?;
 
@@ -1344,7 +1350,7 @@ impl Blockchain {
 
     async fn persist_validated_block(&self, block: &Block) -> Result<(), BlockchainError> {
         // Canonical validation gate for all persistence paths.
-        self.validate_block(block).await?;
+        self.validate_block_strict(block).await?;
 
         // Run expensive full-chain integrity checks periodically.
         let now = SystemTime::now()
@@ -1507,7 +1513,8 @@ impl Blockchain {
         let Some(ttl_secs) = Self::pending_tx_ttl_secs() else {
             return Ok(0);
         };
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1522,10 +1529,13 @@ impl Blockchain {
             };
             if remove {
                 pending_tree.remove(key)?;
+                // Best-effort: keep sidecar in sync with pending tx removals.
+                let _ = full_sigs_tree.remove(&key);
                 removed += 1;
             }
         }
         pending_tree.flush()?;
+        full_sigs_tree.flush()?;
         Ok(removed)
     }
     fn signature_cache_capacity() -> NonZeroUsize {
@@ -1638,10 +1648,11 @@ impl Blockchain {
             signature_cache,
         };
 
-        // Ensure pending tx tree exists (do not clear at startup).
-        if let Ok(pending_tree) = db.open_tree("pending_transactions") {
+        // Ensure pending tx trees exist (do not clear at startup).
+        if let Ok(pending_tree) = db.open_tree(PENDING_TRANSACTIONS_TREE) {
             pending_tree.flush().ok();
         }
+        let _ = db.open_tree(PENDING_FULL_SIGNATURES_TREE);
         let _ = db.open_tree(PENDING_DEBITS_TREE);
         // Ensure orphan-management trees exist.
         let _ = db.open_tree(ORPHAN_BLOCKS_TREE);
@@ -1664,14 +1675,52 @@ impl Blockchain {
         self.prune_orphans()?;
         let _ = self.promote_orphans_from_tip().await;
 
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let mut invalid_txs = Vec::new();
 
         for result in pending_tree.iter() {
             let (key, tx_bytes) = result?;
             if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                if let Err(_) = self.validate_transaction(&tx, None).await {
+                if tx.sender == "MINING_REWARDS" {
                     invalid_txs.push(key.to_vec());
+                    continue;
+                }
+
+                // Pending txs must be fully verifiable (via sidecar witness) before we keep them.
+                if tx.pub_key.is_none() || tx.sig_hash.is_none() || tx.signature.is_none() {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                }
+
+                let mut full_tx = tx.clone();
+                let tx_id = full_tx.get_tx_id();
+                let expected_sig_hash = full_tx.sig_hash.as_ref().unwrap().clone();
+                let sig_hex = full_tx.signature.as_ref().unwrap();
+                let sig_bytes = match hex::decode(sig_hex) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        invalid_txs.push(key.to_vec());
+                        continue;
+                    }
+                };
+
+                if sig_bytes.len() <= 64 {
+                    let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
+                        invalid_txs.push(key.to_vec());
+                        continue;
+                    };
+                    let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
+                    if actual_hash != expected_sig_hash {
+                        invalid_txs.push(key.to_vec());
+                        continue;
+                    }
+                    full_tx.signature = Some(hex::encode(&full_sig_bytes));
+                }
+
+                if self.verify_transaction_signature(&full_tx).is_err() {
+                    invalid_txs.push(key.to_vec());
+                    continue;
                 }
             } else {
                 invalid_txs.push(key.to_vec());
@@ -1680,9 +1729,11 @@ impl Blockchain {
 
         // Remove invalid transactions
         for key in invalid_txs {
-            pending_tree.remove(key)?;
+            pending_tree.remove(&key)?;
+            let _ = full_sigs_tree.remove(&key);
         }
         pending_tree.flush()?;
+        full_sigs_tree.flush()?;
         self.rebuild_pending_debits_index().await?;
 
         Ok(())
@@ -1692,7 +1743,7 @@ impl Blockchain {
         let difficulty = *self.difficulty.lock().await;
 
         // Retrieve pending transactions from sled
-        let pending_transactions = match self.db.open_tree("pending_transactions") {
+        let pending_transactions = match self.db.open_tree(PENDING_TRANSACTIONS_TREE) {
             Ok(tree) => {
                 let mut transactions = Vec::new();
                 for item in tree.iter() {
@@ -1808,7 +1859,7 @@ impl Blockchain {
         // Do not mutate mined header fields here. Mining must include final transactions/root.
         set_finalize_stage(1);
         trace_step("prevalidate");
-        self.validate_block(&block).await?;
+        self.validate_block_strict(&block).await?;
 
         // Get all current confirmed balances first
         let mut confirmed_balances: HashMap<String, f64> = HashMap::new();
@@ -1857,8 +1908,9 @@ impl Blockchain {
         set_finalize_stage(4);
         trace_step("apply_batch");
 
-        // Save block
-        let value = bincode::serialize(&block)?;
+        // Save block with truncated signatures to reduce on-disk chain size.
+        let storage_block = Self::to_storage_block(&block);
+        let value = bincode::serialize(&storage_block)?;
         let key = format!("block_{}", block.index);
         self.db.insert(key.as_bytes(), value)?;
         set_finalize_stage(5);
@@ -1878,9 +1930,11 @@ impl Blockchain {
         transactions: &[Transaction],
     ) -> Result<(), BlockchainError> {
         // Clear from pending transactions tree
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
         let mut batch = sled::Batch::default();
+        let mut full_batch = sled::Batch::default();
 
         for tx in transactions {
             // Use tx_id instead of string formatting
@@ -1888,6 +1942,7 @@ impl Blockchain {
 
             // Remove from pending tree
             batch.remove(tx_id.as_bytes());
+            full_batch.remove(tx_id.as_bytes());
 
             if tx.sender != "MINING_REWARDS" {
                 let current_debit = self.get_pending_debit_for(&tx.sender).await?;
@@ -1895,22 +1950,11 @@ impl Blockchain {
                 let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
                 Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
             }
-
-            // Explicitly remove any full signatures from memory
-            if let Some(sig) = &tx.signature {
-                if let Ok(_) = hex::decode(sig) {
-                    // The decoded signature is automatically dropped here
-                    // Rust's ownership system ensures cleanup
-                    println!(
-                        "Cleaned up signature from memory for transaction: {}",
-                        tx_id
-                    );
-                }
-            }
         }
 
         // Apply batch deletion
         pending_tree.apply_batch(batch)?;
+        full_sigs_tree.apply_batch(full_batch)?;
 
         // Clear from mempool
         let mut mempool = self.mempool.write().await;
@@ -1920,6 +1964,7 @@ impl Blockchain {
 
         // Ensure changes are persisted
         pending_tree.flush()?;
+        full_sigs_tree.flush()?;
         pending_debits_tree.flush()?;
 
         Ok(())
@@ -2131,8 +2176,8 @@ impl Blockchain {
             return Err(BlockchainError::InsufficientFunds);
         }
 
-        // Continue with other validations (signature etc.)
-        tx.verify_signature(self).await?;
+        // Continue with signature validation (must be fully verifiable for non-system txs).
+        self.verify_transaction_signature(tx)?;
         Ok(())
     }
 
@@ -2141,10 +2186,6 @@ impl Blockchain {
             return Ok(());
         }
 
-        let pub_key = tx
-            .pub_key
-            .as_ref()
-            .ok_or(BlockchainError::InvalidTransactionSignature)?;
         let sig_hex = tx
             .signature
             .as_ref()
@@ -2152,6 +2193,15 @@ impl Blockchain {
 
         let sig_bytes =
             hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        if sig_bytes.is_empty() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+        let pub_key = match tx.pub_key.as_ref() {
+            Some(pk) => pk,
+            None => {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+        };
         let actual_hash = Transaction::signature_hash_hex(&sig_bytes);
         let cache_key = format!("{}:{}:{}", tx.get_tx_id(), pub_key, actual_hash);
 
@@ -2242,6 +2292,20 @@ impl Blockchain {
     }
 
     pub async fn validate_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        self.validate_block_internal(block, SignatureValidationMode::AllowTruncatedStored)
+            .await
+    }
+
+    async fn validate_block_strict(&self, block: &Block) -> Result<(), BlockchainError> {
+        self.validate_block_internal(block, SignatureValidationMode::RequireFull)
+            .await
+    }
+
+    async fn validate_block_internal(
+        &self,
+        block: &Block,
+        sig_mode: SignatureValidationMode,
+    ) -> Result<(), BlockchainError> {
         // First validate block header
         block.validate_header()?;
 
@@ -2310,18 +2374,28 @@ impl Blockchain {
             if tx.amount < MIN_TRANSACTION_AMOUNT {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
-            if tx.pub_key.is_none() || tx.sig_hash.is_none() {
-                return Err(BlockchainError::InvalidTransactionSignature);
-            }
             if tx.signature.is_none() {
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
-            if let Some(sig_hex) = &tx.signature {
-                if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                    if sig_bytes.len() > 64 {
-                        self.verify_transaction_signature(tx)?;
-                    }
-                }
+            if tx.pub_key.is_none() || tx.sig_hash.is_none() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+
+            let sig_hex = tx
+                .signature
+                .as_ref()
+                .ok_or(BlockchainError::InvalidTransactionSignature)?;
+            let sig_bytes =
+                hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+
+            // Stored blocks keep truncated sig bytes by design; incoming blocks must be fully verifiable.
+            if sig_mode == SignatureValidationMode::RequireFull && sig_bytes.len() <= 64 {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+
+            // Verify when the full signature is present.
+            if sig_bytes.len() > 64 {
+                self.verify_transaction_signature(tx)?;
             }
         }
 
@@ -2452,16 +2526,9 @@ impl Blockchain {
         }
 
         // Signature verification with public key binding
-        let allow_legacy = std::env::var("ALPHANUMERIC_ALLOW_LEGACY_TX")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
-
         let pub_key = match transaction.pub_key.as_ref() {
             Some(pk) => pk,
             None => {
-                if allow_legacy {
-                    return Err(BlockchainError::InvalidTransactionSignature);
-                }
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
         };
@@ -2500,8 +2567,14 @@ impl Blockchain {
         drop(mempool_guard); // Release read lock before getting write lock
         self.add_to_mempool(mempool_tx).await?;
 
+        // Store full signature witness in sidecar (keyed by tx_id) so mempool can be rehydrated after restart.
+        // The main pending tx record remains compact (truncated signature + sig_hash).
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
+        full_sigs_tree.insert(tx_id.as_bytes(), sig_bytes)?;
+        full_sigs_tree.flush()?;
+
         // Store in pending transactions
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
         let tx_bytes = bincode::serialize(&storage_tx)?;
 
@@ -2696,13 +2769,49 @@ impl Blockchain {
 
         // Get pending transactions from sled
         let _ = self.prune_pending_transactions();
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
 
         // Collect all transactions from sled
         let mut transactions = Vec::new();
         for result in pending_tree.iter() {
             let (_, tx_bytes) = result?;
-            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+            if let Ok(mut tx) = deserialize_transaction(&tx_bytes) {
+                // Pending txs are stored with a truncated signature in the main record. Rehydrate the full signature
+                // from the sidecar tree and strictly verify before admitting into the in-memory mempool.
+                if tx.sender != "MINING_REWARDS" {
+                    if tx.pub_key.is_none() || tx.sig_hash.is_none() || tx.signature.is_none() {
+                        continue;
+                    }
+
+                    let tx_id = tx.get_tx_id();
+                    let expected_sig_hash = tx.sig_hash.as_ref().unwrap();
+
+                    let sig_hex = tx.signature.as_ref().unwrap();
+                    let sig_bytes = match hex::decode(sig_hex) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    if sig_bytes.len() <= 64 {
+                        let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
+                            // No witness available; do not allow unverifiable tx into the mempool.
+                            continue;
+                        };
+
+                        let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
+                        if &actual_hash != expected_sig_hash {
+                            continue;
+                        }
+
+                        tx.signature = Some(hex::encode(&full_sig_bytes));
+                    }
+
+                    if self.verify_transaction_signature(&tx).is_err() {
+                        continue;
+                    }
+                }
+
                 transactions.push(tx);
             }
         }
@@ -2723,7 +2832,7 @@ impl Blockchain {
         self.sync_mempool_with_sled().await?;
 
         // Now get transactions from sled
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let mut transactions = Vec::new();
 
         for result in pending_tree.iter() {
@@ -2773,7 +2882,7 @@ impl Blockchain {
         }
 
         // Handle pending transactions CORRECTLY
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let mut pending_balances: HashMap<String, f64> = HashMap::new(); // Track pending balances
 
         for result in pending_tree.iter() {
@@ -2806,7 +2915,8 @@ impl Blockchain {
         context: TransactionContext,
     ) -> Result<(), BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
 
         // Track cumulative balance changes
@@ -2835,13 +2945,8 @@ impl Blockchain {
                 }
                 _ => {
                     if context == TransactionContext::BlockValidation {
-                        if let Some(sig_hex) = &tx.signature {
-                            if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                                if sig_bytes.len() > 64 {
-                                    self.verify_transaction_signature(tx)?;
-                                }
-                            }
-                        }
+                        // BlockValidation must only operate on fully-verifiable transactions.
+                        self.verify_transaction_signature(tx)?;
                     }
 
                     let total_debit = tx.amount + tx.fee;
@@ -2876,6 +2981,7 @@ impl Blockchain {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
                     pending_tree.remove(tx_id.as_bytes())?;
+                    let _ = full_sigs_tree.remove(tx_id.as_bytes());
                     let current_debit = self.get_pending_debit_for(&tx.sender).await?;
                     let delta = tx.amount + tx.fee;
                     let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
@@ -2883,13 +2989,14 @@ impl Blockchain {
                 }
             }
             pending_debits_tree.flush()?;
+            full_sigs_tree.flush()?;
         }
 
         Ok(())
     }
 
     pub async fn process_pending_transactions(&self) -> Result<(), BlockchainError> {
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let mut transactions = Vec::new();
 
         for result in pending_tree.iter() {
@@ -2982,7 +3089,7 @@ impl Blockchain {
         let confirmed = self.get_confirmed_balance(address).await?;
         let mut spendable = confirmed;
 
-        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         for result in pending_tree.iter() {
             if let Ok((_, tx_bytes)) = result {
                 if let Ok(tx) = deserialize_transaction(&tx_bytes) {
