@@ -35,7 +35,7 @@ mod config;
 
 const KEY_FILE_PATH: &str = "private.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
-const DEFAULT_BOOTSTRAP_URL: &str = "https://www.alphanumeric.blue/bootstrap/blockchain.db.zip";
+const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
 const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
 const BOOTSTRAP_META_LAST_PUBLISH_AT: &[u8] = b"last_publish_at";
@@ -2265,7 +2265,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         let manifest_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_MANIFEST_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "https://www.alphanumeric.blue/api/bootstrap/manifest".to_string());
+            .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/manifest".to_string());
 
         let manifest_res = reqwest::get(&manifest_url).await;
         let manifest_res = match manifest_res {
@@ -2497,7 +2497,7 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
     let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://www.alphanumeric.blue/api/bootstrap/publish".to_string());
+        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
 
     let cooldown_secs = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS")
         .ok()
@@ -2720,7 +2720,7 @@ async fn publish_bootstrap_snapshot(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         return Err(format!(
-            "bootstrap publish URL redirected ({}). Set ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL to the final host (e.g. https://www.alphanumeric.blue/api/bootstrap/publish). Location={}",
+            "bootstrap publish URL redirected ({}). Set ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL to the final host (e.g. https://alphanumeric.blue/api/bootstrap/publish). Location={}",
             resp.status(),
             loc
         )
@@ -2800,7 +2800,7 @@ async fn publish_bootstrap_snapshot(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         return Err(format!(
-            "bootstrap pointer URL redirected ({}). Use https://www.alphanumeric.blue/api/bootstrap/pointer. Location={}",
+            "bootstrap pointer URL redirected ({}). Use https://alphanumeric.blue/api/bootstrap/pointer. Location={}",
             pointer_resp.status(),
             loc
         )
@@ -2863,7 +2863,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
     let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://www.alphanumeric.blue/api/bootstrap/publish".to_string());
+        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
 
     let cooldown_secs = 3600u64;
     let now_secs = SystemTime::now()
