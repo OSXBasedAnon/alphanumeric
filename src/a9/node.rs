@@ -1,6 +1,5 @@
 use arrayref::array_ref;
 use axum::{extract::State, routing::get, Json, Router};
-use bytes::{BufMut, BytesMut};
 use dashmap::DashMap;
 use futures_util::{
     future::{join_all, Either},
@@ -395,6 +394,11 @@ pub enum NetworkMessage {
         headers: Vec<BlockHeaderInfo>,
         node_id: String,
         signature: Vec<u8>,
+    },
+    DilithiumKeyRegistration {
+        node_id: String,
+        dilithium_public_key: Vec<u8>,
+        ed25519_signature: Vec<u8>,
     },
     Challenge(Vec<u8>),
     ChallengeResponse {
@@ -1112,9 +1116,61 @@ impl Node {
         Ok(keypair.sign(&payload).as_ref().to_vec())
     }
 
+    fn sign_with_handshake_key(&self, payload: &[u8]) -> Result<Vec<u8>, NodeError> {
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        Ok(keypair.sign(payload).as_ref().to_vec())
+    }
+
+    fn build_dilithium_registration_message(&self) -> Result<Option<NetworkMessage>, NodeError> {
+        let Some(sentinel) = &self.header_sentinel else {
+            return Ok(None);
+        };
+
+        let dilithium_public_key = sentinel.local_dilithium_public_key();
+        if dilithium_public_key.is_empty() {
+            return Ok(None);
+        }
+
+        let payload = crate::a9::bpos::build_dilithium_binding_payload(
+            &self.node_id,
+            &dilithium_public_key,
+        );
+        let ed25519_signature = self.sign_with_handshake_key(&payload)?;
+
+        Ok(Some(NetworkMessage::DilithiumKeyRegistration {
+            node_id: self.node_id.clone(),
+            dilithium_public_key,
+            ed25519_signature,
+        }))
+    }
+
+    pub async fn advertise_dilithium_key(&self, addr: SocketAddr) -> Result<(), NodeError> {
+        if let Some(message) = self.build_dilithium_registration_message()? {
+            self.send_message(addr, &message).await?;
+        }
+        Ok(())
+    }
+
     fn verify_handshake(&self, message: &HandshakeMessage) -> Result<(), NodeError> {
+        const MAX_HANDSHAKE_SKEW_SECS: u64 = 300;
         if message.public_key.len() != 32 || message.signature.len() != 64 {
             return Err(NodeError::Network("Invalid handshake key/signature length".into()));
+        }
+        if message.public_key == self.handshake_public_key {
+            return Err(NodeError::Network("Self-handshake rejected".into()));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let skew = if now >= message.timestamp {
+            now - message.timestamp
+        } else {
+            message.timestamp - now
+        };
+        if skew > MAX_HANDSHAKE_SKEW_SECS {
+            return Err(NodeError::Network("Handshake timestamp outside allowed skew".into()));
         }
         let payload = Self::handshake_payload(message)?;
         let public_key = UnparsedPublicKey::new(&ED25519, &message.public_key);
@@ -1149,7 +1205,7 @@ impl Node {
             .map_err(|e| NodeError::Serialization(format!("JSON canonicalization error: {}", e)))
     }
 
-    fn dns_seeds() -> Vec<&'static str> {
+    fn dns_seeds() -> Vec<String> {
         let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS").ok();
         if let Some(seeds) = override_seeds {
             let parsed: Vec<String> = seeds
@@ -1157,16 +1213,11 @@ impl Node {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            // Store in leaked static to satisfy lifetime; minimal footprint.
             if !parsed.is_empty() {
-                let leaked: Vec<&'static str> = parsed
-                    .into_iter()
-                    .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
-                    .collect();
-                return leaked;
+                return parsed;
             }
         }
-        DEFAULT_DNS_SEEDS.to_vec()
+        DEFAULT_DNS_SEEDS.iter().map(|s| s.to_string()).collect()
     }
 
     fn discovery_bases() -> Vec<String> {
@@ -1760,7 +1811,7 @@ async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<()
 
         if enable_dns_fallback {
             for seed in Self::dns_seeds() {
-                match tokio::net::lookup_host(seed).await {
+                match tokio::net::lookup_host(seed.as_str()).await {
                     Ok(addrs) => discovered_addrs.extend(addrs),
                     Err(e) => debug!("DNS lookup failed for {}: {}", seed, e),
                 }
@@ -3840,7 +3891,27 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
         let validation_result = {
             let blockchain = self.blockchain.read().await;
-            blockchain.validate_block(block).await.is_ok()
+            match blockchain.validate_block(block).await {
+                Ok(()) => true,
+                Err(_) => {
+                    // Accept structurally valid out-of-order blocks so the blockchain layer can
+                    // park them as orphans and retry when parents arrive.
+                    let parent_known = if block.index == 0 {
+                        true
+                    } else {
+                        blockchain
+                            .get_block(block.index.saturating_sub(1))
+                            .map(|parent| parent.hash == block.previous_hash)
+                            .unwrap_or(false)
+                    };
+                    let ahead_of_tip = block.index > (blockchain.get_latest_block_index() as u32).saturating_add(1);
+                    let orphan_candidate = (!parent_known) || ahead_of_tip;
+                    orphan_candidate
+                        && Blockchain::calculate_merkle_root(&block.transactions)
+                            .map(|root| root == block.merkle_root)
+                            .unwrap_or(false)
+                }
+            }
         };
 
         self.validation_cache.insert(
@@ -3864,7 +3935,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
                 let sentinel = sentinel.clone();
                 tokio::spawn(async move {
-                    let _ = sentinel.verify_and_add_header(header_info, &node_id, Vec::new()).await;
+                    let _ = sentinel.add_verified_header(header_info).await;
+                    let _ = node_id;
                 });
             }
         }
@@ -4664,6 +4736,25 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 }
             }
 
+            NetworkMessage::DilithiumKeyRegistration {
+                node_id,
+                dilithium_public_key,
+                ed25519_signature,
+            } => {
+                if let Some(ref sentinel) = self.header_sentinel {
+                    if let Err(e) = sentinel.register_peer_dilithium_key(
+                        &node_id,
+                        dilithium_public_key,
+                        ed25519_signature,
+                    ) {
+                        debug!(
+                            "Dilithium key registration rejected from {} (node {}): {}",
+                            addr, node_id, e
+                        );
+                    }
+                }
+            }
+
             // Handle other message types with default implementation
             _ => {}
         }
@@ -4894,10 +4985,12 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
         tx.send(NetworkEvent::PeerJoin(addr))
             .await
             .map_err(|e| NodeError::Network(format!("Failed to send join event: {}", e)))?;
+        if let Err(e) = self.advertise_dilithium_key(addr).await {
+            debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
+        }
 
         // Message handling loop
         let (mut reader, _writer) = tokio::io::split(stream);
-        let mut buffer = BytesMut::with_capacity(64 * 1024);
 
         'connection: loop {
             // Read message length prefix with timeout
@@ -4926,9 +5019,6 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 break;
             }
 
-            // Ensure buffer has enough capacity
-            buffer.reserve(message_len);
-
             // Create a mutable slice for reading
             let mut data_buf = vec![0u8; message_len];
 
@@ -4940,11 +5030,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             .await
             {
                 Ok(Ok(_)) => {
-                    // Extend buffer with the read data
-                    buffer.put_slice(&data_buf);
-
-                    // Get data to process
-                    let data_to_process = buffer.split_to(message_len);
+                    let data_to_process = &data_buf;
 
                     // Decrypt message if we have a shared secret - FIXED TYPE MISMATCH
                     let message: NetworkMessage =
@@ -5256,6 +5342,11 @@ pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
     
     let mut peer_secrets = self.peer_secrets.write().await;
     peer_secrets.insert(addr, shared_secret);
+    drop(peer_secrets);
+
+    if let Err(e) = self.advertise_dilithium_key(addr).await {
+        debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
+    }
     
     // Reset failure counter
     self.reset_peer_failures(addr).await;
@@ -5689,10 +5780,15 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         local_nonce: &[u8; 32],
         remote_nonce: &[u8; 32],
     ) -> Result<Vec<u8>, NodeError> {
-        // Combine nonces deterministically
+        // Canonical ordering prevents initiator/responder key mismatch.
         let mut combined = Vec::with_capacity(64);
-        combined.extend_from_slice(local_nonce);
-        combined.extend_from_slice(remote_nonce);
+        if local_nonce <= remote_nonce {
+            combined.extend_from_slice(local_nonce);
+            combined.extend_from_slice(remote_nonce);
+        } else {
+            combined.extend_from_slice(remote_nonce);
+            combined.extend_from_slice(local_nonce);
+        }
 
         // Use HKDF to derive key material
         let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]);
@@ -5706,6 +5802,12 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
             .map_err(|_| NodeError::Network("Failed to fill shared secret".into()))?;
 
         Ok(shared_secret.to_vec())
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&*self.lock_path);
     }
 }
 

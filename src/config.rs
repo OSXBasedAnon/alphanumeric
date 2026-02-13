@@ -215,6 +215,6 @@ impl AppConfig {
             mining_info
         );
         use std::io::{self, Write};
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
     }
 }

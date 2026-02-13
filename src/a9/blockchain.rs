@@ -37,10 +37,14 @@ use crate::a9::wallet::Wallet;
 
 const BLOCKCHAIN_PATH: &str = "blockchain.db";
 const BALANCES_TREE: &str = "balances";
+const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
+const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const NONCE_MAGIC: u128 = 0xA5A5A5A5A5A5A5A5A;
 const DIFFICULTY_MAGIC: u128 = 0x5A5A5A5A5A5A5A5A5A5A5A5A5A;
 const MIN_TRANSACTION_AMOUNT: f64 = 0.00000564;
+const ORPHAN_MAX_COUNT: usize = 10_000;
+const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 
 pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 1; //Base
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
@@ -975,7 +979,338 @@ pub struct Blockchain {
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OrphanStoredBlock {
+    block: Block,
+    received_at: u64,
+}
+
 impl Blockchain {
+    fn block_index_from_key(key: &[u8]) -> Option<u32> {
+        let key_str = std::str::from_utf8(key).ok()?;
+        let index_str = key_str.strip_prefix("block_")?;
+        index_str.parse::<u32>().ok()
+    }
+
+    fn highest_block_index(&self) -> Option<u32> {
+        self.db
+            .scan_prefix("block_")
+            .filter_map(|entry| entry.ok().and_then(|(k, _)| Self::block_index_from_key(&k)))
+            .max()
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn orphan_hash_key(hash: &[u8; 32]) -> String {
+        hex::encode(hash)
+    }
+
+    fn orphan_index_key(prev_hash: &[u8; 32], index: u32, hash: &[u8; 32]) -> String {
+        format!(
+            "{}:{}:{}",
+            hex::encode(prev_hash),
+            index,
+            Self::orphan_hash_key(hash)
+        )
+    }
+
+    fn parse_orphan_index_hash(key: &[u8]) -> Option<String> {
+        let key_str = std::str::from_utf8(key).ok()?;
+        key_str.rsplit(':').next().map(|s| s.to_string())
+    }
+
+    fn open_orphan_blocks_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(ORPHAN_BLOCKS_TREE).map_err(Into::into)
+    }
+
+    fn open_orphan_index_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(ORPHAN_INDEX_TREE).map_err(Into::into)
+    }
+
+    fn store_orphan_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let orphan_index = self.open_orphan_index_tree()?;
+        let hash_key = Self::orphan_hash_key(&block.hash);
+
+        if orphan_blocks.get(hash_key.as_bytes())?.is_some() {
+            return Ok(());
+        }
+
+        let orphan_entry = OrphanStoredBlock {
+            block: block.clone(),
+            received_at: Self::now_unix_secs(),
+        };
+
+        orphan_blocks.insert(hash_key.as_bytes(), bincode::serialize(&orphan_entry)?)?;
+        orphan_index.insert(
+            Self::orphan_index_key(&block.previous_hash, block.index, &block.hash).as_bytes(),
+            &[] as &[u8],
+        )?;
+        orphan_blocks.flush()?;
+        orphan_index.flush()?;
+        self.prune_orphans()?;
+        Ok(())
+    }
+
+    fn remove_orphan_by_hash(&self, hash: &[u8; 32]) -> Result<(), BlockchainError> {
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let orphan_index = self.open_orphan_index_tree()?;
+        let hash_key = Self::orphan_hash_key(hash);
+
+        if let Some(raw) = orphan_blocks.remove(hash_key.as_bytes())? {
+            if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+                let index_key = Self::orphan_index_key(
+                    &entry.block.previous_hash,
+                    entry.block.index,
+                    &entry.block.hash,
+                );
+                orphan_index.remove(index_key.as_bytes())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn orphan_children_of(&self, parent_hash: &[u8; 32]) -> Result<Vec<Block>, BlockchainError> {
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let orphan_index = self.open_orphan_index_tree()?;
+        let prefix = format!("{}:", hex::encode(parent_hash));
+        let mut children = Vec::new();
+
+        for item in orphan_index.scan_prefix(prefix.as_bytes()) {
+            let (idx_key, _) = item?;
+            let Some(orphan_hash_hex) = Self::parse_orphan_index_hash(&idx_key) else {
+                continue;
+            };
+            if let Some(raw) = orphan_blocks.get(orphan_hash_hex.as_bytes())? {
+                if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+                    if entry.block.previous_hash == *parent_hash {
+                        children.push(entry.block);
+                    }
+                }
+            }
+        }
+
+        // Deterministic candidate ordering:
+        // 1) expected next height first, 2) higher difficulty, 3) earlier timestamp, 4) lexical hash.
+        children.sort_by(|a, b| {
+            a.index
+                .cmp(&b.index)
+                .then_with(|| b.difficulty.cmp(&a.difficulty))
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+
+        Ok(children)
+    }
+
+    fn prune_orphans(&self) -> Result<(), BlockchainError> {
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let orphan_index = self.open_orphan_index_tree()?;
+        let now = Self::now_unix_secs();
+        let tip = self.highest_block_index();
+        let mut remove_hashes: Vec<[u8; 32]> = Vec::new();
+
+        let mut retained: Vec<OrphanStoredBlock> = Vec::new();
+        for item in orphan_blocks.iter() {
+            let (_, raw) = item?;
+            if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+                let expired = now.saturating_sub(entry.received_at) > ORPHAN_TTL_SECS;
+                let stale_height = tip.map(|t| entry.block.index <= t).unwrap_or(false);
+                if expired || stale_height {
+                    remove_hashes.push(entry.block.hash);
+                } else {
+                    retained.push(entry);
+                }
+            }
+        }
+
+        if retained.len() > ORPHAN_MAX_COUNT {
+            retained.sort_by_key(|e| e.received_at);
+            let overflow = retained.len().saturating_sub(ORPHAN_MAX_COUNT);
+            for entry in retained.into_iter().take(overflow) {
+                remove_hashes.push(entry.block.hash);
+            }
+        }
+
+        for hash in remove_hashes {
+            self.remove_orphan_by_hash(&hash)?;
+        }
+
+        // Best-effort cleanup for index entries that no longer have backing orphan blocks.
+        let mut dangling = Vec::new();
+        for item in orphan_index.iter() {
+            let (key, _) = item?;
+            if let Some(hash_hex) = Self::parse_orphan_index_hash(&key) {
+                if orphan_blocks.get(hash_hex.as_bytes())?.is_none() {
+                    dangling.push(key);
+                }
+            }
+        }
+        for key in dangling {
+            orphan_index.remove(key)?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_validated_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        // Verify chain integrity first
+        if !self.chain_sentinel.verify_chain_integrity(self).await {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+
+        // Verify system transaction positioning and uniqueness
+        let system_txs: Vec<_> = block
+            .transactions
+            .iter()
+            .enumerate()
+            .filter(|(_, tx)| SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+            .collect();
+
+        // Rule 1: Mining reward must be first transaction if present
+        if let Some((idx, tx)) = system_txs
+            .iter()
+            .find(|(_, tx)| tx.sender == "MINING_REWARDS")
+        {
+            if *idx != 0 {
+                return Err(BlockchainError::InvalidSystemTransaction);
+            }
+        }
+
+        // Rule 2: Only one system transaction of each type allowed per block
+        let mut seen_types = HashSet::new();
+        for (_, tx) in system_txs {
+            if !seen_types.insert(tx.sender.as_str()) {
+                return Err(BlockchainError::InvalidSystemTransaction);
+            }
+        }
+
+        // Add this block's verification
+        let verifier = match block.transactions.first() {
+            Some(tx) if tx.sender == "MINING_REWARDS" => tx.recipient.clone(),
+            _ => "network".to_string(),
+        };
+
+        self.chain_sentinel.add_block_verification(block, verifier);
+
+        // Only save if block is verified (or quorum is not required)
+        let require_quorum = std::env::var("ALPHANUMERIC_REQUIRE_QUORUM")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let verification_count = self.chain_sentinel.get_verification_count(block);
+        if require_quorum {
+            if !self.chain_sentinel.is_block_verified(block) {
+                return Err(BlockchainError::InvalidBlockHeader);
+            }
+        } else if verification_count == 0 {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+
+        // Process transactions with BlockValidation context
+        self.process_transactions_batch(
+            block.transactions.clone(),
+            TransactionContext::BlockValidation,
+        )
+        .await?;
+
+        // Store block with truncated signatures to reduce chain size
+        let mut storage_block = block.clone();
+        storage_block.transactions = block
+            .transactions
+            .iter()
+            .map(|tx| {
+                if tx.sender == "MINING_REWARDS" {
+                    return tx.clone();
+                }
+
+                let mut full_tx = tx.clone();
+                if full_tx.sig_hash.is_none() {
+                    if let Some(sig_hex) = &full_tx.signature {
+                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+                        }
+                    }
+                }
+
+                match &full_tx.sig_hash {
+                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
+                    None => full_tx,
+                }
+            })
+            .collect();
+
+        // Serialize and save block
+        let value = bincode::serialize(&storage_block)
+            .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+
+        let key = format!("block_{}", block.index);
+        self.db
+            .insert(key.as_bytes(), value)
+            .map_err(BlockchainError::DatabaseError)?;
+
+        // Remove this hash from orphan pool if present
+        self.remove_orphan_by_hash(&block.hash)?;
+
+        // Update network difficulty atomically
+        {
+            let mut current_difficulty = self.difficulty.lock().await;
+            *current_difficulty = block.difficulty;
+        }
+
+        // Ensure all changes are persisted
+        self.db
+            .flush()
+            .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn promote_orphans_from_tip(&self) -> Result<usize, BlockchainError> {
+        let mut attached = 0usize;
+
+        // Safety cap avoids pathological loops if orphan pool contains bad data.
+        for _ in 0..256 {
+            let Some(tip) = self.get_last_block() else {
+                break;
+            };
+
+            let candidates = self.orphan_children_of(&tip.hash)?;
+            let next_height = tip.index.saturating_add(1);
+            let mut progressed = false;
+
+            for candidate in candidates {
+                if candidate.index != next_height || candidate.previous_hash != tip.hash {
+                    continue;
+                }
+
+                match self.persist_validated_block(&candidate).await {
+                    Ok(()) => {
+                        attached = attached.saturating_add(1);
+                        progressed = true;
+                        break;
+                    }
+                    Err(_) => {
+                        // Invalid child can never attach.
+                        let _ = self.remove_orphan_by_hash(&candidate.hash);
+                    }
+                }
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        self.prune_orphans()?;
+        Ok(attached)
+    }
+
     fn pending_tx_ttl_secs() -> Option<u64> {
         const DEFAULT_TTL_SECS: u64 = 7200;
         let raw = std::env::var("ALPHANUMERIC_PENDING_TX_TTL_SECS").ok();
@@ -1131,6 +1466,9 @@ impl Blockchain {
             pending_tree.clear().ok();
             pending_tree.flush().ok();
         }
+        // Ensure orphan-management trees exist.
+        let _ = db.open_tree(ORPHAN_BLOCKS_TREE);
+        let _ = db.open_tree(ORPHAN_INDEX_TREE);
 
         blockchain
     }
@@ -1145,6 +1483,8 @@ impl Blockchain {
 
         // Ensure balances index is valid (rebuild if needed)
         self.ensure_balances_index().await?;
+        self.prune_orphans()?;
+        let _ = self.promote_orphans_from_tip().await;
 
         let pending_tree = self.db.open_tree("pending_transactions")?;
         let mut invalid_txs = Vec::new();
@@ -1203,111 +1543,37 @@ impl Blockchain {
     }
 
     pub async fn save_block(&self, block: &Block) -> Result<(), BlockchainError> {
-        // Verify chain integrity first
-        if !self.chain_sentinel.verify_chain_integrity(self).await {
-            return Err(BlockchainError::InvalidBlockHeader);
-        }
-
-        // Verify system transaction positioning and uniqueness
-        let system_txs: Vec<_> = block
-            .transactions
-            .iter()
-            .enumerate()
-            .filter(|(_, tx)| SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
-            .collect();
-
-        // Rule 1: Mining reward must be first transaction if present
-        if let Some((idx, tx)) = system_txs
-            .iter()
-            .find(|(_, tx)| tx.sender == "MINING_REWARDS")
-        {
-            if *idx != 0 {
-                return Err(BlockchainError::InvalidSystemTransaction);
-            }
-        }
-
-        // Rule 2: Only one system transaction of each type allowed per block
-        let mut seen_types = HashSet::new();
-        for (_, tx) in system_txs {
-            if !seen_types.insert(tx.sender.as_str()) {
-                return Err(BlockchainError::InvalidSystemTransaction);
-            }
-        }
-
-        // Add this block's verification
-        let verifier = match block.transactions.first() {
-            Some(tx) if tx.sender == "MINING_REWARDS" => tx.recipient.clone(),
-            _ => "network".to_string(),
-        };
-
-        self.chain_sentinel.add_block_verification(block, verifier);
-
-        // Only save if block is verified (or quorum is not required)
-        let require_quorum = std::env::var("ALPHANUMERIC_REQUIRE_QUORUM")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false);
-        let verification_count = self.chain_sentinel.get_verification_count(block);
-        if require_quorum {
-            if !self.chain_sentinel.is_block_verified(block) {
-                return Err(BlockchainError::InvalidBlockHeader);
-            }
-        } else if verification_count == 0 {
-            return Err(BlockchainError::InvalidBlockHeader);
-        }
-
-        // Process transactions with BlockValidation context
-        self.process_transactions_batch(
-            block.transactions.clone(),
-            TransactionContext::BlockValidation,
-        )
-        .await?;
-
-        // Store block with truncated signatures to reduce chain size
-        let mut storage_block = block.clone();
-        storage_block.transactions = block
-            .transactions
-            .iter()
-            .map(|tx| {
-                if tx.sender == "MINING_REWARDS" {
-                    return tx.clone();
+        // Enforce linear tip extension and park out-of-order blocks as orphans.
+        match self.highest_block_index() {
+            None => {
+                if block.index != 0 || block.previous_hash != [0u8; 32] {
+                    self.store_orphan_block(block)?;
+                    return Ok(());
                 }
-
-                let mut full_tx = tx.clone();
-                if full_tx.sig_hash.is_none() {
-                    if let Some(sig_hex) = &full_tx.signature {
-                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+            }
+            Some(tip_index) => {
+                if block.index <= tip_index {
+                    if let Ok(existing) = self.get_block(block.index) {
+                        if existing.hash == block.hash {
+                            return Ok(());
                         }
                     }
+                    return Err(BlockchainError::InvalidBlockHeader);
                 }
-
-                match &full_tx.sig_hash {
-                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
-                    None => full_tx,
+                if block.index != tip_index.saturating_add(1) {
+                    self.store_orphan_block(block)?;
+                    return Ok(());
                 }
-            })
-            .collect();
-
-        // Serialize and save block
-        let value = bincode::serialize(&storage_block)
-            .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
-
-        let key = format!("block_{}", block.index);
-        self.db
-            .insert(key.as_bytes(), value)
-            .map_err(|e| BlockchainError::DatabaseError(e))?;
-
-        // Update network difficulty atomically
-        {
-            let mut current_difficulty = self.difficulty.lock().await;
-            *current_difficulty = block.difficulty;
+                let prev = self.get_block(tip_index)?;
+                if block.previous_hash != prev.hash {
+                    self.store_orphan_block(block)?;
+                    return Ok(());
+                }
+            }
         }
 
-        // Ensure all changes are persisted
-        self.db
-            .flush()
-            .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
-
+        self.persist_validated_block(block).await?;
+        let _ = self.promote_orphans_from_tip().await?;
         Ok(())
     }
 
@@ -1335,6 +1601,24 @@ impl Blockchain {
         };
 
         trace_step("start");
+
+        // Ensure locally finalized blocks still extend the current canonical tip.
+        match self.highest_block_index() {
+            None => {
+                if block.index != 0 || block.previous_hash != [0u8; 32] {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+            }
+            Some(tip_index) => {
+                if block.index != tip_index.saturating_add(1) {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+                let prev = self.get_block(tip_index)?;
+                if block.previous_hash != prev.hash {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+            }
+        }
 
         // Derive block's system keys
         set_finalize_stage(1);
@@ -1439,6 +1723,8 @@ impl Blockchain {
         Self::set_balances_height(&balances_tree, block.index as u64)?;
         set_finalize_stage(10);
         trace_step("balances_height");
+        self.db.flush()?;
+        let _ = self.promote_orphans_from_tip().await;
 
         Ok(())
     }
@@ -1488,52 +1774,30 @@ impl Blockchain {
 
     // Retrieve the latest block's index
     pub fn get_latest_block_index(&self) -> u64 {
-        let last_key = self.db.last().ok().flatten().map(|(k, _)| k.to_vec());
-
-        if let Some(key_bytes) = last_key {
-            if let Ok(key_str) = String::from_utf8(key_bytes) {
-                if let Some(index_str) = key_str.strip_prefix("block_") {
-                    return index_str.parse().unwrap_or(0);
-                }
-            }
-        }
-        0
+        self.highest_block_index().map(u64::from).unwrap_or(0)
     }
 
     pub fn get_last_block_hash(&self) -> Result<[u8; 32], BlockchainError> {
-        let (_, value) = self
-            .db
-            .last()
-            .map_err(BlockchainError::DatabaseError)?
+        let tip = self
+            .highest_block_index()
             .ok_or_else(|| BlockchainError::FlushError("No blocks found".to_string()))?;
-
-        Block::from_bytes(&value)
-            .map(|b| b.hash)
-            .map_err(|e| BlockchainError::SerializationError(e))
+        self.get_block(tip).map(|b| b.hash)
     }
 
     pub fn get_latest_block_hash(&self) -> [u8; 32] {
-        self.db
-            .last()
-            .ok()
-            .flatten()
-            .and_then(|(_, value)| Block::from_bytes(&value).ok())
+        self.highest_block_index()
+            .and_then(|idx| self.get_block(idx).ok())
             .map(|b| b.hash)
             .unwrap_or([0u8; 32])
     }
 
     pub fn get_last_block(&self) -> Option<Block> {
-        self.db
-            .scan_prefix(b"block_")
-            .filter_map(|entry| {
-                let (_, value) = entry.ok()?;
-                Block::from_bytes(value.as_ref()).ok()
-            })
-            .max_by_key(|block| block.timestamp)
+        self.highest_block_index()
+            .and_then(|idx| self.get_block(idx).ok())
     }
 
     pub fn get_block_count(&self) -> usize {
-        self.db.len()
+        self.db.scan_prefix("block_").count()
     }
 
     pub fn get_blocks(&self) -> Vec<Block> {
@@ -1545,6 +1809,12 @@ impl Blockchain {
             .collect();
         blocks.sort_unstable_by_key(|b| b.index);
         blocks
+    }
+
+    pub fn get_orphan_count(&self) -> usize {
+        self.open_orphan_blocks_tree()
+            .map(|t| t.len())
+            .unwrap_or(0)
     }
 
     pub async fn get_current_difficulty(&self) -> u64 {

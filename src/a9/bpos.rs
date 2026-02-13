@@ -7,6 +7,7 @@ use pqcrypto_traits::sign::{
     DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
 use rand::{thread_rng, Rng};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -34,6 +35,18 @@ const SENTINEL_VERIFY_INTERVAL: u64 = 300; // 5 minute verification cycle
 const SENTINEL_CHALLENGE_TTL: u64 = 60; // Challenges valid for 1 minute
 const HEADER_SYNC_SIZE: usize = 1000; // Number of headers to sync
 const REWARD_SCORE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 day window for scoring
+const DILITHIUM_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_DILITHIUM_BIND_V1";
+
+pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8]) -> Vec<u8> {
+    let mut payload =
+        Vec::with_capacity(DILITHIUM_BINDING_CONTEXT.len() + node_id.len() + dilithium_public_key.len() + 6);
+    payload.extend_from_slice(DILITHIUM_BINDING_CONTEXT);
+    payload.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
+    payload.extend_from_slice(node_id.as_bytes());
+    payload.extend_from_slice(&(dilithium_public_key.len() as u16).to_be_bytes());
+    payload.extend_from_slice(dilithium_public_key);
+    payload
+}
 
 // Base APY and tier multipliers
 const BASE_APY: f64 = 0.045;
@@ -1224,6 +1237,10 @@ impl BPoSSentinel {
         header: &BlockHeaderInfo,
         signature: &[u8],
     ) -> Result<(), String> {
+        self.node
+            .advertise_dilithium_key(addr)
+            .await
+            .map_err(|e| e.to_string())?;
         let message = NetworkMessage::HeaderVerification {
             header: header.clone(),
             node_id: self.node.id().to_string(), // Using accessor method instead of direct field access
@@ -2194,19 +2211,106 @@ struct NetworkSyncState {
 pub struct HeaderSentinel {
     headers: Arc<RwLock<VecDeque<HeaderState>>>,
     verifications: Arc<DashMap<[u8; 32], VerificationState>>,
+    peer_dilithium_keys: Arc<DashMap<String, Vec<u8>>>,
     sync_state: Arc<RwLock<NetworkSyncState>>,
     consensus_threshold: f64,
     max_headers: usize,
     sentinel: Option<Arc<RwLock<NodeSentinel>>>,
+    public_key: Vec<u8>,
     secret_key: Vec<u8>,
     node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
 }
 
 impl HeaderSentinel {
+    fn strict_header_signatures() -> bool {
+        true
+    }
+
+    fn verify_signature_with_registered_node_key(
+        &self,
+        payload: &[u8],
+        node_id: &str,
+        signature: &[u8],
+    ) -> Result<bool, String> {
+        if signature.is_empty() {
+            return Ok(false);
+        }
+        let detached_sig = DetachedSignature::from_bytes(signature)
+            .map_err(|e| format!("Invalid signature format: {}", e))?;
+        let public_key_bytes = self
+            .peer_dilithium_keys
+            .get(node_id)
+            .map(|k| k.value().clone())
+            .ok_or_else(|| format!("No Dilithium key registered for node {}", node_id))?;
+        let pub_key = PublicKey::from_bytes(&public_key_bytes)
+            .map_err(|e| format!("Invalid public key format: {}", e))?;
+        Ok(
+            pqcrypto_dilithium::dilithium5::verify_detached_signature(
+                &detached_sig,
+                payload,
+                &pub_key,
+            )
+            .is_ok(),
+        )
+    }
+
+    pub fn local_dilithium_public_key(&self) -> Vec<u8> {
+        self.public_key.clone()
+    }
+
+    pub fn register_peer_dilithium_key(
+        &self,
+        node_id: &str,
+        dilithium_public_key: Vec<u8>,
+        ed25519_signature: Vec<u8>,
+    ) -> Result<(), String> {
+        if node_id.trim().is_empty() {
+            return Err("Node ID is empty".to_string());
+        }
+        if ed25519_signature.is_empty() {
+            return Err("Missing Ed25519 attestation signature".to_string());
+        }
+
+        let ed_pub = hex::decode(node_id)
+            .map_err(|e| format!("Node ID must be Ed25519 public key hex: {}", e))?;
+        if ed_pub.len() != 32 {
+            return Err("Invalid Ed25519 public key length in node_id".to_string());
+        }
+
+        let _dilithium = PublicKey::from_bytes(&dilithium_public_key)
+            .map_err(|e| format!("Invalid Dilithium public key bytes: {}", e))?;
+
+        let payload = build_dilithium_binding_payload(node_id, &dilithium_public_key);
+        let verifier = UnparsedPublicKey::new(&ED25519, &ed_pub);
+        verifier
+            .verify(&payload, &ed25519_signature)
+            .map_err(|_| "Invalid Ed25519 attestation signature".to_string())?;
+
+        if let Some(existing) = self.peer_dilithium_keys.get(node_id) {
+            if existing.value().as_slice() != dilithium_public_key.as_slice() {
+                warn!(
+                    "Dilithium key rotated for node {} (updating attested key binding)",
+                    node_id
+                );
+                drop(existing);
+                self.peer_dilithium_keys
+                    .insert(node_id.to_string(), dilithium_public_key);
+                return Ok(());
+            }
+            return Ok(());
+        }
+
+        self.peer_dilithium_keys
+            .insert(node_id.to_string(), dilithium_public_key);
+        Ok(())
+    }
+
     pub fn new() -> Self {
+        let (public_key, secret_key) = dilithium_keypair();
         Self {
             headers: Arc::new(RwLock::new(VecDeque::with_capacity(10000))),
             verifications: Arc::new(DashMap::new()),
+            peer_dilithium_keys: Arc::new(DashMap::new()),
             sync_state: Arc::new(RwLock::new(NetworkSyncState {
                 last_sync: 0,
                 sync_rounds: 0,
@@ -2216,7 +2320,8 @@ impl HeaderSentinel {
             consensus_threshold: 0.67,
             max_headers: 10000,
             sentinel: None,
-            secret_key: Vec::new(),
+            public_key: public_key.as_bytes().to_vec(),
+            secret_key: secret_key.as_bytes().to_vec(),
             node_sentinel: None,
         }
     }
@@ -2259,13 +2364,20 @@ impl HeaderSentinel {
         &self,
         headers: Vec<BlockHeaderInfo>,
         node_id: &str,
-        _signature: Vec<u8>,
+        signature: Vec<u8>,
     ) -> Result<usize, String> {
         let mut valid_count = 0;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let headers_payload = bincode::serialize(&headers)
+            .map_err(|e| format!("Headers serialization error: {}", e))?;
+        let signature_valid =
+            self.verify_signature_with_registered_node_key(&headers_payload, node_id, &signature)?;
+        if !signature_valid && Self::strict_header_signatures() {
+            return Err("Header batch signature verification failed".to_string());
+        }
 
         // Process up to 200 headers at a time
         for chunk in headers.chunks(200) {
@@ -2322,6 +2434,11 @@ impl HeaderSentinel {
                     // Add verification
                     if verification.verifiers.insert(node_id.to_string()) {
                         valid_count += 1;
+                    }
+                    if signature_valid {
+                        verification
+                            .dilithium_signatures
+                            .insert(node_id.to_string(), signature.clone());
                     }
 
                     header_states.push_back(HeaderState {
@@ -2438,12 +2555,19 @@ impl HeaderSentinel {
         &self,
         header: BlockHeaderInfo,
         node_id: &str,
-        _signature: Vec<u8>,
+        signature: Vec<u8>,
     ) -> Result<bool, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let header_payload =
+            bincode::serialize(&header).map_err(|e| format!("Serialization error: {}", e))?;
+        let signature_valid =
+            self.verify_signature_with_registered_node_key(&header_payload, node_id, &signature)?;
+        if !signature_valid && Self::strict_header_signatures() {
+            return Err("Header signature verification failed".to_string());
+        }
 
         // Quick lookup in recent verifications using DashMap
         let mut verification =
@@ -2458,6 +2582,11 @@ impl HeaderSentinel {
 
         // Add verification atomically
         verification.verifiers.insert(node_id.to_string());
+        if signature_valid {
+            verification
+                .dilithium_signatures
+                .insert(node_id.to_string(), signature);
+        }
 
         // Add to headers queue with fixed size
         let mut headers = self.headers.write().await;
@@ -2562,6 +2691,9 @@ impl HeaderSentinel {
         signature: &[u8],
         node: &Arc<Node>,
     ) -> Result<(), String> {
+        node.advertise_dilithium_key(addr)
+            .await
+            .map_err(|e| e.to_string())?;
         let message = NetworkMessage::HeaderSync {
             headers: headers.to_vec(),
             node_id: node.id().to_string(),

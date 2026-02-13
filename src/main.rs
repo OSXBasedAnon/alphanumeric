@@ -5,6 +5,7 @@ use log::{debug, error, warn};
 use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::io::Write;
@@ -570,9 +571,9 @@ async fn main() -> Result<()> {
             let mut stdout = StandardStream::stdout(ColorChoice::Always);
             let mut color_spec = ColorSpec::new();
             color_spec.set_fg(Some(Color::White)).set_bold(true);
-            stdout.set_color(&color_spec).unwrap();
+            let _ = stdout.set_color(&color_spec);
             print!("αlphanumeric:");
-            stdout.reset().unwrap();
+            let _ = stdout.reset();
             println!();
             println!("1. Create Transaction (format: create sender recipient amount)");
             println!("2. Whisper Code (format: whisper address msg)");
@@ -2031,9 +2032,9 @@ fn print_step(message: &str, step: &str, color: Color) {
     color_spec.set_fg(Some(color)).set_bold(true);
 
     // Print the step
-    stdout.set_color(&color_spec).unwrap();
-    writeln!(&mut stdout, "{} {}", step, message).unwrap();
-    stdout.reset().unwrap();
+    let _ = stdout.set_color(&color_spec);
+    let _ = writeln!(&mut stdout, "{} {}", step, message);
+    let _ = stdout.reset();
 }
 
 // ASCII Art - version
@@ -2078,11 +2079,11 @@ fn print_ascii_intro() {
         let mut color_spec = ColorSpec::new();
         color_spec.set_fg(Some(line_color));
 
-        stdout.set_color(&color_spec).unwrap();
-        writeln!(&mut stdout, "{}", line).unwrap();
+        let _ = stdout.set_color(&color_spec);
+        let _ = writeln!(&mut stdout, "{}", line);
     }
 
-    stdout.reset().unwrap();
+    let _ = stdout.reset();
 }
 
 fn cleanup_sled_snapshots(path: &str) -> std::io::Result<()> {
@@ -2214,6 +2215,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     }
 
     let bytes = res.bytes().await?;
+    if let Ok(expected_hash) = std::env::var("ALPHANUMERIC_BOOTSTRAP_SHA256") {
+        let expected = expected_hash.trim().to_ascii_lowercase();
+        if !expected.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let actual = hex::encode(hasher.finalize());
+            if actual != expected {
+                return Err(format!(
+                    "Bootstrap SHA-256 mismatch: expected {}, got {}",
+                    expected, actual
+                )
+                .into());
+            }
+        }
+    }
     let zip_path = format!("{}.zip", db_path);
     fs::write(&zip_path, &bytes).await?;
 
