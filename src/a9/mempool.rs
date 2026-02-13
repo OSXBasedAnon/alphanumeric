@@ -112,8 +112,9 @@ impl Mempool {
         // Quick checks first
         let current_total_size = self.total_size.load(AtomicOrdering::SeqCst);
         let current_total_count = self.total_count.load(AtomicOrdering::SeqCst);
-        let required_bytes =
-            current_total_size.saturating_add(tx_size).saturating_sub(MEMPOOL_MAX_BYTES);
+        let required_bytes = current_total_size
+            .saturating_add(tx_size)
+            .saturating_sub(MEMPOOL_MAX_BYTES);
         let required_count = current_total_count
             .saturating_add(1)
             .saturating_sub(MEMPOOL_MAX_TRANSACTIONS);
@@ -165,8 +166,8 @@ impl Mempool {
     }
 
     pub fn get_transactions_for_block(&self) -> Vec<Transaction> {
-        use std::collections::BinaryHeap;
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
         let mut selected = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
         let mut total_size = 0;
@@ -184,7 +185,12 @@ impl Mempool {
 
             // Get the highest fee transaction from this sender
             if let Some(best_tx) = entry.value().iter().max_by_key(|tx| tx.fee_per_byte) {
-                heap.push((best_tx.fee_per_byte, Reverse(best_tx.timestamp), sender.clone(), best_tx.size));
+                heap.push((
+                    best_tx.fee_per_byte,
+                    Reverse(best_tx.timestamp),
+                    sender.clone(),
+                    best_tx.size,
+                ));
             }
         }
 
@@ -279,11 +285,7 @@ impl Mempool {
             let sender = entry.key();
             for tx in entry.value().iter() {
                 if now.saturating_sub(tx.timestamp) > ttl_secs {
-                    to_remove.push((
-                        sender.clone(),
-                        tx.transaction.get_tx_id(),
-                        tx.size,
-                    ));
+                    to_remove.push((sender.clone(), tx.transaction.get_tx_id(), tx.size));
                 }
             }
         }
@@ -318,8 +320,8 @@ impl Mempool {
     }
 
     fn evict_lowest_fee_transactions(&mut self, required_space: usize, required_count: usize) {
-        use std::collections::BinaryHeap;
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
         let mut space_freed = 0;
         let mut count_freed = 0;

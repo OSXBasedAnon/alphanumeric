@@ -6,6 +6,7 @@ use futures_util::{
     stream::{FuturesUnordered, StreamExt},
     TryFutureExt,
 };
+use igd_next::{search_gateway, PortMappingProtocol};
 use ipnet::{Ipv4Net, Ipv6Net};
 use libp2p::{
     core::{
@@ -27,10 +28,10 @@ use libp2p::{
     yamux, Multiaddr, PeerId, Transport,
 };
 use log::{debug, error, info, trace, warn};
+use lru::LruCache;
 use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use reqwest::Client;
-use igd_next::{search_gateway, PortMappingProtocol};
 use ring::{
     aead, hkdf,
     rand::SecureRandom,
@@ -63,7 +64,6 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
     time::{interval, sleep, timeout},
 };
-use lru::LruCache;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -1132,10 +1132,8 @@ impl Node {
             return Ok(None);
         }
 
-        let payload = crate::a9::bpos::build_dilithium_binding_payload(
-            &self.node_id,
-            &dilithium_public_key,
-        );
+        let payload =
+            crate::a9::bpos::build_dilithium_binding_payload(&self.node_id, &dilithium_public_key);
         let ed25519_signature = self.sign_with_handshake_key(&payload)?;
 
         Ok(Some(NetworkMessage::DilithiumKeyRegistration {
@@ -1155,7 +1153,9 @@ impl Node {
     fn verify_handshake(&self, message: &HandshakeMessage) -> Result<(), NodeError> {
         const MAX_HANDSHAKE_SKEW_SECS: u64 = 300;
         if message.public_key.len() != 32 || message.signature.len() != 64 {
-            return Err(NodeError::Network("Invalid handshake key/signature length".into()));
+            return Err(NodeError::Network(
+                "Invalid handshake key/signature length".into(),
+            ));
         }
         if message.public_key == self.handshake_public_key {
             return Err(NodeError::Network("Self-handshake rejected".into()));
@@ -1170,7 +1170,9 @@ impl Node {
             message.timestamp - now
         };
         if skew > MAX_HANDSHAKE_SKEW_SECS {
-            return Err(NodeError::Network("Handshake timestamp outside allowed skew".into()));
+            return Err(NodeError::Network(
+                "Handshake timestamp outside allowed skew".into(),
+            ));
         }
         let payload = Self::handshake_payload(message)?;
         let public_key = UnparsedPublicKey::new(&ED25519, &message.public_key);
@@ -1235,9 +1237,8 @@ impl Node {
             return bases;
         }
 
-        vec![std::env::var("ALPHANUMERIC_DISCOVERY_BASE").unwrap_or_else(|_| {
-            DEFAULT_DISCOVERY_BASE.to_string()
-        })]
+        vec![std::env::var("ALPHANUMERIC_DISCOVERY_BASE")
+            .unwrap_or_else(|_| DEFAULT_DISCOVERY_BASE.to_string())]
     }
 
     fn discovery_peers_urls() -> Vec<String> {
@@ -1291,9 +1292,7 @@ impl Node {
             IpAddr::V4(ip) => {
                 ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
             }
-            IpAddr::V6(ip) => {
-                ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local()
-            }
+            IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local(),
         }
     }
 
@@ -1567,7 +1566,10 @@ impl Node {
 
         let last_block_time = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_last_block().map(|b| b.timestamp).unwrap_or(0)
+            blockchain
+                .get_last_block()
+                .map(|b| b.timestamp)
+                .unwrap_or(0)
         };
 
         let difficulty = {
@@ -1644,7 +1646,10 @@ impl Node {
 
         let last_block_time = {
             let blockchain = state.blockchain.read().await;
-            blockchain.get_last_block().map(|b| b.timestamp).unwrap_or(0)
+            blockchain
+                .get_last_block()
+                .map(|b| b.timestamp)
+                .unwrap_or(0)
         };
 
         let difficulty = {
@@ -1686,7 +1691,8 @@ impl Node {
     }
 
     async fn start_stats_server(&self) -> Result<(), NodeError> {
-        let bind_ip = std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let bind_ip =
+            std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = std::env::var("ALPHANUMERIC_STATS_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
@@ -1715,7 +1721,10 @@ impl Node {
             }
         };
         if let Err(e) = listener.set_nonblocking(true) {
-            warn!("Stats API disabled: failed to set nonblocking listener ({})", e);
+            warn!(
+                "Stats API disabled: failed to set nonblocking listener ({})",
+                e
+            );
             return Ok(());
         }
 
@@ -1764,453 +1773,460 @@ impl Node {
         Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 
-pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
-    info!("Starting network discovery");
+    pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
+        info!("Starting network discovery");
 
-    self.discover_network_nodes_with_retry(0).await
-}
-
-// Separate implementation for recursive calls with retry counter
-async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
-    const MAX_DISCOVERY_RETRIES: u32 = 3;
-    const MAX_TARGET_PEERS: usize = 32;
-    const MIN_TARGET_PEERS: usize = 5;
-    const VERIFY_BATCH_SIZE: usize = 24;
-    const VERIFY_CONCURRENCY: usize = 12;
-
-    let gateway_only = std::env::var("ALPHANUMERIC_DISCOVERY_GATEWAY_ONLY")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
-    let enable_dns_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_DNS_FALLBACK")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
-    let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let enable_aggressive_discovery = std::env::var("ALPHANUMERIC_ENABLE_AGGRESSIVE_DISCOVERY")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-
-    let mut discovered_addrs = HashSet::new();
-    let mut verified_peers = Vec::new();
-
-    let current_peers: HashSet<SocketAddr> = {
-        let peers = self.peers.read().await;
-        peers.keys().copied().collect()
-    };
-
-    let needs_more_peers = current_peers.len() < MIN_TARGET_PEERS;
-
-    // Priority 1: alphanumeric.blue discovery service
-    let mut gateway_ok = false;
-    match self.fetch_discovery_peers().await {
-        Ok(peer_addrs) => {
-            gateway_ok = true;
-            discovered_addrs.extend(peer_addrs);
-            debug!("Discovery gateway provided {} candidate peers", discovered_addrs.len());
-        }
-        Err(e) => {
-            warn!("Discovery gateway unavailable: {}", e);
-        }
+        self.discover_network_nodes_with_retry(0).await
     }
 
-    // Fallbacks are only used when gateway is unavailable, or explicitly allowed.
-    let allow_fallback = !gateway_ok || !gateway_only;
-    if allow_fallback {
-        discovered_addrs.extend(self.load_peer_cache());
+    // Separate implementation for recursive calls with retry counter
+    async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
+        const MAX_DISCOVERY_RETRIES: u32 = 3;
+        const MAX_TARGET_PEERS: usize = 32;
+        const MIN_TARGET_PEERS: usize = 5;
+        const VERIFY_BATCH_SIZE: usize = 24;
+        const VERIFY_CONCURRENCY: usize = 12;
 
-        if !current_peers.is_empty() {
-            if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
+        let gateway_only = std::env::var("ALPHANUMERIC_DISCOVERY_GATEWAY_ONLY")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        let enable_dns_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_DNS_FALLBACK")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let enable_aggressive_discovery = std::env::var("ALPHANUMERIC_ENABLE_AGGRESSIVE_DISCOVERY")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let mut discovered_addrs = HashSet::new();
+        let mut verified_peers = Vec::new();
+
+        let current_peers: HashSet<SocketAddr> = {
+            let peers = self.peers.read().await;
+            peers.keys().copied().collect()
+        };
+
+        let needs_more_peers = current_peers.len() < MIN_TARGET_PEERS;
+
+        // Priority 1: alphanumeric.blue discovery service
+        let mut gateway_ok = false;
+        match self.fetch_discovery_peers().await {
+            Ok(peer_addrs) => {
+                gateway_ok = true;
                 discovered_addrs.extend(peer_addrs);
+                debug!(
+                    "Discovery gateway provided {} candidate peers",
+                    discovered_addrs.len()
+                );
+            }
+            Err(e) => {
+                warn!("Discovery gateway unavailable: {}", e);
             }
         }
 
-        if enable_dns_fallback {
-            for seed in Self::dns_seeds() {
-                match tokio::net::lookup_host(seed.as_str()).await {
-                    Ok(addrs) => discovered_addrs.extend(addrs),
-                    Err(e) => debug!("DNS lookup failed for {}: {}", seed, e),
+        // Fallbacks are only used when gateway is unavailable, or explicitly allowed.
+        let allow_fallback = !gateway_ok || !gateway_only;
+        if allow_fallback {
+            discovered_addrs.extend(self.load_peer_cache());
+
+            if !current_peers.is_empty() {
+                if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
+                    discovered_addrs.extend(peer_addrs);
+                }
+            }
+
+            if enable_dns_fallback {
+                for seed in Self::dns_seeds() {
+                    match tokio::net::lookup_host(seed.as_str()).await {
+                        Ok(addrs) => discovered_addrs.extend(addrs),
+                        Err(e) => debug!("DNS lookup failed for {}: {}", seed, e),
+                    }
+                }
+            }
+
+            if enable_kad_fallback {
+                if let Ok(kad_addrs) = self.discover_from_kademlia().await {
+                    discovered_addrs.extend(kad_addrs);
                 }
             }
         }
 
-        if enable_kad_fallback {
-            if let Ok(kad_addrs) = self.discover_from_kademlia().await {
-                discovered_addrs.extend(kad_addrs);
+        // Heavy scan mode is strictly opt-in and only when connectivity is weak.
+        if enable_aggressive_discovery && needs_more_peers && !gateway_ok {
+            if let Ok(local_addrs) = self.discover_local_network().await {
+                discovered_addrs.extend(local_addrs);
             }
-        }
-    }
 
-    // Heavy scan mode is strictly opt-in and only when connectivity is weak.
-    if enable_aggressive_discovery && needs_more_peers && !gateway_ok {
-        if let Ok(local_addrs) = self.discover_local_network().await {
-            discovered_addrs.extend(local_addrs);
-        }
-
-        if let Ok((Some(v4), v6)) = self.discover_external_addresses(STUN_SERVERS).await {
-            if let Ok(ranges) = self.build_scan_ranges(v4, v6).await {
-                for range in ranges.iter().take(3) {
-                    if range.priority <= 3 {
-                        if let Ok(range_addrs) =
-                            tokio::time::timeout(Duration::from_secs(8), self.scan_range(range))
-                                .await
-                                .unwrap_or_else(|_| Ok(HashSet::new()))
-                        {
-                            discovered_addrs.extend(range_addrs);
+            if let Ok((Some(v4), v6)) = self.discover_external_addresses(STUN_SERVERS).await {
+                if let Ok(ranges) = self.build_scan_ranges(v4, v6).await {
+                    for range in ranges.iter().take(3) {
+                        if range.priority <= 3 {
+                            if let Ok(range_addrs) =
+                                tokio::time::timeout(Duration::from_secs(8), self.scan_range(range))
+                                    .await
+                                    .unwrap_or_else(|_| Ok(HashSet::new()))
+                            {
+                                discovered_addrs.extend(range_addrs);
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    let mut new_addrs: Vec<_> = discovered_addrs
-        .into_iter()
-        .filter(|addr| *addr != self.bind_addr && !current_peers.contains(addr))
-        .collect();
+        let mut new_addrs: Vec<_> = discovered_addrs
+            .into_iter()
+            .filter(|addr| *addr != self.bind_addr && !current_peers.contains(addr))
+            .collect();
 
-    if new_addrs.is_empty() {
-        info!("No new peers discovered");
-        if needs_more_peers && retry_count < MAX_DISCOVERY_RETRIES {
-            let backoff_ms = 300_u64.saturating_mul(1_u64 << retry_count.min(4));
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            return Box::pin(self.discover_network_nodes_with_retry(retry_count + 1)).await;
-        }
-        return Ok(());
-    }
-
-    new_addrs.shuffle(&mut thread_rng());
-    new_addrs.truncate(MAX_TARGET_PEERS.saturating_mul(2));
-
-    let connection_limiter = Arc::new(Semaphore::new(VERIFY_CONCURRENCY));
-    for batch in new_addrs.chunks(VERIFY_BATCH_SIZE) {
-        if verified_peers.len() >= MAX_TARGET_PEERS {
-            break;
+        if new_addrs.is_empty() {
+            info!("No new peers discovered");
+            if needs_more_peers && retry_count < MAX_DISCOVERY_RETRIES {
+                let backoff_ms = 300_u64.saturating_mul(1_u64 << retry_count.min(4));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                return Box::pin(self.discover_network_nodes_with_retry(retry_count + 1)).await;
+            }
+            return Ok(());
         }
 
-        let verification_tasks: Vec<_> = batch
-            .iter()
-            .copied()
+        new_addrs.shuffle(&mut thread_rng());
+        new_addrs.truncate(MAX_TARGET_PEERS.saturating_mul(2));
+
+        let connection_limiter = Arc::new(Semaphore::new(VERIFY_CONCURRENCY));
+        for batch in new_addrs.chunks(VERIFY_BATCH_SIZE) {
+            if verified_peers.len() >= MAX_TARGET_PEERS {
+                break;
+            }
+
+            let verification_tasks: Vec<_> = batch
+                .iter()
+                .copied()
+                .map(|addr| {
+                    let permit = connection_limiter.clone().acquire_owned();
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = match permit.await {
+                            Ok(permit) => permit,
+                            Err(_) => return None,
+                        };
+                        match tokio::time::timeout(Duration::from_secs(5), node.verify_peer(addr))
+                            .await
+                        {
+                            Ok(Ok(_)) => Some(addr),
+                            Ok(Err(e)) => {
+                                debug!("Failed to verify peer {}: {}", addr, e);
+                                None
+                            }
+                            Err(_) => {
+                                debug!("Verification timed out for {}", addr);
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for result in futures::future::join_all(verification_tasks).await {
+                if let Ok(Some(addr)) = result {
+                    verified_peers.push(addr);
+                    if verified_peers.len() >= MAX_TARGET_PEERS {
+                        break;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Discovery cycle complete: verified {} new peer(s), gateway_ok={}, fallback_used={}",
+            verified_peers.len(),
+            gateway_ok,
+            allow_fallback
+        );
+
+        if let Err(e) = self.rebalance_peer_subnets().await {
+            warn!("Failed to rebalance peer subnets: {}", e);
+        }
+
+        Ok(())
+    }
+
+    async fn discover_from_dns_seeds(&self) -> Result<HashSet<SocketAddr>, NodeError> {
+        const DNS_SEEDS: &[&str] = &[
+            "seed.alphanumeric.network",
+            "seed2.alphanumeric.network",
+            "a9seed.mynode.network",
+        ];
+
+        let mut discovered = HashSet::new();
+
+        for &seed in DNS_SEEDS {
+            match tokio::net::lookup_host(format!("{}:{}", seed, DEFAULT_PORT)).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        discovered.insert(addr);
+                    }
+                }
+                Err(e) => {
+                    debug!("DNS lookup failed for {}: {}", seed, e);
+                }
+            }
+        }
+
+        Ok(discovered)
+    }
+
+    async fn discover_from_kademlia(&self) -> Result<HashSet<SocketAddr>, NodeError> {
+        let mut discovered = HashSet::new();
+
+        // Safely access the swarm without using addresses_of_peer
+        let swarm_guard = self.p2p_swarm.read().await;
+        if swarm_guard.is_none() {
+            return Ok(discovered);
+        }
+
+        // Try to collect known peer addresses using safer methods
+        if let Ok(_) = self.handle_p2p_events().await {
+            // After handling events, extract any discovered addresses
+            // from swarm's connected peers using direct access methods
+            if let Some(swarm) = &*swarm_guard {
+                // Get connected peers from the swarm
+                for peer_id in swarm.0.connected_peers() {
+                    // Fixed: add .await here to properly await the future
+                    if let Ok(addrs) = self.get_peer_addresses_from_connections(&peer_id).await {
+                        for addr in addrs {
+                            discovered.insert(addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(discovered)
+    }
+
+    // Helper function to safely get peer addresses
+    async fn get_peer_addresses_from_connections(
+        &self,
+        _peer_id: &PeerId,
+    ) -> Result<Vec<SocketAddr>, NodeError> {
+        // Simple implementation that doesn't depend on addresses_of_peer
+        let mut result = Vec::new();
+
+        // If we have existing connections in peers map, use those
+        let peers = self.peers.read().await;
+        for (addr, _) in peers.iter() {
+            result.push(*addr);
+        }
+
+        Ok(result)
+    }
+
+    async fn scan_range_with_limit(
+        &self,
+        range: &ScanRange,
+        semaphore: Arc<Semaphore>,
+        limit: usize,
+    ) -> Result<HashSet<SocketAddr>, NodeError> {
+        let mut discovered = HashSet::new();
+
+        // Get addresses to scan based on network type
+        let mut addrs = match &range.network {
+            ScanNetwork::V4(net) => {
+                let mut addrs = Vec::new();
+                // Generate addresses from the subnet, but limit to reasonable number
+                for host in net.hosts().take(limit) {
+                    addrs.push(SocketAddr::new(IpAddr::V4(host), DEFAULT_PORT));
+                }
+                addrs
+            }
+            ScanNetwork::V6(net) => {
+                let mut addrs = Vec::new();
+                let mut rng = thread_rng();
+
+                // For IPv6, generate limited random addresses in the subnet
+                for _ in 0..limit.min(25) {
+                    let mut segments = [0u16; 8];
+
+                    // Copy prefix
+                    let prefix_len = (net.prefix_len() / 16) as usize;
+                    for i in 0..prefix_len {
+                        segments[i] = net.addr().segments()[i];
+                    }
+
+                    // Randomize host part
+                    for i in prefix_len..8 {
+                        segments[i] = rng.gen();
+                    }
+
+                    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
+                    addrs.push(addr);
+                }
+                addrs
+            }
+        };
+
+        // Randomize order for better distribution
+        addrs.shuffle(&mut thread_rng());
+
+        // Take only the first 'limit' addresses
+        addrs.truncate(limit);
+
+        // Concurrently scan addresses with improved error handling
+        let scan_tasks: Vec<_> = addrs
+            .into_iter()
             .map(|addr| {
-                let permit = connection_limiter.clone().acquire_owned();
+                let permit = semaphore.clone().acquire_owned();
                 let node = self.clone();
+
                 tokio::spawn(async move {
-                    let _permit = match permit.await {
-                        Ok(permit) => permit,
-                        Err(_) => return None,
-                    };
-                    match tokio::time::timeout(Duration::from_secs(5), node.verify_peer(addr)).await {
+                    let _permit = permit.await.ok()?;
+
+                    if addr == node.bind_addr {
+                        return None;
+                    }
+
+                    // Quick TCP check with better timeout
+                    match tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
+                        .await
+                    {
                         Ok(Ok(_)) => Some(addr),
-                        Ok(Err(e)) => {
-                            debug!("Failed to verify peer {}: {}", addr, e);
-                            None
-                        }
-                        Err(_) => {
-                            debug!("Verification timed out for {}", addr);
-                            None
-                        }
+                        _ => None,
                     }
                 })
             })
             .collect();
 
-        for result in futures::future::join_all(verification_tasks).await {
+        // Gather results
+        for result in futures::future::join_all(scan_tasks).await {
             if let Ok(Some(addr)) = result {
-                verified_peers.push(addr);
-                if verified_peers.len() >= MAX_TARGET_PEERS {
-                    break;
-                }
+                discovered.insert(addr);
             }
         }
+
+        Ok(discovered)
     }
 
-    info!(
-        "Discovery cycle complete: verified {} new peer(s), gateway_ok={}, fallback_used={}",
-        verified_peers.len(),
-        gateway_ok,
-        allow_fallback
-    );
+    async fn build_optimized_scan_ranges(
+        &self,
+        v4_addr: IpAddr,
+        v6_addr: Option<IpAddr>,
+    ) -> Result<Vec<ScanRange>, NodeError> {
+        let mut ranges = Vec::new();
 
-    if let Err(e) = self.rebalance_peer_subnets().await {
-        warn!("Failed to rebalance peer subnets: {}", e);
-    }
+        // Add current peer subnet ranges first (most likely to find peers)
+        {
+            let peers = self.peers.read().await;
+            for (_, info) in peers.iter() {
+                // Direct access to subnet_group - it's not an Option
+                let subnet = info.subnet_group;
 
-    Ok(())
-}
+                // Convert subnet group to scan range
+                match info.address.ip() {
+                    IpAddr::V4(ip) => {
+                        let octets = ip.octets();
+                        let subnet_str = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
 
-async fn discover_from_dns_seeds(&self) -> Result<HashSet<SocketAddr>, NodeError> {
-    const DNS_SEEDS: &[&str] = &[
-        "seed.alphanumeric.network",
-        "seed2.alphanumeric.network",
-        "a9seed.mynode.network",
-    ];
-    
-    let mut discovered = HashSet::new();
-    
-    for &seed in DNS_SEEDS {
-        match tokio::net::lookup_host(format!("{}:{}", seed, DEFAULT_PORT)).await {
-            Ok(addrs) => {
-                for addr in addrs {
-                    discovered.insert(addr);
-                }
-            }
-            Err(e) => {
-                debug!("DNS lookup failed for {}: {}", seed, e);
-            }
-        }
-    }
-    
-    Ok(discovered)
-}
-
-async fn discover_from_kademlia(&self) -> Result<HashSet<SocketAddr>, NodeError> {
-    let mut discovered = HashSet::new();
-    
-    // Safely access the swarm without using addresses_of_peer
-    let swarm_guard = self.p2p_swarm.read().await;
-    if swarm_guard.is_none() {
-        return Ok(discovered);
-    }
-    
-    // Try to collect known peer addresses using safer methods
-    if let Ok(_) = self.handle_p2p_events().await {
-        // After handling events, extract any discovered addresses
-        // from swarm's connected peers using direct access methods
-        if let Some(swarm) = &*swarm_guard {
-            // Get connected peers from the swarm
-            for peer_id in swarm.0.connected_peers() {
-                // Fixed: add .await here to properly await the future
-                if let Ok(addrs) = self.get_peer_addresses_from_connections(&peer_id).await {
-                    for addr in addrs {
-                        discovered.insert(addr);
+                        if let Ok(net) = subnet_str.parse::<Ipv4Net>() {
+                            // Add with high priority
+                            ranges.push(ScanRange {
+                                network: ScanNetwork::V4(net),
+                                priority: 1, // Highest priority
+                            });
+                        }
                     }
+                    IpAddr::V6(_) => {} // Skip IPv6 for now
                 }
             }
         }
-    }
-    
-    Ok(discovered)
-}
 
-// Helper function to safely get peer addresses
-async fn get_peer_addresses_from_connections(&self, _peer_id: &PeerId) -> Result<Vec<SocketAddr>, NodeError> {
-    // Simple implementation that doesn't depend on addresses_of_peer
-    let mut result = Vec::new();
-    
-    // If we have existing connections in peers map, use those
-    let peers = self.peers.read().await;
-    for (addr, _) in peers.iter() {
-        result.push(*addr);
-    }
-    
-    Ok(result)
-}
+        // Add IPv4 subnet from current address (your likely subnet)
+        if let IpAddr::V4(ipv4) = v4_addr {
+            let octets = ipv4.octets();
 
-async fn scan_range_with_limit(
-    &self, 
-    range: &ScanRange,
-    semaphore: Arc<Semaphore>,
-    limit: usize
-) -> Result<HashSet<SocketAddr>, NodeError> {
-    let mut discovered = HashSet::new();
-    
-    // Get addresses to scan based on network type
-    let mut addrs = match &range.network {
-        ScanNetwork::V4(net) => {
-            let mut addrs = Vec::new();
-            // Generate addresses from the subnet, but limit to reasonable number
-            for host in net.hosts().take(limit) {
-                addrs.push(SocketAddr::new(IpAddr::V4(host), DEFAULT_PORT));
-            }
-            addrs
-        }
-        ScanNetwork::V6(net) => {
-            let mut addrs = Vec::new();
-            let mut rng = thread_rng();
-            
-            // For IPv6, generate limited random addresses in the subnet
-            for _ in 0..limit.min(25) {
-                let mut segments = [0u16; 8];
-                
-                // Copy prefix
-                let prefix_len = (net.prefix_len() / 16) as usize;
-                for i in 0..prefix_len {
-                    segments[i] = net.addr().segments()[i];
-                }
-                
-                // Randomize host part
-                for i in prefix_len..8 {
-                    segments[i] = rng.gen();
-                }
-                
-                let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
-                addrs.push(addr);
-            }
-            addrs
-        }
-    };
-    
-    // Randomize order for better distribution
-    addrs.shuffle(&mut thread_rng());
-    
-    // Take only the first 'limit' addresses
-    addrs.truncate(limit);
-    
-    // Concurrently scan addresses with improved error handling
-    let scan_tasks: Vec<_> = addrs
-        .into_iter()
-        .map(|addr| {
-            let permit = semaphore.clone().acquire_owned();
-            let node = self.clone();
-            
-            tokio::spawn(async move {
-                let _permit = permit.await.ok()?;
-                
-                if addr == node.bind_addr {
-                    return None;
-                }
-                
-                // Quick TCP check with better timeout
-                match tokio::time::timeout(
-                    Duration::from_millis(300), 
-                    TcpStream::connect(addr)
-                ).await {
-                    Ok(Ok(_)) => Some(addr),
-                    _ => None,
-                }
-            })
-        })
-        .collect();
-    
-    // Gather results
-    for result in futures::future::join_all(scan_tasks).await {
-        if let Ok(Some(addr)) = result {
-            discovered.insert(addr);
-        }
-    }
-    
-    Ok(discovered)
-}
-
-async fn build_optimized_scan_ranges(
-    &self,
-    v4_addr: IpAddr,
-    v6_addr: Option<IpAddr>,
-) -> Result<Vec<ScanRange>, NodeError> {
-    let mut ranges = Vec::new();
-    
-    // Add current peer subnet ranges first (most likely to find peers)
-    {
-        let peers = self.peers.read().await;
-        for (_, info) in peers.iter() {
-            // Direct access to subnet_group - it's not an Option
-            let subnet = info.subnet_group;
-            
-            // Convert subnet group to scan range
-            match info.address.ip() {
-                IpAddr::V4(ip) => {
-                    let octets = ip.octets();
-                    let subnet_str = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-                    
-                    if let Ok(net) = subnet_str.parse::<Ipv4Net>() {
-                        // Add with high priority
-                        ranges.push(ScanRange {
-                            network: ScanNetwork::V4(net),
-                            priority: 1, // Highest priority
-                        });
-                    }
-                }
-                IpAddr::V6(_) => {} // Skip IPv6 for now
-            }
-        }
-    }
-    
-    // Add IPv4 subnet from current address (your likely subnet)
-    if let IpAddr::V4(ipv4) = v4_addr {
-        let octets = ipv4.octets();
-        
-        // Current /24 subnet
-        let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-        if let Ok(net) = subnet.parse::<Ipv4Net>() {
-            ranges.push(ScanRange {
-                network: ScanNetwork::V4(net),
-                priority: 1, // Highest priority
-            });
-        }
-        
-        // Add adjacent subnets
-        for i in -2i32..=2i32 {
-            if i == 0 {
-                continue;
-            }
-            
-            // Try to handle wraparound properly
-            let third_octet = ((octets[2] as i32) + i) & 0xFF;
-            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], third_octet);
-            
+            // Current /24 subnet
+            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
             if let Ok(net) = subnet.parse::<Ipv4Net>() {
                 ranges.push(ScanRange {
                     network: ScanNetwork::V4(net),
-                    priority: 2,
+                    priority: 1, // Highest priority
+                });
+            }
+
+            // Add adjacent subnets
+            for i in -2i32..=2i32 {
+                if i == 0 {
+                    continue;
+                }
+
+                // Try to handle wraparound properly
+                let third_octet = ((octets[2] as i32) + i) & 0xFF;
+                let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], third_octet);
+
+                if let Ok(net) = subnet.parse::<Ipv4Net>() {
+                    ranges.push(ScanRange {
+                        network: ScanNetwork::V4(net),
+                        priority: 2,
+                    });
+                }
+            }
+
+            // Add broader subnet (faster search across larger network)
+            let broader_subnet = format!("{}.{}.0.0/16", octets[0], octets[1]);
+            if let Ok(net) = broader_subnet.parse::<Ipv4Net>() {
+                ranges.push(ScanRange {
+                    network: ScanNetwork::V4(net),
+                    priority: 3,
                 });
             }
         }
-        
-        // Add broader subnet (faster search across larger network)
-        let broader_subnet = format!("{}.{}.0.0/16", octets[0], octets[1]);
-        if let Ok(net) = broader_subnet.parse::<Ipv4Net>() {
-            ranges.push(ScanRange {
-                network: ScanNetwork::V4(net),
-                priority: 3,
-            });
+
+        // Add common cloud provider and ISP ranges
+        for &(range, priority) in &[
+            // Major cloud providers (likely to host nodes)
+            ("3.0.0.0/8", 3),   // AWS
+            ("35.0.0.0/8", 3),  // GCP
+            ("52.0.0.0/8", 3),  // AWS
+            ("104.0.0.0/8", 3), // Cloud
+            // ISP ranges
+            ("24.0.0.0/8", 4), // Comcast
+            ("71.0.0.0/8", 4), // AT&T
+            ("73.0.0.0/8", 4), // Verizon
+            // Private networks (for local testing)
+            ("192.168.0.0/16", 2), // Local
+            ("10.0.0.0/8", 3),     // Private
+        ] {
+            if let Ok(net) = range.parse::<Ipv4Net>() {
+                ranges.push(ScanRange {
+                    network: ScanNetwork::V4(net),
+                    priority,
+                });
+            }
         }
-    }
-    
-    // Add common cloud provider and ISP ranges
-    for &(range, priority) in &[
-        // Major cloud providers (likely to host nodes)
-        ("3.0.0.0/8", 3),   // AWS
-        ("35.0.0.0/8", 3),  // GCP
-        ("52.0.0.0/8", 3),  // AWS
-        ("104.0.0.0/8", 3), // Cloud
-        // ISP ranges
-        ("24.0.0.0/8", 4),  // Comcast
-        ("71.0.0.0/8", 4),  // AT&T
-        ("73.0.0.0/8", 4),  // Verizon
-        // Private networks (for local testing)
-        ("192.168.0.0/16", 2), // Local
-        ("10.0.0.0/8", 3),     // Private
-    ] {
-        if let Ok(net) = range.parse::<Ipv4Net>() {
-            ranges.push(ScanRange {
-                network: ScanNetwork::V4(net),
-                priority,
-            });
+
+        // Add IPv6 ranges if available
+        if let Some(IpAddr::V6(ipv6)) = v6_addr {
+            let segments = ipv6.segments();
+            // Try to get a reasonable IPv6 subnet
+            let subnet = format!(
+                "{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            );
+
+            if let Ok(net) = subnet.parse::<Ipv6Net>() {
+                ranges.push(ScanRange {
+                    network: ScanNetwork::V6(net),
+                    priority: 5, // Lower priority since IPv6 is less common
+                });
+            }
         }
+
+        // Sort ranges by priority (lower number = higher priority)
+        ranges.sort_by_key(|range| range.priority);
+
+        Ok(ranges)
     }
-    
-    // Add IPv6 ranges if available
-    if let Some(IpAddr::V6(ipv6)) = v6_addr {
-        let segments = ipv6.segments();
-        // Try to get a reasonable IPv6 subnet
-        let subnet = format!(
-            "{:x}:{:x}:{:x}:{:x}::/64",
-            segments[0], segments[1], segments[2], segments[3]
-        );
-        
-        if let Ok(net) = subnet.parse::<Ipv6Net>() {
-            ranges.push(ScanRange {
-                network: ScanNetwork::V6(net),
-                priority: 5, // Lower priority since IPv6 is less common
-            });
-        }
-    }
-    
-    // Sort ranges by priority (lower number = higher priority)
-    ranges.sort_by_key(|range| range.priority);
-    
-    Ok(ranges)
-}
 
     async fn build_scan_ranges(
         &self,
@@ -2614,7 +2630,13 @@ async fn build_optimized_scan_ranges(
                     .map_err(|e| NodeError::Network(format!("UPnP search error: {}", e)))?;
                 let socket = SocketAddr::new(bind_ip, port);
                 gateway
-                    .add_port(PortMappingProtocol::TCP, port, socket, 3600, "alphanumeric node")
+                    .add_port(
+                        PortMappingProtocol::TCP,
+                        port,
+                        socket,
+                        3600,
+                        "alphanumeric node",
+                    )
                     .map_err(|e| NodeError::Network(format!("UPnP add port error: {}", e)))?;
                 Ok::<(), NodeError>(())
             })
@@ -2851,7 +2873,8 @@ async fn build_optimized_scan_ranges(
                         .map(|(addr, info)| (*addr, Self::score_peer_for_cache(info, now)))
                         .filter(|(_, score)| *score >= -5.0)
                         .collect();
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    scored
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     scored.into_iter().take(200).map(|(addr, _)| addr).collect()
                 };
                 if let Err(e) = node_clone.save_peer_cache(&peers) {
@@ -2912,165 +2935,165 @@ async fn build_optimized_scan_ranges(
         Ok(())
     }
 
-async fn initialize_p2p(&self) -> Result<(), NodeError> {
-    use libp2p::core::transport::Transport;
-    use libp2p::core::upgrade;
-    use std::time::Duration;
-    
-    // Generate new identity key
-    let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
-    info!("Generated peer ID: {}", local_peer_id);
-    
-    // Setup transport with noise for encryption
-    let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-        .into_authentic(&local_key)
-        .map_err(|e| NodeError::Network(format!("Noise key generation failed: {}", e)))?;
-    
-    // Use the appropriate approach for libp2p 0.51.4
-    let transport = {
-        // Try to detect if we're using tokio runtime (should be the case)
-        #[cfg(feature = "tcp")]
-        let tcp_config = libp2p::tcp::GenTcpConfig::default().nodelay(true);
-        
-        // Attempt to use a more direct method to create TCP transport
-        #[cfg(feature = "tcp")]
+    async fn initialize_p2p(&self) -> Result<(), NodeError> {
+        use libp2p::core::transport::Transport;
+        use libp2p::core::upgrade;
+        use std::time::Duration;
+
+        // Generate new identity key
+        let local_key = identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
+        info!("Generated peer ID: {}", local_peer_id);
+
+        // Setup transport with noise for encryption
+        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
+            .into_authentic(&local_key)
+            .map_err(|e| NodeError::Network(format!("Noise key generation failed: {}", e)))?;
+
+        // Use the appropriate approach for libp2p 0.51.4
         let transport = {
-            // First attempt - should work for most tokio-enabled builds
-            let transport = match libp2p::tcp::TokioTcpTransport::new(tcp_config) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("Could not create TCP transport: {}", e);
-                    warn!("Falling back to memory transport. Only in-process communication will work.");
-                    libp2p::core::transport::MemoryTransport::default()
-                }
+            // Try to detect if we're using tokio runtime (should be the case)
+            #[cfg(feature = "tcp")]
+            let tcp_config = libp2p::tcp::GenTcpConfig::default().nodelay(true);
+
+            // Attempt to use a more direct method to create TCP transport
+            #[cfg(feature = "tcp")]
+            let transport = {
+                // First attempt - should work for most tokio-enabled builds
+                let transport = match libp2p::tcp::TokioTcpTransport::new(tcp_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("Could not create TCP transport: {}", e);
+                        warn!("Falling back to memory transport. Only in-process communication will work.");
+                        libp2p::core::transport::MemoryTransport::default()
+                    }
+                };
+
+                transport
+                    .upgrade(upgrade::Version::V1)
+                    .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
+                    .multiplex(yamux::Config::default())
+                    .timeout(Duration::from_secs(20))
+                    .boxed()
             };
-            
+
+            // Fallback if tcp feature is not available
+            #[cfg(not(feature = "tcp"))]
+            let transport = {
+                warn!("TCP feature not enabled. Using memory transport (in-process only).");
+                libp2p::core::transport::MemoryTransport::default()
+                    .upgrade(upgrade::Version::V1)
+                    .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
+                    .multiplex(yamux::Config::default())
+                    .timeout(Duration::from_secs(20))
+                    .boxed()
+            };
+
             transport
-                .upgrade(upgrade::Version::V1)
-                .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-                .multiplex(yamux::Config::default())
-                .timeout(Duration::from_secs(20))
-                .boxed()
         };
-        
-        // Fallback if tcp feature is not available
-        #[cfg(not(feature = "tcp"))]
-        let transport = {
-            warn!("TCP feature not enabled. Using memory transport (in-process only).");
-            libp2p::core::transport::MemoryTransport::default()
-                .upgrade(upgrade::Version::V1)
-                .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-                .multiplex(yamux::Config::default())
-                .timeout(Duration::from_secs(20))
-                .boxed()
-        };
-        
-        transport
-    };
-    
-    // Configure Kademlia DHT
-    let mut cfg = KademliaConfig::default();
-    if let Some(parallelism) = NonZeroUsize::new(32) {
-        cfg.set_parallelism(parallelism);
-    }
-    cfg.set_query_timeout(Duration::from_secs(60));
-    let store = MemoryStore::new(local_peer_id);
-    let mut kademlia = Kademlia::with_config(local_peer_id, store, cfg);
-    
-    //==============================================================================
-    // BOOTSTRAP NODE CONFIGURATION
-    //==============================================================================
-    // To connect to existing network nodes, uncomment the section below and add
-    // bootstrap node addresses in 'ip:port' or 'domain:port' format.
-    //------------------------------------------------------------------------------
-    
-    /* UNCOMMENT THIS SECTION TO ENABLE BOOTSTRAP NODES
-    // Add bootstrap nodes - customize with your node addresses
-    let bootstrap_addrs = vec![
-        // Example formats - replace with actual node addresses:
-        "192.168.1.100:7177",       // IP address format
-        "node1.example.com:7177",   // Domain name format
-    ];
-    
-    // Create a dummy peer ID to use for bootstrap nodes
-    // In a real network, you'd discover the actual peer IDs dynamically
-    let dummy_keypair = identity::Keypair::generate_ed25519();
-    let bootstrap_peer_id = PeerId::from(dummy_keypair.public());
-    
-    for addr_str in bootstrap_addrs {
-        // Parse address string (ip:port or domain:port format)
-        let parts: Vec<&str> = addr_str.split(':').collect();
-        if parts.len() == 2 {
-            let host = parts[0];
-            if let Ok(port) = parts[1].parse::<u16>() {
-                // Try to parse as IP address first
-                let multi_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                    match ip {
-                        std::net::IpAddr::V4(ipv4) => format!("/ip4/{}/tcp/{}", ipv4, port),
-                        std::net::IpAddr::V6(ipv6) => format!("/ip6/{}/tcp/{}", ipv6, port),
+
+        // Configure Kademlia DHT
+        let mut cfg = KademliaConfig::default();
+        if let Some(parallelism) = NonZeroUsize::new(32) {
+            cfg.set_parallelism(parallelism);
+        }
+        cfg.set_query_timeout(Duration::from_secs(60));
+        let store = MemoryStore::new(local_peer_id);
+        let mut kademlia = Kademlia::with_config(local_peer_id, store, cfg);
+
+        //==============================================================================
+        // BOOTSTRAP NODE CONFIGURATION
+        //==============================================================================
+        // To connect to existing network nodes, uncomment the section below and add
+        // bootstrap node addresses in 'ip:port' or 'domain:port' format.
+        //------------------------------------------------------------------------------
+
+        /* UNCOMMENT THIS SECTION TO ENABLE BOOTSTRAP NODES
+        // Add bootstrap nodes - customize with your node addresses
+        let bootstrap_addrs = vec![
+            // Example formats - replace with actual node addresses:
+            "192.168.1.100:7177",       // IP address format
+            "node1.example.com:7177",   // Domain name format
+        ];
+
+        // Create a dummy peer ID to use for bootstrap nodes
+        // In a real network, you'd discover the actual peer IDs dynamically
+        let dummy_keypair = identity::Keypair::generate_ed25519();
+        let bootstrap_peer_id = PeerId::from(dummy_keypair.public());
+
+        for addr_str in bootstrap_addrs {
+            // Parse address string (ip:port or domain:port format)
+            let parts: Vec<&str> = addr_str.split(':').collect();
+            if parts.len() == 2 {
+                let host = parts[0];
+                if let Ok(port) = parts[1].parse::<u16>() {
+                    // Try to parse as IP address first
+                    let multi_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                        match ip {
+                            std::net::IpAddr::V4(ipv4) => format!("/ip4/{}/tcp/{}", ipv4, port),
+                            std::net::IpAddr::V6(ipv6) => format!("/ip6/{}/tcp/{}", ipv6, port),
+                        }
+                    } else {
+                        // Assume it's a domain name
+                        format!("/dns/{}/tcp/{}", host, port)
+                    };
+
+                    // Parse as Multiaddr
+                    if let Ok(addr) = multi_addr.parse() {
+                        info!("Adding bootstrap address: {}", addr);
+                        // Use add_address method which requires a peer ID
+                        kademlia.add_address(&bootstrap_peer_id, addr);
+                    } else {
+                        warn!("Failed to parse bootstrap address: {}", addr_str);
                     }
                 } else {
-                    // Assume it's a domain name
-                    format!("/dns/{}/tcp/{}", host, port)
-                };
-                
-                // Parse as Multiaddr
-                if let Ok(addr) = multi_addr.parse() {
-                    info!("Adding bootstrap address: {}", addr);
-                    // Use add_address method which requires a peer ID
-                    kademlia.add_address(&bootstrap_peer_id, addr);
-                } else {
-                    warn!("Failed to parse bootstrap address: {}", addr_str);
+                    warn!("Invalid port in bootstrap address: {}", addr_str);
                 }
             } else {
-                warn!("Invalid port in bootstrap address: {}", addr_str);
+                warn!("Invalid bootstrap address format (should be host:port): {}", addr_str);
             }
-        } else {
-            warn!("Invalid bootstrap address format (should be host:port): {}", addr_str);
         }
-    }
-    
-    // Start the bootstrap process to connect to the network
-    match kademlia.bootstrap() {
-        Ok(_) => info!("Started Kademlia bootstrap process"),
-        Err(e) => warn!("Failed to start bootstrap process: {}", e),
-    }
-    // END OF BOOTSTRAP SECTION */
-    
-    // Initialize behavior and swarm with the correct executor
-    let behaviour = HybridBehaviour { kademlia };
-    
-    // Use without_executor for the older version of libp2p - this is the safest option
-    let mut swarm = SwarmBuilder::without_executor(transport, behaviour, local_peer_id).build();
-    
-    // Start listening on appropriate address
-    #[cfg(feature = "tcp")]
-    let listen_addr = "/ip4/0.0.0.0/tcp/0";
-    
-    #[cfg(not(feature = "tcp"))]
-    let listen_addr = "/memory/0";
-    
-    if let Ok(addr) = listen_addr.parse() {
-        match swarm.listen_on(addr) {
-            Ok(id) => {
-                info!("P2P listening started successfully (id: {:?})", id);
-                
-                #[cfg(feature = "tcp")]
-                info!("P2P listening started on TCP transport");
-                
-                #[cfg(not(feature = "tcp"))]
-                info!("P2P listening started on memory transport (in-process only)");
+
+        // Start the bootstrap process to connect to the network
+        match kademlia.bootstrap() {
+            Ok(_) => info!("Started Kademlia bootstrap process"),
+            Err(e) => warn!("Failed to start bootstrap process: {}", e),
+        }
+        // END OF BOOTSTRAP SECTION */
+
+        // Initialize behavior and swarm with the correct executor
+        let behaviour = HybridBehaviour { kademlia };
+
+        // Use without_executor for the older version of libp2p - this is the safest option
+        let mut swarm = SwarmBuilder::without_executor(transport, behaviour, local_peer_id).build();
+
+        // Start listening on appropriate address
+        #[cfg(feature = "tcp")]
+        let listen_addr = "/ip4/0.0.0.0/tcp/0";
+
+        #[cfg(not(feature = "tcp"))]
+        let listen_addr = "/memory/0";
+
+        if let Ok(addr) = listen_addr.parse() {
+            match swarm.listen_on(addr) {
+                Ok(id) => {
+                    info!("P2P listening started successfully (id: {:?})", id);
+
+                    #[cfg(feature = "tcp")]
+                    info!("P2P listening started on TCP transport");
+
+                    #[cfg(not(feature = "tcp"))]
+                    info!("P2P listening started on memory transport (in-process only)");
+                }
+                Err(e) => return Err(NodeError::Network(format!("Failed to listen: {}", e))),
             }
-            Err(e) => return Err(NodeError::Network(format!("Failed to listen: {}", e))),
         }
+
+        // Store swarm
+        *self.p2p_swarm.write().await = Some(HybridSwarm(swarm));
+
+        Ok(())
     }
-    
-    // Store swarm
-    *self.p2p_swarm.write().await = Some(HybridSwarm(swarm));
-    
-    Ok(())
-}
 
     async fn handle_p2p_events(&self) -> Result<(), NodeError> {
         // Use explicit import to avoid ambiguity
@@ -3129,296 +3152,300 @@ async fn initialize_p2p(&self) -> Result<(), NodeError> {
     }
 
     // Maintain connections to peers
-async fn maintain_peer_connections(&self) -> Result<(), NodeError> {
-    const PING_INTERVAL_SECS: u64 = 30;
-    const MAX_PING_LATENCY: u64 = 500; // ms
-    const PEER_TIMEOUT_SECS: u64 = 180; // 3 minutes
-    const MAX_FAILURES: u32 = 3;
-    const HEALTH_CHECK_BATCH: usize = 5; // Check 5 peers per maintenance cycle
-    
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
-    // IMPROVEMENT: Track peer metrics for better connection management
-    let mut active_peers = 0;
-    let mut inactive_peers = 0;
-    let mut high_latency_peers = 0;
-    let mut peers_to_check = Vec::new();
-    let mut peers_to_remove = Vec::new();
-    
-    // Identify peers that need health checks
-    {
-        let peers = self.peers.read().await;
-        
-        // Gather peer info first
-        let peer_info: Vec<(SocketAddr, u64, u64)> = peers.iter()
-            .map(|(addr, info)| (*addr, info.last_seen, info.latency))
-            .collect();
-            
-        // Now analyze without holding the lock
-        for (addr, last_seen, latency) in peer_info {
-            let inactive_time = now.saturating_sub(last_seen);
-            
-            if inactive_time > PEER_TIMEOUT_SECS {
-                inactive_peers += 1;
-                peers_to_remove.push(addr);
-            } else if inactive_time > PING_INTERVAL_SECS {
-                // Needs a health check
-                peers_to_check.push(addr);
-            } else {
-                active_peers += 1;
-                
-                // Track latency
-                if latency > MAX_PING_LATENCY {
-                    high_latency_peers += 1;
-                }
-            }
-        }
-    }
-    
-    // Find the least recently seen peers to check first
-    let peer_last_seen = {
-        let peers_guard = self.peers.read().await;
-        let mut result = Vec::with_capacity(peers_to_check.len());
-        
-        for &addr in &peers_to_check {
-            if let Some(info) = peers_guard.get(&addr) {
-                let time_since_seen = now.saturating_sub(info.last_seen);
-                result.push((addr, time_since_seen));
-            }
-        }
-        
-        result
-    };
-    
-    // Sort by time since last seen (outside of the peers guard)
-    let mut sorted_peers = peer_last_seen;
-    sorted_peers.sort_by_key(|&(_, time)| std::cmp::Reverse(time));
-    
-    // Update peers_to_check with sorted order
-    peers_to_check = sorted_peers.into_iter().map(|(addr, _)| addr).collect();
-    
-    // IMPROVEMENT: Perform health checks in batches
-    let health_check_batch = peers_to_check.into_iter()
-        .take(HEALTH_CHECK_BATCH)
-        .collect::<Vec<_>>();
-    
-    if !health_check_batch.is_empty() {
-        // Check peer health in parallel with rate limiting
-        let max_concurrent_checks = health_check_batch.len().min(5);
-        let semaphore = Arc::new(Semaphore::new(max_concurrent_checks));
-        
-        let health_check_futures: Vec<_> = health_check_batch
-            .into_iter()
-            .map(|addr| {
-                let permit = semaphore.clone().acquire_owned();
-                let node = self.clone();
-                
-                tokio::spawn(async move {
-                    let _permit = match permit.await {
-                        Ok(permit) => permit,
-                        Err(_) => return (addr, false),
-                    };
-                    let result = node.check_peer_health_internal(addr).await;
-                    (addr, result.is_ok())
-                })
-            })
-            .collect();
-        
-        // Process health check results
-        for result in futures::future::join_all(health_check_futures).await {
-            match result {
-                Ok((addr, true)) => {
-                    // Peer is healthy, update last_seen
-                    let mut peers = self.peers.write().await;
-                    if let Some(info) = peers.get_mut(&addr) {
-                        info.last_seen = now;
-                    }
-                    drop(peers);
-                    
-                    // Reset failure counter
-                    self.reset_peer_failures(addr).await;
-                }
-                Ok((addr, false)) => {
-                    // Peer is unhealthy, record failure
-                    self.record_peer_failure(addr).await;
-                    
-                    // Check if peer has failed too many times
-                    let failures = self.peer_failures.read().await;
-                    if failures.get(&addr).copied().unwrap_or(0) >= MAX_FAILURES {
-                        peers_to_remove.push(addr);
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-    
-    // IMPROVEMENT: Apply updates to peer state all at once
-    if !peers_to_remove.is_empty() {
-        let remove_list = peers_to_remove.clone();
-        {
-            let mut peers = self.peers.write().await;
-            for addr in &remove_list {
-                peers.remove(addr);
-            }
-        }
-        {
-            let mut peer_secrets = self.peer_secrets.write().await;
-            for addr in &remove_list {
-                peer_secrets.remove(addr);
-            }
-        }
-        {
-            let mut pool = self.outbound_connections.write().await;
-            for addr in &remove_list {
-                pool.remove(addr);
-            }
-        }
-        {
-            let mut breakers = self.outbound_circuit_breakers.write().await;
-            for addr in &remove_list {
-                breakers.remove(addr);
-            }
-        }
-    }
-    
-    // IMPROVEMENT: Initiate discovery if we need more peers
-    let current_peer_count = self.peers.read().await.len();
-    if current_peer_count < MIN_PEERS {
-        debug!("Low peer count ({}), initiating discovery", current_peer_count);
-        
-        // Spawn discovery as a separate task to avoid blocking maintenance
-        tokio::spawn({
-            let node = self.clone();
-            async move {
-                if let Err(e) = node.discover_network_nodes().await {
-                    warn!("Peer discovery during maintenance failed: {}", e);
-                }
-            }
-        });
-    }
-    
-    // IMPROVEMENT: Rebalance subnet distribution periodically
-    // Only do this if we have enough peers to be selective
-    if current_peer_count >= MIN_PEERS + 2 {
-        if let Err(e) = self.rebalance_peer_subnets().await {
-            warn!("Subnet rebalancing failed: {}", e);
-        }
-    }
-    
-    // IMPROVEMENT: Update network health metrics
-    {
-        let mut network_health = self.network_health.write().await;
-        // Fix the type issue - use proper type for active_nodes
-        network_health.active_nodes = active_peers;  // Assuming active_peers is already a usize
-        
-        network_health.average_response_time = {
-            let peers = self.peers.read().await;
-            if peers.is_empty() {
-                0
-            } else {
-                peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
-            }
-        };
-    }
-    
-    Ok(())
-}
+    async fn maintain_peer_connections(&self) -> Result<(), NodeError> {
+        const PING_INTERVAL_SECS: u64 = 30;
+        const MAX_PING_LATENCY: u64 = 500; // ms
+        const PEER_TIMEOUT_SECS: u64 = 180; // 3 minutes
+        const MAX_FAILURES: u32 = 3;
+        const HEALTH_CHECK_BATCH: usize = 5; // Check 5 peers per maintenance cycle
 
-// Helper method - improved subnet rebalancing
-async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
-    // Get current time at the beginning
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
-    // Get current peers
-    let peers = self.peers.read().await;
-    
-    // Count peers per subnet
-    let mut subnet_counts = HashMap::new();
-    for (_, info) in peers.iter() {
-        *subnet_counts.entry(info.subnet_group).or_insert(0) += 1;
-    }
-    
-    // Find overrepresented subnets
-    let max_per_subnet = (self.max_peers / 8).max(MAX_PEERS_PER_SUBNET);
-    let mut removals = Vec::new();
-    
-    for (subnet, count) in subnet_counts.iter() {
-        if *count > max_per_subnet {
-            // Get all peers in this subnet
-            let subnet_peers: Vec<_> = peers
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // IMPROVEMENT: Track peer metrics for better connection management
+        let mut active_peers = 0;
+        let mut inactive_peers = 0;
+        let mut high_latency_peers = 0;
+        let mut peers_to_check = Vec::new();
+        let mut peers_to_remove = Vec::new();
+
+        // Identify peers that need health checks
+        {
+            let peers = self.peers.read().await;
+
+            // Gather peer info first
+            let peer_info: Vec<(SocketAddr, u64, u64)> = peers
                 .iter()
-                .filter(|(_, info)| &info.subnet_group == subnet)
+                .map(|(addr, info)| (*addr, info.last_seen, info.latency))
                 .collect();
-            
-            // Get all the rating data first
-            let mut peer_ratings = Vec::with_capacity(subnet_peers.len());
-            
-            for (addr, info) in subnet_peers {
-                // Calculate a quality score
-                // Lower is better: latency (ms) - blocks (importance) + age (seconds)
-                let score = info.latency as i64 - 
-                           (info.blocks as i64) + 
-                           (now.saturating_sub(info.last_seen) as i64) / 60;
-                
-                // Fixed: Don't double-dereference the address
-                peer_ratings.push((*addr, score));
-            }
-            
-            // Sort by score (lower is better)
-            peer_ratings.sort_by_key(|&(_, score)| score);
-            
-            // Keep the best max_per_subnet, remove the rest
-            let excess_count = count - max_per_subnet;
-            let peers_to_remove = peer_ratings.len().saturating_sub(max_per_subnet);
-            
-            for i in (peer_ratings.len() - peers_to_remove)..peer_ratings.len() {
-                if i < peer_ratings.len() {
-                    removals.push(peer_ratings[i].0);
+
+            // Now analyze without holding the lock
+            for (addr, last_seen, latency) in peer_info {
+                let inactive_time = now.saturating_sub(last_seen);
+
+                if inactive_time > PEER_TIMEOUT_SECS {
+                    inactive_peers += 1;
+                    peers_to_remove.push(addr);
+                } else if inactive_time > PING_INTERVAL_SECS {
+                    // Needs a health check
+                    peers_to_check.push(addr);
+                } else {
+                    active_peers += 1;
+
+                    // Track latency
+                    if latency > MAX_PING_LATENCY {
+                        high_latency_peers += 1;
+                    }
                 }
             }
         }
+
+        // Find the least recently seen peers to check first
+        let peer_last_seen = {
+            let peers_guard = self.peers.read().await;
+            let mut result = Vec::with_capacity(peers_to_check.len());
+
+            for &addr in &peers_to_check {
+                if let Some(info) = peers_guard.get(&addr) {
+                    let time_since_seen = now.saturating_sub(info.last_seen);
+                    result.push((addr, time_since_seen));
+                }
+            }
+
+            result
+        };
+
+        // Sort by time since last seen (outside of the peers guard)
+        let mut sorted_peers = peer_last_seen;
+        sorted_peers.sort_by_key(|&(_, time)| std::cmp::Reverse(time));
+
+        // Update peers_to_check with sorted order
+        peers_to_check = sorted_peers.into_iter().map(|(addr, _)| addr).collect();
+
+        // IMPROVEMENT: Perform health checks in batches
+        let health_check_batch = peers_to_check
+            .into_iter()
+            .take(HEALTH_CHECK_BATCH)
+            .collect::<Vec<_>>();
+
+        if !health_check_batch.is_empty() {
+            // Check peer health in parallel with rate limiting
+            let max_concurrent_checks = health_check_batch.len().min(5);
+            let semaphore = Arc::new(Semaphore::new(max_concurrent_checks));
+
+            let health_check_futures: Vec<_> = health_check_batch
+                .into_iter()
+                .map(|addr| {
+                    let permit = semaphore.clone().acquire_owned();
+                    let node = self.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = match permit.await {
+                            Ok(permit) => permit,
+                            Err(_) => return (addr, false),
+                        };
+                        let result = node.check_peer_health_internal(addr).await;
+                        (addr, result.is_ok())
+                    })
+                })
+                .collect();
+
+            // Process health check results
+            for result in futures::future::join_all(health_check_futures).await {
+                match result {
+                    Ok((addr, true)) => {
+                        // Peer is healthy, update last_seen
+                        let mut peers = self.peers.write().await;
+                        if let Some(info) = peers.get_mut(&addr) {
+                            info.last_seen = now;
+                        }
+                        drop(peers);
+
+                        // Reset failure counter
+                        self.reset_peer_failures(addr).await;
+                    }
+                    Ok((addr, false)) => {
+                        // Peer is unhealthy, record failure
+                        self.record_peer_failure(addr).await;
+
+                        // Check if peer has failed too many times
+                        let failures = self.peer_failures.read().await;
+                        if failures.get(&addr).copied().unwrap_or(0) >= MAX_FAILURES {
+                            peers_to_remove.push(addr);
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        // IMPROVEMENT: Apply updates to peer state all at once
+        if !peers_to_remove.is_empty() {
+            let remove_list = peers_to_remove.clone();
+            {
+                let mut peers = self.peers.write().await;
+                for addr in &remove_list {
+                    peers.remove(addr);
+                }
+            }
+            {
+                let mut peer_secrets = self.peer_secrets.write().await;
+                for addr in &remove_list {
+                    peer_secrets.remove(addr);
+                }
+            }
+            {
+                let mut pool = self.outbound_connections.write().await;
+                for addr in &remove_list {
+                    pool.remove(addr);
+                }
+            }
+            {
+                let mut breakers = self.outbound_circuit_breakers.write().await;
+                for addr in &remove_list {
+                    breakers.remove(addr);
+                }
+            }
+        }
+
+        // IMPROVEMENT: Initiate discovery if we need more peers
+        let current_peer_count = self.peers.read().await.len();
+        if current_peer_count < MIN_PEERS {
+            debug!(
+                "Low peer count ({}), initiating discovery",
+                current_peer_count
+            );
+
+            // Spawn discovery as a separate task to avoid blocking maintenance
+            tokio::spawn({
+                let node = self.clone();
+                async move {
+                    if let Err(e) = node.discover_network_nodes().await {
+                        warn!("Peer discovery during maintenance failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        // IMPROVEMENT: Rebalance subnet distribution periodically
+        // Only do this if we have enough peers to be selective
+        if current_peer_count >= MIN_PEERS + 2 {
+            if let Err(e) = self.rebalance_peer_subnets().await {
+                warn!("Subnet rebalancing failed: {}", e);
+            }
+        }
+
+        // IMPROVEMENT: Update network health metrics
+        {
+            let mut network_health = self.network_health.write().await;
+            // Fix the type issue - use proper type for active_nodes
+            network_health.active_nodes = active_peers; // Assuming active_peers is already a usize
+
+            network_health.average_response_time = {
+                let peers = self.peers.read().await;
+                if peers.is_empty() {
+                    0
+                } else {
+                    peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
+                }
+            };
+        }
+
+        Ok(())
     }
-    
-    // Drop read lock before acquiring write lock
-    drop(peers);
-    
-    // Remove excess peers
-    if !removals.is_empty() {
-        {
-            let mut peers = self.peers.write().await;
-            for addr in &removals {
-                peers.remove(addr);
+
+    // Helper method - improved subnet rebalancing
+    async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
+        // Get current time at the beginning
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Get current peers
+        let peers = self.peers.read().await;
+
+        // Count peers per subnet
+        let mut subnet_counts = HashMap::new();
+        for (_, info) in peers.iter() {
+            *subnet_counts.entry(info.subnet_group).or_insert(0) += 1;
+        }
+
+        // Find overrepresented subnets
+        let max_per_subnet = (self.max_peers / 8).max(MAX_PEERS_PER_SUBNET);
+        let mut removals = Vec::new();
+
+        for (subnet, count) in subnet_counts.iter() {
+            if *count > max_per_subnet {
+                // Get all peers in this subnet
+                let subnet_peers: Vec<_> = peers
+                    .iter()
+                    .filter(|(_, info)| &info.subnet_group == subnet)
+                    .collect();
+
+                // Get all the rating data first
+                let mut peer_ratings = Vec::with_capacity(subnet_peers.len());
+
+                for (addr, info) in subnet_peers {
+                    // Calculate a quality score
+                    // Lower is better: latency (ms) - blocks (importance) + age (seconds)
+                    let score = info.latency as i64 - (info.blocks as i64)
+                        + (now.saturating_sub(info.last_seen) as i64) / 60;
+
+                    // Fixed: Don't double-dereference the address
+                    peer_ratings.push((*addr, score));
+                }
+
+                // Sort by score (lower is better)
+                peer_ratings.sort_by_key(|&(_, score)| score);
+
+                // Keep the best max_per_subnet, remove the rest
+                let excess_count = count - max_per_subnet;
+                let peers_to_remove = peer_ratings.len().saturating_sub(max_per_subnet);
+
+                for i in (peer_ratings.len() - peers_to_remove)..peer_ratings.len() {
+                    if i < peer_ratings.len() {
+                        removals.push(peer_ratings[i].0);
+                    }
+                }
             }
         }
-        {
-            let mut peer_secrets = self.peer_secrets.write().await;
-            for addr in &removals {
-                peer_secrets.remove(addr);
+
+        // Drop read lock before acquiring write lock
+        drop(peers);
+
+        // Remove excess peers
+        if !removals.is_empty() {
+            {
+                let mut peers = self.peers.write().await;
+                for addr in &removals {
+                    peers.remove(addr);
+                }
+            }
+            {
+                let mut peer_secrets = self.peer_secrets.write().await;
+                for addr in &removals {
+                    peer_secrets.remove(addr);
+                }
+            }
+            {
+                let mut pool = self.outbound_connections.write().await;
+                for addr in &removals {
+                    pool.remove(addr);
+                }
+            }
+            {
+                let mut breakers = self.outbound_circuit_breakers.write().await;
+                for addr in &removals {
+                    breakers.remove(addr);
+                }
             }
         }
-        {
-            let mut pool = self.outbound_connections.write().await;
-            for addr in &removals {
-                pool.remove(addr);
-            }
-        }
-        {
-            let mut breakers = self.outbound_circuit_breakers.write().await;
-            for addr in &removals {
-                breakers.remove(addr);
-            }
-        }
+
+        Ok(())
     }
-    
-    Ok(())
-}
 
     // Request peer height for sync checking
     pub async fn request_peer_height(&self, addr: SocketAddr) -> Result<u32, NodeError> {
@@ -3506,9 +3533,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             let mut all_blocks = Vec::new();
             let mut batch_start = start;
             while batch_start <= end {
-                let batch_end = batch_start
-                    .saturating_add(MAX_BATCH_SIZE - 1)
-                    .min(end);
+                let batch_end = batch_start.saturating_add(MAX_BATCH_SIZE - 1).min(end);
                 let mut batch = self
                     .request_blocks_batch(addr, batch_start, batch_end, MAX_RETRIES)
                     .await?;
@@ -3523,7 +3548,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             return Ok(all_blocks);
         }
 
-        self.request_blocks_batch(addr, start, end, MAX_RETRIES).await
+        self.request_blocks_batch(addr, start, end, MAX_RETRIES)
+            .await
     }
 
     async fn request_blocks_batch(
@@ -3615,7 +3641,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     async fn cleanup_outbound_connections(&self) {
         let pool_snapshot: Vec<(SocketAddr, Arc<Mutex<OutboundConnection>>)> = {
             let pool = self.outbound_connections.read().await;
-            pool.iter().map(|(addr, conn)| (*addr, Arc::clone(conn))).collect()
+            pool.iter()
+                .map(|(addr, conn)| (*addr, Arc::clone(conn)))
+                .collect()
         };
 
         let now = Instant::now();
@@ -3640,7 +3668,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     async fn evict_lru_outbound_connection(&self) {
         let snapshot: Vec<(SocketAddr, Arc<Mutex<OutboundConnection>>)> = {
             let pool = self.outbound_connections.read().await;
-            pool.iter().map(|(addr, conn)| (*addr, Arc::clone(conn))).collect()
+            pool.iter()
+                .map(|(addr, conn)| (*addr, Arc::clone(conn)))
+                .collect()
         };
 
         let mut lru: Option<(SocketAddr, Instant)> = None;
@@ -3677,7 +3707,10 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             last_used: Instant::now(),
         }));
 
-        let max_pool_size = (self.max_connections.saturating_mul(OUTBOUND_POOL_MAX_FACTOR)).max(32);
+        let max_pool_size = (self
+            .max_connections
+            .saturating_mul(OUTBOUND_POOL_MAX_FACTOR))
+        .max(32);
         if self.outbound_connections.read().await.len() >= max_pool_size {
             self.evict_lru_outbound_connection().await;
         }
@@ -3722,7 +3755,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             bincode::serialize(message)?
         };
         if data.is_empty() {
-            return Err(NodeError::Network("Refusing to send empty request".to_string()));
+            return Err(NodeError::Network(
+                "Refusing to send empty request".to_string(),
+            ));
         }
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(NodeError::Network("Outgoing message too large".to_string()));
@@ -3762,9 +3797,12 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
 
                 let mut len_bytes = [0u8; 4];
-                tokio::time::timeout(RESPONSE_TIMEOUT, stream_guard.stream.read_exact(&mut len_bytes))
-                    .await
-                    .map_err(|_| NodeError::Network(format!("Response timeout from {}", addr)))??;
+                tokio::time::timeout(
+                    RESPONSE_TIMEOUT,
+                    stream_guard.stream.read_exact(&mut len_bytes),
+                )
+                .await
+                .map_err(|_| NodeError::Network(format!("Response timeout from {}", addr)))??;
 
                 let len = u32::from_be_bytes(len_bytes) as usize;
                 if len == 0 {
@@ -3780,7 +3818,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                     stream_guard.stream.read_exact(&mut response_data),
                 )
                 .await
-                .map_err(|_| NodeError::Network(format!("Response data timeout from {}", addr)))??;
+                .map_err(|_| {
+                    NodeError::Network(format!("Response data timeout from {}", addr))
+                })??;
 
                 let response = if let Some(ref secret) = shared_secret {
                     self.decrypt_message(&response_data, secret)?
@@ -3883,8 +3923,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
             if full_tx.sig_hash.is_none() {
                 if let Some(sig_hex) = &full_tx.signature {
-                    let sig_bytes = hex::decode(sig_hex)
-                        .map_err(|_| NodeError::InvalidTransaction("Invalid signature bytes".into()))?;
+                    let sig_bytes = hex::decode(sig_hex).map_err(|_| {
+                        NodeError::InvalidTransaction("Invalid signature bytes".into())
+                    })?;
                     full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
                 }
             }
@@ -3920,7 +3961,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                             .map(|parent| parent.hash == block.previous_hash)
                             .unwrap_or(false)
                     };
-                    let ahead_of_tip = block.index > (blockchain.get_latest_block_index() as u32).saturating_add(1);
+                    let ahead_of_tip = block.index
+                        > (blockchain.get_latest_block_index() as u32).saturating_add(1);
                     let orphan_candidate = (!parent_known) || ahead_of_tip;
                     orphan_candidate
                         && Blockchain::calculate_merkle_root(&block.transactions)
@@ -3972,9 +4014,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
         if let Some(sig_hex) = &tx.signature {
             if !Self::is_signature_truncated(sig_hex) {
-                self.tx_witness_cache
-                    .lock()
-                    .put(tx_id.clone(), tx.clone());
+                self.tx_witness_cache.lock().put(tx_id.clone(), tx.clone());
                 return Ok(Some(tx.clone()));
             }
         }
@@ -4098,7 +4138,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             bincode::serialize(message)?
         };
         if data.is_empty() {
-            return Err(NodeError::Network("Refusing to send empty message".to_string()));
+            return Err(NodeError::Network(
+                "Refusing to send empty message".to_string(),
+            ));
         }
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(NodeError::Network("Outgoing message too large".to_string()));
@@ -4167,7 +4209,9 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(default_size);
-        NonZeroUsize::new(size).or_else(|| NonZeroUsize::new(default_size)).unwrap_or(NonZeroUsize::MIN)
+        NonZeroUsize::new(size)
+            .or_else(|| NonZeroUsize::new(default_size))
+            .unwrap_or(NonZeroUsize::MIN)
     }
 
     // Process incoming network messages from other nodes
@@ -4258,13 +4302,17 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                             .iter()
                             .map(|(&addr, info)| (addr, info.clone()))
                             .collect();
-                        
+
                         // Try velocity protocol first for efficient block propagation
                         if let Err(e) = velocity.process_block(&block, &peer_map).await {
-                            warn!("Velocity broadcast failed, falling back to traditional: {}", e);
-                            
+                            warn!(
+                                "Velocity broadcast failed, falling back to traditional: {}",
+                                e
+                            );
+
                             // Fallback to traditional broadcast
-                            let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
+                            let selected_peers =
+                                self.select_broadcast_peers(&peers, peers.len().min(16));
                             for &addr in &selected_peers {
                                 if let Err(e) = self
                                     .send_message(addr, &NetworkMessage::Block(block.clone()))
@@ -4277,7 +4325,8 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                     } else {
                         // Traditional broadcast method
                         let peers = self.peers.read().await;
-                        let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
+                        let selected_peers =
+                            self.select_broadcast_peers(&peers, peers.len().min(16));
                         for &addr in &selected_peers {
                             if let Err(e) = self
                                 .send_message(addr, &NetworkMessage::Block(block.clone()))
@@ -4430,38 +4479,38 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             return Err(NodeError::Network("Rate limit exceeded".into()));
         }
 
-            match message {
-                NetworkMessage::TxRequest { tx_id } => {
-                    let tx_opt = self
-                        .blockchain
-                        .read()
-                        .await
-                        .get_mempool_transaction_by_id(&tx_id)
-                        .await;
+        match message {
+            NetworkMessage::TxRequest { tx_id } => {
+                let tx_opt = self
+                    .blockchain
+                    .read()
+                    .await
+                    .get_mempool_transaction_by_id(&tx_id)
+                    .await;
 
-                    let response = NetworkMessage::TxResponse { tx_id, tx: tx_opt };
-                    self.send_message(addr, &response).await?;
+                let response = NetworkMessage::TxResponse { tx_id, tx: tx_opt };
+                self.send_message(addr, &response).await?;
+            }
+
+            NetworkMessage::TxResponse { tx_id, tx } => {
+                if let Some(ref full_tx) = tx {
+                    let mut cache = self.tx_witness_cache.lock();
+                    cache.put(tx_id.clone(), full_tx.clone());
                 }
 
-                NetworkMessage::TxResponse { tx_id, tx } => {
-                    if let Some(ref full_tx) = tx {
-                        let mut cache = self.tx_witness_cache.lock();
-                        cache.put(tx_id.clone(), full_tx.clone());
-                    }
+                let sender = {
+                    let mut channels = self.tx_response_channels.write().await;
+                    channels.remove(&tx_id)
+                };
 
-                    let sender = {
-                        let mut channels = self.tx_response_channels.write().await;
-                        channels.remove(&tx_id)
-                    };
-
-                    if let Some(sender) = sender {
-                        let _ = sender.send(tx);
-                    }
+                if let Some(sender) = sender {
+                    let _ = sender.send(tx);
                 }
+            }
 
-                NetworkMessage::Transaction(tx_data) => {
-                    let tx_ref = Arc::new(tx_data);
-                    let tx_hash = tx_ref.create_hash();
+            NetworkMessage::Transaction(tx_data) => {
+                let tx_ref = Arc::new(tx_data);
+                let tx_hash = tx_ref.create_hash();
 
                 // Check validation cache
                 if let Some(cached) = self.validation_cache.get(&tx_hash) {
@@ -4531,7 +4580,10 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 }
 
                 // Verify and propagate block
-                if self.verify_block_with_witness(&block_ref, Some(addr)).await? {
+                if self
+                    .verify_block_with_witness(&block_ref, Some(addr))
+                    .await?
+                {
                     // Save block to blockchain
                     self.blockchain.read().await.save_block(&block_ref).await?;
 
@@ -4592,11 +4644,14 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
             }
 
             NetworkMessage::Blocks(blocks) => {
-                tx.send(NetworkEvent::ChainResponse { blocks, sender: addr })
-                    .await
-                    .map_err(|e| {
-                        NodeError::Network(format!("Failed to send chain response event: {}", e))
-                    })?;
+                tx.send(NetworkEvent::ChainResponse {
+                    blocks,
+                    sender: addr,
+                })
+                .await
+                .map_err(|e| {
+                    NodeError::Network(format!("Failed to send chain response event: {}", e))
+                })?;
             }
 
             NetworkMessage::GetBlockHeight => {
@@ -4617,7 +4672,10 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
                 if let Some(velocity) = &self.velocity_manager {
                     if let Ok(Some(block)) = velocity.handle_shred(shred, addr).await {
                         let block_ref = Arc::new(block);
-                        if self.verify_block_with_witness(&block_ref, Some(addr)).await? {
+                        if self
+                            .verify_block_with_witness(&block_ref, Some(addr))
+                            .await?
+                        {
                             self.blockchain.read().await.save_block(&block_ref).await?;
                         }
                     }
@@ -5217,378 +5275,384 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
     }
 
     // Verification - essential for security
-pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
-    const CONNECTION_RETRIES: u32 = 2;
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-    
-    // Best-effort failure gating:
-    // keep trying peers even after prior failures so transient outages can recover.
-    {
-        let failures = self.peer_failures.read().await;
-        if let Some(&count) = failures.get(&addr) {
-            if count >= 3 {
-                debug!(
-                    "Peer {} had {} prior failures; retrying with backoff",
-                    addr, count
-                );
+    pub async fn verify_peer(&self, addr: SocketAddr) -> Result<(), NodeError> {
+        const CONNECTION_RETRIES: u32 = 2;
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        // Best-effort failure gating:
+        // keep trying peers even after prior failures so transient outages can recover.
+        {
+            let failures = self.peer_failures.read().await;
+            if let Some(&count) = failures.get(&addr) {
+                if count >= 3 {
+                    debug!(
+                        "Peer {} had {} prior failures; retrying with backoff",
+                        addr, count
+                    );
+                }
             }
         }
-    }
-    
-    // Try to establish connection with retries
-    let mut stream = None;
-    let mut last_error = None;
-    
-    for retry in 0..CONNECTION_RETRIES {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(addr)
-        ).await {
-            Ok(Ok(s)) => {
-                stream = Some(s);
-                break;
-            }
-            Ok(Err(e)) => {
-                last_error = Some(e);
-                // Exponential backoff
-                if retry < CONNECTION_RETRIES - 1 {
-                    tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
+
+        // Try to establish connection with retries
+        let mut stream = None;
+        let mut last_error = None;
+
+        for retry in 0..CONNECTION_RETRIES {
+            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    stream = Some(s);
+                    break;
                 }
+                Ok(Err(e)) => {
+                    last_error = Some(e);
+                    // Exponential backoff
+                    if retry < CONNECTION_RETRIES - 1 {
+                        tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
+                    }
+                }
+                Err(_) => {
+                    last_error = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Connection timed out",
+                    ));
+                    // Exponential backoff
+                    if retry < CONNECTION_RETRIES - 1 {
+                        tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
+                    }
+                }
+            }
+        }
+
+        let mut stream = match stream {
+            Some(s) => s,
+            None => {
+                // Record failure for this peer
+                self.record_peer_failure(addr).await;
+                return Err(NodeError::Network(format!(
+                    "Failed to connect to {}: {}",
+                    addr,
+                    last_error.unwrap_or_else(|| std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Unknown error"
+                    ))
+                )));
+            }
+        };
+
+        // IMPROVEMENT: Configure TCP socket for better performance
+        stream.set_nodelay(true)?;
+
+        // Use into_std() before converting to Socket
+        let std_stream = stream.into_std()?;
+        let socket = Socket::from(std_stream);
+
+        // Set better TCP keepalive settings
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(5));
+        socket.set_tcp_keepalive(&keepalive)?;
+
+        // Convert socket back to TcpStream
+        let mut stream = TcpStream::from_std(socket.into())?;
+
+        // IMPROVEMENT: Perform handshake with better timeout handling
+        let handshake_result =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, self.perform_handshake(&mut stream, true))
+                .await;
+
+        let (peer_info, shared_secret) = match handshake_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                self.record_peer_failure(addr).await;
+                return Err(NodeError::Network(format!(
+                    "Handshake failed with {}: {}",
+                    addr, e
+                )));
             }
             Err(_) => {
-                last_error = Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timed out"
-                ));
-                // Exponential backoff
-                if retry < CONNECTION_RETRIES - 1 {
-                    tokio::time::sleep(Duration::from_millis(200 * (1 << retry))).await;
-                }
+                self.record_peer_failure(addr).await;
+                return Err(NodeError::Network(format!(
+                    "Handshake timed out with {}",
+                    addr
+                )));
             }
-        }
-    }
-    
-    let mut stream = match stream {
-        Some(s) => s,
-        None => {
-            // Record failure for this peer
+        };
+
+        // IMPROVEMENT: More comprehensive peer validation
+
+        // 1. Version check
+        if peer_info.version != NETWORK_VERSION {
             self.record_peer_failure(addr).await;
             return Err(NodeError::Network(format!(
-                "Failed to connect to {}: {}", 
-                addr, 
-                last_error.unwrap_or_else(|| std::io::Error::new(
-                    std::io::ErrorKind::Other, 
-                    "Unknown error"
-                ))
+                "Version mismatch with {}: {} (expected {})",
+                addr, peer_info.version, NETWORK_VERSION
             )));
         }
-    };
-    
-    // IMPROVEMENT: Configure TCP socket for better performance
-    stream.set_nodelay(true)?;
-    
-    // Use into_std() before converting to Socket
-    let std_stream = stream.into_std()?;
-    let socket = Socket::from(std_stream);
-    
-    // Set better TCP keepalive settings
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(5));
-    socket.set_tcp_keepalive(&keepalive)?;
-    
-    // Convert socket back to TcpStream
-    let mut stream = TcpStream::from_std(socket.into())?;
-    
-    // IMPROVEMENT: Perform handshake with better timeout handling
-    let handshake_result = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        self.perform_handshake(&mut stream, true)
-    ).await;
-    
-    let (peer_info, shared_secret) = match handshake_result {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            self.record_peer_failure(addr).await;
+
+        // 3. Check for subnet limits
+        let mut peers = self.peers.write().await;
+        let subnet_peers = peers
+            .values()
+            .filter(|p| p.subnet_group == peer_info.subnet_group)
+            .count();
+
+        if subnet_peers >= MAX_PEERS_PER_SUBNET && peers.len() >= MIN_PEERS {
             return Err(NodeError::Network(format!(
-                "Handshake failed with {}: {}", 
-                addr, 
-                e
-            )));
-        }
-        Err(_) => {
-            self.record_peer_failure(addr).await;
-            return Err(NodeError::Network(format!(
-                "Handshake timed out with {}", 
+                "Subnet limit reached for {}",
                 addr
             )));
         }
-    };
-    
-    // IMPROVEMENT: More comprehensive peer validation
-    
-    // 1. Version check
-    if peer_info.version != NETWORK_VERSION {
-        self.record_peer_failure(addr).await;
-        return Err(NodeError::Network(format!(
-            "Version mismatch with {}: {} (expected {})",
-            addr, 
-            peer_info.version, 
-            NETWORK_VERSION
-        )));
-    }
-    
-    // 3. Check for subnet limits
-    let mut peers = self.peers.write().await;
-    let subnet_peers = peers
-        .values()
-        .filter(|p| p.subnet_group == peer_info.subnet_group)
-        .count();
-    
-    if subnet_peers >= MAX_PEERS_PER_SUBNET && peers.len() >= MIN_PEERS {
-        return Err(NodeError::Network(format!(
-            "Subnet limit reached for {}", 
-            addr
-        )));
-    }
-    
-    // 4. Store peer information
-    peers.insert(addr, peer_info);
-    drop(peers);
-    
-    let mut peer_secrets = self.peer_secrets.write().await;
-    peer_secrets.insert(addr, shared_secret);
-    drop(peer_secrets);
 
-    if let Err(e) = self.advertise_dilithium_key(addr).await {
-        debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
-    }
-    
-    // Reset failure counter
-    self.reset_peer_failures(addr).await;
-    
-    // IMPROVEMENT: Trigger initial latency measurement
-    tokio::spawn({
-        let node = self.clone();
-        let addr = addr;
-        async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let _ = node.send_ping(addr).await;
+        // 4. Store peer information
+        peers.insert(addr, peer_info);
+        drop(peers);
+
+        let mut peer_secrets = self.peer_secrets.write().await;
+        peer_secrets.insert(addr, shared_secret);
+        drop(peer_secrets);
+
+        if let Err(e) = self.advertise_dilithium_key(addr).await {
+            debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
         }
-    });
-    
-    Ok(())
-}
+
+        // Reset failure counter
+        self.reset_peer_failures(addr).await;
+
+        // IMPROVEMENT: Trigger initial latency measurement
+        tokio::spawn({
+            let node = self.clone();
+            let addr = addr;
+            async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = node.send_ping(addr).await;
+            }
+        });
+
+        Ok(())
+    }
 
     // Sync with network to keep blockchain updated
-pub async fn sync_with_network(&self) -> Result<(), NodeError> {
-    const MAX_RETRIES: u32 = 3;
-    const RETRY_DELAY_MS: u64 = 1000;
-    const PEER_TIMEOUT_MS: u64 = 5000;
-    const MAX_BATCH_SIZE: u32 = 50;  // More reasonable batch size
-    
-    // 1. Get current blockchain state
-    let current_height = {
-        let blockchain = self.blockchain.read().await;
-        blockchain.get_latest_block_index() as u32
-    };
-    
-    // 2. Check peer count and discover if needed
-    let peers = self.peers.read().await;
-    let peer_count = peers.len();
-    
-    if peer_count == 0 {
-        drop(peers); // Release lock before discovery
-        info!("No peers available, discovering network nodes");
-        if let Err(e) = self.discover_network_nodes().await {
-            warn!("Failed to discover peers for sync: {}", e);
-            return Err(NodeError::Network("No peers available for sync".to_string()));
+    pub async fn sync_with_network(&self) -> Result<(), NodeError> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_MS: u64 = 1000;
+        const PEER_TIMEOUT_MS: u64 = 5000;
+        const MAX_BATCH_SIZE: u32 = 50; // More reasonable batch size
+
+        // 1. Get current blockchain state
+        let current_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+
+        // 2. Check peer count and discover if needed
+        let peers = self.peers.read().await;
+        let peer_count = peers.len();
+
+        if peer_count == 0 {
+            drop(peers); // Release lock before discovery
+            info!("No peers available, discovering network nodes");
+            if let Err(e) = self.discover_network_nodes().await {
+                warn!("Failed to discover peers for sync: {}", e);
+                return Err(NodeError::Network(
+                    "No peers available for sync".to_string(),
+                ));
+            }
         }
-    }
-    
-    // 3. IMPROVEMENT: Find multiple peers with highest block height
-    // Get a fresh peer list after possible discovery
-    let peers = self.peers.read().await;
-    
-    // IMPROVEMENT: Track peer heights with better error handling
-    let mut peer_heights = Vec::new();
-    let peer_ips: Vec<_> = peers.keys().cloned().collect();
-    drop(peers);  // Release lock before making network requests
-    
-    // Query peer heights in parallel with better error handling
-    let height_queries: Vec<_> = peer_ips
-        .iter()
-        .map(|&addr| {
-            let node = self.clone();
-            async move {
-                match tokio::time::timeout(
-                    Duration::from_millis(PEER_TIMEOUT_MS),
-                    node.request_peer_height(addr)
-                ).await {
-                    Ok(Ok(height)) => Some((addr, height)),
-                    _ => None,
+
+        // 3. IMPROVEMENT: Find multiple peers with highest block height
+        // Get a fresh peer list after possible discovery
+        let peers = self.peers.read().await;
+
+        // IMPROVEMENT: Track peer heights with better error handling
+        let mut peer_heights = Vec::new();
+        let peer_ips: Vec<_> = peers.keys().cloned().collect();
+        drop(peers); // Release lock before making network requests
+
+        // Query peer heights in parallel with better error handling
+        let height_queries: Vec<_> = peer_ips
+            .iter()
+            .map(|&addr| {
+                let node = self.clone();
+                async move {
+                    match tokio::time::timeout(
+                        Duration::from_millis(PEER_TIMEOUT_MS),
+                        node.request_peer_height(addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(height)) => Some((addr, height)),
+                        _ => None,
+                    }
                 }
+            })
+            .collect();
+
+        // Gather results
+        for result in futures::future::join_all(height_queries).await {
+            if let Some(pair) = result {
+                peer_heights.push(pair);
             }
-        })
-        .collect();
-    
-    // Gather results
-    for result in futures::future::join_all(height_queries).await {
-        if let Some(pair) = result {
-            peer_heights.push(pair);
         }
-    }
-    
-    // Sort by height descending
-    peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
-    
-    // IMPROVEMENT: Check if we already have the latest blocks
-    if let Some((_, best_height)) = peer_heights.first() {
-        if *best_height <= current_height {
-            info!("Already at best height ({}/{})", current_height, best_height);
-            return Ok(());
-        }
-        
-        info!("Syncing from height {} to {}", current_height, best_height);
-    } else {
-        warn!("No peers reported their height");
-        return Err(NodeError::Network("No peers reported their height".to_string()));
-    }
-    
-    // 4. IMPROVEMENT: Try multiple peers for sync
-    // Use up to 3 best peers for sync
-    let sync_candidates = peer_heights.iter().take(3).cloned().collect::<Vec<_>>();
-    
-    if sync_candidates.is_empty() {
-        return Err(NodeError::Network("No suitable peers for sync".to_string()));
-    }
-    
-    let mut blocks_synced = 0;
-    let mut current_sync_height = current_height;
-    
-    // 5. IMPROVEMENT: Process blocks in smaller batches with parallel validation
-    'outer: for sync_attempt in 0..MAX_RETRIES {
-        // Try each candidate in order
-        for (candidate_idx, (peer_addr, peer_height)) in sync_candidates.iter().enumerate() {
-            if current_sync_height >= *peer_height {
-                continue;
+
+        // Sort by height descending
+        peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
+
+        // IMPROVEMENT: Check if we already have the latest blocks
+        if let Some((_, best_height)) = peer_heights.first() {
+            if *best_height <= current_height {
+                info!(
+                    "Already at best height ({}/{})",
+                    current_height, best_height
+                );
+                return Ok(());
             }
-            
-            info!(
-                "Sync attempt {}/{} using peer {} ({}/{})", 
-                sync_attempt + 1, 
-                MAX_RETRIES, 
-                candidate_idx + 1,
-                peer_addr,
-                peer_height
-            );
-            
-            // Sync in smaller batches
-            let mut start = current_sync_height;
-            
-            while start < *peer_height {
-                let end = std::cmp::min(start + MAX_BATCH_SIZE, *peer_height);
-                
-                match self.request_blocks(*peer_addr, start, end).await {
-                    Ok(blocks) => {
-                        // IMPROVEMENT: Process blocks in parallel
-                        let verification_tasks: Vec<_> = blocks
-                            .iter()
-                            .map(|block| {
-                                let node = self.clone();
-                                let block = block.clone();
-                                let peer_addr = *peer_addr;
-                                async move {
-                                    if node
-                                        .verify_block_with_witness(&block, Some(peer_addr))
-                                        .await
-                                        .unwrap_or(false)
-                                    {
-                                        Some(block)
+
+            info!("Syncing from height {} to {}", current_height, best_height);
+        } else {
+            warn!("No peers reported their height");
+            return Err(NodeError::Network(
+                "No peers reported their height".to_string(),
+            ));
+        }
+
+        // 4. IMPROVEMENT: Try multiple peers for sync
+        // Use up to 3 best peers for sync
+        let sync_candidates = peer_heights.iter().take(3).cloned().collect::<Vec<_>>();
+
+        if sync_candidates.is_empty() {
+            return Err(NodeError::Network("No suitable peers for sync".to_string()));
+        }
+
+        let mut blocks_synced = 0;
+        let mut current_sync_height = current_height;
+
+        // 5. IMPROVEMENT: Process blocks in smaller batches with parallel validation
+        'outer: for sync_attempt in 0..MAX_RETRIES {
+            // Try each candidate in order
+            for (candidate_idx, (peer_addr, peer_height)) in sync_candidates.iter().enumerate() {
+                if current_sync_height >= *peer_height {
+                    continue;
+                }
+
+                info!(
+                    "Sync attempt {}/{} using peer {} ({}/{})",
+                    sync_attempt + 1,
+                    MAX_RETRIES,
+                    candidate_idx + 1,
+                    peer_addr,
+                    peer_height
+                );
+
+                // Sync in smaller batches
+                let mut start = current_sync_height;
+
+                while start < *peer_height {
+                    let end = std::cmp::min(start + MAX_BATCH_SIZE, *peer_height);
+
+                    match self.request_blocks(*peer_addr, start, end).await {
+                        Ok(blocks) => {
+                            // IMPROVEMENT: Process blocks in parallel
+                            let verification_tasks: Vec<_> = blocks
+                                .iter()
+                                .map(|block| {
+                                    let node = self.clone();
+                                    let block = block.clone();
+                                    let peer_addr = *peer_addr;
+                                    async move {
+                                        if node
+                                            .verify_block_with_witness(&block, Some(peer_addr))
+                                            .await
+                                            .unwrap_or(false)
+                                        {
+                                            Some(block)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                })
+                                .collect();
+
+                            let verified_blocks: Vec<_> =
+                                futures::future::join_all(verification_tasks)
+                                    .await
+                                    .into_iter()
+                                    .filter_map(|result| result)
+                                    .collect();
+
+                            // Save verified blocks
+                            let actual_count = verified_blocks.len();
+                            if actual_count > 0 {
+                                let blockchain = self.blockchain.read().await;
+                                let mut saved_count = 0;
+
+                                for block in verified_blocks {
+                                    if let Err(e) = blockchain.save_block(&block).await {
+                                        warn!("Failed to save block {}: {}", block.index, e);
                                     } else {
-                                        None
+                                        saved_count += 1;
+                                        current_sync_height = current_sync_height.max(block.index);
                                     }
                                 }
-                            })
-                            .collect();
-                        
-                        let verified_blocks: Vec<_> = futures::future::join_all(verification_tasks)
-                            .await
-                            .into_iter()
-                            .filter_map(|result| result)
-                            .collect();
-                        
-                        // Save verified blocks
-                        let actual_count = verified_blocks.len();
-                        if actual_count > 0 {
-                            let blockchain = self.blockchain.read().await;
-                            let mut saved_count = 0;
-                            
-                            for block in verified_blocks {
-                                if let Err(e) = blockchain.save_block(&block).await {
-                                    warn!("Failed to save block {}: {}", block.index, e);
-                                } else {
-                                    saved_count += 1;
-                                    current_sync_height = current_sync_height.max(block.index);
-                                }
+
+                                info!(
+                                    "Saved {}/{} blocks ({}-{}), now at {}/{}",
+                                    saved_count,
+                                    actual_count,
+                                    start,
+                                    end,
+                                    current_sync_height,
+                                    peer_height
+                                );
+
+                                blocks_synced += saved_count;
+                            } else {
+                                warn!("No valid blocks received for range {}-{}", start, end);
+                                break; // Try next peer
                             }
-                            
-                            info!(
-                                "Saved {}/{} blocks ({}-{}), now at {}/{}",
-                                saved_count,
-                                actual_count,
-                                start,
-                                end,
-                                current_sync_height,
-                                peer_height
+
+                            // Move to next batch based on what we actually processed
+                            start = current_sync_height + 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get blocks {}-{} from peer {}: {}",
+                                start, end, peer_addr, e
                             );
-                            
-                            blocks_synced += saved_count;
-                        } else {
-                            warn!("No valid blocks received for range {}-{}", start, end);
+
+                            // Add short delay before retry
+                            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
                             break; // Try next peer
                         }
-                        
-                        // Move to next batch based on what we actually processed
-                        start = current_sync_height + 1;
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get blocks {}-{} from peer {}: {}", 
-                            start, 
-                            end, 
-                            peer_addr, 
-                            e
-                        );
-                        
-                        // Add short delay before retry
-                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-                        break; // Try next peer
+
+                    // Check if we're done
+                    if current_sync_height >= *peer_height {
+                        info!("Sync complete to height {}", current_sync_height);
+                        break 'outer;
                     }
-                }
-                
-                // Check if we're done
-                if current_sync_height >= *peer_height {
-                    info!("Sync complete to height {}", current_sync_height);
-                    break 'outer;
                 }
             }
+
+            // If we've tried all peers without success, delay before next attempt
+            if sync_attempt < MAX_RETRIES - 1 {
+                tokio::time::sleep(Duration::from_millis(
+                    RETRY_DELAY_MS * (sync_attempt as u64 + 1),
+                ))
+                .await;
+            }
         }
-        
-        // If we've tried all peers without success, delay before next attempt
-        if sync_attempt < MAX_RETRIES - 1 {
-            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * (sync_attempt as u64 + 1))).await;
+
+        // 6. IMPROVEMENT: Report success even with partial progress
+        if blocks_synced > 0 {
+            info!(
+                "Blockchain synchronized: added {} blocks to height {}",
+                blocks_synced, current_sync_height
+            );
+            Ok(())
+        } else {
+            Err(NodeError::Network("Failed to sync any blocks".to_string()))
         }
     }
-    
-    // 6. IMPROVEMENT: Report success even with partial progress
-    if blocks_synced > 0 {
-        info!("Blockchain synchronized: added {} blocks to height {}", blocks_synced, current_sync_height);
-        Ok(())
-    } else {
-        Err(NodeError::Network("Failed to sync any blocks".to_string()))
-    }
-}
 
     async fn perform_handshake(
         &self,

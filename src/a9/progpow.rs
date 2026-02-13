@@ -1,12 +1,12 @@
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
+use log::warn;
 use num_bigint::BigUint;
 use num_cpus;
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use log::warn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,9 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
-use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError, NETWORK_FEE};
+use crate::a9::blockchain::{
+    current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError, NETWORK_FEE,
+};
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
 
@@ -354,22 +356,25 @@ impl MiningManager {
                             let mut header_data = [0u8; 92];
                             let mut offset = 0;
 
-                            header_data[offset..offset+4].copy_from_slice(&local_header.number.to_le_bytes());
+                            header_data[offset..offset + 4]
+                                .copy_from_slice(&local_header.number.to_le_bytes());
                             offset += 4;
 
-                            header_data[offset..offset+32].copy_from_slice(&previous_block_hash);
+                            header_data[offset..offset + 32].copy_from_slice(&previous_block_hash);
                             offset += 32;
 
-                            header_data[offset..offset+8].copy_from_slice(&timestamp.to_le_bytes());
+                            header_data[offset..offset + 8]
+                                .copy_from_slice(&timestamp.to_le_bytes());
                             offset += 8;
 
-                            header_data[offset..offset+8].copy_from_slice(&nonce.to_le_bytes());
+                            header_data[offset..offset + 8].copy_from_slice(&nonce.to_le_bytes());
                             offset += 8;
 
-                            header_data[offset..offset+8].copy_from_slice(&current_network_difficulty.to_le_bytes());
+                            header_data[offset..offset + 8]
+                                .copy_from_slice(&current_network_difficulty.to_le_bytes());
                             offset += 8;
 
-                            header_data[offset..offset+32].copy_from_slice(&merkle_root);
+                            header_data[offset..offset + 32].copy_from_slice(&merkle_root);
 
                             *blake3::hash(&header_data).as_bytes()
                         };
@@ -448,7 +453,9 @@ impl MiningManager {
                 };
 
                 // Use the hash found during mining (which met the target)
-                new_block.hash = hash.try_into().map_err(|_| MiningError::InvalidHashFormat)?;
+                new_block.hash = hash
+                    .try_into()
+                    .map_err(|_| MiningError::InvalidHashFormat)?;
 
                 // Separate verification step with timeout and logging
                 match tokio::time::timeout(Duration::from_secs(8), async {

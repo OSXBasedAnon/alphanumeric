@@ -2675,7 +2675,14 @@ async fn publish_bootstrap_snapshot(
 
     if !resp.status().is_success() {
         let _ = fs::remove_file(&zip_path).await;
-        return Err(format!("bootstrap publish failed: {}", resp.status()).into());
+        // Include response body to make server-side misconfiguration debuggable (Blob/KV/env issues).
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(format!("bootstrap publish failed: {}", status).into());
+        }
+        return Err(format!("bootstrap publish failed: {}: {}", status, body).into());
     }
 
     let parsed: PublishResponse = resp.json().await?;
@@ -2760,7 +2767,13 @@ async fn publish_bootstrap_snapshot(
     let _ = fs::remove_file(&zip_path).await;
 
     if !pointer_resp.status().is_success() {
-        return Err(format!("bootstrap pointer update failed: {}", pointer_resp.status()).into());
+        let status = pointer_resp.status();
+        let body = pointer_resp.text().await.unwrap_or_default();
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(format!("bootstrap pointer update failed: {}", status).into());
+        }
+        return Err(format!("bootstrap pointer update failed: {}: {}", status, body).into());
     }
 
     let _ = write_bootstrap_publish_meta(db, updated_at, height);

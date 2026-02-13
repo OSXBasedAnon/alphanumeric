@@ -38,8 +38,9 @@ const REWARD_SCORE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 day window for scoring
 const DILITHIUM_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_DILITHIUM_BIND_V1";
 
 pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8]) -> Vec<u8> {
-    let mut payload =
-        Vec::with_capacity(DILITHIUM_BINDING_CONTEXT.len() + node_id.len() + dilithium_public_key.len() + 6);
+    let mut payload = Vec::with_capacity(
+        DILITHIUM_BINDING_CONTEXT.len() + node_id.len() + dilithium_public_key.len() + 6,
+    );
     payload.extend_from_slice(DILITHIUM_BINDING_CONTEXT);
     payload.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
     payload.extend_from_slice(node_id.as_bytes());
@@ -470,7 +471,7 @@ impl BPoSSentinel {
         // Add daily wallet pruning task
         tokio::task::spawn(async move {
             // Wallet pruning is no longer needed since we removed the wallet registry
-            
+
             // Run periodic tasks every 24 hours
             let mut interval = interval(Duration::from_secs(24 * 3600));
             loop {
@@ -1021,7 +1022,6 @@ impl BPoSSentinel {
         Ok(())
     }
 
-
     pub async fn get_node_metrics(&self, address: &str) -> Result<NodeMetrics, String> {
         self.node_metrics
             .get(address)
@@ -1395,10 +1395,8 @@ impl BPoSSentinel {
         const MIN_BLOCK_AGE_FOR_VERIFICATION: u32 = 100; // Skip blocks older than 100 blocks
         let start_height = current_height.saturating_sub(BLOCK_VERIFICATION_BATCH_SIZE as u32);
         let min_height = MIN_BLOCK_AGE_FOR_VERIFICATION.max(start_height);
-        
-        let blocks: Vec<_> = (min_height..current_height)
-            .rev()
-            .collect();
+
+        let blocks: Vec<_> = (min_height..current_height).rev().collect();
 
         let results = futures::future::join_all(
             blocks
@@ -1476,13 +1474,13 @@ impl BPoSSentinel {
                     // For confirmed blocks in the chain, skip detailed validation
                     // These blocks have already been validated when they were mined and accepted
                     // BPoS anomaly detection should focus on network-level attacks, not re-validation
-                    
+
                     // Basic sanity checks only
                     if block.transactions.is_empty() && block.index > 0 {
                         // Empty non-genesis blocks are suspicious
                         return false;
                     }
-                    
+
                     // Check for obviously invalid data (negative values, etc.)
                     for tx in &block.transactions {
                         if tx.amount < 0.0 || tx.fee < 0.0 {
@@ -1530,17 +1528,17 @@ impl BPoSSentinel {
     async fn verify_transaction(&self, tx: &Transaction) -> Result<bool, String> {
         // For transactions in confirmed blocks, we only need to verify structural integrity
         // Balance and signature verification was already done when the block was mined
-        
+
         // Basic sanity checks for confirmed transactions
         if tx.amount < 0.0 || tx.fee < 0.0 {
             return Ok(false);
         }
-        
+
         // System addresses are always valid in confirmed blocks
         if tx.sender == "MINING_REWARDS" {
             return Ok(true);
         }
-        
+
         // For regular transactions in confirmed blocks, assume they were valid when confirmed
         // The fact that they're in a confirmed block means they passed validation when created
         Ok(true)
@@ -1548,7 +1546,10 @@ impl BPoSSentinel {
 
     async fn handle_chain_anomalies(&self, anomalies: Vec<u32>) -> Result<(), String> {
         for height in anomalies {
-            error!("CRITICAL: Chain anomaly detected at height {} - requires immediate attention", height);
+            error!(
+                "CRITICAL: Chain anomaly detected at height {} - requires immediate attention",
+                height
+            );
 
             // Alert network
             self.broadcast_anomaly_alert(height).await?;
@@ -1567,7 +1568,7 @@ impl BPoSSentinel {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let mut last_broadcast = self.last_anomaly_broadcast.write().await;
         if now - *last_broadcast < 60 {
             // Skip broadcast if less than 60 seconds since last one
@@ -1575,7 +1576,7 @@ impl BPoSSentinel {
         }
         *last_broadcast = now;
         drop(last_broadcast);
-        
+
         let peers = self.node.peers.read().await;
 
         for (addr, _) in peers.iter() {
@@ -2241,14 +2242,12 @@ impl HeaderSentinel {
             .ok_or_else(|| format!("No Dilithium key registered for node {}", node_id))?;
         let pub_key = PublicKey::from_bytes(&public_key_bytes)
             .map_err(|e| format!("Invalid public key format: {}", e))?;
-        Ok(
-            pqcrypto_dilithium::dilithium5::verify_detached_signature(
-                &detached_sig,
-                payload,
-                &pub_key,
-            )
-            .is_ok(),
+        Ok(pqcrypto_dilithium::dilithium5::verify_detached_signature(
+            &detached_sig,
+            payload,
+            &pub_key,
         )
+        .is_ok())
     }
 
     pub fn local_dilithium_public_key(&self) -> Vec<u8> {

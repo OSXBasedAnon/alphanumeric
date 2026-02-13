@@ -156,7 +156,11 @@ impl MiningConfig {
 
         if let Ok(threads) = env::var("ALPHANUMERIC_MINING_THREADS") {
             if let Ok(threads) = threads.parse::<usize>() {
-                config.threads = if threads == 0 { num_cpus::get() } else { threads };
+                config.threads = if threads == 0 {
+                    num_cpus::get()
+                } else {
+                    threads
+                };
             }
         }
 
@@ -198,19 +202,22 @@ impl AppConfig {
 
     pub fn log_config(&self) {
         let mining_info = if self.mining.enabled {
-            format!(" mining={} threads={} target={}", 
-                self.mining.enabled, self.mining.threads, self.mining.difficulty_target)
+            format!(
+                " mining={} threads={} target={}",
+                self.mining.enabled, self.mining.threads, self.mining.difficulty_target
+            )
         } else {
             format!(" mining={}", self.mining.enabled)
         };
-        
-        print!("Alphanumeric port={} bind={} peers={} conns={} velocity={} seeds={} db={}{}", 
-            self.network.port, 
-            self.network.bind_ip, 
-            self.network.max_peers, 
+
+        print!(
+            "Alphanumeric port={} bind={} peers={} conns={} velocity={} seeds={} db={}{}",
+            self.network.port,
+            self.network.bind_ip,
+            self.network.max_peers,
             self.network.max_connections,
-            self.network.velocity_enabled, 
-            self.network.seed_nodes.len(), 
+            self.network.velocity_enabled,
+            self.network.seed_nodes.len(),
             self.database.path,
             mining_info
         );

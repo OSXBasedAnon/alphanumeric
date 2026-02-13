@@ -1,5 +1,5 @@
-use inquire::{Password, PasswordDisplayMode};
 use hex;
+use inquire::{Password, PasswordDisplayMode};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -557,12 +557,7 @@ impl Mgmt {
             wallets
                 .values()
                 .find(|w| w.address == wallet_input)
-                .ok_or_else(|| {
-                    format!(
-                        "No wallet found with name or address: {}",
-                        wallet_input
-                    )
-                })?
+                .ok_or_else(|| format!("No wallet found with name or address: {}", wallet_input))?
         };
 
         let (transactions, last_hash, next_block_index, difficulty, mining_reward) = {

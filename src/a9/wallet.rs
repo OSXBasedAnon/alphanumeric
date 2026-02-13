@@ -180,8 +180,8 @@ impl Wallet {
 
         let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
-        let address_binary = hex::decode(&wallet_address)
-            .map_err(|_| "Invalid wallet address".to_string())?;
+        let address_binary =
+            hex::decode(&wallet_address).map_err(|_| "Invalid wallet address".to_string())?;
 
         let keys = WalletKeys {
             dilithium_secret_key_bytes: secret_bytes.to_vec(),

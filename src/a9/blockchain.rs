@@ -8,6 +8,7 @@ use log::error;
 use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
+use parking_lot::Mutex as PLMutex;
 use pqcrypto_traits::sign::{
     DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
@@ -24,7 +25,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
-use parking_lot::Mutex as PLMutex;
 
 use crate::a9::mempool::{Mempool, TemporalVerification};
 use crate::a9::oracle::DifficultyOracle;
@@ -151,7 +151,6 @@ impl Transaction {
         }
     }
 
-
     pub fn create_and_sign(
         sender: String,
         recipient: String,
@@ -193,9 +192,8 @@ impl Transaction {
             Some(hex::encode(&full_signature)),
         );
         tx_with_full_sig.sig_hash = Some(Self::signature_hash_hex(&full_signature));
-        tx_with_full_sig.pub_key = Some(
-            block_on(sender_wallet.get_public_key_hex()).ok_or("Failed to get public key")?,
-        );
+        tx_with_full_sig.pub_key =
+            Some(block_on(sender_wallet.get_public_key_hex()).ok_or("Failed to get public key")?);
 
         // Verify the full signature
         if let Some(pub_key) = &tx_with_full_sig.pub_key {
@@ -546,22 +544,22 @@ impl Block {
         let mut header_data = [0u8; 92];
         let mut offset = 0;
 
-        header_data[offset..offset+4].copy_from_slice(&self.index.to_le_bytes());
+        header_data[offset..offset + 4].copy_from_slice(&self.index.to_le_bytes());
         offset += 4;
 
-        header_data[offset..offset+32].copy_from_slice(&self.previous_hash);
+        header_data[offset..offset + 32].copy_from_slice(&self.previous_hash);
         offset += 32;
 
-        header_data[offset..offset+8].copy_from_slice(&self.timestamp.to_le_bytes());
+        header_data[offset..offset + 8].copy_from_slice(&self.timestamp.to_le_bytes());
         offset += 8;
 
-        header_data[offset..offset+8].copy_from_slice(&self.nonce.to_le_bytes());
+        header_data[offset..offset + 8].copy_from_slice(&self.nonce.to_le_bytes());
         offset += 8;
 
-        header_data[offset..offset+8].copy_from_slice(&self.difficulty.to_le_bytes());
+        header_data[offset..offset + 8].copy_from_slice(&self.difficulty.to_le_bytes());
         offset += 8;
 
-        header_data[offset..offset+32].copy_from_slice(&self.merkle_root);
+        header_data[offset..offset + 32].copy_from_slice(&self.merkle_root);
 
         *blake3::hash(&header_data).as_bytes()
     }
@@ -605,11 +603,7 @@ impl Block {
                 let reward_tx = reward_txs[0];
 
                 // Verify reward transaction is the first transaction in block
-                if block
-                    .transactions
-                    .first()
-                    .map(|tx| tx.sender.as_str())
-                    != Some("MINING_REWARDS")
+                if block.transactions.first().map(|tx| tx.sender.as_str()) != Some("MINING_REWARDS")
                 {
                     return Err(BlockchainError::InvalidTransaction);
                 }
@@ -849,7 +843,10 @@ impl RateLimiter {
         // Fast path: check if we need to cleanup at all
         if !times.is_empty() && times[0] < cutoff {
             // Binary search to find first valid entry
-            let first_valid = times.iter().position(|&t| t >= cutoff).unwrap_or(times.len());
+            let first_valid = times
+                .iter()
+                .position(|&t| t >= cutoff)
+                .unwrap_or(times.len());
             // Efficiently remove old entries by draining
             times.drain(0..first_valid);
         }
@@ -1006,7 +1003,10 @@ impl Blockchain {
         self.get_orphan_block_by_hash(&block.previous_hash)
     }
 
-    async fn prevalidate_unattached_block_strict(&self, block: &Block) -> Result<(), BlockchainError> {
+    async fn prevalidate_unattached_block_strict(
+        &self,
+        block: &Block,
+    ) -> Result<(), BlockchainError> {
         // Basic header checks include hash self-consistency + PoW proof.
         block.validate_header()?;
 
@@ -1173,7 +1173,9 @@ impl Blockchain {
 
     fn best_orphan_child_of(&self, parent: &Block) -> Result<Option<Block>, BlockchainError> {
         let mut children = self.orphan_children_of(&parent.hash)?;
-        children.retain(|c| c.index == parent.index.saturating_add(1) && c.previous_hash == parent.hash);
+        children.retain(|c| {
+            c.index == parent.index.saturating_add(1) && c.previous_hash == parent.hash
+        });
         children.sort_by(|a, b| {
             b.difficulty
                 .cmp(&a.difficulty)
@@ -1345,7 +1347,8 @@ impl Blockchain {
         for b in &branch {
             let key = format!("block_{}", b.index);
             let storage = Self::to_storage_block(b);
-            self.db.insert(key.as_bytes(), bincode::serialize(&storage)?)?;
+            self.db
+                .insert(key.as_bytes(), bincode::serialize(&storage)?)?;
         }
         self.db.flush()?;
 
@@ -1427,7 +1430,8 @@ impl Blockchain {
             .chain_sentinel
             .last_verification
             .load(Ordering::Relaxed);
-        let should_verify_integrity = block.index % 128 == 0 || now.saturating_sub(last_integrity) >= 60;
+        let should_verify_integrity =
+            block.index % 128 == 0 || now.saturating_sub(last_integrity) >= 60;
 
         if should_verify_integrity {
             if !self.chain_sentinel.verify_chain_integrity(self).await {
@@ -1638,9 +1642,8 @@ impl Blockchain {
             .unwrap_or(false);
 
         let current_height = Self::get_balances_height(&balances_tree)?;
-        let needs_rebuild = force_rebuild
-            || current_height.is_none()
-            || current_height.unwrap_or(0) != tip;
+        let needs_rebuild =
+            force_rebuild || current_height.is_none() || current_height.unwrap_or(0) != tip;
 
         if needs_rebuild {
             self.rebuild_balances_index(&balances_tree).await?;
@@ -1697,7 +1700,9 @@ impl Blockchain {
         difficulty: Arc<Mutex<u64>>, // Add difficulty parameter
     ) -> Self {
         let chain_sentinel = Arc::new(ChainSentinel::new());
-        let signature_cache = Arc::new(PLMutex::new(LruCache::new(Self::signature_cache_capacity())));
+        let signature_cache = Arc::new(PLMutex::new(LruCache::new(
+            Self::signature_cache_capacity(),
+        )));
 
         // Create the blockchain instance using passed in difficulty
         let blockchain = Self {
@@ -1814,9 +1819,9 @@ impl Blockchain {
                 let mut transactions = Vec::new();
                 for item in tree.iter() {
                     if let Ok((_, tx_bytes)) = item {
-                    if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                        transactions.push(tx);
-                    }
+                        if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+                            transactions.push(tx);
+                        }
                     }
                 }
                 transactions
@@ -2080,9 +2085,7 @@ impl Blockchain {
     }
 
     pub fn get_orphan_count(&self) -> usize {
-        self.open_orphan_blocks_tree()
-            .map(|t| t.len())
-            .unwrap_or(0)
+        self.open_orphan_blocks_tree().map(|t| t.len()).unwrap_or(0)
     }
 
     pub async fn get_current_difficulty(&self) -> u64 {
@@ -2426,12 +2429,7 @@ impl Blockchain {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
 
-        if block
-            .transactions
-            .first()
-            .map(|tx| tx.sender.as_str())
-            != Some("MINING_REWARDS")
-        {
+        if block.transactions.first().map(|tx| tx.sender.as_str()) != Some("MINING_REWARDS") {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
 
@@ -2589,7 +2587,7 @@ impl Blockchain {
 
         // Get confirmed balance and pending debit index (O(1) lookup)
         let mempool_guard = self.mempool.read().await;
-        
+
         let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
         let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
 
@@ -2838,7 +2836,6 @@ impl Blockchain {
             e
         })
     }
-
 
     pub async fn sync_mempool_with_sled(&self) -> Result<(), BlockchainError> {
         // Clear existing mempool
