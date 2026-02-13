@@ -36,6 +36,9 @@ mod config;
 const KEY_FILE_PATH: &str = "private.key";
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
+const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
+const BOOTSTRAP_META_LAST_PUBLISH_AT: &[u8] = b"last_publish_at";
+const BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT: &[u8] = b"last_published_height";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -583,6 +586,7 @@ async fn main() -> Result<()> {
             println!("4. Make New Wallet (format: new [wallet_name])");
             println!("5. Account Lookup (format: account address)");
             println!("6. Mine Block (format: mine miner_wallet_name)");
+            println!("8. Push Snapshot (format: push)");
             println!("7. Exit");
 
             let mut command = String::new();
@@ -815,8 +819,13 @@ println!("Failed to rename wallet: {}", e);
 println!("Wallet renamed successfully");
 }
 }
-}
-Some("mine") => {
+                }
+                Some("push") => {
+                    if let Err(e) = handle_push_command(&db_path, &blockchain).await {
+                        println!("Error: {}", e);
+                    }
+                }
+                Some("mine") => {
 let parts: Vec<&str> = command.split_whitespace().collect();
 if parts.len() != 2 {
 println!("Usage: mine <miner_wallet_name>");
@@ -2505,10 +2514,12 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(180);
 
+    let db = { blockchain.read().await.db.clone() };
+    let (mut last_published_at, mut last_published_height) =
+        read_bootstrap_publish_meta(&db).unwrap_or((0, 0));
+
     let mut last_tip_hash: Option<String> = None;
     let mut last_tip_change = Instant::now();
-    let mut last_published_height: u64 = 0;
-    let mut last_publish_at = Instant::now() - Duration::from_secs(cooldown_secs);
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -2525,7 +2536,12 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
             last_tip_change = Instant::now();
         }
 
-        if last_publish_at.elapsed().as_secs() < cooldown_secs {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now_secs.saturating_sub(last_published_at) < cooldown_secs {
             continue;
         }
 
@@ -2537,19 +2553,28 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
             continue;
         }
 
-        if let Err(e) =
-            publish_bootstrap_snapshot(&db_path, height, &tip_hash_hex, &publish_url, &token).await
+        if let Err(e) = publish_bootstrap_snapshot(
+            &db,
+            &db_path,
+            height,
+            &tip_hash_hex,
+            &publish_url,
+            &token,
+        )
+        .await
         {
             error!("bootstrap publish failed: {}", e);
             continue;
         }
 
         last_published_height = height;
-        last_publish_at = Instant::now();
+        last_published_at = now_secs;
+        let _ = write_bootstrap_publish_meta(&db, last_published_at, last_published_height);
     }
 }
 
 async fn publish_bootstrap_snapshot(
+    db: &sled::Db,
     db_path: &str,
     height: u64,
     tip_hash_hex: &str,
@@ -2737,5 +2762,78 @@ async fn publish_bootstrap_snapshot(
         return Err(format!("bootstrap pointer update failed: {}", pointer_resp.status()).into());
     }
 
+    let _ = write_bootstrap_publish_meta(db, updated_at, height);
+    Ok(())
+}
+
+fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
+    let tree = db.open_tree(BOOTSTRAP_META_TREE).ok()?;
+    let last_at = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISH_AT)
+        .ok()
+        .flatten()
+        .and_then(|v| bincode::deserialize::<u64>(&v).ok())
+        .unwrap_or(0);
+    let last_height = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT)
+        .ok()
+        .flatten()
+        .and_then(|v| bincode::deserialize::<u64>(&v).ok())
+        .unwrap_or(0);
+    Some((last_at, last_height))
+}
+
+fn write_bootstrap_publish_meta(
+    db: &sled::Db,
+    last_at: u64,
+    last_height: u64,
+) -> std::result::Result<(), sled::Error> {
+    let tree = db.open_tree(BOOTSTRAP_META_TREE)?;
+    let mut batch = sled::Batch::default();
+    batch.insert(BOOTSTRAP_META_LAST_PUBLISH_AT, bincode::serialize(&last_at).unwrap_or_default());
+    batch.insert(
+        BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT,
+        bincode::serialize(&last_height).unwrap_or_default(),
+    );
+    tree.apply_batch(batch)?;
+    tree.flush()?;
+    Ok(())
+}
+
+async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>) -> Result<()> {
+    let token = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN")
+        .map_err(|_| "push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set")?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set".into());
+    }
+
+    let publish_url = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://alphanumeric.blue/api/bootstrap/publish".to_string());
+
+    let cooldown_secs = 3600u64;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let (db, height, tip_hash_hex) = {
+        let bc = blockchain.read().await;
+        let db = bc.db.clone();
+        let height = bc.get_latest_block_index() as u64;
+        let tip_hash_hex = hex::encode(bc.get_latest_block_hash());
+        (db, height, tip_hash_hex)
+    };
+
+    let (last_at, _last_height) = read_bootstrap_publish_meta(&db).unwrap_or((0, 0));
+    if now_secs.saturating_sub(last_at) < cooldown_secs {
+        let remaining = cooldown_secs.saturating_sub(now_secs.saturating_sub(last_at));
+        return Err(format!("push is rate-limited: wait {}s", remaining).into());
+    }
+
+    publish_bootstrap_snapshot(&db, db_path, height, &tip_hash_hex, &publish_url, &token).await?;
+    println!("Bootstrap snapshot published at height {}", height);
     Ok(())
 }

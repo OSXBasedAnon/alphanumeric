@@ -9,6 +9,9 @@
 /path/
 /alphanumeric_serverless_plan.txt
 
+# Secrets
+.env
+
 # OS
 .DS_Store
 Thumbs.db
