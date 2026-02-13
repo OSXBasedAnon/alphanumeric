@@ -2520,6 +2520,7 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
 
     let mut last_tip_hash: Option<String> = None;
     let mut last_tip_change = Instant::now();
+    let mut next_attempt_at: u64 = 0;
 
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -2540,6 +2541,10 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        if now_secs < next_attempt_at {
+            continue;
+        }
 
         if now_secs.saturating_sub(last_published_at) < cooldown_secs {
             continue;
@@ -2564,11 +2569,22 @@ async fn bootstrap_publish_loop(db_path: String, blockchain: Arc<RwLock<Blockcha
         .await
         {
             error!("bootstrap publish failed: {}", e);
+            // Backoff: avoid spamming the endpoint if configuration is wrong or transient errors occur.
+            // - Redirect/auth errors: 10 minutes
+            // - Other errors: 2 minutes
+            let msg = e.to_string();
+            let backoff = if msg.contains("redirected") || msg.contains("401") || msg.contains("unauthorized") {
+                600u64
+            } else {
+                120u64
+            };
+            next_attempt_at = now_secs.saturating_add(backoff);
             continue;
         }
 
         last_published_height = height;
         last_published_at = now_secs;
+        next_attempt_at = 0;
         let _ = write_bootstrap_publish_meta(&db, last_published_at, last_published_height);
     }
 }
