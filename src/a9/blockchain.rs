@@ -8,10 +8,6 @@ use log::error;
 use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
-use pqcrypto_dilithium::dilithium5::{
-    detached_sign, keypair as dilithium_keypair, verify_detached_signature, DetachedSignature,
-    PublicKey, SecretKey,
-};
 use pqcrypto_traits::sign::{
     DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
@@ -37,6 +33,7 @@ use crate::a9::wallet::Wallet;
 
 const BLOCKCHAIN_PATH: &str = "blockchain.db";
 const BALANCES_TREE: &str = "balances";
+const PENDING_DEBITS_TREE: &str = "pending_debits";
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
@@ -440,13 +437,8 @@ impl Block {
             .as_secs();
 
         const MAX_FUTURE_TIME: u64 = 300;
-        const MAX_PAST_TIME: u64 = 300;
 
         if self.timestamp > now + MAX_FUTURE_TIME {
-            return Err(BlockchainError::InvalidBlockHeader);
-        }
-
-        if self.timestamp < now - MAX_PAST_TIME {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
@@ -889,9 +881,6 @@ impl SystemKeyDeriver {
             return Err(BlockchainError::InvalidHash);
         }
 
-        // Derive block keys only after PoW verification
-        let (_, pub_key) = Self::derive_block_keys(block)?;
-
         // Verify transaction is part of the block with exact matching
         if !block.transactions.iter().any(|block_tx| {
             block_tx.sender == tx.sender &&
@@ -903,64 +892,13 @@ impl SystemKeyDeriver {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
 
-        // If signature is present, verify it
-        if let Some(sig) = &tx.signature {
-            let sig_bytes =
-                hex::decode(sig).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
-
-            let detached_sig = DetachedSignature::from_bytes(&sig_bytes)
-                .map_err(|_| BlockchainError::InvalidTransactionSignature)?;
-
-            // Create message binding transaction to block's proof of work
-            let message = [
-                block.hash.as_slice(),
-                &block.nonce.to_le_bytes(),
-                &block.difficulty.to_le_bytes(),
-                tx.recipient.as_bytes(),
-                tx.amount.to_le_bytes().as_slice(),
-            ]
-            .concat();
-
-            verify_detached_signature(&detached_sig, &message, &pub_key)
-                .map_err(|_| BlockchainError::InvalidTransactionSignature)?;
-        } else {
+        // Deterministic rule: system rewards are protocol-generated and unsigned.
+        // Reject legacy/random-key signature variants to avoid node divergence.
+        if tx.signature.is_some() || tx.sig_hash.is_some() {
             return Err(BlockchainError::InvalidTransactionSignature);
         }
 
         Ok(())
-    }
-
-    fn derive_block_keys(block: &Block) -> Result<(SecretKey, PublicKey), BlockchainError> {
-        // Optimized key derivation using all block data
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&block.hash);
-        hasher.update(&block.previous_hash);
-        hasher.update(&block.index.to_le_bytes());
-        hasher.update(&block.nonce.to_le_bytes());
-        hasher.update(&block.difficulty.to_le_bytes());
-        hasher.update(&block.merkle_root);
-        let seed = hasher.finalize();
-
-        let (pub_key, secret_key) = dilithium_keypair();
-
-        // Verify the derived keys with a binding signature
-        let message = [
-            block.hash.as_slice(),
-            &block.index.to_le_bytes(),
-            pub_key.as_bytes(),
-            &block.nonce.to_le_bytes(),
-            &block.difficulty.to_le_bytes(),
-        ]
-        .concat();
-
-        let binding_sig = detached_sign(&message, &secret_key);
-
-        match verify_detached_signature(&binding_sig, &message, &pub_key) {
-            Ok(_) => Ok((secret_key, pub_key)),
-            Err(_) => Err(BlockchainError::InvalidBlockKeys(String::from(
-                "Key verification failed",
-            ))),
-        }
     }
 }
 
@@ -1030,6 +968,61 @@ impl Blockchain {
 
     fn open_orphan_index_tree(&self) -> Result<sled::Tree, BlockchainError> {
         self.db.open_tree(ORPHAN_INDEX_TREE).map_err(Into::into)
+    }
+
+    fn open_pending_debits_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(PENDING_DEBITS_TREE).map_err(Into::into)
+    }
+
+    async fn get_pending_debit_for(&self, address: &str) -> Result<f64, BlockchainError> {
+        let tree = self.open_pending_debits_tree()?;
+        if let Some(raw) = tree.get(address.as_bytes())? {
+            let debit: f64 = bincode::deserialize(&raw)?;
+            Ok(debit)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    fn set_pending_debit_for(
+        tree: &sled::Tree,
+        address: &str,
+        debit: f64,
+    ) -> Result<(), BlockchainError> {
+        let normalized = Transaction::round_amount(debit.max(0.0));
+        if normalized <= 0.0 {
+            tree.remove(address.as_bytes())?;
+        } else {
+            tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
+        }
+        Ok(())
+    }
+
+    async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
+        let pending_tree = self.db.open_tree("pending_transactions")?;
+        let debits_tree = self.open_pending_debits_tree()?;
+        debits_tree.clear()?;
+
+        let mut totals: HashMap<String, f64> = HashMap::new();
+        for item in pending_tree.iter() {
+            let (_, tx_bytes) = item?;
+            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+                if tx.sender != "MINING_REWARDS" {
+                    *totals.entry(tx.sender.clone()).or_insert(0.0) += tx.amount + tx.fee;
+                }
+            }
+        }
+
+        let mut batch = sled::Batch::default();
+        for (address, total) in totals {
+            let normalized = Transaction::round_amount(total.max(0.0));
+            if normalized > 0.0 {
+                batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
+            }
+        }
+        debits_tree.apply_batch(batch)?;
+        debits_tree.flush()?;
+        Ok(())
     }
 
     fn store_orphan_block(&self, block: &Block) -> Result<(), BlockchainError> {
@@ -1109,6 +1102,196 @@ impl Blockchain {
         Ok(children)
     }
 
+    fn best_orphan_child_of(&self, parent: &Block) -> Result<Option<Block>, BlockchainError> {
+        let mut children = self.orphan_children_of(&parent.hash)?;
+        children.retain(|c| c.index == parent.index.saturating_add(1) && c.previous_hash == parent.hash);
+        children.sort_by(|a, b| {
+            b.difficulty
+                .cmp(&a.difficulty)
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        Ok(children.into_iter().next())
+    }
+
+    fn collect_orphan_branch_from(
+        &self,
+        start: Block,
+        max_depth: usize,
+    ) -> Result<Vec<Block>, BlockchainError> {
+        let mut branch = vec![start.clone()];
+        let mut current = start;
+        for _ in 0..max_depth {
+            let Some(next) = self.best_orphan_child_of(&current)? else {
+                break;
+            };
+            if next.index != current.index.saturating_add(1) || next.previous_hash != current.hash {
+                break;
+            }
+            branch.push(next.clone());
+            current = next;
+        }
+        Ok(branch)
+    }
+
+    fn canonical_work_range(&self, start: u32, end: u32) -> Result<u128, BlockchainError> {
+        if end < start {
+            return Ok(0);
+        }
+        let mut work: u128 = 0;
+        for height in start..=end {
+            let block = self.get_block(height)?;
+            work = work.saturating_add(block.difficulty as u128);
+        }
+        Ok(work)
+    }
+
+    fn branch_work_to_height(branch: &[Block], max_height: u32) -> u128 {
+        branch
+            .iter()
+            .filter(|b| b.index <= max_height)
+            .fold(0u128, |acc, b| acc.saturating_add(b.difficulty as u128))
+    }
+
+    fn to_storage_block(block: &Block) -> Block {
+        let mut storage_block = block.clone();
+        storage_block.transactions = block
+            .transactions
+            .iter()
+            .map(|tx| {
+                if tx.sender == "MINING_REWARDS" {
+                    return tx.clone();
+                }
+
+                let mut full_tx = tx.clone();
+                if full_tx.sig_hash.is_none() {
+                    if let Some(sig_hex) = &full_tx.signature {
+                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+                        }
+                    }
+                }
+
+                match &full_tx.sig_hash {
+                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
+                    None => full_tx,
+                }
+            })
+            .collect();
+        storage_block
+    }
+
+    async fn try_adopt_orphan_branch(&self) -> Result<bool, BlockchainError> {
+        let Some(tip) = self.get_last_block() else {
+            return Ok(false);
+        };
+        let orphan_blocks = self.open_orphan_blocks_tree()?;
+        let mut candidates = Vec::new();
+
+        for item in orphan_blocks.iter() {
+            let (_, raw) = item?;
+            let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) else {
+                continue;
+            };
+            let b = entry.block;
+
+            if b.index > tip.index {
+                continue;
+            }
+
+            if b.index == 0 {
+                if b.previous_hash != [0u8; 32] {
+                    continue;
+                }
+            } else {
+                let Ok(parent) = self.get_block(b.index.saturating_sub(1)) else {
+                    continue;
+                };
+                if parent.hash != b.previous_hash {
+                    continue;
+                }
+            }
+
+            let Ok(existing) = self.get_block(b.index) else {
+                continue;
+            };
+            if existing.hash == b.hash {
+                continue;
+            }
+
+            candidates.push(b);
+        }
+
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut best_branch: Option<Vec<Block>> = None;
+        let mut best_overlap_advantage: i128 = i128::MIN;
+        let mut best_tip_hash: [u8; 32] = [0u8; 32];
+
+        for candidate in candidates {
+            let branch = self.collect_orphan_branch_from(candidate, 1024)?;
+            let Some(branch_tip) = branch.last() else {
+                continue;
+            };
+            if branch_tip.index <= tip.index {
+                continue;
+            }
+
+            let fork_height = branch[0].index;
+            let canonical_overlap_work = self.canonical_work_range(fork_height, tip.index)?;
+            let branch_overlap_work = Self::branch_work_to_height(&branch, tip.index);
+            let advantage = branch_overlap_work as i128 - canonical_overlap_work as i128;
+
+            // Deterministic adoption rule:
+            // 1) positive overlap work advantage
+            // 2) tie-break by lexical tip hash
+            let should_replace = if advantage > best_overlap_advantage {
+                true
+            } else if advantage == best_overlap_advantage {
+                branch_tip.hash < best_tip_hash
+            } else {
+                false
+            };
+
+            if should_replace {
+                best_tip_hash = branch_tip.hash;
+                best_overlap_advantage = advantage;
+                best_branch = Some(branch);
+            }
+        }
+
+        let Some(branch) = best_branch else {
+            return Ok(false);
+        };
+        if best_overlap_advantage < 0 {
+            return Ok(false);
+        }
+
+        // Apply reorg by rewriting canonical block slots with the selected branch.
+        for b in &branch {
+            let key = format!("block_{}", b.index);
+            let storage = Self::to_storage_block(b);
+            self.db.insert(key.as_bytes(), bincode::serialize(&storage)?)?;
+        }
+        self.db.flush()?;
+
+        // Remove adopted branch blocks from orphan pool.
+        for b in &branch {
+            let _ = self.remove_orphan_by_hash(&b.hash);
+        }
+        self.prune_orphans()?;
+
+        // Rebuild balances index after reorg.
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        self.rebuild_balances_index(&balances_tree).await?;
+        Self::set_balances_height(&balances_tree, self.get_latest_block_index() as u64)?;
+        let _ = self.get_network_difficulty().await?;
+
+        Ok(true)
+    }
+
     fn prune_orphans(&self) -> Result<(), BlockchainError> {
         let orphan_blocks = self.open_orphan_blocks_tree()?;
         let orphan_index = self.open_orphan_index_tree()?;
@@ -1160,9 +1343,27 @@ impl Blockchain {
     }
 
     async fn persist_validated_block(&self, block: &Block) -> Result<(), BlockchainError> {
-        // Verify chain integrity first
-        if !self.chain_sentinel.verify_chain_integrity(self).await {
-            return Err(BlockchainError::InvalidBlockHeader);
+        // Canonical validation gate for all persistence paths.
+        self.validate_block(block).await?;
+
+        // Run expensive full-chain integrity checks periodically.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_integrity = self
+            .chain_sentinel
+            .last_verification
+            .load(Ordering::Relaxed);
+        let should_verify_integrity = block.index % 128 == 0 || now.saturating_sub(last_integrity) >= 60;
+
+        if should_verify_integrity {
+            if !self.chain_sentinel.verify_chain_integrity(self).await {
+                return Err(BlockchainError::InvalidBlockHeader);
+            }
+            self.chain_sentinel
+                .last_verification
+                .store(now, Ordering::Relaxed);
         }
 
         // Verify system transaction positioning and uniqueness
@@ -1220,30 +1421,7 @@ impl Blockchain {
         .await?;
 
         // Store block with truncated signatures to reduce chain size
-        let mut storage_block = block.clone();
-        storage_block.transactions = block
-            .transactions
-            .iter()
-            .map(|tx| {
-                if tx.sender == "MINING_REWARDS" {
-                    return tx.clone();
-                }
-
-                let mut full_tx = tx.clone();
-                if full_tx.sig_hash.is_none() {
-                    if let Some(sig_hex) = &full_tx.signature {
-                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
-                        }
-                    }
-                }
-
-                match &full_tx.sig_hash {
-                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
-                    None => full_tx,
-                }
-            })
-            .collect();
+        let storage_block = Self::to_storage_block(block);
 
         // Serialize and save block
         let value = bincode::serialize(&storage_block)
@@ -1460,12 +1638,11 @@ impl Blockchain {
             signature_cache,
         };
 
-        // Initialize the pending transactions tree if it doesn't exist
+        // Ensure pending tx tree exists (do not clear at startup).
         if let Ok(pending_tree) = db.open_tree("pending_transactions") {
-            // Clear any invalid transactions from previous runs
-            pending_tree.clear().ok();
             pending_tree.flush().ok();
         }
+        let _ = db.open_tree(PENDING_DEBITS_TREE);
         // Ensure orphan-management trees exist.
         let _ = db.open_tree(ORPHAN_BLOCKS_TREE);
         let _ = db.open_tree(ORPHAN_INDEX_TREE);
@@ -1480,6 +1657,7 @@ impl Blockchain {
         // Sync mempool with sled
         let _ = self.prune_pending_transactions();
         self.sync_mempool_with_sled().await?;
+        self.rebuild_pending_debits_index().await?;
 
         // Ensure balances index is valid (rebuild if needed)
         self.ensure_balances_index().await?;
@@ -1505,6 +1683,7 @@ impl Blockchain {
             pending_tree.remove(key)?;
         }
         pending_tree.flush()?;
+        self.rebuild_pending_debits_index().await?;
 
         Ok(())
     }
@@ -1548,6 +1727,7 @@ impl Blockchain {
             None => {
                 if block.index != 0 || block.previous_hash != [0u8; 32] {
                     self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
                     return Ok(());
                 }
             }
@@ -1558,15 +1738,19 @@ impl Blockchain {
                             return Ok(());
                         }
                     }
-                    return Err(BlockchainError::InvalidBlockHeader);
+                    self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
+                    return Ok(());
                 }
                 if block.index != tip_index.saturating_add(1) {
                     self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
                     return Ok(());
                 }
                 let prev = self.get_block(tip_index)?;
                 if block.previous_hash != prev.hash {
                     self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
                     return Ok(());
                 }
             }
@@ -1574,13 +1758,14 @@ impl Blockchain {
 
         self.persist_validated_block(block).await?;
         let _ = self.promote_orphans_from_tip().await?;
+        let _ = self.try_adopt_orphan_branch().await?;
         Ok(())
     }
 
     pub async fn finalize_block(
         &self,
-        mut block: Block,
-        miner_address: String,
+        block: Block,
+        _miner_address: String,
     ) -> Result<(), BlockchainError> {
         let trace_finalize = std::env::var("ALPHANUMERIC_TRACE_FINALIZE")
             .map(|v| !v.trim().is_empty() && v.trim() != "0")
@@ -1620,51 +1805,10 @@ impl Blockchain {
             }
         }
 
-        // Derive block's system keys
+        // Do not mutate mined header fields here. Mining must include final transactions/root.
         set_finalize_stage(1);
-        let (secret_key, _) = SystemKeyDeriver::derive_block_keys(&block)?;
-        trace_step("derive_keys");
-
-        // Calculate mining reward first
-        set_finalize_stage(2);
-        let reward = self.calculate_block_reward(&block)?;
-        trace_step("calc_reward");
-
-        // Create reward transaction message with proper binding
-        let message = [
-            block.hash.as_slice(),
-            &block.index.to_le_bytes(),
-            miner_address.as_bytes(),
-            &reward.to_le_bytes(),
-            &[0u8], // MiningReward type
-        ]
-        .concat();
-
-        // Sign with block's key
-        let signature = detached_sign(&message, &secret_key);
-        set_finalize_stage(3);
-        trace_step("sign_reward");
-
-        // Create reward transaction
-        let mut reward_tx = Transaction::new(
-            "MINING_REWARDS".to_string(),
-            miner_address,
-            reward,
-            super::blockchain::NETWORK_FEE,
-            block.timestamp,
-            Some(hex::encode(signature.as_bytes())),
-        );
-        reward_tx.sig_hash = Some(Transaction::signature_hash_hex(signature.as_bytes()));
-
-        // Insert reward as first transaction
-        block.transactions.insert(0, reward_tx);
-        set_finalize_stage(4);
-        trace_step("insert_reward");
-
-        // Recalculate merkle root with reward included
-        set_finalize_stage(5);
-        block.merkle_root = Self::calculate_merkle_root(&block.transactions)?;
-        trace_step("merkle");
+        trace_step("prevalidate");
+        self.validate_block(&block).await?;
 
         // Get all current confirmed balances first
         let mut confirmed_balances: HashMap<String, f64> = HashMap::new();
@@ -1679,7 +1823,7 @@ impl Blockchain {
                 }
             }
         }
-        set_finalize_stage(6);
+        set_finalize_stage(2);
         trace_step("prefetch_balances");
 
         // Second pass: Validate transactions and track effects
@@ -1701,7 +1845,7 @@ impl Blockchain {
             *pending_effects.entry(tx.sender.clone()).or_default() += required;
             *pending_effects.entry(tx.recipient.clone()).or_default() -= tx.amount;
         }
-        set_finalize_stage(7);
+        set_finalize_stage(3);
         trace_step("validate_batch");
 
         // Process transactions atomically
@@ -1710,18 +1854,18 @@ impl Blockchain {
             TransactionContext::BlockValidation,
         )
         .await?;
-        set_finalize_stage(8);
+        set_finalize_stage(4);
         trace_step("apply_batch");
 
         // Save block
         let value = bincode::serialize(&block)?;
         let key = format!("block_{}", block.index);
         self.db.insert(key.as_bytes(), value)?;
-        set_finalize_stage(9);
+        set_finalize_stage(5);
         trace_step("db_insert");
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         Self::set_balances_height(&balances_tree, block.index as u64)?;
-        set_finalize_stage(10);
+        set_finalize_stage(6);
         trace_step("balances_height");
         self.db.flush()?;
         let _ = self.promote_orphans_from_tip().await;
@@ -1735,6 +1879,7 @@ impl Blockchain {
     ) -> Result<(), BlockchainError> {
         // Clear from pending transactions tree
         let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_debits_tree = self.open_pending_debits_tree()?;
         let mut batch = sled::Batch::default();
 
         for tx in transactions {
@@ -1743,6 +1888,13 @@ impl Blockchain {
 
             // Remove from pending tree
             batch.remove(tx_id.as_bytes());
+
+            if tx.sender != "MINING_REWARDS" {
+                let current_debit = self.get_pending_debit_for(&tx.sender).await?;
+                let delta = tx.amount + tx.fee;
+                let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
+                Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
+            }
 
             // Explicitly remove any full signatures from memory
             if let Some(sig) = &tx.signature {
@@ -1768,6 +1920,7 @@ impl Blockchain {
 
         // Ensure changes are persisted
         pending_tree.flush()?;
+        pending_debits_tree.flush()?;
 
         Ok(())
     }
@@ -1803,7 +1956,7 @@ impl Blockchain {
     pub fn get_blocks(&self) -> Vec<Block> {
         let mut blocks: Vec<_> = self
             .db
-            .iter()
+            .scan_prefix(b"block_")
             .filter_map(|r| r.ok())
             .filter_map(|(_, value)| Block::from_bytes(&value).ok())
             .collect();
@@ -2122,12 +2275,54 @@ impl Blockchain {
         }
 
         // Validate transactions if present
+        let reward_txs: Vec<&Transaction> = block
+            .transactions
+            .iter()
+            .filter(|tx| tx.sender == "MINING_REWARDS")
+            .collect();
+
+        if reward_txs.len() != 1 {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+
+        if block
+            .transactions
+            .first()
+            .map(|tx| tx.sender.as_str())
+            != Some("MINING_REWARDS")
+        {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+
+        let reward_tx = reward_txs[0];
+        if reward_tx.fee != NETWORK_FEE {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+        let expected_reward = self.calculate_block_reward(block)?;
+        if Transaction::round_amount(reward_tx.amount) != expected_reward {
+            return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
         for tx in &block.transactions {
+            if tx.sender == "MINING_REWARDS" {
+                continue;
+            }
             if tx.amount < MIN_TRANSACTION_AMOUNT {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
-
-            // Address validity is verified through signature verification with public key
+            if tx.pub_key.is_none() || tx.sig_hash.is_none() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+            if tx.signature.is_none() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+            if let Some(sig_hex) = &tx.signature {
+                if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                    if sig_bytes.len() > 64 {
+                        self.verify_transaction_signature(tx)?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -2241,16 +2436,11 @@ impl Blockchain {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        // Get confirmed balance and check pending transactions
+        // Get confirmed balance and pending debit index (O(1) lookup)
         let mempool_guard = self.mempool.read().await;
         
         let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
-        let pending_transactions = mempool_guard.get_transactions_for_block();
-        let pending_amount: f64 = pending_transactions
-            .iter()
-            .filter(|tx| tx.sender == transaction.sender)
-            .map(|tx| tx.amount + tx.fee)
-            .sum();
+        let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
 
         // Calculate available balance considering pending transactions
         let available_balance = confirmed_balance - pending_amount;
@@ -2312,32 +2502,27 @@ impl Blockchain {
 
         // Store in pending transactions
         let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_debits_tree = self.open_pending_debits_tree()?;
         let tx_bytes = bincode::serialize(&storage_tx)?;
 
         // Use batch operation for atomic updates
         let mut batch = sled::Batch::default();
         batch.insert(tx_id.as_bytes(), tx_bytes);
         pending_tree.apply_batch(batch)?;
+
+        let current_debit = self.get_pending_debit_for(&transaction.sender).await?;
+        let next_debit =
+            Transaction::round_amount(current_debit + storage_tx.amount + storage_tx.fee);
+        Self::set_pending_debit_for(&pending_debits_tree, &transaction.sender, next_debit)?;
+
         pending_tree.flush()?;
+        pending_debits_tree.flush()?;
 
         Ok(())
     }
 
     pub async fn get_pending_amount(&self, address: &str) -> Result<f64, BlockchainError> {
-        let pending_tree = self.db.open_tree("pending_transactions")?;
-        let mut total = 0.0;
-
-        for item in pending_tree.iter() {
-            if let Ok((_, tx_bytes)) = item {
-                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                    if tx.sender == address {
-                        total += tx.amount + tx.fee;
-                    }
-                }
-            }
-        }
-
-        Ok(total)
+        self.get_pending_debit_for(address).await
     }
 
     pub async fn get_transactions_for_block(&self) -> Vec<Transaction> {
@@ -2527,6 +2712,8 @@ impl Blockchain {
         for tx in transactions {
             mempool.add_transaction(tx)?;
         }
+        drop(mempool);
+        self.rebuild_pending_debits_index().await?;
 
         Ok(())
     }
@@ -2620,6 +2807,7 @@ impl Blockchain {
     ) -> Result<(), BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let pending_tree = self.db.open_tree("pending_transactions")?;
+        let pending_debits_tree = self.open_pending_debits_tree()?;
 
         // Track cumulative balance changes
         let mut balance_changes: HashMap<String, f64> = HashMap::new();
@@ -2646,6 +2834,16 @@ impl Blockchain {
                     }
                 }
                 _ => {
+                    if context == TransactionContext::BlockValidation {
+                        if let Some(sig_hex) = &tx.signature {
+                            if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                                if sig_bytes.len() > 64 {
+                                    self.verify_transaction_signature(tx)?;
+                                }
+                            }
+                        }
+                    }
+
                     let total_debit = tx.amount + tx.fee;
                     let current_balance = current_balances.get(&tx.sender).copied().unwrap_or(0.0);
                     let pending_change = balance_changes.get(&tx.sender).copied().unwrap_or(0.0);
@@ -2678,8 +2876,13 @@ impl Blockchain {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
                     pending_tree.remove(tx_id.as_bytes())?;
+                    let current_debit = self.get_pending_debit_for(&tx.sender).await?;
+                    let delta = tx.amount + tx.fee;
+                    let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
+                    Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
                 }
             }
+            pending_debits_tree.flush()?;
         }
 
         Ok(())

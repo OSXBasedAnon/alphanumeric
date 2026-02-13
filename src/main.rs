@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use std::collections::HashSet;
 
 use crate::a9::{
-    blockchain::{Blockchain, RateLimiter, Transaction},
+    blockchain::{Block, Blockchain, RateLimiter, Transaction},
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
     node::{Node, NodeError, DEFAULT_PORT},
@@ -35,6 +35,7 @@ mod config;
 
 const KEY_FILE_PATH: &str = "private.key";
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
+const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -74,6 +75,7 @@ async fn main() -> Result<()> {
             error!("Bootstrap failed: {}", e);
         }
         pb.set_message("Initializing database...");
+        ensure_instance_lock()?;
         ensure_db_lock(db_path)?;
         let db = match sled::Config::new()
             .path(db_path)
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
                 let _ = db_for_signal.flush();
                 let _ = remove_db_lock(&lock_path);
+                let _ = remove_instance_lock();
                 eprintln!("Shutting down cleanly...");
                 std::process::exit(0);
             });
@@ -1357,10 +1360,10 @@ async fn handle_chain_sync(
         .collect();
     drop(peers);
 
-    if sync_peers.len() < 2 {
+    if sync_peers.is_empty() {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "Insufficient peers available for sync"
+            "No peers available for sync"
         )));
     }
 
@@ -1481,7 +1484,7 @@ let download_tasks: Vec<_> = sync_peers
                             if block.index > curr_height && 
                                block.index <= batch_end &&
                                block.hash == block.calculate_hash_for_block() {
-                                match tx.send(block).await {
+                                match tx.send((peer, block)).await {
                                     Ok(_) => sent_count += 1,
                                     Err(_) => break 'outer, // Channel closed
                                 }
@@ -1526,39 +1529,46 @@ let download_tasks: Vec<_> = sync_peers
     // IMPROVEMENT: Processing task with batching for efficiency
     let process_handle = {
         let blockchain = Arc::clone(&node.blockchain);
+        let verifier_node = node.clone();
         let processed_height = Arc::clone(&processed_height);
         let main_pb = main_pb.clone();
         let failed_batches = Arc::clone(&failed_batches);
 
         tokio::spawn(async move {
             // Use a buffer to batch process blocks
-            let mut block_buffer = Vec::with_capacity(1000);
+            let mut block_buffer: Vec<(SocketAddr, Block)> = Vec::with_capacity(1000);
             let mut last_update = Instant::now();
             let mut last_save_height = local_height;
             
-            while let Some(block) = rx.recv().await {
+            while let Some((peer, block)) = rx.recv().await {
                 // Basic validation again for safety
                 if block.calculate_hash_for_block() != block.hash {
                     continue;
                 }
 
                 // Add to buffer
-                block_buffer.push(block);
+                block_buffer.push((peer, block));
 
                 // Batch process when buffer gets large enough or every second
                 if block_buffer.len() >= 1000 || last_update.elapsed() > Duration::from_secs(1) {
                     let blockchain = blockchain.write().await;
                     
                     // Sort blocks by index before processing
-                    block_buffer.sort_by_key(|b| b.index);
+                    block_buffer.sort_by_key(|(_, b)| b.index);
                     
                     let mut saved_count = 0;
-                    for block in block_buffer.drain(..) {
+                    for (peer, block) in block_buffer.drain(..) {
                         // Skip blocks we already have
                         if block.index <= last_save_height {
                             continue;
                         }
                         
+                        match verifier_node.verify_block_with_witness(&block, Some(peer)).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(_) => continue,
+                        }
+
                         if let Err(e) = blockchain.save_block(&block).await {
                             // Log error but continue with next blocks
                             println!("Error saving block {}: {}", block.index, e);
@@ -1594,11 +1604,17 @@ let download_tasks: Vec<_> = sync_peers
                 let blockchain = blockchain.write().await;
                 
                 // Sort blocks by index before final processing
-                block_buffer.sort_by_key(|b| b.index);
+                block_buffer.sort_by_key(|(_, b)| b.index);
                 
-                for block in block_buffer.drain(..) {
+                for (peer, block) in block_buffer.drain(..) {
                     if block.index <= last_save_height {
                         continue;
+                    }
+
+                    match verifier_node.verify_block_with_witness(&block, Some(peer)).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => continue,
                     }
                     
                     if let Err(e) = blockchain.save_block(&block).await {
@@ -1667,7 +1683,7 @@ let download_tasks: Vec<_> = sync_peers
                                 if let Ok(blocks) = node.request_blocks(*addr, start, end).await {
                                     // Send blocks to processing queue
                                     for block in blocks {
-                                        let _ = tx.send(block).await;
+                                        let _ = tx.send((*addr, block)).await;
                                     }
                                     status_pb.set_message("Recovery successful - continuing sync");
                                 }
@@ -2102,8 +2118,20 @@ fn quarantine_db(path: &str) -> std::io::Result<()> {
 
 fn ensure_db_lock(path: &str) -> std::io::Result<()> {
     let lock_path = format!("{}.lock", path);
+    ensure_pid_lock(&lock_path, "ALPHANUMERIC_IGNORE_DB_LOCK")
+}
+
+fn ensure_instance_lock() -> std::io::Result<()> {
+    ensure_pid_lock(INSTANCE_LOCK_PATH, "ALPHANUMERIC_IGNORE_INSTANCE_LOCK")
+}
+
+fn remove_instance_lock() -> std::io::Result<()> {
+    remove_db_lock(INSTANCE_LOCK_PATH)
+}
+
+fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
     if std::path::Path::new(&lock_path).exists() {
-        let allow = std::env::var("ALPHANUMERIC_IGNORE_DB_LOCK")
+        let allow = std::env::var(ignore_env)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
         if !allow {
@@ -2133,9 +2161,8 @@ fn ensure_db_lock(path: &str) -> std::io::Result<()> {
     }
 
     let mut file = std::fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
         .open(&lock_path)?;
     let pid = std::process::id();
     use std::io::Write;

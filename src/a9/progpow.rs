@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
-use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError};
+use crate::a9::blockchain::{current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError, NETWORK_FEE};
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
 
@@ -224,6 +224,20 @@ impl MiningManager {
                 tx
             })
             .collect();
+        let mut mining_transactions = transactions;
+        let reward_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let reward_tx = Transaction::new(
+            "MINING_REWARDS".to_string(),
+            miner_address.clone(),
+            reward_amount,
+            NETWORK_FEE,
+            reward_timestamp,
+            None,
+        );
+        mining_transactions.insert(0, reward_tx);
 
         let found = Arc::new(AtomicBool::new(false));
         let result_nonce = Arc::new(AtomicU64::new(0));
@@ -276,8 +290,8 @@ impl MiningManager {
                 continue;
             }
 
-            let merkle_root = if !transactions.is_empty() {
-                Blockchain::calculate_merkle_root(&transactions)
+            let merkle_root = if !mining_transactions.is_empty() {
+                Blockchain::calculate_merkle_root(&mining_transactions)
                     .map_err(|e| MiningError::BlockchainError(e.to_string()))?
             } else {
                 let mut hasher = Sha256::new();
@@ -323,7 +337,7 @@ impl MiningManager {
                     let target = Arc::clone(&target);
 
                     // CRITICAL OPTIMIZATION: Clone transactions ONCE per thread, not per hash
-                    let transactions_ref = transactions.clone();
+                    let transactions_ref = mining_transactions.clone();
 
                     for nonce in start_nonce..end_nonce {
                         if found.load(Ordering::Relaxed) {
@@ -405,10 +419,14 @@ impl MiningManager {
                 let hash = hash_result.lock().unwrap().clone();
                 let hash_string = hex::encode(&hash);
 
-                let mut valid_transactions = Vec::with_capacity(transactions.len());
+                let mut valid_transactions = Vec::with_capacity(mining_transactions.len());
                 {
                     let blockchain_lock = self.blockchain.read().await;
-                    for transaction in &transactions {
+                    for transaction in &mining_transactions {
+                        if transaction.sender == "MINING_REWARDS" {
+                            valid_transactions.push(transaction.clone());
+                            continue;
+                        }
                         let sender_balance = blockchain_lock
                             .get_confirmed_balance(&transaction.sender)
                             .await?;

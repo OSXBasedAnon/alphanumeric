@@ -1707,12 +1707,28 @@ impl Node {
             .route("/health", get(Self::health_handler))
             .with_state(state);
 
+        let listener = match std::net::TcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("Stats API disabled: failed to bind {} ({})", addr, e);
+                return Ok(());
+            }
+        };
+        if let Err(e) = listener.set_nonblocking(true) {
+            warn!("Stats API disabled: failed to set nonblocking listener ({})", e);
+            return Ok(());
+        }
+
         tokio::spawn(async move {
-            if let Err(e) = axum::Server::bind(&addr)
-                .serve(app.into_make_service())
-                .await
-            {
-                error!("Stats server error: {}", e);
+            match axum::Server::from_tcp(listener) {
+                Ok(server) => {
+                    if let Err(e) = server.serve(app.into_make_service()).await {
+                        error!("Stats server error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Stats server setup error: {}", e);
+                }
             }
         });
 
