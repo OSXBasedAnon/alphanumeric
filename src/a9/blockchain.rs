@@ -1528,7 +1528,7 @@ impl Blockchain {
                 Err(_) => true,
             };
             if remove {
-                pending_tree.remove(key)?;
+                pending_tree.remove(&key)?;
                 // Best-effort: keep sidecar in sync with pending tx removals.
                 let _ = full_sigs_tree.remove(&key);
                 removed += 1;
