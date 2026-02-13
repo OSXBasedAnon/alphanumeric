@@ -147,6 +147,13 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_BIND_IP`
 - `ALPHANUMERIC_BOOTSTRAP_URL`
 - `ALPHANUMERIC_BOOTSTRAP_REQUIRED`
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command)
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_URL` (optional: defaults to `https://alphanumeric.blue/api/bootstrap/publish`)
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS` (optional: defaults to `3600`)
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA` (optional: defaults to `10`)
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS` (optional: defaults to `180`)
+- `ALPHANUMERIC_BOOTSTRAP_PUBLISHER_PUBKEY` (optional: require signed bootstrap manifests)
+- `ALPHANUMERIC_BOOTSTRAP_MANIFEST_URL` (optional: defaults to `https://alphanumeric.blue/api/bootstrap/manifest`)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND`
