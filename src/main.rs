@@ -207,17 +207,22 @@ async fn main() -> Result<()> {
         }
         pb.inc(1);
 
-        // Optional: run a dedicated bootstrap publisher loop (intended for ONE canonical node).
-        // Single env var enables it:
-        // - ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN
-        if let Ok(token) = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN") {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                let db_path_for_publish = db_path.clone();
-                let blockchain_for_publish = blockchain.clone();
-                tokio::spawn(async move {
-                    bootstrap_publish_loop(db_path_for_publish, blockchain_for_publish, token).await;
-                });
+        // Bootstrap publishing (zip+upload+sign) is compiled out by default to reduce false positives.
+        // Enable with `--features bootstrap_publisher` for the ONE canonical node that should publish.
+        #[cfg(feature = "bootstrap_publisher")]
+        {
+            // Single env var enables it:
+            // - ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN
+            if let Ok(token) = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN") {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    let db_path_for_publish = db_path.clone();
+                    let blockchain_for_publish = blockchain.clone();
+                    tokio::spawn(async move {
+                        bootstrap_publish_loop(db_path_for_publish, blockchain_for_publish, token)
+                            .await;
+                    });
+                }
             }
         }
 
@@ -855,8 +860,17 @@ println!("Wallet renamed successfully");
 }
                 }
                 Some("push") => {
-                    if let Err(e) = handle_push_command(&db_path, &blockchain).await {
-                        println!("Error: {}", e);
+                    #[cfg(feature = "bootstrap_publisher")]
+                    {
+                        if let Err(e) = handle_push_command(&db_path, &blockchain).await {
+                            println!("Error: {}", e);
+                        }
+                    }
+                    #[cfg(not(feature = "bootstrap_publisher"))]
+                    {
+                        println!(
+                            "Error: push support is not compiled in. Rebuild with `--features bootstrap_publisher`."
+                        );
                     }
                 }
                 Some("mine") => {
@@ -1350,9 +1364,11 @@ print_ascii_intro();
 },
 Some("exit") => {
 use std::process::Command;
-if cfg!(windows) {
-Command::new("cmd").args(["/C", "pause"]).status()?;
-}
+ // Avoid spawning `cmd.exe` (common heuristic trigger). If you really want pause-on-exit
+ // for double-click runs, opt in with `ALPHANUMERIC_PAUSE_ON_EXIT=true`.
+ if cfg!(windows) && std::env::var("ALPHANUMERIC_PAUSE_ON_EXIT").ok().as_deref() == Some("true") {
+     let _ = Command::new("cmd").args(["/C", "pause"]).status();
+ }
 std::process::exit(0);
 },
 
@@ -2429,6 +2445,7 @@ fn has_local_block_data(db_path: &str) -> bool {
     db.scan_prefix("block_").next().is_some()
 }
 
+#[cfg(feature = "bootstrap_publisher")]
 async fn bootstrap_publish_loop(
     db_path: String,
     blockchain: Arc<RwLock<Blockchain>>,
@@ -2511,6 +2528,7 @@ async fn bootstrap_publish_loop(
     }
 }
 
+#[cfg(feature = "bootstrap_publisher")]
 async fn publish_bootstrap_snapshot(
     db: &sled::Db,
     db_path: &str,
@@ -2780,6 +2798,7 @@ async fn publish_bootstrap_snapshot(
     Ok(())
 }
 
+#[cfg(feature = "bootstrap_publisher")]
 fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
     let tree = db.open_tree(BOOTSTRAP_META_TREE).ok()?;
     let last_at = tree
@@ -2797,6 +2816,7 @@ fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
     Some((last_at, last_height))
 }
 
+#[cfg(feature = "bootstrap_publisher")]
 fn write_bootstrap_publish_meta(
     db: &sled::Db,
     last_at: u64,
@@ -2817,6 +2837,7 @@ fn write_bootstrap_publish_meta(
     Ok(())
 }
 
+#[cfg(feature = "bootstrap_publisher")]
 async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>) -> Result<()> {
     let token = std::env::var("ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN")
         .map_err(|_| "push requires ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN to be set")?;

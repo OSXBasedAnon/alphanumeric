@@ -396,13 +396,10 @@ impl Mgmt {
         // Add wallet to local map
         wallets.insert(default_wallet_name, wallet);
 
-        // Now reload the application
-        println!("\nReloading application to initialize wallet...");
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Ok(_) = std::process::Command::new(current_exe).spawn() {
-                std::process::exit(0);
-            }
-        }
+        // Avoid self-relaunch: spawning a second copy of the executable is a common heuristic trigger
+        // for endpoint protection tools. The app can continue running; the newly-created wallet is
+        // already in memory, and callers can re-init any derived state without restarting.
+        println!("\nWallet created. If you need a clean re-init, restart the application.");
 
         Ok(wallets)
     }
