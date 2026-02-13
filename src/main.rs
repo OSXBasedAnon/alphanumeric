@@ -334,7 +334,7 @@ async fn main() -> Result<()> {
                                     // Check chain state with safe conversion
                                     let local_height = {
                                         let blockchain = node.blockchain.read().await;
-                                        match u32::try_from(blockchain.get_block_count()) {
+                                        match u32::try_from(blockchain.get_latest_block_index()) {
                                             Ok(height) => height,
                                             Err(e) => {
                                                 error!("Error converting block height: {}", e);
@@ -712,7 +712,11 @@ async fn main() -> Result<()> {
     writeln!(stdout, "───────────────────")?; 
     color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
     stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Height:            {}", blockchain_guard.get_block_count())?;
+    writeln!(
+        stdout,
+        "Height:            {}",
+        blockchain_guard.get_latest_block_index()
+    )?;
     color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Difficulty:        {}", blockchain_guard.get_current_difficulty().await)?;
@@ -1381,7 +1385,7 @@ async fn handle_chain_sync(
 
     let local_height = {
         let blockchain = node.blockchain.read().await;
-        blockchain.get_block_count() as u32
+        blockchain.get_latest_block_index() as u32
     };
 
     if target_height <= local_height {
@@ -1981,7 +1985,7 @@ async fn handle_network_commands(
                     let blockchain = blockchain.read().await;
                     pb.finish_with_message(format!(
                         "Sync completed. Current height: {}",
-                        blockchain.get_block_count()
+                        blockchain.get_latest_block_index()
                     ));
                 }
                 Err(e) => {

@@ -1413,7 +1413,7 @@ impl Node {
 
         let height = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
@@ -1562,7 +1562,7 @@ impl Node {
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
         let height = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         let last_block_time = {
@@ -1639,7 +1639,7 @@ impl Node {
     async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
         let height = {
             let blockchain = state.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         let last_block_time = {
@@ -4585,7 +4585,7 @@ async fn rebalance_peer_subnets(&self) -> Result<(), NodeError> {
 
             NetworkMessage::GetBlockHeight => {
                 let blockchain = self.blockchain.read().await;
-                let height = blockchain.get_block_count() as u32;
+                let height = blockchain.get_latest_block_index() as u32;
                 self.send_message(addr, &NetworkMessage::BlockHeight(height))
                     .await?;
             }
@@ -5374,7 +5374,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
     // 1. Get current blockchain state
     let current_height = {
         let blockchain = self.blockchain.read().await;
-        blockchain.get_block_count() as u32
+        blockchain.get_latest_block_index() as u32
     };
     
     // 2. Check peer count and discover if needed
@@ -5587,7 +5587,7 @@ pub async fn sync_with_network(&self) -> Result<(), NodeError> {
 
         let blockchain_height = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         let now = SystemTime::now()

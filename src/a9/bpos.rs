@@ -278,7 +278,7 @@ impl BPoSSentinel {
 
         let _total_blocks = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u64
+            blockchain.get_latest_block_index() as u64
         };
 
         // Update all node metrics
@@ -419,7 +419,7 @@ impl BPoSSentinel {
 
                 let current_height = {
                     let blockchain = sentinel.blockchain.read().await;
-                    blockchain.get_block_count() as u32
+                    blockchain.get_latest_block_index() as u32
                 };
 
                 if current_height != last_height {
@@ -495,7 +495,7 @@ impl BPoSSentinel {
     pub async fn monitor_chain(&self) -> Result<(), String> {
         let current_height = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         const FORK_DETECTION_WINDOW: u64 = 900; // Configurable window
@@ -603,7 +603,7 @@ impl BPoSSentinel {
             .as_secs();
 
         let blockchain = self.blockchain.read().await;
-        let current_height = blockchain.get_block_count() as u32;
+        let current_height = blockchain.get_latest_block_index() as u32;
         let blocks_since_fork = current_height.saturating_sub(block_height);
         drop(blockchain);
 
@@ -883,7 +883,7 @@ impl BPoSSentinel {
                 // Only process if height has changed
                 let current_height = {
                     let chain = blockchain.read().await;
-                    chain.get_block_count() as u32
+                    chain.get_latest_block_index() as u32
                 };
 
                 if current_height <= last_height {
@@ -1043,7 +1043,7 @@ impl BPoSSentinel {
         // Quick updates
         {
             let blockchain = self.blockchain.read().await;
-            health.chain_height = blockchain.get_block_count() as u32;
+            health.chain_height = blockchain.get_latest_block_index() as u32;
         }
 
         if force_full_update || (now - health.last_update > 300) {
@@ -1071,7 +1071,7 @@ impl BPoSSentinel {
 
     async fn verify_temporal_consistency(&self, header: &BlockHeaderInfo) -> bool {
         let blockchain = self.blockchain.read().await;
-        let current_height = blockchain.get_block_count() as u32;
+        let current_height = blockchain.get_latest_block_index() as u32;
 
         // Must be within 2 blocks of current height
         if header.height > current_height + 2 || header.height < current_height.saturating_sub(2) {
@@ -1122,7 +1122,7 @@ impl BPoSSentinel {
 
     async fn repair_chain(&self) -> Result<(), String> {
         let blockchain = self.blockchain.read().await;
-        let current_height = blockchain.get_block_count() as u32;
+        let current_height = blockchain.get_latest_block_index() as u32;
 
         // Get peer blocks
         let peers = self.node.peers.read().await;
@@ -1214,7 +1214,7 @@ impl BPoSSentinel {
     async fn request_headers(&self, addr: SocketAddr) -> Result<(), String> {
         let current_height = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_block_count() as u32
+            blockchain.get_latest_block_index() as u32
         };
 
         let message = NetworkMessage::GetHeaders {
@@ -1386,7 +1386,7 @@ impl BPoSSentinel {
         let mut stats = self.stats.write().await;
 
         // Get current chain state
-        let current_height = blockchain.get_block_count() as u32;
+        let current_height = blockchain.get_latest_block_index() as u32;
         let mut verified_blocks = HashSet::new();
         let mut anomalies = Vec::new();
 
