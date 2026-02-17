@@ -584,13 +584,13 @@ async fn main() -> Result<()> {
                 let mut interval = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     interval.tick().await;
-                    let addresses = wallet_addresses.read().await.clone();
+                    let addresses = wallet_addresses.read().await;
                     if addresses.is_empty() {
                         continue;
                     }
                     let blockchain_guard = blockchain.read().await;
                     let whisper = whisper_module.read().await;
-                    for addr in &addresses {
+                    for addr in addresses.iter() {
                         let _ = whisper.sync_index_for_wallet(addr, &blockchain_guard).await;
                     }
                 }

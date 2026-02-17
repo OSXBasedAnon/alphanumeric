@@ -618,11 +618,11 @@ impl Mgmt {
         let progpow_transactions: Vec<ProgPowTransaction> = transactions
             .iter()
             .map(|tx| ProgPowTransaction {
-                fee: tx.fee.clone(),
+                fee: tx.fee,
                 sender: tx.sender.clone(),
                 recipient: tx.recipient.clone(),
-                amount: tx.amount.clone(),
-                timestamp: tx.timestamp.clone(),
+                amount: tx.amount,
+                timestamp: tx.timestamp,
                 signature: tx.signature.clone(),
                 pub_key: tx.pub_key.clone(),
                 sig_hash: tx.sig_hash.clone(),

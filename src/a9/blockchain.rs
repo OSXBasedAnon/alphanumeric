@@ -34,6 +34,7 @@ use crate::a9::wallet::Wallet;
 const BLOCKCHAIN_PATH: &str = "blockchain.db";
 const BALANCES_TREE: &str = "balances";
 const PENDING_DEBITS_TREE: &str = "pending_debits";
+const PENDING_CREDITS_TREE: &str = "pending_credits";
 const PENDING_TRANSACTIONS_TREE: &str = "pending_transactions";
 // Full Dilithium signatures are intentionally NOT stored in the main tx record on disk.
 // We keep them in a sidecar tree for pending/mempool durability across restarts, and prune with the same TTL.
@@ -977,6 +978,10 @@ impl Blockchain {
         self.db.open_tree(PENDING_DEBITS_TREE).map_err(Into::into)
     }
 
+    fn open_pending_credits_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(PENDING_CREDITS_TREE).map_err(Into::into)
+    }
+
     fn get_orphan_block_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>, BlockchainError> {
         let orphan_blocks = self.open_orphan_blocks_tree()?;
         let hash_hex = Self::orphan_hash_key(hash);
@@ -1053,6 +1058,16 @@ impl Blockchain {
         }
     }
 
+    async fn get_pending_credit_for(&self, address: &str) -> Result<f64, BlockchainError> {
+        let tree = self.open_pending_credits_tree()?;
+        if let Some(raw) = tree.get(address.as_bytes())? {
+            let credit: f64 = bincode::deserialize(&raw)?;
+            Ok(credit)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     fn set_pending_debit_for(
         tree: &sled::Tree,
         address: &str,
@@ -1067,30 +1082,57 @@ impl Blockchain {
         Ok(())
     }
 
+    fn set_pending_credit_for(
+        tree: &sled::Tree,
+        address: &str,
+        credit: f64,
+    ) -> Result<(), BlockchainError> {
+        let normalized = Transaction::round_amount(credit.max(0.0));
+        if normalized <= 0.0 {
+            tree.remove(address.as_bytes())?;
+        } else {
+            tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
+        }
+        Ok(())
+    }
+
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let debits_tree = self.open_pending_debits_tree()?;
+        let credits_tree = self.open_pending_credits_tree()?;
         debits_tree.clear()?;
+        credits_tree.clear()?;
 
         let mut totals: HashMap<String, f64> = HashMap::new();
+        let mut incoming: HashMap<String, f64> = HashMap::new();
         for item in pending_tree.iter() {
             let (_, tx_bytes) = item?;
             if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                 if tx.sender != "MINING_REWARDS" {
                     *totals.entry(tx.sender.clone()).or_insert(0.0) += tx.amount + tx.fee;
                 }
+                *incoming.entry(tx.recipient.clone()).or_insert(0.0) += tx.amount;
             }
         }
 
-        let mut batch = sled::Batch::default();
+        let mut debit_batch = sled::Batch::default();
         for (address, total) in totals {
             let normalized = Transaction::round_amount(total.max(0.0));
             if normalized > 0.0 {
-                batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
+                debit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
             }
         }
-        debits_tree.apply_batch(batch)?;
+        let mut credit_batch = sled::Batch::default();
+        for (address, total) in incoming {
+            let normalized = Transaction::round_amount(total.max(0.0));
+            if normalized > 0.0 {
+                credit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
+            }
+        }
+        debits_tree.apply_batch(debit_batch)?;
+        credits_tree.apply_batch(credit_batch)?;
         debits_tree.flush()?;
+        credits_tree.flush()?;
         Ok(())
     }
 
@@ -1725,6 +1767,7 @@ impl Blockchain {
         }
         let _ = db.open_tree(PENDING_FULL_SIGNATURES_TREE);
         let _ = db.open_tree(PENDING_DEBITS_TREE);
+        let _ = db.open_tree(PENDING_CREDITS_TREE);
         // Ensure orphan-management trees exist.
         let _ = db.open_tree(ORPHAN_BLOCKS_TREE);
         let _ = db.open_tree(ORPHAN_INDEX_TREE);
@@ -2070,7 +2113,10 @@ impl Blockchain {
     }
 
     pub fn get_block_count(&self) -> usize {
-        self.db.scan_prefix("block_").count()
+        match self.get_last_block() {
+            Some(last) => last.index as usize + 1,
+            None => 0,
+        }
     }
 
     pub fn get_blocks(&self) -> Vec<Block> {
@@ -2081,6 +2127,21 @@ impl Blockchain {
             .filter_map(|(_, value)| Block::from_bytes(&value).ok())
             .collect();
         blocks.sort_unstable_by_key(|b| b.index);
+        blocks
+    }
+
+    pub fn get_recent_blocks(&self, limit: usize) -> Vec<Block> {
+        let Some(tip) = self.highest_block_index() else {
+            return Vec::new();
+        };
+        let count = limit.min(tip as usize + 1);
+        let start = tip as usize + 1 - count;
+        let mut blocks = Vec::with_capacity(count);
+        for idx in start..=tip as usize {
+            if let Ok(block) = self.get_block(idx as u32) {
+                blocks.push(block);
+            }
+        }
         blocks
     }
 
@@ -2123,12 +2184,7 @@ impl Blockchain {
 
     fn detect_difficulty_manipulation(&self, block: &Block) -> Result<(), BlockchainError> {
         // Get recent blocks
-        let recent_blocks = self
-            .get_blocks()
-            .into_iter()
-            .rev()
-            .take(50)
-            .collect::<Vec<_>>();
+        let recent_blocks = self.get_recent_blocks(50);
 
         if recent_blocks.is_empty() {
             return Ok(());
@@ -2307,10 +2363,16 @@ impl Blockchain {
     }
 
     pub fn get_block_by_timestamp(&self, timestamp: u64) -> Result<Block, BlockchainError> {
-        self.get_blocks()
-            .into_iter()
-            .find(|block| block.timestamp == timestamp)
-            .ok_or(BlockchainError::InvalidTransaction)
+        for result in self.db.scan_prefix(b"block_") {
+            if let Ok((_, block_data)) = result {
+                if let Ok(block) = Block::from_bytes(&block_data) {
+                    if block.timestamp == timestamp {
+                        return Ok(block);
+                    }
+                }
+            }
+        }
+        Err(BlockchainError::InvalidTransaction)
     }
 
     fn validate_system_transaction(
@@ -2651,6 +2713,7 @@ impl Blockchain {
         // Store in pending transactions
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
+        let pending_credits_tree = self.open_pending_credits_tree()?;
         let tx_bytes = bincode::serialize(&storage_tx)?;
 
         // Use batch operation for atomic updates
@@ -2662,9 +2725,13 @@ impl Blockchain {
         let next_debit =
             Transaction::round_amount(current_debit + storage_tx.amount + storage_tx.fee);
         Self::set_pending_debit_for(&pending_debits_tree, &transaction.sender, next_debit)?;
+        let current_credit = self.get_pending_credit_for(&transaction.recipient).await?;
+        let next_credit = Transaction::round_amount(current_credit + storage_tx.amount);
+        Self::set_pending_credit_for(&pending_credits_tree, &transaction.recipient, next_credit)?;
 
         pending_tree.flush()?;
         pending_debits_tree.flush()?;
+        pending_credits_tree.flush()?;
 
         Ok(())
     }
@@ -2992,6 +3059,7 @@ impl Blockchain {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
+        let pending_credits_tree = self.open_pending_credits_tree()?;
 
         // Track cumulative balance changes
         let mut balance_changes: HashMap<String, f64> = HashMap::new();
@@ -3060,9 +3128,17 @@ impl Blockchain {
                     let delta = tx.amount + tx.fee;
                     let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
                     Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
+                    let current_credit = self.get_pending_credit_for(&tx.recipient).await?;
+                    let next_credit = Transaction::round_amount((current_credit - tx.amount).max(0.0));
+                    Self::set_pending_credit_for(
+                        &pending_credits_tree,
+                        &tx.recipient,
+                        next_credit,
+                    )?;
                 }
             }
             pending_debits_tree.flush()?;
+            pending_credits_tree.flush()?;
             full_sigs_tree.flush()?;
         }
 
@@ -3095,7 +3171,7 @@ impl Blockchain {
         }
         // Slow path: calculate from blocks, then cache in balances tree.
         let mut balance = 0.0;
-        let mut current_batch = Vec::with_capacity(1000);
+        let mut current_batch = Vec::with_capacity(200);
 
         for result in self.db.scan_prefix(b"block_") {
             if let Ok((_, block_data)) = result {
@@ -3142,23 +3218,9 @@ impl Blockchain {
     // Public method that shows spendable balance to users
     pub async fn get_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let confirmed = self.get_confirmed_balance(address).await?;
-        let mut spendable = confirmed;
-
-        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        for result in pending_tree.iter() {
-            if let Ok((_, tx_bytes)) = result {
-                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                    if tx.sender == address {
-                        spendable = Transaction::round_amount(spendable - (tx.amount + tx.fee));
-                    }
-                    if tx.recipient == address {
-                        spendable = Transaction::round_amount(spendable + tx.amount);
-                    }
-                }
-            }
-        }
-
-        Ok(spendable)
+        let pending_debit = self.get_pending_debit_for(address).await?;
+        let pending_credit = self.get_pending_credit_for(address).await?;
+        Ok(Transaction::round_amount(confirmed - pending_debit + pending_credit))
     }
 
     pub async fn update_wallet_balance(

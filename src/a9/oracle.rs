@@ -38,34 +38,40 @@ impl DifficultyOracle {
             return 1.0;
         }
 
-        let changes: Vec<f64> = self
+        let mut changes: Vec<f64> = self
             .difficulty_history
             .iter()
             .zip(self.difficulty_history.iter().skip(1))
             .map(|(a, b)| *b as f64 / *a as f64)
             .collect();
-
-        let mut sorted_changes = changes.clone();
-        sorted_changes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        changes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let q1_idx = changes.len() / 4;
         let q3_idx = 3 * changes.len() / 4;
-        let iqr = sorted_changes[q3_idx] - sorted_changes[q1_idx];
-        let lower = sorted_changes[q1_idx] - 1.5 * iqr;
-        let upper = sorted_changes[q3_idx] + 1.5 * iqr;
+        let iqr = changes[q3_idx] - changes[q1_idx];
+        let lower = changes[q1_idx] - 1.5 * iqr;
+        let upper = changes[q3_idx] + 1.5 * iqr;
 
-        let filtered: Vec<f64> = changes
-            .into_iter()
-            .filter(|&x| x >= lower && x <= upper)
-            .collect();
-
-        if filtered.is_empty() {
+        let mut count = 0usize;
+        let mut sum = 0.0f64;
+        for &x in &changes {
+            if x >= lower && x <= upper {
+                sum += x;
+                count += 1;
+            }
+        }
+        if count == 0 {
             return 1.0;
         }
 
-        let mean = filtered.iter().sum::<f64>() / filtered.len() as f64;
-        let variance =
-            filtered.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / filtered.len() as f64;
+        let mean = sum / count as f64;
+        let mut variance_sum = 0.0f64;
+        for &x in &changes {
+            if x >= lower && x <= upper {
+                variance_sum += (x - mean).powi(2);
+            }
+        }
+        let variance = variance_sum / count as f64;
 
         variance.sqrt()
     }

@@ -216,18 +216,12 @@ impl WhisperModule {
 
         let mut fee_cache = Vec::new();
 
-        // Scan blocks in parallel chunks
-        let blocks: Vec<_> = (start_height..=current_height)
-            .collect::<Vec<_>>()
-            .chunks(1000)
-            .par_bridge()
-            .flat_map(|heights| {
-                heights
-                    .iter()
-                    .filter_map(|&height| blockchain.get_block(height).ok())
-                    .collect::<Vec<_>>()
-            })
+        // Scan blocks in parallel without building an intermediate height vector.
+        let mut blocks: Vec<_> = (start_height..=current_height)
+            .into_par_iter()
+            .filter_map(|height| blockchain.get_block(height).ok())
             .collect();
+        blocks.sort_unstable_by_key(|b| b.index);
 
         // Process transactions
         for block in blocks {

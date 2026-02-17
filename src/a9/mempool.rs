@@ -47,6 +47,7 @@ impl Ord for FeePerByte {
 #[derive(Debug, PartialEq)]
 pub struct MempoolEntry {
     transaction: Transaction,
+    tx_id: String,
     timestamp: u64,
     fee_per_byte: FeePerByte,
     size: usize,
@@ -142,6 +143,7 @@ impl Mempool {
         // Create entry
         let entry = MempoolEntry {
             transaction: tx.clone(),
+            tx_id: tx.get_tx_id(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -175,7 +177,7 @@ impl Mempool {
 
         // Use a max-heap to efficiently get highest fee transactions
         // Store metadata in heap, not the full transaction (avoids needing Ord on Transaction)
-        let mut heap: BinaryHeap<(FeePerByte, Reverse<u64>, String, usize)> =
+        let mut heap: BinaryHeap<(FeePerByte, Reverse<u64>, String, usize, usize)> =
             BinaryHeap::with_capacity(MAX_TRANSACTIONS_PER_BLOCK * 2);
 
         // Collect only the best transaction per sender into the heap
@@ -184,18 +186,24 @@ impl Mempool {
             let sender = entry.key();
 
             // Get the highest fee transaction from this sender
-            if let Some(best_tx) = entry.value().iter().max_by_key(|tx| tx.fee_per_byte) {
+            if let Some((best_idx, best_tx)) = entry
+                .value()
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, tx)| tx.fee_per_byte)
+            {
                 heap.push((
                     best_tx.fee_per_byte,
                     Reverse(best_tx.timestamp),
                     sender.clone(),
                     best_tx.size,
+                    best_idx,
                 ));
             }
         }
 
         // Extract transactions from heap until we fill the block
-        while let Some((_, Reverse(timestamp), sender, size)) = heap.pop() {
+        while let Some((_, Reverse(_timestamp), sender, size, tx_idx)) = heap.pop() {
             if selected.len() >= MAX_TRANSACTIONS_PER_BLOCK || total_size >= MAX_BLOCK_SIZE {
                 break;
             }
@@ -203,7 +211,7 @@ impl Mempool {
             if processed_senders.insert(sender.clone()) && total_size + size <= MAX_BLOCK_SIZE {
                 // Fetch the actual transaction from the map
                 if let Some(txs) = self.transactions.get(&sender) {
-                    if let Some(entry) = txs.iter().find(|e| e.timestamp == timestamp) {
+                    if let Some(entry) = txs.get(tx_idx) {
                         selected.push(entry.transaction.clone());
                         total_size += size;
                     }
@@ -215,19 +223,18 @@ impl Mempool {
     }
 
     pub fn clear_transaction(&mut self, tx: &Transaction) {
+        let tx_id = tx.get_tx_id();
         if let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) {
             let mut removed = 0usize;
             let mut removed_size = 0usize;
-            for entry in addr_txs.iter() {
-                if entry.transaction == *tx {
+            addr_txs.retain(|entry| {
+                let keep = entry.tx_id != tx_id;
+                if !keep {
                     removed += 1;
                     removed_size += entry.size;
                 }
-            }
-            if removed == 0 {
-                return;
-            }
-            addr_txs.retain(|entry| entry.transaction != *tx);
+                keep
+            });
             if removed > 0 {
                 self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
                 self.total_size
@@ -245,7 +252,7 @@ impl Mempool {
     pub fn find_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
         for entry in self.transactions.iter() {
             for tx in entry.value().iter() {
-                if tx.transaction.get_tx_id() == tx_id {
+                if tx.tx_id == tx_id {
                     return Some(tx.transaction.clone());
                 }
             }
@@ -267,7 +274,7 @@ impl Mempool {
             let sender = entry.key();
             for tx in entry.value().iter() {
                 if now.saturating_sub(tx.timestamp) > ttl_secs {
-                    to_remove.push((sender.clone(), tx.transaction.get_tx_id(), tx.size));
+                    to_remove.push((sender.clone(), tx.tx_id.clone(), tx.size));
                 }
             }
         }
@@ -280,7 +287,7 @@ impl Mempool {
         for (addr, tx_id, size) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let before = txs.len();
-                txs.retain(|entry| entry.transaction.get_tx_id() != tx_id);
+                txs.retain(|entry| entry.tx_id != tx_id);
                 let removed_here = before.saturating_sub(txs.len());
                 if removed_here > 0 {
                     removed += removed_here;
@@ -319,7 +326,7 @@ impl Mempool {
                     tx.fee_per_byte,
                     tx.timestamp,
                     sender.clone(),
-                    tx.transaction.get_tx_id(),
+                    tx.tx_id.clone(),
                     tx.size,
                 )));
             }
@@ -342,7 +349,7 @@ impl Mempool {
         for (addr, tx_id, size) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let before = txs.len();
-                txs.retain(|entry| entry.transaction.get_tx_id() != tx_id);
+                txs.retain(|entry| entry.tx_id != tx_id);
                 let removed_here = before.saturating_sub(txs.len());
                 if removed_here > 0 {
                     self.total_size

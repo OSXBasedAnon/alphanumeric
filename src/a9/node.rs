@@ -5465,12 +5465,11 @@ impl Node {
         let peers = self.peers.read().await;
 
         // IMPROVEMENT: Track peer heights with better error handling
-        let mut peer_heights = Vec::new();
         let peer_ips: Vec<_> = peers.keys().cloned().collect();
         drop(peers); // Release lock before making network requests
 
         // Query peer heights in parallel with better error handling
-        let height_queries: Vec<_> = peer_ips
+        let height_queries = peer_ips
             .iter()
             .map(|&addr| {
                 let node = self.clone();
@@ -5486,14 +5485,12 @@ impl Node {
                     }
                 }
             })
+            });
+        let mut peer_heights: Vec<(SocketAddr, u32)> = futures::future::join_all(height_queries)
+            .await
+            .into_iter()
+            .flatten()
             .collect();
-
-        // Gather results
-        for result in futures::future::join_all(height_queries).await {
-            if let Some(pair) = result {
-                peer_heights.push(pair);
-            }
-        }
 
         // Sort by height descending
         peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
@@ -5560,14 +5557,19 @@ impl Node {
                                     let block = block.clone();
                                     let peer_addr = *peer_addr;
                                     async move {
-                                        if node
+                                        match node
                                             .verify_block_with_witness(&block, Some(peer_addr))
                                             .await
-                                            .unwrap_or(false)
                                         {
-                                            Some(block)
-                                        } else {
-                                            None
+                                            Ok(true) => Some(block),
+                                            Ok(false) => None,
+                                            Err(e) => {
+                                                debug!(
+                                                    "Block verification error at height {} from {}: {}",
+                                                    block.index, peer_addr, e
+                                                );
+                                                None
+                                            }
                                         }
                                     }
                                 })
