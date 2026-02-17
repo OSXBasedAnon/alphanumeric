@@ -251,14 +251,19 @@ impl MiningManager {
 
         let progress_bar = Arc::new(Mutex::new(ProgressBar::new(max_nonce)));
         {
-            let pb = progress_bar.lock().unwrap();
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-                    .progress_chars("=> "),
-            );
-            pb.set_prefix(format!("Block #{}", header.number));
-            pb.enable_steady_tick(100);
+            if let Ok(pb) = progress_bar.lock() {
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+                        .progress_chars("=> "),
+                );
+                pb.set_prefix(format!("Block #{}", header.number));
+                pb.enable_steady_tick(100);
+            } else {
+                return Err(MiningError::MiningFailed(
+                    "Progress bar lock poisoned".to_string(),
+                ));
+            }
         }
 
         let mut current_nonce = 0;
@@ -421,7 +426,14 @@ impl MiningManager {
             if found.load(Ordering::Relaxed) {
                 let nonce = result_nonce.load(Ordering::Acquire);
                 let found_timestamp = result_timestamp.load(Ordering::Acquire);
-                let hash = hash_result.lock().unwrap().clone();
+                let hash = match hash_result.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        return Err(MiningError::MiningFailed(
+                            "Hash result lock poisoned".to_string(),
+                        ))
+                    }
+                };
                 let hash_string = hex::encode(&hash);
 
                 let mut valid_transactions = Vec::with_capacity(mining_transactions.len());

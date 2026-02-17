@@ -979,8 +979,7 @@ impl Mgmt {
                 write!(stdout, "{:.8}", balance)?;
                 stdout.reset()?;
                 stdout
-                    .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(237, 124, 51))))
-                    .unwrap();
+                    .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(237, 124, 51)))).ok();
                 write!(stdout, " ♦\n")?;
                 stdout.reset()?;
 
@@ -1041,16 +1040,16 @@ impl Mgmt {
         // Set the color for the first line
         stdout
             .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(242, 237, 161))))
-            .unwrap();
+            .ok();
         println!("\n Wallet Balances and Addresses:");
-        stdout.reset().unwrap(); // Reset the color to default
+        let _ = stdout.reset(); // Reset the color to default
 
         // Optionally, add a divider with color
         stdout
             .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(51, 43, 23))))
-            .unwrap();
+            .ok();
         println!("────────────────────");
-        stdout.reset().unwrap();
+        let _ = stdout.reset();
 
         let blockchain_guard = self.blockchain.read().await;
 
@@ -1059,34 +1058,29 @@ impl Mgmt {
                 Ok(balance) => {
                     stdout
                         .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))
-                        .unwrap();
-                    writeln!(stdout, "Wallet Name: {}", name).unwrap();
-                    stdout.reset().unwrap();
+                        .ok();
+                    let _ = writeln!(stdout, "Wallet Name: {}", name);
+                    let _ = stdout.reset();
 
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(100, 149, 237))))
-                        .unwrap();
-                    write!(stdout, "Address: ").unwrap();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(100, 149, 237)))).ok();
+                    let _ = write!(stdout, "Address: ");
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White)))
-                        .unwrap();
-                    writeln!(stdout, "{}", wallet.address).unwrap();
-                    stdout.reset().unwrap();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::White))).ok();
+                    let _ = writeln!(stdout, "{}", wallet.address);
+                    let _ = stdout.reset();
 
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(135, 206, 250))))
-                        .unwrap();
-                    write!(stdout, "Balance: ").unwrap();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(135, 206, 250)))).ok();
+                    let _ = write!(stdout, "Balance: ");
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))
-                        .unwrap();
-                    write!(stdout, "{}", balance).unwrap();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true)).ok();
+                    let _ = write!(stdout, "{}", balance);
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181))))
-                        .unwrap();
-                    writeln!(stdout, " ♦").unwrap();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181)))).ok();
+                    let _ = writeln!(stdout, " ♦");
 
-                    stdout.reset().unwrap();
+                    let _ = stdout.reset();
                     println!("-------------------");
                 }
                 Err(e) => {

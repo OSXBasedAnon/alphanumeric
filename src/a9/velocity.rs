@@ -171,7 +171,7 @@ impl ShredCache {
     pub fn new() -> Self {
         Self {
             cache: Arc::new(parking_lot::Mutex::new(LruCache::new(
-                NonZeroUsize::new(SHRED_CACHE_SIZE).unwrap(),
+                NonZeroUsize::new(SHRED_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN),
             ))),
             bloom: Arc::new(BloomFilter::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
         }
@@ -190,7 +190,10 @@ impl ShredCache {
             None => {
                 let vec = vec![None; shred.total_shreds as usize];
                 cache.put(shred.block_hash, vec);
-                cache.get_mut(&shred.block_hash).unwrap()
+                let Some(inserted) = cache.get_mut(&shred.block_hash) else {
+                    return false;
+                };
+                inserted
             }
         };
 
@@ -250,7 +253,9 @@ impl BloomFilter {
         hasher.update(&[seed as u8]);
         hasher.update(data);
         let result = hasher.finalize();
-        u64::from_le_bytes(result.as_bytes()[..8].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&result.as_bytes()[..8]);
+        u64::from_le_bytes(bytes)
     }
 }
 

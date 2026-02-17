@@ -106,7 +106,7 @@ const MAX_PARALLEL_VALIDATIONS: usize = 200;
 const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
-pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
+pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
 const OUTBOUND_POOL_IDLE_SECS: u64 = 90;
 const OUTBOUND_POOL_MAX_FACTOR: usize = 2;
 const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
@@ -4437,8 +4437,6 @@ impl Node {
         addr: SocketAddr,
         tx: &mpsc::Sender<NetworkEvent>,
     ) -> Result<(), NodeError> {
-        pub const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024; // 32MB
-
         if data.len() > MAX_MESSAGE_SIZE {
             self.record_peer_failure(addr).await;
             return Err(NodeError::Network("Message too large".into()));
@@ -5046,7 +5044,10 @@ impl Node {
         }
 
         // Store encryption secret
-        self.peer_secrets.write().await.insert(addr, shared_secret);
+        self.peer_secrets
+            .write()
+            .await
+            .insert(addr, shared_secret.clone());
 
         // Notify peer join
         tx.send(NetworkEvent::PeerJoin(addr))
@@ -5099,26 +5100,16 @@ impl Node {
                 Ok(Ok(_)) => {
                     let data_to_process = &data_buf;
 
-                    // Decrypt message if we have a shared secret - FIXED TYPE MISMATCH
-                    let message: NetworkMessage =
-                        if let Some(secret) = self.peer_secrets.read().await.get(&addr).cloned() {
-                            match self.decrypt_message(&data_to_process, &secret) {
-                                Ok(data) => data,
-                                Err(e) => {
-                                    warn!("Decryption failed from {}: {}", addr, e);
-                                    break 'connection;
-                                }
-                            }
-                        } else {
-                            // Try to deserialize directly
-                            match bincode::deserialize(&data_to_process) {
-                                Ok(msg) => msg,
-                                Err(_) => {
-                                    // If all else fails, wrap in RawData
-                                    NetworkMessage::RawData(data_to_process.to_vec())
-                                }
-                            }
-                        };
+                    // Enforce authenticated transport after a successful handshake.
+                    // Any decrypt failure or missing secret is treated as a protocol violation.
+                    let message: NetworkMessage = match self.decrypt_message(&data_to_process, &shared_secret) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!("Decryption failed from {}: {}", addr, e);
+                            self.record_peer_failure(addr).await;
+                            break 'connection;
+                        }
+                    };
 
                     // Serialize the message for handle_peer_message
                     let serialized_message = bincode::serialize(&message)?;
