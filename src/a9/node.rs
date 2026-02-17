@@ -5484,7 +5484,6 @@ impl Node {
                         _ => None,
                     }
                 }
-            })
             });
         let mut peer_heights: Vec<(SocketAddr, u32)> = futures::future::join_all(height_queries)
             .await
