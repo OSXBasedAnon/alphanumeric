@@ -1276,22 +1276,6 @@ Some("history") => {
         writeln!(&mut stdout, "-------------------")?;
     }
 },
-Some("reset") => {
-    let blockchain_guard = blockchain.write().await;
-    let mut difficulty_guard = blockchain_guard.difficulty.lock().await;
-    *difficulty_guard = 200;
-
-    // Optionally save to persistent storage
-    if let Ok(config_tree) = blockchain_guard.db.open_tree("config") {
-        if let Ok(bytes) = bincode::serialize(&16u64) {
-            if let Err(e) = config_tree.insert("current_difficulty", bytes) {
-                println!("Warning: Could not persist difficulty: {}", e);
-            }
-        }
-    }
-
-    println!("Network difficulty reset to 16 for future blocks");
-},
     Some(cmd) if cmd.starts_with("--") => {
         if let Err(e) = handle_network_commands(&command, &node, &blockchain).await {
             println!("Network command error: {}", e);
@@ -1344,6 +1328,7 @@ Some("help") => {
     println!("mine <wallet_name>                    - Mine a new block");
     println!("rename <wallet_name> <new_wallet>     - Rename wallet");
     println!("info                                  - Show blockchain information");
+    println!("diagnostics (diag)                    - Show difficulty diagnostics");
 
     // For Network Commands header
     stdout.set_color(&header_style)?;
