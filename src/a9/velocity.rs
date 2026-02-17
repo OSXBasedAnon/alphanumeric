@@ -358,18 +358,12 @@ impl VelocityManager {
                 let data = self.erasure_manager.decode(shards)?;
 
                 // Deserialize the block
-                return match bincode::deserialize(&data) {
-                    Ok(block) => {
-                        // Verify hash matches
-                        let reconstructed_block: Block = block;
-                        if reconstructed_block.calculate_hash_for_block() != *block_hash {
-                            Err(VelocityError::HashMismatch)
-                        } else {
-                            Ok(reconstructed_block)
-                        }
-                    }
-                    Err(e) => Err(VelocityError::DeserializationError(e.to_string())),
-                };
+                let reconstructed_block: Block = bincode::deserialize(&data)
+                    .map_err(|e| VelocityError::DeserializationError(e.to_string()))?;
+                if reconstructed_block.calculate_hash_for_block() != *block_hash {
+                    return Err(VelocityError::HashMismatch);
+                }
+                return Ok(reconstructed_block);
             }
         }
 
@@ -522,32 +516,23 @@ impl VelocityManager {
                 continue;
             }
 
-            let shards_per_peer = (shards.len() + peer_count - 1) / peer_count;
-
-            for (i, &(peer_addr, _)) in peer_group.iter().take(peer_count).enumerate() {
-                let start = i * shards_per_peer;
-                let end = (start + shards_per_peer).min(shards.len());
-
-                if start >= shards.len() {
-                    break;
-                }
-
+            let selected = peer_group.into_iter().take(peer_count).collect::<Vec<_>>();
+            for (shard_idx, shard_data) in shards.iter().enumerate() {
+                let (peer_addr, _) = selected[shard_idx % selected.len()];
                 let shred = Shred {
                     block_hash: block.hash,
-                    index: start as u32,
+                    index: shard_idx as u32,
                     total_shreds: shred_count,
-                    data: shards[start..end].concat(),
+                    data: shard_data.clone(),
                     subnet_hint: None,
                     timestamp: block.timestamp,
-                    nonce: start as u64,
+                    nonce: shard_idx as u64,
                 };
 
-                let future = tokio::time::timeout(
+                futures.push(tokio::time::timeout(
                     Duration::from_secs(PROPAGATION_TIMEOUT),
                     self.send_shred(peer_addr, shred),
-                );
-
-                futures.push(future);
+                ));
             }
         }
 
@@ -653,38 +638,6 @@ impl VelocityManager {
         Ok(())
     }
 
-    fn group_peers_by_subnet(
-        &self,
-        peers: &HashMap<SocketAddr, PeerInfo>,
-    ) -> HashMap<SubnetGroup, Vec<SocketAddr>> {
-        let mut groups = HashMap::new();
-
-        for (&addr, _) in peers {
-            let subnet = match addr.ip() {
-                IpAddr::V4(ipv4) => {
-                    if let Ok(net) = Ipv4Net::new(ipv4, 24) {
-                        Some(SubnetGroup::from_ipv4(net))
-                    } else {
-                        None
-                    }
-                }
-                IpAddr::V6(ipv6) => {
-                    if let Ok(net) = Ipv6Net::new(ipv6, 64) {
-                        Some(SubnetGroup::from_ipv6(net))
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            if let Some(subnet) = subnet {
-                groups.entry(subnet).or_insert_with(Vec::new).push(addr);
-            }
-        }
-
-        groups
-    }
-
     pub async fn handle_shred(
         &self,
         shred: Shred,
@@ -710,26 +663,10 @@ impl VelocityManager {
         &self,
         block_hash: &[u8; 32],
     ) -> Result<Option<Block>, VelocityError> {
-        let cache = self.shred_cache.cache.lock();
-
-        if let Some(shreds) = cache.peek(block_hash) {
-            if shreds.iter().all(|s| s.is_some()) {
-                // All shreds available, reconstruct block
-                let shards: Vec<Option<Vec<u8>>> = shreds
-                    .iter()
-                    .map(|s| s.as_ref().map(|s| s.data.to_vec()))
-                    .collect();
-
-                let data = self.erasure_manager.decode(shards)?;
-
-                return Ok(Some(
-                    bincode::deserialize(&data)
-                        .map_err(|e| VelocityError::BlockReconstruction(e.to_string()))?,
-                ));
-            }
+        if !self.is_block_complete(block_hash).await {
+            return Ok(None);
         }
-
-        Ok(None)
+        self.reconstruct_block(block_hash).await.map(Some)
     }
 
     async fn request_missing_shreds(

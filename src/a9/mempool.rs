@@ -253,24 +253,6 @@ impl Mempool {
         None
     }
 
-    fn recalculate_metrics(&mut self) {
-        self.address_counts.clear();
-        self.total_size = AtomicUsize::new(0);
-        self.total_count = AtomicUsize::new(0);
-
-        for entry in &self.transactions {
-            let addr = entry.key();
-            let txs = entry.value();
-            self.address_counts.insert(addr.clone(), txs.len());
-            self.total_size.fetch_add(
-                txs.iter().map(|tx| tx.size).sum::<usize>(),
-                AtomicOrdering::SeqCst,
-            );
-            self.total_count
-                .fetch_add(txs.len(), AtomicOrdering::SeqCst);
-        }
-    }
-
     pub fn prune_expired(&mut self) -> usize {
         let Some(ttl_secs) = Self::mempool_ttl_secs() else {
             return 0;

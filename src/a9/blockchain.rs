@@ -3069,25 +3069,6 @@ impl Blockchain {
         Ok(())
     }
 
-    pub async fn process_pending_transactions(&self) -> Result<(), BlockchainError> {
-        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        let mut transactions = Vec::new();
-
-        for result in pending_tree.iter() {
-            let (_, tx_bytes) = result?;
-            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                transactions.push(tx);
-            }
-        }
-
-        if !transactions.is_empty() {
-            self.process_transactions_batch(transactions, TransactionContext::Standard)
-                .await?;
-        }
-
-        Ok(())
-    }
-
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let auto_rebuild = std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")

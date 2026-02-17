@@ -260,8 +260,8 @@ impl Wallet {
             return Err("Passphrase required for encrypted wallet".to_string());
         }
 
-        let combined_bytes = if passphrase.is_some() {
-            Self::decrypt_private_key(encrypted_key.to_vec(), passphrase.unwrap())?
+        let combined_bytes = if let Some(pass) = passphrase {
+            Self::decrypt_private_key(encrypted_key.to_vec(), pass)?
         } else {
             encrypted_key.to_vec()
         };
@@ -312,8 +312,10 @@ impl Wallet {
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
+        let payload = serde_json::to_vec(data)
+            .map_err(|e| format!("Failed to serialize wallet data: {}", e))?;
         let encrypted_data = cipher
-            .encrypt(nonce, &*serde_json::to_vec(data).unwrap())
+            .encrypt(nonce, &*payload)
             .map_err(|e| format!("Encryption failed: {}", e))?;
 
         let mut result = nonce.to_vec();
@@ -364,8 +366,7 @@ impl Wallet {
     pub async fn get_full_signature(&self, transaction_data: &[u8]) -> Option<Vec<u8>> {
         let keypair = self.keypair.as_ref()?;
         let keypair = keypair.lock().await;
-        let secret_key = SecretKey::from_bytes(&keypair.dilithium_secret_key_bytes)
-            .expect("Invalid secret key bytes");
+        let secret_key = SecretKey::from_bytes(&keypair.dilithium_secret_key_bytes).ok()?;
         let signature = detached_sign(transaction_data, &secret_key);
         Some(PqDetachedSignature::as_bytes(&signature).to_vec())
     }

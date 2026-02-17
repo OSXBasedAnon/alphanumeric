@@ -33,6 +33,7 @@ use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use reqwest::Client;
 use ring::{
+    agreement,
     aead, hkdf,
     rand::SecureRandom,
     signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519},
@@ -5661,9 +5662,14 @@ impl Node {
     ) -> Result<(PeerInfo, Vec<u8>), NodeError> {
         const MAX_HANDSHAKE_SIZE: usize = 1024;
 
-        // Generate random nonce for this handshake
-        let mut local_nonce = [0u8; 32];
-        thread_rng().fill(&mut local_nonce);
+        // Generate ephemeral X25519 key material for forward-secret transport encryption.
+        let rng = ring::rand::SystemRandom::new();
+        let local_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+            .map_err(|_| NodeError::Network("Failed to generate handshake key".into()))?;
+        let mut local_public = [0u8; 32];
+        local_private
+            .compute_public_key(&mut local_public)
+            .map_err(|_| NodeError::Network("Failed to derive handshake public key".into()))?;
 
         let blockchain_height = {
             let blockchain = self.blockchain.read().await;
@@ -5679,7 +5685,7 @@ impl Node {
         let mut our_handshake = HandshakeMessage {
             version: NETWORK_VERSION,
             timestamp: now,
-            nonce: local_nonce,
+            nonce: local_public,
             public_key: self.handshake_public_key.clone(),
             node_id: self.node_id.clone(),
             network_id: self.network_id,
@@ -5733,7 +5739,7 @@ impl Node {
             };
 
             // Derive shared secret
-            let shared_secret = self.derive_shared_secret(&local_nonce, &peer_handshake.nonce)?;
+            let shared_secret = self.derive_shared_secret(local_private, &peer_handshake.nonce)?;
 
             Ok((peer_info, shared_secret))
         } else {
@@ -5781,7 +5787,7 @@ impl Node {
             };
 
             // Derive shared secret
-            let shared_secret = self.derive_shared_secret(&local_nonce, &peer_handshake.nonce)?;
+            let shared_secret = self.derive_shared_secret(local_private, &peer_handshake.nonce)?;
 
             Ok((peer_info, shared_secret))
         }
@@ -5857,24 +5863,20 @@ impl Node {
     // Method to derive shared secret for secure communication
     fn derive_shared_secret(
         &self,
-        local_nonce: &[u8; 32],
-        remote_nonce: &[u8; 32],
+        local_private: agreement::EphemeralPrivateKey,
+        remote_public: &[u8; 32],
     ) -> Result<Vec<u8>, NodeError> {
-        // Canonical ordering prevents initiator/responder key mismatch.
-        let mut combined = Vec::with_capacity(64);
-        if local_nonce <= remote_nonce {
-            combined.extend_from_slice(local_nonce);
-            combined.extend_from_slice(remote_nonce);
-        } else {
-            combined.extend_from_slice(remote_nonce);
-            combined.extend_from_slice(local_nonce);
-        }
-
-        // Use HKDF to derive key material
-        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]);
-        let prk = salt.extract(&combined);
+        let peer_key = agreement::UnparsedPublicKey::new(&agreement::X25519, remote_public);
+        let ikm = agreement::agree_ephemeral(
+            local_private,
+            &peer_key,
+            NodeError::Network("Failed to derive shared secret".into()),
+            |material| Ok(material.to_vec()),
+        )?;
 
         // Derive 32-byte shared secret
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]);
+        let prk = salt.extract(&ikm);
         let mut shared_secret = [0u8; 32];
         prk.expand(&[b"blockchain_p2p"], ring::hkdf::HKDF_SHA256)
             .map_err(|_| NodeError::Network("Failed to derive shared secret".into()))?

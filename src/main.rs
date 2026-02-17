@@ -299,8 +299,8 @@ async fn main() -> Result<()> {
         const BLOCK_BUFFER_SIZE: usize = 100;     // ~200s worth of blocks
         const MIN_VIABLE_PEERS: usize = 3;        // Minimum peers for operation
         const MAX_SYNC_ATTEMPTS: u32 = 3;         // Maximum sync retries before backing off
-        const HEALTH_CHECK_INTERVAL: u64 = 100;   // 100ms health checks
-        const SYNC_CHECK_INTERVAL: u64 = 500;     // 500ms sync checks
+        const HEALTH_CHECK_INTERVAL: u64 = 1000;  // 1s health checks
+        const SYNC_CHECK_INTERVAL: u64 = 2000;    // 2s sync checks
         const SLEEP_THRESHOLD: u64 = 10;          // 10s threshold for sleep detection
         const MAX_BLOCK_AGE: u64 = 2;            // Maximum acceptable block age deviation
         const MIN_PEER_LATENCY: u64 = 10;        // Minimum acceptable peer latency
@@ -413,14 +413,13 @@ async fn main() -> Result<()> {
                                                     node.request_peer_height(peer)
                                                 ).await {
                                                     Ok(Ok(height)) => Some(height),
-                                                    _ => {
-                                                        consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                                                        None
-                                                    }
+                                                    _ => None
                                                 }
                                             }
                                         })
                                     ).await;
+                                    let batch_timeouts = heights.iter().filter(|h| h.is_none()).count() as u32;
+                                    consecutive_timeouts = consecutive_timeouts.saturating_add(batch_timeouts);
 
                                     // Process height differences with backoff
                                     if let Some(&max_height) = heights.iter().flatten().max() {
@@ -2290,8 +2289,23 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     }
 
     // Always bootstrap from the canonical site; do not allow override URLs.
-    // If the manifest fetch fails, fall back to the default static zip URL.
+    // Require a signed manifest from a trusted publisher before downloading.
     let manifest_url = "https://alphanumeric.blue/api/bootstrap/manifest";
+    let trusted_manifest_keys: HashSet<String> = std::env::var("ALPHANUMERIC_BOOTSTRAP_TRUSTED_PUBLISHER_KEYS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|k| k.trim().to_ascii_lowercase())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if trusted_manifest_keys.is_empty() {
+        return Err(
+            "Missing ALPHANUMERIC_BOOTSTRAP_TRUSTED_PUBLISHER_KEYS for bootstrap verification"
+                .into(),
+        );
+    }
 
     #[derive(serde::Deserialize)]
     struct ManifestResponse {
@@ -2315,26 +2329,88 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         updated_at: u64,
     }
 
-    // Prefer the latest manifest (recent snapshot URL + sha256). Fall back to the static zip URL if
-    // the manifest fetch/parsing fails, but still require the final download to succeed.
+    #[derive(serde::Serialize)]
+    struct SignedManifestFields {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tip_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        updated_at: u64,
+    }
+
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
         Ok(r) if r.status().is_success() => {
             let body = r.bytes().await?;
-            if let Ok(parsed) = serde_json::from_slice::<ManifestResponse>(&body) {
-                if parsed.ok && !parsed.manifest.url.trim().is_empty() {
-                    (parsed.manifest.url.clone(), parsed.manifest.sha256.clone())
-                } else {
-                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                }
-            } else {
-                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            let parsed: ManifestResponse = serde_json::from_slice(&body)
+                .map_err(|e| format!("Invalid bootstrap manifest payload: {}", e))?;
+            if !parsed.ok || parsed.manifest.url.trim().is_empty() {
+                return Err("Invalid bootstrap manifest".into());
             }
+
+            let publisher_pubkey_hex = parsed
+                .manifest
+                .publisher_pubkey
+                .clone()
+                .ok_or("Missing bootstrap manifest publisher_pubkey")?
+                .trim()
+                .to_ascii_lowercase();
+            let manifest_sig_hex = parsed
+                .manifest
+                .manifest_sig
+                .clone()
+                .ok_or("Missing bootstrap manifest signature")?
+                .trim()
+                .to_ascii_lowercase();
+            let sha256 = parsed
+                .manifest
+                .sha256
+                .clone()
+                .ok_or("Missing bootstrap manifest sha256")?;
+
+            if !trusted_manifest_keys.contains(&publisher_pubkey_hex) {
+                return Err("Bootstrap manifest signer is not trusted".into());
+            }
+
+            let signing_payload = SignedManifestFields {
+                url: parsed.manifest.url.clone(),
+                height: parsed.manifest.height,
+                tip_hash: parsed.manifest.tip_hash.clone(),
+                sha256: Some(sha256.clone()),
+                updated_at: parsed.manifest.updated_at,
+            };
+            let message = serde_json::to_vec(&signing_payload)?;
+
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let pubkey_bytes = hex::decode(&publisher_pubkey_hex)
+                .map_err(|_| "Invalid bootstrap manifest public key encoding")?;
+            let sig_bytes = hex::decode(&manifest_sig_hex)
+                .map_err(|_| "Invalid bootstrap manifest signature encoding")?;
+            let pubkey_arr: [u8; 32] = pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Invalid bootstrap manifest public key length")?;
+            let sig_arr: [u8; 64] = sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Invalid bootstrap manifest signature length")?;
+            let verifier = VerifyingKey::from_bytes(&pubkey_arr)
+                .map_err(|_| "Invalid bootstrap manifest public key")?;
+            let sig = Signature::from_bytes(&sig_arr);
+            verifier
+                .verify(&message, &sig)
+                .map_err(|_| "Bootstrap manifest signature verification failed")?;
+
+            (parsed.manifest.url.clone(), Some(sha256))
         }
         Ok(r) => {
-            // Manifest endpoint returned non-2xx.
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            return Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into());
         }
-        Err(_) => (DEFAULT_BOOTSTRAP_URL.to_string(), None),
+        Err(e) => {
+            return Err(format!("Bootstrap manifest request failed: {}", e).into());
+        }
     };
 
     let res = reqwest::get(&download_url).await?;
