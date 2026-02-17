@@ -2272,23 +2272,9 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     }
 
     // Always bootstrap from the canonical site; do not allow override URLs.
-    // Require a signed manifest from a trusted publisher before downloading.
+    // Prefer manifest-driven latest snapshot; if unavailable, fall back to the
+    // canonical static bootstrap URL.
     let manifest_url = "https://alphanumeric.blue/api/bootstrap/manifest";
-    let trusted_manifest_keys: HashSet<String> = std::env::var("ALPHANUMERIC_BOOTSTRAP_TRUSTED_PUBLISHER_KEYS")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(|k| k.trim().to_ascii_lowercase())
-                .filter(|k| !k.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    if trusted_manifest_keys.is_empty() {
-        return Err(
-            "Missing ALPHANUMERIC_BOOTSTRAP_TRUSTED_PUBLISHER_KEYS for bootstrap verification"
-                .into(),
-        );
-    }
 
     #[derive(serde::Deserialize)]
     struct ManifestResponse {
@@ -2305,94 +2291,50 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         tip_hash: Option<String>,
         #[serde(default)]
         sha256: Option<String>,
-        #[serde(default)]
-        publisher_pubkey: Option<String>,
-        #[serde(default)]
-        manifest_sig: Option<String>,
-        updated_at: u64,
-    }
-
-    #[derive(serde::Serialize)]
-    struct SignedManifestFields {
-        url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        height: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tip_hash: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sha256: Option<String>,
         updated_at: u64,
     }
 
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
         Ok(r) if r.status().is_success() => {
             let body = r.bytes().await?;
-            let parsed: ManifestResponse = serde_json::from_slice(&body)
-                .map_err(|e| format!("Invalid bootstrap manifest payload: {}", e))?;
-            if !parsed.ok || parsed.manifest.url.trim().is_empty() {
-                return Err("Invalid bootstrap manifest".into());
+            match serde_json::from_slice::<ManifestResponse>(&body) {
+                Ok(parsed) if parsed.ok && !parsed.manifest.url.trim().is_empty() => (
+                    parsed.manifest.url.clone(),
+                    parsed
+                        .manifest
+                        .sha256
+                        .clone()
+                        .map(|v| v.trim().to_ascii_lowercase())
+                        .filter(|v| !v.is_empty()),
+                ),
+                Ok(_) => {
+                    warn!(
+                        "Bootstrap manifest is invalid; falling back to canonical bootstrap URL"
+                    );
+                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                }
+                Err(e) => {
+                    warn!(
+                        "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
+                        e
+                    );
+                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                }
             }
-
-            let publisher_pubkey_hex = parsed
-                .manifest
-                .publisher_pubkey
-                .clone()
-                .ok_or("Missing bootstrap manifest publisher_pubkey")?
-                .trim()
-                .to_ascii_lowercase();
-            let manifest_sig_hex = parsed
-                .manifest
-                .manifest_sig
-                .clone()
-                .ok_or("Missing bootstrap manifest signature")?
-                .trim()
-                .to_ascii_lowercase();
-            let sha256 = parsed
-                .manifest
-                .sha256
-                .clone()
-                .ok_or("Missing bootstrap manifest sha256")?;
-
-            if !trusted_manifest_keys.contains(&publisher_pubkey_hex) {
-                return Err("Bootstrap manifest signer is not trusted".into());
-            }
-
-            let signing_payload = SignedManifestFields {
-                url: parsed.manifest.url.clone(),
-                height: parsed.manifest.height,
-                tip_hash: parsed.manifest.tip_hash.clone(),
-                sha256: Some(sha256.clone()),
-                updated_at: parsed.manifest.updated_at,
-            };
-            let message = serde_json::to_vec(&signing_payload)?;
-
-            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-            let pubkey_bytes = hex::decode(&publisher_pubkey_hex)
-                .map_err(|_| "Invalid bootstrap manifest public key encoding")?;
-            let sig_bytes = hex::decode(&manifest_sig_hex)
-                .map_err(|_| "Invalid bootstrap manifest signature encoding")?;
-            let pubkey_arr: [u8; 32] = pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "Invalid bootstrap manifest public key length")?;
-            let sig_arr: [u8; 64] = sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "Invalid bootstrap manifest signature length")?;
-            let verifier = VerifyingKey::from_bytes(&pubkey_arr)
-                .map_err(|_| "Invalid bootstrap manifest public key")?;
-            let sig = Signature::from_bytes(&sig_arr);
-            verifier
-                .verify(&message, &sig)
-                .map_err(|_| "Bootstrap manifest signature verification failed")?;
-
-            (parsed.manifest.url.clone(), Some(sha256))
         }
         Ok(r) => {
-            return Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into());
+            warn!(
+                "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
+                r.status()
+            );
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
         }
         Err(e) => {
-            return Err(format!("Bootstrap manifest request failed: {}", e).into());
+            warn!(
+                "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
+                e
+            );
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
         }
     };
 
