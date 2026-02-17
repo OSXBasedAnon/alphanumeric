@@ -1328,7 +1328,6 @@ Some("help") => {
     println!("mine <wallet_name>                    - Mine a new block");
     println!("rename <wallet_name> <new_wallet>     - Rename wallet");
     println!("info                                  - Show blockchain information");
-    println!("diagnostics (diag)                    - Show difficulty diagnostics");
 
     // For Network Commands header
     stdout.set_color(&header_style)?;
