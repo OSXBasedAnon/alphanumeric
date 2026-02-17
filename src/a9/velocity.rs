@@ -1,13 +1,10 @@
 use async_trait::async_trait;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dashmap::DashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::Ipv4Net;
 use ipnet::Ipv6Net;
 use log::warn;
 use lru::LruCache;
-use rand::prelude::SliceRandom;
-use rayon::prelude::*;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -423,7 +420,6 @@ impl VelocityManager {
                 .collect::<Vec<_>>();
 
             if !selected_peers.is_empty() {
-                let mut successes = 0;
                 let min_confirmations = (selected_peers.len() * 3) / 4;
 
                 let futures: Vec<_> = selected_peers
@@ -445,7 +441,7 @@ impl VelocityManager {
                     .collect();
 
                 let results = futures::future::join_all(futures).await;
-                successes = results.iter().filter(|r| r.is_ok()).count();
+                let successes = results.iter().filter(|r| r.is_ok()).count();
 
                 if successes >= min_confirmations {
                     log::info!(

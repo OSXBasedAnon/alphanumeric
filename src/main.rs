@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
 
         // Continue with rest of initialization
         pb.set_message("Setting up management...");
-        let (transaction_fee, mining_reward, _difficulty_adjustment_interval, block_time) = {
+        let (_transaction_fee, _mining_reward, _difficulty_adjustment_interval, _block_time) = {
             let blockchain_lock = blockchain.read().await;
             (
                 blockchain_lock.transaction_fee,
@@ -757,7 +757,7 @@ async fn main() -> Result<()> {
 
     // Chain Status
     let blockchain_guard = blockchain.read().await;
-    let current_height = blockchain_guard.get_latest_block_index();
+    let _current_height = blockchain_guard.get_latest_block_index();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1732,7 +1732,6 @@ async fn handle_chain_sync(
             let current_height = Arc::clone(&current_height);
             let processed_height = Arc::clone(&processed_height);
             let active_requests = Arc::clone(&active_requests);
-            let main_pb = main_pb.clone();
             let status_pb = status_pb.clone();
             let tx = tx.clone();
             let node = node.clone();
@@ -1764,7 +1763,7 @@ async fn handle_chain_sync(
                         status_pb.set_message("Sync stalled - attempting recovery");
 
                         // Try to find a new peer to get blocks from
-                        if let Ok(peers) = node.discover_network_nodes().await {
+                        if node.discover_network_nodes().await.is_ok() {
                             let peers = node.peers.read().await;
                             if let Some((addr, _)) = peers
                                 .iter()

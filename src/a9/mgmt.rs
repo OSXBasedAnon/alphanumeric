@@ -88,7 +88,7 @@ pub struct Mgmt {
 
 impl Mgmt {
     pub fn new(
-        db: sled::Db,
+        _db: sled::Db,
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
     ) -> Self {
         Mgmt {
@@ -255,7 +255,7 @@ impl Mgmt {
 
     pub async fn create_default_wallet(
         &self,
-        passphrase: Option<&[u8]>,
+        _passphrase: Option<&[u8]>,
     ) -> Result<HashMap<String, Wallet>> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
         let mut wallets = HashMap::new();
@@ -406,11 +406,10 @@ impl Mgmt {
 
     pub async fn load_wallets(
         &self,
-        db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Db>>,
         passphrase: Option<&[u8]>,
     ) -> Result<HashMap<String, Wallet>> {
         let mut wallets = HashMap::new();
-        let db = db_arc.read().await;
 
         match fs::read_to_string(KEY_FILE_PATH).await {
             Ok(key_data) => {
@@ -461,7 +460,7 @@ impl Mgmt {
         &self,
         db_arc: &Arc<RwLock<Db>>,
         wallets: &HashMap<String, Wallet>,
-        passphrase: Option<&[u8]>,
+        _passphrase: Option<&[u8]>,
     ) -> std::result::Result<(), Box<dyn Error>> {
         let wallet_key_data: Vec<WalletKeyData> = wallets
             .iter()
@@ -541,7 +540,7 @@ impl Mgmt {
         miner: &Miner,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
-        db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Db>>,
     ) -> Result<()> {
         if command.len() < 2 {
             return Err("Usage: mine <wallet_name_or_address>".into());
@@ -587,7 +586,7 @@ impl Mgmt {
             let mining_reward = blockchain_guard.get_block_reward(&regular_transactions);
 
             // Pass as slice to calculate_merkle_root
-            let merkle_root = Blockchain::calculate_merkle_root(&regular_transactions)?;
+            let _merkle_root = Blockchain::calculate_merkle_root(&regular_transactions)?;
 
             let tip = blockchain_guard
                 .get_last_block()
@@ -645,7 +644,7 @@ impl Mgmt {
             )
             .await
         {
-            Ok((nonce, hash)) => {
+            Ok((_nonce, _hash)) => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                 writeln!(stdout, "\n Mining successful")?;
                 stdout.reset()?;
@@ -681,7 +680,7 @@ impl Mgmt {
         command: &str,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
-        db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Db>>,
     ) -> Result<()> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 

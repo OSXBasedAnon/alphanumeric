@@ -9,9 +9,6 @@ use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use parking_lot::Mutex as PLMutex;
-use pqcrypto_traits::sign::{
-    DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
-};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
@@ -1493,7 +1490,7 @@ impl Blockchain {
             .collect();
 
         // Rule 1: Mining reward must be first transaction if present
-        if let Some((idx, tx)) = system_txs
+        if let Some((idx, _tx)) = system_txs
             .iter()
             .find(|(_, tx)| tx.sender == "MINING_REWARDS")
         {
@@ -2240,7 +2237,7 @@ impl Blockchain {
             let current_block =
                 Block::from_bytes(&value).map_err(|e| BlockchainError::SerializationError(e))?;
 
-            let epoch = mining_manager
+            let _epoch = mining_manager
                 .get_last_epoch()
                 .await
                 .map_err(|e| BlockchainError::MiningError(e.to_string()))?;
@@ -2788,7 +2785,7 @@ impl Blockchain {
         let current_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods as i32);
 
         // Get transaction metrics and sum fees in a single pass (excluding mining rewards)
-        let (tx_count, total_volume, total_fees) = block
+        let (tx_count, _total_volume, total_fees) = block
             .transactions
             .iter()
             .filter(|tx| tx.sender != "MINING_REWARDS")
@@ -2872,7 +2869,7 @@ impl Blockchain {
     // Genesis block
     pub async fn create_genesis_block(
         &self,
-        mining_manager: &MiningManager,
+        _mining_manager: &MiningManager,
     ) -> Result<(), BlockchainError> {
         let transaction_amount = 17.76;
         let fee = transaction_amount * FEE_PERCENTAGE;

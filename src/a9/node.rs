@@ -2,49 +2,41 @@ use arrayref::array_ref;
 use axum::{extract::State, routing::get, Json, Router};
 use dashmap::DashMap;
 use futures_util::{
-    future::{join_all, Either},
-    stream::{FuturesUnordered, StreamExt},
-    TryFutureExt,
+    future::join_all,
 };
 use igd_next::{search_gateway, PortMappingProtocol};
 use ipnet::{Ipv4Net, Ipv6Net};
 use libp2p::{
-    core::{
-        connection::ConnectedPoint, muxing::StreamMuxerBox, transport::upgrade, upgrade::Version,
-    },
+    core::transport::upgrade,
     identity,
     kad::{
         handler::{KademliaHandler, KademliaHandlerIn},
         record::store::MemoryStore,
-        store::RecordStore,
         Kademlia, KademliaConfig, KademliaEvent, QueryId, QueryResult,
     },
     noise,
     swarm::{
-        derive_prelude::*, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm,
-        IntoConnectionHandler, NetworkBehaviour, PollParameters, Swarm, SwarmBuilder, SwarmEvent,
-        ToSwarm,
+        derive_prelude::*, ConnectionHandler, ConnectionId, FromSwarm, NetworkBehaviour,
+        PollParameters, Swarm, SwarmBuilder, ToSwarm,
     },
-    yamux, Multiaddr, PeerId, Transport,
+    yamux, Multiaddr, PeerId,
 };
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use lru::LruCache;
-use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
+use parking_lot::Mutex as PLMutex;
 use rand::{seq::SliceRandom, thread_rng, Rng};
 use reqwest::Client;
 use ring::{
     agreement,
-    aead, hkdf,
     rand::SecureRandom,
     signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use sled::Db;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     convert::TryInto,
     hash::{Hash, Hasher},
     io::Write,
@@ -68,17 +60,13 @@ use tokio::{
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-#[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, FromRawSocket};
 
 use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, RateLimiter, Transaction, SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::mempool::TemporalVerification;
-use crate::a9::oracle::DifficultyOracle;
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
-use crate::a9::wallet::Wallet;
 
 //----------------------------------------------------------------------
 // Constants
@@ -941,12 +929,12 @@ impl Node {
         // Check for existing lock
         if lock_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&lock_path) {
-                if let Ok(pid) = content.parse::<u32>() {
+                if let Ok(_pid) = content.parse::<u32>() {
                     #[cfg(unix)]
                     {
                         use nix::sys::signal;
                         use nix::unistd::Pid;
-                        if signal::kill(Pid::from_raw(pid as i32), None).is_ok() {
+                        if signal::kill(Pid::from_raw(_pid as i32), None).is_ok() {
                             return Err(NodeError::Network(
                                 "Wallet already in use. Please close other instances first."
                                     .to_string(),
@@ -2121,8 +2109,6 @@ impl Node {
             let peers = self.peers.read().await;
             for (_, info) in peers.iter() {
                 // Direct access to subnet_group - it's not an Option
-                let subnet = info.subnet_group;
-
                 // Convert subnet group to scan range
                 match info.address.ip() {
                     IpAddr::V4(ip) => {
@@ -2523,7 +2509,7 @@ impl Node {
                     if ip_family == 0x01 {
                         // IPv4
                         let xor_port = ((data[pos + 6] as u16) << 8) | (data[pos + 7] as u16);
-                        let port = xor_port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
+                        let _port = xor_port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
 
                         let xor_ip = ((data[pos + 8] as u32) << 24)
                             | ((data[pos + 9] as u32) << 16)
@@ -3000,7 +2986,7 @@ impl Node {
         }
         cfg.set_query_timeout(Duration::from_secs(60));
         let store = MemoryStore::new(local_peer_id);
-        let mut kademlia = Kademlia::with_config(local_peer_id, store, cfg);
+        let kademlia = Kademlia::with_config(local_peer_id, store, cfg);
 
         //==============================================================================
         // BOOTSTRAP NODE CONFIGURATION
@@ -3110,7 +3096,7 @@ impl Node {
         let mut event_count = 0;
 
         // Create a temporary future to drive the swarm
-        let mut swarm_future = Box::pin(async move {
+        let swarm_future = Box::pin(async move {
             loop {
                 if event_count >= event_count_limit {
                     return (swarm, Ok(()));
@@ -3167,8 +3153,8 @@ impl Node {
 
         // IMPROVEMENT: Track peer metrics for better connection management
         let mut active_peers = 0;
-        let mut inactive_peers = 0;
-        let mut high_latency_peers = 0;
+        let mut _inactive_peers = 0;
+        let mut _high_latency_peers = 0;
         let mut peers_to_check = Vec::new();
         let mut peers_to_remove = Vec::new();
 
@@ -3187,7 +3173,7 @@ impl Node {
                 let inactive_time = now.saturating_sub(last_seen);
 
                 if inactive_time > PEER_TIMEOUT_SECS {
-                    inactive_peers += 1;
+                    _inactive_peers += 1;
                     peers_to_remove.push(addr);
                 } else if inactive_time > PING_INTERVAL_SECS {
                     // Needs a health check
@@ -3197,7 +3183,7 @@ impl Node {
 
                     // Track latency
                     if latency > MAX_PING_LATENCY {
-                        high_latency_peers += 1;
+                        _high_latency_peers += 1;
                     }
                 }
             }
@@ -3403,7 +3389,7 @@ impl Node {
                 peer_ratings.sort_by_key(|&(_, score)| score);
 
                 // Keep the best max_per_subnet, remove the rest
-                let excess_count = count - max_per_subnet;
+                let _excess_count = count - max_per_subnet;
                 let peers_to_remove = peer_ratings.len().saturating_sub(max_per_subnet);
 
                 for i in (peer_ratings.len() - peers_to_remove)..peer_ratings.len() {
@@ -3698,7 +3684,7 @@ impl Node {
             return Ok(existing);
         }
 
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
             .await
             .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
         stream.set_nodelay(true)?;
@@ -4732,7 +4718,10 @@ impl Node {
                 }
             }
 
-            NetworkMessage::ShredResponse { block_hash, shreds } => {
+            NetworkMessage::ShredResponse {
+                block_hash: _block_hash,
+                shreds,
+            } => {
                 if let Some(velocity) = &self.velocity_manager {
                     // Process each shred in the response
                     for shred in shreds {
@@ -4743,7 +4732,10 @@ impl Node {
                 }
             }
 
-            NetworkMessage::Ping { timestamp, node_id } => {
+            NetworkMessage::Ping {
+                timestamp,
+                node_id: _node_id,
+            } => {
                 // Respond to ping with pong
                 let response = NetworkMessage::Pong {
                     timestamp,
@@ -4966,7 +4958,7 @@ impl Node {
 
     async fn handle_connection(
         &self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         addr: SocketAddr,
         tx: mpsc::Sender<NetworkEvent>,
     ) -> Result<(), NodeError> {
@@ -5324,7 +5316,7 @@ impl Node {
             }
         }
 
-        let mut stream = match stream {
+        let stream = match stream {
             Some(s) => s,
             None => {
                 // Record failure for this peer
