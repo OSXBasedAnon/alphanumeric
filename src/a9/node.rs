@@ -5666,10 +5666,13 @@ impl Node {
         let rng = ring::rand::SystemRandom::new();
         let local_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
             .map_err(|_| NodeError::Network("Failed to generate handshake key".into()))?;
-        let mut local_public = [0u8; 32];
-        local_private
-            .compute_public_key(&mut local_public)
+        let local_public = local_private
+            .compute_public_key()
             .map_err(|_| NodeError::Network("Failed to derive handshake public key".into()))?;
+        let local_public_bytes: [u8; 32] = local_public
+            .as_ref()
+            .try_into()
+            .map_err(|_| NodeError::Network("Invalid handshake public key length".into()))?;
 
         let blockchain_height = {
             let blockchain = self.blockchain.read().await;
@@ -5685,7 +5688,7 @@ impl Node {
         let mut our_handshake = HandshakeMessage {
             version: NETWORK_VERSION,
             timestamp: now,
-            nonce: local_public,
+            nonce: local_public_bytes,
             public_key: self.handshake_public_key.clone(),
             node_id: self.node_id.clone(),
             network_id: self.network_id,
