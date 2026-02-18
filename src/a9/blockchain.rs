@@ -41,6 +41,8 @@ const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const NONCE_MAGIC: u128 = 0xA5A5A5A5A5A5A5A5A;
 const DIFFICULTY_MAGIC: u128 = 0x5A5A5A5A5A5A5A5A5A5A5A5A5A;
+const MONEY_SCALE_I128: i128 = 100_000_000;
+const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT: f64 = 0.00000564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
@@ -126,7 +128,22 @@ struct LegacyTransaction {
 
 impl Transaction {
     pub fn round_amount(amount: f64) -> f64 {
-        (amount * 100_000_000.0).round() / 100_000_000.0
+        (amount * MONEY_SCALE_F64).round() / MONEY_SCALE_F64
+    }
+
+    pub fn to_units(amount: f64) -> i128 {
+        if !amount.is_finite() {
+            return 0;
+        }
+        (Self::round_amount(amount) * MONEY_SCALE_F64).round() as i128
+    }
+
+    pub fn from_units(units: i128) -> f64 {
+        Self::round_amount(units as f64 / MONEY_SCALE_F64)
+    }
+
+    pub fn total_debit_units(&self) -> i128 {
+        Self::to_units(self.amount) + Self::to_units(self.fee)
     }
 
     pub fn new(
@@ -315,9 +332,10 @@ impl Transaction {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        let total_required = self.amount + self.fee;
+        let sender_units = Transaction::to_units(sender_balance);
+        let total_required = self.total_debit_units();
 
-        if sender_balance < total_required {
+        if sender_units < total_required {
             return Err(BlockchainError::InsufficientFunds);
         }
 
@@ -607,7 +625,7 @@ impl Block {
                 }
 
                 // Critical security checks
-                if reward_tx.fee != NETWORK_FEE
+                if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE)
                     || reward_tx.signature.is_some()
                     || reward_tx.sender != "MINING_REWARDS"
                 {
@@ -621,7 +639,9 @@ impl Block {
 
                 // Fixed: Pass blockchain reference to calculate_block_reward
                 let expected_reward = blockchain.calculate_block_reward(block)?;
-                if Transaction::round_amount(reward_tx.amount) != expected_reward {
+                if Transaction::to_units(reward_tx.amount)
+                    != Transaction::to_units(expected_reward)
+                {
                     return Err(BlockchainError::InvalidTransactionAmount);
                 }
             }
@@ -886,8 +906,8 @@ impl SystemKeyDeriver {
         if !block.transactions.iter().any(|block_tx| {
             block_tx.sender == tx.sender &&
             block_tx.recipient == tx.recipient &&
-            (block_tx.amount - tx.amount).abs() < f64::EPSILON &&  // Use epsilon for float comparison
-            (block_tx.fee - tx.fee).abs() < f64::EPSILON &&
+            Transaction::to_units(block_tx.amount) == Transaction::to_units(tx.amount) &&
+            Transaction::to_units(block_tx.fee) == Transaction::to_units(tx.fee) &&
             block_tx.timestamp == tx.timestamp
         }) {
             return Err(BlockchainError::InvalidSystemTransaction);
@@ -1046,32 +1066,46 @@ impl Blockchain {
     }
 
     async fn get_pending_debit_for(&self, address: &str) -> Result<f64, BlockchainError> {
+        Ok(Transaction::from_units(self.get_pending_debit_units(address).await?))
+    }
+
+    async fn get_pending_debit_units(&self, address: &str) -> Result<i128, BlockchainError> {
         let tree = self.open_pending_debits_tree()?;
         if let Some(raw) = tree.get(address.as_bytes())? {
-            let debit: f64 = bincode::deserialize(&raw)?;
-            Ok(debit)
+            Ok(Self::deserialize_units_compatible(&raw)?.max(0))
         } else {
-            Ok(0.0)
+            Ok(0)
         }
     }
 
     async fn get_pending_credit_for(&self, address: &str) -> Result<f64, BlockchainError> {
+        Ok(Transaction::from_units(self.get_pending_credit_units(address).await?))
+    }
+
+    async fn get_pending_credit_units(&self, address: &str) -> Result<i128, BlockchainError> {
         let tree = self.open_pending_credits_tree()?;
         if let Some(raw) = tree.get(address.as_bytes())? {
-            let credit: f64 = bincode::deserialize(&raw)?;
-            Ok(credit)
+            Ok(Self::deserialize_units_compatible(&raw)?.max(0))
         } else {
-            Ok(0.0)
+            Ok(0)
         }
+    }
+
+    fn deserialize_units_compatible(raw: &[u8]) -> Result<i128, BlockchainError> {
+        if let Ok(units) = bincode::deserialize::<i128>(raw) {
+            return Ok(units);
+        }
+        let legacy_amount: f64 = bincode::deserialize(raw)?;
+        Ok(Transaction::to_units(legacy_amount))
     }
 
     fn set_pending_debit_for(
         tree: &sled::Tree,
         address: &str,
-        debit: f64,
+        debit_units: i128,
     ) -> Result<(), BlockchainError> {
-        let normalized = Transaction::round_amount(debit.max(0.0));
-        if normalized <= 0.0 {
+        let normalized = debit_units.max(0);
+        if normalized <= 0 {
             tree.remove(address.as_bytes())?;
         } else {
             tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
@@ -1082,10 +1116,10 @@ impl Blockchain {
     fn set_pending_credit_for(
         tree: &sled::Tree,
         address: &str,
-        credit: f64,
+        credit_units: i128,
     ) -> Result<(), BlockchainError> {
-        let normalized = Transaction::round_amount(credit.max(0.0));
-        if normalized <= 0.0 {
+        let normalized = credit_units.max(0);
+        if normalized <= 0 {
             tree.remove(address.as_bytes())?;
         } else {
             tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
@@ -1100,29 +1134,29 @@ impl Blockchain {
         debits_tree.clear()?;
         credits_tree.clear()?;
 
-        let mut totals: HashMap<String, f64> = HashMap::new();
-        let mut incoming: HashMap<String, f64> = HashMap::new();
+        let mut totals: HashMap<String, i128> = HashMap::new();
+        let mut incoming: HashMap<String, i128> = HashMap::new();
         for item in pending_tree.iter() {
             let (_, tx_bytes) = item?;
             if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                 if tx.sender != "MINING_REWARDS" {
-                    *totals.entry(tx.sender.clone()).or_insert(0.0) += tx.amount + tx.fee;
+                    *totals.entry(tx.sender.clone()).or_insert(0) += tx.total_debit_units();
                 }
-                *incoming.entry(tx.recipient.clone()).or_insert(0.0) += tx.amount;
+                *incoming.entry(tx.recipient.clone()).or_insert(0) += Transaction::to_units(tx.amount);
             }
         }
 
         let mut debit_batch = sled::Batch::default();
         for (address, total) in totals {
-            let normalized = Transaction::round_amount(total.max(0.0));
-            if normalized > 0.0 {
+            let normalized = total.max(0);
+            if normalized > 0 {
                 debit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
             }
         }
         let mut credit_batch = sled::Batch::default();
         for (address, total) in incoming {
-            let normalized = Transaction::round_amount(total.max(0.0));
-            if normalized > 0.0 {
+            let normalized = total.max(0);
+            if normalized > 0 {
                 credit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
             }
         }
@@ -1708,16 +1742,16 @@ impl Blockchain {
             .collect();
         blocks.sort_unstable_by_key(|b| b.index);
 
-        let mut balances: HashMap<String, f64> = HashMap::new();
+        let mut balances: HashMap<String, i128> = HashMap::new();
         for block in blocks {
             for tx in block.transactions {
                 if tx.sender != "MINING_REWARDS" {
-                    let debit = tx.amount + tx.fee;
-                    let entry = balances.entry(tx.sender).or_insert(0.0);
-                    *entry = Transaction::round_amount(*entry - debit);
+                    let debit = tx.total_debit_units();
+                    let entry = balances.entry(tx.sender).or_insert(0);
+                    *entry -= debit;
                 }
-                let entry = balances.entry(tx.recipient).or_insert(0.0);
-                *entry = Transaction::round_amount(*entry + tx.amount);
+                let entry = balances.entry(tx.recipient).or_insert(0);
+                *entry += Transaction::to_units(tx.amount);
             }
         }
 
@@ -1806,7 +1840,6 @@ impl Blockchain {
 
                 let mut full_tx = tx.clone();
                 let tx_id = full_tx.get_tx_id();
-                let expected_sig_hash = full_tx.sig_hash.as_ref().unwrap().clone();
                 let sig_hex = full_tx.signature.as_ref().unwrap();
                 let sig_bytes = match hex::decode(sig_hex) {
                     Ok(v) => v,
@@ -1817,14 +1850,20 @@ impl Blockchain {
                 };
 
                 if sig_bytes.len() <= 64 {
+                    if tx.sig_hash.is_none() {
+                        invalid_txs.push(key.to_vec());
+                        continue;
+                    }
                     let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
                         invalid_txs.push(key.to_vec());
                         continue;
                     };
-                    let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
-                    if actual_hash != expected_sig_hash {
-                        invalid_txs.push(key.to_vec());
-                        continue;
+                    if let Some(expected) = tx.sig_hash.as_ref() {
+                        let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
+                        if actual_hash != *expected {
+                            invalid_txs.push(key.to_vec());
+                            continue;
+                        }
                     }
                     full_tx.signature = Some(hex::encode(&full_sig_bytes));
                 }
@@ -1977,15 +2016,15 @@ impl Blockchain {
         self.validate_block_strict(&block).await?;
 
         // Get all current confirmed balances first
-        let mut confirmed_balances: HashMap<String, f64> = HashMap::new();
-        let mut pending_effects: HashMap<String, f64> = HashMap::new();
+        let mut confirmed_balances: HashMap<String, i128> = HashMap::new();
+        let mut pending_effects: HashMap<String, i128> = HashMap::new();
 
         // First pass: Get all confirmed balances
         for tx in &block.transactions {
             if tx.sender != "MINING_REWARDS" {
                 if !confirmed_balances.contains_key(&tx.sender) {
                     let balance = self.get_confirmed_balance(&tx.sender).await?;
-                    confirmed_balances.insert(tx.sender.clone(), balance);
+                    confirmed_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
                 }
             }
         }
@@ -1998,10 +2037,10 @@ impl Blockchain {
                 continue; // Skip validation for mining rewards
             }
 
-            let confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0.0);
-            let pending = pending_effects.get(&tx.sender).copied().unwrap_or(0.0);
+            let confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0);
+            let pending = pending_effects.get(&tx.sender).copied().unwrap_or(0);
             let available = confirmed - pending;
-            let required = tx.amount + tx.fee;
+            let required = tx.total_debit_units();
 
             if available < required {
                 return Err(BlockchainError::InsufficientFunds);
@@ -2009,7 +2048,7 @@ impl Blockchain {
 
             // Track this transaction's effect
             *pending_effects.entry(tx.sender.clone()).or_default() += required;
-            *pending_effects.entry(tx.recipient.clone()).or_default() -= tx.amount;
+            *pending_effects.entry(tx.recipient.clone()).or_default() -= Transaction::to_units(tx.amount);
         }
         set_finalize_stage(3);
         trace_step("validate_batch");
@@ -2060,9 +2099,9 @@ impl Blockchain {
             full_batch.remove(tx_id.as_bytes());
 
             if tx.sender != "MINING_REWARDS" {
-                let current_debit = self.get_pending_debit_for(&tx.sender).await?;
-                let delta = tx.amount + tx.fee;
-                let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
+                let current_debit = self.get_pending_debit_units(&tx.sender).await?;
+                let delta = tx.total_debit_units();
+                let next_debit = current_debit.saturating_sub(delta);
                 Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
             }
         }
@@ -2218,9 +2257,8 @@ impl Blockchain {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
 
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
-            let balance: f64 = bincode::deserialize(&balance_bytes)
-                .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
-            Ok(balance)
+            let units = Self::deserialize_units_compatible(&balance_bytes)?;
+            Ok(Transaction::from_units(units))
         } else {
             Ok(0.0)
         }
@@ -2295,8 +2333,8 @@ impl Blockchain {
             0.0
         };
 
-        let available_balance = Transaction::round_amount(confirmed_balance - pending_amount);
-        let required_amount = Transaction::round_amount(tx.amount + tx.fee);
+        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
+        let required_amount = tx.total_debit_units();
 
         if available_balance < required_amount {
             return Err(BlockchainError::InsufficientFunds);
@@ -2322,6 +2360,7 @@ impl Blockchain {
         if sig_bytes.is_empty() {
             return Err(BlockchainError::InvalidTransactionSignature);
         }
+
         let pub_key = match tx.pub_key.as_ref() {
             Some(pk) => pk,
             None => {
@@ -2387,12 +2426,14 @@ impl Blockchain {
 
         let reward_tx = &block.transactions[0];
 
-        if reward_tx.fee != NETWORK_FEE || reward_tx.signature.is_some() {
+        if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE)
+            || reward_tx.signature.is_some()
+        {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
 
         let expected_reward = self.calculate_block_reward(block)?; // Calculate expected reward
-        if Transaction::round_amount(reward_tx.amount) != expected_reward {
+        if Transaction::to_units(reward_tx.amount) != Transaction::to_units(expected_reward) {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -2493,11 +2534,11 @@ impl Blockchain {
         }
 
         let reward_tx = reward_txs[0];
-        if reward_tx.fee != NETWORK_FEE {
+        if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE) {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
         let expected_reward = self.calculate_block_reward(block)?;
-        if Transaction::round_amount(reward_tx.amount) != expected_reward {
+        if Transaction::to_units(reward_tx.amount) != Transaction::to_units(expected_reward) {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -2564,8 +2605,8 @@ impl Blockchain {
         block.validate_header()?;
 
         // Get current confirmed balances before validation
-        let mut confirmed_balances: HashMap<String, f64> = HashMap::new();
-        let mut pending_deductions: HashMap<String, f64> = HashMap::new();
+        let mut confirmed_balances: HashMap<String, i128> = HashMap::new();
+        let mut pending_deductions: HashMap<String, i128> = HashMap::new();
 
         // Only look at non-mining-reward transactions
         let regular_transactions: Vec<&Transaction> = block
@@ -2581,17 +2622,17 @@ impl Blockchain {
         // Fetch all confirmed balances in one pass
         for sender in unique_senders {
             let balance = self.get_confirmed_balance(sender).await?;
-            confirmed_balances.insert(sender.clone(), balance);
+            confirmed_balances.insert(sender.clone(), Transaction::to_units(balance));
         }
 
         // Validate each regular transaction
         for tx in regular_transactions {
-            let current_confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0.0);
+            let current_confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0);
 
-            let pending_deducted = pending_deductions.get(&tx.sender).copied().unwrap_or(0.0);
+            let pending_deducted = pending_deductions.get(&tx.sender).copied().unwrap_or(0);
 
             let available_balance = current_confirmed - pending_deducted;
-            let required_amount = tx.amount + tx.fee;
+            let required_amount = tx.total_debit_units();
 
             if available_balance < required_amount {
                 return Err(BlockchainError::InsufficientFunds);
@@ -2606,7 +2647,7 @@ impl Blockchain {
 
     // New helper method to calculate confirmed balance without pending transactions
     async fn calculate_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
-        let mut balance = 0.0;
+        let mut balance_units: i128 = 0;
 
         // Only consider confirmed blocks
         for result in self.db.scan_prefix("block_") {
@@ -2614,17 +2655,17 @@ impl Blockchain {
                 if let Ok(block) = Block::from_bytes(&block_data) {
                     for tx in block.transactions {
                         if tx.recipient == address {
-                            balance = Transaction::round_amount(balance + tx.amount);
+                            balance_units += Transaction::to_units(tx.amount);
                         }
                         if tx.sender == address && tx.sender != "MINING_REWARDS" {
-                            balance = Transaction::round_amount(balance - (tx.amount + tx.fee));
+                            balance_units -= tx.total_debit_units();
                         }
                     }
                 }
             }
         }
 
-        Ok(balance)
+        Ok(Transaction::from_units(balance_units))
     }
 
     pub async fn add_transaction(&self, transaction: Transaction) -> Result<(), BlockchainError> {
@@ -2651,8 +2692,8 @@ impl Blockchain {
         let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
 
         // Calculate available balance considering pending transactions
-        let available_balance = confirmed_balance - pending_amount;
-        let total_required = transaction.amount + transaction.fee;
+        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
+        let total_required = transaction.total_debit_units();
 
         // Check if there's enough available balance
         if available_balance < total_required {
@@ -2673,6 +2714,10 @@ impl Blockchain {
 
         let sig_bytes =
             hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        if sig_bytes.is_empty() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
         if !transaction.is_valid(pub_key) {
             return Err(BlockchainError::InvalidTransactionSignature);
         }
@@ -2705,7 +2750,6 @@ impl Blockchain {
         // The main pending tx record remains compact (truncated signature + sig_hash).
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         full_sigs_tree.insert(tx_id.as_bytes(), sig_bytes)?;
-        full_sigs_tree.flush()?;
 
         // Store in pending transactions
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
@@ -2718,17 +2762,25 @@ impl Blockchain {
         batch.insert(tx_id.as_bytes(), tx_bytes);
         pending_tree.apply_batch(batch)?;
 
-        let current_debit = self.get_pending_debit_for(&transaction.sender).await?;
-        let next_debit =
-            Transaction::round_amount(current_debit + storage_tx.amount + storage_tx.fee);
+        let current_debit = self.get_pending_debit_units(&transaction.sender).await?;
+        let next_debit = current_debit + storage_tx.total_debit_units();
         Self::set_pending_debit_for(&pending_debits_tree, &transaction.sender, next_debit)?;
-        let current_credit = self.get_pending_credit_for(&transaction.recipient).await?;
-        let next_credit = Transaction::round_amount(current_credit + storage_tx.amount);
+        let current_credit = self.get_pending_credit_units(&transaction.recipient).await?;
+        let next_credit = current_credit + Transaction::to_units(storage_tx.amount);
         Self::set_pending_credit_for(&pending_credits_tree, &transaction.recipient, next_credit)?;
 
-        pending_tree.flush()?;
-        pending_debits_tree.flush()?;
-        pending_credits_tree.flush()?;
+        // Hot path durability policy:
+        // defer fsync to periodic DB flushing to avoid per-transaction stalls.
+        // Set ALPHANUMERIC_SYNC_PENDING_WRITES=true to force immediate pending-tree flushes.
+        let sync_pending_writes = std::env::var("ALPHANUMERIC_SYNC_PENDING_WRITES")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if sync_pending_writes {
+            full_sigs_tree.flush()?;
+            pending_tree.flush()?;
+            pending_debits_tree.flush()?;
+            pending_credits_tree.flush()?;
+        }
 
         Ok(())
     }
@@ -2746,7 +2798,7 @@ impl Blockchain {
     pub async fn get_mempool_transactions(&self) -> Result<Vec<Transaction>, BlockchainError> {
         let mut mempool = self.mempool.write().await;
         mempool.prune_expired();
-        Ok(mempool.get_transactions_for_block())
+        Ok(mempool.get_all_transactions())
     }
 
     pub async fn get_mempool_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
@@ -2923,7 +2975,7 @@ impl Blockchain {
                     }
 
                     let tx_id = tx.get_tx_id();
-                    let expected_sig_hash = tx.sig_hash.as_ref().unwrap();
+                    let expected_sig_hash = tx.sig_hash.as_ref().cloned();
 
                     let sig_hex = tx.signature.as_ref().unwrap();
                     let sig_bytes = match hex::decode(sig_hex) {
@@ -2932,13 +2984,16 @@ impl Blockchain {
                     };
 
                     if sig_bytes.len() <= 64 {
+                        if expected_sig_hash.is_none() {
+                            continue;
+                        }
                         let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
                             // No witness available; do not allow unverifiable tx into the mempool.
                             continue;
                         };
 
                         let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
-                        if &actual_hash != expected_sig_hash {
+                        if expected_sig_hash.as_deref() != Some(actual_hash.as_str()) {
                             continue;
                         }
 
@@ -2991,7 +3046,7 @@ impl Blockchain {
         // ... (address decoding as before)
 
         let blocks = self.get_blocks();
-        let mut balance = 0.0;
+        let mut balance_units: i128 = 0;
         let mut causal_chain = Vec::new();
 
         // Process blocks and build causal chain (as before)
@@ -3009,41 +3064,41 @@ impl Blockchain {
         for entry in &causal_chain {
             let tx = &entry.0;
             if tx.sender == "MINING_REWARDS" && tx.recipient == address {
-                balance += tx.amount;
+                balance_units += Transaction::to_units(tx.amount);
             } else if tx.sender == address {
                 // Transactions in confirmed blocks are assumed validated at acceptance time.
                 // Do not re-check signatures here with sender address input.
-                balance -= tx.amount + tx.fee;
+                balance_units -= tx.total_debit_units();
             } else if tx.recipient == address {
-                balance += tx.amount;
+                balance_units += Transaction::to_units(tx.amount);
             }
         }
 
         // Handle pending transactions CORRECTLY
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        let mut pending_balances: HashMap<String, f64> = HashMap::new(); // Track pending balances
+        let mut pending_balances: HashMap<String, i128> = HashMap::new(); // Track pending balances
 
         for result in pending_tree.iter() {
             if let Ok((_, tx_bytes)) = result {
                 if let Ok(tx) = deserialize_transaction(&tx_bytes) {
                     if tx.sender == address {
-                        let pending_spent = pending_balances.get(address).unwrap_or(&0.0);
+                        let pending_spent = pending_balances.get(address).unwrap_or(&0);
                         // Get current balance from confirmed transactions
-                        let current_balance = balance;
-                        if current_balance + pending_spent < tx.amount + tx.fee {
+                        let current_balance = balance_units;
+                        let tx_debit = tx.total_debit_units();
+                        if current_balance + pending_spent < tx_debit {
                             continue; // Skip double-spending transaction
                         }
-                        balance -= tx.amount + tx.fee;
-                        *pending_balances.entry(address.to_string()).or_insert(0.0) -=
-                            tx.amount + tx.fee;
+                        balance_units -= tx_debit;
+                        *pending_balances.entry(address.to_string()).or_insert(0) -= tx_debit;
                     } else if tx.recipient == address {
-                        balance += tx.amount;
+                        balance_units += Transaction::to_units(tx.amount);
                     }
                 }
             }
         }
 
-        Ok(balance)
+        Ok(Transaction::from_units(balance_units))
     }
 
     // Add to handle distributions
@@ -3059,18 +3114,18 @@ impl Blockchain {
         let pending_credits_tree = self.open_pending_credits_tree()?;
 
         // Track cumulative balance changes
-        let mut balance_changes: HashMap<String, f64> = HashMap::new();
-        let mut current_balances: HashMap<String, f64> = HashMap::new();
+        let mut balance_changes: HashMap<String, i128> = HashMap::new();
+        let mut current_balances: HashMap<String, i128> = HashMap::new();
 
         // First pass: Get all current balances for any address touched by this batch
         for tx in &transactions {
             if tx.sender != "MINING_REWARDS" && !current_balances.contains_key(&tx.sender) {
                 let balance = self.get_confirmed_balance(&tx.sender).await?;
-                current_balances.insert(tx.sender.clone(), balance);
+                current_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
             }
             if !current_balances.contains_key(&tx.recipient) {
                 let balance = self.get_confirmed_balance(&tx.recipient).await?;
-                current_balances.insert(tx.recipient.clone(), balance);
+                current_balances.insert(tx.recipient.clone(), Transaction::to_units(balance));
             }
         }
 
@@ -3079,7 +3134,8 @@ impl Blockchain {
             match tx.sender.as_str() {
                 "MINING_REWARDS" => {
                     if context == TransactionContext::BlockValidation {
-                        *balance_changes.entry(tx.recipient.clone()).or_default() += tx.amount;
+                        *balance_changes.entry(tx.recipient.clone()).or_default() +=
+                            Transaction::to_units(tx.amount);
                     }
                 }
                 _ => {
@@ -3088,17 +3144,18 @@ impl Blockchain {
                         self.verify_transaction_signature(tx)?;
                     }
 
-                    let total_debit = tx.amount + tx.fee;
-                    let current_balance = current_balances.get(&tx.sender).copied().unwrap_or(0.0);
-                    let pending_change = balance_changes.get(&tx.sender).copied().unwrap_or(0.0);
+                    let total_debit = tx.total_debit_units();
+                    let current_balance = current_balances.get(&tx.sender).copied().unwrap_or(0);
+                    let pending_change = balance_changes.get(&tx.sender).copied().unwrap_or(0);
 
                     // Check if sufficient funds available
-                    if Transaction::round_amount(current_balance + pending_change) < total_debit {
+                    if current_balance + pending_change < total_debit {
                         return Err(BlockchainError::InsufficientFunds);
                     }
 
                     *balance_changes.entry(tx.sender.clone()).or_default() -= total_debit;
-                    *balance_changes.entry(tx.recipient.clone()).or_default() += tx.amount;
+                    *balance_changes.entry(tx.recipient.clone()).or_default() +=
+                        Transaction::to_units(tx.amount);
                 }
             }
         }
@@ -3106,8 +3163,8 @@ impl Blockchain {
         // Apply all changes atomically
         let mut batch = sled::Batch::default();
         for (address, change) in balance_changes {
-            let current = current_balances.get(&address).copied().unwrap_or(0.0);
-            let new_balance = Transaction::round_amount(current + change);
+            let current = current_balances.get(&address).copied().unwrap_or(0);
+            let new_balance = current + change;
             batch.insert(address.as_bytes(), bincode::serialize(&new_balance)?);
         }
 
@@ -3121,12 +3178,12 @@ impl Blockchain {
                     let tx_id = tx.get_tx_id();
                     pending_tree.remove(tx_id.as_bytes())?;
                     let _ = full_sigs_tree.remove(tx_id.as_bytes());
-                    let current_debit = self.get_pending_debit_for(&tx.sender).await?;
-                    let delta = tx.amount + tx.fee;
-                    let next_debit = Transaction::round_amount((current_debit - delta).max(0.0));
+                    let current_debit = self.get_pending_debit_units(&tx.sender).await?;
+                    let delta = tx.total_debit_units();
+                    let next_debit = current_debit.saturating_sub(delta);
                     Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
-                    let current_credit = self.get_pending_credit_for(&tx.recipient).await?;
-                    let next_credit = Transaction::round_amount((current_credit - tx.amount).max(0.0));
+                    let current_credit = self.get_pending_credit_units(&tx.recipient).await?;
+                    let next_credit = current_credit.saturating_sub(Transaction::to_units(tx.amount));
                     Self::set_pending_credit_for(
                         &pending_credits_tree,
                         &tx.recipient,
@@ -3157,17 +3214,16 @@ impl Blockchain {
             }
         }
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
-            let balance: f64 = bincode::deserialize(&balance_bytes)
-                .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
-            return Ok(balance);
+            let balance_units = Self::deserialize_units_compatible(&balance_bytes)?;
+            return Ok(Transaction::from_units(balance_units));
         }
         if auto_rebuild && index_height >= self.get_latest_block_index() as u64 {
-            let balance = 0.0;
-            balances_tree.insert(address.as_bytes(), bincode::serialize(&balance)?)?;
-            return Ok(balance);
+            let balance_units: i128 = 0;
+            balances_tree.insert(address.as_bytes(), bincode::serialize(&balance_units)?)?;
+            return Ok(0.0);
         }
         // Slow path: calculate from blocks, then cache in balances tree.
-        let mut balance = 0.0;
+        let mut balance_units: i128 = 0;
         let mut current_batch = Vec::with_capacity(200);
 
         for result in self.db.scan_prefix(b"block_") {
@@ -3180,11 +3236,10 @@ impl Blockchain {
                         if let Ok(block) = Block::from_bytes(&block_data) {
                             for tx in &block.transactions {
                                 if tx.recipient == address {
-                                    balance = Transaction::round_amount(balance + tx.amount);
+                                    balance_units += Transaction::to_units(tx.amount);
                                 }
                                 if tx.sender == address {
-                                    balance =
-                                        Transaction::round_amount(balance - (tx.amount + tx.fee));
+                                    balance_units -= tx.total_debit_units();
                                 }
                             }
                         }
@@ -3198,18 +3253,17 @@ impl Blockchain {
             if let Ok(block) = Block::from_bytes(&block_data) {
                 for tx in &block.transactions {
                     if tx.recipient == address {
-                        balance = Transaction::round_amount(balance + tx.amount);
+                        balance_units += Transaction::to_units(tx.amount);
                     }
                     if tx.sender == address {
-                        balance = Transaction::round_amount(balance - (tx.amount + tx.fee));
+                        balance_units -= tx.total_debit_units();
                     }
                 }
             }
         }
 
-        let balance = Transaction::round_amount(balance);
-        balances_tree.insert(address.as_bytes(), bincode::serialize(&balance)?)?;
-        Ok(balance)
+        balances_tree.insert(address.as_bytes(), bincode::serialize(&balance_units)?)?;
+        Ok(Transaction::from_units(balance_units))
     }
 
     // Public method that shows spendable balance to users
@@ -3217,7 +3271,10 @@ impl Blockchain {
         let confirmed = self.get_confirmed_balance(address).await?;
         let pending_debit = self.get_pending_debit_for(address).await?;
         let pending_credit = self.get_pending_credit_for(address).await?;
-        Ok(Transaction::round_amount(confirmed - pending_debit + pending_credit))
+        let net_units = Transaction::to_units(confirmed)
+            .saturating_sub(Transaction::to_units(pending_debit))
+            .saturating_add(Transaction::to_units(pending_credit));
+        Ok(Transaction::from_units(net_units))
     }
 
     pub async fn update_wallet_balance(
@@ -3228,18 +3285,18 @@ impl Blockchain {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
 
         // Get current balance
-        let current_balance = match balances_tree.get(address.as_bytes())? {
-            Some(balance_bytes) => bincode::deserialize::<f64>(&balance_bytes)?,
-            None => 0.0,
+        let current_balance_units = match balances_tree.get(address.as_bytes())? {
+            Some(balance_bytes) => Self::deserialize_units_compatible(&balance_bytes)?,
+            None => 0,
         };
 
-        // Update balance with rounding
-        let new_balance = Transaction::round_amount(current_balance + amount);
+        let new_balance_units = current_balance_units + Transaction::to_units(amount);
 
         // Store new balance
         balances_tree.insert(
             address.as_bytes(),
-            bincode::serialize(&new_balance).map_err(|_| BlockchainError::InvalidTransaction)?,
+            bincode::serialize(&new_balance_units)
+                .map_err(|_| BlockchainError::InvalidTransaction)?,
         )?;
 
         Ok(())
