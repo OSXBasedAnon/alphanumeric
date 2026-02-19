@@ -617,10 +617,10 @@ impl Mgmt {
         let progpow_transactions: Vec<ProgPowTransaction> = transactions
             .iter()
             .map(|tx| ProgPowTransaction {
-                fee: tx.fee,
+                fee: tx.fee(),
                 sender: tx.sender.clone(),
                 recipient: tx.recipient.clone(),
-                amount: tx.amount,
+                amount: tx.amount(),
                 timestamp: tx.timestamp,
                 signature: tx.signature.clone(),
                 pub_key: tx.pub_key.clone(),
@@ -925,11 +925,11 @@ impl Mgmt {
                     for tx in pending_txs {
                         if tx.sender == addr {
                             pending_stats.0 += 1;
-                            pending_stats.2 += tx.amount + tx.fee;
+                            pending_stats.2 += tx.amount() + tx.fee();
                         }
                         if tx.recipient == addr {
                             pending_stats.1 += 1;
-                            pending_stats.3 += tx.amount;
+                            pending_stats.3 += tx.amount();
                         }
                     }
                 }
@@ -940,12 +940,12 @@ impl Mgmt {
                     for tx in &block.transactions {
                         if tx.sender == addr {
                             tx_stats.0 += 1;
-                            tx_stats.1 += tx.amount;
-                            tx_stats.3 += tx.fee;
+                            tx_stats.1 += tx.amount();
+                            tx_stats.3 += tx.fee();
                         }
                         if tx.recipient == addr {
                             tx_stats.0 += 1;
-                            tx_stats.2 += tx.amount;
+                            tx_stats.2 += tx.amount();
                         }
                     }
                 }
@@ -1016,7 +1016,7 @@ impl Mgmt {
                     let total_supply: f64 = blocks
                         .iter()
                         .flat_map(|block| &block.transactions)
-                        .map(|tx| tx.amount)
+                        .map(|tx| tx.amount())
                         .sum();
 
                     if total_supply > 0.0 {

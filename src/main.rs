@@ -808,8 +808,8 @@ async fn main() -> Result<()> {
     writeln!(stdout, "Pending Txs:        {}\n", pending_txs.len())?;
 
     // Calculate total pending value with absolute values
-    let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount.abs()).sum();
-    let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee.abs()).sum();
+    let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount().abs()).sum();
+    let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee().abs()).sum();
 
 if pending_txs.len() > 0 {
     color_spec.set_fg(Some(Color::Rgb(88, 240, 181)));
@@ -990,7 +990,7 @@ stdout.reset()?;
 let mut amount_style = ColorSpec::new();
 amount_style.set_fg(Some(Color::Rgb(255, 255, 255))).set_bold(false);
 stdout.set_color(&amount_style)?; // Borrow stdout
-writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
+writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
 
         let mut content_style = ColorSpec::new();
         content_style.set_fg(Some(Color::Rgb(169, 169, 169))).set_bold(true);
@@ -1166,8 +1166,8 @@ writeln!(stdout, "\n  Receipt:")?;
 stdout.reset()?;
 style.set_fg(Some(Color::Rgb(180, 219, 210)));
 stdout.set_color(&style)?;
-writeln!(stdout, "  Amount: {:.8}", whisper_tx.amount)?;
-writeln!(stdout, "  Fee: {:.8}", whisper_tx.fee)?;
+writeln!(stdout, "  Amount: {:.8}", whisper_tx.amount())?;
+writeln!(stdout, "  Fee: {:.8}", whisper_tx.fee())?;
 writeln!(stdout, "  Message: {}\n", message)?;
 stdout.reset()?;
 
@@ -2215,7 +2215,9 @@ fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
         let allow = std::env::var(ignore_env)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
-        if !allow {
+        if allow {
+            let _ = std::fs::remove_file(&lock_path);
+        } else {
             if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     if !is_process_alive(pid) {
@@ -2266,6 +2268,10 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
+    fn is_valid_sha256_hex(v: &str) -> bool {
+        v.len() == 64 && v.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+    }
+
     // Simple and safe: only bootstrap if the DB does not already contain blocks.
     if has_local_block_data(db_path) {
         return Ok(());
@@ -2305,7 +2311,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                         .sha256
                         .clone()
                         .map(|v| v.trim().to_ascii_lowercase())
-                        .filter(|v| !v.is_empty()),
+                        .filter(|v| is_valid_sha256_hex(v)),
                 ),
                 Ok(_) => {
                     warn!(

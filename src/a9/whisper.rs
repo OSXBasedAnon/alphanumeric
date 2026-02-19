@@ -227,11 +227,11 @@ impl WhisperModule {
         for block in blocks {
             for tx in &block.transactions {
                 if (tx.sender == address || tx.recipient == address)
-                    && (tx.fee - FEE_PERCENTAGE * tx.amount).abs() > 1e-8
+                    && (tx.fee() - FEE_PERCENTAGE * tx.amount()).abs() > 1e-8
                 {
                     fee_cache.push(FeeInfo {
-                        fee: tx.fee,
-                        amount: tx.amount,
+                        fee: tx.fee(),
+                        amount: tx.amount(),
                         from: tx.sender.clone(),
                         to: tx.recipient.clone(),
                         timestamp: tx.timestamp,
@@ -302,7 +302,11 @@ impl WhisperModule {
         // Create a deterministic string representation of the transaction
         let tx_string = format!(
             "{}:{}:{:.8}:{:.8}:{}",
-            tx.sender, tx.recipient, tx.amount, tx.fee, tx.timestamp
+            tx.sender,
+            tx.recipient,
+            tx.amount(),
+            tx.fee(),
+            tx.timestamp
         );
 
         // Update hasher with transaction data
@@ -312,7 +316,7 @@ impl WhisperModule {
         hex::encode(hasher.finalize())
     }
 
-    pub fn encode_message_as_fee(&self, message: &str, timestamp: u64, base_amount: f64) -> f64 {
+    pub fn encode_message_as_fee(&self, message: &str, _timestamp: u64, base_amount: f64) -> f64 {
         let mut low = 0.0;
         let mut high = 1.0;
 
@@ -324,7 +328,7 @@ impl WhisperModule {
             .collect();
 
         for c in normalized_message.chars() {
-            if let Some(&(start, end, prime)) = self.frequency_map.get(&c) {
+            if let Some(&(start, end, _prime)) = self.frequency_map.get(&c) {
                 // Now c is already lowercase
                 let range = high - low;
                 high = low + range * end;
@@ -344,7 +348,7 @@ impl WhisperModule {
     pub fn decode_message_from_fee(
         &self,
         total_fee: f64,
-        timestamp: u64,
+        _timestamp: u64,
         amount: f64,
     ) -> Option<String> {
         // First subtract the regular transaction fee to get the whisper component
@@ -420,14 +424,8 @@ impl WhisperModule {
             return Err(BlockchainError::InvalidTransaction);
         }
 
-        let normalized_message: String = message
-            .chars()
-            .map(|c| c.to_ascii_lowercase())
-            .take(4)
-            .collect();
-
-        if base_tx.amount < WHISPER_MIN_AMOUNT {
-            base_tx.amount = WHISPER_MIN_AMOUNT;
+        if base_tx.amount() < WHISPER_MIN_AMOUNT {
+            base_tx.amount_units = Transaction::to_units(WHISPER_MIN_AMOUNT);
         }
 
         let timestamp = SystemTime::now()
@@ -435,8 +433,9 @@ impl WhisperModule {
             .unwrap_or_default()
             .as_secs();
 
-        let total_fee = self.encode_message_as_fee(message, timestamp, base_tx.amount);
-        let total_cost = base_tx.amount + total_fee;
+        let base_amount = base_tx.amount();
+        let total_fee = self.encode_message_as_fee(message, timestamp, base_amount);
+        let total_cost = base_amount + total_fee;
 
         // Check balance including pending amounts
         self.check_balance(wallet, total_cost, sender_balance)
@@ -444,7 +443,7 @@ impl WhisperModule {
 
         let message_str = format!(
             "{}:{}:{:.8}:{:.8}:{}",
-            wallet.address, recipient, base_tx.amount, total_fee, timestamp
+            wallet.address, recipient, base_amount, total_fee, timestamp
         );
 
         let signature = wallet
@@ -455,8 +454,8 @@ impl WhisperModule {
         let tx = Transaction {
             sender: wallet.address.clone(),
             recipient: recipient.to_string(),
-            amount: base_tx.amount,
-            fee: total_fee,
+            amount_units: Transaction::to_units(base_amount),
+            fee_units: Transaction::to_units(total_fee),
             timestamp,
             signature: Some(signature),
             pub_key: wallet.get_public_key_hex().await,
@@ -484,7 +483,7 @@ impl WhisperModule {
             for tx in &block.transactions {
                 if tx.sender == address || tx.recipient == address {
                     if let Some(content) =
-                        self.decode_message_from_fee(tx.fee, tx.timestamp, tx.amount)
+                        self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount())
                     {
                         messages.push(WhisperMessage {
                             from: tx.sender.clone(),
@@ -492,8 +491,8 @@ impl WhisperModule {
                             content,
                             tx_hash: self.calculate_transaction_hash(tx),
                             timestamp: tx.timestamp,
-                            amount: tx.amount,
-                            fee: tx.fee,
+                            amount: tx.amount(),
+                            fee: tx.fee(),
                         });
                     }
                 }
@@ -505,7 +504,7 @@ impl WhisperModule {
             for tx in &pending {
                 if tx.sender == address || tx.recipient == address {
                     if let Some(content) =
-                        self.decode_message_from_fee(tx.fee, tx.timestamp, tx.amount)
+                        self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount())
                     {
                         messages.push(WhisperMessage {
                             from: tx.sender.clone(),
@@ -513,8 +512,8 @@ impl WhisperModule {
                             content: format!("[PENDING] {}", content),
                             tx_hash: self.calculate_transaction_hash(tx),
                             timestamp: tx.timestamp,
-                            amount: tx.amount,
-                            fee: tx.fee,
+                            amount: tx.amount(),
+                            fee: tx.fee(),
                         });
                     }
                 }
@@ -544,7 +543,7 @@ impl WhisperModule {
                 if tx.sender == address || tx.recipient == address {
                     // Updated to include tx.amount as the third parameter
                     if let Some(content) =
-                        self.decode_message_from_fee(tx.fee, tx.timestamp, tx.amount)
+                        self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount())
                     {
                         let msg = WhisperMessage {
                             from: tx.sender.clone(),
@@ -552,8 +551,8 @@ impl WhisperModule {
                             content: format!("[PENDING] {}", content),
                             tx_hash: self.calculate_transaction_hash(&tx),
                             timestamp: tx.timestamp,
-                            amount: tx.amount,
-                            fee: tx.fee,
+                            amount: tx.amount(),
+                            fee: tx.fee(),
                         };
                         messages.push(msg);
                     }
@@ -595,8 +594,8 @@ impl WhisperModule {
                             tx_hash: self.calculate_transaction_hash(&Transaction {
                                 sender: info.from.clone(),
                                 recipient: info.to.clone(),
-                                fee: info.fee,
-                                amount: info.amount,
+                                fee_units: Transaction::to_units(info.fee),
+                                amount_units: Transaction::to_units(info.amount),
                                 timestamp: info.timestamp,
                                 signature: None,
                                 pub_key: None,
@@ -617,27 +616,27 @@ impl WhisperModule {
     }
 
     pub async fn process_new_transaction(&self, tx: &Transaction) -> Option<WhisperMessage> {
-        if tx.fee < WHISPER_MIN_AMOUNT {
+        if tx.fee() < WHISPER_MIN_AMOUNT {
             return None;
         }
 
         // Remove from pending amounts when transaction is processed
         if let Some(mut pending) = self.pending_amounts.get_mut(&tx.sender) {
-            *pending -= tx.amount + tx.fee;
+            *pending -= tx.amount() + tx.fee();
             if *pending <= 0.0 {
                 self.pending_amounts.remove(&tx.sender);
             }
         }
 
-        if let Some(content) = self.decode_message_from_fee(tx.fee, tx.timestamp, tx.amount) {
+        if let Some(content) = self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount()) {
             return Some(WhisperMessage {
                 from: tx.sender.clone(),
                 to: tx.recipient.clone(),
                 content,
                 tx_hash: self.calculate_transaction_hash(tx),
                 timestamp: tx.timestamp,
-                amount: tx.amount,
-                fee: tx.fee,
+                amount: tx.amount(),
+                fee: tx.fee(),
             });
         }
 
@@ -660,8 +659,8 @@ impl WhisperModule {
             for tx in &block.transactions {
                 if tx.sender == address || tx.recipient == address {
                     transactions.push(FeeInfo {
-                        fee: tx.fee,
-                        amount: tx.amount,
+                        fee: tx.fee(),
+                        amount: tx.amount(),
                         from: tx.sender.clone(),
                         to: tx.recipient.clone(),
                         timestamp: tx.timestamp,
@@ -679,8 +678,8 @@ impl WhisperModule {
                 }
                 if tx.sender == address || tx.recipient == address {
                     transactions.push(FeeInfo {
-                        fee: tx.fee,
-                        amount: tx.amount,
+                        fee: tx.fee(),
+                        amount: tx.amount(),
                         from: tx.sender.clone(),
                         to: tx.recipient.clone(),
                         timestamp: tx.timestamp,

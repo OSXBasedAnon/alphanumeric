@@ -7,7 +7,6 @@ use futures_util::{
 use igd_next::{search_gateway, PortMappingProtocol};
 use ipnet::{Ipv4Net, Ipv6Net};
 use libp2p::{
-    core::transport::upgrade,
     identity,
     kad::{
         handler::{KademliaHandler, KademliaHandlerIn},
@@ -733,9 +732,6 @@ impl std::fmt::Debug for HybridSwarm {
     }
 }
 
-unsafe impl Send for HybridSwarm {}
-unsafe impl Sync for HybridSwarm {}
-
 //----------------------------------------------------------------------
 // TcpNatConfig
 //----------------------------------------------------------------------
@@ -776,7 +772,7 @@ pub struct Node {
     outbound_circuit_breakers: Arc<RwLock<HashMap<SocketAddr, OutboundCircuitState>>>,
     pub rate_limiter: Arc<RateLimiter>,
     http_client: Client,
-    p2p_swarm: Arc<RwLock<Option<HybridSwarm>>>,
+    p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
     peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
     peer_cache_path: Arc<String>,
@@ -995,7 +991,7 @@ impl Node {
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
             bind_addr,
             listener,
-            p2p_swarm: Arc::new(RwLock::new(None)),
+            p2p_swarm: Arc::new(Mutex::new(None)),
             http_client,
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
@@ -1970,7 +1966,7 @@ impl Node {
         let mut discovered = HashSet::new();
 
         // Safely access the swarm without using addresses_of_peer
-        let swarm_guard = self.p2p_swarm.read().await;
+        let swarm_guard = self.p2p_swarm.lock().await;
         if swarm_guard.is_none() {
             return Ok(discovered);
         }
@@ -2932,52 +2928,16 @@ impl Node {
         let local_peer_id = PeerId::from(local_key.public());
         info!("Generated peer ID: {}", local_peer_id);
 
-        // Setup transport with noise for encryption
-        let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
-            .into_authentic(&local_key)
-            .map_err(|e| NodeError::Network(format!("Noise key generation failed: {}", e)))?;
+        // Setup transport with current libp2p TCP+Noise APIs.
+        let noise_config = noise::Config::new(&local_key)
+            .map_err(|e| NodeError::Network(format!("Noise config failed: {}", e)))?;
 
-        // Use the appropriate approach for libp2p 0.51.4
-        let transport = {
-            // Try to detect if we're using tokio runtime (should be the case)
-            #[cfg(feature = "tcp")]
-            let tcp_config = libp2p::tcp::GenTcpConfig::default().nodelay(true);
-
-            // Attempt to use a more direct method to create TCP transport
-            #[cfg(feature = "tcp")]
-            let transport = {
-                // First attempt - should work for most tokio-enabled builds
-                let transport = match libp2p::tcp::TokioTcpTransport::new(tcp_config) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("Could not create TCP transport: {}", e);
-                        warn!("Falling back to memory transport. Only in-process communication will work.");
-                        libp2p::core::transport::MemoryTransport::default()
-                    }
-                };
-
-                transport
-                    .upgrade(upgrade::Version::V1)
-                    .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-                    .multiplex(yamux::Config::default())
-                    .timeout(Duration::from_secs(20))
-                    .boxed()
-            };
-
-            // Fallback if tcp feature is not available
-            #[cfg(not(feature = "tcp"))]
-            let transport = {
-                warn!("TCP feature not enabled. Using memory transport (in-process only).");
-                libp2p::core::transport::MemoryTransport::default()
-                    .upgrade(upgrade::Version::V1)
-                    .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
-                    .multiplex(yamux::Config::default())
-                    .timeout(Duration::from_secs(20))
-                    .boxed()
-            };
-
-            transport
-        };
+        let transport = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise_config)
+            .multiplex(yamux::Config::default())
+            .timeout(Duration::from_secs(20))
+            .boxed();
 
         // Configure Kademlia DHT
         let mut cfg = KademliaConfig::default();
@@ -3054,30 +3014,21 @@ impl Node {
         // Use without_executor for the older version of libp2p - this is the safest option
         let mut swarm = SwarmBuilder::without_executor(transport, behaviour, local_peer_id).build();
 
-        // Start listening on appropriate address
-        #[cfg(feature = "tcp")]
+        // Transport is explicitly TCP, so always listen on a TCP multiaddr.
         let listen_addr = "/ip4/0.0.0.0/tcp/0";
-
-        #[cfg(not(feature = "tcp"))]
-        let listen_addr = "/memory/0";
 
         if let Ok(addr) = listen_addr.parse() {
             match swarm.listen_on(addr) {
                 Ok(id) => {
                     info!("P2P listening started successfully (id: {:?})", id);
-
-                    #[cfg(feature = "tcp")]
                     info!("P2P listening started on TCP transport");
-
-                    #[cfg(not(feature = "tcp"))]
-                    info!("P2P listening started on memory transport (in-process only)");
                 }
                 Err(e) => return Err(NodeError::Network(format!("Failed to listen: {}", e))),
             }
         }
 
         // Store swarm
-        *self.p2p_swarm.write().await = Some(HybridSwarm(swarm));
+        *self.p2p_swarm.lock().await = Some(HybridSwarm(swarm));
 
         Ok(())
     }
@@ -3087,7 +3038,7 @@ impl Node {
         use futures_util::StreamExt;
         use libp2p::swarm::SwarmEvent;
 
-        let mut swarm_guard = self.p2p_swarm.write().await;
+        let mut swarm_guard = self.p2p_swarm.lock().await;
         let mut swarm = swarm_guard
             .take()
             .ok_or_else(|| NodeError::Network("Swarm not initialized".to_string()))?;
@@ -3933,7 +3884,7 @@ impl Node {
             }
         }
 
-        let validation_result = {
+        let mut validation_result = {
             let blockchain = self.blockchain.read().await;
             match blockchain.validate_block(block).await {
                 Ok(()) => true,
@@ -3958,6 +3909,32 @@ impl Node {
                 }
             }
         };
+
+        if validation_result {
+            if let Some(ref sentinel) = self.header_sentinel {
+                // Enforce BPoS header quorum only when network verifier context is mature enough.
+                if sentinel.should_enforce_consensus_for_headers().await {
+                    if sentinel
+                        .has_conflicting_verified_header(block.index, &block.hash)
+                        .await
+                    {
+                        debug!(
+                            "Rejecting block {} due to conflicting verified header at same height",
+                            block.index
+                        );
+                        validation_result = false;
+                    } else if sentinel.has_verification_record(&block.hash)
+                        && !sentinel.is_header_verified(&block.hash).await
+                    {
+                        debug!(
+                            "Rejecting block {} due to insufficient BPoS verifier quorum",
+                            block.index
+                        );
+                        validation_result = false;
+                    }
+                }
+            }
+        }
 
         self.validation_cache.insert(
             block_hash,

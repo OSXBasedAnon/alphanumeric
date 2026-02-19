@@ -43,7 +43,7 @@ tokio-tungstenite = "0.15"
 futures = "0.3"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-libp2p = { version = "0.51.4", features = ["mdns", "dns", "tcp", "noise", "yamux", "identify", "kad"] }
+libp2p = { version = "0.51.4", features = ["mdns", "dns", "tcp", "tokio", "noise", "yamux", "identify", "kad"] }
 if-addrs = "0.10"
 lazy_static = "1.4"
 serde_json = "1.0"

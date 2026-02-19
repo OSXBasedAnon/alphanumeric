@@ -43,7 +43,7 @@ const NONCE_MAGIC: u128 = 0xA5A5A5A5A5A5A5A5A;
 const DIFFICULTY_MAGIC: u128 = 0x5A5A5A5A5A5A5A5A5A5A5A5A5A;
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
-const MIN_TRANSACTION_AMOUNT: f64 = 0.00000564;
+const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 
@@ -58,6 +58,20 @@ pub const TARGET_BLOCK_TIME: u64 = 5;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
+}
+
+pub(crate) fn pow_target_from_difficulty(difficulty: u64) -> BigUint {
+    // Deterministic bounded mapping:
+    // target = MAX_TARGET / 2^(difficulty/16)
+    // For exponent >= 256, target collapses to 0.
+    if difficulty == 0 {
+        return MAX_TARGET.clone();
+    }
+    let exponent = difficulty / 16;
+    if exponent >= 256 {
+        return BigUint::from(0u8);
+    }
+    MAX_TARGET.clone() >> (exponent as usize)
 }
 
 static FINALIZE_STAGE: AtomicUsize = AtomicUsize::new(0);
@@ -105,8 +119,18 @@ enum SignatureValidationMode {
 pub struct Transaction {
     pub sender: String,
     pub recipient: String,
-    pub fee: f64,
-    pub amount: f64,
+    #[serde(
+        rename = "fee",
+        serialize_with = "serialize_units_as_amount",
+        deserialize_with = "deserialize_amount_to_units"
+    )]
+    pub fee_units: i128,
+    #[serde(
+        rename = "amount",
+        serialize_with = "serialize_units_as_amount",
+        deserialize_with = "deserialize_amount_to_units"
+    )]
+    pub amount_units: i128,
     pub timestamp: u64,
     pub signature: Option<String>,
     #[serde(default)]
@@ -126,6 +150,21 @@ struct LegacyTransaction {
     pub signature: Option<String>,
 }
 
+fn serialize_units_as_amount<S>(units: &i128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_f64(Transaction::from_units(*units))
+}
+
+fn deserialize_amount_to_units<'de, D>(deserializer: D) -> Result<i128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let amount = f64::deserialize(deserializer)?;
+    Ok(Transaction::to_units(amount))
+}
+
 impl Transaction {
     pub fn round_amount(amount: f64) -> f64 {
         (amount * MONEY_SCALE_F64).round() / MONEY_SCALE_F64
@@ -143,7 +182,15 @@ impl Transaction {
     }
 
     pub fn total_debit_units(&self) -> i128 {
-        Self::to_units(self.amount) + Self::to_units(self.fee)
+        self.amount_units + self.fee_units
+    }
+
+    pub fn amount(&self) -> f64 {
+        Self::from_units(self.amount_units)
+    }
+
+    pub fn fee(&self) -> f64 {
+        Self::from_units(self.fee_units)
     }
 
     pub fn new(
@@ -157,8 +204,8 @@ impl Transaction {
         Transaction {
             sender,
             recipient,
-            amount: Self::round_amount(amount),
-            fee: Self::round_amount(fee),
+            amount_units: Self::to_units(amount),
+            fee_units: Self::to_units(fee),
             timestamp,
             signature,
             pub_key: None,
@@ -182,8 +229,8 @@ impl Transaction {
         let transaction = Self {
             sender,
             recipient,
-            amount,
-            fee,
+            amount_units: Self::to_units(amount),
+            fee_units: Self::to_units(fee),
             timestamp,
             signature: None,
             pub_key: None,
@@ -201,8 +248,8 @@ impl Transaction {
         let mut tx_with_full_sig = Self::new(
             transaction.sender.clone(),
             transaction.recipient.clone(),
-            transaction.amount,
-            transaction.fee,
+            transaction.amount(),
+            transaction.fee(),
             transaction.timestamp,
             Some(hex::encode(&full_signature)),
         );
@@ -226,7 +273,11 @@ impl Transaction {
         let mut hasher = Sha256::new();
         hasher.update(format!(
             "{}:{}:{:.8}:{:.8}:{}",
-            self.sender, self.recipient, self.amount, self.fee, self.timestamp
+            self.sender,
+            self.recipient,
+            self.amount(),
+            self.fee(),
+            self.timestamp
         ));
         hex::encode(hasher.finalize())
     }
@@ -284,8 +335,8 @@ impl Transaction {
         Transaction {
             sender: self.sender.clone(),
             recipient: self.recipient.clone(),
-            amount: self.amount,
-            fee: self.fee,
+            amount_units: self.amount_units,
+            fee_units: self.fee_units,
             timestamp: self.timestamp,
             signature: truncated_signature,
             pub_key: self.pub_key.clone(),
@@ -328,7 +379,7 @@ impl Transaction {
     async fn verify_balance(&self, blockchain: &Blockchain) -> Result<(), BlockchainError> {
         let sender_balance = blockchain.get_confirmed_balance(&self.sender).await?; // Changed this line!
 
-        if self.amount < 0.0 || self.fee < 0.0 {
+        if self.amount_units < 0 || self.fee_units < 0 {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -360,14 +411,22 @@ impl Transaction {
     pub fn get_tx_id(&self) -> String {
         format!(
             "{}:{}:{:.8}:{:.8}:{}",
-            self.sender, self.recipient, self.amount, self.fee, self.timestamp
+            self.sender,
+            self.recipient,
+            self.amount(),
+            self.fee(),
+            self.timestamp
         )
     }
 
     fn get_message(&self) -> Vec<u8> {
         format!(
             "{}:{}:{:.8}:{:.8}:{}",
-            self.sender, self.recipient, self.amount, self.fee, self.timestamp
+            self.sender,
+            self.recipient,
+            self.amount(),
+            self.fee(),
+            self.timestamp
         )
         .into_bytes()
     }
@@ -532,24 +591,7 @@ impl Block {
     pub fn verify_pow(&self) -> bool {
         let hash = self.calculate_hash_for_block();
         let hash_int = BigUint::from_bytes_be(&hash);
-
-        let target = if self.difficulty == 0 {
-            MAX_TARGET.clone()
-        } else {
-            // Convert everything to BigUint to avoid overflow
-            let two = BigUint::from(2u8);
-            let sixteen = BigUint::from(16u8);
-            let difficulty = BigUint::from(self.difficulty);
-
-            // Calculate (difficulty / 16) using BigUint division
-            let scaled_difficulty = difficulty / sixteen;
-
-            // Calculate 2^(difficulty/16) using BigUint pow
-            let divisor = two.pow(scaled_difficulty.to_u32().unwrap_or(0));
-
-            // Finally divide max_target by the calculated divisor
-            MAX_TARGET.clone() / divisor
-        };
+        let target = pow_target_from_difficulty(self.difficulty);
 
         hash_int <= target
     }
@@ -625,7 +667,7 @@ impl Block {
                 }
 
                 // Critical security checks
-                if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE)
+                if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE)
                     || reward_tx.signature.is_some()
                     || reward_tx.sender != "MINING_REWARDS"
                 {
@@ -639,8 +681,7 @@ impl Block {
 
                 // Fixed: Pass blockchain reference to calculate_block_reward
                 let expected_reward = blockchain.calculate_block_reward(block)?;
-                if Transaction::to_units(reward_tx.amount)
-                    != Transaction::to_units(expected_reward)
+                if reward_tx.amount_units != Transaction::to_units(expected_reward)
                 {
                     return Err(BlockchainError::InvalidTransactionAmount);
                 }
@@ -790,8 +831,8 @@ fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction, BlockchainError>
     Ok(Transaction {
         sender: legacy.sender,
         recipient: legacy.recipient,
-        fee: legacy.fee,
-        amount: legacy.amount,
+        fee_units: Transaction::to_units(legacy.fee),
+        amount_units: Transaction::to_units(legacy.amount),
         timestamp: legacy.timestamp,
         signature: legacy.signature,
         pub_key: None,
@@ -815,8 +856,8 @@ fn deserialize_block(bytes: &[u8]) -> Result<Block, BlockchainError> {
             .map(|tx| Transaction {
                 sender: tx.sender,
                 recipient: tx.recipient,
-                fee: tx.fee,
-                amount: tx.amount,
+                fee_units: Transaction::to_units(tx.fee),
+                amount_units: Transaction::to_units(tx.amount),
                 timestamp: tx.timestamp,
                 signature: tx.signature,
                 pub_key: None,
@@ -906,8 +947,8 @@ impl SystemKeyDeriver {
         if !block.transactions.iter().any(|block_tx| {
             block_tx.sender == tx.sender &&
             block_tx.recipient == tx.recipient &&
-            Transaction::to_units(block_tx.amount) == Transaction::to_units(tx.amount) &&
-            Transaction::to_units(block_tx.fee) == Transaction::to_units(tx.fee) &&
+            block_tx.amount_units == tx.amount_units &&
+            block_tx.fee_units == tx.fee_units &&
             block_tx.timestamp == tx.timestamp
         }) {
             return Err(BlockchainError::InvalidSystemTransaction);
@@ -1044,7 +1085,7 @@ impl Blockchain {
             if tx.sender == "MINING_REWARDS" {
                 continue;
             }
-            if tx.amount < MIN_TRANSACTION_AMOUNT {
+            if tx.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
             if tx.signature.is_none() || tx.pub_key.is_none() || tx.sig_hash.is_none() {
@@ -1142,7 +1183,7 @@ impl Blockchain {
                 if tx.sender != "MINING_REWARDS" {
                     *totals.entry(tx.sender.clone()).or_insert(0) += tx.total_debit_units();
                 }
-                *incoming.entry(tx.recipient.clone()).or_insert(0) += Transaction::to_units(tx.amount);
+                *incoming.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
             }
         }
 
@@ -1751,7 +1792,7 @@ impl Blockchain {
                     *entry -= debit;
                 }
                 let entry = balances.entry(tx.recipient).or_insert(0);
-                *entry += Transaction::to_units(tx.amount);
+                *entry += tx.amount_units;
             }
         }
 
@@ -2048,7 +2089,7 @@ impl Blockchain {
 
             // Track this transaction's effect
             *pending_effects.entry(tx.sender.clone()).or_default() += required;
-            *pending_effects.entry(tx.recipient.clone()).or_default() -= Transaction::to_units(tx.amount);
+            *pending_effects.entry(tx.recipient.clone()).or_default() -= tx.amount_units;
         }
         set_finalize_stage(3);
         trace_step("validate_batch");
@@ -2426,14 +2467,14 @@ impl Blockchain {
 
         let reward_tx = &block.transactions[0];
 
-        if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE)
+        if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE)
             || reward_tx.signature.is_some()
         {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
 
         let expected_reward = self.calculate_block_reward(block)?; // Calculate expected reward
-        if Transaction::to_units(reward_tx.amount) != Transaction::to_units(expected_reward) {
+        if reward_tx.amount_units != Transaction::to_units(expected_reward) {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -2442,24 +2483,7 @@ impl Blockchain {
 
     fn is_valid_hash_with_difficulty(&self, hash: &[u8; 32], difficulty: u64) -> bool {
         let hash_int = BigUint::from_bytes_be(hash);
-
-        let target = if difficulty == 0 {
-            MAX_TARGET.clone()
-        } else {
-            // Convert everything to BigUint to avoid overflow
-            let two = BigUint::from(2u8);
-            let sixteen = BigUint::from(16u8);
-            let difficulty = BigUint::from(difficulty);
-
-            // Calculate (difficulty / 16) using BigUint division
-            let scaled_difficulty = difficulty / sixteen;
-
-            // Calculate 2^(difficulty/16) using BigUint pow
-            let divisor = two.pow(scaled_difficulty.to_u32().unwrap_or(0));
-
-            // Finally divide max_target by the calculated divisor
-            MAX_TARGET.clone() / divisor
-        };
+        let target = pow_target_from_difficulty(difficulty);
 
         hash_int <= target
     }
@@ -2512,8 +2536,11 @@ impl Blockchain {
             );
 
             // Allow small variance for network synchronization (0.1% tolerance)
-            let diff_ratio = (block.difficulty as f64) / (expected_difficulty as f64);
-            if (diff_ratio - 1.0).abs() > 0.001 {
+            // 0.1% tolerance without floating-point arithmetic.
+            let expected = expected_difficulty.max(1) as u128;
+            let actual = block.difficulty as u128;
+            let delta = actual.abs_diff(expected);
+            if delta.saturating_mul(1000) > expected {
                 return Err(BlockchainError::InvalidBlockHeader);
             }
         }
@@ -2534,11 +2561,11 @@ impl Blockchain {
         }
 
         let reward_tx = reward_txs[0];
-        if Transaction::to_units(reward_tx.fee) != Transaction::to_units(NETWORK_FEE) {
+        if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE) {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
         let expected_reward = self.calculate_block_reward(block)?;
-        if Transaction::to_units(reward_tx.amount) != Transaction::to_units(expected_reward) {
+        if reward_tx.amount_units != Transaction::to_units(expected_reward) {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -2546,7 +2573,7 @@ impl Blockchain {
             if tx.sender == "MINING_REWARDS" {
                 continue;
             }
-            if tx.amount < MIN_TRANSACTION_AMOUNT {
+            if tx.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
             if tx.signature.is_none() {
@@ -2655,7 +2682,7 @@ impl Blockchain {
                 if let Ok(block) = Block::from_bytes(&block_data) {
                     for tx in block.transactions {
                         if tx.recipient == address {
-                            balance_units += Transaction::to_units(tx.amount);
+                            balance_units += tx.amount_units;
                         }
                         if tx.sender == address && tx.sender != "MINING_REWARDS" {
                             balance_units -= tx.total_debit_units();
@@ -2681,7 +2708,7 @@ impl Blockchain {
         }
 
         // Check if the transaction amount is below the minimum threshold
-        if transaction.amount < MIN_TRANSACTION_AMOUNT {
+        if transaction.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -2766,7 +2793,7 @@ impl Blockchain {
         let next_debit = current_debit + storage_tx.total_debit_units();
         Self::set_pending_debit_for(&pending_debits_tree, &transaction.sender, next_debit)?;
         let current_credit = self.get_pending_credit_units(&transaction.recipient).await?;
-        let next_credit = current_credit + Transaction::to_units(storage_tx.amount);
+        let next_credit = current_credit + storage_tx.amount_units;
         Self::set_pending_credit_for(&pending_credits_tree, &transaction.recipient, next_credit)?;
 
         // Hot path durability policy:
@@ -2842,7 +2869,7 @@ impl Blockchain {
             .iter()
             .filter(|tx| tx.sender != "MINING_REWARDS")
             .fold((0usize, 0.0, 0.0), |(count, volume, fees), tx| {
-                (count + 1, volume + tx.amount, fees + tx.fee)
+                (count + 1, volume + tx.amount(), fees + tx.fee())
             });
 
         // Fee-weighted reward to avoid incentivizing spammy tx counts.
@@ -2871,19 +2898,7 @@ impl Blockchain {
             if let Ok(prev_block) = self.get_block(last_block.index.saturating_sub(1)) {
                 let time_diff = last_block.timestamp.saturating_sub(prev_block.timestamp);
                 if time_diff > 0 {
-                    let target = if last_block.difficulty == 0 {
-                        MAX_TARGET.clone()
-                    } else {
-                        let mut target = MAX_TARGET.clone();
-                        let mut scaled_difficulty = last_block.difficulty / 16;
-                        let two = BigUint::from(2u8);
-
-                        while scaled_difficulty > 0 {
-                            target /= &two;
-                            scaled_difficulty -= 1;
-                        }
-                        target
-                    };
+                    let target = pow_target_from_difficulty(last_block.difficulty);
                     let hashrate = MAX_TARGET.to_f64().unwrap_or(0.0)
                         / target.to_f64().unwrap_or(1.0)
                         / time_diff as f64;
@@ -3064,13 +3079,13 @@ impl Blockchain {
         for entry in &causal_chain {
             let tx = &entry.0;
             if tx.sender == "MINING_REWARDS" && tx.recipient == address {
-                balance_units += Transaction::to_units(tx.amount);
+                balance_units += tx.amount_units;
             } else if tx.sender == address {
                 // Transactions in confirmed blocks are assumed validated at acceptance time.
                 // Do not re-check signatures here with sender address input.
                 balance_units -= tx.total_debit_units();
             } else if tx.recipient == address {
-                balance_units += Transaction::to_units(tx.amount);
+                balance_units += tx.amount_units;
             }
         }
 
@@ -3092,7 +3107,7 @@ impl Blockchain {
                         balance_units -= tx_debit;
                         *pending_balances.entry(address.to_string()).or_insert(0) -= tx_debit;
                     } else if tx.recipient == address {
-                        balance_units += Transaction::to_units(tx.amount);
+                        balance_units += tx.amount_units;
                     }
                 }
             }
@@ -3135,7 +3150,7 @@ impl Blockchain {
                 "MINING_REWARDS" => {
                     if context == TransactionContext::BlockValidation {
                         *balance_changes.entry(tx.recipient.clone()).or_default() +=
-                            Transaction::to_units(tx.amount);
+                            tx.amount_units;
                     }
                 }
                 _ => {
@@ -3155,7 +3170,7 @@ impl Blockchain {
 
                     *balance_changes.entry(tx.sender.clone()).or_default() -= total_debit;
                     *balance_changes.entry(tx.recipient.clone()).or_default() +=
-                        Transaction::to_units(tx.amount);
+                        tx.amount_units;
                 }
             }
         }
@@ -3183,7 +3198,7 @@ impl Blockchain {
                     let next_debit = current_debit.saturating_sub(delta);
                     Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
                     let current_credit = self.get_pending_credit_units(&tx.recipient).await?;
-                    let next_credit = current_credit.saturating_sub(Transaction::to_units(tx.amount));
+                    let next_credit = current_credit.saturating_sub(tx.amount_units);
                     Self::set_pending_credit_for(
                         &pending_credits_tree,
                         &tx.recipient,
@@ -3236,7 +3251,7 @@ impl Blockchain {
                         if let Ok(block) = Block::from_bytes(&block_data) {
                             for tx in &block.transactions {
                                 if tx.recipient == address {
-                                    balance_units += Transaction::to_units(tx.amount);
+                                    balance_units += tx.amount_units;
                                 }
                                 if tx.sender == address {
                                     balance_units -= tx.total_debit_units();
@@ -3253,7 +3268,7 @@ impl Blockchain {
             if let Ok(block) = Block::from_bytes(&block_data) {
                 for tx in &block.transactions {
                     if tx.recipient == address {
-                        balance_units += Transaction::to_units(tx.amount);
+                        balance_units += tx.amount_units;
                     }
                     if tx.sender == address {
                         balance_units -= tx.total_debit_units();
@@ -3464,7 +3479,9 @@ impl ChainSentinel {
                 block.timestamp,
             );
 
-            if block.difficulty < (expected_difficulty as f64 * 0.99) as u64 {
+            let lhs = (block.difficulty as u128).saturating_mul(100);
+            let rhs = (expected_difficulty as u128).saturating_mul(99);
+            if lhs < rhs {
                 self.integrity_score.fetch_sub(5, Ordering::Relaxed);
                 return false;
             }
@@ -3512,5 +3529,80 @@ impl ChainSentinel {
             .get(&block.hash)
             .map(|v| v.verifiers.len() as u32)
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn pow_target_zero_difficulty_is_max_target() {
+        assert_eq!(pow_target_from_difficulty(0), *MAX_TARGET);
+    }
+
+    #[test]
+    fn pow_target_halves_every_16_difficulty_points() {
+        let t0 = pow_target_from_difficulty(0);
+        let t16 = pow_target_from_difficulty(16);
+        assert_eq!(t16, t0 >> 1usize);
+    }
+
+    #[test]
+    fn pow_target_saturates_to_zero_for_large_difficulty() {
+        // 4096 / 16 == 256 -> shifted past full 256-bit target width.
+        assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
+    }
+
+    #[test]
+    fn orphan_index_round_trip_extracts_hash() {
+        let prev = [0x11u8; 32];
+        let hash = [0x22u8; 32];
+        let key = Blockchain::orphan_index_key(&prev, 42, &hash);
+        let parsed = Blockchain::parse_orphan_index_hash(key.as_bytes())
+            .expect("should parse orphan index key");
+        assert_eq!(parsed, hex::encode(hash));
+    }
+
+    #[test]
+    fn transaction_json_uses_legacy_field_names() {
+        let tx = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(0.0005),
+            amount_units: Transaction::to_units(1.23456789),
+            timestamp: 1234,
+            signature: Some("deadbeef".to_string()),
+            pub_key: None,
+            sig_hash: None,
+        };
+
+        let v: Value = serde_json::to_value(&tx).expect("tx should serialize");
+        assert!(v.get("amount").is_some());
+        assert!(v.get("fee").is_some());
+        assert!(v.get("amount_units").is_none());
+        assert!(v.get("fee_units").is_none());
+    }
+
+    #[test]
+    fn legacy_transaction_bincode_is_deserialized() {
+        let legacy = LegacyTransaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee: 0.001,
+            amount: 2.5,
+            timestamp: 999,
+            signature: Some("cafebabe".to_string()),
+        };
+        let bytes = bincode::serialize(&legacy).expect("legacy tx should serialize");
+        let tx = deserialize_transaction(&bytes).expect("legacy tx should deserialize");
+
+        assert_eq!(tx.sender, legacy.sender);
+        assert_eq!(tx.recipient, legacy.recipient);
+        assert_eq!(tx.timestamp, legacy.timestamp);
+        assert_eq!(tx.signature, legacy.signature);
+        assert_eq!(tx.fee_units, Transaction::to_units(legacy.fee));
+        assert_eq!(tx.amount_units, Transaction::to_units(legacy.amount));
     }
 }

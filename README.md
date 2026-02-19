@@ -224,6 +224,10 @@ When changing protocol/runtime code, prefer:
 - clear lock scopes
 - deterministic error handling
 
+Threat model and control mapping:
+
+- `docs/THREAT_MODEL.md`
+
 ## Frontend
 
 - Official frontend: https://www.alphanumeric.blue/

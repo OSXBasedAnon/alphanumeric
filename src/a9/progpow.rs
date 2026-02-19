@@ -4,7 +4,6 @@ use lazy_static::lazy_static;
 use log::warn;
 use num_bigint::BigUint;
 use num_cpus;
-use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -16,7 +15,8 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 
 use crate::a9::blockchain::{
-    current_finalize_stage, finalize_stage_name, set_finalize_stage, BlockchainError, NETWORK_FEE,
+    current_finalize_stage, finalize_stage_name, pow_target_from_difficulty, set_finalize_stage,
+    BlockchainError, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
@@ -139,8 +139,8 @@ impl From<ProgPowTransaction> for Transaction {
         Transaction {
             sender: p.sender,
             recipient: p.recipient,
-            amount: p.amount,
-            fee: p.fee,
+            amount_units: Transaction::to_units(p.amount),
+            fee_units: Transaction::to_units(p.fee),
             timestamp: p.timestamp,
             signature: p.signature,
             pub_key: p.pub_key,
@@ -273,7 +273,7 @@ impl MiningManager {
             let (
                 current_network_difficulty,
                 previous_block_hash,
-                previous_block_timestamp,
+                _previous_block_timestamp,
                 current_height,
             ) = {
                 let blockchain_guard = self.blockchain.read().await;
@@ -309,28 +309,10 @@ impl MiningManager {
                 root
             };
 
-            let current_header_number = header.number;
-            let blockchain = self.blockchain.clone();
             let progress_bar = Arc::clone(&progress_bar);
 
             // Calculate target using proper difficulty scaling that handles large values
-            let target = if current_network_difficulty == 0 {
-                MAX_TARGET.clone()
-            } else {
-                // Convert everything to BigUint to avoid overflow
-                let two = BigUint::from(2u8);
-                let sixteen = BigUint::from(16u8);
-                let difficulty = BigUint::from(current_network_difficulty);
-
-                // Calculate (difficulty / 16) using BigUint division
-                let scaled_difficulty = difficulty / sixteen;
-
-                // Calculate 2^(difficulty/16) using BigUint pow
-                let divisor = two.pow(scaled_difficulty.to_u32().unwrap_or(0));
-
-                // Finally divide max_target by the calculated divisor
-                MAX_TARGET.clone() / divisor
-            };
+            let target = pow_target_from_difficulty(current_network_difficulty);
             let target = Arc::new(target);
             let result_timestamp = Arc::clone(&result_timestamp);
 
@@ -342,9 +324,6 @@ impl MiningManager {
                     let start_nonce = current_nonce + (thread_id * nonces_per_thread);
                     let end_nonce = start_nonce + nonces_per_thread;
                     let target = Arc::clone(&target);
-
-                    // CRITICAL OPTIMIZATION: Clone transactions ONCE per thread, not per hash
-                    let transactions_ref = mining_transactions.clone();
 
                     for nonce in start_nonce..end_nonce {
                         if found.load(Ordering::Relaxed) {
@@ -447,7 +426,7 @@ impl MiningManager {
                         let sender_balance = blockchain_lock
                             .get_confirmed_balance(&transaction.sender)
                             .await?;
-                        if sender_balance >= transaction.amount + transaction.fee {
+                        if sender_balance >= transaction.amount() + transaction.fee() {
                             valid_transactions.push(transaction.clone());
                         }
                     }
@@ -588,7 +567,7 @@ impl Miner {
         header: &mut BlockHeader,
         transactions: &[ProgPowTransaction],
         max_nonce: u64,
-        max_time: u64,
+        _max_time: u64,
         miner_address: String,
         reward_amount: f64,
     ) -> Result<(u64, String), MiningError> {

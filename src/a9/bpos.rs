@@ -272,8 +272,8 @@ impl BPoSSentinel {
     }
 
     pub async fn update_metrics(&self) -> Result<(), String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
@@ -1483,7 +1483,7 @@ impl BPoSSentinel {
 
                     // Check for obviously invalid data (negative values, etc.)
                     for tx in &block.transactions {
-                        if tx.amount < 0.0 || tx.fee < 0.0 {
+                        if tx.amount_units < 0 || tx.fee_units < 0 {
                             return false;
                         }
                     }
@@ -1530,7 +1530,7 @@ impl BPoSSentinel {
         // Balance and signature verification was already done when the block was mined
 
         // Basic sanity checks for confirmed transactions
-        if tx.amount < 0.0 || tx.fee < 0.0 {
+        if tx.amount_units < 0 || tx.fee_units < 0 {
             return Ok(false);
         }
 
@@ -2220,8 +2220,17 @@ pub struct HeaderSentinel {
 }
 
 impl HeaderSentinel {
+    const LOCAL_VERIFIER_ID: &'static str = "__local__";
+
     fn strict_header_signatures() -> bool {
         true
+    }
+
+    fn external_verifier_count(verifiers: &HashSet<String>) -> usize {
+        verifiers
+            .iter()
+            .filter(|id| id.as_str() != Self::LOCAL_VERIFIER_ID)
+            .count()
     }
 
     fn verify_signature_with_registered_node_key(
@@ -2466,10 +2475,69 @@ impl HeaderSentinel {
 
     pub async fn is_header_verified(&self, hash: &[u8; 32]) -> bool {
         let verifications = self.verifications.get(hash);
-        match verifications {
-            Some(v) => v.verifiers.len() >= (self.consensus_threshold * 100.0) as usize,
-            None => false,
+        let Some(v) = verifications else {
+            return false;
+        };
+
+        let participating = self.sync_state.read().await.participating_nodes.len();
+        let registered = self.peer_dilithium_keys.len();
+        let eligible = participating.max(registered).max(1);
+        let required = self.required_verifier_count(eligible);
+        let actual = Self::external_verifier_count(&v.verifiers);
+
+        actual >= required
+    }
+
+    pub async fn eligible_verifier_count(&self) -> usize {
+        let participating = self.sync_state.read().await.participating_nodes.len();
+        let registered = self.peer_dilithium_keys.len();
+        participating.max(registered).max(1)
+    }
+
+    pub async fn should_enforce_consensus_for_headers(&self) -> bool {
+        // Only enforce quorum checks when there is enough validator context to avoid
+        // breaking bootstrap/single-node operation.
+        let eligible = self.eligible_verifier_count().await;
+        eligible >= 3
+    }
+
+    pub fn has_verification_record(&self, hash: &[u8; 32]) -> bool {
+        self.verifications.contains_key(hash)
+    }
+
+    pub async fn has_conflicting_verified_header(
+        &self,
+        height: u32,
+        expected_hash: &[u8; 32],
+    ) -> bool {
+        let candidates: Vec<[u8; 32]> = {
+            let headers = self.headers.read().await;
+            headers
+                .iter()
+                .filter(|state| state.header.height == height && state.header.hash != *expected_hash)
+                .map(|state| state.header.hash)
+                .collect()
+        };
+
+        for hash in candidates {
+            if self.is_header_verified(&hash).await {
+                return true;
+            }
         }
+        false
+    }
+
+    fn required_verifier_count(&self, eligible: usize) -> usize {
+        let eligible = eligible.max(1);
+        // Ratio-based threshold with deterministic integer ceiling.
+        let threshold_ppm = (self.consensus_threshold * 1_000_000.0)
+            .round()
+            .clamp(0.0, 1_000_000.0) as u128;
+        let required = ((eligible as u128)
+            .saturating_mul(threshold_ppm)
+            .saturating_add(999_999))
+            / 1_000_000;
+        (required as usize).clamp(1, eligible)
     }
 
     async fn manage_header_cache(&self) -> Result<(), String> {
@@ -2511,6 +2579,7 @@ impl HeaderSentinel {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let local_verifier = Self::LOCAL_VERIFIER_ID.to_string();
 
         let mut headers = self.headers.write().await;
         if headers.len() >= self.max_headers {
@@ -2519,16 +2588,30 @@ impl HeaderSentinel {
             headers = self.headers.write().await;
         }
 
+        let mut verified_by = HashSet::new();
+        verified_by.insert(local_verifier.clone());
         headers.push_back(HeaderState {
             header: header.clone(),
             timestamp: now,
             verification_count: 1,
-            verified_by: HashSet::new(),
+            verified_by,
         });
         drop(headers);
 
         // Get sync state and record verification
         let sync_state = self.sync_state.read().await;
+        {
+            let mut state = self
+                .verifications
+                .entry(header.hash)
+                .or_insert_with(|| VerificationState {
+                    timestamp: now,
+                    verifiers: HashSet::new(),
+                    verified_hash: header.hash,
+                    dilithium_signatures: HashMap::new(),
+                });
+            state.verifiers.insert(local_verifier);
+        }
         for node_id in &sync_state.participating_nodes {
             // Update verification state
             let _ = self
@@ -2542,6 +2625,25 @@ impl HeaderSentinel {
                 })
                 .verifiers
                 .insert(node_id.clone());
+        }
+
+        let (verification_count, verified_by) = self
+            .verifications
+            .get(&header.hash)
+            .map(|state| {
+                (
+                    Self::external_verifier_count(&state.verifiers) as u32,
+                    state.verifiers.clone(),
+                )
+            })
+            .unwrap_or((0, HashSet::new()));
+
+        let mut headers = self.headers.write().await;
+        if let Some(last) = headers.back_mut() {
+            if last.header.hash == header.hash {
+                last.verification_count = verification_count;
+                last.verified_by = verified_by;
+            }
         }
 
         Ok(())
@@ -2738,5 +2840,101 @@ impl From<NodeError> for String {
 impl From<BlockchainError> for String {
     fn from(error: BlockchainError) -> Self {
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn verifier_threshold_is_ratio_based_for_small_sets() {
+        let sentinel = HeaderSentinel::new();
+        // Default threshold is 0.67, so 3 eligible validators require 3 confirmations (ceil(2.01)).
+        assert_eq!(sentinel.required_verifier_count(3), 3);
+        // 4 eligible validators require 3 confirmations (ceil(2.68)).
+        assert_eq!(sentinel.required_verifier_count(4), 3);
+    }
+
+    #[test]
+    fn verifier_threshold_is_clamped_to_valid_range() {
+        let sentinel = HeaderSentinel::new();
+        let required = sentinel.required_verifier_count(10);
+        assert!(required >= 1);
+        assert!(required <= 10);
+    }
+
+    #[tokio::test]
+    async fn header_quorum_enforcement_is_disabled_for_small_networks() {
+        let sentinel = HeaderSentinel::new();
+        assert!(!sentinel.should_enforce_consensus_for_headers().await);
+    }
+
+    #[tokio::test]
+    async fn header_quorum_enforcement_is_enabled_with_three_eligible_nodes() {
+        let sentinel = HeaderSentinel::new();
+        sentinel
+            .peer_dilithium_keys
+            .insert("n1".to_string(), vec![1u8; 32]);
+        sentinel
+            .peer_dilithium_keys
+            .insert("n2".to_string(), vec![2u8; 32]);
+        sentinel
+            .peer_dilithium_keys
+            .insert("n3".to_string(), vec![3u8; 32]);
+        assert!(sentinel.should_enforce_consensus_for_headers().await);
+    }
+
+    #[tokio::test]
+    async fn conflicting_verified_header_is_detected() {
+        let sentinel = HeaderSentinel::new();
+
+        sentinel
+            .peer_dilithium_keys
+            .insert("n1".to_string(), vec![1u8; 32]);
+        sentinel
+            .peer_dilithium_keys
+            .insert("n2".to_string(), vec![2u8; 32]);
+        sentinel
+            .peer_dilithium_keys
+            .insert("n3".to_string(), vec![3u8; 32]);
+
+        let conflicting_hash = [0xAA; 32];
+        let expected_hash = [0xBB; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        sentinel.headers.write().await.push_back(HeaderState {
+            header: BlockHeaderInfo {
+                height: 10,
+                hash: conflicting_hash,
+                prev_hash: [0x10; 32],
+                timestamp: now,
+            },
+            timestamp: now,
+            verification_count: 3,
+            verified_by: HashSet::new(),
+        });
+
+        sentinel.verifications.insert(
+            conflicting_hash,
+            VerificationState {
+                timestamp: now,
+                verifiers: ["n1".to_string(), "n2".to_string(), "n3".to_string()]
+                    .into_iter()
+                    .collect(),
+                verified_hash: conflicting_hash,
+                dilithium_signatures: HashMap::new(),
+            },
+        );
+
+        assert!(
+            sentinel
+                .has_conflicting_verified_header(10, &expected_hash)
+                .await
+        );
     }
 }

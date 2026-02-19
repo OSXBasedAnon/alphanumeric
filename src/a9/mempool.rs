@@ -148,7 +148,7 @@ impl Mempool {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            fee_per_byte: FeePerByte(tx.fee as f64 / tx_size as f64),
+            fee_per_byte: FeePerByte(tx.fee() / tx_size as f64),
             size: tx_size,
         };
 
@@ -258,6 +258,16 @@ impl Mempool {
             }
         }
         None
+    }
+
+    pub fn get_all_transactions(&self) -> Vec<Transaction> {
+        let mut out = Vec::with_capacity(self.total_count.load(AtomicOrdering::Relaxed));
+        for entry in self.transactions.iter() {
+            for tx in entry.value().iter() {
+                out.push(tx.transaction.clone());
+            }
+        }
+        out
     }
 
     pub fn prune_expired(&mut self) -> usize {
@@ -436,19 +446,14 @@ impl TemporalVerification {
             }
         }
 
+        let should_checkpoint = self
+            .last_checkpoint
+            .try_read()
+            .map(|last| now.saturating_sub(*last) >= CHECKPOINT_INTERVAL)
+            .unwrap_or(false);
+
         // Add new verification
         self.verified_headers.insert(header.hash, now);
-
-        // Check if checkpoint needed
-        let should_checkpoint = {
-            let last = self
-                .verified_headers
-                .iter()
-                .map(|e| *e.value())
-                .max()
-                .unwrap_or(0);
-            now.saturating_sub(last) >= CHECKPOINT_INTERVAL
-        };
 
         // Trigger checkpoint if needed
         if should_checkpoint {

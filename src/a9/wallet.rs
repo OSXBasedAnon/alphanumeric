@@ -256,14 +256,15 @@ impl Wallet {
             .as_ref()
             .ok_or("Missing encrypted private key")?;
 
-        if temp_wallet.keypair.is_some() && passphrase.is_none() {
-            return Err("Passphrase required for encrypted wallet".to_string());
-        }
-
-        let combined_bytes = if let Some(pass) = passphrase {
-            Self::decrypt_private_key(encrypted_key.to_vec(), pass)?
+        // Wallet JSON omits runtime key material and encryption flags, so we infer encryption
+        // from whether passphrase-based decryption succeeds.
+        let (combined_bytes, is_encrypted) = if let Some(pass) = passphrase {
+            match Self::decrypt_private_key(encrypted_key.to_vec(), pass) {
+                Ok(bytes) => (bytes, true),
+                Err(_) => (encrypted_key.to_vec(), false),
+            }
         } else {
-            encrypted_key.to_vec()
+            (encrypted_key.to_vec(), false)
         };
 
         let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
@@ -279,7 +280,7 @@ impl Wallet {
             name: temp_wallet.name,
             encrypted_private_key: temp_wallet.encrypted_private_key,
             keypair: Some(Arc::new(Mutex::new(keys))),
-            is_encrypted: passphrase.map(|p| !p.is_empty()).unwrap_or(false),
+            is_encrypted,
         })
     }
 
@@ -336,7 +337,7 @@ impl Wallet {
 
     pub async fn sync_private_key(
         &mut self,
-        db: &RwLock<Db>,
+        _db: &RwLock<Db>,
         passphrase: &[u8],
     ) -> Result<(), String> {
         let private_key = self
