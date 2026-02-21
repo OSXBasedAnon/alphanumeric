@@ -1592,7 +1592,7 @@ impl Blockchain {
 
         // Only save if block is verified (or quorum is not required)
         let require_quorum = std::env::var("ALPHANUMERIC_REQUIRE_QUORUM")
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let verification_count = self.chain_sentinel.get_verification_count(block);
         if require_quorum {
@@ -2800,7 +2800,7 @@ impl Blockchain {
         // defer fsync to periodic DB flushing to avoid per-transaction stalls.
         // Set ALPHANUMERIC_SYNC_PENDING_WRITES=true to force immediate pending-tree flushes.
         let sync_pending_writes = std::env::var("ALPHANUMERIC_SYNC_PENDING_WRITES")
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if sync_pending_writes {
             full_sigs_tree.flush()?;
@@ -3217,7 +3217,7 @@ impl Blockchain {
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let auto_rebuild = std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
 
         let mut index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);

@@ -42,7 +42,7 @@ impl DifficultyOracle {
             .difficulty_history
             .iter()
             .zip(self.difficulty_history.iter().skip(1))
-            .map(|(a, b)| *b as f64 / *a as f64)
+            .map(|(a, b)| if *a == 0 { 1.0 } else { *b as f64 / *a as f64 })
             .collect();
         changes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -100,6 +100,9 @@ impl DifficultyOracle {
         }
 
         let total = self.difficulty_history.iter().sum::<u64>() as f64;
+        if total == 0.0 {
+            return 0.5;
+        }
         let probabilities: Vec<f64> = self
             .difficulty_history
             .iter()

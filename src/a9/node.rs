@@ -1197,8 +1197,10 @@ impl Node {
         if let Some(seeds) = override_seeds {
             let parsed: Vec<String> = seeds
                 .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .filter_map(|s| {
+                    let t = s.trim();
+                    (!t.is_empty()).then(|| t.to_owned())
+                })
                 .collect();
             if !parsed.is_empty() {
                 return parsed;
@@ -1212,8 +1214,10 @@ impl Node {
             .ok()
             .map(|v| {
                 v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| {
+                        let t = s.trim();
+                        (!t.is_empty()).then(|| t.to_owned())
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1773,10 +1777,10 @@ impl Node {
         const VERIFY_CONCURRENCY: usize = 12;
 
         let gateway_only = std::env::var("ALPHANUMERIC_DISCOVERY_GATEWAY_ONLY")
-            .map(|v| v.to_lowercase() != "false")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let enable_dns_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_DNS_FALLBACK")
-            .map(|v| v.to_lowercase() != "false")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
             .map(|v| v.to_lowercase() == "true")

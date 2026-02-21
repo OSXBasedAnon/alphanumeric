@@ -65,13 +65,15 @@ impl NetworkConfig {
         if let Ok(seed_nodes) = env::var("ALPHANUMERIC_SEED_NODES") {
             config.seed_nodes = seed_nodes
                 .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .filter_map(|s| {
+                    let t = s.trim();
+                    (!t.is_empty()).then(|| t.to_owned())
+                })
                 .collect();
         }
 
         if let Ok(velocity_enabled) = env::var("ALPHANUMERIC_VELOCITY_ENABLED") {
-            config.velocity_enabled = velocity_enabled.to_lowercase() == "true";
+            config.velocity_enabled = velocity_enabled.eq_ignore_ascii_case("true");
         }
 
         if let Ok(max_shred_size) = env::var("ALPHANUMERIC_MAX_SHRED_SIZE") {
@@ -151,7 +153,7 @@ impl MiningConfig {
         let mut config = Self::default();
 
         if let Ok(enabled) = env::var("ALPHANUMERIC_MINING_ENABLED") {
-            config.enabled = enabled.to_lowercase() == "true";
+            config.enabled = enabled.eq_ignore_ascii_case("true");
         }
 
         if let Ok(threads) = env::var("ALPHANUMERIC_MINING_THREADS") {

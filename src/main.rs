@@ -2150,7 +2150,7 @@ fn print_ascii_intro() {
     let start_color = (42, 93, 253); // White
     let end_color = (190, 252, 233); // Neon Green
 
-    let lines: Vec<&str> = ascii_art.split('\n').collect();
+    let lines: Vec<&str> = ascii_art.lines().collect();
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
     for (line_idx, line) in lines.iter().enumerate() {
@@ -2213,7 +2213,7 @@ fn remove_instance_lock() -> std::io::Result<()> {
 fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
     if std::path::Path::new(&lock_path).exists() {
         let allow = std::env::var(ignore_env)
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if allow {
             let _ = std::fs::remove_file(&lock_path);
