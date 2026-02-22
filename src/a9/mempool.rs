@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -141,24 +141,24 @@ impl Mempool {
         }
 
         // Create entry
+        let tx_id = tx.get_tx_id();
+        let sender = tx.sender.clone();
+        let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
         let entry = MempoolEntry {
-            transaction: tx.clone(),
-            tx_id: tx.get_tx_id(),
+            transaction: tx,
+            tx_id,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            fee_per_byte: FeePerByte(tx.fee() / tx_size as f64),
+            fee_per_byte,
             size: tx_size,
         };
 
         // Batch updates atomically
-        self.transactions
-            .entry(tx.sender.clone())
-            .or_default()
-            .push(entry);
+        self.transactions.entry(sender.clone()).or_default().push(entry);
         self.address_counts
-            .entry(tx.sender)
+            .entry(sender)
             .and_modify(|e| *e += 1)
             .or_insert(1);
         self.total_size.fetch_add(tx_size, AtomicOrdering::SeqCst);
@@ -173,7 +173,6 @@ impl Mempool {
 
         let mut selected = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
         let mut total_size = 0;
-        let mut processed_senders = HashSet::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
 
         // Use a max-heap to efficiently get highest fee transactions
         // Store metadata in heap, not the full transaction (avoids needing Ord on Transaction)
@@ -208,7 +207,7 @@ impl Mempool {
                 break;
             }
 
-            if processed_senders.insert(sender.clone()) && total_size + size <= MAX_BLOCK_SIZE {
+            if total_size + size <= MAX_BLOCK_SIZE {
                 // Fetch the actual transaction from the map
                 if let Some(txs) = self.transactions.get(&sender) {
                     if let Some(entry) = txs.get(tx_idx) {
@@ -279,12 +278,15 @@ impl Mempool {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let mut to_remove: Vec<(String, String, usize)> = Vec::new();
+        let mut to_remove: HashMap<String, HashSet<String>> = HashMap::new();
         for entry in self.transactions.iter() {
             let sender = entry.key();
             for tx in entry.value().iter() {
                 if now.saturating_sub(tx.timestamp) > ttl_secs {
-                    to_remove.push((sender.clone(), tx.tx_id.clone(), tx.size));
+                    to_remove
+                        .entry(sender.clone())
+                        .or_default()
+                        .insert(tx.tx_id.clone());
                 }
             }
         }
@@ -294,17 +296,24 @@ impl Mempool {
         }
 
         let mut removed = 0usize;
-        for (addr, tx_id, size) in to_remove {
+        for (addr, expired_ids) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
-                let before = txs.len();
-                txs.retain(|entry| entry.tx_id != tx_id);
-                let removed_here = before.saturating_sub(txs.len());
+                let mut removed_here = 0usize;
+                let mut removed_size = 0usize;
+                txs.retain(|entry| {
+                    let keep = !expired_ids.contains(&entry.tx_id);
+                    if !keep {
+                        removed_here += 1;
+                        removed_size += entry.size;
+                    }
+                    keep
+                });
                 if removed_here > 0 {
                     removed += removed_here;
                     self.total_count
                         .fetch_sub(removed_here, AtomicOrdering::SeqCst);
                     self.total_size
-                        .fetch_sub(size.saturating_mul(removed_here), AtomicOrdering::SeqCst);
+                        .fetch_sub(removed_size, AtomicOrdering::SeqCst);
                     if let Some(mut count) = self.address_counts.get_mut(&addr) {
                         *count = count.saturating_sub(removed_here);
                         if *count == 0 {
@@ -343,11 +352,11 @@ impl Mempool {
         }
 
         // Evict lowest fee transactions until we have enough space
-        let mut to_remove: Vec<(String, String, usize)> = Vec::new();
+        let mut to_remove: HashMap<String, HashSet<String>> = HashMap::new();
 
         while space_freed < required_space || count_freed < required_count {
             if let Some(Reverse((_, _timestamp, sender, tx_id, size))) = candidates.pop() {
-                to_remove.push((sender, tx_id, size));
+                to_remove.entry(sender).or_default().insert(tx_id);
                 space_freed += size;
                 count_freed += 1;
             } else {
@@ -356,14 +365,21 @@ impl Mempool {
         }
 
         // Batch removals
-        for (addr, tx_id, size) in to_remove {
+        for (addr, tx_ids) in to_remove {
             if let Some(mut txs) = self.transactions.get_mut(&addr) {
-                let before = txs.len();
-                txs.retain(|entry| entry.tx_id != tx_id);
-                let removed_here = before.saturating_sub(txs.len());
+                let mut removed_here = 0usize;
+                let mut removed_size = 0usize;
+                txs.retain(|entry| {
+                    let keep = !tx_ids.contains(&entry.tx_id);
+                    if !keep {
+                        removed_here += 1;
+                        removed_size += entry.size;
+                    }
+                    keep
+                });
                 if removed_here > 0 {
                     self.total_size
-                        .fetch_sub(size.saturating_mul(removed_here), AtomicOrdering::SeqCst);
+                        .fetch_sub(removed_size, AtomicOrdering::SeqCst);
                     self.total_count
                         .fetch_sub(removed_here, AtomicOrdering::SeqCst);
                     if let Some(mut count) = self.address_counts.get_mut(&addr) {
