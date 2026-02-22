@@ -1388,7 +1388,7 @@ impl Node {
         };
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
-            .map(|v| v.to_lowercase() != "false")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let stats_port: Option<u16> = if stats_enabled {
             std::env::var("ALPHANUMERIC_STATS_PORT")
@@ -1766,10 +1766,10 @@ impl Node {
             .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let enable_aggressive_discovery = std::env::var("ALPHANUMERIC_ENABLE_AGGRESSIVE_DISCOVERY")
-            .map(|v| v.to_lowercase() == "true")
+            .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         let mut discovered_addrs = HashSet::new();
@@ -2582,7 +2582,7 @@ impl Node {
         sock.set_tcp_keepalive(&keepalive)?;
 
         let enable_upnp = std::env::var("ALPHANUMERIC_ENABLE_UPNP")
-            .map(|v| v.to_lowercase() != "false")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
         let mut upnp_ok = false;
@@ -2661,7 +2661,7 @@ impl Node {
 
         // Start stats API (optional)
         if std::env::var("ALPHANUMERIC_STATS_ENABLED")
-            .map(|v| v.to_lowercase() != "false")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true)
         {
             if let Err(e) = self.start_stats_server().await {

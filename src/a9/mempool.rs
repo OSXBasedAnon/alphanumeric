@@ -529,7 +529,7 @@ impl TemporalVerification {
         let now = self.current_timestamp();
         let mut last_checkpoint = self.last_checkpoint.write().await;
 
-        if now - *last_checkpoint < CHECKPOINT_INTERVAL {
+        if now.saturating_sub(*last_checkpoint) < CHECKPOINT_INTERVAL {
             return;
         }
         *last_checkpoint = now;
