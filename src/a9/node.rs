@@ -85,11 +85,8 @@ const ANNOUNCE_INTERVAL: u64 = 60; // seconds
 const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DEFAULT_DISCOVERY_BASE: &str = "https://alphanumeric.blue";
-const DEFAULT_DNS_SEEDS: &[&str] = &[
-    "seed.alphanumeric.network:7177",
-    "seed2.alphanumeric.network:7177",
-    "a9seed.mynode.network:7177",
-];
+// DNS seeds are optional fallback only. Discovery should come from alphanumeric.blue.
+const DEFAULT_DNS_SEEDS: &[&str] = &[];
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
@@ -1925,16 +1922,10 @@ impl Node {
     }
 
     async fn discover_from_dns_seeds(&self) -> Result<HashSet<SocketAddr>, NodeError> {
-        const DNS_SEEDS: &[&str] = &[
-            "seed.alphanumeric.network",
-            "seed2.alphanumeric.network",
-            "a9seed.mynode.network",
-        ];
-
         let mut discovered = HashSet::new();
 
-        for &seed in DNS_SEEDS {
-            match tokio::net::lookup_host(format!("{}:{}", seed, DEFAULT_PORT)).await {
+        for seed in Self::dns_seeds() {
+            match tokio::net::lookup_host(seed.as_str()).await {
                 Ok(addrs) => {
                     for addr in addrs {
                         discovered.insert(addr);
