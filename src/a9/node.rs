@@ -1753,11 +1753,11 @@ impl Node {
 
     // Separate implementation for recursive calls with retry counter
     async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
-        const MAX_DISCOVERY_RETRIES: u32 = 3;
-        const MAX_TARGET_PEERS: usize = 32;
-        const MIN_TARGET_PEERS: usize = 5;
-        const VERIFY_BATCH_SIZE: usize = 24;
-        const VERIFY_CONCURRENCY: usize = 12;
+        const MAX_DISCOVERY_RETRIES: u32 = 1;
+        const MAX_TARGET_PEERS: usize = 12;
+        const MIN_TARGET_PEERS: usize = 3;
+        const VERIFY_BATCH_SIZE: usize = 8;
+        const VERIFY_CONCURRENCY: usize = 3;
 
         let gateway_only = std::env::var("ALPHANUMERIC_DISCOVERY_GATEWAY_ONLY")
             .map(|v| !v.eq_ignore_ascii_case("false"))
@@ -1825,8 +1825,8 @@ impl Node {
             }
         }
 
-        // Heavy scan mode is strictly opt-in and only when connectivity is weak.
-        if enable_aggressive_discovery && needs_more_peers && !gateway_ok {
+        // Heavy scan mode is restricted to debug builds to keep release behavior conservative.
+        if cfg!(debug_assertions) && enable_aggressive_discovery && needs_more_peers && !gateway_ok {
             if let Ok(local_addrs) = self.discover_local_network().await {
                 discovered_addrs.extend(local_addrs);
             }
@@ -1864,7 +1864,7 @@ impl Node {
         }
 
         new_addrs.shuffle(&mut thread_rng());
-        new_addrs.truncate(MAX_TARGET_PEERS.saturating_mul(2));
+        new_addrs.truncate(MAX_TARGET_PEERS);
 
         let connection_limiter = Arc::new(Semaphore::new(VERIFY_CONCURRENCY));
         for batch in new_addrs.chunks(VERIFY_BATCH_SIZE) {
@@ -1883,7 +1883,7 @@ impl Node {
                             Ok(permit) => permit,
                             Err(_) => return None,
                         };
-                        match tokio::time::timeout(Duration::from_secs(5), node.verify_peer(addr))
+                        match tokio::time::timeout(Duration::from_secs(4), node.verify_peer(addr))
                             .await
                         {
                             Ok(Ok(_)) => Some(addr),
