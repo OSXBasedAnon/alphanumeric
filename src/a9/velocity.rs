@@ -101,6 +101,7 @@ pub struct VelocityManager {
     shred_cache: Arc<ShredCache>,
     erasure_manager: Arc<ErasureManager>,
     subnet_manager: Arc<SubnetManager>,
+    metrics: Arc<VelocityMetrics>,
     request_limiter: Arc<Semaphore>,
     pending_requests: Arc<DashMap<[u8; 32], Instant>>,
     request_tx: Sender<ShredRequest>,
@@ -319,6 +320,7 @@ impl VelocityManager {
             shred_cache: Arc::new(ShredCache::new()),
             erasure_manager: Arc::new(ErasureManager::new()),
             subnet_manager: Arc::new(SubnetManager::new()),
+            metrics: Arc::new(VelocityMetrics::default()),
             request_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             pending_requests: Arc::new(DashMap::new()),
             request_tx,
@@ -396,7 +398,7 @@ impl VelocityManager {
         const MIN_LATENCY: u64 = 100;
         const PROPAGATION_TIMEOUT: u64 = 5; // Increased for production stability
         const MIN_SUCCESS_RATIO: f64 = 0.60; // Reduced for better reliability on slower networks
-        const SUBNET_PEER_LIMIT: usize = 3;
+        let propagation_started = Instant::now();
 
         // Calculate block size
         let block_bytes =
@@ -415,7 +417,16 @@ impl VelocityManager {
             let mut fast_peers: Vec<_> = peers
                 .iter()
                 .filter(|(_, info)| info.latency < MIN_LATENCY)
+                .filter(|(addr, _)| self.subnet_manager.lookup_coverage(addr.ip()))
                 .collect::<Vec<_>>();
+
+            // If we don't have coverage history yet, fall back to all low-latency peers.
+            if fast_peers.is_empty() {
+                fast_peers = peers
+                    .iter()
+                    .filter(|(_, info)| info.latency < MIN_LATENCY)
+                    .collect::<Vec<_>>();
+            }
 
             fast_peers.sort_by_key(|(_addr, info)| info.latency);
 
@@ -449,6 +460,8 @@ impl VelocityManager {
                 let successes = results.iter().filter(|r| r.is_ok()).count();
 
                 if successes >= min_confirmations {
+                    self.metrics
+                        .record_propagation_latency(propagation_started.elapsed());
                     log::info!(
                         "Velocity: Fast path successful, {} confirmations",
                         successes
@@ -512,7 +525,7 @@ impl VelocityManager {
         for (_, mut peer_group) in subnet_peers {
             peer_group.sort_by_key(|(_, latency)| *latency);
 
-            let peer_count = peer_group.len().min(SUBNET_PEER_LIMIT);
+            let peer_count = peer_group.len().min(MAX_SUBNET_PEERS);
             if peer_count == 0 {
                 continue;
             }
@@ -549,6 +562,8 @@ impl VelocityManager {
             / results.len().max(1) as f64;
 
         if success_ratio >= MIN_SUCCESS_RATIO {
+            self.metrics
+                .record_propagation_latency(propagation_started.elapsed());
             log::info!(
                 "Velocity: Block propagation successful, {:.1}% success rate",
                 success_ratio * 100.0
@@ -636,6 +651,7 @@ impl VelocityManager {
         .map_err(|_| VelocityError::Network(format!("Send timeout to {}", peer)))?
         .map_err(|e| VelocityError::Network(format!("Send error to {}: {}", peer, e)))?;
 
+        self.subnet_manager.update_coverage(peer.ip(), true);
         Ok(())
     }
 
@@ -648,9 +664,12 @@ impl VelocityManager {
         if !self.shred_cache.add_shred(shred.clone()) {
             return Ok(None);
         }
+        self.metrics.record_shred_processed();
+        self.subnet_manager.update_coverage(from.ip(), true);
 
         // Check if we can reconstruct the block
         if let Some(block) = self.try_reconstruct_block(&shred.block_hash).await? {
+            self.metrics.record_block_reconstructed();
             return Ok(Some(block));
         }
 
@@ -675,6 +694,7 @@ impl VelocityManager {
         block_hash: [u8; 32],
         from: SocketAddr,
     ) -> Result<(), VelocityError> {
+        let request_started = Instant::now();
         if !self.should_request_shreds(&block_hash) {
             return Ok(());
         }
@@ -723,6 +743,8 @@ impl VelocityManager {
 
         // Mark request as pending
         self.pending_requests.insert(block_hash, Instant::now());
+        self.metrics
+            .record_request_latency(request_started.elapsed());
 
         Ok(())
     }
@@ -738,6 +760,7 @@ impl VelocityManager {
     }
 
     async fn process_shred_request(&self, request: ShredRequest) -> Result<(), VelocityError> {
+        let request_started = Instant::now();
         let ShredRequest {
             block_hash,
             indices,
@@ -762,6 +785,8 @@ impl VelocityManager {
             // This would integrate with your network layer
             self.send_shred_response(from, block_hash, available_shreds)
                 .await?;
+            self.metrics
+                .record_request_latency(request_started.elapsed());
         }
 
         Ok(())
@@ -807,6 +832,7 @@ impl VelocityManager {
         .map_err(|_| VelocityError::Network(format!("Send timeout to {}", to)))?
         .map_err(|e| VelocityError::Network(format!("Send error to {}: {}", to, e)))?;
 
+        self.subnet_manager.update_coverage(to.ip(), true);
         Ok(())
     }
 
@@ -919,7 +945,7 @@ impl VelocityProtocol for Node {
 }
 
 // Statistics and metrics tracking
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct VelocityMetrics {
     shreds_processed: AtomicU64,
     blocks_reconstructed: AtomicU64,

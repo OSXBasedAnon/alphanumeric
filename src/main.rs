@@ -22,7 +22,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::a9::{
-    blockchain::{Block, Blockchain, RateLimiter, Transaction},
+    blockchain::{
+        Block, Blockchain, RateLimiter, Transaction, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
+    },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
     node::{Node, NodeError, DEFAULT_PORT},
@@ -38,12 +40,41 @@ const KEY_FILE_PATH: &str = "private.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
+#[cfg(feature = "bootstrap_publisher")]
 const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
+#[cfg(feature = "bootstrap_publisher")]
 const BOOTSTRAP_META_LAST_PUBLISH_AT: &[u8] = b"last_publish_at";
+#[cfg(feature = "bootstrap_publisher")]
 const BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT: &[u8] = b"last_published_height";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
+    let genesis_hash = blockchain
+        .get_block(0)
+        .map(|b| hex::encode(b.hash))
+        .unwrap_or_else(|_| "missing_genesis".to_string());
+
+    let descriptor = format!(
+        "fee={:.12};reward={:.8};adj={};block_time={};target_block_time={};network_fee={:.8};mint_clip={:.8};genesis={};hdr_rules_ver={};hdr_future={}",
+        blockchain.transaction_fee,
+        blockchain.mining_reward,
+        blockchain.difficulty_adjustment_interval,
+        blockchain.block_time,
+        TARGET_BLOCK_TIME,
+        NETWORK_FEE,
+        MINT_CLIP,
+        genesis_hash,
+        2,
+        600
+    );
+
+    let mut hasher = Sha256::new();
+    hasher.update(descriptor.as_bytes());
+    let fingerprint = hex::encode(hasher.finalize());
+    (descriptor, fingerprint)
+}
 
 impl std::fmt::Display for Blockchain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -207,6 +238,10 @@ async fn main() -> Result<()> {
         }
         pb.inc(1);
 
+        let (consensus_descriptor, consensus_fingerprint) = {
+            let blockchain_lock = blockchain.read().await;
+            compute_consensus_fingerprint(&blockchain_lock)
+        };
         // Bootstrap publishing (zip+upload+sign) is compiled out by default to reduce false positives.
         // Enable with `--features bootstrap_publisher` for the ONE canonical node that should publish.
         #[cfg(feature = "bootstrap_publisher")]
@@ -296,7 +331,6 @@ async fn main() -> Result<()> {
     local.spawn_local(async move {
         const FAST_SYNC_LATENCY: u64 = 50;       // 50ms target latency
         const RECOVERY_LATENCY: u64 = 500;        // 500ms acceptable during network stress
-        const BLOCK_BUFFER_SIZE: usize = 100;     // ~200s worth of blocks
         const MIN_VIABLE_PEERS: usize = 3;        // Minimum peers for operation
         const MAX_SYNC_ATTEMPTS: u32 = 3;         // Maximum sync retries before backing off
         const HEALTH_CHECK_INTERVAL: u64 = 1000;  // 1s health checks
@@ -304,7 +338,6 @@ async fn main() -> Result<()> {
         const SLEEP_THRESHOLD: u64 = 10;          // 10s threshold for sleep detection
         const MAX_BLOCK_AGE: u64 = 2;            // Maximum acceptable block age deviation
         const MIN_PEER_LATENCY: u64 = 10;        // Minimum acceptable peer latency
-        const MAX_DISCOVERIES_PER_CYCLE: u32 = 5; // Maximum peer discoveries per cycle
         const RECENT_PEER_THRESHOLD: u64 = 300;   // Peer considered recent within 300s
         const MAX_DISCOVERY_ATTEMPTS: u32 = 5;    // Maximum discovery retry attempts
 
@@ -1307,6 +1340,9 @@ Some("diagnostics") | Some("diag") => {
     } else {
         println!("No blocks available for diagnostics");
     }
+
+    println!("Consensus Fingerprint: {}", consensus_fingerprint);
+    println!("Consensus Descriptor:  {}", consensus_descriptor);
 },
 
 Some("help") => {
@@ -2106,18 +2142,6 @@ async fn handle_network_commands(
     Ok(())
 }
 
-// Boot sequence
-fn print_step(message: &str, step: &str, color: Color) {
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let mut color_spec = ColorSpec::new();
-    color_spec.set_fg(Some(color)).set_bold(true);
-
-    // Print the step
-    let _ = stdout.set_color(&color_spec);
-    let _ = writeln!(&mut stdout, "{} {}", step, message);
-    let _ = stdout.reset();
-}
-
 // ASCII Art - version
 fn interpolate_channel(start: u8, end: u8, t: f32) -> u8 {
     (start as f32 + t * (end as f32 - start as f32)) as u8
@@ -2292,12 +2316,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     struct BootstrapManifest {
         url: String,
         #[serde(default)]
-        height: Option<u64>,
-        #[serde(default)]
-        tip_hash: Option<String>,
-        #[serde(default)]
         sha256: Option<String>,
-        updated_at: u64,
     }
 
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {

@@ -74,7 +74,6 @@ use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, 
 // Network parameters
 pub const DEFAULT_PORT: u16 = 7177;
 const MIN_PEERS: usize = 3;
-const MAX_PEERS: usize = 128;
 const MAX_PEERS_PER_SUBNET: usize = 3;
 const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
 const SUBNET_MASK_IPV6: u8 = 64; // /64 subnet
@@ -96,9 +95,6 @@ const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
 // Protocol
 const NETWORK_VERSION: u32 = 1;
-const CONSENSUS_THRESHOLD: f64 = 0.67; // 2/3 majority for BFT
-const MAX_SHRED_SIZE: usize = 2048; // 2KB max shred size
-const MAX_BLOCK_SIZE: usize = 2000;
 
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
@@ -244,13 +240,6 @@ pub struct SubnetGroup {
 }
 
 impl SubnetGroup {
-    fn new() -> Self {
-        Self {
-            data: [0u8; 16],
-            len: 0,
-        }
-    }
-
     fn from_ip(ip: IpAddr, mask_v4: u8, mask_v6: u8) -> Self {
         match ip {
             IpAddr::V4(ipv4) => {
@@ -655,10 +644,12 @@ impl NetworkBehaviour for HybridBehaviour {
     type ConnectionHandler = KademliaHandler<QueryId>;
     type OutEvent = HybridBehaviourEvent;
 
+    #[allow(deprecated)]
     fn new_handler(&mut self) -> Self::ConnectionHandler {
         self.kademlia.new_handler()
     }
 
+    #[allow(deprecated)]
     fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
         self.kademlia.addresses_of_peer(peer_id)
     }
@@ -864,14 +855,6 @@ struct DiscoveryResponse {
 struct DiscoveryPeer {
     ip: String,
     port: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum ConsensusMessage {
-    PrepareRequest(Block),
-    PrepareResponse(bool, String),
-    CommitRequest(Block),
-    CommitResponse(bool, String),
 }
 
 impl Node {
@@ -3916,14 +3899,24 @@ impl Node {
 
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
-                // Enforce BPoS header quorum only when network verifier context is mature enough.
-                if sentinel.should_enforce_consensus_for_headers().await {
+                // Header consensus is versioned by activation height:
+                // - v1: enforce only when verifier context is mature
+                // - v2+: enforce unconditionally from activation height
+                if sentinel.should_enforce_consensus_for_block(block.index).await {
                     if sentinel
                         .has_conflicting_verified_header(block.index, &block.hash)
                         .await
                     {
                         debug!(
                             "Rejecting block {} due to conflicting verified header at same height",
+                            block.index
+                        );
+                        validation_result = false;
+                    } else if sentinel.should_require_verified_header_record_for_block(block.index)
+                        && !sentinel.has_verification_record(&block.hash)
+                    {
+                        debug!(
+                            "Rejecting block {} due to missing verified header record under active strict header rules",
                             block.index
                         );
                         validation_result = false;

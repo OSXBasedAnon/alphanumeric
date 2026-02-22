@@ -17,24 +17,24 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 
 use crate::a9::blockchain::{Block, Blockchain, BlockchainError, Transaction};
-use crate::a9::feepool::ActionType;
 use crate::a9::node::NetworkMessage;
 use crate::a9::node::{Node, NodeError};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionType {
+    BlockValidation,
+    AnomalyDetection,
+    ForkResolution,
+    HeaderValidation,
+    ChainVerification,
+}
+
 // Performance and reward constants
 const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
-const HEADER_SYNC_INTERVAL: u64 = 300; // Sync headers every 5 minutes
 const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
-const PERFORMANCE_WINDOW: u64 = 604800; // 7 day performance tracking
-const MAX_RESPONSE_TIME: u64 = 1000; // 1 second max response time
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
-const MAX_FORK_RESOLUTION_ATTEMPTS: u32 = 3; // Maximum attempts to resolve a fork
-const HEADER_BROADCAST_SIZE: usize = 1000; // Number of headers to broadcast
-const MAX_HEADER_MEMORY: usize = 1024 * 1024; // 1MB max header cache
 const SENTINEL_VERIFY_INTERVAL: u64 = 300; // 5 minute verification cycle
-const SENTINEL_CHALLENGE_TTL: u64 = 60; // Challenges valid for 1 minute
 const HEADER_SYNC_SIZE: usize = 1000; // Number of headers to sync
-const REWARD_SCORE_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 day window for scoring
 const DILITHIUM_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_DILITHIUM_BIND_V1";
 
 pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8]) -> Vec<u8> {
@@ -49,28 +49,13 @@ pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8
     payload
 }
 
-// Base APY and tier multipliers
-const BASE_APY: f64 = 0.045;
-const RED_DIAMOND_MULT: f64 = 2.0;
-const DIAMOND_MULT: f64 = 1.5;
-const EMERALD_MULT: f64 = 1.3;
-const GOLD_MULT: f64 = 1.2;
-const SILVER_MULT: f64 = 1.1;
-
-// Percentage constants for tiers
-const RED_DIAMOND_PERCENT: f64 = 0.0001; // 0.01%
-const DIAMOND_PERCENT: f64 = 0.001; // 0.1%
-const EMERALD_PERCENT: f64 = 0.005; // 0.5%
-const GOLD_PERCENT: f64 = 0.02; // 2%
-const SILVER_PERCENT: f64 = 0.05; // 5%
-
 const MAX_BLOCK_SIZE: usize = 1_000_000;
 const BLOCK_VERIFICATION_BATCH_SIZE: usize = 1000; // Increased for better scaling
 
-pub const MIN_UPTIME_REQUIREMENT: f64 = 0.95; // 95% minimum uptime
 pub const AUTO_STAKE_PERCENTAGE: f64 = 0.20; // 20% automatic stake
-pub const MIN_ACTIONS_FOR_REWARD: u64 = 100;
 pub const WITHDRAWAL_COOLDOWN: u64 = 24 * 60 * 60; // 24 hours in seconds
+const HEADER_RULES_VERSION: u32 = 2;
+const HEADER_MAX_FUTURE_SECONDS: u64 = 600;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ValidatorTier {
@@ -115,48 +100,6 @@ impl ValidatorTier {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BPoSController {
-    config: BPoSConfig,
-    pub stats: Arc<RwLock<StakeStats>>,
-}
-
-impl BPoSController {
-    pub fn new(config: BPoSConfig) -> Self {
-        Self {
-            config,
-            stats: Arc::new(RwLock::new(StakeStats::default())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BPoSConfig {
-    pub min_stake: u64,
-    pub epoch_length: u64,
-    pub max_validators: usize,
-    pub reward_rate: f64,
-}
-
-impl Default for BPoSConfig {
-    fn default() -> Self {
-        Self {
-            min_stake: 1000,
-            epoch_length: 86400,
-            max_validators: 100,
-            reward_rate: 0.05,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StakeStats {
-    pub total_staked: u64,
-    pub active_validators: usize,
-    pub epoch: u64,
-    pub rewards_distributed: f64,
-}
-
 #[derive(Debug)]
 struct NodeSentinel {
     public_key: Vec<u8>,
@@ -182,7 +125,6 @@ pub struct BPoSSentinel {
     header_cache: Arc<RwLock<VecDeque<Block>>>,
     network_health: Arc<RwLock<NetworkHealth>>,
     stats: Arc<RwLock<SentinelStats>>,
-    controller: BPoSController,
     header_sentinel: Arc<HeaderSentinel>,
     anomaly_detector: Arc<RwLock<AnomalyDetector>>,
     sync_manager: Arc<RwLock<SyncManager>>,
@@ -212,7 +154,6 @@ impl BPoSSentinel {
             header_cache: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_HEADER_CACHE_SIZE))),
             network_health: Arc::new(RwLock::new(NetworkHealth::new())),
             stats: Arc::new(RwLock::new(SentinelStats::default())),
-            controller: BPoSController::new(BPoSConfig::default()),
             header_sentinel,
             anomaly_detector: Arc::new(RwLock::new(AnomalyDetector {
                 recent_anomalies: VecDeque::with_capacity(1000),
@@ -2160,7 +2101,6 @@ impl Clone for BPoSSentinel {
             header_cache: Arc::clone(&self.header_cache),
             network_health: Arc::clone(&self.network_health),
             stats: Arc::clone(&self.stats),
-            controller: self.controller.clone(),
             header_sentinel: Arc::clone(&self.header_sentinel),
             anomaly_detector: Arc::clone(&self.anomaly_detector),
             sync_manager: Arc::clone(&self.sync_manager),
@@ -2217,6 +2157,7 @@ pub struct HeaderSentinel {
     public_key: Vec<u8>,
     secret_key: Vec<u8>,
     node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
+    header_rules_version: u32,
 }
 
 impl HeaderSentinel {
@@ -2224,6 +2165,22 @@ impl HeaderSentinel {
 
     fn strict_header_signatures() -> bool {
         true
+    }
+
+    fn is_header_rules_v2_active(&self) -> bool {
+        self.header_rules_version >= 2
+    }
+
+    fn max_future_skew_seconds(&self) -> u64 {
+        HEADER_MAX_FUTURE_SECONDS
+    }
+
+    fn signature_required(&self) -> bool {
+        if self.is_header_rules_v2_active() {
+            true
+        } else {
+            Self::strict_header_signatures()
+        }
     }
 
     fn external_verifier_count(verifiers: &HashSet<String>) -> usize {
@@ -2328,6 +2285,7 @@ impl HeaderSentinel {
             public_key: public_key.as_bytes().to_vec(),
             secret_key: secret_key.as_bytes().to_vec(),
             node_sentinel: None,
+            header_rules_version: HEADER_RULES_VERSION,
         }
     }
 
@@ -2380,9 +2338,18 @@ impl HeaderSentinel {
             .map_err(|e| format!("Headers serialization error: {}", e))?;
         let signature_valid =
             self.verify_signature_with_registered_node_key(&headers_payload, node_id, &signature)?;
-        if !signature_valid && Self::strict_header_signatures() {
+        let batch_requires_signature = self.signature_required();
+        if !signature_valid && batch_requires_signature {
             return Err("Header batch signature verification failed".to_string());
         }
+        let existing_headers: Vec<BlockHeaderInfo> = {
+            self.headers
+                .read()
+                .await
+                .iter()
+                .map(|h| h.header.clone())
+                .collect()
+        };
 
         // Process up to 200 headers at a time
         for chunk in headers.chunks(200) {
@@ -2390,30 +2357,36 @@ impl HeaderSentinel {
 
             // Verify headers in chunk
             for header in chunk {
+                let strict_v2 = self.is_header_rules_v2_active();
                 // Skip duplicates
                 if self.verifications.contains_key(&header.hash) {
                     continue;
                 }
 
                 // Do quick temporal verification
-                if header.timestamp > now + 7200 {
-                    // 2 hours max future
+                if header.timestamp > now + self.max_future_skew_seconds() {
                     continue;
                 }
 
                 // Check previous hash links
                 if header.height > 0 {
-                    let found_prev = verified_headers
+                    let prev_in_chunk = verified_headers
                         .iter()
-                        .any(|h: &BlockHeaderInfo| h.hash == header.prev_hash)
-                        || self
-                            .headers
-                            .read()
-                            .await
-                            .iter()
-                            .any(|h| h.header.hash == header.prev_hash);
+                        .find(|h: &&BlockHeaderInfo| h.hash == header.prev_hash)
+                        .map(|h| (h.height, h.timestamp));
+                    let prev_in_store = existing_headers
+                        .iter()
+                        .find(|h| h.hash == header.prev_hash)
+                        .map(|h| (h.height, h.timestamp));
+                    let Some((prev_height, prev_timestamp)) = prev_in_chunk.or(prev_in_store)
+                    else {
+                        continue;
+                    };
 
-                    if !found_prev {
+                    if strict_v2 && header.height != prev_height.saturating_add(1) {
+                        continue;
+                    }
+                    if strict_v2 && header.timestamp <= prev_timestamp {
                         continue;
                     }
                 }
@@ -2499,6 +2472,20 @@ impl HeaderSentinel {
         // breaking bootstrap/single-node operation.
         let eligible = self.eligible_verifier_count().await;
         eligible >= 3
+    }
+
+    pub async fn should_enforce_consensus_for_block(&self, height: u32) -> bool {
+        let _ = height;
+        if self.is_header_rules_v2_active() {
+            true
+        } else {
+            self.should_enforce_consensus_for_headers().await
+        }
+    }
+
+    pub fn should_require_verified_header_record_for_block(&self, height: u32) -> bool {
+        let _ = height;
+        self.is_header_rules_v2_active()
     }
 
     pub fn has_verification_record(&self, hash: &[u8; 32]) -> bool {
@@ -2663,8 +2650,28 @@ impl HeaderSentinel {
             bincode::serialize(&header).map_err(|e| format!("Serialization error: {}", e))?;
         let signature_valid =
             self.verify_signature_with_registered_node_key(&header_payload, node_id, &signature)?;
-        if !signature_valid && Self::strict_header_signatures() {
+        if !signature_valid && self.signature_required() {
             return Err("Header signature verification failed".to_string());
+        }
+        if header.timestamp > now + self.max_future_skew_seconds() {
+            return Err("Header timestamp too far in the future".to_string());
+        }
+        if header.height > 0 {
+            let prev = self
+                .headers
+                .read()
+                .await
+                .iter()
+                .rev()
+                .find(|h| h.header.hash == header.prev_hash)
+                .map(|h| h.header.clone())
+                .ok_or_else(|| "Header previous hash not found".to_string())?;
+            if self.is_header_rules_v2_active() && header.height != prev.height.saturating_add(1) {
+                return Err("Header height continuity check failed".to_string());
+            }
+            if self.is_header_rules_v2_active() && header.timestamp <= prev.timestamp {
+                return Err("Header timestamp continuity check failed".to_string());
+            }
         }
 
         // Quick lookup in recent verifications using DashMap
@@ -2936,5 +2943,19 @@ mod tests {
                 .has_conflicting_verified_header(10, &expected_hash)
                 .await
         );
+    }
+
+    #[test]
+    fn header_rule_v2_is_chain_wide() {
+        let sentinel = HeaderSentinel::new();
+        assert!(sentinel.is_header_rules_v2_active());
+        assert!(sentinel.should_require_verified_header_record_for_block(1));
+        assert!(sentinel.should_require_verified_header_record_for_block(1_000_000));
+    }
+
+    #[test]
+    fn header_rule_v2_uses_fixed_future_skew() {
+        let sentinel = HeaderSentinel::new();
+        assert_eq!(sentinel.max_future_skew_seconds(), HEADER_MAX_FUTURE_SECONDS);
     }
 }

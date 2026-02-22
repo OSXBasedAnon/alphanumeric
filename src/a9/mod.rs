@@ -1,6 +1,5 @@
 pub mod blockchain;
 pub mod bpos;
-pub mod feepool;
 pub mod mempool;
 pub mod mgmt;
 pub mod node;

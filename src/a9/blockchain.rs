@@ -28,7 +28,6 @@ use crate::a9::oracle::DifficultyOracle;
 use crate::a9::progpow::MiningManager;
 use crate::a9::wallet::Wallet;
 
-const BLOCKCHAIN_PATH: &str = "blockchain.db";
 const BALANCES_TREE: &str = "balances";
 const PENDING_DEBITS_TREE: &str = "pending_debits";
 const PENDING_CREDITS_TREE: &str = "pending_credits";
@@ -39,15 +38,12 @@ const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
-const NONCE_MAGIC: u128 = 0xA5A5A5A5A5A5A5A5A;
-const DIFFICULTY_MAGIC: u128 = 0x5A5A5A5A5A5A5A5A5A5A5A5A5A;
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 
-pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 1; //Base
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
 pub const MAX_BLOCK_REWARD: f64 = 50.0;
@@ -104,7 +100,6 @@ pub fn finalize_stage_name(stage: usize) -> &'static str {
 #[derive(Eq, PartialEq)]
 pub enum TransactionContext {
     BlockValidation,
-    Standard,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -432,12 +427,6 @@ impl Transaction {
     }
 }
 
-pub struct BlockHeader {
-    pub index: u64,
-    pub previous_hash: String,
-    pub timestamp: u64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub index: u32,
@@ -547,7 +536,6 @@ impl Block {
         const MAX_ADJUSTMENT: f64 = 1.15;
         const DAMPENING_FACTOR: f64 = 0.6;
         const EMERGENCY_THRESHOLD: u64 = 5;
-        const EMERGENCY_MULTIPLIER: f64 = 0.9;
 
         // Record metrics
         oracle.record_block_metrics(current_timestamp, current_difficulty);
@@ -708,15 +696,6 @@ impl Block {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
         deserialize_block(bytes).map_err(|e| Box::new(e) as Box<dyn Error>)
-    }
-}
-
-#[derive(Debug)]
-struct ParallelProcessingError(String);
-
-impl From<sled::Error> for ParallelProcessingError {
-    fn from(error: sled::Error) -> Self {
-        ParallelProcessingError(error.to_string())
     }
 }
 
@@ -1928,39 +1907,6 @@ impl Blockchain {
         self.rebuild_pending_debits_index().await?;
 
         Ok(())
-    }
-
-    pub async fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let difficulty = *self.difficulty.lock().await;
-
-        // Retrieve pending transactions from sled
-        let pending_transactions = match self.db.open_tree(PENDING_TRANSACTIONS_TREE) {
-            Ok(tree) => {
-                let mut transactions = Vec::new();
-                for item in tree.iter() {
-                    if let Ok((_, tx_bytes)) = item {
-                        if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                            transactions.push(tx);
-                        }
-                    }
-                }
-                transactions
-            }
-            Err(_) => Vec::new(),
-        };
-
-        f.debug_struct("Blockchain")
-            .field("db", &self.db)
-            .field("difficulty", &difficulty)
-            .field("pending_transactions", &pending_transactions)
-            .field("transaction_fee", &self.transaction_fee)
-            .field("mining_reward", &self.mining_reward)
-            .field(
-                "difficulty_adjustment_interval",
-                &self.difficulty_adjustment_interval,
-            )
-            .field("block_time", &self.block_time)
-            .finish()
     }
 
     pub async fn save_block(&self, block: &Block) -> Result<(), BlockchainError> {

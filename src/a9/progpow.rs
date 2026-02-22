@@ -1,6 +1,5 @@
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
-use lazy_static::lazy_static;
 use log::warn;
 use num_bigint::BigUint;
 use num_cpus;
@@ -22,18 +21,8 @@ use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::wallet::Wallet;
 
 // Constants for ProgPOW
-const MAX_NONCE: u64 = 100000000;
 const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
-const PROGPOW_CACHE_BYTES: usize = 16 * 1024;
-const PROGPOW_CNT_DAG: u32 = 64;
-const PROGPOW_CNT_CACHE: u32 = 12;
-const PERIOD_LENGTH: u32 = 50;
-
-pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
-lazy_static! {
-    pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
-}
 
 #[derive(Debug, Clone, Error)]
 pub enum CryptoError {
