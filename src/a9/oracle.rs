@@ -81,14 +81,21 @@ impl DifficultyOracle {
             return 0.5;
         }
 
-        let intervals: Vec<f64> = self
-            .recent_block_times
-            .iter()
-            .zip(self.recent_block_times.iter().skip(1))
-            .map(|(a, b)| (*b - *a) as f64)
-            .collect();
+        let mut count = 0usize;
+        let mut sum = 0.0f64;
+        let mut prev = None;
+        for &ts in &self.recent_block_times {
+            if let Some(last) = prev {
+                sum += ts.saturating_sub(last) as f64;
+                count += 1;
+            }
+            prev = Some(ts);
+        }
+        if count == 0 {
+            return 0.5;
+        }
 
-        let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        let avg_interval = sum / count as f64;
         let target = TARGET_BLOCK_TIME as f64;
 
         ((-0.5 * (avg_interval - target).abs()).exp() + 0.1).min(1.0)
@@ -103,19 +110,16 @@ impl DifficultyOracle {
         if total == 0.0 {
             return 0.5;
         }
-        let probabilities: Vec<f64> = self
-            .difficulty_history
-            .iter()
-            .map(|&x| (x as f64) / total)
-            .collect();
 
-        -probabilities
-            .iter()
-            .filter(|&&p| p > 0.0)
-            .map(|&p| p * p.log2())
-            .sum::<f64>()
-            .max(0.0)
-            .min(1.0)
+        let mut entropy = 0.0f64;
+        for &x in &self.difficulty_history {
+            let p = (x as f64) / total;
+            if p > 0.0 {
+                entropy += p * p.log2();
+            }
+        }
+
+        (-entropy).max(0.0).min(1.0)
     }
 
     pub fn assess_network_stability(&self) -> f64 {
@@ -123,16 +127,26 @@ impl DifficultyOracle {
             return 1.0;
         }
 
-        let intervals: Vec<f64> = self
-            .recent_block_times
-            .iter()
-            .zip(self.recent_block_times.iter().skip(1))
-            .map(|(a, b)| (*b - *a) as f64)
-            .collect();
-
-        let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
-        let variance =
-            intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
+        // Welford's algorithm gives mean/variance in one pass without storing intervals.
+        let mut n = 0usize;
+        let mut mean = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut prev = None;
+        for &ts in &self.recent_block_times {
+            if let Some(last) = prev {
+                let x = ts.saturating_sub(last) as f64;
+                n += 1;
+                let delta = x - mean;
+                mean += delta / n as f64;
+                let delta2 = x - mean;
+                m2 += delta * delta2;
+            }
+            prev = Some(ts);
+        }
+        if n == 0 || mean == 0.0 {
+            return 1.0;
+        }
+        let variance = m2 / n as f64;
 
         (-variance / (4.0 * mean.powi(2))).exp()
     }
