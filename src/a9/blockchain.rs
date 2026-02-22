@@ -235,9 +235,11 @@ impl Transaction {
         let transaction_data = serde_json::to_vec(&transaction)
             .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
 
-        // Get full signature for verification
-        let full_signature = block_on(sender_wallet.get_full_signature(&transaction_data))
+        // Sign and decode into bytes for signature hash + verification.
+        let full_signature_hex = block_on(sender_wallet.sign_transaction(&transaction_data))
             .ok_or("Failed to sign transaction")?;
+        let full_signature =
+            hex::decode(&full_signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
 
         // Create new transaction with full signature for verification
         let mut tx_with_full_sig = Self::new(
@@ -246,7 +248,7 @@ impl Transaction {
             transaction.amount(),
             transaction.fee(),
             transaction.timestamp,
-            Some(hex::encode(&full_signature)),
+            Some(full_signature_hex),
         );
         tx_with_full_sig.sig_hash = Some(Self::signature_hash_hex(&full_signature));
         tx_with_full_sig.pub_key =
