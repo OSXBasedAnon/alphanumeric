@@ -1921,25 +1921,6 @@ impl Node {
         Ok(())
     }
 
-    async fn discover_from_dns_seeds(&self) -> Result<HashSet<SocketAddr>, NodeError> {
-        let mut discovered = HashSet::new();
-
-        for seed in Self::dns_seeds() {
-            match tokio::net::lookup_host(seed.as_str()).await {
-                Ok(addrs) => {
-                    for addr in addrs {
-                        discovered.insert(addr);
-                    }
-                }
-                Err(e) => {
-                    debug!("DNS lookup failed for {}: {}", seed, e);
-                }
-            }
-        }
-
-        Ok(discovered)
-    }
-
     async fn discover_from_kademlia(&self) -> Result<HashSet<SocketAddr>, NodeError> {
         let mut discovered = HashSet::new();
 

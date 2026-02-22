@@ -100,6 +100,8 @@ flowchart LR
   - per-peer circuit breaker on repeated failures
 - Inbound connection handling is concurrency-limited
 - DNS/discovery endpoints are environment-configurable
+  - Primary peer bootstrap: `ALPHANUMERIC_DISCOVERY_BASE` (default `https://alphanumeric.blue`)
+  - Optional DNS fallback seeds: `ALPHANUMERIC_DNS_SEEDS` (comma-separated `host:port`)
 
 ## Consensus and Validation
 
