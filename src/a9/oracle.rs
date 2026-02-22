@@ -9,8 +9,6 @@ pub struct DifficultyOracle {
     window_size: usize,
     recent_block_times: VecDeque<u64>,
     difficulty_history: VecDeque<u64>,
-    volatility_threshold: f64,
-    difficulty_damping_factor: f64,
 }
 
 impl DifficultyOracle {
@@ -19,8 +17,6 @@ impl DifficultyOracle {
             window_size: 50,
             recent_block_times: VecDeque::with_capacity(50),
             difficulty_history: VecDeque::with_capacity(50),
-            volatility_threshold: 0.15,
-            difficulty_damping_factor: 0.75,
         }
     }
 
@@ -149,14 +145,6 @@ impl DifficultyOracle {
         let variance = m2 / n as f64;
 
         (-variance / (4.0 * mean.powi(2))).exp()
-    }
-
-    fn calculate_weighted_adjustment(&self, variance: f64, load: f64, entropy: f64) -> f64 {
-        let variance_weight = if variance > 0.5 { 0.5 } else { 0.3 };
-        let load_weight = if load < 0.2 || load > 0.8 { 0.4 } else { 0.3 };
-        let entropy_weight = 1.0 - variance_weight - load_weight;
-
-        (variance * variance_weight) + (load * load_weight) + (entropy * entropy_weight) - 0.5
     }
 
     pub async fn display_difficulty_metrics(

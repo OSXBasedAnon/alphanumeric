@@ -802,7 +802,6 @@ struct ScanRange {
 struct ValidationCacheEntry {
     pub valid: bool,
     pub timestamp: SystemTime,
-    pub verification_count: u32,
 }
 
 #[derive(Debug)]
@@ -3790,7 +3789,6 @@ impl Node {
                 ValidationCacheEntry {
                     valid: false,
                     timestamp: SystemTime::now(),
-                    verification_count: 1,
                 },
             );
             return Ok(false);
@@ -3910,7 +3908,6 @@ impl Node {
             ValidationCacheEntry {
                 valid: validation_result,
                 timestamp: SystemTime::now(),
-                verification_count: 1,
             },
         );
 
@@ -4466,7 +4463,6 @@ impl Node {
                         ValidationCacheEntry {
                             valid: true,
                             timestamp: SystemTime::now(),
-                            verification_count: 1,
                         },
                     );
 

@@ -65,24 +65,9 @@ impl WalletKeyData {
         }
     }
 
-    pub fn verify_encryption_status(&self) -> std::result::Result<bool, Box<dyn Error>> {
-        if let Some(key) = &self.private_key {
-            let mut hasher = Sha256::new();
-            hasher.update(key);
-            hasher.update(&[self.is_encrypted as u8]);
-            let hash = hasher.finalize();
-            Ok(hash.as_slice() == self.key_verification_hash.as_slice())
-        } else {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Missing private key",
-            )))
-        }
-    }
 }
 
 pub struct Mgmt {
-    pub wallets: HashMap<String, Wallet>,
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
 }
 
@@ -92,7 +77,6 @@ impl Mgmt {
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
     ) -> Self {
         Mgmt {
-            wallets: HashMap::new(),
             blockchain,
         }
     }

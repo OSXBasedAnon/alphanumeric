@@ -8,7 +8,6 @@ use sled::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 use crate::a9::blockchain::{
     Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
@@ -22,24 +21,6 @@ pub const MAX_MESSAGE_BYTES: usize = 128;
 
 const PRIME_TABLE: &[u64] = &[
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
-];
-
-const FREQUENCY_TABLE: &[(char, f64)] = &[
-    (' ', 0.180),
-    ('e', 0.127),
-    ('t', 0.090),
-    ('a', 0.082),
-    ('o', 0.075),
-    ('i', 0.070),
-    ('n', 0.067),
-    ('s', 0.063),
-    ('r', 0.060),
-    ('h', 0.060),
-    ('d', 0.043),
-    ('l', 0.040),
-    ('u', 0.028),
-    ('c', 0.027),
-    ('m', 0.024),
 ];
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -71,7 +52,6 @@ pub struct WhisperMessage {
 pub struct WhisperModule {
     frequency_map: HashMap<char, (f64, f64, u64)>,
     wallet_indices: DashMap<String, WalletIndex>,
-    last_height: Arc<RwLock<u32>>,
     pending_amounts: DashMap<String, f64>,
     db: Option<Arc<Db>>,
 }
@@ -84,7 +64,6 @@ impl WhisperModule {
         Self {
             frequency_map: Self::build_frequency_map(),
             wallet_indices: DashMap::new(),
-            last_height: Arc::new(RwLock::new(0)),
             pending_amounts: DashMap::new(),
             db: None,
         }
@@ -561,86 +540,6 @@ impl WhisperModule {
         }
 
         messages
-    }
-
-    pub async fn get_all_messages(
-        &self,
-        address: &str,
-        blockchain: &Blockchain,
-    ) -> Vec<WhisperMessage> {
-        // Ensure index is up to date
-        if let Err(_) = self.ensure_wallet_indexed(address, blockchain).await {
-            return Vec::new();
-        }
-
-        let now = Utc::now();
-        let cutoff = now - Duration::hours(MESSAGE_HISTORY_HOURS);
-
-        if let Some(index) = self.wallet_indices.get(address) {
-            let mut messages: Vec<_> = index
-                .fee_cache
-                .iter()
-                .filter(|info| {
-                    DateTime::<Utc>::from_timestamp(info.timestamp as i64, 0)
-                        .map(|dt| dt >= cutoff)
-                        .unwrap_or(false)
-                })
-                .filter_map(|info| {
-                    self.decode_message_from_fee(info.fee, info.timestamp, info.amount)
-                        .map(|content| WhisperMessage {
-                            from: info.from.clone(),
-                            to: info.to.clone(),
-                            content,
-                            tx_hash: self.calculate_transaction_hash(&Transaction {
-                                sender: info.from.clone(),
-                                recipient: info.to.clone(),
-                                fee_units: Transaction::to_units(info.fee),
-                                amount_units: Transaction::to_units(info.amount),
-                                timestamp: info.timestamp,
-                                signature: None,
-                                pub_key: None,
-                                sig_hash: None,
-                            }),
-                            timestamp: info.timestamp,
-                            amount: info.amount,
-                            fee: info.fee,
-                        })
-                })
-                .collect();
-
-            messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            messages
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub async fn process_new_transaction(&self, tx: &Transaction) -> Option<WhisperMessage> {
-        if tx.fee() < WHISPER_MIN_AMOUNT {
-            return None;
-        }
-
-        // Remove from pending amounts when transaction is processed
-        if let Some(mut pending) = self.pending_amounts.get_mut(&tx.sender) {
-            *pending -= tx.amount() + tx.fee();
-            if *pending <= 0.0 {
-                self.pending_amounts.remove(&tx.sender);
-            }
-        }
-
-        if let Some(content) = self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount()) {
-            return Some(WhisperMessage {
-                from: tx.sender.clone(),
-                to: tx.recipient.clone(),
-                content,
-                tx_hash: self.calculate_transaction_hash(tx),
-                timestamp: tx.timestamp,
-                amount: tx.amount(),
-                fee: tx.fee(),
-            });
-        }
-
-        None
     }
 
     pub async fn get_transaction_history(
