@@ -208,8 +208,6 @@ async fn main() -> Result<()> {
             let db_for_flush = db.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
-        println!("1. Create Transaction (format: create sender recipient amount)");
-
                 loop {
                     interval.tick().await;
                     let _ = db_for_flush.flush();
@@ -2305,6 +2303,18 @@ fn is_process_alive(pid: u32) -> bool {
     sys.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
 fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -2343,9 +2353,18 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         v.len() == 64 && v.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
     }
 
+    let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
+
     // Simple and safe: only bootstrap if the DB does not already contain blocks.
-    if has_local_block_data(db_path) {
+    if has_local_block_data(db_path) && !force_bootstrap {
+        println!(
+            "Bootstrap skipped: local block data found at {} (set ALPHANUMERIC_FORCE_BOOTSTRAP=true to force download)",
+            db_path
+        );
         return Ok(());
+    }
+    if force_bootstrap {
+        println!("Forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)");
     }
 
     // Always bootstrap from the canonical site; do not allow override URLs.
