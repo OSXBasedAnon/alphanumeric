@@ -13,6 +13,7 @@ https://www.alphanumeric.blue/
 
 - [System Goals](#system-goals)
 - [Technical Architecture](#technical-architecture)
+- [Tokenomics](#tokenomics)
 - [Build and Run](#build-and-run)
 - [Configuration via Environment Variables](#configuration-via-environment-variables)
 - [CLI Surface](#cli-surface)
@@ -109,6 +110,29 @@ The codebase includes multiple consensus/validation-related components (PoW/mini
 
 If you are integrating against this repository, pin a commit hash and validate behavior at that exact revision.
 
+## Tokenomics
+
+The following economics are derived from current consensus/runtime constants in `src/a9/blockchain.rs`:
+
+- Transaction fee rate: `FEE_PERCENTAGE = 0.000563063063` (0.0563063063%)
+- Reward bounds:
+  - `MIN_BLOCK_REWARD = 1.0`
+  - `MAX_BLOCK_REWARD = 50.0`
+- Network fee on reward tx: `NETWORK_FEE = 0.0005`
+- Fee clipping/burn factor: `MINT_CLIP = 0.35` (35% of tx fees clipped from miner reward path)
+- Target block time: `TARGET_BLOCK_TIME = 5` seconds
+- Reward decay schedule:
+  - every 6 months (`15,768,000` seconds), max reward is multiplied by `0.83` (17% reduction)
+- Empty block behavior:
+  - base reward starts at 20% of current max reward for empty blocks
+- Non-empty block behavior:
+  - reward scales with effective fees and is clamped to `[MIN_BLOCK_REWARD, current_max]`
+
+Important:
+
+- There is no single fixed hard-cap constant documented as total supply in current code.
+- Effective issuance depends on block production and fee activity over time under the rules above.
+
 ## Build and Run
 
 Prerequisites:
@@ -134,6 +158,16 @@ Startup bootstrap source (default):
 
 - `https://alphanumeric.blue/bootstrap/blockchain.db.zip`
 
+Bootstrap trust mode:
+
+- Nodes prefer signed manifest bootstrap from `https://alphanumeric.blue/api/bootstrap/manifest`.
+- Current default allows legacy unsigned fallback:
+  - `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=true` (when unset)
+- Recommended strict production mode:
+  - `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=false`
+  - `REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS=true`
+  - `TRUSTED_BOOTSTRAP_PUBLISHER_KEYS=<comma-separated ed25519 pubkeys>`
+
 If `blockchain.db` already exists locally, that state is used.
 
 Primary local artifacts:
@@ -148,6 +182,9 @@ Common variables used by the runtime include:
 
 - `ALPHANUMERIC_BIND_IP`
 - `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command for the canonical publisher node)
+- `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK` (default `true`; set `false` for signed-only bootstrap)
+- `REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS` (default `false`)
+- `TRUSTED_BOOTSTRAP_PUBLISHER_KEYS` (comma-separated trusted Ed25519 publisher keys)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND`
