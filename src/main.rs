@@ -208,6 +208,8 @@ async fn main() -> Result<()> {
             let db_for_flush = db.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
+        println!("1. Create Transaction (format: create sender recipient amount)");
+
                 loop {
                     interval.tick().await;
                     let _ = db_for_flush.flush();
@@ -645,6 +647,14 @@ async fn main() -> Result<()> {
             }
         }
 
+        println!("1. Create Transaction (format: create sender recipient amount)");
+        println!("2. Whisper Code (format: whisper address msg)");
+        println!("3. Show Balance (format: balance)");
+        println!("4. Make New Wallet (format: new [wallet_name])");
+        println!("5. Account Lookup (format: account address)");
+        println!("6. Mine Block (format: mine miner_wallet_name)");
+        println!("7. Exit");
+
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
                 return Ok(());
@@ -656,13 +666,6 @@ async fn main() -> Result<()> {
             print!("αlphanumeric:");
             let _ = stdout.reset();
             println!();
-            println!("1. Create Transaction (format: create sender recipient amount)");
-            println!("2. Whisper Code (format: whisper address msg)");
-            println!("3. Show Balance (format: balance)");
-            println!("4. Make New Wallet (format: new [wallet_name])");
-            println!("5. Account Lookup (format: account address)");
-            println!("6. Mine Block (format: mine miner_wallet_name)");
-            println!("7. Exit");
 
             let mut command = String::new();
             if let Err(e) = std::io::stdin().read_line(&mut command) {
