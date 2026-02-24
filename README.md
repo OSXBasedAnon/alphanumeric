@@ -112,26 +112,28 @@ If you are integrating against this repository, pin a commit hash and validate b
 
 ## Tokenomics
 
-The following economics are derived from current consensus/runtime constants in `src/a9/blockchain.rs`:
+### Supply Summary (Simple)
 
-- Transaction fee rate: `FEE_PERCENTAGE = 0.000563063063` (0.0563063063%)
-- Reward bounds:
-  - `MIN_BLOCK_REWARD = 1.0`
-  - `MAX_BLOCK_REWARD = 50.0`
-- Network fee on reward tx: `NETWORK_FEE = 0.0005`
-- Fee clipping/burn factor: `MINT_CLIP = 0.35` (35% of tx fees clipped from miner reward path)
+- There is **no fixed hard cap** encoded as a single number.
+- New issuance **decays over time**:
+  - max block reward drops by **17% every 6 months** (`* 0.83` each period)
+- In practice this creates **asymptotic supply behavior**:
+  - total supply can continue to increase
+  - but new issuance becomes progressively smaller over time
+- **5-year max-supply estimate (upper-bound model): ~783.5M tokens**
+  - assumption: continuous 5s blocks and every block earning the period max reward
+
+### Runtime Parameters (Current Code)
+
+- Fee rate: `FEE_PERCENTAGE = 0.000563063063` (0.0563063063%)
+- Reward range: `MIN_BLOCK_REWARD = 1.0`, `MAX_BLOCK_REWARD = 50.0`
+- Reward network fee: `NETWORK_FEE = 0.0005`
+- Fee clipping factor: `MINT_CLIP = 0.35`
 - Target block time: `TARGET_BLOCK_TIME = 5` seconds
-- Reward decay schedule:
-  - every 6 months (`15,768,000` seconds), max reward is multiplied by `0.83` (17% reduction)
-- Empty block behavior:
-  - base reward starts at 20% of current max reward for empty blocks
-- Non-empty block behavior:
-  - reward scales with effective fees and is clamped to `[MIN_BLOCK_REWARD, current_max]`
+- Empty blocks start at 20% of current max reward
+- Non-empty block rewards scale with effective fees and are clamped to `[MIN_BLOCK_REWARD, current_max]`
 
-Important:
-
-- There is no single fixed hard-cap constant documented as total supply in current code.
-- Effective issuance depends on block production and fee activity over time under the rules above.
+Actual realized issuance still depends on real network activity (block production + transaction fees).
 
 ## Build and Run
 
