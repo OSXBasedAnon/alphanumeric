@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
         let node = match Node::new(
             Arc::new(db.clone()),
             blockchain.clone(),
-            key_pair_pkcs8.as_ref().to_vec(),
+            key_pair_pkcs8.clone(),
             bind_addr,
             config.network.velocity_enabled,
             config.network.max_peers,
@@ -647,7 +647,7 @@ async fn main() -> Result<()> {
 
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
-                break;
+                return Ok(());
             }
             let mut stdout = StandardStream::stdout(ColorChoice::Always);
             let mut color_spec = ColorSpec::new();
@@ -669,7 +669,7 @@ async fn main() -> Result<()> {
                 warn!("Input loop interrupted: {}", e);
                 let _ = remove_db_lock(&format!("{}.lock", db_path));
                 let _ = remove_instance_lock();
-                break;
+                return Ok(());
             }
             let command = command.trim();
 
@@ -1399,7 +1399,7 @@ use std::process::Command;
  }
 let _ = remove_db_lock(&format!("{}.lock", db_path));
 let _ = remove_instance_lock();
-break;
+return Ok(());
 },
 
 Some(_) => println!("Invalid command. Type 'help' for command list or 'info' for blockchain details."),
@@ -2434,7 +2434,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         };
         let signature = match <[u8; 64]>::try_from(sig.as_slice())
             .ok()
-            .map(Signature::from_bytes)
+            .map(|bytes| Signature::from_bytes(&bytes))
         {
             Some(v) => v,
             None => return false,
