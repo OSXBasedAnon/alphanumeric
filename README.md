@@ -120,7 +120,6 @@ If you are integrating against this repository, pin a commit hash and validate b
 - In practice this creates **asymptotic supply behavior**:
   - total supply can continue to increase
   - but new issuance becomes progressively smaller over time
-- **5-year max-supply estimate from genesis: ~783.5M tokens**
 - **5-year max-supply estimate from now (network live ~6 months): ~625.8M tokens**
 
 ### Runtime Parameters (Current Code)
