@@ -1395,35 +1395,39 @@ impl Node {
             None
         };
 
-        let message = json!({
-            "ip": ip.clone().unwrap_or_default(),
-            "port": self.bind_addr.port(),
-            "node_id": &self.node_id,
-            "public_key": &self.node_id,
-            "version": format!("rust-{}", NETWORK_VERSION),
-            "height": height,
-            "last_seen": now,
-            "latency_ms": 0,
-            "stats_port": stats_port
-        });
+        let mut message = serde_json::Map::new();
+        message.insert("ip".to_string(), json!(ip.clone().unwrap_or_default()));
+        message.insert("port".to_string(), json!(self.bind_addr.port()));
+        message.insert("node_id".to_string(), json!(&self.node_id));
+        message.insert("public_key".to_string(), json!(&self.node_id));
+        message.insert("version".to_string(), json!(format!("rust-{}", NETWORK_VERSION)));
+        message.insert("height".to_string(), json!(height));
+        message.insert("last_seen".to_string(), json!(now));
+        message.insert("latency_ms".to_string(), json!(0));
+        if let Some(port) = stats_port {
+            message.insert("stats_port".to_string(), json!(port));
+        }
+        let message = serde_json::Value::Object(message);
 
         let canonical = Self::canonical_json_string(&message)?;
         let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
             .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
         let signature = keypair.sign(canonical.as_bytes());
 
-        let payload = json!({
-            "ip": ip.unwrap_or_default(),
-            "port": self.bind_addr.port(),
-            "node_id": &self.node_id,
-            "public_key": &self.node_id,
-            "version": format!("rust-{}", NETWORK_VERSION),
-            "height": height,
-            "last_seen": now,
-            "latency_ms": 0,
-            "stats_port": stats_port,
-            "signature": hex::encode(signature.as_ref())
-        });
+        let mut payload = serde_json::Map::new();
+        payload.insert("ip".to_string(), json!(ip.unwrap_or_default()));
+        payload.insert("port".to_string(), json!(self.bind_addr.port()));
+        payload.insert("node_id".to_string(), json!(&self.node_id));
+        payload.insert("public_key".to_string(), json!(&self.node_id));
+        payload.insert("version".to_string(), json!(format!("rust-{}", NETWORK_VERSION)));
+        payload.insert("height".to_string(), json!(height));
+        payload.insert("last_seen".to_string(), json!(now));
+        payload.insert("latency_ms".to_string(), json!(0));
+        if let Some(port) = stats_port {
+            payload.insert("stats_port".to_string(), json!(port));
+        }
+        payload.insert("signature".to_string(), json!(hex::encode(signature.as_ref())));
+        let payload = serde_json::Value::Object(payload);
 
         let mut any_ok = false;
         for url in Self::discovery_announce_urls() {

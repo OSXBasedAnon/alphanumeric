@@ -71,6 +71,23 @@ pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
 }
 
+fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        let metadata = std::fs::metadata(path)?;
+        let mut perms = metadata.permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
 impl Mgmt {
     pub fn new(
         _db: sled::Db,
@@ -205,6 +222,7 @@ impl Mgmt {
         // Save wallet to key file with timeout
         match tokio::time::timeout(Duration::from_secs(5), async {
             fs::write(KEY_FILE_PATH, serialized_key_data).await?;
+            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await
@@ -356,6 +374,7 @@ impl Mgmt {
         // Save wallet to key file with timeout
         match tokio::time::timeout(Duration::from_secs(5), async {
             fs::write(KEY_FILE_PATH, serialized_key_data).await?;
+            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await
@@ -460,6 +479,7 @@ impl Mgmt {
 
         let serialized_key_data = serde_json::to_string(&wallet_key_data)?;
         tokio::fs::write(KEY_FILE_PATH, serialized_key_data).await?;
+        let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
 
         let db_guard = db_arc.write().await;
         let wallets_tree = db_guard
@@ -510,6 +530,7 @@ impl Mgmt {
             // Write the updated wallet key data back to the file
             let updated_data = serde_json::to_string(&wallet_key_data)?;
             fs::write(KEY_FILE_PATH, updated_data).await?;
+            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
 
             info!("Wallet renamed from '{}' to '{}'", old_name, new_name);
             Ok(())

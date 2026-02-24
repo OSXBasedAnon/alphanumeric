@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
@@ -37,6 +37,7 @@ mod a9;
 mod config;
 
 const KEY_FILE_PATH: &str = "private.key";
+const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
@@ -189,16 +190,18 @@ async fn main() -> Result<()> {
                 }
             }
         };
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         {
+            let shutdown_flag = shutdown_requested.clone();
             let db_for_signal = db.clone();
             let lock_path = format!("{}.lock", &db_path);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
+                shutdown_flag.store(true, Ordering::Release);
                 let _ = db_for_signal.flush();
                 let _ = remove_db_lock(&lock_path);
                 let _ = remove_instance_lock();
                 eprintln!("Shutting down cleanly...");
-                std::process::exit(0);
             });
         }
         {
@@ -280,10 +283,8 @@ async fn main() -> Result<()> {
         pb.inc(1);
 
         // First generate the keypair
-        pb.set_message("Generating node keypair...");
-        let rng = SystemRandom::new();
-        let key_pair_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|e| format!("Failed to generate key pair: {}", e))?;
+        pb.set_message("Loading node identity...");
+        let key_pair_pkcs8 = load_or_create_node_identity_key(NODE_IDENTITY_KEY_PATH).await?;
         pb.inc(1);
 
         // Then create the node (single instance)
@@ -645,6 +646,9 @@ async fn main() -> Result<()> {
         }
 
         loop {
+            if shutdown_requested.load(Ordering::Acquire) {
+                break;
+            }
             let mut stdout = StandardStream::stdout(ColorChoice::Always);
             let mut color_spec = ColorSpec::new();
             color_spec.set_fg(Some(Color::White)).set_bold(true);
@@ -661,7 +665,12 @@ async fn main() -> Result<()> {
             println!("7. Exit");
 
             let mut command = String::new();
-            std::io::stdin().read_line(&mut command)?;
+            if let Err(e) = std::io::stdin().read_line(&mut command) {
+                warn!("Input loop interrupted: {}", e);
+                let _ = remove_db_lock(&format!("{}.lock", db_path));
+                let _ = remove_instance_lock();
+                break;
+            }
             let command = command.trim();
 
             match command.split_whitespace().next() {
@@ -1388,7 +1397,9 @@ use std::process::Command;
  if cfg!(windows) && std::env::var("ALPHANUMERIC_PAUSE_ON_EXIT").ok().as_deref() == Some("true") {
      let _ = Command::new("cmd").args(["/C", "pause"]).status();
  }
-std::process::exit(0);
+let _ = remove_db_lock(&format!("{}.lock", db_path));
+let _ = remove_instance_lock();
+break;
 },
 
 Some(_) => println!("Invalid command. Type 'help' for command list or 'info' for blockchain details."),
@@ -2291,9 +2302,50 @@ fn is_process_alive(pid: u32) -> bool {
     sys.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
+fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    {
+        let metadata = std::fs::metadata(path)?;
+        let mut perms = metadata.permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
+    if std::path::Path::new(path).exists() {
+        let key_bytes = fs::read(path).await?;
+        let _ = Ed25519KeyPair::from_pkcs8(&key_bytes)
+            .map_err(|_| format!("Invalid node identity key bytes at {}", path))?;
+        return Ok(key_bytes);
+    }
+
+    let rng = SystemRandom::new();
+    let key_pair_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|e| format!("Failed to generate node identity key pair: {}", e))?;
+    fs::write(path, key_pair_pkcs8.as_ref()).await?;
+    let _ = set_restrictive_file_permissions(path);
+    Ok(key_pair_pkcs8.as_ref().to_vec())
+}
+
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     fn is_valid_sha256_hex(v: &str) -> bool {
         v.len() == 64 && v.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn decode_hex_bytes(input: &str) -> Option<Vec<u8>> {
+        let clean = input.trim().trim_start_matches("0x");
+        if clean.is_empty() || clean.len() % 2 != 0 || !clean.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        hex::decode(clean).ok()
     }
 
     // Simple and safe: only bootstrap if the DB does not already contain blocks.
@@ -2312,54 +2364,166 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         manifest: BootstrapManifest,
     }
 
-    #[derive(serde::Deserialize, Clone)]
+    #[derive(serde::Deserialize, serde::Serialize, Clone)]
     struct BootstrapManifest {
         url: String,
         #[serde(default)]
+        height: Option<u64>,
+        #[serde(default)]
+        tip_hash: Option<String>,
+        #[serde(default)]
         sha256: Option<String>,
+        #[serde(default)]
+        publisher_pubkey: Option<String>,
+        #[serde(default)]
+        manifest_sig: Option<String>,
+        #[serde(default)]
+        updated_at: Option<u64>,
+    }
+
+    fn verify_manifest_signature(
+        manifest: &BootstrapManifest,
+        trusted_publishers: &std::collections::HashSet<String>,
+    ) -> bool {
+        let (publisher_pubkey, manifest_sig, updated_at, sha256) = match (
+            manifest.publisher_pubkey.as_deref(),
+            manifest.manifest_sig.as_deref(),
+            manifest.updated_at,
+            manifest.sha256.as_deref(),
+        ) {
+            (Some(pk), Some(sig), Some(updated_at), Some(sha256)) => (pk, sig, updated_at, sha256),
+            _ => return false,
+        };
+
+        let pubkey_lc = publisher_pubkey.trim().to_ascii_lowercase();
+        if !trusted_publishers.is_empty() && !trusted_publishers.contains(&pubkey_lc) {
+            return false;
+        }
+
+        let pubkey = match decode_hex_bytes(&pubkey_lc) {
+            Some(v) if v.len() == 32 => v,
+            _ => return false,
+        };
+        let sig = match decode_hex_bytes(manifest_sig) {
+            Some(v) if v.len() == 64 => v,
+            _ => return false,
+        };
+
+        let mut signed_fields = serde_json::Map::new();
+        signed_fields.insert("url".to_string(), serde_json::json!(manifest.url.clone()));
+        if let Some(height) = manifest.height {
+            signed_fields.insert("height".to_string(), serde_json::json!(height));
+        }
+        if let Some(tip_hash) = manifest.tip_hash.as_ref() {
+            signed_fields.insert("tip_hash".to_string(), serde_json::json!(tip_hash));
+        }
+        signed_fields.insert("sha256".to_string(), serde_json::json!(sha256));
+        signed_fields.insert("updated_at".to_string(), serde_json::json!(updated_at));
+        let msg = match serde_json::to_vec(&signed_fields) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let verifying_key = match <[u8; 32]>::try_from(pubkey.as_slice())
+            .ok()
+            .and_then(|arr| VerifyingKey::from_bytes(&arr).ok())
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        let signature = match <[u8; 64]>::try_from(sig.as_slice())
+            .ok()
+            .map(Signature::from_bytes)
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        verifying_key.verify(&msg, &signature).is_ok()
+    }
+
+    let trusted_publishers: std::collections::HashSet<String> = std::env::var("TRUSTED_BOOTSTRAP_PUBLISHER_KEYS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let require_trusted_publishers = std::env::var("REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let allow_unsigned_fallback = std::env::var("ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    if require_trusted_publishers && trusted_publishers.is_empty() {
+        return Err("TRUSTED_BOOTSTRAP_PUBLISHER_KEYS is required but empty".into());
     }
 
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
         Ok(r) if r.status().is_success() => {
             let body = r.bytes().await?;
             match serde_json::from_slice::<ManifestResponse>(&body) {
-                Ok(parsed) if parsed.ok && !parsed.manifest.url.trim().is_empty() => (
-                    parsed.manifest.url.clone(),
-                    parsed
+                Ok(parsed) if parsed.ok && !parsed.manifest.url.trim().is_empty() => {
+                    let parsed_sha256 = parsed
                         .manifest
                         .sha256
                         .clone()
                         .map(|v| v.trim().to_ascii_lowercase())
-                        .filter(|v| is_valid_sha256_hex(v)),
-                ),
+                        .filter(|v| is_valid_sha256_hex(v));
+                    let manifest_verified = parsed_sha256.is_some()
+                        && verify_manifest_signature(&parsed.manifest, &trusted_publishers);
+
+                    if manifest_verified {
+                        (parsed.manifest.url.clone(), parsed_sha256)
+                    } else if allow_unsigned_fallback {
+                        warn!("Bootstrap manifest signature missing/invalid; falling back to canonical bootstrap URL");
+                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                    } else {
+                        return Err("Bootstrap manifest signature verification failed; set ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=true to allow legacy fallback".into());
+                    }
+                }
                 Ok(_) => {
-                    warn!(
-                        "Bootstrap manifest is invalid; falling back to canonical bootstrap URL"
-                    );
-                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                    if allow_unsigned_fallback {
+                        warn!("Bootstrap manifest is invalid; falling back to canonical bootstrap URL");
+                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                    } else {
+                        return Err("Bootstrap manifest is invalid and unsigned fallback is disabled".into());
+                    }
                 }
                 Err(e) => {
-                    warn!(
-                        "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
-                        e
-                    );
-                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                    if allow_unsigned_fallback {
+                        warn!(
+                            "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
+                            e
+                        );
+                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+                    } else {
+                        return Err(format!("Bootstrap manifest payload parse failed: {}", e).into());
+                    }
                 }
             }
         }
         Ok(r) => {
-            warn!(
-                "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
-                r.status()
-            );
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            if allow_unsigned_fallback {
+                warn!(
+                    "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
+                    r.status()
+                );
+                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            } else {
+                return Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into());
+            }
         }
         Err(e) => {
-            warn!(
-                "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
-                e
-            );
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            if allow_unsigned_fallback {
+                warn!(
+                    "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
+                    e
+                );
+                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            } else {
+                return Err(format!("Bootstrap manifest request failed: {}", e).into());
+            }
         }
     };
 
