@@ -2456,7 +2456,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         .unwrap_or(false);
     let allow_unsigned_fallback = std::env::var("ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK")
         .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     if require_trusted_publishers && trusted_publishers.is_empty() {
         return Err("TRUSTED_BOOTSTRAP_PUBLISHER_KEYS is required but empty".into());
