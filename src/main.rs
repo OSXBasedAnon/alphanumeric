@@ -2343,14 +2343,6 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         v.len() == 64 && v.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
     }
 
-    fn decode_hex_bytes(input: &str) -> Option<Vec<u8>> {
-        let clean = input.trim().trim_start_matches("0x");
-        if clean.is_empty() || clean.len() % 2 != 0 || !clean.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        hex::decode(clean).ok()
-    }
-
     // Simple and safe: only bootstrap if the DB does not already contain blocks.
     if has_local_block_data(db_path) {
         return Ok(());
@@ -2376,90 +2368,6 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         tip_hash: Option<String>,
         #[serde(default)]
         sha256: Option<String>,
-        #[serde(default)]
-        publisher_pubkey: Option<String>,
-        #[serde(default)]
-        manifest_sig: Option<String>,
-        #[serde(default)]
-        updated_at: Option<u64>,
-    }
-
-    fn verify_manifest_signature(
-        manifest: &BootstrapManifest,
-        trusted_publishers: &std::collections::HashSet<String>,
-    ) -> bool {
-        let (publisher_pubkey, manifest_sig, updated_at, sha256) = match (
-            manifest.publisher_pubkey.as_deref(),
-            manifest.manifest_sig.as_deref(),
-            manifest.updated_at,
-            manifest.sha256.as_deref(),
-        ) {
-            (Some(pk), Some(sig), Some(updated_at), Some(sha256)) => (pk, sig, updated_at, sha256),
-            _ => return false,
-        };
-
-        let pubkey_lc = publisher_pubkey.trim().to_ascii_lowercase();
-        if !trusted_publishers.is_empty() && !trusted_publishers.contains(&pubkey_lc) {
-            return false;
-        }
-
-        let pubkey = match decode_hex_bytes(&pubkey_lc) {
-            Some(v) if v.len() == 32 => v,
-            _ => return false,
-        };
-        let sig = match decode_hex_bytes(manifest_sig) {
-            Some(v) if v.len() == 64 => v,
-            _ => return false,
-        };
-
-        let mut signed_fields = serde_json::Map::new();
-        signed_fields.insert("url".to_string(), serde_json::json!(manifest.url.clone()));
-        if let Some(height) = manifest.height {
-            signed_fields.insert("height".to_string(), serde_json::json!(height));
-        }
-        if let Some(tip_hash) = manifest.tip_hash.as_ref() {
-            signed_fields.insert("tip_hash".to_string(), serde_json::json!(tip_hash));
-        }
-        signed_fields.insert("sha256".to_string(), serde_json::json!(sha256));
-        signed_fields.insert("updated_at".to_string(), serde_json::json!(updated_at));
-        let msg = match serde_json::to_vec(&signed_fields) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let verifying_key = match <[u8; 32]>::try_from(pubkey.as_slice())
-            .ok()
-            .and_then(|arr| VerifyingKey::from_bytes(&arr).ok())
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        let signature = match <[u8; 64]>::try_from(sig.as_slice())
-            .ok()
-            .map(|bytes| Signature::from_bytes(&bytes))
-        {
-            Some(v) => v,
-            None => return false,
-        };
-        verifying_key.verify(&msg, &signature).is_ok()
-    }
-
-    let trusted_publishers: std::collections::HashSet<String> = std::env::var("TRUSTED_BOOTSTRAP_PUBLISHER_KEYS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .collect();
-    let require_trusted_publishers = std::env::var("REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let allow_unsigned_fallback = std::env::var("ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if require_trusted_publishers && trusted_publishers.is_empty() {
-        return Err("TRUSTED_BOOTSTRAP_PUBLISHER_KEYS is required but empty".into());
     }
 
     let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
@@ -2473,60 +2381,34 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                         .clone()
                         .map(|v| v.trim().to_ascii_lowercase())
                         .filter(|v| is_valid_sha256_hex(v));
-                    let manifest_verified = parsed_sha256.is_some()
-                        && verify_manifest_signature(&parsed.manifest, &trusted_publishers);
-
-                    if manifest_verified {
-                        (parsed.manifest.url.clone(), parsed_sha256)
-                    } else if allow_unsigned_fallback {
-                        warn!("Bootstrap manifest signature missing/invalid; falling back to canonical bootstrap URL");
-                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                    } else {
-                        return Err("Bootstrap manifest signature verification failed; set ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=true to allow legacy fallback".into());
-                    }
+                    (parsed.manifest.url.clone(), parsed_sha256)
                 }
                 Ok(_) => {
-                    if allow_unsigned_fallback {
-                        warn!("Bootstrap manifest is invalid; falling back to canonical bootstrap URL");
-                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                    } else {
-                        return Err("Bootstrap manifest is invalid and unsigned fallback is disabled".into());
-                    }
+                    warn!("Bootstrap manifest is invalid; falling back to canonical bootstrap URL");
+                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
                 }
                 Err(e) => {
-                    if allow_unsigned_fallback {
-                        warn!(
-                            "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
-                            e
-                        );
-                        (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                    } else {
-                        return Err(format!("Bootstrap manifest payload parse failed: {}", e).into());
-                    }
+                    warn!(
+                        "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
+                        e
+                    );
+                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
                 }
             }
         }
         Ok(r) => {
-            if allow_unsigned_fallback {
-                warn!(
-                    "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
-                    r.status()
-                );
-                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-            } else {
-                return Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into());
-            }
+            warn!(
+                "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
+                r.status()
+            );
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
         }
         Err(e) => {
-            if allow_unsigned_fallback {
-                warn!(
-                    "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
-                    e
-                );
-                (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-            } else {
-                return Err(format!("Bootstrap manifest request failed: {}", e).into());
-            }
+            warn!(
+                "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
+                e
+            );
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
         }
     };
 

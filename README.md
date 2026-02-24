@@ -161,13 +161,8 @@ Startup bootstrap source (default):
 
 Bootstrap trust mode:
 
-- Nodes prefer signed manifest bootstrap from `https://alphanumeric.blue/api/bootstrap/manifest`.
-- Current default allows legacy unsigned fallback:
-  - `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=true` (when unset)
-- Recommended strict production mode:
-  - `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK=false`
-  - `REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS=true`
-  - `TRUSTED_BOOTSTRAP_PUBLISHER_KEYS=<comma-separated ed25519 pubkeys>`
+- Nodes prefer manifest bootstrap from `https://alphanumeric.blue/api/bootstrap/manifest`.
+- If manifest retrieval/parsing fails, nodes fall back to the canonical static URL.
 
 If `blockchain.db` already exists locally, that state is used.
 
@@ -183,9 +178,6 @@ Common variables used by the runtime include:
 
 - `ALPHANUMERIC_BIND_IP`
 - `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command for the canonical publisher node)
-- `ALPHANUMERIC_ALLOW_UNSIGNED_BOOTSTRAP_FALLBACK` (default `true`; set `false` for signed-only bootstrap)
-- `REQUIRE_TRUSTED_BOOTSTRAP_PUBLISHER_KEYS` (default `false`)
-- `TRUSTED_BOOTSTRAP_PUBLISHER_KEYS` (comma-separated trusted Ed25519 publisher keys)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND`
