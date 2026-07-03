@@ -4395,11 +4395,16 @@ impl Node {
 
             NetworkEvent::ChainResponse { blocks, sender } => {
                 for block in blocks {
-                    if self.verify_block_with_witness(&block, Some(sender)).await? {
-                        let blockchain = self.blockchain.read().await;
-                        if let Err(e) = blockchain.save_block(&block).await {
-                            warn!("Failed to save valid block {}: {}", block.index, e);
-                        }
+                    if block.calculate_hash_for_block() != block.hash || !block.verify_pow() {
+                        continue;
+                    }
+
+                    let blockchain = self.blockchain.read().await;
+                    if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
+                        warn!(
+                            "Failed to save receipt-verified block {} from {}: {}",
+                            block.index, sender, e
+                        );
                     }
                 }
             }
@@ -5561,47 +5566,24 @@ impl Node {
 
                     match self.request_blocks(*peer_addr, start, end).await {
                         Ok(blocks) => {
-                            // IMPROVEMENT: Process blocks in parallel
-                            let verification_tasks: Vec<_> = blocks
-                                .iter()
-                                .map(|block| {
-                                    let node = self.clone();
-                                    let block = block.clone();
-                                    let peer_addr = *peer_addr;
-                                    async move {
-                                        match node
-                                            .verify_block_with_witness(&block, Some(peer_addr))
-                                            .await
-                                        {
-                                            Ok(true) => Some(block),
-                                            Ok(false) => None,
-                                            Err(e) => {
-                                                debug!(
-                                                    "Block verification error at height {} from {}: {}",
-                                                    block.index, peer_addr, e
-                                                );
-                                                None
-                                            }
-                                        }
-                                    }
+                            let mut candidate_blocks: Vec<_> = blocks
+                                .into_iter()
+                                .filter(|block| {
+                                    block.calculate_hash_for_block() == block.hash
+                                        && block.verify_pow()
                                 })
                                 .collect();
+                            candidate_blocks.sort_by_key(|block| block.index);
 
-                            let verified_blocks: Vec<_> =
-                                futures::future::join_all(verification_tasks)
-                                    .await
-                                    .into_iter()
-                                    .filter_map(|result| result)
-                                    .collect();
-
-                            // Save verified blocks
-                            let actual_count = verified_blocks.len();
+                            let actual_count = candidate_blocks.len();
                             if actual_count > 0 {
                                 let blockchain = self.blockchain.read().await;
                                 let mut saved_count = 0;
 
-                                for block in verified_blocks {
-                                    if let Err(e) = blockchain.save_block(&block).await {
+                                for block in candidate_blocks {
+                                    if let Err(e) =
+                                        blockchain.save_receipt_verified_block(&block).await
+                                    {
                                         warn!("Failed to save block {}: {}", block.index, e);
                                     } else {
                                         saved_count += 1;

@@ -108,6 +108,12 @@ flowchart LR
 
 The codebase includes multiple consensus/validation-related components (PoW/mining path, sentinel/validator logic, and propagation optimizations). Behavior is defined by the current code paths in `src/a9/*`.
 
+Transaction witnesses use a compact-finality model:
+
+- live mempool and new block admission require the full Dilithium signature and sender public key
+- confirmed block storage keeps a compact signature receipt plus `sig_hash = SHA256(full_signature)`
+- historical P2P sync validates block hash, merkle root, PoW, balances, reward rules, public-key/address binding, and receipt commitments without requiring archived full witnesses
+
 If you are integrating against this repository, pin a commit hash and validate behavior at that exact revision.
 
 ## Tokenomics

@@ -1653,7 +1653,6 @@ async fn handle_chain_sync(
     // IMPROVEMENT: Processing task with batching for efficiency
     let process_handle = {
         let blockchain = Arc::clone(&node.blockchain);
-        let verifier_node = node.clone();
         let processed_height = Arc::clone(&processed_height);
         let main_pb = main_pb.clone();
         let failed_batches = Arc::clone(&failed_batches);
@@ -1681,22 +1680,13 @@ async fn handle_chain_sync(
                     block_buffer.sort_by_key(|(_, b)| b.index);
 
                     let mut saved_count = 0;
-                    for (peer, block) in block_buffer.drain(..) {
+                    for (_peer, block) in block_buffer.drain(..) {
                         // Skip blocks we already have
                         if block.index <= last_save_height {
                             continue;
                         }
 
-                        match verifier_node
-                            .verify_block_with_witness(&block, Some(peer))
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(_) => continue,
-                        }
-
-                        if let Err(e) = blockchain.save_block(&block).await {
+                        if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
                             // Log error but continue with next blocks
                             println!("Error saving block {}: {}", block.index, e);
 
@@ -1738,21 +1728,12 @@ async fn handle_chain_sync(
                 // Sort blocks by index before final processing
                 block_buffer.sort_by_key(|(_, b)| b.index);
 
-                for (peer, block) in block_buffer.drain(..) {
+                for (_peer, block) in block_buffer.drain(..) {
                     if block.index <= last_save_height {
                         continue;
                     }
 
-                    match verifier_node
-                        .verify_block_with_witness(&block, Some(peer))
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(_) => continue,
-                    }
-
-                    if let Err(e) = blockchain.save_block(&block).await {
+                    if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
                         println!("Error saving final block {}: {}", block.index, e);
                         continue;
                     }

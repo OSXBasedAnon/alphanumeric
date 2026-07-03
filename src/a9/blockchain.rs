@@ -9,6 +9,7 @@ use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use parking_lot::Mutex as PLMutex;
+use pqcrypto_traits::sign::PublicKey as PqPublicKeyTrait;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
@@ -100,6 +101,7 @@ pub fn finalize_stage_name(stage: usize) -> &'static str {
 #[derive(Eq, PartialEq)]
 pub enum TransactionContext {
     BlockValidation,
+    ReceiptValidation,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1047,9 +1049,10 @@ impl Blockchain {
         self.get_orphan_block_by_hash(&block.previous_hash)
     }
 
-    async fn prevalidate_unattached_block_strict(
+    async fn prevalidate_unattached_block(
         &self,
         block: &Block,
+        sig_mode: SignatureValidationMode,
     ) -> Result<(), BlockchainError> {
         // Basic header checks include hash self-consistency + PoW proof.
         block.validate_header()?;
@@ -1078,13 +1081,25 @@ impl Blockchain {
                 .ok_or(BlockchainError::InvalidTransactionSignature)?;
             let sig_bytes =
                 hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
-            if sig_bytes.len() <= 64 {
+            if sig_mode == SignatureValidationMode::RequireFull && sig_bytes.len() <= 64 {
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
-            self.verify_transaction_signature(tx)?;
+            if sig_bytes.len() > 64 {
+                self.verify_transaction_signature(tx)?;
+            } else {
+                Self::verify_transaction_receipt_fields(tx)?;
+            }
         }
 
         Ok(())
+    }
+
+    async fn prevalidate_unattached_block_strict(
+        &self,
+        block: &Block,
+    ) -> Result<(), BlockchainError> {
+        self.prevalidate_unattached_block(block, SignatureValidationMode::RequireFull)
+            .await
     }
 
     async fn get_pending_debit_for(&self, address: &str) -> Result<f64, BlockchainError> {
@@ -1512,9 +1527,13 @@ impl Blockchain {
         Ok(())
     }
 
-    async fn persist_validated_block(&self, block: &Block) -> Result<(), BlockchainError> {
+    async fn persist_validated_block_with_mode(
+        &self,
+        block: &Block,
+        sig_mode: SignatureValidationMode,
+    ) -> Result<(), BlockchainError> {
         // Canonical validation gate for all persistence paths.
-        self.validate_block_strict(block).await?;
+        self.validate_block_internal(block, sig_mode).await?;
 
         // Run expensive full-chain integrity checks periodically.
         let now = SystemTime::now()
@@ -1585,11 +1604,12 @@ impl Blockchain {
         }
 
         // Process transactions with BlockValidation context
-        self.process_transactions_batch(
-            block.transactions.clone(),
-            TransactionContext::BlockValidation,
-        )
-        .await?;
+        let tx_context = match sig_mode {
+            SignatureValidationMode::RequireFull => TransactionContext::BlockValidation,
+            SignatureValidationMode::AllowTruncatedStored => TransactionContext::ReceiptValidation,
+        };
+        self.process_transactions_batch(block.transactions.clone(), tx_context)
+            .await?;
 
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
@@ -1618,6 +1638,11 @@ impl Blockchain {
             .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
 
         Ok(())
+    }
+
+    async fn persist_validated_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        self.persist_validated_block_with_mode(block, SignatureValidationMode::RequireFull)
+            .await
     }
 
     async fn promote_orphans_from_tip(&self) -> Result<usize, BlockchainError> {
@@ -1953,6 +1978,45 @@ impl Blockchain {
         self.persist_validated_block(block).await?;
         let _ = self.promote_orphans_from_tip().await?;
         let _ = self.try_adopt_orphan_branch().await?;
+        Ok(())
+    }
+
+    pub async fn save_receipt_verified_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        // Historical sync peers serve compact stored blocks. Those blocks carry a
+        // signature receipt + full-signature hash, not the full Dilithium witness.
+        self.prevalidate_unattached_block(block, SignatureValidationMode::AllowTruncatedStored)
+            .await?;
+
+        match self.highest_block_index() {
+            None => {
+                if block.index != 0 || block.previous_hash != [0u8; 32] {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+            }
+            Some(tip_index) => {
+                if block.index <= tip_index {
+                    if let Ok(existing) = self.get_block(block.index) {
+                        if existing.hash == block.hash {
+                            return Ok(());
+                        }
+                    }
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+                if block.index != tip_index.saturating_add(1) {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+                let prev = self.get_block(tip_index)?;
+                if block.previous_hash != prev.hash {
+                    return Err(BlockchainError::InvalidBlockHeader);
+                }
+            }
+        }
+
+        self.persist_validated_block_with_mode(
+            block,
+            SignatureValidationMode::AllowTruncatedStored,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2387,6 +2451,48 @@ impl Blockchain {
         Ok(())
     }
 
+    fn verify_transaction_receipt_fields(tx: &Transaction) -> Result<(), BlockchainError> {
+        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            return Ok(());
+        }
+
+        let sig_hex = tx
+            .signature
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+        let sig_bytes =
+            hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        if sig_bytes.is_empty() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        let pub_key = tx
+            .pub_key
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+        let pub_key_bytes =
+            hex::decode(pub_key).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+        if pqcrypto_dilithium::dilithium5::PublicKey::from_bytes(&pub_key_bytes).is_err() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&pub_key_bytes);
+        let derived_addr = hex::encode(&hasher.finalize()[..20]);
+        if derived_addr != tx.sender {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        let sig_hash = tx
+            .sig_hash
+            .as_ref()
+            .ok_or(BlockchainError::InvalidTransactionSignature)?;
+        if sig_hash.len() != 64 || hex::decode(sig_hash).is_err() {
+            return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        Ok(())
+    }
+
     pub fn get_block_by_timestamp(&self, timestamp: u64) -> Result<Block, BlockchainError> {
         for result in self.db.scan_prefix(b"block_") {
             if let Ok((_, block_data)) = result {
@@ -2543,9 +2649,10 @@ impl Blockchain {
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
 
-            // Verify when the full signature is present.
             if sig_bytes.len() > 64 {
                 self.verify_transaction_signature(tx)?;
+            } else {
+                Self::verify_transaction_receipt_fields(tx)?;
             }
         }
 
@@ -3096,15 +3203,15 @@ impl Blockchain {
         for tx in &transactions {
             match tx.sender.as_str() {
                 "MINING_REWARDS" => {
-                    if context == TransactionContext::BlockValidation {
-                        *balance_changes.entry(tx.recipient.clone()).or_default() +=
-                            tx.amount_units;
-                    }
+                    *balance_changes.entry(tx.recipient.clone()).or_default() += tx.amount_units;
                 }
                 _ => {
                     if context == TransactionContext::BlockValidation {
-                        // BlockValidation must only operate on fully-verifiable transactions.
+                        // Live block validation must only operate on fully-verifiable transactions.
                         self.verify_transaction_signature(tx)?;
+                    } else {
+                        // Historical sync stores/receives receipt commitments after full live validation.
+                        Self::verify_transaction_receipt_fields(tx)?;
                     }
 
                     let total_debit = tx.total_debit_units();
@@ -3117,8 +3224,7 @@ impl Blockchain {
                     }
 
                     *balance_changes.entry(tx.sender.clone()).or_default() -= total_debit;
-                    *balance_changes.entry(tx.recipient.clone()).or_default() +=
-                        tx.amount_units;
+                    *balance_changes.entry(tx.recipient.clone()).or_default() += tx.amount_units;
                 }
             }
         }
@@ -3135,7 +3241,10 @@ impl Blockchain {
         balances_tree.apply_batch(batch)?;
 
         // Clear processed transactions from pending
-        if context == TransactionContext::BlockValidation {
+        if matches!(
+            context,
+            TransactionContext::BlockValidation | TransactionContext::ReceiptValidation
+        ) {
             for tx in &transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
@@ -3481,6 +3590,7 @@ impl ChainSentinel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pqcrypto_dilithium::dilithium5::keypair as dilithium_keypair;
     use serde_json::Value;
 
     #[test]
@@ -3550,5 +3660,46 @@ mod tests {
         assert_eq!(tx.signature, legacy.signature);
         assert_eq!(tx.fee_units, Transaction::to_units(legacy.fee));
         assert_eq!(tx.amount_units, Transaction::to_units(legacy.amount));
+    }
+
+    #[test]
+    fn receipt_validation_accepts_truncated_signature_commitment() {
+        let (public_key, _) = dilithium_keypair();
+        let public_key_bytes = PqPublicKeyTrait::as_bytes(&public_key);
+        let mut hasher = Sha256::new();
+        hasher.update(public_key_bytes);
+        let sender = hex::encode(&hasher.finalize()[..20]);
+
+        let tx = Transaction {
+            sender,
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(0.0005),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 1234,
+            signature: Some("aa".repeat(64)),
+            pub_key: Some(hex::encode(public_key_bytes)),
+            sig_hash: Some("bb".repeat(32)),
+        };
+
+        assert!(Blockchain::verify_transaction_receipt_fields(&tx).is_ok());
+    }
+
+    #[test]
+    fn receipt_validation_rejects_pubkey_sender_mismatch() {
+        let (public_key, _) = dilithium_keypair();
+        let public_key_bytes = PqPublicKeyTrait::as_bytes(&public_key);
+
+        let tx = Transaction {
+            sender: "not-derived-from-key".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(0.0005),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 1234,
+            signature: Some("aa".repeat(64)),
+            pub_key: Some(hex::encode(public_key_bytes)),
+            sig_hash: Some("bb".repeat(32)),
+        };
+
+        assert!(Blockchain::verify_transaction_receipt_fields(&tx).is_err());
     }
 }
