@@ -81,6 +81,8 @@ const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const ANNOUNCE_INTERVAL: u64 = 60; // seconds
 const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
+const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
+const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
 const DEFAULT_DISCOVERY_BASE: &str = "https://alphanumeric.blue";
 // DNS seeds are optional fallback only. Primary discovery should come from alphanumeric.blue.
 const DEFAULT_DNS_SEEDS: &[&str] = &[
@@ -761,6 +763,7 @@ pub struct Node {
     outbound_circuit_breakers: Arc<RwLock<HashMap<SocketAddr, OutboundCircuitState>>>,
     pub rate_limiter: Arc<RateLimiter>,
     http_client: Client,
+    discovery_state: Arc<Mutex<DiscoveryState>>,
     p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
     peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
@@ -852,6 +855,24 @@ struct DiscoveryResponse {
 struct DiscoveryPeer {
     ip: String,
     port: u16,
+    node_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DiscoveryState {
+    in_progress: bool,
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl DiscoveryState {
+    fn new() -> Self {
+        Self {
+            in_progress: false,
+            failures: 0,
+            next_attempt: Instant::now(),
+        }
+    }
 }
 
 impl Node {
@@ -882,6 +903,8 @@ impl Node {
             .as_secs();
         let http_client = Client::builder()
             .timeout(Duration::from_millis(DISCOVERY_HTTP_TIMEOUT_MS))
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| NodeError::Network(format!("HTTP client error: {}", e)))?;
         let peer_cache_path = std::env::var("ALPHANUMERIC_PEER_CACHE_PATH").unwrap_or_else(|_| {
@@ -973,6 +996,7 @@ impl Node {
             listener,
             p2p_swarm: Arc::new(Mutex::new(None)),
             http_client,
+            discovery_state: Arc::new(Mutex::new(DiscoveryState::new())),
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             temporal_verification,
@@ -1295,8 +1319,16 @@ impl Node {
 
             any_ok = true;
             for peer in body.peers {
+                if peer.node_id.as_deref() == Some(self.node_id.as_str()) {
+                    continue;
+                }
+
                 if let Ok(ip) = peer.ip.parse::<IpAddr>() {
-                    all_addrs.push(SocketAddr::new(ip, peer.port));
+                    let addr = SocketAddr::new(ip, peer.port);
+                    if addr == self.bind_addr {
+                        continue;
+                    }
+                    all_addrs.push(addr);
                     if all_addrs.len() >= peer_limit {
                         break;
                     }
@@ -1316,7 +1348,6 @@ impl Node {
 
     async fn connect_discovery_peers(&self, limit: usize) -> Result<(), NodeError> {
         let mut addrs = self.fetch_discovery_peers().await?;
-        addrs.retain(|addr| *addr != self.bind_addr);
         addrs.shuffle(&mut thread_rng());
 
         let mut connected = 0usize;
@@ -1763,9 +1794,59 @@ impl Node {
     }
 
     pub async fn discover_network_nodes(&self) -> Result<(), NodeError> {
-        info!("Starting network discovery");
+        let before_count = self.peers.read().await.len();
 
-        self.discover_network_nodes_with_retry(0).await
+        {
+            let mut state = self.discovery_state.lock().await;
+            let now = Instant::now();
+
+            if state.in_progress {
+                debug!("Discovery skipped: another discovery cycle is already running");
+                return Ok(());
+            }
+
+            if before_count < MIN_PEERS && now < state.next_attempt {
+                debug!(
+                    "Discovery skipped: backoff active for {:?}",
+                    state.next_attempt.saturating_duration_since(now)
+                );
+                return Ok(());
+            }
+
+            state.in_progress = true;
+        }
+
+        info!("Starting network discovery");
+        let result = self.discover_network_nodes_with_retry(0).await;
+        let after_count = self.peers.read().await.len();
+        let improved = after_count > before_count || after_count >= MIN_PEERS;
+
+        {
+            let mut state = self.discovery_state.lock().await;
+            state.in_progress = false;
+
+            if after_count >= MIN_PEERS || (result.is_ok() && improved) {
+                state.failures = 0;
+                state.next_attempt = Instant::now();
+            } else if after_count < MIN_PEERS {
+                state.failures = state.failures.saturating_add(1);
+                let backoff_secs = Self::discovery_backoff_secs(state.failures);
+                state.next_attempt = Instant::now() + Duration::from_secs(backoff_secs);
+                debug!(
+                    "Discovery backoff set to {}s after {} low-peer cycle(s)",
+                    backoff_secs, state.failures
+                );
+            }
+        }
+
+        result
+    }
+
+    fn discovery_backoff_secs(failures: u32) -> u64 {
+        let exponent = failures.saturating_sub(1).min(4);
+        DISCOVERY_BACKOFF_BASE_SECS
+            .saturating_mul(1_u64 << exponent)
+            .min(DISCOVERY_BACKOFF_MAX_SECS)
     }
 
     // Separate implementation for recursive calls with retry counter
@@ -2764,12 +2845,6 @@ impl Node {
                     warn!("Peer maintenance error: {}", e);
                 }
                 node_clone.cleanup_outbound_connections().await;
-
-                if node_clone.peers.read().await.len() < MIN_PEERS {
-                    if let Err(e) = node_clone.discover_network_nodes().await {
-                        warn!("Peer discovery error: {}", e);
-                    }
-                }
             }
         });
 
