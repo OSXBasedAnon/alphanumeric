@@ -118,6 +118,7 @@ dependencies = [
  "libp2p",
  "log",
  "lru 0.8.1",
+ "nix 0.30.1",
  "num-bigint",
  "num-traits",
  "num_cpus",

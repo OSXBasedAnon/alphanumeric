@@ -154,6 +154,12 @@ impl Wallet {
         let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
         hex::decode(&wallet_address).map_err(|_| "Invalid wallet address".to_string())?;
+        let mut hasher = Sha256::new();
+        hasher.update(public_bytes);
+        let derived_address = hex::encode(&hasher.finalize()[..20]);
+        if derived_address != wallet_address {
+            return Err("Wallet address does not match public key".to_string());
+        }
 
         let keys = WalletKeys {
             dilithium_secret_key_bytes: secret_bytes.to_vec(),

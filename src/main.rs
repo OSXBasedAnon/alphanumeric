@@ -6,7 +6,7 @@ use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
     // Load configuration from environment variables
     let config = AppConfig::from_env();
     config.log_config();
+    let headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
 
     let pb = ProgressBar::new(9);
     pb.set_style(
@@ -104,11 +105,10 @@ async fn main() -> Result<()> {
     );
 
     // Resolve relative DB paths robustly:
-    // - Prefer the current working directory if it already contains block data (dev runs).
-    // - Otherwise, prefer the executable directory (release bundle portability).
+    // - Prefer any path that already contains block data.
+    // - Otherwise, create new relative databases under the current working directory.
     //
-    // This prevents accidentally creating a second DB under `target\\debug` and incorrectly
-    // triggering bootstrap even when a DB exists in the repo/root folder.
+    // This keeps dev/source runs from silently creating a second DB under `target/release`.
     let db_path = {
         let raw = config.database.path.clone();
         let p = Path::new(&raw);
@@ -131,22 +131,19 @@ async fn main() -> Result<()> {
                 cwd_str
             } else if has_local_block_data(&exe_str) {
                 exe_str
-            } else if cwd_candidate.exists() {
-                cwd_str
             } else {
-                exe_str
+                cwd_str
             }
         }
     };
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         // Database init
+        let _startup_locks = acquire_startup_locks(&db_path)?;
         pb.set_message("Checking bootstrap snapshot...");
         // Fail closed: if there are no local blocks, bootstrap must succeed.
         ensure_bootstrap_db(&db_path).await?;
         pb.set_message("Initializing database...");
-        ensure_instance_lock()?;
-        ensure_db_lock(&db_path)?;
         let db = match sled::Config::new()
             .path(&db_path)
             .flush_every_ms(Some(1000))
@@ -194,13 +191,10 @@ async fn main() -> Result<()> {
         {
             let shutdown_flag = shutdown_requested.clone();
             let db_for_signal = db.clone();
-            let lock_path = format!("{}.lock", &db_path);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
                 shutdown_flag.store(true, Ordering::Release);
                 let _ = db_for_signal.flush();
-                let _ = remove_db_lock(&lock_path);
-                let _ = remove_instance_lock();
                 eprintln!("Shutting down cleanly...");
             });
         }
@@ -569,12 +563,16 @@ async fn main() -> Result<()> {
         pb.inc(1);
 
         pb.set_message("Loading wallets...");
-        let key_data = fs::read_to_string(KEY_FILE_PATH).await.unwrap_or_else(|_| "[]".to_string());
-        let wallet_data: Vec<WalletKeyData> = serde_json::from_str(&key_data).unwrap_or_else(|_| Vec::new());
+        let key_data_result = fs::read_to_string(KEY_FILE_PATH).await;
+        let wallet_data: Vec<WalletKeyData> = key_data_result
+            .as_deref()
+            .ok()
+            .and_then(|data| serde_json::from_str(data).ok())
+            .unwrap_or_default();
 
         let mut wallet_encryption_state: Option<Vec<u8>> = None;
 
-        if !wallet_data.is_empty() {
+        if !headless && !wallet_data.is_empty() {
             println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
 
             let passphrase = Password::new("Passphrase:")
@@ -587,7 +585,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        let mut wallets = if wallet_encryption_state.is_some() {
+        let mut wallets = if headless && key_data_result.is_err() {
+            println!("Headless mode: no private.key found; continuing without a local wallet.");
+            HashMap::new()
+        } else if wallet_encryption_state.is_some() {
             mgmt.load_wallets(&db_arc, wallet_encryption_state.as_deref()).await?
         } else {
             mgmt.load_wallets(&db_arc, None).await?
@@ -643,6 +644,14 @@ async fn main() -> Result<()> {
             if let Err(e) = sentinel.initialize().await {
                 error!("Failed to initialize staking sentinel: {}", e);
             }
+        }
+
+        if headless {
+            println!("Headless mode enabled. Node services are running.");
+            while !shutdown_requested.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            return Ok(());
         }
 
         println!("1. Create Transaction (format: create sender recipient amount)");
@@ -1076,7 +1085,7 @@ writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
             },
             4 => {
                 let amount = match parts[2].parse::<f64>() {
-                    Ok(a) if a >= crate::a9::whisper::WHISPER_MIN_AMOUNT => a,
+                    Ok(a) if a.is_finite() && a >= crate::a9::whisper::WHISPER_MIN_AMOUNT => a,
                     _ => {
                         let mut error_style = ColorSpec::new();
                         error_style.set_fg(Some(Color::Red)).set_bold(true);
@@ -2238,6 +2247,28 @@ fn ensure_db_lock(path: &str) -> std::io::Result<()> {
     ensure_pid_lock(&lock_path, "ALPHANUMERIC_IGNORE_DB_LOCK")
 }
 
+struct StartupLockGuard {
+    db_lock_path: String,
+}
+
+impl Drop for StartupLockGuard {
+    fn drop(&mut self) {
+        let _ = remove_db_lock(&self.db_lock_path);
+        let _ = remove_instance_lock();
+    }
+}
+
+fn acquire_startup_locks(db_path: &str) -> std::io::Result<StartupLockGuard> {
+    ensure_instance_lock()?;
+    if let Err(err) = ensure_db_lock(db_path) {
+        let _ = remove_instance_lock();
+        return Err(err);
+    }
+    Ok(StartupLockGuard {
+        db_lock_path: format!("{}.lock", db_path),
+    })
+}
+
 fn ensure_instance_lock() -> std::io::Result<()> {
     ensure_pid_lock(INSTANCE_LOCK_PATH, "ALPHANUMERIC_IGNORE_INSTANCE_LOCK")
 }
@@ -2337,6 +2368,7 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
         let key_bytes = fs::read(path).await?;
         let _ = Ed25519KeyPair::from_pkcs8(&key_bytes)
             .map_err(|_| format!("Invalid node identity key bytes at {}", path))?;
+        let _ = set_restrictive_file_permissions(path);
         return Ok(key_bytes);
     }
 
@@ -2431,6 +2463,10 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         }
     };
 
+    if !download_url.starts_with("https://") {
+        return Err("Bootstrap manifest URL must use https".into());
+    }
+
     let res = reqwest::get(&download_url).await?;
 
     if !res.status().is_success() {
@@ -2459,11 +2495,16 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let zip_path = format!("{}.zip", db_path);
     fs::write(&zip_path, &bytes).await?;
 
-    if std::path::Path::new(db_path).exists() {
-        let _ = std::fs::remove_dir_all(db_path);
+    let bootstrap_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let temp_extract_path = format!("{}.bootstrap_tmp_{}", db_path, bootstrap_ts);
+    if std::path::Path::new(&temp_extract_path).exists() {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
     }
 
-    let extract_path = db_path.to_string();
+    let extract_path = temp_extract_path.clone();
     let zip_path_clone = zip_path.clone();
     let extract_result = tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
         let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
@@ -2514,7 +2555,38 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     .map_err(|e| e.to_string())?;
 
     if let Err(e) = extract_result {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        let _ = fs::remove_file(&zip_path).await;
         return Err(Box::<dyn Error>::from(e));
+    }
+
+    let final_path = std::path::Path::new(db_path);
+    let backup_path = format!("{}.bootstrap_backup_{}", db_path, bootstrap_ts);
+    let replace_result = (|| -> std::io::Result<()> {
+        if std::path::Path::new(&backup_path).exists() {
+            let _ = std::fs::remove_dir_all(&backup_path);
+        }
+        if final_path.exists() {
+            std::fs::rename(final_path, &backup_path)?;
+        }
+        match std::fs::rename(&temp_extract_path, final_path) {
+            Ok(()) => {
+                if std::path::Path::new(&backup_path).exists() {
+                    let _ = std::fs::remove_dir_all(&backup_path);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if std::path::Path::new(&backup_path).exists() {
+                    let _ = std::fs::rename(&backup_path, final_path);
+                }
+                Err(err)
+            }
+        }
+    })();
+    if let Err(e) = replace_result {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        return Err(Box::new(e));
     }
     Ok(())
 }
@@ -2625,7 +2697,7 @@ async fn bootstrap_publish_loop(
 #[cfg(feature = "bootstrap_publisher")]
 async fn publish_bootstrap_snapshot(
     db: &sled::Db,
-    db_path: &str,
+    _db_path: &str,
     height: u64,
     tip_hash_hex: &str,
     publish_url: &str,

@@ -3233,10 +3233,8 @@ impl Blockchain {
     pub async fn get_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let confirmed = self.get_confirmed_balance(address).await?;
         let pending_debit = self.get_pending_debit_for(address).await?;
-        let pending_credit = self.get_pending_credit_for(address).await?;
-        let net_units = Transaction::to_units(confirmed)
-            .saturating_sub(Transaction::to_units(pending_debit))
-            .saturating_add(Transaction::to_units(pending_credit));
+        let net_units =
+            Transaction::to_units(confirmed).saturating_sub(Transaction::to_units(pending_debit));
         Ok(Transaction::from_units(net_units))
     }
 

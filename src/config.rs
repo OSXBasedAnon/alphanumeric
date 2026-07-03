@@ -212,7 +212,7 @@ impl AppConfig {
             format!(" mining={}", self.mining.enabled)
         };
 
-        print!(
+        println!(
             "Alphanumeric port={} bind={} peers={} conns={} velocity={} seeds={} db={}{}",
             self.network.port,
             self.network.bind_ip,
@@ -223,7 +223,5 @@ impl AppConfig {
             self.database.path,
             mining_info
         );
-        use std::io::{self, Write};
-        let _ = io::stdout().flush();
     }
 }

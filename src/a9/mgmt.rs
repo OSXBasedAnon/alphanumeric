@@ -715,13 +715,20 @@ impl Mgmt {
             return Err("Self-transfer not allowed".into());
         }
 
-        let amount: f64 = match parts[3].parse() {
-            Ok(amount) => amount,
+        let amount: f64 = match parts[3].parse::<f64>() {
+            Ok(amount) if amount.is_finite() && amount > 0.0 => amount,
             Err(_) => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
                 write!(stdout, "error")?;
                 stdout.reset()?;
                 writeln!(stdout, ": invalid amount format")?;
+                return Err("Invalid amount".into());
+            }
+            _ => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": amount must be a positive finite number")?;
                 return Err("Invalid amount".into());
             }
         };

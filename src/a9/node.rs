@@ -51,14 +51,11 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
     time::{interval, sleep, timeout},
 };
-
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, RateLimiter, Transaction, SYSTEM_ADDRESSES,
@@ -85,8 +82,12 @@ const ANNOUNCE_INTERVAL: u64 = 60; // seconds
 const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DEFAULT_DISCOVERY_BASE: &str = "https://alphanumeric.blue";
-// DNS seeds are optional fallback only. Discovery should come from alphanumeric.blue.
-const DEFAULT_DNS_SEEDS: &[&str] = &[];
+// DNS seeds are optional fallback only. Primary discovery should come from alphanumeric.blue.
+const DEFAULT_DNS_SEEDS: &[&str] = &[
+    "seed.alphanumeric.network:7177",
+    "seed2.alphanumeric.network:7177",
+    "a9seed.mynode.network:7177",
+];
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
@@ -1172,7 +1173,9 @@ impl Node {
     }
 
     fn dns_seeds() -> Vec<String> {
-        let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS").ok();
+        let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS")
+            .or_else(|_| std::env::var("ALPHANUMERIC_SEED_NODES"))
+            .ok();
         if let Some(seeds) = override_seeds {
             let parsed: Vec<String> = seeds
                 .split(',')
@@ -1267,6 +1270,7 @@ impl Node {
     async fn fetch_discovery_peers(&self) -> Result<Vec<SocketAddr>, NodeError> {
         let mut all_addrs = Vec::new();
         let mut any_ok = false;
+        let peer_limit = self.max_peers.saturating_mul(4).max(32);
 
         for url in Self::discovery_peers_urls() {
             let res = self.http_client.get(url).send().await;
@@ -1293,7 +1297,13 @@ impl Node {
             for peer in body.peers {
                 if let Ok(ip) = peer.ip.parse::<IpAddr>() {
                     all_addrs.push(SocketAddr::new(ip, peer.port));
+                    if all_addrs.len() >= peer_limit {
+                        break;
+                    }
                 }
+            }
+            if all_addrs.len() >= peer_limit {
+                break;
             }
         }
 
@@ -1386,11 +1396,18 @@ impl Node {
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
             .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
+        let stats_bind_ip =
+            std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let stats_bind_public = stats_bind_ip
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_unspecified() || !ip.is_loopback())
+            .unwrap_or(false);
         let stats_port: Option<u16> = if stats_enabled {
             std::env::var("ALPHANUMERIC_STATS_PORT")
                 .ok()
                 .and_then(|p| p.parse::<u16>().ok())
                 .or(Some(8787))
+                .filter(|_| stats_bind_public)
         } else {
             None
         };
@@ -1664,7 +1681,7 @@ impl Node {
 
     async fn start_stats_server(&self) -> Result<(), NodeError> {
         let bind_ip =
-            std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
+            std::env::var("ALPHANUMERIC_STATS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port: u16 = std::env::var("ALPHANUMERIC_STATS_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
@@ -3594,19 +3611,47 @@ impl Node {
         addr: SocketAddr,
     ) -> Result<Arc<Mutex<OutboundConnection>>, NodeError> {
         if let Some(existing) = self.outbound_connections.read().await.get(&addr).cloned() {
-            return Ok(existing);
+            if self.peer_secrets.read().await.contains_key(&addr) {
+                return Ok(existing);
+            }
+            self.outbound_connections.write().await.remove(&addr);
         }
 
-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
             .await
             .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
         stream.set_nodelay(true)?;
 
+        let (peer_info, shared_secret) =
+            tokio::time::timeout(Duration::from_secs(5), self.perform_handshake(&mut stream, true))
+                .await
+                .map_err(|_| NodeError::Network(format!("Handshake timeout with {}", addr)))??;
+
+        if peer_info.version != NETWORK_VERSION {
+            return Err(NodeError::Network(format!(
+                "Version mismatch with {}: {} (expected {})",
+                addr, peer_info.version, NETWORK_VERSION
+            )));
+        }
+
+        {
+            let mut peers = self.peers.write().await;
+            peers.insert(addr, peer_info);
+        }
+        self.peer_secrets.write().await.insert(addr, shared_secret);
+
+        Ok(self.insert_outbound_connection(addr, stream).await)
+    }
+
+    async fn insert_outbound_connection(
+        &self,
+        addr: SocketAddr,
+        stream: TcpStream,
+    ) -> Arc<Mutex<OutboundConnection>> {
         let connection = Arc::new(Mutex::new(OutboundConnection {
             stream,
             last_used: Instant::now(),
         }));
-
         let max_pool_size = (self
             .max_connections
             .saturating_mul(OUTBOUND_POOL_MAX_FACTOR))
@@ -3618,7 +3663,7 @@ impl Node {
         {
             let mut pool = self.outbound_connections.write().await;
             if let Some(existing) = pool.get(&addr).cloned() {
-                return Ok(existing);
+                return existing;
             }
             if pool.len() >= max_pool_size {
                 let eviction_key = pool.keys().copied().find(|peer| *peer != addr);
@@ -3629,7 +3674,7 @@ impl Node {
             pool.insert(addr, Arc::clone(&connection));
         }
 
-        Ok(connection)
+        connection
     }
 
     pub async fn send_message_with_response(
@@ -3645,22 +3690,6 @@ impl Node {
         let rate_key = format!("msg_to_{}", addr);
         if !self.rate_limiter.check_limit(&rate_key) {
             return Err(NodeError::Network("Rate limit exceeded".to_string()));
-        }
-
-        // Encrypt message if we have a shared secret
-        let shared_secret = self.peer_secrets.read().await.get(&addr).cloned();
-        let data = if let Some(ref secret) = shared_secret {
-            self.encrypt_message(message, &secret)?
-        } else {
-            bincode::serialize(message)?
-        };
-        if data.is_empty() {
-            return Err(NodeError::Network(
-                "Refusing to send empty request".to_string(),
-            ));
-        }
-        if data.len() > MAX_MESSAGE_SIZE {
-            return Err(NodeError::Network("Outgoing message too large".to_string()));
         }
 
         let mut last_error = None;
@@ -3681,6 +3710,30 @@ impl Node {
                     break;
                 }
             };
+
+            let shared_secret = match self.peer_secrets.read().await.get(&addr).cloned() {
+                Some(secret) => secret,
+                None => {
+                    let e = NodeError::Network(format!("Missing shared secret for {}", addr));
+                    self.record_outbound_failure(addr).await;
+                    self.remove_outbound_connection(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let data = self.encrypt_message(message, &shared_secret)?;
+            if data.is_empty() {
+                return Err(NodeError::Network(
+                    "Refusing to send empty request".to_string(),
+                ));
+            }
+            if data.len() > MAX_MESSAGE_SIZE {
+                return Err(NodeError::Network("Outgoing message too large".to_string()));
+            }
 
             let mut stream_guard = conn.lock().await;
             let result: Result<NetworkMessage, NodeError> = async {
@@ -3722,11 +3775,7 @@ impl Node {
                     NodeError::Network(format!("Response data timeout from {}", addr))
                 })??;
 
-                let response = if let Some(ref secret) = shared_secret {
-                    self.decrypt_message(&response_data, secret)?
-                } else {
-                    bincode::deserialize(&response_data)?
-                };
+                let response = self.decrypt_message(&response_data, &shared_secret)?;
                 Ok(response)
             }
             .await;
@@ -3995,34 +4044,16 @@ impl Node {
         addr: SocketAddr,
         tx_id: &str,
     ) -> Result<Option<Transaction>, NodeError> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut channels = self.tx_response_channels.write().await;
-            channels.insert(tx_id.to_string(), tx);
-        }
-
-        let send_result = self
-            .send_message(
-                addr,
-                &NetworkMessage::TxRequest {
-                    tx_id: tx_id.to_string(),
-                },
-            )
-            .await;
-
-        if let Err(e) = send_result {
-            let mut channels = self.tx_response_channels.write().await;
-            channels.remove(tx_id);
-            return Err(e);
-        }
-
-        let result = tokio::time::timeout(Duration::from_secs(3), rx).await;
-        let mut channels = self.tx_response_channels.write().await;
-        channels.remove(tx_id);
-
-        match result {
-            Ok(Ok(tx_opt)) => Ok(tx_opt),
-            _ => Ok(None),
+        let request = NetworkMessage::TxRequest {
+            tx_id: tx_id.to_string(),
+        };
+        match tokio::time::timeout(Duration::from_secs(3), self.send_message_with_response(addr, &request)).await {
+            Ok(Ok(NetworkMessage::TxResponse { tx_id: response_id, tx })) if response_id == tx_id => {
+                Ok(tx)
+            }
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(None),
         }
     }
 
@@ -4062,24 +4093,6 @@ impl Node {
             return Err(NodeError::Network("Rate limit exceeded".to_string()));
         }
 
-        // Get shared secret if available
-        let shared_secret = self.peer_secrets.read().await.get(&addr).cloned();
-
-        // Serialize and optionally encrypt message
-        let data = if let Some(ref secret) = shared_secret {
-            self.encrypt_message(message, &secret)?
-        } else {
-            bincode::serialize(message)?
-        };
-        if data.is_empty() {
-            return Err(NodeError::Network(
-                "Refusing to send empty message".to_string(),
-            ));
-        }
-        if data.len() > MAX_MESSAGE_SIZE {
-            return Err(NodeError::Network("Outgoing message too large".to_string()));
-        }
-
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
             if let Err(e) = self.check_outbound_circuit(addr).await {
@@ -4098,6 +4111,30 @@ impl Node {
                     break;
                 }
             };
+
+            let shared_secret = match self.peer_secrets.read().await.get(&addr).cloned() {
+                Some(secret) => secret,
+                None => {
+                    let e = NodeError::Network(format!("Missing shared secret for {}", addr));
+                    self.record_outbound_failure(addr).await;
+                    self.remove_outbound_connection(addr).await;
+                    last_error = Some(e);
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let data = self.encrypt_message(message, &shared_secret)?;
+            if data.is_empty() {
+                return Err(NodeError::Network(
+                    "Refusing to send empty message".to_string(),
+                ));
+            }
+            if data.len() > MAX_MESSAGE_SIZE {
+                return Err(NodeError::Network("Outgoing message too large".to_string()));
+            }
 
             let mut stream_guard = conn.lock().await;
             let result: Result<(), NodeError> = tokio::time::timeout(TIMEOUT, async {
@@ -4324,7 +4361,7 @@ impl Node {
             NetworkEvent::ChainRequest {
                 start,
                 end,
-                requester,
+                requester: _,
                 response_channel,
             } => {
                 let blocks = {
@@ -4354,13 +4391,6 @@ impl Node {
                     }
                 }
 
-                // Also send through network message
-                if let Some(_) = self.peers.read().await.get(&requester) {
-                    let response = NetworkMessage::Blocks(blocks);
-                    if let Err(e) = self.send_message(requester, &response).await {
-                        warn!("Failed to send chain response to {}: {}", requester, e);
-                    }
-                }
             }
 
             NetworkEvent::ChainResponse { blocks, sender } => {
@@ -4383,7 +4413,7 @@ impl Node {
         data: &[u8],
         addr: SocketAddr,
         tx: &mpsc::Sender<NetworkEvent>,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Option<NetworkMessage>, NodeError> {
         if data.len() > MAX_MESSAGE_SIZE {
             self.record_peer_failure(addr).await;
             return Err(NodeError::Network("Message too large".into()));
@@ -4392,7 +4422,7 @@ impl Node {
         // Deduplication using bloom filter
         let message_hash = blake3::hash(data);
         if !self.network_bloom.insert(message_hash.as_bytes()) {
-            return Ok(());
+            return Ok(None);
         }
 
         // Deserialize message
@@ -4420,8 +4450,7 @@ impl Node {
                     .get_mempool_transaction_by_id(&tx_id)
                     .await;
 
-                let response = NetworkMessage::TxResponse { tx_id, tx: tx_opt };
-                self.send_message(addr, &response).await?;
+                return Ok(Some(NetworkMessage::TxResponse { tx_id, tx: tx_opt }));
             }
 
             NetworkMessage::TxResponse { tx_id, tx } => {
@@ -4451,11 +4480,12 @@ impl Node {
                         let peers = self.peers.read().await;
                         let selected_peers = self.select_broadcast_peers(&peers, 8);
                         drop(peers);
-                        return self
+                        self
                             .broadcast_transaction(tx_ref, addr, selected_peers)
-                            .await;
+                            .await?;
+                        return Ok(None);
                     }
-                    return Ok(());
+                    return Ok(None);
                 }
 
                 // Validate transaction
@@ -4505,7 +4535,7 @@ impl Node {
                 if let Some(velocity) = &self.velocity_manager {
                     let peers = self.peers.read().await;
                     if velocity.process_block(&block_ref, &peers).await.is_ok() {
-                        return Ok(());
+                        return Ok(None);
                     }
                     drop(peers);
                 }
@@ -4567,10 +4597,9 @@ impl Node {
                 .await
                 .map_err(|e| NodeError::Network(format!("Failed to send chain request: {}", e)))?;
 
-                // Wait for response and send to peer
+                // Wait for response and return it to the active connection writer.
                 if let Ok(blocks) = response_rx.await {
-                    self.send_message(addr, &NetworkMessage::Blocks(blocks))
-                        .await?;
+                    return Ok(Some(NetworkMessage::Blocks(blocks)));
                 }
             }
 
@@ -4588,15 +4617,13 @@ impl Node {
             NetworkMessage::GetBlockHeight => {
                 let blockchain = self.blockchain.read().await;
                 let height = blockchain.get_latest_block_index() as u32;
-                self.send_message(addr, &NetworkMessage::BlockHeight(height))
-                    .await?;
+                return Ok(Some(NetworkMessage::BlockHeight(height)));
             }
 
             NetworkMessage::GetPeers => {
                 let peers = self.peers.read().await;
                 let peer_addrs: Vec<_> = peers.keys().cloned().collect();
-                self.send_message(addr, &NetworkMessage::Peers(peer_addrs))
-                    .await?;
+                return Ok(Some(NetworkMessage::Peers(peer_addrs)));
             }
 
             NetworkMessage::Shred(shred) => {
@@ -4680,14 +4707,6 @@ impl Node {
                 timestamp,
                 node_id: _node_id,
             } => {
-                // Respond to ping with pong
-                let response = NetworkMessage::Pong {
-                    timestamp,
-                    node_id: self.node_id.clone(),
-                };
-
-                self.send_message(addr, &response).await?;
-
                 // Update peer info
                 let mut peers = self.peers.write().await;
                 if let Some(info) = peers.get_mut(&addr) {
@@ -4696,6 +4715,11 @@ impl Node {
                         .unwrap_or_default()
                         .as_secs();
                 }
+
+                return Ok(Some(NetworkMessage::Pong {
+                    timestamp,
+                    node_id: self.node_id.clone(),
+                }));
             }
 
             NetworkMessage::Pong {
@@ -4770,7 +4794,7 @@ impl Node {
             _ => {}
         }
 
-        Ok(())
+        Ok(None)
     }
 
     async fn broadcast_transaction(
@@ -4900,6 +4924,29 @@ impl Node {
         selected
     }
 
+    async fn write_encrypted_frame<W>(
+        &self,
+        writer: &mut W,
+        message: &NetworkMessage,
+        shared_secret: &[u8],
+    ) -> Result<(), NodeError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let data = self.encrypt_message(message, shared_secret)?;
+        if data.is_empty() {
+            return Err(NodeError::Network("Refusing to send empty frame".into()));
+        }
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(NodeError::Network("Outgoing frame too large".into()));
+        }
+
+        writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
+        writer.write_all(&data).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
     async fn handle_connection(
         &self,
         stream: TcpStream,
@@ -4999,12 +5046,9 @@ impl Node {
         tx.send(NetworkEvent::PeerJoin(addr))
             .await
             .map_err(|e| NodeError::Network(format!("Failed to send join event: {}", e)))?;
-        if let Err(e) = self.advertise_dilithium_key(addr).await {
-            debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
-        }
 
         // Message handling loop
-        let (mut reader, _writer) = tokio::io::split(stream);
+        let (mut reader, mut writer) = tokio::io::split(stream);
 
         'connection: loop {
             // Read message length prefix with timeout
@@ -5057,34 +5101,58 @@ impl Node {
                         }
                     };
 
-                    // Serialize the message for handle_peer_message
+                    // Serialize the message for handle_peer_message dedup/rate tracking.
                     let serialized_message = bincode::serialize(&message)?;
 
                     // Process message
-                    if let Err(e) = self
+                    let response = match self
                         .handle_peer_message(&serialized_message, addr, &tx)
                         .await
                     {
-                        warn!("Message handling error from {}: {}", addr, e);
+                        Ok(response) => response,
+                        Err(e) => {
+                            warn!("Message handling error from {}: {}", addr, e);
 
-                        // Check if error suggests malicious behavior
-                        match &e {
-                            NodeError::Network(msg)
-                                if msg.contains("Rate limit")
-                                    || msg.contains("too large")
-                                    || msg.contains("Invalid") =>
-                            {
-                                self.record_peer_failure(addr).await;
+                            // Check if error suggests malicious behavior
+                            match &e {
+                                NodeError::Network(msg)
+                                    if msg.contains("Rate limit")
+                                        || msg.contains("too large")
+                                        || msg.contains("Invalid") =>
+                                {
+                                    self.record_peer_failure(addr).await;
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        }
 
-                        // Continue for transient errors
-                        if !matches!(e, NodeError::Network(msg) if msg.contains("Rate limit")) {
-                            continue;
-                        }
+                            // Continue for transient errors
+                            if !matches!(e, NodeError::Network(msg) if msg.contains("Rate limit")) {
+                                continue;
+                            }
 
-                        break 'connection;
+                            break 'connection;
+                        }
+                    };
+
+                    if let Some(response) = response {
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            self.write_encrypted_frame(&mut writer, &response, &shared_secret),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!("Response write failed to {}: {}", addr, e);
+                                self.record_peer_failure(addr).await;
+                                break 'connection;
+                            }
+                            Err(_) => {
+                                warn!("Response write timed out to {}", addr);
+                                self.record_peer_failure(addr).await;
+                                break 'connection;
+                            }
+                        }
                     }
 
                     // Update peer timestamp
@@ -5179,12 +5247,26 @@ impl Node {
             node_id: self.node_id.clone(),
         };
 
-        // Send ping with timeout
-        tokio::time::timeout(Duration::from_secs(5), self.send_message(addr, &ping))
+        // Send ping with timeout and consume the direct pong response on the same stream.
+        let response = tokio::time::timeout(Duration::from_secs(5), self.send_message_with_response(addr, &ping))
             .await
             .map_err(|_| NodeError::Network("Ping timeout".to_string()))??;
 
-        Ok(())
+        match response {
+            NetworkMessage::Pong { timestamp, .. } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut peers = self.peers.write().await;
+                if let Some(info) = peers.get_mut(&addr) {
+                    info.latency = now.saturating_sub(timestamp);
+                    info.last_seen = now;
+                }
+                Ok(())
+            }
+            _ => Err(NodeError::Network("Invalid ping response".to_string())),
+        }
     }
 
     // Method to convert Multiaddr to SocketAddr (needed for libp2p integration)
@@ -5340,6 +5422,8 @@ impl Node {
         let mut peer_secrets = self.peer_secrets.write().await;
         peer_secrets.insert(addr, shared_secret);
         drop(peer_secrets);
+
+        self.insert_outbound_connection(addr, stream).await;
 
         if let Err(e) = self.advertise_dilithium_key(addr).await {
             debug!("Failed to advertise Dilithium key to {}: {}", addr, e);

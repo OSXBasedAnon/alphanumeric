@@ -177,11 +177,15 @@ Primary local artifacts:
 Common variables used by the runtime include:
 
 - `ALPHANUMERIC_BIND_IP`
+- `ALPHANUMERIC_DB_PATH`
+- `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
+- `ALPHANUMERIC_FORCE_BOOTSTRAP`
 - `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command for the canonical publisher node)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
-- `ALPHANUMERIC_STATS_BIND`
+- `ALPHANUMERIC_STATS_BIND` (default `127.0.0.1`; set `0.0.0.0` only when the stats API should be public)
 - `ALPHANUMERIC_STATS_PORT`
+- `ALPHANUMERIC_SEED_NODES`
 - `ALPHANUMERIC_DNS_SEEDS`
 - `ALPHANUMERIC_DISCOVERY_BASE`
 - `ALPHANUMERIC_DISCOVERY_BASES`

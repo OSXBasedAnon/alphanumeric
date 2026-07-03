@@ -7,6 +7,9 @@
 /blockchain.db.lock
 .alphanumeric.instance.lock
 /private.key
+/node_identity.key
+/logs/
+/run/
 /path/
 /alphanumeric_serverless_plan.txt
 
