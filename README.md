@@ -1,20 +1,25 @@
 # alphanumeric
+
+Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
+
 https://www.alphanumeric.blue/
 
 ![Screenshot_2025-01-04_213726](https://github.com/user-attachments/assets/0b5c747c-53f7-4e09-82c8-0e9bfbd8cd89)
 
 [![Rust](https://img.shields.io/badge/Rust-stable-orange)](#build-and-run)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue)](#operations-checklist)
+[![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-`alphanumeric` is a Rust blockchain node runtime with integrated networking, wallet management, mining, and diagnostics tooling.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.3.7`.
 
 ## Quick Nav
 
 - [System Goals](#system-goals)
 - [Technical Architecture](#technical-architecture)
 - [Tokenomics](#tokenomics)
+- [Supported Platforms](#supported-platforms)
 - [Build and Run](#build-and-run)
+- [Bootstrap and Storage](#bootstrap-and-storage)
 - [Configuration via Environment Variables](#configuration-via-environment-variables)
 - [CLI Surface](#cli-surface)
 - [Security Posture](#security-posture)
@@ -41,6 +46,17 @@ https://www.alphanumeric.blue/
 - Active development.
 - Interfaces and internals can change between commits.
 - Not a formally audited production system.
+- macOS/OSX release packaging is supported for the command-line client.
+
+## Supported Platforms
+
+The client is intended to run on:
+
+- macOS/OSX, including Apple Silicon release builds
+- Linux
+- Windows
+
+The repository can be built from source with the Rust stable toolchain. Release zips may include a more user-focused `README.md` from `release/README.md`; this repository README is the technical project overview.
 
 ## Capability Matrix
 
@@ -146,18 +162,27 @@ Prerequisites:
 
 - Rust stable toolchain
 - Cargo
+- macOS/OSX: Xcode Command Line Tools (`xcode-select --install`) if a local compiler toolchain is missing
 
 Build:
 
-```powershell
+```bash
 cargo build --release
 ```
 
 Run:
 
-```powershell
+```bash
 cargo run --release
 ```
+
+Run the built binary directly:
+
+```bash
+./target/release/alphanumeric
+```
+
+For a cleaner local install, keep the binary in a dedicated folder and always run it from that folder, or set `ALPHANUMERIC_DB_PATH` explicitly.
 
 ## Bootstrap and Storage
 
@@ -168,14 +193,24 @@ Startup bootstrap source (default):
 Bootstrap trust mode:
 
 - Nodes prefer manifest bootstrap from `https://alphanumeric.blue/api/bootstrap/manifest`.
-- If manifest retrieval/parsing fails, nodes fall back to the canonical static URL.
+- The manifest is signature-verified before use.
+- If manifest retrieval/parsing/verification fails, startup fails closed by default.
+- Static unverified fallback is only allowed when `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true` is explicitly set.
 
-If `blockchain.db` already exists locally, that state is used.
+If `blockchain.db` already contains local block data, that state is used unless `ALPHANUMERIC_FORCE_BOOTSTRAP=true` is set.
+
+Default storage behavior:
+
+- `ALPHANUMERIC_DB_PATH` controls the chain database path.
+- Without `ALPHANUMERIC_DB_PATH`, the default relative path is `blockchain.db`.
+- Relative paths resolve under the current working directory, unless an existing DB with block data is found beside the executable.
+- For normal users, a dedicated folder such as `~/Alphanumeric` is recommended.
 
 Primary local artifacts:
 
 - `blockchain.db`
 - `private.key`
+- `node_identity.key`
 - optional lock files (`*.lock`)
 
 ## Configuration via Environment Variables
@@ -186,6 +221,7 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_DB_PATH`
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
+- `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP`
 - `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command for the canonical publisher node)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
@@ -251,11 +287,16 @@ Windows firewall example:
 New-NetFirewallRule -Name "Alphanumeric Network" -DisplayName "Alphanumeric Network (Port 7177)" -Protocol TCP -LocalPort 7177 -Direction Inbound,Outbound -Action Allow
 ```
 
+macOS/OSX firewall note:
+
+- If the macOS firewall prompts for incoming connections, allow `alphanumeric` if this machine should accept peers.
+- If Gatekeeper blocks a downloaded release binary, right-click the binary in Finder and choose Open, or remove the quarantine attribute with `xattr -dr com.apple.quarantine ./alphanumeric`.
+
 ## Development Workflow
 
 Quick local checks:
 
-```powershell
+```bash
 cargo check
 ```
 
