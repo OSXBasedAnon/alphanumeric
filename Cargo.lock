@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "alphanumeric"
-version = "7.3.8"
+version = "7.3.7"
 dependencies = [
  "aes-gcm",
  "argon2",
