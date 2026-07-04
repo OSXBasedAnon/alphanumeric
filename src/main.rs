@@ -341,7 +341,8 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
         // Database init
-        let _startup_locks = acquire_startup_locks(&db_path)?;
+        let _startup_locks = acquire_startup_locks(&db_path)
+            .map_err(|e| format!("Startup lock failed for {}: {}", db_path, e))?;
         pb.set_message("Checking bootstrap snapshot...");
         let create_launch_genesis = env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
             || env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
@@ -2496,6 +2497,12 @@ fn remove_instance_lock() -> std::io::Result<()> {
 }
 
 fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(lock_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     if std::path::Path::new(&lock_path).exists() {
         let allow = std::env::var(ignore_env)
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -2672,13 +2679,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         return Err("Bootstrap manifest URL must use https".into());
     }
 
-    let res = reqwest::get(&download_url).await?;
+    let res = reqwest::get(&download_url).await.map_err(|e| {
+        format!(
+            "Bootstrap download request failed for {}: {}",
+            download_url, e
+        )
+    })?;
 
     if !res.status().is_success() {
         return Err(format!("Bootstrap download failed: {}", res.status()).into());
     }
 
-    let bytes = res.bytes().await?;
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| format!("Bootstrap download body read failed: {}", e))?;
 
     // Verified manifests must provide SHA-256. The only no-hash path is the
     // explicit unsafe fallback for local/dev recovery.
@@ -2700,7 +2715,9 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     }
 
     let zip_path = format!("{}.zip", db_path);
-    fs::write(&zip_path, &bytes).await?;
+    fs::write(&zip_path, &bytes)
+        .await
+        .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
 
     let bootstrap_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2802,7 +2819,11 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     })();
     if let Err(e) = replace_result {
         let _ = std::fs::remove_dir_all(&temp_extract_path);
-        return Err(Box::new(e));
+        return Err(format!(
+            "Bootstrap DB replace failed: {} -> {}: {}",
+            temp_extract_path, db_path, e
+        )
+        .into());
     }
     Ok(())
 }
