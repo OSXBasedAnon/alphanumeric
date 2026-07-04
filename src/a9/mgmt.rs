@@ -574,6 +574,9 @@ impl Mgmt {
                     if tx.sender == "MINING_REWARDS" {
                         return false;
                     }
+                    if !tx.has_valid_regular_amounts() {
+                        return false;
+                    }
                     if let Some(sig_hex) = &tx.signature {
                         if let Ok(bytes) = hex::decode(sig_hex) {
                             return bytes.len() > 64;

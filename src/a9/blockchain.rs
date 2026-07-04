@@ -190,6 +190,12 @@ impl Transaction {
         self.amount_units + self.fee_units
     }
 
+    pub fn has_valid_regular_amounts(&self) -> bool {
+        self.amount_units >= MIN_TRANSACTION_AMOUNT_UNITS
+            && self.fee_units >= 0
+            && self.amount_units.checked_add(self.fee_units).is_some()
+    }
+
     pub fn amount(&self) -> f64 {
         Self::from_units(self.amount_units)
     }
@@ -386,7 +392,7 @@ impl Transaction {
     async fn verify_balance(&self, blockchain: &Blockchain) -> Result<(), BlockchainError> {
         let sender_balance = blockchain.get_confirmed_balance(&self.sender).await?; // Changed this line!
 
-        if self.amount_units < 0 || self.fee_units < 0 {
+        if !self.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -1063,7 +1069,7 @@ impl Blockchain {
             if tx.sender == "MINING_REWARDS" {
                 continue;
             }
-            if tx.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
+            if !tx.has_valid_regular_amounts() {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
             if tx.signature.is_none() || tx.pub_key.is_none() || tx.sig_hash.is_none() {
@@ -1248,10 +1254,10 @@ impl Blockchain {
         for item in pending_tree.iter() {
             let (_, tx_bytes) = item?;
             if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                if tx.sender != "MINING_REWARDS" {
+                if tx.sender != "MINING_REWARDS" && tx.has_valid_regular_amounts() {
                     *totals.entry(tx.sender.clone()).or_insert(0) += tx.total_debit_units();
+                    *incoming.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
                 }
-                *incoming.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
             }
         }
 
@@ -2015,6 +2021,11 @@ impl Blockchain {
                     continue;
                 }
 
+                if !tx.has_valid_regular_amounts() {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                }
+
                 // Pending txs must be fully verifiable (via sidecar witness) before we keep them.
                 if tx.pub_key.is_none() || tx.sig_hash.is_none() || tx.signature.is_none() {
                     invalid_txs.push(key.to_vec());
@@ -2497,6 +2508,10 @@ impl Blockchain {
             .await;
         }
 
+        if !tx.has_valid_regular_amounts() {
+            return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
         // For regular transactions, validate balance with proper pending tracking
         let confirmed_balance = self.get_confirmed_balance(&tx.sender).await?;
         let pending_amount = if block.is_none() {
@@ -2776,6 +2791,25 @@ impl Blockchain {
 
         // Validate each regular transaction
         for tx in regular_transactions {
+            if !tx.has_valid_regular_amounts() {
+                return Err(BlockchainError::InvalidTransactionAmount);
+            }
+
+            if tx.signature.is_none() || tx.pub_key.is_none() || tx.sig_hash.is_none() {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+
+            let sig_hex = tx
+                .signature
+                .as_ref()
+                .ok_or(BlockchainError::InvalidTransactionSignature)?;
+            let sig_bytes =
+                hex::decode(sig_hex).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
+            if sig_bytes.len() <= 64 {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+            self.verify_transaction_signature(tx)?;
+
             let current_confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0);
 
             let pending_deducted = pending_deductions.get(&tx.sender).copied().unwrap_or(0);
@@ -2806,8 +2840,7 @@ impl Blockchain {
             ));
         }
 
-        // Check if the transaction amount is below the minimum threshold
-        if transaction.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
+        if !transaction.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
@@ -3084,52 +3117,75 @@ impl Blockchain {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
 
-        // Collect all transactions from sled
+        // Collect all transactions from sled, removing any stale malformed rows so
+        // pending indexes and future mining attempts cannot stay poisoned.
         let mut transactions = Vec::new();
+        let mut invalid_txs = Vec::new();
         for result in pending_tree.iter() {
-            let (_, tx_bytes) = result?;
-            if let Ok(mut tx) = deserialize_transaction(&tx_bytes) {
-                // Pending txs are stored with a truncated signature in the main record. Rehydrate the full signature
-                // from the sidecar tree and strictly verify before admitting into the in-memory mempool.
-                if tx.sender != "MINING_REWARDS" {
-                    if tx.pub_key.is_none() || tx.sig_hash.is_none() || tx.signature.is_none() {
-                        continue;
-                    }
+            let (key, tx_bytes) = result?;
+            let Ok(mut tx) = deserialize_transaction(&tx_bytes) else {
+                invalid_txs.push(key.to_vec());
+                continue;
+            };
 
-                    let tx_id = tx.get_tx_id();
-                    let expected_sig_hash = tx.sig_hash.as_ref().cloned();
+            // Pending txs are stored with a truncated signature in the main record. Rehydrate the full signature
+            // from the sidecar tree and strictly verify before admitting into the in-memory mempool.
+            if tx.sender == "MINING_REWARDS" || !tx.has_valid_regular_amounts() {
+                invalid_txs.push(key.to_vec());
+                continue;
+            }
 
-                    let sig_hex = tx.signature.as_ref().unwrap();
-                    let sig_bytes = match hex::decode(sig_hex) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+            if tx.pub_key.is_none() || tx.sig_hash.is_none() || tx.signature.is_none() {
+                invalid_txs.push(key.to_vec());
+                continue;
+            }
 
-                    if sig_bytes.len() <= 64 {
-                        if expected_sig_hash.is_none() {
-                            continue;
-                        }
-                        let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
-                            // No witness available; do not allow unverifiable tx into the mempool.
-                            continue;
-                        };
+            let tx_id = tx.get_tx_id();
+            let expected_sig_hash = tx.sig_hash.as_ref().cloned();
 
-                        let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
-                        if expected_sig_hash.as_deref() != Some(actual_hash.as_str()) {
-                            continue;
-                        }
+            let sig_hex = tx.signature.as_ref().unwrap();
+            let sig_bytes = match hex::decode(sig_hex) {
+                Ok(v) => v,
+                Err(_) => {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                }
+            };
 
-                        tx.signature = Some(hex::encode(&full_sig_bytes));
-                    }
+            if sig_bytes.len() <= 64 {
+                if expected_sig_hash.is_none() {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                }
+                let Some(full_sig_bytes) = full_sigs_tree.get(tx_id.as_bytes())? else {
+                    // No witness available; do not allow unverifiable tx into the mempool.
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                };
 
-                    if self.verify_transaction_signature(&tx).is_err() {
-                        continue;
-                    }
+                let actual_hash = Transaction::signature_hash_hex(&full_sig_bytes);
+                if expected_sig_hash.as_deref() != Some(actual_hash.as_str()) {
+                    invalid_txs.push(key.to_vec());
+                    continue;
                 }
 
-                transactions.push(tx);
+                tx.signature = Some(hex::encode(&full_sig_bytes));
             }
+
+            if self.verify_transaction_signature(&tx).is_err() {
+                invalid_txs.push(key.to_vec());
+                continue;
+            }
+
+            transactions.push(tx);
         }
+
+        for key in invalid_txs {
+            pending_tree.remove(&key)?;
+            let _ = full_sigs_tree.remove(&key);
+        }
+        pending_tree.flush()?;
+        full_sigs_tree.flush()?;
 
         // Reset mempool and add all transactions
         *mempool = Mempool::new();
@@ -3823,6 +3879,64 @@ mod tests {
         };
 
         assert!(Blockchain::verify_transaction_receipt_fields(&tx).is_err());
+    }
+
+    #[tokio::test]
+    async fn transaction_admission_rejects_negative_fee() {
+        let blockchain = test_blockchain();
+        let tx = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: -1,
+            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
+            timestamp: 1234,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+
+        let err = blockchain
+            .add_transaction(tx)
+            .await
+            .expect_err("negative fee should be rejected before balance/signature checks");
+        assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
+    }
+
+    #[tokio::test]
+    async fn new_block_validation_rejects_invalid_regular_amount() {
+        let blockchain = test_blockchain();
+        let tx = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: 0,
+            amount_units: -1,
+            timestamp: 1234,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        let transactions = vec![tx];
+        let merkle_root = Blockchain::calculate_merkle_root(&transactions).unwrap();
+        let mut block = Block {
+            index: 1,
+            previous_hash: [0u8; 32],
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+
+        let err = blockchain
+            .validate_new_block(&block)
+            .await
+            .expect_err("invalid regular tx amount should be rejected before mining finalization");
+        assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
     }
 
     #[test]
