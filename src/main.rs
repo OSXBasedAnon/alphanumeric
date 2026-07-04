@@ -965,7 +965,7 @@ async fn main() -> Result<()> {
             }
         };
         let mut last_console_command: Option<String> = None;
-        let console_prompt = ("αlphanumeric: ", "\x1b[1mαlphanumeric:\x1b[0m ");
+        let console_prompt = ("αlphanumeric:", "\x1b[1;97mαlphanumeric:\x1b[0m");
 
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
