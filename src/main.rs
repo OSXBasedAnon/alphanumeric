@@ -5,7 +5,7 @@ use log::{debug, error, warn};
 use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
-use rustyline::{error::ReadlineError, DefaultEditor};
+use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -957,8 +957,14 @@ async fn main() -> Result<()> {
         println!("6. Mine Block (format: mine miner_wallet_name)");
         println!("7. Exit");
 
-        let mut line_editor = match DefaultEditor::new() {
-            Ok(editor) => Some(editor),
+        let editor_config = Config::builder()
+            .color_mode(ColorMode::Forced)
+            .build();
+        let mut line_editor = match DefaultEditor::with_config(editor_config) {
+            Ok(mut editor) => {
+                editor.set_helper(Some(()));
+                Some(editor)
+            }
             Err(e) => {
                 warn!("Line editor unavailable; falling back to standard input: {}", e);
                 None
@@ -2633,7 +2639,8 @@ fn print_ascii_intro() {
              +#####+++######++++######+                               Encryption: Argon2
                  -+++++----++++-                                      Quantum DSS: ML-DSA-87
                 .+++++.  .-+++-
-                 ++++     ++++.
+                ++++     ++++.
+
 "#;
 
     let start_color = (42, 93, 253); // White
