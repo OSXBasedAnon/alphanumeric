@@ -6003,6 +6003,9 @@ impl Node {
             stream.read_exact(&mut data).await?;
 
             let peer_handshake: HandshakeMessage = codec::deserialize(&data)?;
+            if peer_handshake.node_id == self.node_id {
+                return Err(NodeError::Network("Refusing self connection".into()));
+            }
 
             // Verify peer's handshake
             if peer_handshake.network_id != self.network_id {
@@ -6044,6 +6047,9 @@ impl Node {
             debug!("perform_handshake(resp): got {} bytes, verifying", len);
 
             let peer_handshake: HandshakeMessage = codec::deserialize(&data)?;
+            if peer_handshake.node_id == self.node_id {
+                return Err(NodeError::Network("Refusing self connection".into()));
+            }
 
             // Verify peer's handshake
             if peer_handshake.network_id != self.network_id {

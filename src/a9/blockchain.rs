@@ -60,8 +60,10 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
-// Floor maps to roughly 2^26 expected hashes. One miner should not mint long
-// runs instantly; aggregate hashpower can still pull the network toward 5s.
+const BOOTSTRAP_MIN_DIFFICULTY: u64 = 321;
+const DIFFICULTY_FLOOR_UPGRADE_HEIGHT: u32 = 24;
+// New floor maps to roughly 2^26 expected hashes. One miner should not mint
+// long runs instantly; aggregate hashpower can still pull the network toward 5s.
 const NETWORK_MIN_DIFFICULTY: u64 = 416;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
@@ -80,6 +82,14 @@ pub(crate) fn pow_target_from_difficulty(difficulty: u64) -> BigUint {
         return BigUint::from(0u8);
     }
     MAX_TARGET.clone() >> (exponent as usize)
+}
+
+fn minimum_difficulty_for_height(block_index: u32) -> u64 {
+    if block_index >= DIFFICULTY_FLOOR_UPGRADE_HEIGHT {
+        NETWORK_MIN_DIFFICULTY
+    } else {
+        BOOTSTRAP_MIN_DIFFICULTY
+    }
 }
 
 static FINALIZE_STAGE: AtomicUsize = AtomicUsize::new(0);
@@ -548,10 +558,11 @@ impl Block {
     pub fn adjust_dynamic_difficulty(
         current_difficulty: u64,
         timestamp_diff: u64,
-        _block_index: u32,
+        block_index: u32,
         oracle: &mut DifficultyOracle,
         current_timestamp: u64,
     ) -> u64 {
+        let minimum_difficulty = minimum_difficulty_for_height(block_index);
         const MAX_DIFFICULTY: u64 = u64::MAX / 2;
         const MAX_ADJUSTMENT: f64 = 1.15;
         const DAMPENING_FACTOR: f64 = 0.6;
@@ -562,7 +573,7 @@ impl Block {
 
         // Emergency Reset Condition (from the second version)
         if timestamp_diff > TARGET_BLOCK_TIME * EMERGENCY_THRESHOLD {
-            return NETWORK_MIN_DIFFICULTY; // Force reset when blocks are very slow
+            return minimum_difficulty; // Force reset when blocks are very slow
         }
 
         // Base time ratio calculation
@@ -584,11 +595,11 @@ impl Block {
 
         // Aggressive minimum difficulty adjustment (from the second version, adapted)
         if time_ratio > 2.0 {
-            return (raw_difficulty / 2).max(NETWORK_MIN_DIFFICULTY); // Cut difficulty in half but respect minimum
+            return (raw_difficulty / 2).max(minimum_difficulty); // Cut difficulty in half but respect minimum
         }
 
         // Ensure bounds (from the first version, but using clamp for conciseness)
-        raw_difficulty.clamp(NETWORK_MIN_DIFFICULTY, MAX_DIFFICULTY)
+        raw_difficulty.clamp(minimum_difficulty, MAX_DIFFICULTY)
     }
 
     pub fn verify_difficulty_proof(&self) -> bool {
@@ -3766,6 +3777,18 @@ mod tests {
     fn pow_target_saturates_to_zero_for_large_difficulty() {
         // 4096 / 16 == 256 -> shifted past full 256-bit target width.
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
+    }
+
+    #[test]
+    fn difficulty_floor_activates_after_bootstrap_chain() {
+        assert_eq!(
+            minimum_difficulty_for_height(DIFFICULTY_FLOOR_UPGRADE_HEIGHT - 1),
+            BOOTSTRAP_MIN_DIFFICULTY
+        );
+        assert_eq!(
+            minimum_difficulty_for_height(DIFFICULTY_FLOOR_UPGRADE_HEIGHT),
+            NETWORK_MIN_DIFFICULTY
+        );
     }
 
     #[test]
