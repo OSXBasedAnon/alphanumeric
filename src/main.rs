@@ -26,7 +26,8 @@ use std::path::Path;
 use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
-        Block, Blockchain, RateLimiter, Transaction, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
+        Block, Blockchain, RateLimiter, Transaction, CONSENSUS_HEADER_RULES_VERSION,
+        MAX_BLOCK_FUTURE_TIME, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
@@ -341,8 +342,8 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
         NETWORK_FEE,
         MINT_CLIP,
         genesis_hash,
-        2,
-        600
+        CONSENSUS_HEADER_RULES_VERSION,
+        MAX_BLOCK_FUTURE_TIME
     );
 
     let mut hasher = Sha256::new();

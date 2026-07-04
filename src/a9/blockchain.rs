@@ -47,6 +47,7 @@ const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 const ORPHAN_REORG_DEPTH: u32 = 1024;
+const ORPHAN_BRANCH_SEARCH_LIMIT: usize = 4_096;
 const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_191_900;
 const GENESIS_LAUNCH_AMOUNT: f64 = 17.76;
 const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
@@ -64,6 +65,11 @@ pub const TARGET_BLOCK_TIME: u64 = 5;
 // desktop this targets a short solo-mining wait while still keeping single-miner
 // throughput bounded.
 const NETWORK_MIN_DIFFICULTY: u64 = 464;
+const MAX_NETWORK_DIFFICULTY: u64 = 4_080;
+const DIFFICULTY_POINTS_PER_HALVING: i128 = 16;
+const DIFFICULTY_RETARGET_HALF_LIFE_SECS: i128 = 60;
+pub const MAX_BLOCK_FUTURE_TIME: u64 = 300;
+pub const CONSENSUS_HEADER_RULES_VERSION: u32 = 3;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
@@ -526,9 +532,7 @@ impl Block {
             .unwrap_or_default()
             .as_secs();
 
-        const MAX_FUTURE_TIME: u64 = 300;
-
-        if self.timestamp > now + MAX_FUTURE_TIME {
+        if self.timestamp > now + MAX_BLOCK_FUTURE_TIME {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
@@ -549,48 +553,49 @@ impl Block {
     pub fn adjust_dynamic_difficulty(
         current_difficulty: u64,
         timestamp_diff: u64,
-        _block_index: u32,
+        block_index: u32,
         oracle: &mut DifficultyOracle,
         current_timestamp: u64,
     ) -> u64 {
-        let minimum_difficulty = NETWORK_MIN_DIFFICULTY;
-        const MAX_DIFFICULTY: u64 = u64::MAX / 2;
-        const MAX_ADJUSTMENT: f64 = 1.15;
-        const DAMPENING_FACTOR: f64 = 0.6;
-        const EMERGENCY_THRESHOLD: u64 = 5;
-
-        // Record metrics
         oracle.record_block_metrics(current_timestamp, current_difficulty);
+        Self::consensus_next_difficulty(current_difficulty, timestamp_diff, block_index)
+    }
 
-        // Emergency Reset Condition (from the second version)
-        if timestamp_diff > TARGET_BLOCK_TIME * EMERGENCY_THRESHOLD {
-            return minimum_difficulty; // Force reset when blocks are very slow
+    pub fn consensus_next_difficulty(
+        parent_difficulty: u64,
+        timestamp_diff: u64,
+        block_index: u32,
+    ) -> u64 {
+        if block_index == 0 {
+            return GENESIS_LAUNCH_DIFFICULTY;
         }
 
-        // Base time ratio calculation
-        let time_ratio = timestamp_diff as f64 / TARGET_BLOCK_TIME as f64;
+        let current = parent_difficulty.clamp(NETWORK_MIN_DIFFICULTY, MAX_NETWORK_DIFFICULTY);
+        let timing_error = TARGET_BLOCK_TIME as i128 - timestamp_diff as i128;
+        let numerator = timing_error.saturating_mul(DIFFICULTY_POINTS_PER_HALVING);
+        let mut delta =
+            Self::div_round_away_from_zero(numerator, DIFFICULTY_RETARGET_HALF_LIFE_SECS);
+        if delta == 0 && timing_error != 0 {
+            delta = timing_error.signum();
+        }
 
-        // Apply hyperbolic tangent dampening (from the first version)
-        let dampened_ratio = 1.0 + (time_ratio - 1.0).tanh() * DAMPENING_FACTOR;
-
-        // Calculate initial adjustment (modified from both versions)
-        let base_adjustment = if time_ratio < 1.0 {
-            // Blocks are faster than target - increase moderately (like the second version, but bounded by MAX_ADJUSTMENT)
-            (1.0 / dampened_ratio).min(MAX_ADJUSTMENT)
+        if delta >= 0 {
+            current
+                .saturating_add(delta as u64)
+                .min(MAX_NETWORK_DIFFICULTY)
         } else {
-            // Blocks are slower than target - decrease more aggressively (like the second version, but also using dampening)
-            (1.0 / (time_ratio * dampened_ratio)).max(1.0 / MAX_ADJUSTMENT)
-        };
-
-        let raw_difficulty = (current_difficulty as f64 * base_adjustment).round() as u64;
-
-        // Aggressive minimum difficulty adjustment (from the second version, adapted)
-        if time_ratio > 2.0 {
-            return (raw_difficulty / 2).max(minimum_difficulty); // Cut difficulty in half but respect minimum
+            let decrease = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
+            current.saturating_sub(decrease).max(NETWORK_MIN_DIFFICULTY)
         }
+    }
 
-        // Ensure bounds (from the first version, but using clamp for conciseness)
-        raw_difficulty.clamp(minimum_difficulty, MAX_DIFFICULTY)
+    fn div_round_away_from_zero(numerator: i128, denominator: i128) -> i128 {
+        if numerator == 0 {
+            return 0;
+        }
+        let abs = numerator.abs();
+        let rounded = abs.saturating_add(denominator.saturating_sub(1)) / denominator;
+        rounded * numerator.signum()
     }
 
     pub fn verify_difficulty_proof(&self) -> bool {
@@ -1363,57 +1368,85 @@ impl Blockchain {
         Ok(children)
     }
 
-    fn best_orphan_child_of(&self, parent: &Block) -> Result<Option<Block>, BlockchainError> {
-        let mut children = self.orphan_children_of(&parent.hash)?;
-        children.retain(|c| {
-            c.index == parent.index.saturating_add(1) && c.previous_hash == parent.hash
-        });
-        children.sort_by(|a, b| {
-            b.difficulty
-                .cmp(&a.difficulty)
-                .then_with(|| a.timestamp.cmp(&b.timestamp))
-                .then_with(|| a.hash.cmp(&b.hash))
-        });
-        Ok(children.into_iter().next())
-    }
-
-    fn collect_orphan_branch_from(
+    fn collect_orphan_branches_from(
         &self,
         start: Block,
         max_depth: usize,
-    ) -> Result<Vec<Block>, BlockchainError> {
-        let mut branch = vec![start.clone()];
-        let mut current = start;
-        for _ in 0..max_depth {
-            let Some(next) = self.best_orphan_child_of(&current)? else {
-                break;
+        max_branches: usize,
+    ) -> Result<Vec<Vec<Block>>, BlockchainError> {
+        let mut complete = Vec::new();
+        let mut stack = vec![vec![start]];
+
+        while let Some(branch) = stack.pop() {
+            let Some(current) = branch.last() else {
+                continue;
             };
-            if next.index != current.index.saturating_add(1) || next.previous_hash != current.hash {
+
+            if branch.len() >= max_depth {
+                complete.push(branch);
+                continue;
+            }
+
+            let mut children = self.orphan_children_of(&current.hash)?;
+            children.retain(|c| {
+                c.index == current.index.saturating_add(1) && c.previous_hash == current.hash
+            });
+
+            if children.is_empty() {
+                complete.push(branch);
+                continue;
+            }
+
+            let remaining_slots = max_branches.saturating_sub(complete.len() + stack.len());
+            if remaining_slots == 0 {
+                complete.push(branch);
                 break;
             }
-            branch.push(next.clone());
-            current = next;
+
+            let selected: Vec<Block> = children.into_iter().take(remaining_slots).collect();
+            for child in selected.into_iter().rev() {
+                let mut next_branch = branch.clone();
+                next_branch.push(child);
+                stack.push(next_branch);
+            }
         }
-        Ok(branch)
+
+        Ok(complete)
     }
 
-    fn canonical_work_range(&self, start: u32, end: u32) -> Result<u128, BlockchainError> {
+    fn canonical_work_range(&self, start: u32, end: u32) -> Result<BigUint, BlockchainError> {
         if end < start {
-            return Ok(0);
+            return Ok(BigUint::from(0u8));
         }
-        let mut work: u128 = 0;
+        let mut work = BigUint::from(0u8);
         for height in start..=end {
             let block = self.get_block(height)?;
-            work = work.saturating_add(block.difficulty as u128);
+            work += Self::work_units_for_difficulty(block.difficulty);
         }
         Ok(work)
     }
 
-    fn branch_work_to_height(branch: &[Block], max_height: u32) -> u128 {
+    fn work_units_for_difficulty(difficulty: u64) -> BigUint {
+        let exponent = (difficulty / 16).min(255) as usize;
+        BigUint::from(1u8) << exponent
+    }
+
+    fn branch_work_to_height(branch: &[Block], max_height: u32) -> BigUint {
         branch
             .iter()
             .filter(|b| b.index <= max_height)
-            .fold(0u128, |acc, b| acc.saturating_add(b.difficulty as u128))
+            .fold(BigUint::from(0u8), |acc, b| {
+                acc + Self::work_units_for_difficulty(b.difficulty)
+            })
+    }
+
+    fn compare_work_delta(
+        branch_work: &BigUint,
+        canonical_work: &BigUint,
+        other_branch_work: &BigUint,
+        other_canonical_work: &BigUint,
+    ) -> std::cmp::Ordering {
+        (branch_work + other_canonical_work).cmp(&(other_branch_work + canonical_work))
     }
 
     fn to_storage_block(block: &Block) -> Block {
@@ -1490,46 +1523,62 @@ impl Blockchain {
         }
 
         let mut best_branch: Option<Vec<Block>> = None;
-        let mut best_overlap_advantage: i128 = i128::MIN;
+        let mut best_work_pair: Option<(BigUint, BigUint)> = None;
         let mut best_tip_hash: [u8; 32] = [0u8; 32];
 
         for candidate in candidates {
-            let branch = self.collect_orphan_branch_from(candidate, 1024)?;
-            let Some(branch_tip) = branch.last() else {
-                continue;
-            };
-            // Branch may be same-height competitor or longer. Adoption decision is based on work.
+            let branches = self.collect_orphan_branches_from(
+                candidate,
+                ORPHAN_REORG_DEPTH as usize,
+                ORPHAN_BRANCH_SEARCH_LIMIT,
+            )?;
+            for branch in branches {
+                let Some(branch_tip) = branch.last() else {
+                    continue;
+                };
+                // Branch may be same-height competitor or longer. Adoption decision is based on work.
 
-            let fork_height = branch[0].index;
-            let canonical_work = self.canonical_work_range(fork_height, tip.index)?;
-            let branch_work = Self::branch_work_to_height(&branch, branch_tip.index);
-            let advantage = branch_work as i128 - canonical_work as i128;
+                let fork_height = branch[0].index;
+                let canonical_work = self.canonical_work_range(fork_height, tip.index)?;
+                let branch_work = Self::branch_work_to_height(&branch, branch_tip.index);
 
-            // Deterministic adoption rule:
-            // 1) positive overlap work advantage
-            // 2) tie-break by lexical tip hash
-            let should_replace = if advantage > best_overlap_advantage {
-                true
-            } else if advantage == best_overlap_advantage {
-                branch_tip.hash < best_tip_hash
-            } else {
-                false
-            };
+                // Deterministic adoption rule:
+                // 1) positive overlap work advantage
+                // 2) tie-break by lexical tip hash
+                let should_replace = match &best_work_pair {
+                    None => true,
+                    Some((best_branch_work, best_canonical_work)) => {
+                        match Self::compare_work_delta(
+                            &branch_work,
+                            &canonical_work,
+                            best_branch_work,
+                            best_canonical_work,
+                        ) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => branch_tip.hash < best_tip_hash,
+                            std::cmp::Ordering::Less => false,
+                        }
+                    }
+                };
 
-            if should_replace {
-                best_tip_hash = branch_tip.hash;
-                best_overlap_advantage = advantage;
-                best_branch = Some(branch);
+                if should_replace {
+                    best_tip_hash = branch_tip.hash;
+                    best_work_pair = Some((branch_work, canonical_work));
+                    best_branch = Some(branch);
+                }
             }
         }
 
         let Some(branch) = best_branch else {
             return Ok(false);
         };
-        if best_overlap_advantage < 0 {
+        let Some((branch_work, canonical_work)) = best_work_pair else {
+            return Ok(false);
+        };
+        if branch_work < canonical_work {
             return Ok(false);
         }
-        if best_overlap_advantage == 0 {
+        if branch_work == canonical_work {
             let Some(branch_tip) = branch.last() else {
                 return Ok(false);
             };
@@ -2725,12 +2774,7 @@ impl Blockchain {
                 block.timestamp,
             );
 
-            // Allow small variance for network synchronization (0.1% tolerance)
-            // 0.1% tolerance without floating-point arithmetic.
-            let expected = expected_difficulty.max(1) as u128;
-            let actual = block.difficulty as u128;
-            let delta = actual.abs_diff(expected);
-            if delta.saturating_mul(1000) > expected {
+            if block.difficulty != expected_difficulty {
                 return Err(BlockchainError::InvalidBlockHeader);
             }
         }
@@ -3659,9 +3703,7 @@ impl ChainSentinel {
                 block.timestamp,
             );
 
-            let lhs = (block.difficulty as u128).saturating_mul(100);
-            let rhs = (expected_difficulty as u128).saturating_mul(99);
-            if lhs < rhs {
+            if block.difficulty != expected_difficulty {
                 self.integrity_score.fetch_sub(5, Ordering::Relaxed);
                 return false;
             }
@@ -3807,6 +3849,90 @@ mod tests {
             ),
             NETWORK_MIN_DIFFICULTY
         );
+    }
+
+    #[test]
+    fn consensus_difficulty_uses_only_parent_and_child_time() {
+        assert_eq!(
+            Block::consensus_next_difficulty(464, TARGET_BLOCK_TIME, 9),
+            464
+        );
+        assert_eq!(Block::consensus_next_difficulty(464, 0, 9), 466);
+        assert_eq!(Block::consensus_next_difficulty(480, 65, 9), 464);
+        assert_eq!(
+            Block::consensus_next_difficulty(MAX_NETWORK_DIFFICULTY, 0, 9),
+            MAX_NETWORK_DIFFICULTY
+        );
+    }
+
+    #[test]
+    fn work_units_follow_pow_target_scaling() {
+        assert_eq!(
+            Blockchain::work_units_for_difficulty(16),
+            Blockchain::work_units_for_difficulty(0) * 2u32
+        );
+        assert_eq!(
+            Blockchain::work_units_for_difficulty(64),
+            Blockchain::work_units_for_difficulty(32) * 4u32
+        );
+    }
+
+    #[test]
+    fn chain_work_uses_exponential_difficulty_units() {
+        let blockchain = test_blockchain();
+        let mut low_a = metadata_test_block(0, [0u8; 32], "low_a", 1.0);
+        low_a.difficulty = 32;
+        low_a.hash = low_a.calculate_hash_for_block();
+        let mut low_b = metadata_test_block(1, low_a.hash, "low_b", 1.0);
+        low_b.difficulty = 32;
+        low_b.hash = low_b.calculate_hash_for_block();
+        insert_raw_block(&blockchain, &low_a);
+        insert_raw_block(&blockchain, &low_b);
+
+        let mut high = metadata_test_block(1, low_a.hash, "high", 1.0);
+        high.difficulty = 64;
+        high.hash = high.calculate_hash_for_block();
+
+        let low_work = blockchain.canonical_work_range(1, 1).unwrap();
+        let high_work = Blockchain::branch_work_to_height(&[high], 1);
+
+        assert!(high_work > low_work);
+        assert_eq!(
+            Blockchain::compare_work_delta(&high_work, &low_work, &low_work, &low_work),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn orphan_branch_search_keeps_deeper_non_greedy_branch() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let start = metadata_test_block(1, block0.hash, "start", 1.0);
+
+        let mut high_child = metadata_test_block(2, start.hash, "high_child", 1.0);
+        high_child.difficulty = 64;
+        high_child.hash = high_child.calculate_hash_for_block();
+
+        let mut lower_child = metadata_test_block(2, start.hash, "lower_child", 1.0);
+        lower_child.difficulty = 32;
+        lower_child.timestamp = lower_child.timestamp.saturating_add(1);
+        lower_child.hash = lower_child.calculate_hash_for_block();
+
+        let mut lower_grandchild =
+            metadata_test_block(3, lower_child.hash, "lower_grandchild", 1.0);
+        lower_grandchild.difficulty = 32;
+        lower_grandchild.hash = lower_grandchild.calculate_hash_for_block();
+
+        blockchain.store_orphan_block(&high_child).unwrap();
+        blockchain.store_orphan_block(&lower_child).unwrap();
+        blockchain.store_orphan_block(&lower_grandchild).unwrap();
+
+        let branches = blockchain
+            .collect_orphan_branches_from(start, 8, ORPHAN_BRANCH_SEARCH_LIMIT)
+            .unwrap();
+
+        assert!(branches.iter().any(|branch| branch.len() == 2));
+        assert!(branches.iter().any(|branch| branch.len() == 3));
     }
 
     #[tokio::test]

@@ -1879,58 +1879,76 @@ impl Node {
             .clamp(1, 200);
         let mut all_blocks = Vec::new();
         let mut any_ok = false;
+        let mut seen_blocks: HashSet<(u32, [u8; 32])> = HashSet::new();
 
         for base_url in Self::discovery_blocks_urls() {
-            let url = format!(
-                "{}?network_id={}&start={}&end={}&limit={}",
-                base_url, network_id, start, end, limit
-            );
-            let res = self.http_client.get(url).send().await;
-            let res = match res {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!("Block relay fetch error: {}", e);
-                    continue;
-                }
-            };
-
-            if !res.status().is_success() {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                debug!(
-                    "Block relay fetch failed: {} {}",
-                    status,
-                    Self::response_body_snippet(&body)
+            let mut offset: u32 = 0;
+            let mut seen_pages: HashSet<Vec<(u32, [u8; 32])>> = HashSet::new();
+            loop {
+                let url = format!(
+                    "{}?network_id={}&start={}&end={}&limit={}&offset={}",
+                    base_url, network_id, start, end, limit, offset
                 );
-                continue;
-            }
-
-            let body = match res.json::<BlockRelayResponse>().await {
-                Ok(body) => body,
-                Err(e) => {
-                    debug!("Block relay response parse failed: {}", e);
-                    continue;
-                }
-            };
-
-            if !body.ok {
-                continue;
-            }
-            any_ok = true;
-
-            for record in body.blocks.unwrap_or_default() {
-                match serde_json::from_value::<Block>(record.block) {
-                    Ok(block) => {
-                        if block.index >= start
-                            && block.index <= end
-                            && block.calculate_hash_for_block() == block.hash
-                            && block.verify_pow()
-                        {
-                            all_blocks.push(block);
-                        }
+                let res = self.http_client.get(url).send().await;
+                let res = match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("Block relay fetch error: {}", e);
+                        break;
                     }
-                    Err(e) => debug!("Relayed block decode failed: {}", e),
+                };
+
+                if !res.status().is_success() {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    debug!(
+                        "Block relay fetch failed: {} {}",
+                        status,
+                        Self::response_body_snippet(&body)
+                    );
+                    break;
                 }
+
+                let body = match res.json::<BlockRelayResponse>().await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        debug!("Block relay response parse failed: {}", e);
+                        break;
+                    }
+                };
+
+                if !body.ok {
+                    break;
+                }
+                any_ok = true;
+
+                let records = body.blocks.unwrap_or_default();
+                let record_count = records.len() as u32;
+                let mut page_keys = Vec::with_capacity(records.len());
+                for record in records {
+                    match serde_json::from_value::<Block>(record.block) {
+                        Ok(block) => {
+                            page_keys.push((block.index, block.hash));
+                            if block.index >= start
+                                && block.index <= end
+                                && block.calculate_hash_for_block() == block.hash
+                                && block.verify_pow()
+                                && seen_blocks.insert((block.index, block.hash))
+                            {
+                                all_blocks.push(block);
+                            }
+                        }
+                        Err(e) => debug!("Relayed block decode failed: {}", e),
+                    }
+                }
+
+                if !seen_pages.insert(page_keys) {
+                    break;
+                }
+                if record_count < limit {
+                    break;
+                }
+                offset = offset.saturating_add(record_count);
             }
         }
 

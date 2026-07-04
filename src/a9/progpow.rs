@@ -226,6 +226,7 @@ impl MiningManager {
         let found = Arc::new(AtomicBool::new(false));
         let result_nonce = Arc::new(AtomicU64::new(0));
         let result_timestamp = Arc::new(AtomicU64::new(0));
+        let result_difficulty = Arc::new(AtomicU64::new(0));
         let hash_result = Arc::new(Mutex::new(Vec::with_capacity(32)));
 
         if max_nonce == 0 {
@@ -258,9 +259,9 @@ impl MiningManager {
 
         loop {
             let (
-                current_network_difficulty,
+                previous_difficulty,
                 previous_block_hash,
-                _previous_block_timestamp,
+                previous_block_timestamp,
                 current_height,
             ) = {
                 let blockchain_guard = self.blockchain.read().await;
@@ -268,7 +269,7 @@ impl MiningManager {
                     MiningError::BlockchainError("Previous block not found".to_string())
                 })?;
                 (
-                    blockchain_guard.get_current_difficulty().await,
+                    previous_block.difficulty,
                     previous_block.hash,
                     previous_block.timestamp,
                     previous_block.index.saturating_add(1),
@@ -320,10 +321,8 @@ impl MiningManager {
 
             let progress_bar = Arc::clone(&progress_bar);
 
-            // Calculate target using proper difficulty scaling that handles large values
-            let target = pow_target_from_difficulty(current_network_difficulty);
-            let target = Arc::new(target);
             let result_timestamp = Arc::clone(&result_timestamp);
+            let result_difficulty = Arc::clone(&result_difficulty);
 
             let mining_result: Result<(), MiningError> = (0..num_threads as u64)
                 .into_par_iter()
@@ -337,7 +336,9 @@ impl MiningManager {
                         return Ok(());
                     }
                     let end_nonce = start_nonce.saturating_add(nonces_per_thread).min(range_end);
-                    let target = Arc::clone(&target);
+                    let mut cached_timestamp = 0u64;
+                    let mut cached_difficulty = 0u64;
+                    let mut cached_target = BigUint::from(0u8);
 
                     for nonce in start_nonce..end_nonce {
                         if found.load(Ordering::Relaxed) {
@@ -350,6 +351,15 @@ impl MiningManager {
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
+                        if timestamp != cached_timestamp {
+                            cached_timestamp = timestamp;
+                            cached_difficulty = Block::consensus_next_difficulty(
+                                previous_difficulty,
+                                timestamp.saturating_sub(previous_block_timestamp),
+                                local_header.number,
+                            );
+                            cached_target = pow_target_from_difficulty(cached_difficulty);
+                        }
                         let hash = {
                             let mut header_data = [0u8; 92];
                             let mut offset = 0;
@@ -369,7 +379,7 @@ impl MiningManager {
                             offset += 8;
 
                             header_data[offset..offset + 8]
-                                .copy_from_slice(&current_network_difficulty.to_le_bytes());
+                                .copy_from_slice(&cached_difficulty.to_le_bytes());
                             offset += 8;
 
                             header_data[offset..offset + 32].copy_from_slice(&merkle_root);
@@ -378,10 +388,11 @@ impl MiningManager {
                         };
 
                         let hash_int = BigUint::from_bytes_be(&hash);
-                        if hash_int <= *target {
+                        if hash_int <= cached_target {
                             if !found.swap(true, Ordering::Relaxed) {
                                 result_nonce.store(nonce, Ordering::Release);
                                 result_timestamp.store(timestamp, Ordering::Release);
+                                result_difficulty.store(cached_difficulty, Ordering::Release);
                                 if let Ok(mut hash_guard) = hash_result.lock() {
                                     *hash_guard = hash.to_vec();
                                 }
@@ -396,7 +407,7 @@ impl MiningManager {
                                 pb.set_message(format!(
                                     "Hash: {} (Difficulty: {})",
                                     &hash_hex[..16],
-                                    current_network_difficulty
+                                    cached_difficulty
                                 ));
                             }
 
@@ -419,6 +430,7 @@ impl MiningManager {
             if found.load(Ordering::Relaxed) {
                 let nonce = result_nonce.load(Ordering::Acquire);
                 let found_timestamp = result_timestamp.load(Ordering::Acquire);
+                let found_difficulty = result_difficulty.load(Ordering::Acquire);
                 let hash = match hash_result.lock() {
                     Ok(guard) => guard.clone(),
                     Err(_) => {
@@ -435,7 +447,7 @@ impl MiningManager {
                     timestamp: found_timestamp,
                     transactions: block_transactions,
                     nonce,
-                    difficulty: current_network_difficulty,
+                    difficulty: found_difficulty,
                     hash: [0u8; 32],
                     merkle_root,
                 };
