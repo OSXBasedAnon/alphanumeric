@@ -5,6 +5,7 @@ use log::{debug, error, warn};
 use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
+use rustyline::{error::ReadlineError, DefaultEditor};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -955,32 +956,95 @@ async fn main() -> Result<()> {
         println!("6. Mine Block (format: mine miner_wallet_name)");
         println!("7. Exit");
 
+        let mut line_editor = match DefaultEditor::new() {
+            Ok(editor) => Some(editor),
+            Err(e) => {
+                warn!("Line editor unavailable; falling back to standard input: {}", e);
+                None
+            }
+        };
+        let mut last_console_command: Option<String> = None;
+
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let mut stdout = StandardStream::stdout(ColorChoice::Always);
-            let mut color_spec = ColorSpec::new();
-            color_spec.set_fg(Some(Color::White)).set_bold(true);
-            let _ = stdout.set_color(&color_spec);
-            print!("αlphanumeric:");
-            let _ = stdout.reset();
-            println!();
+            let mut command = if line_editor.is_some() {
+                let read_result = line_editor
+                    .as_mut()
+                    .expect("line editor checked")
+                    .readline("αlphanumeric:\n");
+                match read_result {
+                    Ok(line) => line.trim().to_string(),
+                    Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Line editor failed; falling back to standard input: {}", e);
+                        line_editor = None;
+                        continue;
+                    }
+                }
+            } else {
+                let mut stdout = StandardStream::stdout(ColorChoice::Always);
+                let mut color_spec = ColorSpec::new();
+                color_spec.set_fg(Some(Color::White)).set_bold(true);
+                let _ = stdout.set_color(&color_spec);
+                print!("αlphanumeric:");
+                let _ = stdout.reset();
+                println!();
 
-            let mut command = String::new();
-            if let Err(e) = std::io::stdin().read_line(&mut command) {
-                warn!("Input loop interrupted: {}", e);
-                let _ = remove_db_lock(&format!("{}.lock", db_path));
-                let _ = remove_instance_lock();
-                return Ok(());
+                let mut command = String::new();
+                match std::io::stdin().read_line(&mut command) {
+                    Ok(0) => {
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                    Ok(_) => command.trim().to_string(),
+                    Err(e) => {
+                        warn!("Input loop interrupted: {}", e);
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                }
+            };
+
+            let recalled_previous = matches!(command.as_str(), "\u{1b}[A" | "\u{1b}OA" | "^[[A")
+                || (command.starts_with('\u{1b}') && command.ends_with("[A"))
+                || (command.ends_with("[A") && command.len() <= 8)
+                || command.contains('\u{1b}')
+                || command.contains("[A");
+            if recalled_previous {
+                if let Some(previous) = last_console_command.clone() {
+                    println!("{}", previous);
+                    command = previous;
+                } else {
+                    println!("No previous command.");
+                    continue;
+                }
             }
-            let command = command.trim();
+
+            if command.is_empty() {
+                println!("Please enter a command.");
+                continue;
+            }
+
+            if !recalled_previous {
+                if let Some(editor) = line_editor.as_mut() {
+                    let _ = editor.add_history_entry(command.as_str());
+                }
+                last_console_command = Some(command.clone());
+            }
 
             match command.split_whitespace().next() {
                 Some("create") | Some("send") | Some("transfer") => {
                     // Handle the creation of the transaction
                     if let Err(e) = mgmt
-                        .handle_create_transaction(command, &mut wallets, &blockchain, &db_arc)
+                        .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
                         .await
                     {
                         println!("Error: {}", e);
@@ -1151,7 +1215,12 @@ async fn main() -> Result<()> {
     }
     color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
     stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Difficulty:        {}", blockchain_guard.get_current_difficulty().await)?;
+    let tip_difficulty = blockchain_guard.get_tip_difficulty().await;
+    let next_difficulty = blockchain_guard.get_current_difficulty().await;
+    writeln!(stdout, "Difficulty:        {}", tip_difficulty)?;
+    if next_difficulty != tip_difficulty {
+        writeln!(stdout, "Next Difficulty:   {}", next_difficulty)?;
+    }
     color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Hashrate:          {:.2} TH/s", blockchain_guard.calculate_network_hashrate().await)?;
@@ -1261,13 +1330,34 @@ println!("Wallet renamed successfully");
                         .await
                     {
                         Ok(mined_block) => {
-                            if let Err(e) = node.publish_block(mined_block, "Post-mine").await {
-                                warn!("Failed to publish mined block: {}", e);
-                                println!(
-                                    "Warning: mined block saved locally, but network publish failed: {}",
-                                    e
-                                );
-                            }
+                            let publish_node = Arc::clone(&node);
+                            tokio::spawn(async move {
+                                const MAX_PUBLISH_ATTEMPTS: u32 = 4;
+                                for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
+                                    match publish_node
+                                        .publish_block(mined_block.clone(), "Post-mine")
+                                        .await
+                                    {
+                                        Ok(()) => return,
+                                        Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
+                                            warn!(
+                                                "Failed to publish mined block (attempt {}/{}): {}",
+                                                attempt, MAX_PUBLISH_ATTEMPTS, e
+                                            );
+                                            tokio::time::sleep(Duration::from_secs(
+                                                2 * attempt as u64,
+                                            ))
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to publish mined block after {} attempts: {}",
+                                                MAX_PUBLISH_ATTEMPTS, e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             println!("Mining error: {}", e);
@@ -1666,17 +1756,20 @@ Some("history") => {
     }
 },
     Some(cmd) if cmd.starts_with("--") => {
-        if let Err(e) = handle_network_commands(command, &node, &blockchain).await {
+        if let Err(e) = handle_network_commands(&command, &node, &blockchain).await {
             println!("Network command error: {}", e);
         }
     },
     Some("account") => {
-        if let Err(e) = mgmt.handle_account_command(command, &blockchain, &wallets).await {
+        if let Err(e) = mgmt
+            .handle_account_command(&command, &blockchain, &wallets)
+            .await
+        {
             println!("Error displaying account info: {}", e);
         }
     },
 
-Some("diagnostics") | Some("diag") => {
+Some("debug") | Some("diagnostics") | Some("diag") => {
     let blockchain_guard = blockchain.read().await;
     let oracle = DifficultyOracle::new();
 
@@ -1687,9 +1780,13 @@ Some("diagnostics") | Some("diag") => {
             .as_secs();
 
         let timestamp_diff = now.saturating_sub(last_block.timestamp);
-        let current_difficulty = blockchain_guard.get_current_difficulty().await;
+        let tip_difficulty = blockchain_guard.get_tip_difficulty().await;
+        let next_difficulty = blockchain_guard.get_current_difficulty().await;
 
-        if let Err(e) = oracle.display_difficulty_metrics(current_difficulty, timestamp_diff).await {
+        if let Err(e) = oracle
+            .display_difficulty_metrics(tip_difficulty, next_difficulty, timestamp_diff)
+            .await
+        {
             error!("Failed to display diagnostics: {}", e);
             println!("Error displaying diagnostics: {}", e);
         }
@@ -1720,6 +1817,7 @@ Some("help") => {
     println!("mine <wallet_name>                    - Mine a new block");
     println!("rename <wallet_name> <new_wallet>     - Rename wallet");
     println!("info                                  - Show blockchain information");
+    println!("debug                                 - Show dynamic network diagnostics");
 
     // For Network Commands header
     stdout.set_color(&header_style)?;

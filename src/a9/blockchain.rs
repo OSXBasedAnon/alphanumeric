@@ -1529,10 +1529,19 @@ impl Blockchain {
         if best_overlap_advantage < 0 {
             return Ok(false);
         }
+        if best_overlap_advantage == 0 {
+            let Some(branch_tip) = branch.last() else {
+                return Ok(false);
+            };
+            if branch_tip.index != tip.index || branch_tip.hash >= tip.hash {
+                return Ok(false);
+            }
+        }
 
         // Validate the selected branch (including parent-linked difficulty adjustment) before applying.
         for b in &branch {
-            self.validate_block_strict(b).await?;
+            self.validate_block_internal(b, SignatureValidationMode::AllowTruncatedStored)
+                .await?;
         }
 
         self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
@@ -2141,7 +2150,9 @@ impl Blockchain {
         match self.highest_block_index() {
             None => {
                 if block.index != 0 || block.previous_hash != [0u8; 32] {
-                    return Err(BlockchainError::InvalidBlockHeader);
+                    self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
+                    return Ok(());
                 }
             }
             Some(tip_index) => {
@@ -2151,14 +2162,20 @@ impl Blockchain {
                             return Ok(());
                         }
                     }
-                    return Err(BlockchainError::InvalidBlockHeader);
+                    self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
+                    return Ok(());
                 }
                 if block.index != tip_index.saturating_add(1) {
-                    return Err(BlockchainError::InvalidBlockHeader);
+                    self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
+                    return Ok(());
                 }
                 let prev = self.get_block(tip_index)?;
                 if block.previous_hash != prev.hash {
-                    return Err(BlockchainError::InvalidBlockHeader);
+                    self.store_orphan_block(block)?;
+                    let _ = self.try_adopt_orphan_branch().await?;
+                    return Ok(());
                 }
             }
         }
@@ -2168,6 +2185,8 @@ impl Blockchain {
             SignatureValidationMode::AllowTruncatedStored,
         )
         .await?;
+        let _ = self.promote_orphans_from_tip().await?;
+        let _ = self.try_adopt_orphan_branch().await?;
         Ok(())
     }
 
@@ -2426,6 +2445,14 @@ impl Blockchain {
                     .unwrap_or_default()
                     .as_secs(),
             )
+        } else {
+            *self.difficulty.lock().await
+        }
+    }
+
+    pub async fn get_tip_difficulty(&self) -> u64 {
+        if let Some(block) = self.get_last_block() {
+            block.difficulty
         } else {
             *self.difficulty.lock().await
         }
@@ -4051,6 +4078,31 @@ mod tests {
             .await
             .expect_err("child block with backwards timestamp should be rejected");
         assert!(matches!(err, BlockchainError::InvalidBlockHeader));
+    }
+
+    #[tokio::test]
+    async fn receipt_sync_parks_unattached_future_block_as_orphan() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "miner1", 2.0);
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+        blockchain.rebuild_chain_tip_metadata().unwrap();
+
+        let mut missing_parent_hash = [0x42u8; 32];
+        missing_parent_hash[0] = 0x99;
+        let future = metadata_test_block(2, missing_parent_hash, "miner2", 3.0);
+
+        blockchain
+            .save_receipt_verified_block(&future)
+            .await
+            .expect("unattached relayed blocks should be parked for later branch adoption");
+
+        assert_eq!(blockchain.get_latest_block_index(), 1);
+        assert!(blockchain
+            .get_orphan_block_by_hash(&future.hash)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

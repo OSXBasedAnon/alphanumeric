@@ -149,7 +149,8 @@ impl DifficultyOracle {
 
     pub async fn display_difficulty_metrics(
         &self,
-        current_difficulty: u64,
+        tip_difficulty: u64,
+        next_difficulty: u64,
         timestamp_diff: u64,
     ) -> std::io::Result<()> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
@@ -160,7 +161,7 @@ impl DifficultyOracle {
         let load = self.estimate_computational_load();
         let entropy = self.measure_network_entropy();
         let stability = self.assess_network_stability();
-        let blocks_missed = timestamp_diff.saturating_sub(TARGET_BLOCK_TIME) / TARGET_BLOCK_TIME;
+        let idle_intervals = timestamp_diff.saturating_sub(TARGET_BLOCK_TIME) / TARGET_BLOCK_TIME;
 
         // Calculate adjustment components
         let timing_error =
@@ -176,10 +177,11 @@ impl DifficultyOracle {
         metrics.set_fg(Some(Color::Rgb(230, 230, 230)));
         stdout.set_color(&metrics)?;
         writeln!(stdout, "Base Metrics:")?;
-        writeln!(stdout, "Current Difficulty:   {}", current_difficulty)?;
-        writeln!(stdout, "Block Age:           {}s", timestamp_diff)?;
-        writeln!(stdout, "Blocks Missed:       {}", blocks_missed)?;
-        writeln!(stdout, "Time Error:          {:.2}%", timing_error * 100.0)?;
+        writeln!(stdout, "Tip Difficulty:        {}", tip_difficulty)?;
+        writeln!(stdout, "Next Mining Difficulty: {}", next_difficulty)?;
+        writeln!(stdout, "Tip Age:              {}s", timestamp_diff)?;
+        writeln!(stdout, "Idle Target Intervals: {}", idle_intervals)?;
+        writeln!(stdout, "Time Drift:           {:.2}%", timing_error * 100.0)?;
 
         metrics.set_fg(Some(Color::Rgb(137, 207, 211)));
         stdout.set_color(&metrics)?;
@@ -201,9 +203,7 @@ impl DifficultyOracle {
 
         // System Analysis - Fix the ColorSpec temporary value issue
         let mut alert_style = ColorSpec::new();
-        alert_style.set_fg(Some(if blocks_missed > 5 {
-            Color::Rgb(255, 84, 73) // Red for alert
-        } else if blocks_missed > 2 {
+        alert_style.set_fg(Some(if idle_intervals > 12 {
             Color::Rgb(237, 124, 51) // Orange for warning
         } else {
             Color::Rgb(59, 242, 173) // Green for normal
@@ -213,11 +213,10 @@ impl DifficultyOracle {
         writeln!(
             stdout,
             "\nSystem Status: {}\n",
-            match blocks_missed {
-                0..=2 => "Normal Operation",
-                3..=5 => "Minor Adjustment Needed",
-                6..=10 => "Significant Deviation",
-                _ => "Critical Adjustment Required",
+            match idle_intervals {
+                0..=2 => "Active Tip",
+                3..=12 => "Idle Network: waiting for next mined block",
+                _ => "Extended Idle: next block will apply the slow-block floor if needed",
             }
         )?;
 

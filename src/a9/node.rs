@@ -1594,7 +1594,7 @@ impl Node {
             None => return Ok(()),
         };
         let height = last_block.index;
-        let difficulty = blockchain.get_current_difficulty().await;
+        let difficulty = blockchain.get_tip_difficulty().await;
 
         let start = height.saturating_sub(20);
         let mut headers = Vec::new();
@@ -1702,7 +1702,7 @@ impl Node {
 
         let difficulty = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_current_difficulty().await
+            blockchain.get_tip_difficulty().await
         };
 
         let hashrate_ths = {
@@ -1872,7 +1872,11 @@ impl Node {
         }
 
         let network_id = hex::encode(self.network_id);
-        let limit = end.saturating_sub(start).saturating_add(1).min(200);
+        let limit = end
+            .saturating_sub(start)
+            .saturating_add(1)
+            .saturating_mul(4)
+            .clamp(1, 200);
         let mut all_blocks = Vec::new();
         let mut any_ok = false;
 
@@ -1949,43 +1953,51 @@ impl Node {
             return Err(NodeError::Network("Block relay sync disabled".into()));
         }
 
-        const RELAY_BATCH_SIZE: u32 = 50;
-        const MAX_RELAY_ROUNDS: usize = 12;
+        const RELAY_BATCH_SIZE: u32 = 64;
+        const RELAY_BACKFILL_DEPTH: u32 = 256;
+        const MAX_RELAY_ROUNDS: usize = 24;
 
-        let mut tip_height = current_height;
+        let mut cursor = current_height.saturating_sub(RELAY_BACKFILL_DEPTH);
         let mut total_saved = 0usize;
+        let mut accepted_any = false;
 
         for _ in 0..MAX_RELAY_ROUNDS {
-            let start = tip_height.saturating_add(1);
+            let start = cursor;
             let end = start.saturating_add(RELAY_BATCH_SIZE.saturating_sub(1));
             let blocks = self.fetch_relay_blocks(start, end).await?;
             if blocks.is_empty() {
+                if start <= current_height {
+                    cursor = end.saturating_add(1);
+                    continue;
+                }
                 break;
             }
 
             let blockchain = self.blockchain.write().await;
-            let mut progressed = false;
+            let before_batch = blockchain.get_latest_block_index() as u32;
 
             for block in blocks {
-                if block.index <= tip_height {
-                    continue;
-                }
-
                 let before = blockchain.get_latest_block_index() as u32;
                 match blockchain.save_receipt_verified_block(&block).await {
                     Ok(()) => {
+                        accepted_any = true;
                         let after = blockchain.get_latest_block_index() as u32;
                         if after > before {
                             total_saved += after.saturating_sub(before) as usize;
-                            tip_height = after;
-                            progressed = true;
                         }
                     }
                     Err(e) => warn!("Failed to save relayed block {}: {}", block.index, e),
                 }
             }
 
-            if !progressed {
+            let after_batch = blockchain.get_latest_block_index() as u32;
+            if after_batch > end {
+                cursor = after_batch.saturating_add(1);
+            } else {
+                cursor = end.saturating_add(1);
+            }
+
+            if after_batch == before_batch && start > current_height {
                 break;
             }
         }
@@ -1993,10 +2005,16 @@ impl Node {
         if total_saved > 0 {
             info!(
                 "Blockchain synchronized from block relay: added {} blocks to height {}",
-                total_saved, tip_height
+                total_saved,
+                {
+                    let blockchain = self.blockchain.read().await;
+                    blockchain.get_latest_block_index()
+                }
             );
             self.publish_discovery_state("Post-relay-sync").await;
             Ok(total_saved)
+        } else if accepted_any {
+            Ok(0)
         } else {
             Err(NodeError::Network("No relayed blocks available".into()))
         }
@@ -2024,15 +2042,32 @@ impl Node {
             }
         }
 
-        let has_peers = !self.peers.read().await.is_empty();
-        if has_peers {
-            match timeout(max_wait, self.sync_with_network()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Pre-mine sync skipped: {}", e),
-                Err(_) => warn!("Pre-mine sync timed out; continuing with local tip"),
+        match timeout(max_wait, self.sync_with_network()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Pre-mine sync skipped: {}", e),
+            Err(_) => warn!("Pre-mine sync timed out; continuing with local tip"),
+        }
+
+        if self.peers.read().await.is_empty() {
+            let current_height = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
+            match timeout(max_wait, self.sync_with_block_relay(current_height)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!("Pre-mine relay sync skipped: {}", e),
+                Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
             }
         } else {
-            warn!("Mining without connected peers; local block will be published after mining");
+            let current_height = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
+            match timeout(max_wait, self.sync_with_block_relay(current_height)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!("Pre-mine relay sync had no newer blocks: {}", e),
+                Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
+            }
         }
         Ok(())
     }
@@ -2092,14 +2127,20 @@ impl Node {
             }
         }
 
+        let mut relay_error = None;
         if let Err(e) = self.post_block_relay(&block).await {
             warn!("{} block relay failed: {}", context, e);
+            relay_error = Some(e);
         }
         self.post_recent_blocks_to_relay(12).await;
 
         self.publish_discovery_state(context).await;
 
-        Ok(())
+        if let Some(e) = relay_error {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
@@ -2118,7 +2159,7 @@ impl Node {
 
         let difficulty = {
             let blockchain = state.blockchain.read().await;
-            blockchain.get_current_difficulty().await
+            blockchain.get_tip_difficulty().await
         };
 
         let hashrate_ths = {
@@ -6256,13 +6297,18 @@ impl Node {
                                 let mut saved_count = 0;
 
                                 for block in candidate_blocks {
-                                    if let Err(e) =
-                                        blockchain.save_receipt_verified_block(&block).await
-                                    {
-                                        warn!("Failed to save block {}: {}", block.index, e);
-                                    } else {
-                                        saved_count += 1;
-                                        current_sync_height = current_sync_height.max(block.index);
+                                    let before = blockchain.get_latest_block_index() as u32;
+                                    match blockchain.save_receipt_verified_block(&block).await {
+                                        Ok(()) => {
+                                            let after = blockchain.get_latest_block_index() as u32;
+                                            if after > before {
+                                                saved_count += after.saturating_sub(before);
+                                                current_sync_height = after;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to save block {}: {}", block.index, e)
+                                        }
                                     }
                                 }
 
@@ -6277,6 +6323,9 @@ impl Node {
                                 );
 
                                 blocks_synced += saved_count;
+                                if saved_count == 0 {
+                                    break;
+                                }
                             } else {
                                 warn!("No valid blocks received for range {}-{}", start, end);
                                 break; // Try next peer

@@ -60,6 +60,7 @@ axum = "0.6"
 ctrlc = "3.4"
 igd-next = "0.15"
 sysinfo = "0.30"
+rustyline = "18.0.1"
 
 [build-dependencies]
 bindgen = "0.64"
