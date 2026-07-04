@@ -22,6 +22,7 @@ use crate::a9::{
 };
 
 const KEY_FILE_PATH: &str = "private.key";
+const MINING_NONCE_WINDOW: u64 = 67_108_864;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -641,7 +642,7 @@ impl Mgmt {
             .mine_block(
                 &mut header,
                 &progpow_transactions,
-                1_000_000,
+                MINING_NONCE_WINDOW,
                 9001,
                 miner_wallet.address.clone(),
                 mining_reward,

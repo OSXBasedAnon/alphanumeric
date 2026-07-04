@@ -1175,6 +1175,25 @@ impl Node {
             .map_err(|e| NodeError::Serialization(format!("JSON canonicalization error: {}", e)))
     }
 
+    fn env_flag_enabled(name: &str) -> bool {
+        std::env::var(name)
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty()
+                    && !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "0" | "false" | "no" | "off"
+                    )
+            })
+            .unwrap_or(false)
+    }
+
+    fn public_discovery_publish_enabled() -> bool {
+        let local_genesis = Self::env_flag_enabled("ALPHANUMERIC_USE_LOCAL_V2_GENESIS")
+            || Self::env_flag_enabled("ALPHANUMERIC_RESET_TO_V2_GENESIS");
+        !local_genesis || Self::env_flag_enabled("ALPHANUMERIC_ALLOW_LOCAL_DISCOVERY")
+    }
+
     fn dns_seeds() -> Vec<String> {
         let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS")
             .or_else(|_| std::env::var("ALPHANUMERIC_SEED_NODES"))
@@ -1375,6 +1394,11 @@ impl Node {
     }
 
     async fn announce_to_discovery(&self) -> Result<(), NodeError> {
+        if !Self::public_discovery_publish_enabled() {
+            debug!("Skipping public discovery announce for local genesis node");
+            return Ok(());
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1478,6 +1502,11 @@ impl Node {
     }
 
     async fn post_header_snapshot(&self) -> Result<(), NodeError> {
+        if !Self::public_discovery_publish_enabled() {
+            debug!("Skipping public header snapshot for local genesis node");
+            return Ok(());
+        }
+
         let blockchain = self.blockchain.read().await;
         let last_block = match blockchain.get_last_block() {
             Some(b) => b,
@@ -1564,6 +1593,11 @@ impl Node {
     }
 
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
+        if !Self::public_discovery_publish_enabled() {
+            debug!("Skipping public stats snapshot for local genesis node");
+            return Ok(());
+        }
+
         let height = {
             let blockchain = self.blockchain.read().await;
             blockchain.get_latest_block_index() as u32
@@ -1638,6 +1672,84 @@ impl Node {
 
         if !any_ok {
             warn!("Stats snapshot post failed on all endpoints");
+        }
+
+        Ok(())
+    }
+
+    pub async fn prepare_local_mining(&self) {
+        let has_peers = !self.peers.read().await.is_empty();
+        if !has_peers {
+            if let Err(e) = self.connect_discovery_peers(8).await {
+                warn!("Pre-mine discovery failed: {}", e);
+            }
+        }
+
+        let has_peers = !self.peers.read().await.is_empty();
+        if has_peers {
+            match timeout(Duration::from_secs(10), self.sync_with_network()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Pre-mine sync skipped: {}", e),
+                Err(_) => warn!("Pre-mine sync timed out; continuing with local tip"),
+            }
+        } else {
+            warn!("Mining without connected peers; local block will be published after mining");
+        }
+    }
+
+    pub async fn publish_local_tip(&self) -> Result<(), NodeError> {
+        if self.peers.read().await.is_empty() {
+            if let Err(e) = self.connect_discovery_peers(8).await {
+                warn!("Post-mine discovery failed: {}", e);
+            }
+        }
+
+        let tip = {
+            let blockchain = self.blockchain.read().await;
+            blockchain
+                .get_last_block()
+                .ok_or_else(|| NodeError::Blockchain("No local chain tip found".to_string()))?
+        };
+
+        let block_hash = tip.calculate_hash_for_block();
+        let _ = self.network_bloom.insert(&block_hash);
+
+        let selected_peers = {
+            let peers = self.peers.read().await;
+            self.select_broadcast_peers(&peers, peers.len().min(16))
+        };
+
+        if selected_peers.is_empty() {
+            warn!("Mined block saved locally, but no peers were available for block broadcast");
+        } else {
+            let mut delivered = 0usize;
+            for addr in selected_peers {
+                match self
+                    .send_message(addr, &NetworkMessage::Block(tip.clone()))
+                    .await
+                {
+                    Ok(()) => delivered += 1,
+                    Err(e) => warn!("Failed to publish mined block to {}: {}", addr, e),
+                }
+            }
+            if delivered == 0 {
+                warn!("Mined block broadcast failed for every selected peer");
+            } else {
+                info!(
+                    "Published mined block #{} to {} peer(s)",
+                    tip.index, delivered
+                );
+            }
+        }
+
+        if let Err(e) = self.announce_to_discovery().await {
+            warn!("Post-mine discovery announce failed: {}", e);
+        }
+        if let Err(e) = self.post_header_snapshot().await {
+            warn!("Post-mine header snapshot failed: {}", e);
+        }
+        if let Err(e) = self.post_stats_snapshot().await {
+            warn!("Post-mine stats snapshot failed: {}", e);
         }
 
         Ok(())

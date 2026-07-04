@@ -1113,11 +1113,15 @@ if parts.len() != 2 {
 println!("Usage: mine <miner_wallet_name>");
 continue;
 }
+node.prepare_local_mining().await;
 if let Err(e) = mgmt
 .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
 .await
 {
 println!("Mining error: {}", e);
+} else if let Err(e) = node.publish_local_tip().await {
+warn!("Failed to publish mined block: {}", e);
+println!("Warning: mined block saved locally, but network publish failed: {}", e);
 }
 }
 Some("whisper") => {

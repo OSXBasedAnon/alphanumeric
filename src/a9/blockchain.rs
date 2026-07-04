@@ -60,6 +60,9 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
+// Floor maps to roughly 2^26 expected hashes. One miner should not mint long
+// runs instantly; aggregate hashpower can still pull the network toward 5s.
+const NETWORK_MIN_DIFFICULTY: u64 = 416;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
@@ -545,11 +548,10 @@ impl Block {
     pub fn adjust_dynamic_difficulty(
         current_difficulty: u64,
         timestamp_diff: u64,
-        _block_index: u32, // Unused parameter, can be prefixed with _
+        _block_index: u32,
         oracle: &mut DifficultyOracle,
         current_timestamp: u64,
     ) -> u64 {
-        const MIN_DIFFICULTY: u64 = 321;
         const MAX_DIFFICULTY: u64 = u64::MAX / 2;
         const MAX_ADJUSTMENT: f64 = 1.15;
         const DAMPENING_FACTOR: f64 = 0.6;
@@ -560,7 +562,7 @@ impl Block {
 
         // Emergency Reset Condition (from the second version)
         if timestamp_diff > TARGET_BLOCK_TIME * EMERGENCY_THRESHOLD {
-            return MIN_DIFFICULTY; // Force reset when blocks are very slow
+            return NETWORK_MIN_DIFFICULTY; // Force reset when blocks are very slow
         }
 
         // Base time ratio calculation
@@ -582,11 +584,11 @@ impl Block {
 
         // Aggressive minimum difficulty adjustment (from the second version, adapted)
         if time_ratio > 2.0 {
-            return (raw_difficulty / 2).max(MIN_DIFFICULTY); // Cut difficulty in half but respect minimum
+            return (raw_difficulty / 2).max(NETWORK_MIN_DIFFICULTY); // Cut difficulty in half but respect minimum
         }
 
         // Ensure bounds (from the first version, but using clamp for conciseness)
-        raw_difficulty.clamp(MIN_DIFFICULTY, MAX_DIFFICULTY)
+        raw_difficulty.clamp(NETWORK_MIN_DIFFICULTY, MAX_DIFFICULTY)
     }
 
     pub fn verify_difficulty_proof(&self) -> bool {
