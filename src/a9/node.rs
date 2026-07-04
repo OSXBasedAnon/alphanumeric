@@ -743,6 +743,7 @@ pub struct Node {
     pub rate_limiter: Arc<RateLimiter>,
     http_client: Client,
     discovery_state: Arc<Mutex<DiscoveryState>>,
+    public_relay_tip: Arc<RwLock<Option<RelayTipState>>>,
     p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
     pub peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
@@ -856,6 +857,12 @@ struct DiscoveryState {
     in_progress: bool,
     failures: u32,
     next_attempt: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayTipState {
+    height: u32,
+    hash: [u8; 32],
 }
 
 impl DiscoveryState {
@@ -989,6 +996,7 @@ impl Node {
             p2p_swarm: Arc::new(Mutex::new(None)),
             http_client,
             discovery_state: Arc::new(Mutex::new(DiscoveryState::new())),
+            public_relay_tip: Arc::new(RwLock::new(None)),
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             temporal_verification,
@@ -1310,6 +1318,83 @@ impl Node {
             .collect()
     }
 
+    fn relay_backfill_limit() -> u32 {
+        std::env::var("ALPHANUMERIC_RELAY_BACKFILL_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(4)
+            .min(12)
+    }
+
+    async fn mark_block_relayed(&self, block: &Block) {
+        let mut public_tip = self.public_relay_tip.write().await;
+        let should_update = public_tip
+            .map(|tip| {
+                block.index > tip.height || (block.index == tip.height && block.hash == tip.hash)
+            })
+            .unwrap_or(true);
+        if should_update {
+            *public_tip = Some(RelayTipState {
+                height: block.index,
+                hash: block.hash,
+            });
+        }
+    }
+
+    async fn public_advertisable_tip(&self) -> Option<Block> {
+        let relay_tip = *self.public_relay_tip.read().await;
+        let relay_tip = match relay_tip {
+            Some(tip) => tip,
+            None => {
+                debug!("Public discovery publish skipped until a local block is relay-confirmed");
+                return None;
+            }
+        };
+
+        let blockchain = self.blockchain.read().await;
+        match blockchain.get_block(relay_tip.height) {
+            Ok(block) if block.hash == relay_tip.hash => Some(block),
+            Ok(_) => {
+                warn!(
+                    "Relay-confirmed tip #{} no longer matches local canonical block; suppressing public announce",
+                    relay_tip.height
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Relay-confirmed tip #{} is not available locally: {}",
+                    relay_tip.height, e
+                );
+                None
+            }
+        }
+    }
+
+    async fn ensure_public_tip_relayed(&self) -> Result<(), NodeError> {
+        let tip = {
+            let blockchain = self.blockchain.read().await;
+            blockchain
+                .get_last_block()
+                .ok_or_else(|| NodeError::Blockchain("No local chain tip found".to_string()))?
+        };
+
+        let already_relayed = self
+            .public_relay_tip
+            .read()
+            .await
+            .map(|public_tip| public_tip.height == tip.index && public_tip.hash == tip.hash)
+            .unwrap_or(false);
+        if already_relayed {
+            return Ok(());
+        }
+
+        self.post_block_relay(&tip).await?;
+        self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
+            .await;
+        Ok(())
+    }
+
     async fn get_external_ip(&self) -> Option<IpAddr> {
         // Prefer a concrete bind address if available
         let ip = self.bind_addr.ip();
@@ -1487,10 +1572,10 @@ impl Node {
                 .map(|addr| addr.to_string())
         };
 
-        let height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
+        let Some(public_tip) = self.public_advertisable_tip().await else {
+            return Ok(());
         };
+        let height = public_tip.index;
         let network_id = hex::encode(self.network_id);
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
@@ -1588,24 +1673,25 @@ impl Node {
             return Ok(());
         }
 
-        let blockchain = self.blockchain.read().await;
-        let last_block = match blockchain.get_last_block() {
-            Some(b) => b,
-            None => return Ok(()),
+        let Some(last_block) = self.public_advertisable_tip().await else {
+            return Ok(());
         };
         let height = last_block.index;
-        let difficulty = blockchain.get_tip_difficulty().await;
+        let difficulty = last_block.difficulty;
 
         let start = height.saturating_sub(20);
         let mut headers = Vec::new();
-        for h in start..=height {
-            if let Ok(block) = blockchain.get_block(h) {
-                headers.push(json!({
-                    "height": block.index,
-                    "hash": hex::encode(block.hash),
-                    "prev_hash": hex::encode(block.previous_hash),
-                    "timestamp": block.timestamp
-                }));
+        {
+            let blockchain = self.blockchain.read().await;
+            for h in start..=height {
+                if let Ok(block) = blockchain.get_block(h) {
+                    headers.push(json!({
+                        "height": block.index,
+                        "hash": hex::encode(block.hash),
+                        "prev_hash": hex::encode(block.previous_hash),
+                        "timestamp": block.timestamp
+                    }));
+                }
             }
         }
 
@@ -1687,23 +1773,12 @@ impl Node {
             return Ok(());
         }
 
-        let height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
+        let Some(public_tip) = self.public_advertisable_tip().await else {
+            return Ok(());
         };
-
-        let last_block_time = {
-            let blockchain = self.blockchain.read().await;
-            blockchain
-                .get_last_block()
-                .map(|b| b.timestamp)
-                .unwrap_or(0)
-        };
-
-        let difficulty = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_tip_difficulty().await
-        };
+        let height = public_tip.index;
+        let last_block_time = public_tip.timestamp;
+        let difficulty = public_tip.difficulty;
 
         let hashrate_ths = {
             let blockchain = self.blockchain.read().await;
@@ -1830,8 +1905,12 @@ impl Node {
 
         if !any_ok {
             warn!("Block relay post failed on all endpoints");
+            return Err(NodeError::Network(
+                "Block relay post failed on all endpoints".into(),
+            ));
         }
 
+        self.mark_block_relayed(block).await;
         Ok(())
     }
 
@@ -1993,11 +2072,13 @@ impl Node {
 
             let blockchain = self.blockchain.write().await;
             let before_batch = blockchain.get_latest_block_index() as u32;
+            let mut relay_confirmed_blocks = Vec::new();
 
             for block in blocks {
                 let before = blockchain.get_latest_block_index() as u32;
                 match blockchain.save_receipt_verified_block(&block).await {
                     Ok(()) => {
+                        relay_confirmed_blocks.push(block.clone());
                         accepted_any = true;
                         let after = blockchain.get_latest_block_index() as u32;
                         if after > before {
@@ -2009,6 +2090,10 @@ impl Node {
             }
 
             let after_batch = blockchain.get_latest_block_index() as u32;
+            drop(blockchain);
+            for block in relay_confirmed_blocks {
+                self.mark_block_relayed(&block).await;
+            }
             if after_batch > end {
                 cursor = after_batch.saturating_add(1);
             } else {
@@ -2145,20 +2230,16 @@ impl Node {
             }
         }
 
-        let mut relay_error = None;
         if let Err(e) = self.post_block_relay(&block).await {
             warn!("{} block relay failed: {}", context, e);
-            relay_error = Some(e);
+            return Err(e);
         }
-        self.post_recent_blocks_to_relay(12).await;
+        self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
+            .await;
 
         self.publish_discovery_state(context).await;
 
-        if let Some(e) = relay_error {
-            Err(e)
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
@@ -3357,6 +3438,10 @@ impl Node {
             let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_INTERVAL));
             loop {
                 announce_interval.tick().await;
+                if let Err(e) = node_clone.ensure_public_tip_relayed().await {
+                    debug!("Public relay tip refresh failed: {}", e);
+                    continue;
+                }
                 if let Err(e) = node_clone.announce_to_discovery().await {
                     debug!("Announce error: {}", e);
                 }
