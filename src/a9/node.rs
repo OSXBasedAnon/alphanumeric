@@ -840,6 +840,17 @@ struct DiscoveryPeer {
     node_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BlockRelayResponse {
+    ok: bool,
+    blocks: Option<Vec<BlockRelayRecord>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockRelayRecord {
+    block: Value,
+}
+
 #[derive(Debug)]
 struct DiscoveryState {
     in_progress: bool,
@@ -1003,8 +1014,6 @@ impl Node {
                 info!("Using provided bind address: {}", addr);
                 let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
                 socket.set_reuse_address(true)?;
-                #[cfg(unix)]
-                socket.set_reuse_port(true)?;
                 socket.set_nodelay(true)?;
 
                 info!("Attempting to bind to address: {}", addr);
@@ -1047,8 +1056,6 @@ impl Node {
     fn try_bind_default_port() -> Result<(SocketAddr, TcpListener), NodeError> {
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_address(true)?;
-        #[cfg(unix)]
-        socket.set_reuse_port(true)?;
         socket.set_nodelay(true)?;
 
         // Bind to all interfaces (0.0.0.0) with default port
@@ -1209,6 +1216,20 @@ impl Node {
         !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_PUBLIC_DISCOVERY")
     }
 
+    fn public_announce_enabled() -> bool {
+        Self::public_discovery_publish_enabled()
+            && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_PUBLIC_ANNOUNCE")
+    }
+
+    fn block_relay_publish_enabled() -> bool {
+        Self::public_discovery_publish_enabled()
+            && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY")
+    }
+
+    fn block_relay_sync_enabled() -> bool {
+        !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC")
+    }
+
     fn dns_seeds() -> Vec<String> {
         let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS")
             .or_else(|_| std::env::var("ALPHANUMERIC_SEED_NODES"))
@@ -1276,6 +1297,16 @@ impl Node {
         Self::discovery_bases()
             .into_iter()
             .map(|base| format!("{}/api/headers", base))
+            .collect()
+    }
+
+    fn discovery_blocks_urls() -> Vec<String> {
+        if let Ok(url) = std::env::var("ALPHANUMERIC_BLOCKS_URL") {
+            return vec![url];
+        }
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/blocks", base))
             .collect()
     }
 
@@ -1433,7 +1464,7 @@ impl Node {
     }
 
     async fn announce_to_discovery(&self) -> Result<(), NodeError> {
-        if !Self::public_discovery_publish_enabled() {
+        if !Self::public_announce_enabled() {
             debug!("Skipping public discovery announce because it is disabled by environment");
             return Ok(());
         }
@@ -1746,6 +1777,231 @@ impl Node {
         Ok(())
     }
 
+    async fn post_block_relay(&self, block: &Block) -> Result<(), NodeError> {
+        if !Self::block_relay_publish_enabled() {
+            debug!("Skipping public block relay because it is disabled by environment");
+            return Ok(());
+        }
+
+        let block_value = serde_json::to_value(block)
+            .map_err(|e| NodeError::Serialization(format!("Block relay JSON error: {}", e)))?;
+        let network_id = hex::encode(self.network_id);
+        let hash = hex::encode(block.hash);
+        let previous_hash = hex::encode(block.previous_hash);
+        let message = json!({
+            "network_id": network_id,
+            "height": block.index,
+            "hash": hash,
+            "previous_hash": previous_hash,
+            "timestamp": block.timestamp,
+            "difficulty": block.difficulty,
+            "node_id": &self.node_id,
+            "public_key": &self.node_id
+        });
+
+        let canonical = Self::canonical_json_string(&message)?;
+        let signature = self.sign_with_handshake_key(canonical.as_bytes())?;
+        let mut payload = message.clone();
+        if let Value::Object(map) = &mut payload {
+            map.insert("block".to_string(), block_value);
+            map.insert(
+                "signature".to_string(),
+                json!(hex::encode(signature.as_slice())),
+            );
+        }
+
+        let mut any_ok = false;
+        for url in Self::discovery_blocks_urls() {
+            let res = self.http_client.post(url).json(&payload).send().await;
+            match res {
+                Ok(res) if res.status().is_success() => any_ok = true,
+                Ok(res) => {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    warn!(
+                        "Block relay post failed: {} {}",
+                        status,
+                        Self::response_body_snippet(&body)
+                    );
+                }
+                Err(e) => warn!("Block relay post error: {}", e),
+            }
+        }
+
+        if !any_ok {
+            warn!("Block relay post failed on all endpoints");
+        }
+
+        Ok(())
+    }
+
+    async fn post_recent_blocks_to_relay(&self, limit: u32) {
+        if limit == 0 || !Self::block_relay_publish_enabled() {
+            return;
+        }
+
+        let blocks = {
+            let blockchain = self.blockchain.read().await;
+            let Some(tip) = blockchain.get_last_block() else {
+                return;
+            };
+            let start = tip.index.saturating_sub(limit.saturating_sub(1));
+            let mut blocks = Vec::new();
+            for height in start..=tip.index {
+                match blockchain.get_block(height) {
+                    Ok(block) => blocks.push(block),
+                    Err(e) => debug!("Recent relay block {} unavailable: {}", height, e),
+                }
+            }
+            blocks
+        };
+
+        for block in blocks {
+            if let Err(e) = self.post_block_relay(&block).await {
+                debug!("Recent block relay failed for #{}: {}", block.index, e);
+            }
+        }
+    }
+
+    async fn fetch_relay_blocks(&self, start: u32, end: u32) -> Result<Vec<Block>, NodeError> {
+        if !Self::block_relay_sync_enabled() {
+            return Err(NodeError::Network("Block relay sync disabled".into()));
+        }
+        if end < start {
+            return Ok(Vec::new());
+        }
+
+        let network_id = hex::encode(self.network_id);
+        let limit = end.saturating_sub(start).saturating_add(1).min(200);
+        let mut all_blocks = Vec::new();
+        let mut any_ok = false;
+
+        for base_url in Self::discovery_blocks_urls() {
+            let url = format!(
+                "{}?network_id={}&start={}&end={}&limit={}",
+                base_url, network_id, start, end, limit
+            );
+            let res = self.http_client.get(url).send().await;
+            let res = match res {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("Block relay fetch error: {}", e);
+                    continue;
+                }
+            };
+
+            if !res.status().is_success() {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                debug!(
+                    "Block relay fetch failed: {} {}",
+                    status,
+                    Self::response_body_snippet(&body)
+                );
+                continue;
+            }
+
+            let body = match res.json::<BlockRelayResponse>().await {
+                Ok(body) => body,
+                Err(e) => {
+                    debug!("Block relay response parse failed: {}", e);
+                    continue;
+                }
+            };
+
+            if !body.ok {
+                continue;
+            }
+            any_ok = true;
+
+            for record in body.blocks.unwrap_or_default() {
+                match serde_json::from_value::<Block>(record.block) {
+                    Ok(block) => {
+                        if block.index >= start
+                            && block.index <= end
+                            && block.calculate_hash_for_block() == block.hash
+                            && block.verify_pow()
+                        {
+                            all_blocks.push(block);
+                        }
+                    }
+                    Err(e) => debug!("Relayed block decode failed: {}", e),
+                }
+            }
+        }
+
+        if !any_ok {
+            return Err(NodeError::Network("Block relay fetch failed".into()));
+        }
+
+        all_blocks.sort_by(|a, b| {
+            a.index
+                .cmp(&b.index)
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        all_blocks.dedup_by(|a, b| a.index == b.index && a.hash == b.hash);
+        Ok(all_blocks)
+    }
+
+    async fn sync_with_block_relay(&self, current_height: u32) -> Result<usize, NodeError> {
+        if !Self::block_relay_sync_enabled() {
+            return Err(NodeError::Network("Block relay sync disabled".into()));
+        }
+
+        const RELAY_BATCH_SIZE: u32 = 50;
+        const MAX_RELAY_ROUNDS: usize = 12;
+
+        let mut tip_height = current_height;
+        let mut total_saved = 0usize;
+
+        for _ in 0..MAX_RELAY_ROUNDS {
+            let start = tip_height.saturating_add(1);
+            let end = start.saturating_add(RELAY_BATCH_SIZE.saturating_sub(1));
+            let blocks = self.fetch_relay_blocks(start, end).await?;
+            if blocks.is_empty() {
+                break;
+            }
+
+            let blockchain = self.blockchain.write().await;
+            let mut progressed = false;
+
+            for block in blocks {
+                if block.index <= tip_height {
+                    continue;
+                }
+
+                let before = blockchain.get_latest_block_index() as u32;
+                match blockchain.save_receipt_verified_block(&block).await {
+                    Ok(()) => {
+                        let after = blockchain.get_latest_block_index() as u32;
+                        if after > before {
+                            total_saved += after.saturating_sub(before) as usize;
+                            tip_height = after;
+                            progressed = true;
+                        }
+                    }
+                    Err(e) => warn!("Failed to save relayed block {}: {}", block.index, e),
+                }
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        if total_saved > 0 {
+            info!(
+                "Blockchain synchronized from block relay: added {} blocks to height {}",
+                total_saved, tip_height
+            );
+            self.publish_discovery_state("Post-relay-sync").await;
+            Ok(total_saved)
+        } else {
+            Err(NodeError::Network("No relayed blocks available".into()))
+        }
+    }
+
     async fn publish_discovery_state(&self, context: &str) {
         if let Err(e) = self.announce_to_discovery().await {
             warn!("{} discovery announce failed: {}", context, e);
@@ -1835,6 +2091,11 @@ impl Node {
                 );
             }
         }
+
+        if let Err(e) = self.post_block_relay(&block).await {
+            warn!("{} block relay failed: {}", context, e);
+        }
+        self.post_recent_blocks_to_relay(12).await;
 
         self.publish_discovery_state(context).await;
 
@@ -2825,9 +3086,6 @@ impl Node {
         let sock = Socket::from(socket.into_std()?);
         sock.set_reuse_address(true)?;
 
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-
         // Set non-blocking to allow concurrent connections
         sock.set_nonblocking(true)?;
 
@@ -3142,6 +3400,31 @@ impl Node {
             sleep(Duration::from_secs(5)).await; // Small delay to let connections establish
             if let Err(e) = node_clone.sync_with_network().await {
                 warn!("Initial sync failed: {}", e);
+            }
+            if let Err(e) = node_clone.publish_local_tip().await {
+                warn!("Initial post-sync publish failed: {}", e);
+            }
+        });
+
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut relay_interval = interval(Duration::from_secs(15));
+            loop {
+                relay_interval.tick().await;
+                let current_height = {
+                    let blockchain = node_clone.blockchain.read().await;
+                    blockchain.get_latest_block_index() as u32
+                };
+
+                match node_clone.sync_with_block_relay(current_height).await {
+                    Ok(saved) if saved > 0 => {
+                        if let Err(e) = node_clone.publish_local_tip().await {
+                            warn!("Post-relay-sync publish failed: {}", e);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => debug!("Periodic relay sync skipped: {}", e),
+                }
             }
         });
 
@@ -3706,6 +3989,50 @@ impl Node {
 
         self.request_blocks_batch(addr, start, end, MAX_RETRIES)
             .await
+    }
+
+    async fn query_peer_heights(
+        &self,
+        addrs: Vec<SocketAddr>,
+        timeout_ms: u64,
+    ) -> Vec<(SocketAddr, u32)> {
+        let height_queries = addrs.into_iter().map(|addr| {
+            let node = self.clone();
+            async move {
+                match tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    node.request_peer_height(addr),
+                )
+                .await
+                {
+                    Ok(Ok(height)) => Some((addr, height)),
+                    _ => None,
+                }
+            }
+        });
+
+        let mut peer_heights: Vec<(SocketAddr, u32)> = join_all(height_queries)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if !peer_heights.is_empty() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut peers = self.peers.write().await;
+            for (addr, height) in &peer_heights {
+                if let Some(info) = peers.get_mut(addr) {
+                    info.blocks = *height;
+                    info.last_seen = now;
+                }
+            }
+        }
+
+        peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
+        peer_heights
     }
 
     async fn request_blocks_batch(
@@ -5812,11 +6139,14 @@ impl Node {
         if peer_count == 0 {
             drop(peers); // Release lock before discovery
             info!("No peers available, discovering network nodes");
-            if let Err(e) = self.discover_network_nodes().await {
-                warn!("Failed to discover peers for sync: {}", e);
-                return Err(NodeError::Network(
-                    "No peers available for sync".to_string(),
-                ));
+            if let Err(connect_err) = self.connect_discovery_peers(8).await {
+                warn!("Fast discovery peer connect failed: {}", connect_err);
+                if let Err(discovery_err) = self.discover_network_nodes().await {
+                    warn!("Failed to discover peers for sync: {}", discovery_err);
+                    return Err(NodeError::Network(
+                        "No peers available for sync".to_string(),
+                    ));
+                }
             }
         }
 
@@ -5828,33 +6158,26 @@ impl Node {
         let peer_ips: Vec<_> = peers.keys().cloned().collect();
         drop(peers); // Release lock before making network requests
 
-        // Query peer heights in parallel with better error handling
-        let height_queries = peer_ips.iter().map(|&addr| {
-            let node = self.clone();
-            async move {
-                match tokio::time::timeout(
-                    Duration::from_millis(PEER_TIMEOUT_MS),
-                    node.request_peer_height(addr),
-                )
-                .await
-                {
-                    Ok(Ok(height)) => Some((addr, height)),
-                    _ => None,
-                }
-            }
-        });
-        let mut peer_heights: Vec<(SocketAddr, u32)> = futures::future::join_all(height_queries)
-            .await
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut peer_heights = self.query_peer_heights(peer_ips, PEER_TIMEOUT_MS).await;
 
-        // Sort by height descending
-        peer_heights.sort_by_key(|(_, height)| std::cmp::Reverse(*height));
+        if peer_heights.is_empty() {
+            if let Err(e) = self.connect_discovery_peers(8).await {
+                warn!("Discovery retry before sync failed: {}", e);
+            }
+            let peers = self.peers.read().await;
+            let peer_ips: Vec<_> = peers.keys().cloned().collect();
+            drop(peers);
+            peer_heights = self.query_peer_heights(peer_ips, PEER_TIMEOUT_MS).await;
+        }
 
         // IMPROVEMENT: Check if we already have the latest blocks
         if let Some((_, best_height)) = peer_heights.first() {
             if *best_height <= current_height {
+                match self.sync_with_block_relay(current_height).await {
+                    Ok(saved) if saved > 0 => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => debug!("Block relay had no newer blocks: {}", e),
+                }
                 info!(
                     "Already at best height ({}/{})",
                     current_height, best_height
@@ -5865,9 +6188,16 @@ impl Node {
             info!("Syncing from height {} to {}", current_height, best_height);
         } else {
             warn!("No peers reported their height");
-            return Err(NodeError::Network(
-                "No peers reported their height".to_string(),
-            ));
+            return self
+                .sync_with_block_relay(current_height)
+                .await
+                .map(|_| ())
+                .map_err(|relay_err| {
+                    NodeError::Network(format!(
+                        "No peers reported their height and relay sync failed: {}",
+                        relay_err
+                    ))
+                });
         }
 
         // 4. IMPROVEMENT: Try multiple peers for sync
@@ -5899,17 +6229,22 @@ impl Node {
                 );
 
                 // Sync in smaller batches
-                let mut start = current_sync_height;
+                let mut start = current_sync_height.saturating_add(1);
 
-                while start < *peer_height {
-                    let end = std::cmp::min(start + MAX_BATCH_SIZE, *peer_height);
+                while start <= *peer_height {
+                    let end = std::cmp::min(
+                        start.saturating_add(MAX_BATCH_SIZE.saturating_sub(1)),
+                        *peer_height,
+                    );
 
                     match self.request_blocks(*peer_addr, start, end).await {
                         Ok(blocks) => {
                             let mut candidate_blocks: Vec<_> = blocks
                                 .into_iter()
                                 .filter(|block| {
-                                    block.calculate_hash_for_block() == block.hash
+                                    block.index >= start
+                                        && block.index <= end
+                                        && block.calculate_hash_for_block() == block.hash
                                         && block.verify_pow()
                                 })
                                 .collect();
@@ -5985,9 +6320,18 @@ impl Node {
                 "Blockchain synchronized: added {} blocks to height {}",
                 blocks_synced, current_sync_height
             );
+            self.publish_discovery_state("Post-sync").await;
             Ok(())
         } else {
-            Err(NodeError::Network("Failed to sync any blocks".to_string()))
+            self.sync_with_block_relay(current_height)
+                .await
+                .map(|_| ())
+                .map_err(|relay_err| {
+                    NodeError::Network(format!(
+                        "Failed to sync any blocks from peers and relay sync failed: {}",
+                        relay_err
+                    ))
+                })
         }
     }
 

@@ -572,18 +572,13 @@ async fn main() -> Result<()> {
 
         // Then create the node (single instance)
         pb.set_message("Creating node...");
-        let bind_ip = if std::env::var("ALPHANUMERIC_BIND_IP").is_ok() {
-            config.network.bind_ip
+        let explicit_bind = std::env::var("ALPHANUMERIC_BIND_IP").is_ok()
+            || std::env::var("ALPHANUMERIC_PORT").is_ok();
+        let bind_addr = if explicit_bind {
+            Some(SocketAddr::new(config.network.bind_ip, config.network.port))
         } else {
-            match Node::get_bind_address() {
-                Ok(ip) => ip,
-                Err(e) => {
-                    error!("Failed to determine bind address: {}", e);
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                }
-            }
+            None
         };
-        let bind_addr = Some(SocketAddr::new(bind_ip, config.network.port));
 
         let node = match Node::new(
             Arc::new(db.clone()),
@@ -746,11 +741,14 @@ async fn main() -> Result<()> {
 
                                     // Process height differences with backoff
                                     if let Some(&max_height) = heights.iter().flatten().max() {
-                                        if max_height > local_height + 1 {
+                                        if max_height > local_height {
                                             sync_attempts = sync_attempts.saturating_add(1);
                                             if sync_attempts < MAX_SYNC_ATTEMPTS {
-                                                match handle_chain_sync(&node).await {
+                                                match node.sync_with_network().await {
                                                     Ok(_) => {
+                                                        if let Err(e) = node.publish_local_tip().await {
+                                                            warn!("Post-sync publish failed: {}", e);
+                                                        }
                                                         sync_attempts = 0;
                                                         consecutive_timeouts = 0;
                                                     }
@@ -1253,17 +1251,10 @@ println!("Wallet renamed successfully");
                         continue;
                     }
 
-                    let prep_bar = ProgressBar::new_spinner();
-                    let prep_style =
-                        ProgressStyle::with_template("Mining {spinner:.cyan/blue} {msg}")
-                            .unwrap_or_else(|_| ProgressStyle::default_spinner());
-                    prep_bar.set_style(prep_style);
-                    prep_bar.set_message("Preparing network tip...");
-                    prep_bar.enable_steady_tick(Duration::from_millis(100));
+                    println!("Preparing mining: checking peers and network tip...");
                     if let Err(e) = node.prepare_local_mining(Duration::from_secs(3)).await {
                         warn!("Pre-mine preparation skipped: {}", e);
                     }
-                    prep_bar.finish_and_clear();
 
                     match mgmt
                         .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
@@ -1918,8 +1909,12 @@ async fn handle_chain_sync(
                         break;
                     }
 
-                    let batch_end = (curr_height + PARALLEL_BATCH_SIZE as u32).min(target_height);
-                    let batch_key = format!("{}-{}", curr_height, batch_end);
+                    let batch_start = curr_height.saturating_add(1);
+                    let batch_end = batch_start
+                        .saturating_add(PARALLEL_BATCH_SIZE as u32)
+                        .saturating_sub(1)
+                        .min(target_height);
+                    let batch_key = format!("{}-{}", batch_start, batch_end);
 
                     // Check if this batch has already failed too many times
                     if let Some(failures) = failed_batches.get(&batch_key) {
@@ -1944,7 +1939,7 @@ async fn handle_chain_sync(
                     // Proper timeout and error handling
                     let result = tokio::time::timeout(
                         BLOCK_REQUEST_TIMEOUT,
-                        node.request_blocks(peer, curr_height, batch_end),
+                        node.request_blocks(peer, batch_start, batch_end),
                     )
                     .await;
 
@@ -1953,7 +1948,7 @@ async fn handle_chain_sync(
                             let mut sent_count = 0;
                             for block in blocks {
                                 // Validate hash before sending to process queue
-                                if block.index > curr_height
+                                if block.index >= batch_start
                                     && block.index <= batch_end
                                     && block.hash == block.calculate_hash_for_block()
                                 {
@@ -2145,7 +2140,7 @@ async fn handle_chain_sync(
                                 .min_by_key(|(_, p)| p.latency)
                             {
                                 // Request blocks directly from this peer
-                                let start = now_processed;
+                                let start = now_processed.saturating_add(1);
                                 let end = (start + 100).min(target_height);
 
                                 if let Ok(blocks) = node.request_blocks(*addr, start, end).await {
@@ -2335,6 +2330,9 @@ async fn handle_network_commands(
                                     if let Err(e) = handle_chain_sync(node).await {
                                         println!("Initial sync failed: {}", e);
                                     } else {
+                                        if let Err(e) = node.publish_local_tip().await {
+                                            warn!("Post-sync publish failed: {}", e);
+                                        }
                                         println!("✓ Initial sync completed");
                                     }
                                     return Ok(());
@@ -2418,6 +2416,8 @@ async fn handle_network_commands(
                         if final_peers > 0 {
                             if let Err(e) = handle_chain_sync(node).await {
                                 warn!("Initial sync with discovered peers failed: {}", e);
+                            } else if let Err(e) = node.publish_local_tip().await {
+                                warn!("Post-sync publish failed: {}", e);
                             }
                         }
                     } else {
@@ -2473,6 +2473,9 @@ async fn handle_network_commands(
 
             match handle_chain_sync(node).await {
                 Ok(_) => {
+                    if let Err(e) = node.publish_local_tip().await {
+                        warn!("Post-sync publish failed: {}", e);
+                    }
                     let blockchain = blockchain.read().await;
                     pb.finish_with_message(format!(
                         "Sync completed. Current height: {}",
