@@ -50,6 +50,8 @@ const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
 const BOOTSTRAP_META_LAST_PUBLISH_AT: &[u8] = b"last_publish_at";
 #[cfg(feature = "bootstrap_publisher")]
 const BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT: &[u8] = b"last_published_height";
+#[cfg(feature = "bootstrap_publisher")]
+const BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID: &[u8] = b"last_published_network_id";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -63,6 +65,8 @@ struct BootstrapManifestResponse {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct BootstrapManifestPointer {
     url: String,
+    #[serde(default)]
+    network_id: Option<String>,
     #[serde(default)]
     height: Option<u64>,
     #[serde(default)]
@@ -78,6 +82,8 @@ struct BootstrapManifestPointer {
 struct BootstrapManifestSignedFields {
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     height: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tip_hash: Option<String>,
@@ -90,6 +96,7 @@ impl BootstrapManifestPointer {
     fn signed_fields(&self) -> BootstrapManifestSignedFields {
         BootstrapManifestSignedFields {
             url: self.url.clone(),
+            network_id: self.network_id.clone(),
             height: self.height,
             tip_hash: self.tip_hash.clone(),
             sha256: self.sha256.clone(),
@@ -102,7 +109,19 @@ fn is_hex_with_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
+fn launch_network_id_hex() -> Result<String> {
+    let genesis = Blockchain::genesis_launch_block()?;
+    Ok(hex::encode(genesis.hash))
+}
+
 fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> {
+    verify_bootstrap_manifest_with_publisher(manifest, BOOTSTRAP_PUBLISHER_PUBKEY)
+}
+
+fn verify_bootstrap_manifest_with_publisher(
+    manifest: &BootstrapManifestPointer,
+    pinned_publisher_pubkey: &str,
+) -> Result<()> {
     if manifest.url.trim().is_empty() {
         return Err("Bootstrap manifest URL is empty".into());
     }
@@ -111,11 +130,27 @@ fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> 
     }
 
     let publisher_pubkey = manifest.publisher_pubkey.trim().to_ascii_lowercase();
-    if publisher_pubkey != BOOTSTRAP_PUBLISHER_PUBKEY {
+    if publisher_pubkey != pinned_publisher_pubkey.trim().to_ascii_lowercase() {
         return Err("Bootstrap manifest publisher key is not pinned".into());
     }
     if !is_hex_with_len(&publisher_pubkey, 64) {
         return Err("Bootstrap manifest publisher key is malformed".into());
+    }
+
+    let Some(network_id) = manifest.network_id.as_deref() else {
+        return Err("Bootstrap manifest is missing network id".into());
+    };
+    let network_id = network_id.trim().to_ascii_lowercase();
+    if !is_hex_with_len(&network_id, 64) {
+        return Err("Bootstrap manifest network id is malformed".into());
+    }
+    let expected_network_id = launch_network_id_hex()?;
+    if network_id != expected_network_id {
+        return Err(format!(
+            "Bootstrap manifest network id mismatch: expected {}, got {}",
+            expected_network_id, network_id
+        )
+        .into());
     }
 
     if manifest.height.is_none() {
@@ -2804,8 +2839,8 @@ async fn bootstrap_publish_loop(
     let stable_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS", 180);
 
     let db = { blockchain.read().await.db.clone() };
-    let (mut last_published_at, mut last_published_height) =
-        read_bootstrap_publish_meta(&db).unwrap_or((0, 0));
+    let (mut last_published_at, mut last_published_height, mut last_published_network_id) =
+        read_bootstrap_publish_meta(&db).unwrap_or((0, 0, None));
 
     let mut last_tip_hash: Option<String> = None;
     let mut last_tip_change = Instant::now();
@@ -2814,11 +2849,15 @@ async fn bootstrap_publish_loop(
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
 
-        let (height, tip_hash_hex) = {
+        let (height, tip_hash_hex, network_id_hex) = {
             let bc = blockchain.read().await;
             let h = bc.get_latest_block_index();
             let tip = bc.get_latest_block_hash();
-            (h, hex::encode(tip))
+            let network_id = bc
+                .get_block(0)
+                .map(|block| hex::encode(block.hash))
+                .unwrap_or_else(|_| hex::encode(tip));
+            (h, hex::encode(tip), network_id)
         };
 
         if last_tip_hash.as_deref() != Some(tip_hash_hex.as_str()) {
@@ -2835,11 +2874,13 @@ async fn bootstrap_publish_loop(
             continue;
         }
 
-        if now_secs.saturating_sub(last_published_at) < cooldown_secs {
+        let same_network = last_published_network_id.as_deref() == Some(network_id_hex.as_str());
+
+        if same_network && now_secs.saturating_sub(last_published_at) < cooldown_secs {
             continue;
         }
 
-        if height < last_published_height.saturating_add(min_delta) {
+        if same_network && height < last_published_height.saturating_add(min_delta) {
             continue;
         }
 
@@ -2847,9 +2888,16 @@ async fn bootstrap_publish_loop(
             continue;
         }
 
-        if let Err(e) =
-            publish_bootstrap_snapshot(&db, &db_path, height, &tip_hash_hex, &publish_url, &token)
-                .await
+        if let Err(e) = publish_bootstrap_snapshot(
+            &db,
+            &db_path,
+            height,
+            &tip_hash_hex,
+            &network_id_hex,
+            &publish_url,
+            &token,
+        )
+        .await
         {
             error!("bootstrap publish failed: {}", e);
             // Backoff: avoid spamming the endpoint if configuration is wrong or transient errors occur.
@@ -2870,8 +2918,14 @@ async fn bootstrap_publish_loop(
 
         last_published_height = height;
         last_published_at = now_secs;
+        last_published_network_id = Some(network_id_hex.clone());
         next_attempt_at = 0;
-        let _ = write_bootstrap_publish_meta(&db, last_published_at, last_published_height);
+        let _ = write_bootstrap_publish_meta(
+            &db,
+            last_published_at,
+            last_published_height,
+            &network_id_hex,
+        );
     }
 }
 
@@ -2881,6 +2935,7 @@ async fn publish_bootstrap_snapshot(
     _db_path: &str,
     height: u64,
     tip_hash_hex: &str,
+    network_id_hex: &str,
     publish_url: &str,
     token: &str,
 ) -> Result<()> {
@@ -2898,6 +2953,7 @@ async fn publish_bootstrap_snapshot(
     #[derive(serde::Serialize)]
     struct PointerUpdate {
         url: String,
+        network_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         height: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2997,8 +3053,8 @@ async fn publish_bootstrap_snapshot(
 
     // Step 1: upload snapshot to blue (server will store in Blob and return final blob URL).
     let upload_url = format!(
-        "{}?height={}&tip={}&sha256={}",
-        publish_url, height, tip_hash_hex, sha256
+        "{}?network_id={}&height={}&tip={}&sha256={}",
+        publish_url, network_id_hex, height, tip_hash_hex, sha256
     );
     // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
     let client = reqwest::Client::builder()
@@ -3052,6 +3108,7 @@ async fn publish_bootstrap_snapshot(
 
     let signed_fields = BootstrapManifestSignedFields {
         url: parsed.latest.url.clone(),
+        network_id: Some(network_id_hex.to_string()),
         height: Some(height),
         tip_hash: Some(tip_hash_hex.to_string()),
         sha256: Some(sha256),
@@ -3087,6 +3144,7 @@ async fn publish_bootstrap_snapshot(
 
     let pointer_update = PointerUpdate {
         url: signed_fields.url,
+        network_id: network_id_hex.to_string(),
         height: signed_fields.height,
         tip_hash: signed_fields.tip_hash,
         sha256: signed_fields.sha256,
@@ -3129,12 +3187,12 @@ async fn publish_bootstrap_snapshot(
         return Err(format!("bootstrap pointer update failed: {}: {}", status, body).into());
     }
 
-    let _ = write_bootstrap_publish_meta(db, updated_at, height);
+    let _ = write_bootstrap_publish_meta(db, updated_at, height, network_id_hex);
     Ok(())
 }
 
 #[cfg(feature = "bootstrap_publisher")]
-fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
+fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64, Option<String>)> {
     let tree = db.open_tree(BOOTSTRAP_META_TREE).ok()?;
     let last_at = tree
         .get(BOOTSTRAP_META_LAST_PUBLISH_AT)
@@ -3148,7 +3206,13 @@ fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
         .flatten()
         .and_then(|v| codec::deserialize::<u64>(&v).ok())
         .unwrap_or(0);
-    Some((last_at, last_height))
+    let last_network_id = tree
+        .get(BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID)
+        .ok()
+        .flatten()
+        .and_then(|v| String::from_utf8(v.to_vec()).ok())
+        .filter(|v| is_hex_with_len(v, 64));
+    Some((last_at, last_height, last_network_id))
 }
 
 #[cfg(feature = "bootstrap_publisher")]
@@ -3156,6 +3220,7 @@ fn write_bootstrap_publish_meta(
     db: &sled::Db,
     last_at: u64,
     last_height: u64,
+    network_id: &str,
 ) -> std::result::Result<(), sled::Error> {
     let tree = db.open_tree(BOOTSTRAP_META_TREE)?;
     let mut batch = sled::Batch::default();
@@ -3167,6 +3232,7 @@ fn write_bootstrap_publish_meta(
         BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT,
         codec::serialize(&last_height).unwrap_or_default(),
     );
+    batch.insert(BOOTSTRAP_META_LAST_PUBLISHED_NETWORK_ID, network_id);
     tree.apply_batch(batch)?;
     tree.flush()?;
     Ok(())
@@ -3189,21 +3255,37 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
         .unwrap_or_default()
         .as_secs();
 
-    let (db, height, tip_hash_hex) = {
+    let (db, height, tip_hash_hex, network_id_hex) = {
         let bc = blockchain.read().await;
         let db = bc.db.clone();
         let height = bc.get_latest_block_index();
-        let tip_hash_hex = hex::encode(bc.get_latest_block_hash());
-        (db, height, tip_hash_hex)
+        let tip = bc.get_latest_block_hash();
+        let tip_hash_hex = hex::encode(tip);
+        let network_id_hex = bc
+            .get_block(0)
+            .map(|block| hex::encode(block.hash))
+            .unwrap_or_else(|_| hex::encode(tip));
+        (db, height, tip_hash_hex, network_id_hex)
     };
 
-    let (last_at, _last_height) = read_bootstrap_publish_meta(&db).unwrap_or((0, 0));
-    if now_secs.saturating_sub(last_at) < cooldown_secs {
+    let (last_at, _last_height, last_network_id) =
+        read_bootstrap_publish_meta(&db).unwrap_or((0, 0, None));
+    let same_network = last_network_id.as_deref() == Some(network_id_hex.as_str());
+    if same_network && now_secs.saturating_sub(last_at) < cooldown_secs {
         let remaining = cooldown_secs.saturating_sub(now_secs.saturating_sub(last_at));
         return Err(format!("push is rate-limited: wait {}s", remaining).into());
     }
 
-    publish_bootstrap_snapshot(&db, db_path, height, &tip_hash_hex, &publish_url, &token).await?;
+    publish_bootstrap_snapshot(
+        &db,
+        db_path,
+        height,
+        &tip_hash_hex,
+        &network_id_hex,
+        &publish_url,
+        &token,
+    )
+    .await?;
     println!("Bootstrap snapshot published at height {}", height);
     Ok(())
 }
@@ -3212,22 +3294,59 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 mod tests {
     use super::*;
 
-    const SIGNED_BOOTSTRAP_MANIFEST: &str = r#"{"ok":true,"manifest":{"url":"https://dyyq00nyrwpgq1yi.public.blob.vercel-storage.com/bootstrap/blockchain.db-h172-00000af9e04b34bfb9f7dcf88bfb15767b7f607fd58c9d0c46169bd3abb1734a-i5Mu3aItDw3gsknc4beOWzizUcSXbo.zip","height":172,"tip_hash":"00000af9e04b34bfb9f7dcf88bfb15767b7f607fd58c9d0c46169bd3abb1734a","sha256":"f199e63d0a621e7df67a1c7644ba78a87c8706f96d5d52610026b2c2d27ed843","publisher_pubkey":"dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3","manifest_sig":"e1d8d6ec97563c2bbc6506efb4f1f523ae985dac344235a722830a84220f5e5d1b025f0e34a7789d9b3d09c8cf4a89c123cacf352bb28760fe925905e689ea01","updated_at":1771908886}}"#;
+    fn signed_bootstrap_manifest() -> BootstrapManifestPointer {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let publisher_pubkey = hex::encode(signing.verifying_key().to_bytes());
+        let network_id = launch_network_id_hex().unwrap();
+        let mut manifest = BootstrapManifestPointer {
+            url: "https://dyyq00nyrwpgq1yi.public.blob.vercel-storage.com/bootstrap/test.zip"
+                .to_string(),
+            network_id: Some(network_id.clone()),
+            height: Some(0),
+            tip_hash: Some(network_id),
+            sha256: Some(
+                "f199e63d0a621e7df67a1c7644ba78a87c8706f96d5d52610026b2c2d27ed843".to_string(),
+            ),
+            publisher_pubkey,
+            manifest_sig: String::new(),
+            updated_at: 1_783_184_400,
+        };
+        let payload = serde_json::to_vec(&manifest.signed_fields()).unwrap();
+        let sig = signing.sign(&payload);
+        manifest.manifest_sig = hex::encode(sig.to_bytes());
+        manifest
+    }
 
     #[test]
     fn bootstrap_manifest_signature_accepts_pinned_publisher() {
-        let parsed: BootstrapManifestResponse =
-            serde_json::from_str(SIGNED_BOOTSTRAP_MANIFEST).unwrap();
+        let manifest = signed_bootstrap_manifest();
 
-        assert!(verify_bootstrap_manifest(&parsed.manifest).is_ok());
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey).is_ok()
+        );
     }
 
     #[test]
     fn bootstrap_manifest_signature_rejects_tampering() {
-        let mut parsed: BootstrapManifestResponse =
-            serde_json::from_str(SIGNED_BOOTSTRAP_MANIFEST).unwrap();
-        parsed.manifest.sha256 = Some("0".repeat(64));
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.sha256 = Some("0".repeat(64));
 
-        assert!(verify_bootstrap_manifest(&parsed.manifest).is_err());
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_rejects_wrong_network() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.network_id = Some("0".repeat(64));
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
     }
 }
