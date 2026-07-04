@@ -1485,7 +1485,6 @@ impl Node {
         };
         let height = last_block.index;
         let difficulty = blockchain.get_current_difficulty().await;
-        let hashrate_ths = blockchain.calculate_network_hashrate().await;
 
         let start = height.saturating_sub(20);
         let mut headers = Vec::new();
@@ -1516,12 +1515,16 @@ impl Node {
             .and_then(|v| v.as_u64())
             .unwrap_or(last_block.timestamp);
 
+        // hashrate_ths is deliberately omitted: it is an f64, and Rust (ryu) and
+        // the gateway's JS canonical JSON stringify floats differently, so any
+        // float in the signed message makes signature verification fail
+        // server-side. The gateway treats it as optional and gets hashrate from
+        // the stats push instead.
         let message = json!({
             "height": height,
             "network_id": hex::encode(self.network_id),
             "last_block_time": last_block_time,
             "difficulty": difficulty,
-            "hashrate_ths": hashrate_ths,
             "headers": headers,
             "node_id": &self.node_id,
             "public_key": &self.node_id
@@ -1537,7 +1540,6 @@ impl Node {
             "network_id": hex::encode(self.network_id),
             "last_block_time": last_block_time,
             "difficulty": difficulty,
-            "hashrate_ths": hashrate_ths,
             "headers": message["headers"],
             "node_id": &self.node_id,
             "public_key": &self.node_id,
@@ -3670,7 +3672,10 @@ impl Node {
         &self,
         addr: SocketAddr,
     ) -> Result<Arc<Mutex<OutboundConnection>>, NodeError> {
-        if let Some(existing) = self.outbound_connections.read().await.get(&addr).cloned() {
+        // Take the guard in a scoped read: the if-let scrutinee would otherwise
+        // hold the read guard across the write().remove() below and self-deadlock.
+        let existing = self.outbound_connections.read().await.get(&addr).cloned();
+        if let Some(existing) = existing {
             if self.peer_secrets.read().await.contains_key(&addr) {
                 return Ok(existing);
             }

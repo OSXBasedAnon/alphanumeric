@@ -21,12 +21,13 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use std::collections::HashSet;
 use std::path::Path;
 
+#[cfg(feature = "bootstrap_publisher")]
+use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
         Block, Blockchain, RateLimiter, Transaction, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
-    codec,
     mgmt::{Mgmt, WalletKeyData},
     node::{Node, NodeError, DEFAULT_PORT},
     oracle::DifficultyOracle,

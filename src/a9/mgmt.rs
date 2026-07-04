@@ -857,7 +857,14 @@ impl Mgmt {
 
         // No wallet registry needed - transactions are self-contained with public keys
 
-        match blockchain.write().await.add_transaction(transaction).await {
+        // Scope the write guard: `match lock().await.f().await { .. }` keeps the
+        // guard alive for every match arm, and the Ok arm reads the same lock
+        // (get_wallet_balance), causing a self-deadlock right after "Done".
+        let submit_result = {
+            let chain = blockchain.write().await;
+            chain.add_transaction(transaction).await
+        };
+        match submit_result {
             Ok(_) => {
                 writeln!(stdout, "Done")?;
 
