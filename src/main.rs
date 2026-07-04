@@ -250,9 +250,11 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    // Initialize logging with ERROR level during startup to avoid UI interference
-    env_logger::Builder::from_default_env()
+    // Initialize logging with ERROR level during startup to avoid UI interference.
+    // RUST_LOG still wins when set so field diagnostics stay possible.
+    env_logger::Builder::new()
         .filter_level(log::LevelFilter::Error)
+        .parse_default_env()
         .init();
 
     print_ascii_intro();
@@ -565,11 +567,13 @@ async fn main() -> Result<()> {
                             }
                             activity_time.store(now, Ordering::Release);
 
-                            // Network state check
-                            let peers = node.peers.read().await;
-                            let active_peers = peers.len();
+                            // Network state check. Snapshot under a short-lived guard:
+                            // holding this read lock across the sleeps/discovery/sync
+                            // awaits below deadlocks every peers.write() in verify_peer.
+                            let (active_peers, target_latency, available_peers) = {
+                                let peers = node.peers.read().await;
+                                let active_peers = peers.len();
 
-                            if active_peers > 0 {
                                 // Calculate network health with safe division
                                 let avg_latency = peers.iter()
                                     .filter(|(_, info)| info.latency >= MIN_PEER_LATENCY)
@@ -593,6 +597,10 @@ async fn main() -> Result<()> {
                                     .map(|(addr, _)| *addr)
                                     .collect();
 
+                                (active_peers, target_latency, available_peers)
+                            };
+
+                            if active_peers > 0 {
                                 if !available_peers.is_empty() {
                                     // Check chain state with safe conversion
                                     let local_height = {

@@ -1006,6 +1006,10 @@ impl Node {
                 info!("Attempting to bind to address: {}", addr);
                 socket.bind(&addr.into())?;
                 socket.listen(1024)?;
+                // Tokio's TcpListener::from_std requires a non-blocking socket;
+                // a blocking one stalls a worker thread inside accept() and
+                // strands every accepted connection's handler task.
+                socket.set_nonblocking(true)?;
 
                 let std_listener = socket.into();
                 let listener = TcpListener::from_std(std_listener)?;
@@ -1025,6 +1029,7 @@ impl Node {
                 let alt_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
                 socket.bind(&alt_addr.into())?;
                 socket.listen(1024)?;
+                socket.set_nonblocking(true)?;
 
                 let std_listener = socket.into();
                 let listener = TcpListener::from_std(std_listener)?;
@@ -1048,6 +1053,7 @@ impl Node {
 
         socket.bind(&primary_addr.into())?;
         socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
         let std_listener = socket.into();
         let listener = TcpListener::from_std(std_listener)?;
         let addr = listener.local_addr()?;
@@ -5506,6 +5512,7 @@ impl Node {
             }
         };
 
+        debug!("verify_peer({}): tcp connected", addr);
         // IMPROVEMENT: Configure TCP socket for better performance
         stream.set_nodelay(true)?;
 
@@ -5522,10 +5529,12 @@ impl Node {
         // Convert socket back to TcpStream
         let mut stream = TcpStream::from_std(socket.into())?;
 
+        debug!("verify_peer({}): starting handshake", addr);
         // IMPROVEMENT: Perform handshake with better timeout handling
         let handshake_result =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, self.perform_handshake(&mut stream, true))
                 .await;
+        debug!("verify_peer({}): handshake returned", addr);
 
         let (peer_info, shared_secret) = match handshake_result {
             Ok(Ok(result)) => result,
@@ -5557,6 +5566,7 @@ impl Node {
         }
 
         // 3. Check for subnet limits
+        debug!("verify_peer({}): acquiring peers write lock", addr);
         let mut peers = self.peers.write().await;
         let subnet_peers = peers
             .values()
@@ -5574,18 +5584,23 @@ impl Node {
         peers.insert(addr, peer_info);
         drop(peers);
 
+        debug!("verify_peer({}): storing secret", addr);
         let mut peer_secrets = self.peer_secrets.write().await;
         peer_secrets.insert(addr, shared_secret);
         drop(peer_secrets);
 
+        debug!("verify_peer({}): registering outbound connection", addr);
         self.insert_outbound_connection(addr, stream).await;
 
+        debug!("verify_peer({}): advertising ML-DSA key", addr);
         if let Err(e) = self.advertise_mldsa_key(addr).await {
             debug!("Failed to advertise ML-DSA key to {}: {}", addr, e);
         }
 
+        debug!("verify_peer({}): resetting failure counter", addr);
         // Reset failure counter
         self.reset_peer_failures(addr).await;
+        debug!("verify_peer({}): done", addr);
 
         // IMPROVEMENT: Trigger initial latency measurement
         tokio::spawn({
@@ -5817,10 +5832,15 @@ impl Node {
             .try_into()
             .map_err(|_| NodeError::Network("Invalid handshake public key length".into()))?;
 
+        debug!("perform_handshake(init={}): getting height", is_initiator);
         let blockchain_height = {
             let blockchain = self.blockchain.read().await;
             blockchain.get_latest_block_index() as u32
         };
+        debug!(
+            "perform_handshake(init={}): height={}",
+            is_initiator, blockchain_height
+        );
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5846,13 +5866,16 @@ impl Node {
             if data.is_empty() || data.len() > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Invalid handshake size".into()));
             }
+            debug!("perform_handshake(init): sending {} bytes", data.len());
             stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
             stream.write_all(&data).await?;
             stream.flush().await?;
+            debug!("perform_handshake(init): sent, awaiting reply");
 
             // Read peer's handshake
             let mut len_bytes = [0u8; 4];
             stream.read_exact(&mut len_bytes).await?;
+            debug!("perform_handshake(init): got reply len");
             let len = u32::from_be_bytes(len_bytes) as usize;
 
             if len == 0 || len > MAX_HANDSHAKE_SIZE {
@@ -5890,6 +5913,7 @@ impl Node {
             Ok((peer_info, shared_secret))
         } else {
             // Read peer's handshake first
+            debug!("perform_handshake(resp): awaiting peer handshake");
             let mut len_bytes = [0u8; 4];
             stream.read_exact(&mut len_bytes).await?;
             let len = u32::from_be_bytes(len_bytes) as usize;
@@ -5900,6 +5924,7 @@ impl Node {
 
             let mut data = vec![0u8; len];
             stream.read_exact(&mut data).await?;
+            debug!("perform_handshake(resp): got {} bytes, verifying", len);
 
             let peer_handshake: HandshakeMessage = codec::deserialize(&data)?;
 
@@ -5908,6 +5933,7 @@ impl Node {
                 return Err(NodeError::Network("Network ID mismatch".into()));
             }
             self.verify_handshake(&peer_handshake)?;
+            debug!("perform_handshake(resp): verified, sending reply");
 
             // Send our response
             let data = codec::serialize(&our_handshake)?;
