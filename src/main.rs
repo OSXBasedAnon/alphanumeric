@@ -1026,7 +1026,7 @@ async fn main() -> Result<()> {
     if let Some(last_block) = blockchain_guard.get_last_block() {
         color_spec.set_fg(Some(Color::Rgb(237, 124, 51)));
         stdout.set_color(&color_spec)?;
-        let age = now - last_block.timestamp;
+        let age = now.saturating_sub(last_block.timestamp);
         writeln!(stdout, "Last Block Time:   {}s", age)?;
     }
     stdout.reset()?;
@@ -1043,19 +1043,18 @@ async fn main() -> Result<()> {
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Pending Txs:        {}\n", pending_txs.len())?;
 
-    // Calculate total pending value with absolute values
-    let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount().abs()).sum();
-    let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee().abs()).sum();
+    let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount()).sum();
+    let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee()).sum();
 
-if !pending_txs.is_empty() {
-    color_spec.set_fg(Some(Color::Rgb(88, 240, 181)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Total Value:        {:.8} ♦", pending_value)?;
+    if !pending_txs.is_empty() {
+        color_spec.set_fg(Some(Color::Rgb(88, 240, 181)));
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "Total Value:        {:.8} ♦", pending_value)?;
 
-    color_spec.set_fg(Some(Color::Rgb(180, 219, 210)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Total Pending Fees: {:.8} ♦\n", pending_fees)?;
-}
+        color_spec.set_fg(Some(Color::Rgb(180, 219, 210)));
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "Total Pending Fees: {:.8} ♦\n", pending_fees)?;
+    }
 
 
     stdout.reset()?;

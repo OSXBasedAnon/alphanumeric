@@ -39,6 +39,19 @@ Path: `docs/THREAT_MODEL.md`
 - Corrected bootstrap integrity assumptions.
 - Mapped added quorum hardening tests and residual risks.
 
+6. Pending transaction and mining safety tightened.
+Paths: `src/a9/blockchain.rs`, `src/a9/mgmt.rs`
+- Invalid pending transactions are removed during live mempool sync instead of only being skipped.
+- Candidate mining filters now skip malformed regular transactions before block construction.
+- New-block prevalidation rejects invalid regular transaction amount/signature shape before finalization.
+- Added regression coverage for negative fees and invalid regular transaction amounts.
+
+7. CLI output and status display hardened.
+Paths: `src/a9/wallet.rs`, `src/a9/blockchain.rs`, `src/main.rs`
+- ML-DSA verification diagnostics now go through debug logging instead of writing into interactive command output.
+- Chain status uses saturating timestamp math for future-skewed local blocks.
+- Pending totals display actual pending values/fees instead of absolute values.
+
 ## Remaining Gaps To Reach/Keep 8+ Quality
 1. Add deterministic multi-node adversarial tests:
 - divergent header broadcasts

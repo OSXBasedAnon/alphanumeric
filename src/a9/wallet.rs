@@ -3,6 +3,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{password_hash::SaltString, Argon2};
+use log::debug;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -174,11 +175,15 @@ impl Wallet {
         signature: &[u8],
         public_key: &[u8],
     ) -> Result<bool, String> {
-        println!("Verifying ML-DSA: {},{}", signature.len(), public_key.len());
+        debug!(
+            "Verifying ML-DSA signature: signature_len={}, public_key_len={}",
+            signature.len(),
+            public_key.len()
+        );
         match mldsa::verify(message, signature, public_key) {
             Ok(()) => Ok(true),
             Err(e) => {
-                println!("Verification error: {}", e);
+                debug!("ML-DSA verification failed: {}", e);
                 Ok(false)
             }
         }

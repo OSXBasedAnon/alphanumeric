@@ -2,7 +2,7 @@ use blake3;
 use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
-use log::{error, warn};
+use log::{debug, error, warn};
 use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
@@ -308,22 +308,22 @@ impl Transaction {
                     Ok(pub_key_bytes) => {
                         match Wallet::verify_signature(&message, &full_sig, &pub_key_bytes) {
                             Ok(true) => {
-                                println!("Signature verification: ✓");
+                                debug!("Transaction signature verification succeeded");
                                 true
                             }
                             _ => {
-                                println!("Signature verification failed");
+                                debug!("Transaction signature verification failed");
                                 false
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to decode public key: ✗ ({})", e);
+                        debug!("Failed to decode transaction public key: {}", e);
                         false
                     }
                 },
                 Err(e) => {
-                    println!("Failed to decode signature: ✗ ({})", e);
+                    debug!("Failed to decode transaction signature: {}", e);
                     false
                 }
             }
