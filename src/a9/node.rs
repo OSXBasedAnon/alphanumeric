@@ -1,25 +1,18 @@
 use arrayref::array_ref;
 use axum::{extract::State, routing::get, Json, Router};
 use dashmap::DashMap;
-use futures_util::{
-    future::join_all,
-};
+use futures_util::future::join_all;
 use igd_next::{search_gateway, PortMappingProtocol};
 use ipnet::{Ipv4Net, Ipv6Net};
-use libp2p::{
-    identity,
-    kad::{
-        handler::{KademliaHandler, KademliaHandlerIn},
-        record::store::MemoryStore,
-        Kademlia, KademliaConfig, KademliaEvent, QueryId, QueryResult,
-    },
-    noise,
-    swarm::{
-        derive_prelude::*, ConnectionHandler, ConnectionId, FromSwarm, NetworkBehaviour,
-        PollParameters, Swarm, SwarmBuilder, ToSwarm,
-    },
-    yamux, Multiaddr, PeerId,
+use libp2p_core::{Multiaddr, PeerId};
+use libp2p_identity as identity;
+use libp2p_kad::{
+    store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig, Event as KademliaEvent,
+    QueryResult,
 };
+use libp2p_noise as noise;
+use libp2p_swarm::{NetworkBehaviour, Swarm};
+use libp2p_yamux as yamux;
 use log::{debug, error, info, warn};
 use lru::LruCache;
 use parking_lot::Mutex as PLMutex;
@@ -46,7 +39,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -108,6 +100,8 @@ const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 30;
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
+const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
+const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 
 // STUN servers for NAT traversal
@@ -256,8 +250,13 @@ impl SubnetGroup {
                     data[full_bytes] &= mask_byte;
                 }
 
-                for i in (full_bytes + 1)..4 {
-                    data[i] = 0;
+                let zero_start = if remainder_bits == 0 {
+                    full_bytes
+                } else {
+                    full_bytes + 1
+                };
+                for byte in data.iter_mut().take(4).skip(zero_start) {
+                    *byte = 0;
                 }
 
                 Self { data, len: mask }
@@ -276,8 +275,13 @@ impl SubnetGroup {
                     data[full_bytes] &= mask_byte;
                 }
 
-                for i in (full_bytes + 1)..16 {
-                    data[i] = 0;
+                let zero_start = if remainder_bits == 0 {
+                    full_bytes
+                } else {
+                    full_bytes + 1
+                };
+                for byte in data.iter_mut().skip(zero_start) {
+                    *byte = 0;
                 }
 
                 Self { data, len: mask }
@@ -471,23 +475,29 @@ pub struct NetworkBloom {
     bits: Vec<AtomicBool>,
     num_hashes: usize,
     size: usize,
+    max_items_before_reset: usize,
     items_count: AtomicUsize,
 }
 
 impl NetworkBloom {
     pub fn new(size: usize, fpr: f64) -> Self {
-        let num_hashes = Self::optimal_num_hashes(size, fpr);
+        let size = size.max(8);
+        let max_items_before_reset = Self::optimal_item_capacity(size, fpr);
+        let num_hashes = Self::optimal_num_hashes(size, max_items_before_reset);
         let bits = (0..size).map(|_| AtomicBool::new(false)).collect();
 
         Self {
             bits,
             num_hashes,
             size,
+            max_items_before_reset,
             items_count: AtomicUsize::new(0),
         }
     }
 
     pub fn insert(&self, item: &[u8]) -> bool {
+        self.rotate_if_needed();
+
         let mut was_new = false;
 
         for i in 0..self.num_hashes {
@@ -520,8 +530,25 @@ impl NetworkBloom {
         self.items_count.store(0, Ordering::Relaxed);
     }
 
-    fn optimal_num_hashes(size: usize, fpr: f64) -> usize {
-        ((size as f64) * fpr.ln() / (-2f64).ln()).round() as usize
+    fn rotate_if_needed(&self) {
+        if self.items_count.load(Ordering::Relaxed) >= self.max_items_before_reset {
+            self.clear();
+        }
+    }
+
+    fn optimal_item_capacity(size: usize, fpr: f64) -> usize {
+        let fpr = if fpr.is_finite() {
+            fpr.clamp(1e-9, 0.5)
+        } else {
+            0.01
+        };
+        let capacity = -((size as f64) * std::f64::consts::LN_2.powi(2)) / fpr.ln();
+        capacity.floor().max(1.0) as usize
+    }
+
+    fn optimal_num_hashes(size: usize, expected_items: usize) -> usize {
+        let expected_items = expected_items.max(1);
+        (((size as f64 / expected_items as f64) * std::f64::consts::LN_2).round() as usize).max(1)
     }
 
     fn hash(data: &[u8], seed: usize) -> u64 {
@@ -558,6 +585,7 @@ impl Clone for NetworkBloom {
             bits,
             num_hashes: self.num_hashes,
             size: self.size,
+            max_items_before_reset: self.max_items_before_reset,
             items_count: AtomicUsize::new(self.items_count.load(Ordering::Relaxed)),
         }
     }
@@ -601,6 +629,12 @@ impl ValidationPool {
     }
 }
 
+impl Default for ValidationPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // RAII guard for validation permits
 struct ValidationPermit<'a> {
     _permit: tokio::sync::SemaphorePermit<'a>,
@@ -617,6 +651,11 @@ impl<'a> Drop for ValidationPermit<'a> {
 // P2P Swarm (libp2p integration)
 //----------------------------------------------------------------------
 
+#[derive(NetworkBehaviour)]
+#[behaviour(
+    to_swarm = "HybridBehaviourEvent",
+    prelude = "libp2p_swarm::derive_prelude"
+)]
 pub struct HybridBehaviour {
     kademlia: Kademlia<MemoryStore>,
 }
@@ -637,68 +676,6 @@ impl std::fmt::Debug for HybridBehaviour {
         f.debug_struct("HybridBehaviour")
             .field("kademlia", &"Kademlia<MemoryStore>")
             .finish()
-    }
-}
-
-impl NetworkBehaviour for HybridBehaviour {
-    type ConnectionHandler = KademliaHandler<QueryId>;
-    type OutEvent = HybridBehaviourEvent;
-
-    #[allow(deprecated)]
-    fn new_handler(&mut self) -> Self::ConnectionHandler {
-        self.kademlia.new_handler()
-    }
-
-    #[allow(deprecated)]
-    fn addresses_of_peer(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
-        self.kademlia.addresses_of_peer(peer_id)
-    }
-
-    fn on_swarm_event(&mut self, event: FromSwarm<'_, Self::ConnectionHandler>) {
-        self.kademlia.on_swarm_event(event);
-    }
-
-    fn on_connection_handler_event(
-        &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
-        event: <KademliaHandler<QueryId> as ConnectionHandler>::OutEvent,
-    ) {
-        self.kademlia
-            .on_connection_handler_event(peer_id, connection_id, event);
-    }
-
-    fn poll(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        params: &mut impl PollParameters,
-    ) -> Poll<ToSwarm<Self::OutEvent, KademliaHandlerIn<QueryId>>> {
-        match self.kademlia.poll(cx, params) {
-            Poll::Ready(ToSwarm::GenerateEvent(event)) => Poll::Ready(ToSwarm::GenerateEvent(
-                HybridBehaviourEvent::Kademlia(event),
-            )),
-            Poll::Ready(ToSwarm::NotifyHandler {
-                peer_id,
-                handler,
-                event,
-            }) => Poll::Ready(ToSwarm::NotifyHandler {
-                peer_id,
-                handler,
-                event,
-            }),
-            Poll::Ready(ToSwarm::CloseConnection {
-                peer_id,
-                connection,
-            }) => Poll::Ready(ToSwarm::CloseConnection {
-                peer_id,
-                connection,
-            }),
-            Poll::Ready(ToSwarm::Dial { opts }) => Poll::Ready(ToSwarm::Dial { opts }),
-            Poll::Ready(ToSwarm::ReportObservedAddr { address, score }) => {
-                Poll::Ready(ToSwarm::ReportObservedAddr { address, score })
-            }
-            Poll::Pending => Poll::Pending,
-        }
     }
 }
 
@@ -729,12 +706,12 @@ impl std::fmt::Debug for HybridSwarm {
 
 #[derive(Clone)]
 pub struct TcpNatConfig {
-    external_port: u16,
-    supports_upnp: bool,
-    supports_nat_pmp: bool,
-    connect_timeout: Duration,
-    mapping_lifetime: Duration,
-    max_retries: u32,
+    pub external_port: u16,
+    pub supports_upnp: bool,
+    pub supports_nat_pmp: bool,
+    pub connect_timeout: Duration,
+    pub mapping_lifetime: Duration,
+    pub max_retries: u32,
 }
 
 //----------------------------------------------------------------------
@@ -765,7 +742,7 @@ pub struct Node {
     http_client: Client,
     discovery_state: Arc<Mutex<DiscoveryState>>,
     p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
-    peer_id: String,
+    pub peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
     peer_cache_path: Arc<String>,
 
@@ -968,13 +945,12 @@ impl Node {
             .map(|b| b.hash)
             .unwrap_or_default();
 
-        let velocity_manager = if velocity_enabled {
-            let vm = Arc::new(VelocityManager::new());
-            vm.clone().start_request_processor();
-            Some(vm)
-        } else {
-            None
-        };
+        if velocity_enabled {
+            warn!(
+                "Velocity propagation is disabled: shred transport must be moved onto the authenticated peer channel before use"
+            );
+        }
+        let velocity_manager = None;
 
         Ok(Self {
             db,
@@ -1153,11 +1129,7 @@ impl Node {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let skew = if now >= message.timestamp {
-            now - message.timestamp
-        } else {
-            message.timestamp - now
-        };
+        let skew = now.abs_diff(message.timestamp);
         if skew > MAX_HANDSHAKE_SKEW_SECS {
             return Err(NodeError::Network(
                 "Handshake timestamp outside allowed skew".into(),
@@ -1273,10 +1245,8 @@ impl Node {
             return Some(ip);
         }
 
-        if let Ok((v4, _v6)) = self.discover_external_addresses(STUN_SERVERS).await {
-            if let Some(ip) = v4 {
-                return Some(ip);
-            }
+        if let Ok((Some(ip), _v6)) = self.discover_external_addresses(STUN_SERVERS).await {
+            return Some(ip);
         }
 
         None
@@ -1352,11 +1322,8 @@ impl Node {
 
         let mut connected = 0usize;
         for addr in addrs.into_iter().take(limit) {
-            match timeout(Duration::from_secs(5), self.verify_peer(addr)).await {
-                Ok(Ok(_)) => {
-                    connected += 1;
-                }
-                _ => {}
+            if let Ok(Ok(_)) = timeout(Duration::from_secs(5), self.verify_peer(addr)).await {
+                connected += 1;
             }
         }
 
@@ -1448,7 +1415,10 @@ impl Node {
         message.insert("port".to_string(), json!(self.bind_addr.port()));
         message.insert("node_id".to_string(), json!(&self.node_id));
         message.insert("public_key".to_string(), json!(&self.node_id));
-        message.insert("version".to_string(), json!(format!("rust-{}", NETWORK_VERSION)));
+        message.insert(
+            "version".to_string(),
+            json!(format!("rust-{}", NETWORK_VERSION)),
+        );
         message.insert("height".to_string(), json!(height));
         message.insert("last_seen".to_string(), json!(now));
         message.insert("latency_ms".to_string(), json!(0));
@@ -1467,14 +1437,20 @@ impl Node {
         payload.insert("port".to_string(), json!(self.bind_addr.port()));
         payload.insert("node_id".to_string(), json!(&self.node_id));
         payload.insert("public_key".to_string(), json!(&self.node_id));
-        payload.insert("version".to_string(), json!(format!("rust-{}", NETWORK_VERSION)));
+        payload.insert(
+            "version".to_string(),
+            json!(format!("rust-{}", NETWORK_VERSION)),
+        );
         payload.insert("height".to_string(), json!(height));
         payload.insert("last_seen".to_string(), json!(now));
         payload.insert("latency_ms".to_string(), json!(0));
         if let Some(port) = stats_port {
             payload.insert("stats_port".to_string(), json!(port));
         }
-        payload.insert("signature".to_string(), json!(hex::encode(signature.as_ref())));
+        payload.insert(
+            "signature".to_string(),
+            json!(hex::encode(signature.as_ref())),
+        );
         let payload = serde_json::Value::Object(payload);
 
         let mut any_ok = false;
@@ -1924,7 +1900,8 @@ impl Node {
         }
 
         // Heavy scan mode is restricted to debug builds to keep release behavior conservative.
-        if cfg!(debug_assertions) && enable_aggressive_discovery && needs_more_peers && !gateway_ok {
+        if cfg!(debug_assertions) && enable_aggressive_discovery && needs_more_peers && !gateway_ok
+        {
             if let Ok(local_addrs) = self.discover_local_network().await {
                 discovered_addrs.extend(local_addrs);
             }
@@ -2032,14 +2009,14 @@ impl Node {
         }
 
         // Try to collect known peer addresses using safer methods
-        if let Ok(_) = self.handle_p2p_events().await {
+        if self.handle_p2p_events().await.is_ok() {
             // After handling events, extract any discovered addresses
             // from swarm's connected peers using direct access methods
             if let Some(swarm) = &*swarm_guard {
                 // Get connected peers from the swarm
                 for peer_id in swarm.0.connected_peers() {
                     // Fixed: add .await here to properly await the future
-                    if let Ok(addrs) = self.get_peer_addresses_from_connections(&peer_id).await {
+                    if let Ok(addrs) = self.get_peer_addresses_from_connections(peer_id).await {
                         for addr in addrs {
                             discovered.insert(addr);
                         }
@@ -2068,6 +2045,7 @@ impl Node {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     async fn scan_range_with_limit(
         &self,
         range: &ScanRange,
@@ -2096,13 +2074,12 @@ impl Node {
 
                     // Copy prefix
                     let prefix_len = (net.prefix_len() / 16) as usize;
-                    for i in 0..prefix_len {
-                        segments[i] = net.addr().segments()[i];
-                    }
+                    let prefix = net.addr().segments();
+                    segments[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
 
                     // Randomize host part
-                    for i in prefix_len..8 {
-                        segments[i] = rng.gen();
+                    for segment in segments.iter_mut().skip(prefix_len) {
+                        *segment = rng.gen();
                     }
 
                     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
@@ -2153,6 +2130,7 @@ impl Node {
         Ok(discovered)
     }
 
+    #[allow(dead_code)]
     async fn build_optimized_scan_ranges(
         &self,
         v4_addr: IpAddr,
@@ -2377,13 +2355,12 @@ impl Node {
 
                     // Copy prefix
                     let prefix_len = (net.prefix_len() / 16) as usize;
-                    for i in 0..prefix_len {
-                        segments[i] = net.addr().segments()[i];
-                    }
+                    let prefix = net.addr().segments();
+                    segments[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
 
                     // Randomize host part
-                    for i in prefix_len..8 {
-                        segments[i] = rng.gen();
+                    for segment in segments.iter_mut().skip(prefix_len) {
+                        *segment = rng.gen();
                     }
 
                     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
@@ -2483,10 +2460,8 @@ impl Node {
             futures.push(self.request_peer_list(addr));
         }
 
-        for result in join_all(futures).await {
-            if let Ok(peer_list) = result {
-                discovered.extend(peer_list);
-            }
+        for peer_list in join_all(futures).await.into_iter().flatten() {
+            discovered.extend(peer_list);
         }
 
         Ok(discovered)
@@ -2845,6 +2820,7 @@ impl Node {
                     warn!("Peer maintenance error: {}", e);
                 }
                 node_clone.cleanup_outbound_connections().await;
+                node_clone.prune_validation_cache();
             }
         });
 
@@ -2973,8 +2949,8 @@ impl Node {
     }
 
     async fn initialize_p2p(&self) -> Result<(), NodeError> {
-        use libp2p::core::transport::Transport;
-        use libp2p::core::upgrade;
+        use libp2p_core::transport::Transport;
+        use libp2p_core::upgrade;
         use std::time::Duration;
 
         // Generate new identity key
@@ -2986,12 +2962,13 @@ impl Node {
         let noise_config = noise::Config::new(&local_key)
             .map_err(|e| NodeError::Network(format!("Noise config failed: {}", e)))?;
 
-        let transport = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
-            .upgrade(upgrade::Version::V1)
-            .authenticate(noise_config)
-            .multiplex(yamux::Config::default())
-            .timeout(Duration::from_secs(20))
-            .boxed();
+        let transport =
+            libp2p_tcp::tokio::Transport::new(libp2p_tcp::Config::default().nodelay(true))
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise_config)
+                .multiplex(yamux::Config::default())
+                .timeout(Duration::from_secs(20))
+                .boxed();
 
         // Configure Kademlia DHT
         let mut cfg = KademliaConfig::default();
@@ -3062,11 +3039,14 @@ impl Node {
         }
         // END OF BOOTSTRAP SECTION */
 
-        // Initialize behavior and swarm with the correct executor
+        // Initialize behavior and swarm with the Tokio executor.
         let behaviour = HybridBehaviour { kademlia };
-
-        // Use without_executor for the older version of libp2p - this is the safest option
-        let mut swarm = SwarmBuilder::without_executor(transport, behaviour, local_peer_id).build();
+        let mut swarm = Swarm::new(
+            transport,
+            behaviour,
+            local_peer_id,
+            libp2p_swarm::Config::with_tokio_executor(),
+        );
 
         // Transport is explicitly TCP, so always listen on a TCP multiaddr.
         let listen_addr = "/ip4/0.0.0.0/tcp/0";
@@ -3090,7 +3070,7 @@ impl Node {
     async fn handle_p2p_events(&self) -> Result<(), NodeError> {
         // Use explicit import to avoid ambiguity
         use futures_util::StreamExt;
-        use libp2p::swarm::SwarmEvent;
+        use libp2p_swarm::SwarmEvent;
 
         let mut swarm_guard = self.p2p_swarm.lock().await;
         let mut swarm = swarm_guard
@@ -3109,16 +3089,14 @@ impl Node {
 
                 // Use select_next_some() instead of next_event()
                 match swarm.select_next_some().await {
-                    SwarmEvent::Behaviour(HybridBehaviourEvent::Kademlia(event)) => {
-                        match event {
-                            KademliaEvent::OutboundQueryProgressed { result, .. } => {
-                                if let QueryResult::GetClosestPeers(Ok(closest_peers)) = result {
-                                    // Process closest peers
-                                    debug!("Found {} closest peers", closest_peers.peers.len());
-                                }
-                            }
-                            _ => {}
-                        }
+                    SwarmEvent::Behaviour(HybridBehaviourEvent::Kademlia(
+                        KademliaEvent::OutboundQueryProgressed {
+                            result: QueryResult::GetClosestPeers(Ok(closest_peers)),
+                            ..
+                        },
+                    )) => {
+                        // Process closest peers
+                        debug!("Found {} closest peers", closest_peers.peers.len());
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("P2P listening on {:?}", address);
@@ -3697,10 +3675,12 @@ impl Node {
             .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
         stream.set_nodelay(true)?;
 
-        let (peer_info, shared_secret) =
-            tokio::time::timeout(Duration::from_secs(5), self.perform_handshake(&mut stream, true))
-                .await
-                .map_err(|_| NodeError::Network(format!("Handshake timeout with {}", addr)))??;
+        let (peer_info, shared_secret) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.perform_handshake(&mut stream, true),
+        )
+        .await
+        .map_err(|_| NodeError::Network(format!("Handshake timeout with {}", addr)))??;
 
         if peer_info.version != NETWORK_VERSION {
             return Err(NodeError::Network(format!(
@@ -3769,9 +3749,7 @@ impl Node {
 
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
-            if let Err(e) = self.check_outbound_circuit(addr).await {
-                return Err(e);
-            }
+            self.check_outbound_circuit(addr).await?;
 
             let conn = match self.get_or_create_outbound_connection(addr).await {
                 Ok(conn) => conn,
@@ -3888,15 +3866,17 @@ impl Node {
         block: &Block,
         peer: Option<SocketAddr>,
     ) -> Result<bool, NodeError> {
-        let block_hash = hex::encode(&block.hash);
+        let block_hash = hex::encode(block.hash);
 
-        if let Some(entry) = self.validation_cache.get(&block_hash) {
-            if SystemTime::now()
-                .duration_since(entry.timestamp)
-                .map_or(true, |d| d.as_secs() < 3600)
-            {
+        if let Some(entry) = self
+            .validation_cache
+            .get(&block_hash)
+            .map(|entry| entry.clone())
+        {
+            if Self::is_validation_cache_entry_fresh(&entry, SystemTime::now()) {
                 return Ok(entry.valid);
             }
+            self.validation_cache.remove(&block_hash);
         }
 
         let _permit = match tokio::time::timeout(
@@ -4000,7 +3980,10 @@ impl Node {
                 // Header consensus is versioned by activation height:
                 // - v1: enforce only when verifier context is mature
                 // - v2+: enforce unconditionally from activation height
-                if sentinel.should_enforce_consensus_for_block(block.index).await {
+                if sentinel
+                    .should_enforce_consensus_for_block(block.index)
+                    .await
+                {
                     if sentinel
                         .has_conflicting_verified_header(block.index, &block.hash)
                         .await
@@ -4010,22 +3993,21 @@ impl Node {
                             block.index
                         );
                         validation_result = false;
-                    } else if sentinel.should_require_verified_header_record_for_block(block.index)
-                        && !sentinel.has_verification_record(&block.hash)
-                    {
-                        debug!(
-                            "Rejecting block {} due to missing verified header record under active strict header rules",
-                            block.index
-                        );
-                        validation_result = false;
-                    } else if sentinel.has_verification_record(&block.hash)
-                        && !sentinel.is_header_verified(&block.hash).await
-                    {
-                        debug!(
-                            "Rejecting block {} due to insufficient BPoS verifier quorum",
-                            block.index
-                        );
-                        validation_result = false;
+                    } else {
+                        let has_record = sentinel.has_verification_record(&block.hash);
+                        if sentinel.should_require_verified_header_record_for_block(block.index)
+                            && !has_record
+                        {
+                            debug!(
+                                "Accepting block {} with pending header verification record; header sync may arrive after block gossip",
+                                block.index
+                            );
+                        } else if has_record && !sentinel.is_header_verified(&block.hash).await {
+                            debug!(
+                                "Accepting block {} with pending BPoS verifier quorum; rejecting only proven header conflicts",
+                                block.index
+                            );
+                        }
                     }
                 }
             }
@@ -4038,6 +4020,7 @@ impl Node {
                 timestamp: SystemTime::now(),
             },
         );
+        self.maybe_prune_validation_cache();
 
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
@@ -4122,13 +4105,83 @@ impl Node {
         let request = NetworkMessage::TxRequest {
             tx_id: tx_id.to_string(),
         };
-        match tokio::time::timeout(Duration::from_secs(3), self.send_message_with_response(addr, &request)).await {
-            Ok(Ok(NetworkMessage::TxResponse { tx_id: response_id, tx })) if response_id == tx_id => {
-                Ok(tx)
-            }
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            self.send_message_with_response(addr, &request),
+        )
+        .await
+        {
+            Ok(Ok(NetworkMessage::TxResponse {
+                tx_id: response_id,
+                tx,
+            })) if response_id == tx_id => Ok(tx),
             Ok(Ok(_)) => Ok(None),
             Ok(Err(e)) => Err(e),
             Err(_) => Ok(None),
+        }
+    }
+
+    fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
+        now.duration_since(entry.timestamp)
+            .map(|age| age.as_secs() < VALIDATION_CACHE_TTL_SECS)
+            .unwrap_or(false)
+    }
+
+    fn prune_validation_cache_entries(
+        cache: &DashMap<String, ValidationCacheEntry>,
+        now: SystemTime,
+        ttl_secs: u64,
+        max_entries: usize,
+    ) {
+        let expired_keys: Vec<String> = cache
+            .iter()
+            .filter_map(|entry| {
+                let expired = now
+                    .duration_since(entry.timestamp)
+                    .map(|age| age.as_secs() >= ttl_secs)
+                    .unwrap_or(true);
+                expired.then(|| entry.key().clone())
+            })
+            .collect();
+        for key in expired_keys {
+            cache.remove(&key);
+        }
+
+        let len = cache.len();
+        if len <= max_entries {
+            return;
+        }
+
+        let mut entries: Vec<(String, u64)> = cache
+            .iter()
+            .map(|entry| {
+                let timestamp = entry
+                    .timestamp
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                (entry.key().clone(), timestamp)
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(_, timestamp)| *timestamp);
+
+        for (key, _) in entries.into_iter().take(len.saturating_sub(max_entries)) {
+            cache.remove(&key);
+        }
+    }
+
+    fn prune_validation_cache(&self) {
+        Self::prune_validation_cache_entries(
+            &self.validation_cache,
+            SystemTime::now(),
+            VALIDATION_CACHE_TTL_SECS,
+            VALIDATION_CACHE_MAX_ENTRIES,
+        );
+    }
+
+    fn maybe_prune_validation_cache(&self) {
+        if self.validation_cache.len() > VALIDATION_CACHE_MAX_ENTRIES {
+            self.prune_validation_cache();
         }
     }
 
@@ -4170,9 +4223,7 @@ impl Node {
 
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
-            if let Err(e) = self.check_outbound_circuit(addr).await {
-                return Err(e);
-            }
+            self.check_outbound_circuit(addr).await?;
 
             let conn = match self.get_or_create_outbound_connection(addr).await {
                 Ok(conn) => conn,
@@ -4312,8 +4363,10 @@ impl Node {
                 // Validate transaction before adding
                 if self.validate_transaction(&tx, None).await? {
                     // Add to blockchain
-                    let blockchain = self.blockchain.read().await;
-                    blockchain.add_transaction(tx.clone()).await?;
+                    {
+                        let blockchain = self.blockchain.write().await;
+                        blockchain.add_transaction(tx.clone()).await?;
+                    }
 
                     // Broadcast to subset of peers
                     let peers = self.peers.read().await;
@@ -4339,7 +4392,7 @@ impl Node {
                 // Verify block before processing
                 if self.verify_block_parallel(&block).await? {
                     // Save block to blockchain
-                    self.blockchain.read().await.save_block(&block).await?;
+                    self.blockchain.write().await.save_block(&block).await?;
 
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
@@ -4389,8 +4442,8 @@ impl Node {
                 // Add new peer only if not already present
                 let should_monitor = {
                     let mut peers = self.peers.write().await;
-                    if !peers.contains_key(&addr) {
-                        peers.insert(addr, PeerInfo::new(addr));
+                    if let std::collections::hash_map::Entry::Vacant(e) = peers.entry(addr) {
+                        e.insert(PeerInfo::new(addr));
                         true
                     } else {
                         false
@@ -4465,7 +4518,6 @@ impl Node {
                         warn!("Chain response channel already consumed");
                     }
                 }
-
             }
 
             NetworkEvent::ChainResponse { blocks, sender } => {
@@ -4474,7 +4526,7 @@ impl Node {
                         continue;
                     }
 
-                    let blockchain = self.blockchain.read().await;
+                    let blockchain = self.blockchain.write().await;
                     if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
                         warn!(
                             "Failed to save receipt-verified block {} from {}: {}",
@@ -4499,12 +4551,6 @@ impl Node {
             return Err(NodeError::Network("Message too large".into()));
         }
 
-        // Deduplication using bloom filter
-        let message_hash = blake3::hash(data);
-        if !self.network_bloom.insert(message_hash.as_bytes()) {
-            return Ok(None);
-        }
-
         // Deserialize message
         let message: NetworkMessage = match bincode::deserialize(data) {
             Ok(msg) => msg,
@@ -4513,6 +4559,15 @@ impl Node {
                 return Err(NodeError::Network("Invalid message format".into()));
             }
         };
+
+        // Deduplicate gossip only. Requests/responses must always be processed, otherwise one
+        // peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request.
+        if Self::should_dedup_message(&message) {
+            let message_hash = blake3::hash(data);
+            if !self.network_bloom.insert(message_hash.as_bytes()) {
+                return Ok(None);
+            }
+        }
 
         // Rate limiting
         let rate_key = format!("peer_msg:{}:{:?}", addr, std::mem::discriminant(&message));
@@ -4554,23 +4609,32 @@ impl Node {
                 let tx_hash = tx_ref.create_hash();
 
                 // Check validation cache
-                if let Some(cached) = self.validation_cache.get(&tx_hash) {
-                    if cached.valid {
+                if let Some(cached) = self
+                    .validation_cache
+                    .get(&tx_hash)
+                    .map(|entry| entry.clone())
+                {
+                    if !Self::is_validation_cache_entry_fresh(&cached, SystemTime::now()) {
+                        self.validation_cache.remove(&tx_hash);
+                    } else if cached.valid {
                         // If previously validated, just broadcast
                         let peers = self.peers.read().await;
                         let selected_peers = self.select_broadcast_peers(&peers, 8);
                         drop(peers);
-                        self
-                            .broadcast_transaction(tx_ref, addr, selected_peers)
+                        self.broadcast_transaction(tx_ref, addr, selected_peers)
                             .await?;
                         return Ok(None);
+                    } else {
+                        return Ok(None);
                     }
-                    return Ok(None);
                 }
 
                 // Validate transaction
-                let blockchain = self.blockchain.read().await;
-                if blockchain.validate_transaction(&tx_ref, None).await.is_ok() {
+                let tx_valid = {
+                    let blockchain = self.blockchain.read().await;
+                    blockchain.validate_transaction(&tx_ref, None).await.is_ok()
+                };
+                if tx_valid {
                     // Update cache
                     self.validation_cache.insert(
                         tx_hash.clone(),
@@ -4579,14 +4643,18 @@ impl Node {
                             timestamp: SystemTime::now(),
                         },
                     );
+                    self.maybe_prune_validation_cache();
 
                     // Add to blockchain
-                    if blockchain.add_transaction((*tx_ref).clone()).await.is_ok() {
+                    let tx_added = {
+                        let blockchain = self.blockchain.write().await;
+                        blockchain.add_transaction((*tx_ref).clone()).await.is_ok()
+                    };
+                    if tx_added {
                         // Broadcast to peers
                         let peers = self.peers.read().await;
                         let selected_peers = self.select_broadcast_peers(&peers, 8);
                         drop(peers);
-                        drop(blockchain);
 
                         // Execute broadcasts and notifications concurrently
                         let broadcast_fut =
@@ -4611,22 +4679,13 @@ impl Node {
                     return Err(NodeError::Network("Invalid block proof of work".into()));
                 }
 
-                // Process through velocity manager if available
-                if let Some(velocity) = &self.velocity_manager {
-                    let peers = self.peers.read().await;
-                    if velocity.process_block(&block_ref, &peers).await.is_ok() {
-                        return Ok(None);
-                    }
-                    drop(peers);
-                }
-
                 // Verify and propagate block
                 if self
                     .verify_block_with_witness(&block_ref, Some(addr))
                     .await?
                 {
                     // Save block to blockchain
-                    self.blockchain.read().await.save_block(&block_ref).await?;
+                    self.blockchain.write().await.save_block(&block_ref).await?;
 
                     // Send network event
                     tx.send(NetworkEvent::NewBlock((*block_ref).clone()))
@@ -4714,7 +4773,7 @@ impl Node {
                             .verify_block_with_witness(&block_ref, Some(addr))
                             .await?
                         {
-                            self.blockchain.read().await.save_block(&block_ref).await?;
+                            self.blockchain.write().await.save_block(&block_ref).await?;
                         }
                     }
                 }
@@ -4877,6 +4936,19 @@ impl Node {
         Ok(None)
     }
 
+    fn should_dedup_message(message: &NetworkMessage) -> bool {
+        matches!(
+            message,
+            NetworkMessage::Block(_)
+                | NetworkMessage::Transaction(_)
+                | NetworkMessage::AlertMessage(_)
+                | NetworkMessage::HeaderVerification { .. }
+                | NetworkMessage::HeaderSync { .. }
+                | NetworkMessage::DilithiumKeyRegistration { .. }
+                | NetworkMessage::Shred(_)
+        )
+    }
+
     async fn broadcast_transaction(
         &self,
         tx: Arc<Transaction>,
@@ -4965,8 +5037,8 @@ impl Node {
 
                 if let Some((addr, _)) = subnet_peers_sorted.first() {
                     selected.push(**addr);
-                    different_subnets.insert(subnet.clone());
-                    *subnet_counts.entry(subnet.clone()).or_insert(0) += 1;
+                    different_subnets.insert(*subnet);
+                    *subnet_counts.entry(*subnet).or_insert(0) += 1;
 
                     if selected.len() >= actual_target {
                         return selected;
@@ -5172,14 +5244,15 @@ impl Node {
 
                     // Enforce authenticated transport after a successful handshake.
                     // Any decrypt failure or missing secret is treated as a protocol violation.
-                    let message: NetworkMessage = match self.decrypt_message(&data_to_process, &shared_secret) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!("Decryption failed from {}: {}", addr, e);
-                            self.record_peer_failure(addr).await;
-                            break 'connection;
-                        }
-                    };
+                    let message: NetworkMessage =
+                        match self.decrypt_message(data_to_process, &shared_secret) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!("Decryption failed from {}: {}", addr, e);
+                                self.record_peer_failure(addr).await;
+                                break 'connection;
+                            }
+                        };
 
                     // Serialize the message for handle_peer_message dedup/rate tracking.
                     let serialized_message = bincode::serialize(&message)?;
@@ -5276,7 +5349,7 @@ impl Node {
         let mut failures = 0;
 
         // Send initial ping to measure latency
-        if let Err(_) = self.send_ping(addr).await {
+        if self.send_ping(addr).await.is_err() {
             failures += 1;
         }
 
@@ -5328,9 +5401,12 @@ impl Node {
         };
 
         // Send ping with timeout and consume the direct pong response on the same stream.
-        let response = tokio::time::timeout(Duration::from_secs(5), self.send_message_with_response(addr, &ping))
-            .await
-            .map_err(|_| NodeError::Network("Ping timeout".to_string()))??;
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.send_message_with_response(addr, &ping),
+        )
+        .await
+        .map_err(|_| NodeError::Network("Ping timeout".to_string()))??;
 
         match response {
             NetworkMessage::Pong { timestamp, .. } => {
@@ -5350,12 +5426,13 @@ impl Node {
     }
 
     // Method to convert Multiaddr to SocketAddr (needed for libp2p integration)
+    #[allow(dead_code)]
     fn multiaddr_to_socketaddr(&self, addr: &Multiaddr) -> Result<SocketAddr, NodeError> {
-        use libp2p::core::multiaddr::Protocol;
+        use libp2p_core::multiaddr::Protocol;
 
         let components: Vec<_> = addr.iter().collect();
 
-        match (components.get(0), components.get(1)) {
+        match (components.first(), components.get(1)) {
             (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) => {
                 Ok(SocketAddr::new(IpAddr::V4(*ip), *port))
             }
@@ -5423,10 +5500,7 @@ impl Node {
                 return Err(NodeError::Network(format!(
                     "Failed to connect to {}: {}",
                     addr,
-                    last_error.unwrap_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Unknown error"
-                    ))
+                    last_error.unwrap_or_else(|| std::io::Error::other("Unknown error"))
                 )));
             }
         };
@@ -5515,7 +5589,6 @@ impl Node {
         // IMPROVEMENT: Trigger initial latency measurement
         tokio::spawn({
             let node = self.clone();
-            let addr = addr;
             async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let _ = node.send_ping(addr).await;
@@ -5562,22 +5635,20 @@ impl Node {
         drop(peers); // Release lock before making network requests
 
         // Query peer heights in parallel with better error handling
-        let height_queries = peer_ips
-            .iter()
-            .map(|&addr| {
-                let node = self.clone();
-                async move {
-                    match tokio::time::timeout(
-                        Duration::from_millis(PEER_TIMEOUT_MS),
-                        node.request_peer_height(addr),
-                    )
-                    .await
-                    {
-                        Ok(Ok(height)) => Some((addr, height)),
-                        _ => None,
-                    }
+        let height_queries = peer_ips.iter().map(|&addr| {
+            let node = self.clone();
+            async move {
+                match tokio::time::timeout(
+                    Duration::from_millis(PEER_TIMEOUT_MS),
+                    node.request_peer_height(addr),
+                )
+                .await
+                {
+                    Ok(Ok(height)) => Some((addr, height)),
+                    _ => None,
                 }
-            });
+            }
+        });
         let mut peer_heights: Vec<(SocketAddr, u32)> = futures::future::join_all(height_queries)
             .await
             .into_iter()
@@ -5652,7 +5723,7 @@ impl Node {
 
                             let actual_count = candidate_blocks.len();
                             if actual_count > 0 {
-                                let blockchain = self.blockchain.read().await;
+                                let blockchain = self.blockchain.write().await;
                                 let mut saved_count = 0;
 
                                 for block in candidate_blocks {
@@ -5771,7 +5842,7 @@ impl Node {
         if is_initiator {
             // Send our handshake first
             let data = bincode::serialize(&our_handshake)?;
-            if data.len() == 0 || data.len() > MAX_HANDSHAKE_SIZE {
+            if data.is_empty() || data.len() > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Invalid handshake size".into()));
             }
             stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
@@ -5839,7 +5910,7 @@ impl Node {
 
             // Send our response
             let data = bincode::serialize(&our_handshake)?;
-            if data.len() == 0 || data.len() > MAX_HANDSHAKE_SIZE {
+            if data.is_empty() || data.len() > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Invalid handshake size".into()));
             }
             stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
@@ -5941,12 +6012,9 @@ impl Node {
         remote_public: &[u8; 32],
     ) -> Result<Vec<u8>, NodeError> {
         let peer_key = agreement::UnparsedPublicKey::new(&agreement::X25519, remote_public);
-        let ikm = agreement::agree_ephemeral(
-            local_private,
-            &peer_key,
-            NodeError::Network("Failed to derive shared secret".into()),
-            |material| Ok(material.to_vec()),
-        )?;
+        let ikm =
+            agreement::agree_ephemeral(local_private, &peer_key, |material| material.to_vec())
+                .map_err(|_| NodeError::Network("Failed to derive shared secret".into()))?;
 
         // Derive 32-byte shared secret
         let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]);
@@ -5971,5 +6039,132 @@ impl Drop for Node {
 impl From<&Node> for Node {
     fn from(node: &Node) -> Self {
         node.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_bloom_uses_nonzero_hash_count() {
+        let bloom = NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR);
+
+        assert!(bloom.num_hashes > 0);
+        assert!(bloom.max_items_before_reset > 0);
+        assert!(bloom.max_items_before_reset < BLOOM_FILTER_SIZE);
+    }
+
+    #[test]
+    fn network_bloom_deduplicates_and_rotates_before_saturation() {
+        let bloom = NetworkBloom::new(64, 0.01);
+
+        assert!(bloom.insert(b"same-message"));
+        assert!(!bloom.insert(b"same-message"));
+        assert!(bloom.check(b"same-message"));
+
+        let reset_after = bloom.max_items_before_reset;
+        for i in 0..reset_after + 5 {
+            let item = format!("message-{i}");
+            bloom.insert(item.as_bytes());
+        }
+
+        assert!(bloom.item_count() <= reset_after);
+        assert!(bloom.load_factor() < 1.0);
+    }
+
+    #[test]
+    fn validation_cache_prune_removes_expired_and_caps_oldest() {
+        let cache = DashMap::new();
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        cache.insert(
+            "expired".to_string(),
+            ValidationCacheEntry {
+                valid: true,
+                timestamp: now - Duration::from_secs(4_000),
+            },
+        );
+
+        for i in 0..5 {
+            cache.insert(
+                format!("fresh-{i}"),
+                ValidationCacheEntry {
+                    valid: true,
+                    timestamp: now - Duration::from_secs(10 * (i + 1) as u64),
+                },
+            );
+        }
+
+        Node::prune_validation_cache_entries(&cache, now, 3_600, 3);
+
+        assert!(cache.get("expired").is_none());
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("fresh-0").is_some());
+        assert!(cache.get("fresh-1").is_some());
+        assert!(cache.get("fresh-2").is_some());
+        assert!(cache.get("fresh-3").is_none());
+        assert!(cache.get("fresh-4").is_none());
+    }
+
+    #[test]
+    fn network_dedup_applies_only_to_gossip_messages() {
+        assert!(Node::should_dedup_message(&NetworkMessage::AlertMessage(
+            "notice".to_string()
+        )));
+        assert!(!Node::should_dedup_message(&NetworkMessage::GetBlocks {
+            start: 1,
+            end: 2,
+        }));
+        assert!(!Node::should_dedup_message(&NetworkMessage::TxRequest {
+            tx_id: "abc".to_string(),
+        }));
+        assert!(!Node::should_dedup_message(&NetworkMessage::Ping {
+            timestamp: 123,
+            node_id: "node".to_string(),
+        }));
+        assert!(!Node::should_dedup_message(&NetworkMessage::BlockHeight(1)));
+    }
+
+    #[test]
+    fn subnet_group_canonicalizes_ipv4_prefixes() {
+        let group = SubnetGroup::from_ip("192.168.42.99".parse().unwrap(), 24, 64);
+        assert_eq!(group.len, 24);
+        assert_eq!(&group.data[0..4], &[192, 168, 42, 0]);
+        assert_eq!(&group.data[4..], &[0; 12]);
+
+        let group = SubnetGroup::from_ip("10.20.30.40".parse().unwrap(), 16, 64);
+        assert_eq!(group.len, 16);
+        assert_eq!(&group.data[0..4], &[10, 20, 0, 0]);
+
+        let group = SubnetGroup::from_ip("172.16.255.255".parse().unwrap(), 17, 64);
+        assert_eq!(group.len, 17);
+        assert_eq!(&group.data[0..4], &[172, 16, 128, 0]);
+    }
+
+    #[test]
+    fn subnet_group_canonicalizes_ipv6_prefixes() {
+        let group = SubnetGroup::from_ip(
+            "2001:db8:abcd:1234:5678:90ab:cdef:1111".parse().unwrap(),
+            24,
+            64,
+        );
+        assert_eq!(group.len, 64);
+        assert_eq!(
+            &group.data,
+            &[0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        let group = SubnetGroup::from_ip(
+            "2001:db8:abcd:1234:5678:90ab:cdef:1111".parse().unwrap(),
+            24,
+            73,
+        );
+        assert_eq!(group.len, 73);
+        assert_eq!(
+            &group.data[0..8],
+            &[0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0x12, 0x34]
+        );
+        assert_eq!(group.data[8], 0x56);
+        assert_eq!(group.data[9], 0);
     }
 }

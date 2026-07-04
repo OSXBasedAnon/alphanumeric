@@ -4,7 +4,6 @@ use log::warn;
 use num_bigint::BigUint;
 use num_cpus;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,11 +26,11 @@ const PROGPOW_REGS: usize = 32;
 #[derive(Debug, Clone, Error)]
 pub enum CryptoError {
     #[error("Encryption failed")]
-    EncryptionError,
+    Encryption,
     #[error("Decryption failed")]
-    DecryptionError,
+    Decryption,
     #[error("Key generation failed")]
-    KeyGenerationError,
+    KeyGeneration,
 }
 
 #[derive(Error, Debug)]
@@ -141,7 +140,6 @@ impl From<ProgPowTransaction> for Transaction {
 #[derive(Debug)]
 pub struct MiningManager {
     pub params: Arc<RwLock<MiningParams>>,
-    cache: Arc<RwLock<ProgPowCache>>,
     pub last_epoch: Arc<RwLock<u32>>,
     pub wallets: RwLock<HashMap<String, Wallet>>,
     blockchain: Arc<RwLock<Blockchain>>,
@@ -161,11 +159,6 @@ impl MiningManager {
                 min_tx_fee: 0.0,
                 target_block_time: 0.0,
             })),
-            cache: Arc::new(RwLock::new(ProgPowCache {
-                mix_state: [0; PROGPOW_REGS],
-                lanes: [[0; PROGPOW_REGS]; PROGPOW_LANES],
-                dag_entries: Vec::new(),
-            })),
             last_epoch: Arc::new(RwLock::new(0)),
             wallets: RwLock::new(HashMap::new()),
             blockchain,
@@ -176,7 +169,7 @@ impl MiningManager {
         let blockchain = self.blockchain.read().await;
         let mut params = self.params.write().await;
 
-        params.block_reward = blockchain.mining_reward as f64;
+        params.block_reward = blockchain.mining_reward;
         params.min_tx_fee = blockchain.transaction_fee;
         params.target_block_time = blockchain.block_time as f64;
         // Convert blockchain difficulty to our format if needed
@@ -235,19 +228,24 @@ impl MiningManager {
         let result_timestamp = Arc::new(AtomicU64::new(0));
         let hash_result = Arc::new(Mutex::new(Vec::with_capacity(32)));
 
-        let num_threads = std::cmp::min(num_cpus::get(), 32);
-        let nonces_per_thread = max_nonce / num_threads as u64;
+        if max_nonce == 0 {
+            return Err(MiningError::MaxNonceExceeded);
+        }
+
+        let num_threads = std::cmp::min(num_cpus::get(), 32).max(1);
+        let nonces_per_thread = max_nonce.div_ceil(num_threads as u64);
 
         let progress_bar = Arc::new(Mutex::new(ProgressBar::new(max_nonce)));
         {
             if let Ok(pb) = progress_bar.lock() {
-                pb.set_style(
-                    ProgressStyle::default_bar()
-                        .template("{prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-                        .progress_chars("=> "),
-                );
+                let style = ProgressStyle::with_template(
+                    "{prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+                )
+                .map_err(|e| MiningError::MiningFailed(format!("Progress style error: {}", e)))?
+                .progress_chars("=> ");
+                pb.set_style(style);
                 pb.set_prefix(format!("Block #{}", header.number));
-                pb.enable_steady_tick(100);
+                pb.enable_steady_tick(Duration::from_millis(100));
             } else {
                 return Err(MiningError::MiningFailed(
                     "Progress bar lock poisoned".to_string(),
@@ -255,7 +253,7 @@ impl MiningManager {
             }
         }
 
-        let mut current_nonce = 0;
+        let mut current_nonce: u64 = 0;
         let update_interval = 1000;
 
         loop {
@@ -271,7 +269,7 @@ impl MiningManager {
                 })?;
                 (
                     blockchain_guard.get_current_difficulty().await,
-                    previous_block.hash.clone(),
+                    previous_block.hash,
                     previous_block.timestamp,
                     previous_block.index.saturating_add(1),
                 )
@@ -286,17 +284,39 @@ impl MiningManager {
                 continue;
             }
 
-            let merkle_root = if !mining_transactions.is_empty() {
-                Blockchain::calculate_merkle_root(&mining_transactions)
-                    .map_err(|e| MiningError::BlockchainError(e.to_string()))?
-            } else {
-                let mut hasher = Sha256::new();
-                hasher.update(b"empty_transactions");
-                let result = hasher.finalize();
-                let mut root = [0u8; 32];
-                root.copy_from_slice(&result[0..32]);
-                root
+            let block_transactions = {
+                let blockchain_lock = self.blockchain.write().await;
+                let mut selected = Vec::with_capacity(mining_transactions.len());
+                let mut sender_debits: HashMap<String, i128> = HashMap::new();
+
+                for transaction in &mining_transactions {
+                    if transaction.sender == "MINING_REWARDS" {
+                        selected.push(transaction.clone());
+                        continue;
+                    }
+
+                    let confirmed_balance = blockchain_lock
+                        .get_confirmed_balance(&transaction.sender)
+                        .await?;
+                    let confirmed_units = Transaction::to_units(confirmed_balance);
+                    let already_selected = sender_debits
+                        .get(&transaction.sender)
+                        .copied()
+                        .unwrap_or_default();
+                    let required_units = transaction.total_debit_units();
+
+                    if confirmed_units.saturating_sub(already_selected) >= required_units {
+                        selected.push(transaction.clone());
+                        *sender_debits.entry(transaction.sender.clone()).or_default() +=
+                            required_units;
+                    }
+                }
+
+                selected
             };
+
+            let merkle_root = Blockchain::calculate_merkle_root(&block_transactions)
+                .map_err(|e| MiningError::BlockchainError(e.to_string()))?;
 
             let progress_bar = Arc::clone(&progress_bar);
 
@@ -310,8 +330,13 @@ impl MiningManager {
                 .try_for_each(|thread_id| -> Result<(), MiningError> {
                     let mut local_header = header.clone();
                     local_header.merkle_root = merkle_root;
-                    let start_nonce = current_nonce + (thread_id * nonces_per_thread);
-                    let end_nonce = start_nonce + nonces_per_thread;
+                    let range_end = current_nonce.saturating_add(max_nonce);
+                    let start_nonce =
+                        current_nonce.saturating_add(thread_id.saturating_mul(nonces_per_thread));
+                    if start_nonce >= range_end {
+                        return Ok(());
+                    }
+                    let end_nonce = start_nonce.saturating_add(nonces_per_thread).min(range_end);
                     let target = Arc::clone(&target);
 
                     for nonce in start_nonce..end_nonce {
@@ -366,8 +391,8 @@ impl MiningManager {
 
                         if nonce % update_interval == 0 {
                             if let Ok(pb) = progress_bar.try_lock() {
-                                pb.set_position(nonce - current_nonce);
-                                let hash_hex = hex::encode(&hash);
+                                pb.set_position(nonce.saturating_sub(current_nonce));
+                                let hash_hex = hex::encode(hash);
                                 pb.set_message(format!(
                                     "Hash: {} (Difficulty: {})",
                                     &hash_hex[..16],
@@ -404,28 +429,11 @@ impl MiningManager {
                 };
                 let hash_string = hex::encode(&hash);
 
-                let mut valid_transactions = Vec::with_capacity(mining_transactions.len());
-                {
-                    let blockchain_lock = self.blockchain.read().await;
-                    for transaction in &mining_transactions {
-                        if transaction.sender == "MINING_REWARDS" {
-                            valid_transactions.push(transaction.clone());
-                            continue;
-                        }
-                        let sender_balance = blockchain_lock
-                            .get_confirmed_balance(&transaction.sender)
-                            .await?;
-                        if sender_balance >= transaction.amount() + transaction.fee() {
-                            valid_transactions.push(transaction.clone());
-                        }
-                    }
-                }
-
                 let mut new_block = Block {
                     index: header.number,
-                    previous_hash: previous_block_hash.clone(),
+                    previous_hash: previous_block_hash,
                     timestamp: found_timestamp,
-                    transactions: valid_transactions,
+                    transactions: block_transactions,
                     nonce,
                     difficulty: current_network_difficulty,
                     hash: [0u8; 32],
@@ -464,7 +472,7 @@ impl MiningManager {
                 }
 
                 set_finalize_stage(0);
-                let blockchain_lock = self.blockchain.read().await;
+                let blockchain_lock = self.blockchain.write().await;
 
                 let finalize_future = async {
                     let tip = blockchain_lock.get_last_block();
@@ -529,7 +537,9 @@ impl MiningManager {
                 }
             }
 
-            current_nonce += max_nonce;
+            current_nonce = current_nonce
+                .checked_add(max_nonce)
+                .ok_or(MiningError::MaxNonceExceeded)?;
             if let Ok(pb) = progress_bar.lock() {
                 pb.reset();
                 pb.set_message("Starting next nonce range...");
@@ -539,16 +549,12 @@ impl MiningManager {
 }
 
 pub struct Miner {
-    blockchain: Arc<RwLock<Blockchain>>,
     manager: MiningManager,
 }
 
 impl Miner {
-    pub fn new(blockchain: Arc<RwLock<Blockchain>>, manager: MiningManager) -> Self {
-        Miner {
-            blockchain,
-            manager,
-        }
+    pub fn new(_blockchain: Arc<RwLock<Blockchain>>, manager: MiningManager) -> Self {
+        Miner { manager }
     }
 
     pub async fn mine_block(

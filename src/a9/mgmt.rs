@@ -46,7 +46,7 @@ impl WalletKeyData {
         let key_verification_hash = if let Some(key) = &private_key {
             let mut hasher = Sha256::new();
             hasher.update(key);
-            hasher.update(&[is_encrypted as u8]);
+            hasher.update([is_encrypted as u8]);
             hasher.finalize().to_vec()
         } else {
             vec![0u8; 32]
@@ -64,7 +64,6 @@ impl WalletKeyData {
             key_verification_hash,
         }
     }
-
 }
 
 pub struct Mgmt {
@@ -93,9 +92,7 @@ impl Mgmt {
         _db: sled::Db,
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
     ) -> Self {
-        Mgmt {
-            blockchain,
-        }
+        Mgmt { blockchain }
     }
 
     pub fn get_current_timestamp() -> Result<u64> {
@@ -366,8 +363,7 @@ impl Mgmt {
             is_encrypted,
         );
 
-        let mut key_data_vec = Vec::new();
-        key_data_vec.push(key_data);
+        let key_data_vec = vec![key_data];
 
         let serialized_key_data = serde_json::to_string(&key_data_vec)?;
 
@@ -486,7 +482,7 @@ impl Mgmt {
             .open_tree("wallets")
             .map_err(|e| format!("Failed to open wallets tree: {}", e))?;
 
-        for (_, wallet) in wallets {
+        for wallet in wallets.values() {
             let encrypted_private_key = wallet
                 .encrypted_private_key
                 .as_ref()
@@ -831,7 +827,7 @@ impl Mgmt {
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
         write!(stdout, "    Submitting")?;
         stdout.reset()?;
-        write!(stdout, " to blockchain...\n")?;
+        writeln!(stdout, " to blockchain...")?;
         stdout.flush()?;
 
         let mut transaction = Transaction::new(
@@ -861,7 +857,7 @@ impl Mgmt {
 
         // No wallet registry needed - transactions are self-contained with public keys
 
-        match blockchain.read().await.add_transaction(transaction).await {
+        match blockchain.write().await.add_transaction(transaction).await {
             Ok(_) => {
                 writeln!(stdout, "Done")?;
 
@@ -991,8 +987,9 @@ impl Mgmt {
                 write!(stdout, "{:.8}", balance)?;
                 stdout.reset()?;
                 stdout
-                    .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(237, 124, 51)))).ok();
-                write!(stdout, " ♦\n")?;
+                    .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(237, 124, 51))))
+                    .ok();
+                writeln!(stdout, " ♦")?;
                 stdout.reset()?;
 
                 // Pending Transactions Section
@@ -1075,21 +1072,26 @@ impl Mgmt {
                     let _ = stdout.reset();
 
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(100, 149, 237)))).ok();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(100, 149, 237))))
+                        .ok();
                     let _ = write!(stdout, "Address: ");
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White))).ok();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::White)))
+                        .ok();
                     let _ = writeln!(stdout, "{}", wallet.address);
                     let _ = stdout.reset();
 
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(135, 206, 250)))).ok();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(135, 206, 250))))
+                        .ok();
                     let _ = write!(stdout, "Balance: ");
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true)).ok();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))
+                        .ok();
                     let _ = write!(stdout, "{}", balance);
                     stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181)))).ok();
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181))))
+                        .ok();
                     let _ = writeln!(stdout, " ♦");
 
                     let _ = stdout.reset();

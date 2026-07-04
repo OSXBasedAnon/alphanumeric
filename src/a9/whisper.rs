@@ -311,7 +311,7 @@ impl WhisperModule {
                 // Now c is already lowercase
                 let range = high - low;
                 high = low + range * end;
-                low = low + range * start;
+                low += range * start;
             }
         }
 
@@ -335,7 +335,7 @@ impl WhisperModule {
 
         // Normalize the whisper component
         let normalized = (whisper_fee - WHISPER_MIN_AMOUNT) / (MAX_FEE - WHISPER_MIN_AMOUNT);
-        if normalized < 0.0 || normalized > 1.0 {
+        if !(0.0..=1.0).contains(&normalized) {
             return None;
         }
 
@@ -399,7 +399,7 @@ impl WhisperModule {
         wallet: &Wallet,
         sender_balance: f64,
     ) -> Result<Transaction, BlockchainError> {
-        if message.as_bytes().len() > MAX_MESSAGE_BYTES {
+        if message.len() > MAX_MESSAGE_BYTES {
             return Err(BlockchainError::InvalidTransaction);
         }
 
@@ -627,5 +627,11 @@ impl WhisperModule {
         } else {
             "invalid time".to_string()
         }
+    }
+}
+
+impl Default for WhisperModule {
+    fn default() -> Self {
+        Self::new()
     }
 }

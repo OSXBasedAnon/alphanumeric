@@ -24,11 +24,14 @@ use crate::a9::node::Node;
 use crate::a9::node::PeerInfo;
 
 // Constants for tuning
-const MAX_SHRED_SIZE: usize = 32 * 1024; // 32KB per shred
 const MAX_CONCURRENT_REQUESTS: usize = 100;
 const SHRED_CACHE_SIZE: usize = 10_000;
 const ERASURE_SHARD_COUNT: usize = 16;
 const ERASURE_PARITY_SHARD_COUNT: usize = 4;
+const ERASURE_TOTAL_SHARD_COUNT: usize = ERASURE_SHARD_COUNT + ERASURE_PARITY_SHARD_COUNT;
+const DIRECT_BLOCK_SHRED_COUNT: u32 = 1;
+const ERASURE_FRAME_MAGIC: &[u8; 4] = b"A9E1";
+const ERASURE_FRAME_HEADER_LEN: usize = ERASURE_FRAME_MAGIC.len() + std::mem::size_of::<u64>();
 const MAX_SUBNET_PEERS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOOM_FILTER_SIZE: usize = 100_000;
@@ -74,10 +77,12 @@ pub struct SubnetGroup {
     len: u8,
 }
 
+type ShredCacheStore = Arc<parking_lot::Mutex<LruCache<[u8; 32], Vec<Option<Shred>>>>>;
+
 /// High-performance shred cache using LRU
 #[derive(Debug)]
 pub struct ShredCache {
-    cache: Arc<parking_lot::Mutex<LruCache<[u8; 32], Vec<Option<Shred>>>>>,
+    cache: ShredCacheStore,
     bloom: Arc<BloomFilter>,
 }
 
@@ -86,13 +91,14 @@ pub struct ShredCache {
 pub struct BloomFilter {
     bits: Vec<AtomicBool>,
     num_hashes: usize,
+    max_items_before_reset: usize,
+    items_count: AtomicU64,
 }
 
 /// Manages erasure coding for reliability
 #[derive(Debug)]
 pub struct ErasureManager {
     encoder: Arc<ReedSolomon<galois_8::Field>>,
-    shard_size: usize,
 }
 
 /// Core velocity protocol manager
@@ -154,7 +160,7 @@ impl SubnetGroup {
         }
     }
 
-    pub fn into_ip(&self) -> IpAddr {
+    pub fn as_ip(&self) -> IpAddr {
         if self.len <= 32 {
             let mut addr = [0u8; 4];
             addr.copy_from_slice(&self.data[0..4]);
@@ -179,6 +185,10 @@ impl ShredCache {
     }
 
     pub fn add_shred(&self, shred: Shred) -> bool {
+        if !Self::is_erasure_shred_shape(&shred) {
+            return false;
+        }
+
         let key = Self::create_shred_key(&shred);
         if self.bloom.check(&key) {
             return false;
@@ -207,6 +217,12 @@ impl ShredCache {
         true
     }
 
+    fn is_erasure_shred_shape(shred: &Shred) -> bool {
+        shred.total_shreds as usize == ERASURE_TOTAL_SHARD_COUNT
+            && (shred.index as usize) < ERASURE_TOTAL_SHARD_COUNT
+            && !shred.data.is_empty()
+    }
+
     fn create_shred_key(shred: &Shred) -> [u8; 32] {
         use blake3::Hasher;
         let mut hasher = Hasher::new();
@@ -217,12 +233,25 @@ impl ShredCache {
     }
 }
 
+impl Default for ShredCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lock-free bloom filter implementation
 impl BloomFilter {
     pub fn new(size: usize, fpr: f64) -> Self {
-        let num_hashes = Self::optimal_num_hashes(size, fpr);
+        let size = size.max(8);
+        let max_items_before_reset = Self::optimal_item_capacity(size, fpr);
+        let num_hashes = Self::optimal_num_hashes(size, max_items_before_reset);
         let bits = (0..size).map(|_| AtomicBool::new(false)).collect();
-        Self { bits, num_hashes }
+        Self {
+            bits,
+            num_hashes,
+            max_items_before_reset,
+            items_count: AtomicU64::new(0),
+        }
     }
 
     pub fn check(&self, item: &[u8]) -> bool {
@@ -233,11 +262,9 @@ impl BloomFilter {
         })
     }
 
-    fn optimal_num_hashes(size: usize, fpr: f64) -> usize {
-        ((size as f64) * fpr.ln() / (-2f64).ln()).round() as usize
-    }
-
     pub fn add(&self, item: &[u8]) -> bool {
+        self.rotate_if_needed();
+
         let mut was_new = false;
         for i in 0..self.num_hashes {
             let hash = Self::hash(item, i);
@@ -246,7 +273,38 @@ impl BloomFilter {
             let old = self.bits[idx].swap(true, Ordering::Relaxed);
             was_new |= !old; // Track if any bit was newly set
         }
+        if was_new {
+            self.items_count.fetch_add(1, Ordering::Relaxed);
+        }
         was_new
+    }
+
+    fn clear(&self) {
+        for bit in &self.bits {
+            bit.store(false, Ordering::Relaxed);
+        }
+        self.items_count.store(0, Ordering::Relaxed);
+    }
+
+    fn rotate_if_needed(&self) {
+        if self.items_count.load(Ordering::Relaxed) >= self.max_items_before_reset as u64 {
+            self.clear();
+        }
+    }
+
+    fn optimal_item_capacity(size: usize, fpr: f64) -> usize {
+        let fpr = if fpr.is_finite() {
+            fpr.clamp(1e-9, 0.5)
+        } else {
+            0.01
+        };
+        let capacity = -((size as f64) * std::f64::consts::LN_2.powi(2)) / fpr.ln();
+        capacity.floor().max(1.0) as usize
+    }
+
+    fn optimal_num_hashes(size: usize, expected_items: usize) -> usize {
+        let expected_items = expected_items.max(1);
+        (((size as f64 / expected_items as f64) * std::f64::consts::LN_2).round() as usize).max(1)
     }
 
     fn hash(data: &[u8], seed: usize) -> u64 {
@@ -268,16 +326,16 @@ impl ErasureManager {
 
         Self {
             encoder: Arc::new(encoder),
-            shard_size: MAX_SHRED_SIZE,
         }
     }
 
     pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, VelocityError> {
+        let payload = Self::frame_payload(data);
         let mut shards = Vec::new();
-        let shard_size = (data.len() + ERASURE_SHARD_COUNT - 1) / ERASURE_SHARD_COUNT;
+        let shard_size = payload.len().div_ceil(ERASURE_SHARD_COUNT).max(1);
 
         // Create data shards
-        for chunk in data.chunks(shard_size) {
+        for chunk in payload.chunks(shard_size) {
             let mut shard = vec![0u8; shard_size];
             shard[..chunk.len()].copy_from_slice(chunk);
             shards.push(shard);
@@ -299,6 +357,22 @@ impl ErasureManager {
     }
 
     pub fn decode(&self, mut shards: Vec<Option<Vec<u8>>>) -> Result<Vec<u8>, VelocityError> {
+        if shards.len() != ERASURE_TOTAL_SHARD_COUNT {
+            return Err(VelocityError::Encoding(format!(
+                "expected {} shards, got {}",
+                ERASURE_TOTAL_SHARD_COUNT,
+                shards.len()
+            )));
+        }
+
+        let available = shards.iter().filter(|shard| shard.is_some()).count();
+        if available < ERASURE_SHARD_COUNT {
+            return Err(VelocityError::Encoding(format!(
+                "need at least {} shards, got {}",
+                ERASURE_SHARD_COUNT, available
+            )));
+        }
+
         self.encoder
             .reconstruct(&mut shards)
             .map_err(|e| VelocityError::Encoding(e.to_string()))?;
@@ -307,7 +381,45 @@ impl ErasureManager {
         for shard in shards.into_iter().take(ERASURE_SHARD_COUNT).flatten() {
             result.extend(shard);
         }
-        Ok(result)
+        Self::unframe_payload(result)
+    }
+
+    fn frame_payload(data: &[u8]) -> Vec<u8> {
+        let mut framed = Vec::with_capacity(ERASURE_FRAME_HEADER_LEN + data.len());
+        framed.extend_from_slice(ERASURE_FRAME_MAGIC);
+        framed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        framed.extend_from_slice(data);
+        framed
+    }
+
+    fn unframe_payload(data: Vec<u8>) -> Result<Vec<u8>, VelocityError> {
+        if data.len() < ERASURE_FRAME_HEADER_LEN
+            || &data[..ERASURE_FRAME_MAGIC.len()] != ERASURE_FRAME_MAGIC
+        {
+            return Ok(data);
+        }
+
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&data[ERASURE_FRAME_MAGIC.len()..ERASURE_FRAME_HEADER_LEN]);
+        let payload_len = u64::from_le_bytes(len_bytes) as usize;
+        let payload_start = ERASURE_FRAME_HEADER_LEN;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| VelocityError::Encoding("framed payload length overflow".into()))?;
+
+        if payload_end > data.len() {
+            return Err(VelocityError::Encoding(
+                "framed payload length exceeds decoded data".into(),
+            ));
+        }
+
+        Ok(data[payload_start..payload_end].to_vec())
+    }
+}
+
+impl Default for ErasureManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -350,8 +462,7 @@ impl VelocityManager {
         let cache = self.shred_cache.cache.lock();
 
         if let Some(shreds) = cache.peek(block_hash) {
-            if shreds.iter().all(|s| s.is_some()) {
-                // All shreds available, reconstruct block
+            if Self::has_enough_erasure_shards(shreds) {
                 let shards: Vec<Option<Vec<u8>>> = shreds
                     .iter()
                     .map(|s| s.as_ref().map(|s| s.data.to_vec()))
@@ -585,7 +696,7 @@ impl VelocityManager {
     pub async fn is_block_complete(&self, block_hash: &[u8; 32]) -> bool {
         let cache = self.shred_cache.cache.lock();
         if let Some(shreds) = cache.peek(block_hash) {
-            shreds.iter().all(|s| s.is_some())
+            Self::has_enough_erasure_shards(shreds)
         } else {
             false
         }
@@ -660,6 +771,10 @@ impl VelocityManager {
         shred: Shred,
         from: SocketAddr,
     ) -> Result<Option<Block>, VelocityError> {
+        if shred.total_shreds == DIRECT_BLOCK_SHRED_COUNT {
+            return self.handle_direct_block_shred(shred, from).await;
+        }
+
         // Add shred to cache
         if !self.shred_cache.add_shred(shred.clone()) {
             return Ok(None);
@@ -677,6 +792,35 @@ impl VelocityManager {
         self.request_missing_shreds(shred.block_hash, from).await?;
 
         Ok(None)
+    }
+
+    async fn handle_direct_block_shred(
+        &self,
+        shred: Shred,
+        from: SocketAddr,
+    ) -> Result<Option<Block>, VelocityError> {
+        if shred.index != 0 {
+            return Err(VelocityError::ShredValidation(
+                "direct block shred index must be zero".into(),
+            ));
+        }
+
+        let block: Block = bincode::deserialize(&shred.data)
+            .map_err(|e| VelocityError::DeserializationError(e.to_string()))?;
+        let calculated_hash = block.calculate_hash_for_block();
+        if calculated_hash != block.hash || block.hash != shred.block_hash {
+            return Err(VelocityError::HashMismatch);
+        }
+
+        self.metrics.record_shred_processed();
+        self.metrics.record_block_reconstructed();
+        self.subnet_manager.update_coverage(from.ip(), true);
+        Ok(Some(block))
+    }
+
+    fn has_enough_erasure_shards(shreds: &[Option<Shred>]) -> bool {
+        shreds.len() == ERASURE_TOTAL_SHARD_COUNT
+            && shreds.iter().filter(|shred| shred.is_some()).count() >= ERASURE_SHARD_COUNT
     }
 
     async fn try_reconstruct_block(
@@ -845,6 +989,12 @@ impl VelocityManager {
     }
 }
 
+impl Default for VelocityManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Subnet implementation
 impl SubnetManager {
     pub fn new() -> Self {
@@ -878,8 +1028,14 @@ impl SubnetManager {
 
     fn ip_to_index(&self, ip: IpAddr) -> usize {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&ip.to_string().as_bytes());
+        hasher.update(ip.to_string().as_bytes());
         (hasher.finalize().as_bytes()[0] as usize) % self.coverage.len()
+    }
+}
+
+impl Default for SubnetManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -976,5 +1132,114 @@ impl VelocityMetrics {
 
     pub fn record_propagation_latency(&self, duration: Duration) {
         Self::record_latency(&self.propagation_latency, duration.as_micros() as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a9::blockchain::Transaction;
+
+    fn test_shred(block_hash: [u8; 32], index: u32) -> Shred {
+        Shred {
+            block_hash,
+            index,
+            total_shreds: ERASURE_TOTAL_SHARD_COUNT as u32,
+            data: vec![index as u8 + 1],
+            subnet_hint: None,
+            timestamp: 1,
+            nonce: index as u64,
+        }
+    }
+
+    #[test]
+    fn bloom_filter_accepts_first_insert_and_rejects_duplicate() {
+        let bloom = BloomFilter::new(64, 0.01);
+
+        assert!(bloom.num_hashes > 0);
+        assert!(bloom.max_items_before_reset > 0);
+        assert!(!bloom.check(b"first-shred"));
+        assert!(bloom.add(b"first-shred"));
+        assert!(bloom.check(b"first-shred"));
+        assert!(!bloom.add(b"first-shred"));
+    }
+
+    #[test]
+    fn shred_cache_rejects_unbounded_total_shreds() {
+        let cache = ShredCache::new();
+        let mut shred = test_shred([7u8; 32], 0);
+        shred.total_shreds = u32::MAX;
+
+        assert!(!cache.add_shred(shred));
+        assert_eq!(cache.cache.lock().len(), 0);
+    }
+
+    #[test]
+    fn erasure_encode_decode_handles_empty_payload() {
+        let manager = ErasureManager::new();
+        let shards = manager.encode(&[]).expect("empty payload should encode");
+
+        assert_eq!(shards.len(), ERASURE_TOTAL_SHARD_COUNT);
+
+        let decoded = manager
+            .decode(shards.into_iter().map(Some).collect())
+            .expect("empty payload should decode");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn erasure_decode_reconstructs_with_data_threshold() {
+        let manager = ErasureManager::new();
+        let payload = b"payload that should survive four missing shards";
+        let shards = manager.encode(payload).expect("payload should encode");
+        let mut shards = shards.into_iter().map(Some).collect::<Vec<_>>();
+
+        shards[0] = None;
+        shards[3] = None;
+        shards[16] = None;
+        shards[19] = None;
+
+        let decoded = manager
+            .decode(shards)
+            .expect("threshold shards should reconstruct");
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn velocity_considers_erasure_block_complete_at_data_threshold() {
+        let manager = VelocityManager::new();
+        let block_hash = [9u8; 32];
+
+        for index in 0..ERASURE_SHARD_COUNT {
+            assert!(manager
+                .shred_cache
+                .add_shred(test_shred(block_hash, index as u32)));
+        }
+
+        assert!(manager.is_block_complete(&block_hash).await);
+    }
+
+    #[tokio::test]
+    async fn direct_block_shred_returns_block_without_erasure_decode() {
+        let manager = VelocityManager::new();
+        let tx = Transaction::new("alice".into(), "bob".into(), 1.0, 0.001, 1, None);
+        let block = Block::new(1, [0u8; 32], 1, vec![tx], 0, 1).expect("block should build");
+        let shred = Shred {
+            block_hash: block.hash,
+            index: 0,
+            total_shreds: DIRECT_BLOCK_SHRED_COUNT,
+            data: bincode::serialize(&block).expect("block should serialize"),
+            subnet_hint: None,
+            timestamp: block.timestamp,
+            nonce: 0,
+        };
+
+        let reconstructed = manager
+            .handle_shred(shred, "127.0.0.1:8333".parse().unwrap())
+            .await
+            .expect("direct shred should decode")
+            .expect("direct shred should return a block");
+
+        assert_eq!(reconstructed.hash, block.hash);
     }
 }

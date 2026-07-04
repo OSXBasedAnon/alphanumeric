@@ -12,6 +12,8 @@ use bincode;
 use crate::a9::blockchain::{Blockchain, BlockchainError, Transaction};
 use crate::a9::bpos::BlockHeaderInfo;
 
+type CheckpointQueue = Arc<RwLock<VecDeque<([u8; 32], u64)>>>;
+
 const MEMPOOL_MAX_BYTES: usize = 50_000_000;
 const MEMPOOL_MAX_TRANSACTIONS: usize = 50_000;
 const MEMPOOL_MAX_PER_ADDRESS: usize = 100;
@@ -34,13 +36,13 @@ impl Eq for FeePerByte {}
 
 impl PartialOrd for FeePerByte {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FeePerByte {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -55,13 +57,13 @@ pub struct MempoolEntry {
 
 impl PartialOrd for MempoolEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.fee_per_byte.cmp(&other.fee_per_byte))
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for MempoolEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        self.fee_per_byte.cmp(&other.fee_per_byte)
     }
 }
 
@@ -156,7 +158,10 @@ impl Mempool {
         };
 
         // Batch updates atomically
-        self.transactions.entry(sender.clone()).or_default().push(entry);
+        self.transactions
+            .entry(sender.clone())
+            .or_default()
+            .push(entry);
         self.address_counts
             .entry(sender)
             .and_modify(|e| *e += 1)
@@ -394,10 +399,16 @@ impl Mempool {
     }
 }
 
+impl Default for Mempool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct TemporalVerification {
     verified_headers: Arc<DashMap<[u8; 32], u64>>,
-    checkpoint_hashes: Arc<RwLock<VecDeque<([u8; 32], u64)>>>,
+    checkpoint_hashes: CheckpointQueue,
     last_checkpoint: Arc<RwLock<u64>>,
 }
 
@@ -436,7 +447,11 @@ impl TemporalVerification {
             self.verified_headers.insert(block.hash, block.timestamp);
 
             // Also add to checkpoint hashes if appropriate
-            if self.verified_headers.len() % (MAX_CHECKPOINT_HEADERS / 10) == 0 {
+            if self
+                .verified_headers
+                .len()
+                .is_multiple_of(MAX_CHECKPOINT_HEADERS / 10)
+            {
                 self.update_checkpoint_hashes(&header_info).await;
             }
         }
@@ -547,5 +562,34 @@ impl TemporalVerification {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+}
+
+impl Default for TemporalVerification {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn fee_per_byte_orders_highest_fee_first() {
+        let low = FeePerByte(1.0);
+        let mid = FeePerByte(2.5);
+        let high = FeePerByte(10.0);
+
+        assert!(high > mid);
+        assert!(mid > low);
+        assert_eq!(high.partial_cmp(&mid), Some(high.cmp(&mid)));
+
+        let mut heap = BinaryHeap::from([mid, high, low]);
+        assert_eq!(heap.pop(), Some(high));
+        assert_eq!(heap.pop(), Some(mid));
+        assert_eq!(heap.pop(), Some(low));
+        assert_eq!(heap.pop(), None);
     }
 }

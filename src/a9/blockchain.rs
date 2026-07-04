@@ -4,7 +4,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
-use log::error;
+use log::{error, warn};
 use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
 use sled::Db;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::error::Error;
 use std::fmt;
@@ -38,12 +38,16 @@ const PENDING_TRANSACTIONS_TREE: &str = "pending_transactions";
 const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
+const CHAIN_META_TREE: &str = "chain_meta";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
+const CHAIN_TIP_KEY: &[u8] = b"tip";
+const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
+const ORPHAN_REORG_DEPTH: u32 = 1024;
 
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
@@ -240,8 +244,8 @@ impl Transaction {
         // Sign and decode into bytes for signature hash + verification.
         let full_signature_hex = block_on(sender_wallet.sign_transaction(&transaction_data))
             .ok_or("Failed to sign transaction")?;
-        let full_signature =
-            hex::decode(&full_signature_hex).map_err(|e| format!("Invalid signature hex: {}", e))?;
+        let full_signature = hex::decode(&full_signature_hex)
+            .map_err(|e| format!("Invalid signature hex: {}", e))?;
 
         // Create new transaction with full signature for verification
         let mut tx_with_full_sig = Self::new(
@@ -635,63 +639,14 @@ impl Block {
         Ok(())
     }
 
-    fn validate_mining_reward(
-        &self,
-        blockchain: &Blockchain,
-        block: &Block,
-    ) -> Result<(), BlockchainError> {
-        // Find mining reward transaction - must be first transaction
-        let reward_txs: Vec<&Transaction> = block
-            .transactions
-            .iter()
-            .filter(|tx| tx.sender == "MINING_REWARDS")
-            .collect();
-
-        match reward_txs.len() {
-            0 => return Err(BlockchainError::InvalidTransaction),
-            1 => {
-                let reward_tx = reward_txs[0];
-
-                // Verify reward transaction is the first transaction in block
-                if block.transactions.first().map(|tx| tx.sender.as_str()) != Some("MINING_REWARDS")
-                {
-                    return Err(BlockchainError::InvalidTransaction);
-                }
-
-                // Critical security checks
-                if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE)
-                    || reward_tx.signature.is_some()
-                    || reward_tx.sender != "MINING_REWARDS"
-                {
-                    return Err(BlockchainError::InvalidTransaction);
-                }
-
-                // Fixed: Using Block's verify_difficulty_proof instead
-                if !block.verify_difficulty_proof() {
-                    return Err(BlockchainError::InvalidHash);
-                }
-
-                // Fixed: Pass blockchain reference to calculate_block_reward
-                let expected_reward = blockchain.calculate_block_reward(block)?;
-                if reward_tx.amount_units != Transaction::to_units(expected_reward)
-                {
-                    return Err(BlockchainError::InvalidTransactionAmount);
-                }
-            }
-            _ => return Err(BlockchainError::InvalidTransaction), // Multiple rewards not allowed
-        }
-
-        Ok(())
-    }
-
     pub fn hash_to_hex_string(&self) -> String {
         // Use hex::encode which is optimized for this exact use case
-        hex::encode(&self.hash)
+        hex::encode(self.hash)
     }
 
     pub fn previous_hash_to_hex_string(&self) -> String {
         // Use hex::encode which is optimized for this exact use case
-        hex::encode(&self.previous_hash)
+        hex::encode(self.previous_hash)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -786,10 +741,10 @@ impl From<std::io::Error> for BlockchainError {
 
 impl From<hex::FromHexError> for BlockchainError {
     fn from(err: hex::FromHexError) -> Self {
-        BlockchainError::SerializationError(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Hex decode error: {}", err),
-        )))
+        BlockchainError::SerializationError(Box::new(std::io::Error::other(format!(
+            "Hex decode error: {}",
+            err
+        ))))
     }
 }
 
@@ -872,10 +827,7 @@ impl RateLimiter {
 
     pub fn check_limit(&self, address: &str) -> bool {
         let now = tokio::time::Instant::now();
-        let mut times = self
-            .windows
-            .entry(address.to_string())
-            .or_insert_with(Vec::new);
+        let mut times = self.windows.entry(address.to_string()).or_default();
 
         // Optimization: Only cleanup if we have entries to clean
         // Most of the time, the vector will be small and all entries valid
@@ -928,11 +880,11 @@ impl SystemKeyDeriver {
 
         // Verify transaction is part of the block with exact matching
         if !block.transactions.iter().any(|block_tx| {
-            block_tx.sender == tx.sender &&
-            block_tx.recipient == tx.recipient &&
-            block_tx.amount_units == tx.amount_units &&
-            block_tx.fee_units == tx.fee_units &&
-            block_tx.timestamp == tx.timestamp
+            block_tx.sender == tx.sender
+                && block_tx.recipient == tx.recipient
+                && block_tx.amount_units == tx.amount_units
+                && block_tx.fee_units == tx.fee_units
+                && block_tx.timestamp == tx.timestamp
         }) {
             return Err(BlockchainError::InvalidSystemTransaction);
         }
@@ -962,10 +914,29 @@ pub struct Blockchain {
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
 }
 
+impl fmt::Display for Blockchain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Blockchain {{ ... }}")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OrphanStoredBlock {
     block: Block,
     received_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct ChainTipMetadata {
+    height: u32,
+    hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct ChainStateDirty {
+    block_index: u32,
+    reason: String,
+    marked_at: u64,
 }
 
 impl Blockchain {
@@ -975,11 +946,19 @@ impl Blockchain {
         index_str.parse::<u32>().ok()
     }
 
-    fn highest_block_index(&self) -> Option<u32> {
+    fn highest_block_index_scan(&self) -> Option<u32> {
         self.db
             .scan_prefix("block_")
             .filter_map(|entry| entry.ok().and_then(|(k, _)| Self::block_index_from_key(&k)))
             .max()
+    }
+
+    fn highest_block_index(&self) -> Option<u32> {
+        self.current_chain_tip_metadata()
+            .ok()
+            .flatten()
+            .map(|tip| tip.height)
+            .or_else(|| self.highest_block_index_scan())
     }
 
     fn now_unix_secs() -> u64 {
@@ -1015,6 +994,10 @@ impl Blockchain {
         self.db.open_tree(ORPHAN_INDEX_TREE).map_err(Into::into)
     }
 
+    fn open_chain_meta_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(CHAIN_META_TREE).map_err(Into::into)
+    }
+
     fn open_pending_debits_tree(&self) -> Result<sled::Tree, BlockchainError> {
         self.db.open_tree(PENDING_DEBITS_TREE).map_err(Into::into)
     }
@@ -1047,6 +1030,13 @@ impl Blockchain {
 
         // Otherwise, parent might currently be in the orphan pool.
         self.get_orphan_block_by_hash(&block.previous_hash)
+    }
+
+    fn validate_parent_timestamp(block: &Block, parent: &Block) -> Result<(), BlockchainError> {
+        if block.timestamp < parent.timestamp {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+        Ok(())
     }
 
     async fn prevalidate_unattached_block(
@@ -1103,7 +1093,9 @@ impl Blockchain {
     }
 
     async fn get_pending_debit_for(&self, address: &str) -> Result<f64, BlockchainError> {
-        Ok(Transaction::from_units(self.get_pending_debit_units(address).await?))
+        Ok(Transaction::from_units(
+            self.get_pending_debit_units(address).await?,
+        ))
     }
 
     async fn get_pending_debit_units(&self, address: &str) -> Result<i128, BlockchainError> {
@@ -1113,10 +1105,6 @@ impl Blockchain {
         } else {
             Ok(0)
         }
-    }
-
-    async fn get_pending_credit_for(&self, address: &str) -> Result<f64, BlockchainError> {
-        Ok(Transaction::from_units(self.get_pending_credit_units(address).await?))
     }
 
     async fn get_pending_credit_units(&self, address: &str) -> Result<i128, BlockchainError> {
@@ -1162,6 +1150,86 @@ impl Blockchain {
             tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
         }
         Ok(())
+    }
+
+    fn read_chain_tip_metadata(&self) -> Result<Option<ChainTipMetadata>, BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        let Some(raw) = meta_tree.get(CHAIN_TIP_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(bincode::deserialize(&raw)?))
+    }
+
+    fn write_chain_tip_metadata(&self, block: &Block) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        let tip = ChainTipMetadata {
+            height: block.index,
+            hash: block.hash,
+        };
+        meta_tree.insert(CHAIN_TIP_KEY, bincode::serialize(&tip)?)?;
+        Ok(())
+    }
+
+    fn clear_chain_tip_metadata(&self) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        meta_tree.remove(CHAIN_TIP_KEY)?;
+        Ok(())
+    }
+
+    fn rebuild_chain_tip_metadata(&self) -> Result<Option<ChainTipMetadata>, BlockchainError> {
+        let Some(height) = self.highest_block_index_scan() else {
+            self.clear_chain_tip_metadata()?;
+            return Ok(None);
+        };
+        let block = self.get_block(height)?;
+        self.write_chain_tip_metadata(&block)?;
+        self.open_chain_meta_tree()?.flush()?;
+        Ok(Some(ChainTipMetadata {
+            height,
+            hash: block.hash,
+        }))
+    }
+
+    fn current_chain_tip_metadata(&self) -> Result<Option<ChainTipMetadata>, BlockchainError> {
+        let Some(tip) = self.read_chain_tip_metadata()? else {
+            return self.rebuild_chain_tip_metadata();
+        };
+
+        match self.get_block(tip.height) {
+            Ok(block) if block.hash == tip.hash => Ok(Some(tip)),
+            _ => self.rebuild_chain_tip_metadata(),
+        }
+    }
+
+    fn mark_chain_state_dirty(
+        &self,
+        block_index: u32,
+        reason: &str,
+    ) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        let marker = ChainStateDirty {
+            block_index,
+            reason: reason.to_string(),
+            marked_at: Self::now_unix_secs(),
+        };
+        meta_tree.insert(CHAIN_STATE_DIRTY_KEY, bincode::serialize(&marker)?)?;
+        meta_tree.flush()?;
+        Ok(())
+    }
+
+    fn clear_chain_state_dirty(&self) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        meta_tree.remove(CHAIN_STATE_DIRTY_KEY)?;
+        meta_tree.flush()?;
+        Ok(())
+    }
+
+    fn chain_state_dirty(&self) -> Result<Option<ChainStateDirty>, BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        let Some(raw) = meta_tree.get(CHAIN_STATE_DIRTY_KEY)? else {
+            return Ok(None);
+        };
+        Ok(Some(bincode::deserialize(&raw)?))
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
@@ -1453,6 +1521,8 @@ impl Blockchain {
             self.validate_block_strict(b).await?;
         }
 
+        self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
+
         // Apply reorg by rewriting canonical block slots with the selected branch.
         for b in &branch {
             let key = format!("block_{}", b.index);
@@ -1460,7 +1530,15 @@ impl Blockchain {
             self.db
                 .insert(key.as_bytes(), bincode::serialize(&storage)?)?;
         }
-        self.db.flush()?;
+
+        let branch_tip = branch
+            .last()
+            .ok_or(BlockchainError::InvalidBlockHeader)?
+            .clone();
+        for stale_height in branch_tip.index.saturating_add(1)..=tip.index {
+            let key = format!("block_{}", stale_height);
+            self.db.remove(key.as_bytes())?;
+        }
 
         // Remove adopted branch blocks from orphan pool.
         for b in &branch {
@@ -1471,8 +1549,13 @@ impl Blockchain {
         // Rebuild balances index after reorg.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         self.rebuild_balances_index(&balances_tree).await?;
-        Self::set_balances_height(&balances_tree, self.get_latest_block_index() as u64)?;
+        Self::set_balances_height(&balances_tree, branch_tip.index as u64)?;
+        self.write_chain_tip_metadata(&branch_tip)?;
         let _ = self.get_network_difficulty().await?;
+        self.db.flush()?;
+        balances_tree.flush()?;
+        self.open_chain_meta_tree()?.flush()?;
+        self.clear_chain_state_dirty()?;
 
         Ok(true)
     }
@@ -1489,7 +1572,9 @@ impl Blockchain {
             let (_, raw) = item?;
             if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
                 let expired = now.saturating_sub(entry.received_at) > ORPHAN_TTL_SECS;
-                let stale_height = tip.map(|t| entry.block.index <= t).unwrap_or(false);
+                let stale_height = tip
+                    .map(|t| entry.block.index.saturating_add(ORPHAN_REORG_DEPTH) < t)
+                    .unwrap_or(false);
                 if expired || stale_height {
                     remove_hashes.push(entry.block.hash);
                 } else {
@@ -1545,7 +1630,7 @@ impl Blockchain {
             .last_verification
             .load(Ordering::Relaxed);
         let should_verify_integrity =
-            block.index % 128 == 0 || now.saturating_sub(last_integrity) >= 60;
+            block.index.is_multiple_of(128) || now.saturating_sub(last_integrity) >= 60;
 
         if should_verify_integrity {
             if !self.chain_sentinel.verify_chain_integrity(self).await {
@@ -1603,28 +1688,44 @@ impl Blockchain {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
+        self.mark_chain_state_dirty(block.index, "persist_block")?;
+
         // Process transactions with BlockValidation context
         let tx_context = match sig_mode {
             SignatureValidationMode::RequireFull => TransactionContext::BlockValidation,
             SignatureValidationMode::AllowTruncatedStored => TransactionContext::ReceiptValidation,
         };
-        self.process_transactions_batch(block.transactions.clone(), tx_context)
-            .await?;
+        if let Err(err) = self
+            .process_transactions_batch(block.transactions.clone(), tx_context)
+            .await
+        {
+            warn!(
+                "Block {} transaction application failed; dirty marker remains for startup recovery",
+                block.index
+            );
+            return Err(err);
+        }
 
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
 
         // Serialize and save block
-        let value = bincode::serialize(&storage_block)
-            .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+        let value = match bincode::serialize(&storage_block) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(BlockchainError::SerializationError(Box::new(err)));
+            }
+        };
 
         let key = format!("block_{}", block.index);
-        self.db
-            .insert(key.as_bytes(), value)
-            .map_err(BlockchainError::DatabaseError)?;
+        if let Err(err) = self.db.insert(key.as_bytes(), value) {
+            return Err(BlockchainError::DatabaseError(err));
+        }
 
         // Remove this hash from orphan pool if present
-        self.remove_orphan_by_hash(&block.hash)?;
+        if let Err(err) = self.remove_orphan_by_hash(&block.hash) {
+            warn!("Failed to remove adopted orphan {}: {}", block.index, err);
+        }
 
         // Update network difficulty atomically
         {
@@ -1632,10 +1733,17 @@ impl Blockchain {
             *current_difficulty = block.difficulty;
         }
 
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        Self::set_balances_height(&balances_tree, block.index as u64)?;
+        self.write_chain_tip_metadata(block)?;
+
         // Ensure all changes are persisted
         self.db
             .flush()
             .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
+        balances_tree.flush()?;
+        self.open_chain_meta_tree()?.flush()?;
+        self.clear_chain_state_dirty()?;
 
         Ok(())
     }
@@ -1755,19 +1863,29 @@ impl Blockchain {
     }
 
     pub async fn ensure_balances_index(&self) -> Result<(), BlockchainError> {
+        self.ensure_balances_index_with_force(false).await
+    }
+
+    async fn ensure_balances_index_with_force(
+        &self,
+        force_rebuild_requested: bool,
+    ) -> Result<(), BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let tip = self.get_latest_block_index();
-        let force_rebuild = std::env::var("ALPHANUMERIC_REBUILD_BALANCES")
+        let force_rebuild_env = std::env::var("ALPHANUMERIC_REBUILD_BALANCES")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         let current_height = Self::get_balances_height(&balances_tree)?;
-        let needs_rebuild =
-            force_rebuild || current_height.is_none() || current_height.unwrap_or(0) != tip;
+        let needs_rebuild = force_rebuild_requested
+            || force_rebuild_env
+            || current_height.is_none()
+            || current_height.unwrap_or(0) != tip;
 
         if needs_rebuild {
             self.rebuild_balances_index(&balances_tree).await?;
             Self::set_balances_height(&balances_tree, tip)?;
+            balances_tree.flush()?;
         }
 
         Ok(())
@@ -1849,11 +1967,21 @@ impl Blockchain {
         // Ensure orphan-management trees exist.
         let _ = db.open_tree(ORPHAN_BLOCKS_TREE);
         let _ = db.open_tree(ORPHAN_INDEX_TREE);
+        let _ = db.open_tree(CHAIN_META_TREE);
 
         blockchain
     }
 
     pub async fn initialize(&self) -> Result<(), BlockchainError> {
+        let dirty_state = self.chain_state_dirty()?;
+        if let Some(marker) = dirty_state.as_ref() {
+            warn!(
+                "Recovering derived chain state after interrupted {} at block {}",
+                marker.reason, marker.block_index
+            );
+        }
+        let _ = self.rebuild_chain_tip_metadata()?;
+
         // Get and set the network difficulty first
         self.get_network_difficulty().await?;
 
@@ -1863,7 +1991,11 @@ impl Blockchain {
         self.rebuild_pending_debits_index().await?;
 
         // Ensure balances index is valid (rebuild if needed)
-        self.ensure_balances_index().await?;
+        self.ensure_balances_index_with_force(dirty_state.is_some())
+            .await?;
+        if dirty_state.is_some() {
+            self.clear_chain_state_dirty()?;
+        }
         self.prune_orphans()?;
         let _ = self.promote_orphans_from_tip().await;
 
@@ -2074,11 +2206,9 @@ impl Blockchain {
 
         // First pass: Get all confirmed balances
         for tx in &block.transactions {
-            if tx.sender != "MINING_REWARDS" {
-                if !confirmed_balances.contains_key(&tx.sender) {
-                    let balance = self.get_confirmed_balance(&tx.sender).await?;
-                    confirmed_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
-                }
+            if tx.sender != "MINING_REWARDS" && !confirmed_balances.contains_key(&tx.sender) {
+                let balance = self.get_confirmed_balance(&tx.sender).await?;
+                confirmed_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
             }
         }
         set_finalize_stage(2);
@@ -2106,27 +2236,48 @@ impl Blockchain {
         set_finalize_stage(3);
         trace_step("validate_batch");
 
+        self.mark_chain_state_dirty(block.index, "finalize_block")?;
+
         // Process transactions atomically
-        self.process_transactions_batch(
-            block.transactions.clone(),
-            TransactionContext::BlockValidation,
-        )
-        .await?;
+        if let Err(err) = self
+            .process_transactions_batch(
+                block.transactions.clone(),
+                TransactionContext::BlockValidation,
+            )
+            .await
+        {
+            warn!(
+                "Finalized block {} transaction application failed; dirty marker remains for startup recovery",
+                block.index
+            );
+            return Err(err);
+        }
         set_finalize_stage(4);
         trace_step("apply_batch");
 
         // Save block with truncated signatures to reduce on-disk chain size.
         let storage_block = Self::to_storage_block(&block);
-        let value = bincode::serialize(&storage_block)?;
+        let value = match bincode::serialize(&storage_block) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(BlockchainError::SerializationError(Box::new(err)));
+            }
+        };
         let key = format!("block_{}", block.index);
-        self.db.insert(key.as_bytes(), value)?;
+        if let Err(err) = self.db.insert(key.as_bytes(), value) {
+            return Err(BlockchainError::DatabaseError(err));
+        }
         set_finalize_stage(5);
         trace_step("db_insert");
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         Self::set_balances_height(&balances_tree, block.index as u64)?;
+        self.write_chain_tip_metadata(&block)?;
         set_finalize_stage(6);
         trace_step("balances_height");
         self.db.flush()?;
+        balances_tree.flush()?;
+        self.open_chain_meta_tree()?.flush()?;
+        self.clear_chain_state_dirty()?;
         let _ = self.promote_orphans_from_tip().await;
 
         Ok(())
@@ -2271,37 +2422,6 @@ impl Blockchain {
         }
     }
 
-    fn detect_difficulty_manipulation(&self, block: &Block) -> Result<(), BlockchainError> {
-        // Get recent blocks
-        let recent_blocks = self.get_recent_blocks(50);
-
-        if recent_blocks.is_empty() {
-            return Ok(());
-        }
-
-        // Calculate statistical measures
-        let mut difficulties: Vec<u64> = recent_blocks.iter().map(|b| b.difficulty).collect();
-
-        difficulties.sort_unstable();
-        let median = difficulties[difficulties.len() / 2];
-
-        // Calculate mean absolute deviation
-        let mad: f64 = difficulties
-            .iter()
-            .map(|&d| (d as i64 - median as i64).abs() as f64)
-            .sum::<f64>()
-            / difficulties.len() as f64;
-
-        // Check if new difficulty is within acceptable range
-        let diff = (block.difficulty as i64 - median as i64).abs() as f64;
-        if diff > mad * 3.0 {
-            // Using 3 MAD as threshold
-            return Err(BlockchainError::InvalidBlockHeader);
-        }
-
-        Ok(())
-    }
-
     pub fn get_genesis_block(&self) -> Result<Block, BlockchainError> {
         self.get_block(0)
     }
@@ -2323,11 +2443,7 @@ impl Blockchain {
     ) -> Result<bool, BlockchainError> {
         let mut previous_block: Option<Block> = None;
 
-        for item in self.db.iter() {
-            let (_, value) = item.map_err(BlockchainError::DatabaseError)?;
-            let current_block =
-                Block::from_bytes(&value).map_err(|e| BlockchainError::SerializationError(e))?;
-
+        for current_block in self.get_blocks() {
             let _epoch = mining_manager
                 .get_last_epoch()
                 .await
@@ -2494,45 +2610,14 @@ impl Blockchain {
     }
 
     pub fn get_block_by_timestamp(&self, timestamp: u64) -> Result<Block, BlockchainError> {
-        for result in self.db.scan_prefix(b"block_") {
-            if let Ok((_, block_data)) = result {
-                if let Ok(block) = Block::from_bytes(&block_data) {
-                    if block.timestamp == timestamp {
-                        return Ok(block);
-                    }
+        for (_, block_data) in self.db.scan_prefix(b"block_").flatten() {
+            if let Ok(block) = Block::from_bytes(&block_data) {
+                if block.timestamp == timestamp {
+                    return Ok(block);
                 }
             }
         }
         Err(BlockchainError::InvalidTransaction)
-    }
-
-    fn validate_system_transaction(
-        &self,
-        tx: &Transaction,
-        block: &Block,
-    ) -> Result<(), BlockchainError> {
-        if tx.sender != "MINING_REWARDS" {
-            return Err(BlockchainError::InvalidSystemTransaction); // Handle other system tx types if needed
-        }
-
-        if block.transactions.is_empty() || block.transactions[0].sender != "MINING_REWARDS" {
-            return Err(BlockchainError::InvalidSystemTransaction); // Not the first transaction
-        }
-
-        let reward_tx = &block.transactions[0];
-
-        if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE)
-            || reward_tx.signature.is_some()
-        {
-            return Err(BlockchainError::InvalidSystemTransaction);
-        }
-
-        let expected_reward = self.calculate_block_reward(block)?; // Calculate expected reward
-        if reward_tx.amount_units != Transaction::to_units(expected_reward) {
-            return Err(BlockchainError::InvalidTransactionAmount);
-        }
-
-        Ok(())
     }
 
     fn is_valid_hash_with_difficulty(&self, hash: &[u8; 32], difficulty: u64) -> bool {
@@ -2580,6 +2665,7 @@ impl Blockchain {
             if parent.hash != block.previous_hash {
                 return Err(BlockchainError::InvalidBlockHeader);
             }
+            Self::validate_parent_timestamp(block, &parent)?;
 
             let expected_difficulty = Block::adjust_dynamic_difficulty(
                 parent.difficulty,
@@ -2659,29 +2745,6 @@ impl Blockchain {
         Ok(())
     }
 
-    async fn get_weighted_average_timestamp(&self) -> Result<u64, BlockchainError> {
-        let block_count = self.get_block_count();
-        if block_count == 0 {
-            return Ok(SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs());
-        }
-
-        let num_blocks_to_consider = std::cmp::min(11, block_count as usize); // Same as MTP
-        let mut weighted_sum = 0u64;
-        let mut total_weight = 0u64;
-
-        for i in 0..num_blocks_to_consider {
-            let block = self.get_block((block_count as usize - 1 - i) as u32)?;
-            let weight = (num_blocks_to_consider - i) as u64; // Linear weighting
-            weighted_sum += block.timestamp * weight;
-            total_weight += weight;
-        }
-
-        Ok(weighted_sum / total_weight)
-    }
-
     pub async fn validate_new_block(&self, block: &Block) -> Result<(), BlockchainError> {
         // Basic Header Validation
         block.validate_header()?;
@@ -2725,29 +2788,6 @@ impl Blockchain {
         }
 
         Ok(())
-    }
-
-    // New helper method to calculate confirmed balance without pending transactions
-    async fn calculate_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
-        let mut balance_units: i128 = 0;
-
-        // Only consider confirmed blocks
-        for result in self.db.scan_prefix("block_") {
-            if let Ok((_, block_data)) = result {
-                if let Ok(block) = Block::from_bytes(&block_data) {
-                    for tx in block.transactions {
-                        if tx.recipient == address {
-                            balance_units += tx.amount_units;
-                        }
-                        if tx.sender == address && tx.sender != "MINING_REWARDS" {
-                            balance_units -= tx.total_debit_units();
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(Transaction::from_units(balance_units))
     }
 
     pub async fn add_transaction(&self, transaction: Transaction) -> Result<(), BlockchainError> {
@@ -2847,7 +2887,9 @@ impl Blockchain {
         let current_debit = self.get_pending_debit_units(&transaction.sender).await?;
         let next_debit = current_debit + storage_tx.total_debit_units();
         Self::set_pending_debit_for(&pending_debits_tree, &transaction.sender, next_debit)?;
-        let current_credit = self.get_pending_credit_units(&transaction.recipient).await?;
+        let current_credit = self
+            .get_pending_credit_units(&transaction.recipient)
+            .await?;
         let next_credit = current_credit + storage_tx.amount_units;
         Self::set_pending_credit_for(&pending_credits_tree, &transaction.recipient, next_credit)?;
 
@@ -2892,13 +2934,11 @@ impl Blockchain {
     }
 
     pub fn get_transaction_by_hash(&self, hash: &str) -> Option<Transaction> {
-        for result in self.db.iter() {
-            if let Ok((_, value)) = result {
-                if let Ok(block) = Block::from_bytes(&value) {
-                    for tx in block.transactions {
-                        if tx.create_hash() == hash {
-                            return Some(tx);
-                        }
+        for (_, value) in self.db.scan_prefix(b"block_").flatten() {
+            if let Ok(block) = Block::from_bytes(&value) {
+                for tx in block.transactions {
+                    if tx.create_hash() == hash {
+                        return Some(tx);
                     }
                 }
             }
@@ -3148,22 +3188,20 @@ impl Blockchain {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let mut pending_balances: HashMap<String, i128> = HashMap::new(); // Track pending balances
 
-        for result in pending_tree.iter() {
-            if let Ok((_, tx_bytes)) = result {
-                if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                    if tx.sender == address {
-                        let pending_spent = pending_balances.get(address).unwrap_or(&0);
-                        // Get current balance from confirmed transactions
-                        let current_balance = balance_units;
-                        let tx_debit = tx.total_debit_units();
-                        if current_balance + pending_spent < tx_debit {
-                            continue; // Skip double-spending transaction
-                        }
-                        balance_units -= tx_debit;
-                        *pending_balances.entry(address.to_string()).or_insert(0) -= tx_debit;
-                    } else if tx.recipient == address {
-                        balance_units += tx.amount_units;
+        for (_, tx_bytes) in pending_tree.iter().flatten() {
+            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
+                if tx.sender == address {
+                    let pending_spent = pending_balances.get(address).unwrap_or(&0);
+                    // Get current balance from confirmed transactions
+                    let current_balance = balance_units;
+                    let tx_debit = tx.total_debit_units();
+                    if current_balance + pending_spent < tx_debit {
+                        continue; // Skip double-spending transaction
                     }
+                    balance_units -= tx_debit;
+                    *pending_balances.entry(address.to_string()).or_insert(0) -= tx_debit;
+                } else if tx.recipient == address {
+                    balance_units += tx.amount_units;
                 }
             }
         }
@@ -3279,7 +3317,7 @@ impl Blockchain {
 
         let mut index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);
         if auto_rebuild {
-            let tip = self.get_latest_block_index() as u64;
+            let tip = self.get_latest_block_index();
             if index_height < tip {
                 self.ensure_balances_index().await?;
                 index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(tip);
@@ -3289,7 +3327,7 @@ impl Blockchain {
             let balance_units = Self::deserialize_units_compatible(&balance_bytes)?;
             return Ok(Transaction::from_units(balance_units));
         }
-        if auto_rebuild && index_height >= self.get_latest_block_index() as u64 {
+        if auto_rebuild && index_height >= self.get_latest_block_index() {
             let balance_units: i128 = 0;
             balances_tree.insert(address.as_bytes(), bincode::serialize(&balance_units)?)?;
             return Ok(0.0);
@@ -3298,21 +3336,19 @@ impl Blockchain {
         let mut balance_units: i128 = 0;
         let mut current_batch = Vec::with_capacity(200);
 
-        for result in self.db.scan_prefix(b"block_") {
-            if let Ok((_, block_data)) = result {
-                current_batch.push(block_data);
+        for (_, block_data) in self.db.scan_prefix(b"block_").flatten() {
+            current_batch.push(block_data);
 
-                if current_batch.len() >= 200 {
-                    // Process current batch
-                    for block_data in current_batch.drain(..) {
-                        if let Ok(block) = Block::from_bytes(&block_data) {
-                            for tx in &block.transactions {
-                                if tx.recipient == address {
-                                    balance_units += tx.amount_units;
-                                }
-                                if tx.sender == address {
-                                    balance_units -= tx.total_debit_units();
-                                }
+            if current_batch.len() >= 200 {
+                // Process current batch
+                for block_data in current_batch.drain(..) {
+                    if let Ok(block) = Block::from_bytes(&block_data) {
+                        for tx in &block.transactions {
+                            if tx.recipient == address {
+                                balance_units += tx.amount_units;
+                            }
+                            if tx.sender == address {
+                                balance_units -= tx.total_debit_units();
                             }
                         }
                     }
@@ -3423,8 +3459,8 @@ impl Blockchain {
         if current_level.len() == 1 {
             let single_hash = current_level[0];
             let mut hasher = Sha256::new();
-            hasher.update(&single_hash);
-            hasher.update(&single_hash); // Duplicate the hash!
+            hasher.update(single_hash);
+            hasher.update(single_hash); // Duplicate the hash!
             return Ok(hasher.finalize().into());
         }
 
@@ -3433,9 +3469,9 @@ impl Blockchain {
                 .chunks(2)
                 .map(|pair| {
                     let mut hasher = Sha256::new();
-                    hasher.update(&pair[0]);
+                    hasher.update(pair[0]);
                     if pair.len() == 2 {
-                        hasher.update(&pair[1]);
+                        hasher.update(pair[1]);
                     }
                     hasher.finalize().into()
                 })
@@ -3470,23 +3506,13 @@ pub struct BlockchainInfo {
 
 #[derive(Debug)]
 pub struct ChainSentinel {
-    header_cache: Arc<RwLock<VecDeque<HeaderInfo>>>,
     verified_blocks: Arc<DashMap<[u8; 32], BlockVerification>>,
     integrity_score: AtomicU64,
     last_verification: AtomicU64,
 }
 
-#[derive(Debug, Clone)]
-struct HeaderInfo {
-    hash: [u8; 32],
-    height: u32,
-    timestamp: u64,
-    verification_count: u32,
-}
-
 #[derive(Debug)]
 struct BlockVerification {
-    timestamp: u64,
     verifiers: HashSet<String>, // Node IDs that verified
     integrity_confirmed: bool,
 }
@@ -3494,7 +3520,6 @@ struct BlockVerification {
 impl ChainSentinel {
     pub fn new() -> Self {
         Self {
-            header_cache: Arc::new(RwLock::new(VecDeque::with_capacity(10000))),
             verified_blocks: Arc::new(DashMap::new()),
             integrity_score: AtomicU64::new(100), // Start at 100%
             last_verification: AtomicU64::new(0),
@@ -3519,6 +3544,10 @@ impl ChainSentinel {
             }
 
             // Time verification
+            if block.timestamp < prev_timestamp {
+                self.integrity_score.fetch_sub(5, Ordering::Relaxed);
+                return false;
+            }
             let time_diff = block.timestamp.saturating_sub(prev_timestamp);
             if time_diff > TARGET_BLOCK_TIME * 12 {
                 self.integrity_score.fetch_sub(5, Ordering::Relaxed);
@@ -3562,10 +3591,6 @@ impl ChainSentinel {
                 let mut verifiers = HashSet::new();
                 verifiers.insert(verifier);
                 BlockVerification {
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
                     verifiers,
                     integrity_confirmed: false,
                 }
@@ -3587,11 +3612,74 @@ impl ChainSentinel {
     }
 }
 
+impl Default for ChainSentinel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pqcrypto_dilithium::dilithium5::keypair as dilithium_keypair;
     use serde_json::Value;
+
+    fn test_blockchain() -> Blockchain {
+        let db = sled::Config::new()
+            .temporary(true)
+            .open()
+            .expect("temporary sled db should open");
+        Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            TARGET_BLOCK_TIME as u32,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(Mutex::new(321)),
+        )
+    }
+
+    fn metadata_test_block(
+        index: u32,
+        previous_hash: [u8; 32],
+        recipient: &str,
+        amount: f64,
+    ) -> Block {
+        let tx = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: recipient.to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(amount),
+            timestamp: 1_000 + index as u64,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        let transactions = vec![tx];
+        let merkle_root =
+            Blockchain::calculate_merkle_root(&transactions).expect("merkle root should build");
+        let mut block = Block {
+            index,
+            previous_hash,
+            timestamp: 1_000 + index as u64,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+        block
+    }
+
+    fn insert_raw_block(blockchain: &Blockchain, block: &Block) {
+        let key = format!("block_{}", block.index);
+        blockchain
+            .db
+            .insert(key.as_bytes(), bincode::serialize(block).unwrap())
+            .expect("raw block insert should succeed");
+    }
 
     #[test]
     fn pow_target_zero_difficulty_is_max_target() {
@@ -3701,5 +3789,98 @@ mod tests {
         };
 
         assert!(Blockchain::verify_transaction_receipt_fields(&tx).is_err());
+    }
+
+    #[test]
+    fn chain_tip_metadata_rebuilds_from_existing_blocks() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "miner1", 2.0);
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+
+        assert_eq!(blockchain.read_chain_tip_metadata().unwrap(), None);
+        assert_eq!(blockchain.get_latest_block_index(), 1);
+
+        let tip = blockchain
+            .read_chain_tip_metadata()
+            .unwrap()
+            .expect("tip metadata should be rebuilt");
+        assert_eq!(tip.height, 1);
+        assert_eq!(tip.hash, block1.hash);
+        assert_eq!(blockchain.get_latest_block_hash(), block1.hash);
+    }
+
+    #[tokio::test]
+    async fn dirty_state_recovery_rebuilds_tip_and_balances() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "miner1", 2.0);
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+
+        blockchain
+            .write_chain_tip_metadata(&block0)
+            .expect("stale tip metadata should write");
+        blockchain
+            .mark_chain_state_dirty(1, "test_interrupted_commit")
+            .expect("dirty marker should write");
+        let balances_tree = blockchain
+            .db
+            .open_tree(BALANCES_TREE)
+            .expect("balances tree should open");
+        balances_tree
+            .insert("miner1".as_bytes(), bincode::serialize(&999i128).unwrap())
+            .expect("stale balance should write");
+        Blockchain::set_balances_height(&balances_tree, 0).unwrap();
+
+        blockchain.initialize().await.unwrap();
+
+        assert_eq!(blockchain.chain_state_dirty().unwrap(), None);
+        assert_eq!(blockchain.get_latest_block_index(), 1);
+        assert_eq!(blockchain.get_latest_block_hash(), block1.hash);
+        assert_eq!(
+            blockchain.get_confirmed_balance("miner0").await.unwrap(),
+            1.0
+        );
+        assert_eq!(
+            blockchain.get_confirmed_balance("miner1").await.unwrap(),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_child_timestamp_before_parent() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 10.0);
+        insert_raw_block(&blockchain, &block0);
+
+        let mut block1 = metadata_test_block(1, block0.hash, "miner1", 10.0);
+        block1.timestamp = block0.timestamp.saturating_sub(1);
+        block1.hash = block1.calculate_hash_for_block();
+
+        let err = blockchain
+            .validate_block(&block1)
+            .await
+            .expect_err("child block with backwards timestamp should be rejected");
+        assert!(matches!(err, BlockchainError::InvalidBlockHeader));
+    }
+
+    #[test]
+    fn orphan_pruning_retains_recent_same_height_competitors() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "miner1", 2.0);
+        let competing = metadata_test_block(1, block0.hash, "miner2", 3.0);
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+        blockchain.rebuild_chain_tip_metadata().unwrap();
+
+        blockchain.store_orphan_block(&competing).unwrap();
+
+        assert!(blockchain
+            .get_orphan_block_by_hash(&competing.hash)
+            .unwrap()
+            .is_some());
     }
 }

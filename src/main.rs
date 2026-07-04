@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::a9::{
+use alphanumeric::a9::{
     blockchain::{
         Block, Blockchain, RateLimiter, Transaction, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
@@ -32,14 +32,15 @@ use crate::a9::{
     progpow::{Miner, MiningManager},
     whisper::WhisperModule,
 };
-use crate::config::AppConfig;
-mod a9;
-mod config;
+use alphanumeric::config::AppConfig;
 
 const KEY_FILE_PATH: &str = "private.key";
 const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
+const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
+const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
+    "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
 #[cfg(feature = "bootstrap_publisher")]
 const BOOTSTRAP_META_TREE: &str = "bootstrap_publish_meta";
@@ -50,6 +51,179 @@ const BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT: &[u8] = b"last_published_height";
 
 // Modify result to take only one type parameter
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(serde::Deserialize)]
+struct BootstrapManifestResponse {
+    ok: bool,
+    manifest: BootstrapManifestPointer,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct BootstrapManifestPointer {
+    url: String,
+    #[serde(default)]
+    height: Option<u64>,
+    #[serde(default)]
+    tip_hash: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    publisher_pubkey: String,
+    manifest_sig: String,
+    updated_at: u64,
+}
+
+#[derive(serde::Serialize)]
+struct BootstrapManifestSignedFields {
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tip_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    updated_at: u64,
+}
+
+impl BootstrapManifestPointer {
+    fn signed_fields(&self) -> BootstrapManifestSignedFields {
+        BootstrapManifestSignedFields {
+            url: self.url.clone(),
+            height: self.height,
+            tip_hash: self.tip_hash.clone(),
+            sha256: self.sha256.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+fn is_hex_with_len(value: &str, len: usize) -> bool {
+    value.len() == len && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> {
+    if manifest.url.trim().is_empty() {
+        return Err("Bootstrap manifest URL is empty".into());
+    }
+    if !manifest.url.starts_with("https://") {
+        return Err("Bootstrap manifest URL must use https".into());
+    }
+
+    let publisher_pubkey = manifest.publisher_pubkey.trim().to_ascii_lowercase();
+    if publisher_pubkey != BOOTSTRAP_PUBLISHER_PUBKEY {
+        return Err("Bootstrap manifest publisher key is not pinned".into());
+    }
+    if !is_hex_with_len(&publisher_pubkey, 64) {
+        return Err("Bootstrap manifest publisher key is malformed".into());
+    }
+
+    let Some(height) = manifest.height else {
+        return Err("Bootstrap manifest is missing height".into());
+    };
+    if height == 0 {
+        return Err("Bootstrap manifest height must be non-zero".into());
+    }
+
+    let Some(tip_hash) = manifest.tip_hash.as_deref() else {
+        return Err("Bootstrap manifest is missing tip hash".into());
+    };
+    if !is_hex_with_len(tip_hash.trim(), 64) {
+        return Err("Bootstrap manifest tip hash is malformed".into());
+    }
+
+    let Some(sha256) = manifest.sha256.as_deref() else {
+        return Err("Bootstrap manifest is missing SHA-256".into());
+    };
+    if !is_hex_with_len(sha256.trim(), 64) {
+        return Err("Bootstrap manifest SHA-256 is malformed".into());
+    }
+
+    let sig_hex = manifest.manifest_sig.trim();
+    if !is_hex_with_len(sig_hex, 128) {
+        return Err("Bootstrap manifest signature is malformed".into());
+    }
+
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let pubkey_bytes: [u8; 32] = hex::decode(&publisher_pubkey)?
+        .try_into()
+        .map_err(|_| "Bootstrap publisher key must be 32 bytes")?;
+    let sig_bytes: [u8; 64] = hex::decode(sig_hex)?
+        .try_into()
+        .map_err(|_| "Bootstrap manifest signature must be 64 bytes")?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes)
+        .map_err(|e| format!("Bootstrap publisher key rejected: {}", e))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let signed_payload = serde_json::to_vec(&manifest.signed_fields())?;
+
+    verifying_key
+        .verify(&signed_payload, &signature)
+        .map_err(|e| format!("Bootstrap manifest signature verification failed: {}", e))?;
+
+    Ok(())
+}
+
+fn bootstrap_block_index_from_key(key: &[u8]) -> Option<u32> {
+    let key_str = std::str::from_utf8(key).ok()?;
+    let index_str = key_str.strip_prefix("block_")?;
+    index_str.parse::<u32>().ok()
+}
+
+fn verify_bootstrap_snapshot_tip(
+    db_path: &str,
+    expected_height: Option<u64>,
+    expected_tip_hash: Option<&str>,
+) -> Result<()> {
+    let db = sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .open()?;
+
+    let tip_index = db
+        .scan_prefix("block_")
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|(k, _)| bootstrap_block_index_from_key(&k))
+        })
+        .max()
+        .ok_or("Bootstrap snapshot does not contain block data")?;
+
+    if let Some(expected_height) = expected_height {
+        if u64::from(tip_index) != expected_height {
+            return Err(format!(
+                "Bootstrap snapshot height mismatch: expected {}, got {}",
+                expected_height, tip_index
+            )
+            .into());
+        }
+    }
+
+    let key = format!("block_{}", tip_index);
+    let raw = db
+        .get(key.as_bytes())?
+        .ok_or("Bootstrap snapshot tip block is missing")?;
+    let block = Block::from_bytes(raw.as_ref())?;
+    if block.calculate_hash_for_block() != block.hash {
+        return Err("Bootstrap snapshot tip block hash is invalid".into());
+    }
+
+    if let Some(expected_tip_hash) = expected_tip_hash {
+        let expected_tip_hash = expected_tip_hash.trim().to_ascii_lowercase();
+        if !expected_tip_hash.is_empty() {
+            let actual = hex::encode(block.hash);
+            if actual != expected_tip_hash {
+                return Err(format!(
+                    "Bootstrap snapshot tip mismatch: expected {}, got {}",
+                    expected_tip_hash, actual
+                )
+                .into());
+            }
+        }
+    }
+
+    drop(db);
+    Ok(())
+}
 
 fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
     let genesis_hash = blockchain
@@ -77,12 +251,6 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
     (descriptor, fingerprint)
 }
 
-impl std::fmt::Display for Blockchain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Blockchain {{ ... }}")
-    }
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     // Initialize logging with ERROR level during startup to avoid UI interference
@@ -99,8 +267,7 @@ async fn main() -> Result<()> {
 
     let pb = ProgressBar::new(9);
     pb.set_style(
-        ProgressStyle::default_bar()
-            .template("\r{spinner:.green} [{bar:40.cyan/blue}] {msg}")
+        ProgressStyle::with_template("\r{spinner:.green} [{bar:40.cyan/blue}] {msg}")?
             .progress_chars("█▓░"),
     );
 
@@ -597,7 +764,7 @@ async fn main() -> Result<()> {
 
         // Staking
         let header_sentinel = node.header_sentinel().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Missing header sentinel")
+            std::io::Error::other("Missing header sentinel")
         })?;
         let staking_node = Arc::new(RwLock::new(BPoSSentinel::new(
             blockchain.clone(),
@@ -687,7 +854,7 @@ async fn main() -> Result<()> {
                 Some("create") | Some("send") | Some("transfer") => {
                     // Handle the creation of the transaction
                     if let Err(e) = mgmt
-                        .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
+                        .handle_create_transaction(command, &mut wallets, &blockchain, &db_arc)
                         .await
                     {
                         println!("Error: {}", e);
@@ -863,7 +1030,7 @@ async fn main() -> Result<()> {
     let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount().abs()).sum();
     let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee().abs()).sum();
 
-if pending_txs.len() > 0 {
+if !pending_txs.is_empty() {
     color_spec.set_fg(Some(Color::Rgb(88, 240, 181)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Total Value:        {:.8} ♦", pending_value)?;
@@ -1073,7 +1240,7 @@ writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
         let (recipient, amount, message) = match parts.len() {
             3 => {
                 let msg = parts[2].trim_matches('"');
-                if msg.as_bytes().len() > crate::a9::whisper::MAX_MESSAGE_BYTES {
+                if msg.len() > alphanumeric::a9::whisper::MAX_MESSAGE_BYTES {
                     let mut error_style = ColorSpec::new();
                     error_style.set_fg(Some(Color::Red)).set_bold(true);
                     stdout.set_color(&error_style)?;
@@ -1081,24 +1248,24 @@ writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
                     stdout.reset()?;
                     continue;
                 }
-                (&parts[1], crate::a9::whisper::WHISPER_MIN_AMOUNT, msg)
+                (&parts[1], alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT, msg)
             },
             4 => {
                 let amount = match parts[2].parse::<f64>() {
-                    Ok(a) if a.is_finite() && a >= crate::a9::whisper::WHISPER_MIN_AMOUNT => a,
+                    Ok(a) if a.is_finite() && a >= alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT => a,
                     _ => {
                         let mut error_style = ColorSpec::new();
                         error_style.set_fg(Some(Color::Red)).set_bold(true);
                         stdout.set_color(&error_style)?;
                         println!("Minimum {} token required for whisper messages", 
-                            crate::a9::whisper::WHISPER_MIN_AMOUNT);
+                            alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT);
                         stdout.reset()?;
                         continue;
                     }
                 };
 
                 let msg = parts[3].trim_matches('"');
-                if msg.as_bytes().len() > crate::a9::whisper::MAX_MESSAGE_BYTES {
+                if msg.len() > alphanumeric::a9::whisper::MAX_MESSAGE_BYTES {
                     let mut error_style = ColorSpec::new();
                     error_style.set_fg(Some(Color::Red)).set_bold(true);
                     stdout.set_color(&error_style)?;
@@ -1125,16 +1292,16 @@ stdout.reset()?;
     writeln!(stdout, "\n───────────────────")?;
 
 
-write!(&mut stdout, "whisper (Displays recent whispers.)\n")?;
-write!(&mut stdout, "whisper <recipient> <amount> <message> Send a new whisper to <recipient>.\n")?;
+writeln!(&mut stdout, "whisper (Displays recent whispers.)")?;
+writeln!(&mut stdout, "whisper <recipient> <amount> <message> Send a new whisper to <recipient>.")?;
 
 stdout.set_color(&section_style)?;
 write!(&mut stdout, "\n Whisper Code")?;
 stdout.reset()?;
     writeln!(stdout, "\n───────────────────")?;
 
-write!(&mut stdout, "Embed a short alphabetic message, 4-character (4-byte) code.\n")?;
-write!(&mut stdout, "This optional feature provides a vanity fee code that can be seen by decoding the fee with a cipher.\n")?;
+writeln!(&mut stdout, "Embed a short alphabetic message, 4-character (4-byte) code.")?;
+writeln!(&mut stdout, "This optional feature provides a vanity fee code that can be seen by decoding the fee with a cipher.")?;
 stdout.set_color(&description_style)?;
 write!(&mut stdout, "Whisper codes can be decoded from the public ledger so do not share sensitive information.\n\n")?;
 
@@ -1329,12 +1496,12 @@ Some("history") => {
     }
 },
     Some(cmd) if cmd.starts_with("--") => {
-        if let Err(e) = handle_network_commands(&command, &node, &blockchain).await {
+        if let Err(e) = handle_network_commands(command, &node, &blockchain).await {
             println!("Network command error: {}", e);
         }
     },
     Some("account") => {
-        if let Err(e) = mgmt.handle_account_command(&command, &blockchain, &wallets).await {
+        if let Err(e) = mgmt.handle_account_command(command, &blockchain, &wallets).await {
             println!("Error displaying account info: {}", e);
         }
     },
@@ -1439,8 +1606,7 @@ async fn handle_chain_sync(
 
     // IMPROVEMENT: Better peer selection with health metrics
     let network_health = node.network_health.read().await;
-    let target_peers =
-        ((network_health.active_nodes / 4) as usize).clamp(3, MAX_PARALLEL_DOWNLOADS);
+    let target_peers = (network_health.active_nodes / 4).clamp(3, MAX_PARALLEL_DOWNLOADS);
     drop(network_health);
 
     // Try to discover peers if we don't have enough
@@ -1478,8 +1644,7 @@ async fn handle_chain_sync(
     drop(peers);
 
     if sync_peers.is_empty() {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(Box::new(std::io::Error::other(
             "No peers available for sync",
         )));
     }
@@ -1517,17 +1682,15 @@ async fn handle_chain_sync(
     let blocks_remaining = target_height - local_height;
     let main_pb = mp.add(ProgressBar::new(blocks_remaining as u64));
     main_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks ({eta}) {msg}")
-            .progress_chars("█▓░"),
+        ProgressStyle::with_template(
+            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks ({eta}) {msg}",
+        )?
+        .progress_chars("█▓░"),
     );
     main_pb.set_message("Syncing blockchain...");
 
     // IMPROVEMENT: Sort peers by block height AND latency for better reliability
-    let mut sync_peers: Vec<_> = sync_peers
-        .into_iter()
-        .map(|(addr, height, latency)| (addr, height, latency))
-        .collect();
+    let mut sync_peers: Vec<_> = sync_peers.into_iter().collect();
 
     sync_peers.sort_by(|a, b| {
         let a_score = a.1 as f64 * 0.8 - a.2 as f64 * 0.2; // 80% height, 20% latency
@@ -1872,7 +2035,7 @@ async fn handle_network_commands(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Changed from Result<(), NodeError>
     let parts: Vec<&str> = command.split_whitespace().collect();
-    let cmd = parts.get(0).map(|s| *s).unwrap_or("");
+    let cmd = parts.first().copied().unwrap_or("");
 
     match cmd {
         "--status" | "-s" => {
@@ -1900,7 +2063,11 @@ async fn handle_network_commands(
 
             println!(
                 "Connection Status: {}",
-                if peers.len() > 0 { "Online" } else { "Offline" }
+                if !peers.is_empty() {
+                    "Online"
+                } else {
+                    "Offline"
+                }
             );
             println!("Connected Peers: {}", peers.len());
             println!("Node Address: {}", node.get_public_key());
@@ -1909,7 +2076,7 @@ async fn handle_network_commands(
                 "Uptime: {}d {}h {}m",
                 uptime_days, uptime_hours, uptime_minutes
             );
-            println!("");
+            println!();
         }
 
         "--connect" => {
@@ -1976,7 +2143,7 @@ async fn handle_network_commands(
                                     }
 
                                     println!("\nAttempting initial sync...");
-                                    if let Err(e) = handle_chain_sync(&node).await {
+                                    if let Err(e) = handle_chain_sync(node).await {
                                         println!("Initial sync failed: {}", e);
                                     } else {
                                         println!("✓ Initial sync completed");
@@ -2060,7 +2227,7 @@ async fn handle_network_commands(
 
                         // If we have peers, try to sync
                         if final_peers > 0 {
-                            if let Err(e) = handle_chain_sync(&node).await {
+                            if let Err(e) = handle_chain_sync(node).await {
                                 warn!("Initial sync with discovered peers failed: {}", e);
                             }
                         }
@@ -2115,7 +2282,7 @@ async fn handle_network_commands(
                 }
             }
 
-            match handle_chain_sync(&node).await {
+            match handle_chain_sync(node).await {
                 Ok(_) => {
                     let blockchain = blockchain.read().await;
                     pb.finish_with_message(format!(
@@ -2264,37 +2431,32 @@ fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if allow {
-            let _ = std::fs::remove_file(&lock_path);
-        } else {
-            if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if !is_process_alive(pid) {
-                        let _ = std::fs::remove_file(&lock_path);
-                    } else {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Database lock exists. Another instance may be running.",
-                        ));
-                    }
+            let _ = std::fs::remove_file(lock_path);
+        } else if let Ok(pid_str) = std::fs::read_to_string(lock_path) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                if !is_process_alive(pid) {
+                    let _ = std::fs::remove_file(lock_path);
                 } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "Database lock exists. Another instance may be running.",
                     ));
                 }
             } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "Database lock exists. Another instance may be running.",
                 ));
             }
+        } else {
+            return Err(std::io::Error::other(
+                "Database lock exists. Another instance may be running.",
+            ));
         }
     }
 
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&lock_path)?;
+        .open(lock_path)?;
     let pid = std::process::id();
     use std::io::Write;
     writeln!(file, "{}", pid)?;
@@ -2362,11 +2524,8 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
 }
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
-    fn is_valid_sha256_hex(v: &str) -> bool {
-        v.len() == 64 && v.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
-    }
-
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
+    let allow_unverified_bootstrap = env_flag_enabled("ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP");
 
     // Simple and safe: only bootstrap if the DB does not already contain blocks.
     if has_local_block_data(db_path) && !force_bootstrap {
@@ -2380,67 +2539,54 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         println!("Forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)");
     }
 
-    // Always bootstrap from the canonical site; do not allow override URLs.
-    // Prefer manifest-driven latest snapshot; if unavailable, fall back to the
-    // canonical static bootstrap URL.
-    let manifest_url = "https://alphanumeric.blue/api/bootstrap/manifest";
+    let manifest_result: Result<BootstrapManifestPointer> =
+        match reqwest::get(BOOTSTRAP_MANIFEST_URL).await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
+                    Ok(parsed) if parsed.ok => match verify_bootstrap_manifest(&parsed.manifest) {
+                        Ok(()) => Ok(parsed.manifest),
+                        Err(e) => Err(e),
+                    },
+                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
+                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
+        };
 
-    #[derive(serde::Deserialize)]
-    struct ManifestResponse {
-        ok: bool,
-        manifest: BootstrapManifest,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize, Clone)]
-    struct BootstrapManifest {
-        url: String,
-        #[serde(default)]
-        height: Option<u64>,
-        #[serde(default)]
-        tip_hash: Option<String>,
-        #[serde(default)]
-        sha256: Option<String>,
-    }
-
-    let (download_url, expected_sha256) = match reqwest::get(manifest_url).await {
-        Ok(r) if r.status().is_success() => {
-            let body = r.bytes().await?;
-            match serde_json::from_slice::<ManifestResponse>(&body) {
-                Ok(parsed) if parsed.ok && !parsed.manifest.url.trim().is_empty() => {
-                    let parsed_sha256 = parsed
-                        .manifest
-                        .sha256
-                        .clone()
-                        .map(|v| v.trim().to_ascii_lowercase())
-                        .filter(|v| is_valid_sha256_hex(v));
-                    (parsed.manifest.url.clone(), parsed_sha256)
-                }
-                Ok(_) => {
-                    warn!("Bootstrap manifest is invalid; falling back to canonical bootstrap URL");
-                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                }
-                Err(e) => {
-                    warn!(
-                        "Bootstrap manifest payload parse failed ({}); falling back to canonical bootstrap URL",
-                        e
-                    );
-                    (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-                }
-            }
+    let (download_url, expected_sha256, expected_height, expected_tip_hash) = match manifest_result
+    {
+        Ok(manifest) => {
+            let expected_sha256 = manifest
+                .sha256
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase());
+            let expected_tip_hash = manifest
+                .tip_hash
+                .as_ref()
+                .map(|v| v.trim().to_ascii_lowercase());
+            (
+                manifest.url.clone(),
+                expected_sha256,
+                manifest.height,
+                expected_tip_hash,
+            )
         }
-        Ok(r) => {
+        Err(e) if allow_unverified_bootstrap => {
             warn!(
-                "Bootstrap manifest endpoint failed ({}); falling back to canonical bootstrap URL",
-                r.status()
-            );
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
-        }
-        Err(e) => {
-            warn!(
-                "Bootstrap manifest request failed ({}); falling back to canonical bootstrap URL",
+                "Using unverified bootstrap fallback because ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true: {}",
                 e
             );
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None)
+            (DEFAULT_BOOTSTRAP_URL.to_string(), None, None, None)
+        }
+        Err(e) => {
+            return Err(format!(
+                "Bootstrap manifest verification failed and unverified fallback is disabled: {}",
+                e
+            )
+            .into());
         }
     };
 
@@ -2456,7 +2602,8 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
 
     let bytes = res.bytes().await?;
 
-    // If the manifest provided sha256, enforce it.
+    // Verified manifests must provide SHA-256. The only no-hash path is the
+    // explicit unsafe fallback for local/dev recovery.
     if let Some(expected) = expected_sha256
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase())
@@ -2473,6 +2620,7 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
             .into());
         }
     }
+
     let zip_path = format!("{}.zip", db_path);
     fs::write(&zip_path, &bytes).await?;
 
@@ -2539,6 +2687,15 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         let _ = std::fs::remove_dir_all(&temp_extract_path);
         let _ = fs::remove_file(&zip_path).await;
         return Err(Box::<dyn Error>::from(e));
+    }
+
+    if let Err(e) = verify_bootstrap_snapshot_tip(
+        &temp_extract_path,
+        expected_height,
+        expected_tip_hash.as_deref(),
+    ) {
+        let _ = std::fs::remove_dir_all(&temp_extract_path);
+        return Err(e);
     }
 
     let final_path = std::path::Path::new(db_path);
@@ -2616,7 +2773,7 @@ async fn bootstrap_publish_loop(
 
         let (height, tip_hash_hex) = {
             let bc = blockchain.read().await;
-            let h = bc.get_latest_block_index() as u64;
+            let h = bc.get_latest_block_index();
             let tip = bc.get_latest_block_hash();
             (h, hex::encode(tip))
         };
@@ -2696,18 +2853,6 @@ async fn publish_bootstrap_snapshot(
     }
 
     #[derive(serde::Serialize)]
-    struct SignedFields {
-        url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        height: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tip_hash: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sha256: Option<String>,
-        updated_at: u64,
-    }
-
-    #[derive(serde::Serialize)]
     struct PointerUpdate {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2765,7 +2910,7 @@ async fn publish_bootstrap_snapshot(
             zip: &mut zip::ZipWriter<std::fs::File>,
             base: &std::path::Path,
             path: &std::path::Path,
-            options: zip::write::FileOptions,
+            options: zip::write::SimpleFileOptions,
         ) -> std::result::Result<(), String> {
             for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
                 let entry = entry.map_err(|e| e.to_string())?;
@@ -2862,7 +3007,7 @@ async fn publish_bootstrap_snapshot(
         .unwrap_or_default()
         .as_secs();
 
-    let signed_fields = SignedFields {
+    let signed_fields = BootstrapManifestSignedFields {
         url: parsed.latest.url.clone(),
         height: Some(height),
         tip_hash: Some(tip_hash_hex.to_string()),
@@ -3004,7 +3149,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
     let (db, height, tip_hash_hex) = {
         let bc = blockchain.read().await;
         let db = bc.db.clone();
-        let height = bc.get_latest_block_index() as u64;
+        let height = bc.get_latest_block_index();
         let tip_hash_hex = hex::encode(bc.get_latest_block_hash());
         (db, height, tip_hash_hex)
     };
@@ -3018,4 +3163,28 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
     publish_bootstrap_snapshot(&db, db_path, height, &tip_hash_hex, &publish_url, &token).await?;
     println!("Bootstrap snapshot published at height {}", height);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIGNED_BOOTSTRAP_MANIFEST: &str = r#"{"ok":true,"manifest":{"url":"https://dyyq00nyrwpgq1yi.public.blob.vercel-storage.com/bootstrap/blockchain.db-h172-00000af9e04b34bfb9f7dcf88bfb15767b7f607fd58c9d0c46169bd3abb1734a-i5Mu3aItDw3gsknc4beOWzizUcSXbo.zip","height":172,"tip_hash":"00000af9e04b34bfb9f7dcf88bfb15767b7f607fd58c9d0c46169bd3abb1734a","sha256":"f199e63d0a621e7df67a1c7644ba78a87c8706f96d5d52610026b2c2d27ed843","publisher_pubkey":"dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3","manifest_sig":"e1d8d6ec97563c2bbc6506efb4f1f523ae985dac344235a722830a84220f5e5d1b025f0e34a7789d9b3d09c8cf4a89c123cacf352bb28760fe925905e689ea01","updated_at":1771908886}}"#;
+
+    #[test]
+    fn bootstrap_manifest_signature_accepts_pinned_publisher() {
+        let parsed: BootstrapManifestResponse =
+            serde_json::from_str(SIGNED_BOOTSTRAP_MANIFEST).unwrap();
+
+        assert!(verify_bootstrap_manifest(&parsed.manifest).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_manifest_signature_rejects_tampering() {
+        let mut parsed: BootstrapManifestResponse =
+            serde_json::from_str(SIGNED_BOOTSTRAP_MANIFEST).unwrap();
+        parsed.manifest.sha256 = Some("0".repeat(64));
+
+        assert!(verify_bootstrap_manifest(&parsed.manifest).is_err());
+    }
 }

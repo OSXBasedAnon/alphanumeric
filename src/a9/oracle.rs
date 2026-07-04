@@ -115,7 +115,7 @@ impl DifficultyOracle {
             }
         }
 
-        (-entropy).max(0.0).min(1.0)
+        (-entropy).clamp(0.0, 1.0)
     }
 
     pub fn assess_network_stability(&self) -> f64 {
@@ -223,5 +223,11 @@ impl DifficultyOracle {
 
         stdout.reset()?;
         Ok(())
+    }
+}
+
+impl Default for DifficultyOracle {
+    fn default() -> Self {
+        Self::new()
     }
 }

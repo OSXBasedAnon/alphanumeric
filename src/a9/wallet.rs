@@ -233,7 +233,7 @@ impl Wallet {
         rng.try_fill_bytes(&mut salt_bytes)
             .map_err(|e| format!("Failed to generate salt: {}", e))?;
 
-        let salt = SaltString::b64_encode(&salt_bytes)
+        let salt = SaltString::encode_b64(&salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
         let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
         let cipher = Aes256Gcm::new_from_slice(&key)
@@ -264,7 +264,7 @@ impl Wallet {
         let salt_bytes = &encrypted_data[12..28];
         let ciphertext = &encrypted_data[28..];
 
-        let salt = SaltString::b64_encode(salt_bytes)
+        let salt = SaltString::encode_b64(salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
         let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
         let cipher = Aes256Gcm::new_from_slice(&key)

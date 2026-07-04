@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-argon2 = "0.3"
+argon2 = "0.5"
 arrayref = "0.3"
 bincode = "1.3"
 byteorder = "1.4"
@@ -24,35 +24,38 @@ thiserror = "1.0"
 socket2 = "0.5.8"
 uuid = { version = "1.6.1", features = ["v4", "rng"] }
 get_if_addrs = "0.5.3"
-ring = "0.16"
-base64 = "0.13"
-indicatif = "0.16"
+ring = "0.17.14"
+indicatif = "0.18"
 termcolor = "1.1"
 log = "0.4"
 hex = "0.4"
-crossbeam-channel = "0.5.6"
+crossbeam-channel = "0.5.15"
 parking_lot = "0.12.1"
 lru = "0.8"
-bytes = "1.3"
 reed-solomon-erasure = "6.0.0"
 pqcrypto-dilithium = "0.5.0"
 pqcrypto-traits = "0.3.5"
 aes-gcm = "0.10"
 inquire = "0.7.0"
-tokio = { version = "1.41", features = ["full"] }
-tokio-tungstenite = "0.15"
+tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-libp2p = { version = "0.51.4", features = ["mdns", "dns", "tcp", "tokio", "noise", "yamux", "identify", "kad"] }
+libp2p-core = "0.43.2"
+libp2p-identity = { version = "0.2.14", features = ["ed25519", "peerid", "rand"] }
+libp2p-kad = "0.48.0"
+libp2p-noise = "0.46.1"
+libp2p-swarm = { version = "0.47.1", features = ["macros", "tokio"] }
+libp2p-tcp = { version = "0.44.1", features = ["tokio"] }
+libp2p-yamux = "0.47.0"
 if-addrs = "0.10"
 lazy_static = "1.4"
 serde_json = "1.0"
 async-trait = "0.1.74"
 sled = "0.34.0"
 env_logger = "0.10"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-zip = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+zip = "6"
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 axum = "0.6"
 ctrlc = "3.4"

@@ -26,7 +26,7 @@ impl Default for NetworkConfig {
                 "seed2.alphanumeric.network:7177".to_string(),
                 "a9seed.mynode.network:7177".to_string(),
             ],
-            velocity_enabled: true,
+            velocity_enabled: false,
             max_shred_size: 32 * 1024, // 32KB
             erasure_shards: 16,
             erasure_parity: 4,
@@ -176,21 +176,11 @@ impl MiningConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AppConfig {
     pub network: NetworkConfig,
     pub database: DatabaseConfig,
     pub mining: MiningConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            network: NetworkConfig::default(),
-            database: DatabaseConfig::default(),
-            mining: MiningConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {

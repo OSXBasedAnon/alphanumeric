@@ -20,6 +20,8 @@ use crate::a9::blockchain::{Block, Blockchain, BlockchainError, Transaction};
 use crate::a9::node::NetworkMessage;
 use crate::a9::node::{Node, NodeError};
 
+type VerifiedHeaderQueue = Arc<RwLock<VecDeque<(u32, [u8; 32])>>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ActionType {
     BlockValidation,
@@ -33,8 +35,8 @@ pub enum ActionType {
 const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
 const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
+#[allow(dead_code)]
 const SENTINEL_VERIFY_INTERVAL: u64 = 300; // 5 minute verification cycle
-const HEADER_SYNC_SIZE: usize = 1000; // Number of headers to sync
 const DILITHIUM_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_DILITHIUM_BIND_V1";
 
 pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8]) -> Vec<u8> {
@@ -80,7 +82,7 @@ impl ValidatorTier {
         };
 
         // Uptime score (25% weight)
-        let uptime_score = (uptime / 100.0).max(0.0).min(1.0) * 0.25;
+        let uptime_score = (uptime / 100.0).clamp(0.0, 1.0) * 0.25;
 
         // Network stake score (25% weight)
         let stake_score = network_contribution * 0.25;
@@ -102,11 +104,9 @@ impl ValidatorTier {
 
 #[derive(Debug)]
 struct NodeSentinel {
-    public_key: Vec<u8>,
     secret_key: Vec<u8>,
     last_challenge: u64,
     verified_peers: HashSet<String>,
-    header_cache: VecDeque<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,10 +131,11 @@ pub struct BPoSSentinel {
     last_anomaly_broadcast: Arc<RwLock<u64>>, // Rate limiting for anomaly broadcasts
     node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     peer_sentinels: Arc<RwLock<DashMap<String, Vec<u8>>>>,
-    verified_headers: Arc<RwLock<VecDeque<(u32, [u8; 32])>>>,
+    verified_headers: VerifiedHeaderQueue,
     initialized: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[allow(dead_code)]
 impl BPoSSentinel {
     // Memory constants
     const MAX_PERFORMANCE_HISTORY: usize = 24;
@@ -156,14 +157,9 @@ impl BPoSSentinel {
             stats: Arc::new(RwLock::new(SentinelStats::default())),
             header_sentinel,
             anomaly_detector: Arc::new(RwLock::new(AnomalyDetector {
-                recent_anomalies: VecDeque::with_capacity(1000),
-                detection_thresholds: HashMap::new(),
+                recent_anomalies: VecDeque::with_capacity(100),
             })),
-            sync_manager: Arc::new(RwLock::new(SyncManager {
-                node_versions: DashMap::new(),
-                sync_status: DashMap::new(),
-                last_header_broadcast: 0,
-            })),
+            sync_manager: Arc::new(RwLock::new(SyncManager {})),
             last_anomaly_broadcast: Arc::new(RwLock::new(0)),
             node_sentinel: None,
             peer_sentinels: Arc::new(RwLock::new(DashMap::new())),
@@ -220,7 +216,7 @@ impl BPoSSentinel {
 
         let _total_blocks = {
             let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u64
+            blockchain.get_latest_block_index()
         };
 
         // Update all node metrics
@@ -555,13 +551,7 @@ impl BPoSSentinel {
         }
 
         // Security hardening: Never drop below safe consensus threshold
-        let min_validators = if blocks_since_fork > 100 {
-            3 // Maintain security even in emergency
-        } else if blocks_since_fork > 50 {
-            3 // Consistent safe threshold
-        } else {
-            3 // Normal mode
-        };
+        let min_validators = 3;
 
         if trusted_validators.len() < min_validators {
             warn!(
@@ -778,12 +768,14 @@ impl BPoSSentinel {
             })
             .collect();
 
-        for result in futures::future::join_all(peer_futures).await {
-            if let Ok(blocks) = result {
-                if let Some(block) = blocks.first() {
-                    if block.hash == new_hash {
-                        confirmation_score += 2.0;
-                    }
+        for blocks in futures::future::join_all(peer_futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if let Some(block) = blocks.first() {
+                if block.hash == new_hash {
+                    confirmation_score += 2.0;
                 }
             }
         }
@@ -796,14 +788,16 @@ impl BPoSSentinel {
         let mut all_versions = Vec::new();
 
         let peer_futures: Vec<_> = peers
-            .iter()
-            .map(|(addr, _)| self.node.request_blocks(*addr, height, height))
+            .keys()
+            .map(|addr| self.node.request_blocks(*addr, height, height))
             .collect();
 
-        for result in futures::future::join_all(peer_futures).await {
-            if let Ok(mut blocks) = result {
-                all_versions.append(&mut blocks);
-            }
+        for mut blocks in futures::future::join_all(peer_futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            all_versions.append(&mut blocks);
         }
 
         Ok(all_versions)
@@ -1241,7 +1235,7 @@ impl BPoSSentinel {
         // Find most common chain
         let mut consensus_chain: Vec<_> = block_counts
             .into_iter()
-            .filter(|(_, (count, _))| *count >= (peer_blocks.len() + 1) / 2)
+            .filter(|(_, (count, _))| *count >= peer_blocks.len().div_ceil(2))
             .map(|(_, (_, block))| block)
             .collect();
 
@@ -1535,7 +1529,7 @@ impl BPoSSentinel {
         let mut valid_blocks = Vec::new();
 
         // Request blocks from peers in parallel
-        let requests = peers.iter().map(|(addr, _)| async {
+        let requests = peers.keys().map(|addr| async {
             match self.node.request_blocks(*addr, height, height).await {
                 Ok(mut blocks) => {
                     if blocks.len() == 1
@@ -1599,14 +1593,12 @@ impl BPoSSentinel {
 
     async fn initialize_sentinel(&mut self) -> Result<(), String> {
         // Generate fresh dilithium keypair for this node instance
-        let (public_key, secret_key) = dilithium_keypair();
+        let (_public_key, secret_key) = dilithium_keypair();
 
         let sentinel = NodeSentinel {
-            public_key: public_key.as_bytes().to_vec(),
             secret_key: secret_key.as_bytes().to_vec(),
             last_challenge: 0,
             verified_peers: HashSet::new(),
-            header_cache: VecDeque::with_capacity(HEADER_SYNC_SIZE),
         };
 
         self.node_sentinel = Some(Arc::new(RwLock::new(sentinel)));
@@ -1980,7 +1972,7 @@ impl NodeMetrics {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NetworkHealth {
     pub active_nodes: usize,
     pub average_block_time: f64,
@@ -2019,10 +2011,6 @@ impl NetworkHealth {
             consensus_participation: 0.0,
             average_peer_count: 0.0,
         }
-    }
-
-    fn default() -> Self {
-        Self::new()
     }
 
     pub fn update_fork_count(&mut self, new_fork: bool) {
@@ -2067,18 +2055,19 @@ impl NetworkHealth {
     }
 }
 
-#[derive(Debug)]
-struct AnomalyDetector {
-    recent_anomalies: VecDeque<String>,
-    detection_thresholds: HashMap<String, f64>,
+impl Default for NetworkHealth {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
-struct SyncManager {
-    node_versions: DashMap<String, String>,
-    sync_status: DashMap<String, String>,
-    last_header_broadcast: u64,
+struct AnomalyDetector {
+    recent_anomalies: VecDeque<String>,
 }
+
+#[derive(Debug)]
+struct SyncManager {}
 
 #[derive(Debug, Clone, Default)]
 pub struct SentinelStats {
@@ -2133,15 +2122,11 @@ struct HeaderState {
 struct VerificationState {
     timestamp: u64,
     verifiers: HashSet<String>,
-    verified_hash: [u8; 32],
     dilithium_signatures: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct NetworkSyncState {
-    last_sync: u64,
-    sync_rounds: u32,
-    consensus_score: f64,
     participating_nodes: HashSet<String>,
 }
 
@@ -2153,9 +2138,11 @@ pub struct HeaderSentinel {
     sync_state: Arc<RwLock<NetworkSyncState>>,
     consensus_threshold: f64,
     max_headers: usize,
+    #[allow(dead_code)]
     sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     public_key: Vec<u8>,
     secret_key: Vec<u8>,
+    #[allow(dead_code)]
     node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     header_rules_version: u32,
 }
@@ -2274,9 +2261,6 @@ impl HeaderSentinel {
             verifications: Arc::new(DashMap::new()),
             peer_dilithium_keys: Arc::new(DashMap::new()),
             sync_state: Arc::new(RwLock::new(NetworkSyncState {
-                last_sync: 0,
-                sync_rounds: 0,
-                consensus_score: 1.0,
                 participating_nodes: HashSet::new(),
             })),
             consensus_threshold: 0.67,
@@ -2289,6 +2273,7 @@ impl HeaderSentinel {
         }
     }
 
+    #[allow(dead_code)]
     async fn get_sentinel(&self) -> Result<tokio::sync::RwLockReadGuard<'_, NodeSentinel>, String> {
         match &self.sentinel {
             Some(sentinel) => Ok(sentinel.read().await),
@@ -2404,7 +2389,6 @@ impl HeaderSentinel {
                             VerificationState {
                                 timestamp: now,
                                 verifiers: HashSet::with_capacity(10),
-                                verified_hash: header.hash,
                                 dilithium_signatures: HashMap::with_capacity(10),
                             }
                         });
@@ -2437,6 +2421,7 @@ impl HeaderSentinel {
         Ok(valid_count)
     }
 
+    #[allow(dead_code)]
     async fn get_node_sentinel(
         &self,
     ) -> Result<tokio::sync::RwLockReadGuard<'_, NodeSentinel>, String> {
@@ -2501,7 +2486,9 @@ impl HeaderSentinel {
             let headers = self.headers.read().await;
             headers
                 .iter()
-                .filter(|state| state.header.height == height && state.header.hash != *expected_hash)
+                .filter(|state| {
+                    state.header.height == height && state.header.hash != *expected_hash
+                })
                 .map(|state| state.header.hash)
                 .collect()
         };
@@ -2588,15 +2575,14 @@ impl HeaderSentinel {
         // Get sync state and record verification
         let sync_state = self.sync_state.read().await;
         {
-            let mut state = self
-                .verifications
-                .entry(header.hash)
-                .or_insert_with(|| VerificationState {
-                    timestamp: now,
-                    verifiers: HashSet::new(),
-                    verified_hash: header.hash,
-                    dilithium_signatures: HashMap::new(),
-                });
+            let mut state =
+                self.verifications
+                    .entry(header.hash)
+                    .or_insert_with(|| VerificationState {
+                        timestamp: now,
+                        verifiers: HashSet::new(),
+                        dilithium_signatures: HashMap::new(),
+                    });
             state.verifiers.insert(local_verifier);
         }
         for node_id in &sync_state.participating_nodes {
@@ -2607,7 +2593,6 @@ impl HeaderSentinel {
                 .or_insert_with(|| VerificationState {
                     timestamp: now,
                     verifiers: HashSet::new(),
-                    verified_hash: header.hash,
                     dilithium_signatures: HashMap::new(),
                 })
                 .verifiers
@@ -2681,7 +2666,6 @@ impl HeaderSentinel {
                 .or_insert_with(|| VerificationState {
                     timestamp: now,
                     verifiers: HashSet::with_capacity(10),
-                    verified_hash: header.hash,
                     dilithium_signatures: HashMap::with_capacity(10),
                 });
 
@@ -2710,6 +2694,7 @@ impl HeaderSentinel {
     }
 
     // Regular cleanup of old verifications
+    #[allow(dead_code)]
     async fn prune_old_verifications(&self, now: u64) {
         const MAX_AGE: u64 = 60; // Only keep last minute of verifications
 
@@ -2720,6 +2705,7 @@ impl HeaderSentinel {
         headers.retain(|state| now.saturating_sub(state.timestamp) < MAX_AGE);
     }
 
+    #[allow(dead_code)]
     async fn verify_signature(
         &self,
         data: &[u8],
@@ -2741,6 +2727,7 @@ impl HeaderSentinel {
         }
     }
 
+    #[allow(dead_code)]
     async fn sign_single_header(&self, header: &BlockHeaderInfo) -> Result<Vec<u8>, String> {
         let header_bytes =
             bincode::serialize(header).map_err(|e| format!("Serialization error: {}", e))?;
@@ -2808,6 +2795,12 @@ impl HeaderSentinel {
         node.send_message(addr, &message)
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+impl Default for HeaderSentinel {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2933,7 +2926,6 @@ mod tests {
                 verifiers: ["n1".to_string(), "n2".to_string(), "n3".to_string()]
                     .into_iter()
                     .collect(),
-                verified_hash: conflicting_hash,
                 dilithium_signatures: HashMap::new(),
             },
         );
@@ -2956,6 +2948,9 @@ mod tests {
     #[test]
     fn header_rule_v2_uses_fixed_future_skew() {
         let sentinel = HeaderSentinel::new();
-        assert_eq!(sentinel.max_future_skew_seconds(), HEADER_MAX_FUTURE_SECONDS);
+        assert_eq!(
+            sentinel.max_future_skew_seconds(),
+            HEADER_MAX_FUTURE_SECONDS
+        );
     }
 }
