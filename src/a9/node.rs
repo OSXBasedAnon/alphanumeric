@@ -1206,9 +1206,7 @@ impl Node {
     }
 
     fn public_discovery_publish_enabled() -> bool {
-        let launch_genesis = Self::env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
-            || Self::env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
-        !launch_genesis || Self::env_flag_enabled("ALPHANUMERIC_ALLOW_LOCAL_DISCOVERY")
+        !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_PUBLIC_DISCOVERY")
     }
 
     fn dns_seeds() -> Vec<String> {
@@ -1424,7 +1422,7 @@ impl Node {
 
     async fn announce_to_discovery(&self) -> Result<(), NodeError> {
         if !Self::public_discovery_publish_enabled() {
-            debug!("Skipping public discovery announce for local genesis node");
+            debug!("Skipping public discovery announce because it is disabled by environment");
             return Ok(());
         }
 

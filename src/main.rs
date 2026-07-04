@@ -41,6 +41,7 @@ const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
+const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
@@ -76,6 +77,13 @@ struct BootstrapManifestPointer {
     publisher_pubkey: String,
     manifest_sig: String,
     updated_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GatewayOverview {
+    peers: Option<u64>,
+    height: Option<u64>,
+    verified: Option<bool>,
 }
 
 #[derive(serde::Serialize)]
@@ -116,6 +124,64 @@ fn launch_network_id_hex() -> Result<String> {
 
 fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> {
     verify_bootstrap_manifest_with_publisher(manifest, BOOTSTRAP_PUBLISHER_PUBKEY)
+}
+
+async fn fetch_gateway_overview() -> Option<GatewayOverview> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(2500))
+        .build()
+        .ok()?;
+
+    let manifest_request = async {
+        client
+            .get(BOOTSTRAP_MANIFEST_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    let peers_request = async {
+        client
+            .get(PEERS_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    let (manifest_body, peers_body) = tokio::join!(manifest_request, peers_request);
+
+    let height = manifest_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("manifest"))
+        .and_then(|manifest| manifest.get("height"))
+        .and_then(|v| v.as_u64());
+    let peers = peers_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("count"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            peers_body
+                .as_ref()
+                .and_then(|body| body.get("peers"))
+                .and_then(|v| v.as_array())
+                .map(|peers| peers.len() as u64)
+        });
+
+    if height.is_none() && peers.is_none() {
+        return None;
+    }
+
+    Some(GatewayOverview {
+        peers,
+        height,
+        verified: height.map(|_| true),
+    })
 }
 
 fn verify_bootstrap_manifest_with_publisher(
@@ -329,9 +395,18 @@ async fn main() -> Result<()> {
             let cwd_str = cwd_candidate.to_string_lossy().to_string();
             let exe_str = exe_candidate.to_string_lossy().to_string();
 
-            if has_local_block_data(&cwd_str) {
+            let cwd_is_launch = local_db_matches_launch_genesis(&cwd_str);
+            let exe_is_launch = local_db_matches_launch_genesis(&exe_str);
+            let cwd_has_blocks = has_local_block_data(&cwd_str);
+            let exe_has_blocks = has_local_block_data(&exe_str);
+
+            if cwd_is_launch {
                 cwd_str
-            } else if has_local_block_data(&exe_str) {
+            } else if exe_is_launch {
+                exe_str
+            } else if cwd_has_blocks {
+                cwd_str
+            } else if exe_has_blocks {
                 exe_str
             } else {
                 cwd_str
@@ -917,6 +992,7 @@ async fn main() -> Result<()> {
                 Some("info") => {
                     let mut stdout = StandardStream::stdout(ColorChoice::Always);
                     let mut color_spec = ColorSpec::new();
+                    let gateway_overview = fetch_gateway_overview().await;
 
     // Get total wallets and balance first
     let mut total_balance = 0.0;
@@ -1007,7 +1083,12 @@ async fn main() -> Result<()> {
     if let Ok(health) = sentinel.get_network_metrics().await {
         let peers = node.peers.read().await;
         let active_peers = peers.len();
-        let active_nodes = health.active_nodes.max(active_peers);
+        let gateway_peers = gateway_overview
+            .as_ref()
+            .and_then(|overview| overview.peers)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0);
+        let active_nodes = health.active_nodes.max(active_peers).max(gateway_peers);
 
         color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
         stdout.set_color(&color_spec)?;
@@ -1015,6 +1096,11 @@ async fn main() -> Result<()> {
         color_spec.set_fg(Some(Color::Rgb(167, 165, 198)));
         stdout.set_color(&color_spec)?;
         writeln!(stdout, "Connected Peers: {}", active_peers)?;
+        if gateway_peers > 0 {
+            color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
+            stdout.set_color(&color_spec)?;
+            writeln!(stdout, "Gateway Peers:   {}", gateway_peers)?;
+        }
         color_spec.set_fg(Some(Color::Rgb(247, 111, 142)));
         stdout.set_color(&color_spec)?;
         writeln!(stdout, "Network Load:    {:.1}%", health.network_load * 100.0)?; 
@@ -1029,7 +1115,7 @@ async fn main() -> Result<()> {
 
     // Chain Status
     let blockchain_guard = blockchain.read().await;
-    let _current_height = blockchain_guard.get_latest_block_index();
+    let current_height = blockchain_guard.get_latest_block_index();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1046,8 +1132,25 @@ async fn main() -> Result<()> {
     writeln!(
         stdout,
         "Height:            {}",
-        blockchain_guard.get_latest_block_index()
+        current_height
     )?;
+    if let Some(network_height) = gateway_overview.as_ref().and_then(|overview| overview.height) {
+        color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "Network Height:    {}", network_height)?;
+    }
+    if let Some(verified) = gateway_overview
+        .as_ref()
+        .and_then(|overview| overview.verified)
+    {
+        color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
+        stdout.set_color(&color_spec)?;
+        writeln!(
+            stdout,
+            "Network Verified:  {}",
+            if verified { "yes" } else { "pending" }
+        )?;
+    }
     color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Difficulty:        {}", blockchain_guard.get_current_difficulty().await)?;
@@ -2612,16 +2715,29 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
     let allow_unverified_bootstrap = env_flag_enabled("ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP");
 
-    // Simple and safe: only bootstrap if the DB does not already contain blocks.
-    if has_local_block_data(db_path) && !force_bootstrap {
-        println!(
-            "Bootstrap skipped: local block data found at {} (set ALPHANUMERIC_FORCE_BOOTSTRAP=true to force download)",
-            db_path
-        );
-        return Ok(());
+    if !force_bootstrap {
+        match local_launch_db_status(db_path) {
+            LaunchDbStatus::Valid => {
+                println!("Bootstrap skipped: launch network DB found at {}", db_path);
+                return Ok(());
+            }
+            LaunchDbStatus::Missing | LaunchDbStatus::Empty => {}
+            LaunchDbStatus::WrongGenesis(actual) => {
+                println!(
+                    "Replacing local DB at {}: wrong genesis {}",
+                    db_path, actual
+                );
+                remove_local_db(db_path).await?;
+            }
+            LaunchDbStatus::Unreadable(err) => {
+                println!("Replacing local DB at {}: {}", db_path, err);
+                remove_local_db(db_path).await?;
+            }
+        }
     }
     if force_bootstrap {
         println!("Forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)");
+        remove_local_db(db_path).await?;
     }
 
     let manifest_result: Result<BootstrapManifestPointer> =
@@ -2711,6 +2827,18 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 expected, actual
             )
             .into());
+        }
+    }
+
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                format!(
+                    "Bootstrap parent directory create failed at {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
         }
     }
 
@@ -2828,6 +2956,85 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum LaunchDbStatus {
+    Valid,
+    Missing,
+    Empty,
+    WrongGenesis(String),
+    Unreadable(String),
+}
+
+fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() {
+        return LaunchDbStatus::Missing;
+    }
+    if !path.is_dir() {
+        return LaunchDbStatus::Unreadable("database path is not a directory".to_string());
+    }
+
+    let db = match sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .open()
+    {
+        Ok(db) => db,
+        Err(e) => return LaunchDbStatus::Unreadable(format!("database open failed: {}", e)),
+    };
+
+    let genesis_raw = match db.get(b"block_0") {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return if db.scan_prefix("block_").next().is_some() {
+                LaunchDbStatus::Unreadable("database has blocks but no genesis block".to_string())
+            } else {
+                LaunchDbStatus::Empty
+            }
+        }
+        Err(e) => return LaunchDbStatus::Unreadable(format!("genesis read failed: {}", e)),
+    };
+
+    let genesis = match Block::from_bytes(genesis_raw.as_ref()) {
+        Ok(block) => block,
+        Err(e) => return LaunchDbStatus::Unreadable(format!("genesis decode failed: {}", e)),
+    };
+
+    let expected = match Blockchain::genesis_launch_block() {
+        Ok(block) => block.hash,
+        Err(e) => {
+            return LaunchDbStatus::Unreadable(format!("launch genesis construction failed: {}", e))
+        }
+    };
+
+    if genesis.hash == expected && genesis.calculate_hash_for_block() == genesis.hash {
+        LaunchDbStatus::Valid
+    } else {
+        LaunchDbStatus::WrongGenesis(hex::encode(genesis.hash))
+    }
+}
+
+fn local_db_matches_launch_genesis(db_path: &str) -> bool {
+    matches!(local_launch_db_status(db_path), LaunchDbStatus::Valid)
+}
+
+async fn remove_local_db(db_path: &str) -> Result<()> {
+    let path = std::path::Path::new(db_path);
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+            .await
+            .map_err(|e| format!("Failed to remove local DB at {}: {}", db_path, e))?;
+    } else {
+        fs::remove_file(path)
+            .await
+            .map_err(|e| format!("Failed to remove local DB file at {}: {}", db_path, e))?;
+    }
+    Ok(())
+}
+
 fn has_local_block_data(db_path: &str) -> bool {
     let path = std::path::Path::new(db_path);
     if !path.exists() || !path.is_dir() {
@@ -2855,9 +3062,6 @@ async fn bootstrap_publish_loop(
     token: String,
 ) {
     let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
-    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 3600);
-    let min_delta = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA", 10);
-    let stable_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS", 180);
 
     let db = { blockchain.read().await.db.clone() };
     let (mut last_published_at, mut last_published_height, mut last_published_network_id) =
@@ -2880,6 +3084,26 @@ async fn bootstrap_publish_loop(
                 .unwrap_or_else(|_| hex::encode(tip));
             (h, hex::encode(tip), network_id)
         };
+
+        let (default_cooldown_secs, default_min_delta, default_stable_secs) = if height < 100 {
+            (30, 1, 15)
+        } else if height < 10_000 {
+            (120, 5, 30)
+        } else {
+            (300, 25, 60)
+        };
+        let cooldown_secs = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS",
+            default_cooldown_secs,
+        );
+        let min_delta = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA",
+            default_min_delta,
+        );
+        let stable_secs = env_u64_or(
+            "ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS",
+            default_stable_secs,
+        );
 
         if last_tip_hash.as_deref() != Some(tip_hash_hex.as_str()) {
             last_tip_hash = Some(tip_hash_hex.clone());
@@ -3270,7 +3494,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 
     let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
 
-    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 3600);
+    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 30);
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

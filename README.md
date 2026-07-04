@@ -197,13 +197,18 @@ Bootstrap trust mode:
 - If manifest retrieval/parsing/verification fails, startup fails closed by default.
 - Static unverified fallback is only allowed when `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true` is explicitly set.
 
-If `blockchain.db` already contains local block data, that state is used unless `ALPHANUMERIC_FORCE_BOOTSTRAP=true` is set.
+Launch-network guard:
+
+- `blockchain.db` is reused only when block `0` matches the frozen launch genesis/network ID.
+- If a local DB belongs to a different network, has a bad genesis, or cannot be read, startup replaces it from the signed bootstrap.
+- Wallet keys are separate from chain state; keeping `private.key` preserves wallet identity, but balances are always calculated from the verified launch-chain DB.
+- `ALPHANUMERIC_FORCE_BOOTSTRAP=true` forces replacement from the signed bootstrap even when the local DB is already valid.
 
 Default storage behavior:
 
 - `ALPHANUMERIC_DB_PATH` controls the chain database path.
 - Without `ALPHANUMERIC_DB_PATH`, the default relative path is `blockchain.db`.
-- Relative paths resolve under the current working directory, unless an existing DB with block data is found beside the executable.
+- Relative paths resolve under the current working directory, unless an existing launch-network DB or stale DB is found beside the executable and needs to be reused/replaced.
 - For normal users, a dedicated folder such as `~/Alphanumeric` is recommended.
 
 Primary local artifacts:

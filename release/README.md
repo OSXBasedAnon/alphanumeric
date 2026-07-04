@@ -50,7 +50,7 @@ xattr -dr com.apple.quarantine ./alphanumeric
 
 ## First Run
 
-When the client starts, it checks for local chain data. If no usable `blockchain.db` exists, it downloads the current bootstrap snapshot from the Alphanumeric gateway and verifies it before using it.
+When the client starts, it checks local chain data against the launch network. If no usable `blockchain.db` exists, or if the local DB belongs to the wrong network, it downloads the current bootstrap snapshot from the Alphanumeric gateway and verifies it before using it.
 
 If bootstrap succeeds, the command prompt appears:
 
@@ -156,12 +156,7 @@ If the client cannot connect to peers, leave it open for a minute, then run:
 info
 ```
 
-If the chain database gets corrupted or you want to start from the latest bootstrap again, stop the client, move the old database aside, and start again:
-
-```bash
-mv blockchain.db blockchain.db.backup
-./alphanumeric
-```
+If the chain database gets corrupted or belongs to the wrong network, the client replaces it from the signed bootstrap at startup.
 
 If you intentionally want to force bootstrap while keeping the same folder:
 
