@@ -1410,6 +1410,18 @@ impl Node {
         height * 0.002 - age * 0.02 - latency * 0.005
     }
 
+    fn response_body_snippet(body: &str) -> String {
+        let trimmed = body.trim();
+        const MAX_CHARS: usize = 240;
+        let mut chars = trimmed.chars();
+        let snippet: String = chars.by_ref().take(MAX_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{}...", snippet)
+        } else {
+            snippet
+        }
+    }
+
     async fn announce_to_discovery(&self) -> Result<(), NodeError> {
         if !Self::public_discovery_publish_enabled() {
             debug!("Skipping public discovery announce for local genesis node");
@@ -1509,7 +1521,15 @@ impl Node {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
                 Ok(res) if res.status().is_success() => any_ok = true,
-                Ok(res) => warn!("Discovery announce failed: {}", res.status()),
+                Ok(res) => {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    warn!(
+                        "Discovery announce failed: {} {}",
+                        status,
+                        Self::response_body_snippet(&body)
+                    );
+                }
                 Err(e) => warn!("Discovery announce error: {}", e),
             }
         }
@@ -1600,7 +1620,15 @@ impl Node {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
                 Ok(res) if res.status().is_success() => any_ok = true,
-                Ok(res) => warn!("Header snapshot post failed: {}", res.status()),
+                Ok(res) => {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    warn!(
+                        "Header snapshot post failed: {} {}",
+                        status,
+                        Self::response_body_snippet(&body)
+                    );
+                }
                 Err(e) => warn!("Header snapshot error: {}", e),
             }
         }
@@ -1688,7 +1716,15 @@ impl Node {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
                 Ok(res) if res.status().is_success() => any_ok = true,
-                Ok(res) => warn!("Stats snapshot post failed: {}", res.status()),
+                Ok(res) => {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    warn!(
+                        "Stats snapshot post failed: {} {}",
+                        status,
+                        Self::response_body_snippet(&body)
+                    );
+                }
                 Err(e) => warn!("Stats snapshot error: {}", e),
             }
         }
