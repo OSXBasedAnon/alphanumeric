@@ -1247,27 +1247,42 @@ println!("Wallet renamed successfully");
                     }
                 }
                 Some("mine") => {
-let parts: Vec<&str> = command.split_whitespace().collect();
-if parts.len() != 2 {
-println!("Usage: mine <miner_wallet_name>");
-continue;
-}
-node.prepare_local_mining().await;
-match mgmt
-.handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
-.await
-{
-Ok(mined_block) => {
-if let Err(e) = node.publish_block(mined_block, "Post-mine").await {
-warn!("Failed to publish mined block: {}", e);
-println!("Warning: mined block saved locally, but network publish failed: {}", e);
-}
-}
-Err(e) => {
-println!("Mining error: {}", e);
-}
-}
-}
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    if parts.len() != 2 {
+                        println!("Usage: mine <miner_wallet_name>");
+                        continue;
+                    }
+
+                    let prep_bar = ProgressBar::new_spinner();
+                    let prep_style =
+                        ProgressStyle::with_template("Mining {spinner:.cyan/blue} {msg}")
+                            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+                    prep_bar.set_style(prep_style);
+                    prep_bar.set_message("Preparing network tip...");
+                    prep_bar.enable_steady_tick(Duration::from_millis(100));
+                    if let Err(e) = node.prepare_local_mining(Duration::from_secs(3)).await {
+                        warn!("Pre-mine preparation skipped: {}", e);
+                    }
+                    prep_bar.finish_and_clear();
+
+                    match mgmt
+                        .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
+                        .await
+                    {
+                        Ok(mined_block) => {
+                            if let Err(e) = node.publish_block(mined_block, "Post-mine").await {
+                                warn!("Failed to publish mined block: {}", e);
+                                println!(
+                                    "Warning: mined block saved locally, but network publish failed: {}",
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("Mining error: {}", e);
+                        }
+                    }
+                }
 Some("whisper") => {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let whisper = whisper_module.read().await;

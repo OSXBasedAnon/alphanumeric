@@ -47,11 +47,11 @@ const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 const ORPHAN_REORG_DEPTH: u32 = 1024;
-const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_184_400;
+const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_191_900;
 const GENESIS_LAUNCH_AMOUNT: f64 = 17.76;
 const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
 const GENESIS_LAUNCH_DIFFICULTY: u64 = 0;
-const GENESIS_LAUNCH_NONCE: u64 = 1_776;
+const GENESIS_LAUNCH_NONCE: u64 = 7_377;
 
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
@@ -60,10 +60,10 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
-// The launch floor maps to roughly 2^30 expected hashes. On a strong desktop CPU
-// this targets tens-of-seconds solo blocks; aggregate hashpower can still pull the
-// network toward 5s.
-const NETWORK_MIN_DIFFICULTY: u64 = 480;
+// The launch floor maps to roughly 2^29 expected hashes. On the launch reference
+// desktop this targets a short solo-mining wait while still keeping single-miner
+// throughput bounded.
+const NETWORK_MIN_DIFFICULTY: u64 = 464;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);

@@ -1,4 +1,5 @@
 use hex;
+use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -548,6 +549,19 @@ impl Mgmt {
             return Err("Usage: mine <wallet_name_or_address>".into());
         }
 
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
+        writeln!(stdout, "\nStarting mining operation")?;
+        stdout.reset()?;
+
+        let prep_bar = ProgressBar::new_spinner();
+        let style = ProgressStyle::with_template("{prefix} {spinner:.cyan/blue} {msg}")
+            .map_err(|e| format!("Progress style error: {}", e))?;
+        prep_bar.set_style(style);
+        prep_bar.set_prefix("Mining");
+        prep_bar.set_message("Preparing block template...");
+        prep_bar.enable_steady_tick(Duration::from_millis(100));
+
         let wallet_input = command[1].to_string();
         let miner_wallet = if let Some(w) = wallets.get(&wallet_input) {
             w
@@ -559,15 +573,18 @@ impl Mgmt {
         };
 
         let (transactions, last_hash, next_block_index, difficulty, mining_reward) = {
+            prep_bar.set_message("Reading chain tip and mempool...");
             let blockchain_guard = blockchain.read().await;
 
             // Initialize temporal verification
+            prep_bar.set_message("Preparing transaction verification...");
             blockchain_guard
                 .temporal_verification
                 .initialize_from_blockchain(&blockchain_guard)
                 .await?;
 
             // Get mempool transactions (full signatures only)
+            prep_bar.set_message("Selecting pending transactions...");
             let mempool_transactions = blockchain_guard.get_mempool_transactions().await?;
             let regular_transactions: Vec<Transaction> = mempool_transactions
                 .into_iter()
@@ -588,6 +605,7 @@ impl Mgmt {
                 .collect();
 
             // Calculate mining reward
+            prep_bar.set_message("Calculating reward and difficulty...");
             let mining_reward = blockchain_guard.get_block_reward(&regular_transactions);
 
             // Pass as slice to calculate_merkle_root
@@ -608,6 +626,9 @@ impl Mgmt {
                 mining_reward,
             )
         };
+
+        prep_bar.set_message("Starting hash search...");
+        prep_bar.finish_and_clear();
 
         // Ensure header uses a slice of transactions
         let mut header = ProgPowHeader {
@@ -632,11 +653,6 @@ impl Mgmt {
                 sig_hash: tx.sig_hash.clone(),
             })
             .collect();
-
-        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
-        writeln!(stdout, "\nStarting mining operation")?;
-        stdout.reset()?;
 
         match miner
             .mine_block(

@@ -1361,12 +1361,24 @@ impl Node {
         let mut addrs = self.fetch_discovery_peers().await?;
         addrs.shuffle(&mut thread_rng());
 
-        let mut connected = 0usize;
-        for addr in addrs.into_iter().take(limit) {
-            if let Ok(Ok(_)) = timeout(Duration::from_secs(5), self.verify_peer(addr)).await {
-                connected += 1;
+        let attempts: Vec<_> = addrs
+            .into_iter()
+            .take(limit)
+            .map(|addr| async move {
+                matches!(
+                    timeout(Duration::from_secs(5), self.verify_peer(addr)).await,
+                    Ok(Ok(_))
+                )
+            })
+            .collect();
+
+        let connected = match timeout(Duration::from_secs(6), join_all(attempts)).await {
+            Ok(results) => results.into_iter().filter(|ok| *ok).count(),
+            Err(_) => {
+                warn!("Discovery peer connect timed out");
+                0
             }
-        }
+        };
 
         if connected > 0 {
             info!("Connected to {} peer(s) via discovery service", connected);
@@ -1746,17 +1758,19 @@ impl Node {
         }
     }
 
-    pub async fn prepare_local_mining(&self) {
+    pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
         let has_peers = !self.peers.read().await.is_empty();
         if !has_peers {
-            if let Err(e) = self.connect_discovery_peers(8).await {
-                warn!("Pre-mine discovery failed: {}", e);
+            match timeout(max_wait, self.connect_discovery_peers(8)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Pre-mine discovery failed: {}", e),
+                Err(_) => warn!("Pre-mine discovery timed out; continuing with local tip"),
             }
         }
 
         let has_peers = !self.peers.read().await.is_empty();
         if has_peers {
-            match timeout(Duration::from_secs(10), self.sync_with_network()).await {
+            match timeout(max_wait, self.sync_with_network()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Pre-mine sync skipped: {}", e),
                 Err(_) => warn!("Pre-mine sync timed out; continuing with local tip"),
@@ -1764,6 +1778,7 @@ impl Node {
         } else {
             warn!("Mining without connected peers; local block will be published after mining");
         }
+        Ok(())
     }
 
     pub async fn publish_local_tip(&self) -> Result<(), NodeError> {
