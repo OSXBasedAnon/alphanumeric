@@ -47,11 +47,11 @@ const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 const ORPHAN_REORG_DEPTH: u32 = 1024;
-const GENESIS_V2_TIMESTAMP: u64 = 1_776_000_000;
-const GENESIS_V2_AMOUNT: f64 = 17.76;
-const GENESIS_V2_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
-const GENESIS_V2_DIFFICULTY: u64 = 0;
-const GENESIS_V2_NONCE: u64 = 1_776;
+const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_184_400;
+const GENESIS_LAUNCH_AMOUNT: f64 = 17.76;
+const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
+const GENESIS_LAUNCH_DIFFICULTY: u64 = 0;
+const GENESIS_LAUNCH_NONCE: u64 = 1_776;
 
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
@@ -60,11 +60,10 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
-const BOOTSTRAP_MIN_DIFFICULTY: u64 = 321;
-const DIFFICULTY_FLOOR_UPGRADE_HEIGHT: u32 = 24;
-// New floor maps to roughly 2^26 expected hashes. One miner should not mint
-// long runs instantly; aggregate hashpower can still pull the network toward 5s.
-const NETWORK_MIN_DIFFICULTY: u64 = 416;
+// The launch floor maps to roughly 2^30 expected hashes. On a strong desktop CPU
+// this targets tens-of-seconds solo blocks; aggregate hashpower can still pull the
+// network toward 5s.
+const NETWORK_MIN_DIFFICULTY: u64 = 480;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
@@ -82,14 +81,6 @@ pub(crate) fn pow_target_from_difficulty(difficulty: u64) -> BigUint {
         return BigUint::from(0u8);
     }
     MAX_TARGET.clone() >> (exponent as usize)
-}
-
-fn minimum_difficulty_for_height(block_index: u32) -> u64 {
-    if block_index >= DIFFICULTY_FLOOR_UPGRADE_HEIGHT {
-        NETWORK_MIN_DIFFICULTY
-    } else {
-        BOOTSTRAP_MIN_DIFFICULTY
-    }
 }
 
 static FINALIZE_STAGE: AtomicUsize = AtomicUsize::new(0);
@@ -558,11 +549,11 @@ impl Block {
     pub fn adjust_dynamic_difficulty(
         current_difficulty: u64,
         timestamp_diff: u64,
-        block_index: u32,
+        _block_index: u32,
         oracle: &mut DifficultyOracle,
         current_timestamp: u64,
     ) -> u64 {
-        let minimum_difficulty = minimum_difficulty_for_height(block_index);
+        let minimum_difficulty = NETWORK_MIN_DIFFICULTY;
         const MAX_DIFFICULTY: u64 = u64::MAX / 2;
         const MAX_ADJUSTMENT: f64 = 1.15;
         const DAMPENING_FACTOR: f64 = 0.6;
@@ -3001,7 +2992,7 @@ impl Blockchain {
         const REDUCTION_RATE: f64 = 0.83; // 17% reduction = multiply by 0.83
 
         if block.index == 0 {
-            return Ok(GENESIS_V2_AMOUNT);
+            return Ok(GENESIS_LAUNCH_AMOUNT);
         }
 
         // Calculate periods since genesis for halving
@@ -3082,13 +3073,13 @@ impl Blockchain {
         }
     }
 
-    pub fn genesis_v2_block() -> Result<Block, BlockchainError> {
+    pub fn genesis_launch_block() -> Result<Block, BlockchainError> {
         let genesis_transaction = Transaction::new(
             "MINING_REWARDS".to_string(),
-            GENESIS_V2_RECIPIENT.to_string(),
-            GENESIS_V2_AMOUNT,
+            GENESIS_LAUNCH_RECIPIENT.to_string(),
+            GENESIS_LAUNCH_AMOUNT,
             NETWORK_FEE,
-            GENESIS_V2_TIMESTAMP,
+            GENESIS_LAUNCH_TIMESTAMP,
             None,
         );
         let transactions = vec![genesis_transaction];
@@ -3096,10 +3087,10 @@ impl Blockchain {
         let mut block = Block {
             index: 0,
             previous_hash: [0u8; 32],
-            timestamp: GENESIS_V2_TIMESTAMP,
+            timestamp: GENESIS_LAUNCH_TIMESTAMP,
             transactions,
-            nonce: GENESIS_V2_NONCE,
-            difficulty: GENESIS_V2_DIFFICULTY,
+            nonce: GENESIS_LAUNCH_NONCE,
+            difficulty: GENESIS_LAUNCH_DIFFICULTY,
             hash: [0u8; 32],
             merkle_root,
         };
@@ -3107,12 +3098,12 @@ impl Blockchain {
         Ok(block)
     }
 
-    // Frozen v2 genesis block. Empty beta DBs create this exact block; existing DBs never recreate it.
+    // Frozen launch genesis block. Empty launch DBs create this exact block.
     pub async fn create_genesis_block(&self) -> Result<(), BlockchainError> {
         if self.get_block(0).is_ok() {
             return Ok(());
         }
-        let genesis_block = Self::genesis_v2_block()?;
+        let genesis_block = Self::genesis_launch_block()?;
         self.save_receipt_verified_block(&genesis_block)
             .await
             .map_err(|e| {
@@ -3615,6 +3606,7 @@ impl ChainSentinel {
 
         let mut prev_hash = blocks[0].hash;
         let mut prev_timestamp = blocks[0].timestamp;
+        let mut prev_difficulty = blocks[0].difficulty;
         let mut difficulty_oracle = DifficultyOracle::new();
 
         for block in blocks.iter().skip(1) {
@@ -3630,14 +3622,10 @@ impl ChainSentinel {
                 return false;
             }
             let time_diff = block.timestamp.saturating_sub(prev_timestamp);
-            if time_diff > TARGET_BLOCK_TIME * 12 {
-                self.integrity_score.fetch_sub(5, Ordering::Relaxed);
-                return false;
-            }
 
             // Difficulty verification
             let expected_difficulty = Block::adjust_dynamic_difficulty(
-                block.difficulty,
+                prev_difficulty,
                 time_diff,
                 block.index,
                 &mut difficulty_oracle,
@@ -3653,6 +3641,7 @@ impl ChainSentinel {
 
             prev_hash = block.hash;
             prev_timestamp = block.timestamp;
+            prev_difficulty = block.difficulty;
         }
 
         true
@@ -3780,14 +3769,35 @@ mod tests {
     }
 
     #[test]
-    fn difficulty_floor_activates_after_bootstrap_chain() {
+    fn difficulty_floor_applies_from_first_launch_block() {
         assert_eq!(
-            minimum_difficulty_for_height(DIFFICULTY_FLOOR_UPGRADE_HEIGHT - 1),
-            BOOTSTRAP_MIN_DIFFICULTY
-        );
-        assert_eq!(
-            minimum_difficulty_for_height(DIFFICULTY_FLOOR_UPGRADE_HEIGHT),
+            Block::adjust_dynamic_difficulty(
+                0,
+                TARGET_BLOCK_TIME,
+                1,
+                &mut DifficultyOracle::new(),
+                GENESIS_LAUNCH_TIMESTAMP + TARGET_BLOCK_TIME,
+            ),
             NETWORK_MIN_DIFFICULTY
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_sentinel_allows_idle_launch_gap() {
+        let blockchain = test_blockchain();
+        let genesis = Blockchain::genesis_launch_block().expect("genesis should build");
+        let mut block1 = metadata_test_block(1, genesis.hash, "miner1", 1.0);
+        block1.timestamp = genesis.timestamp + TARGET_BLOCK_TIME * 1_000;
+        block1.difficulty = NETWORK_MIN_DIFFICULTY;
+        block1.hash = block1.calculate_hash_for_block();
+
+        insert_raw_block(&blockchain, &genesis);
+        insert_raw_block(&blockchain, &block1);
+
+        assert!(
+            ChainSentinel::new()
+                .verify_chain_integrity(&blockchain)
+                .await
         );
     }
 
@@ -3822,9 +3832,10 @@ mod tests {
     }
 
     #[test]
-    fn genesis_v2_is_deterministic_and_carries_1776_artifact() {
-        let block_a = Blockchain::genesis_v2_block().expect("genesis should build");
-        let block_b = Blockchain::genesis_v2_block().expect("genesis should rebuild identically");
+    fn launch_genesis_is_deterministic_and_carries_1776_artifact() {
+        let block_a = Blockchain::genesis_launch_block().expect("genesis should build");
+        let block_b =
+            Blockchain::genesis_launch_block().expect("genesis should rebuild identically");
 
         assert_eq!(block_a.hash, block_b.hash);
         assert_eq!(block_a.merkle_root, block_b.merkle_root);
@@ -3834,15 +3845,18 @@ mod tests {
         );
         assert_eq!(block_a.index, 0);
         assert_eq!(block_a.previous_hash, [0u8; 32]);
-        assert_eq!(block_a.timestamp, GENESIS_V2_TIMESTAMP);
-        assert_eq!(block_a.nonce, GENESIS_V2_NONCE);
-        assert_eq!(block_a.difficulty, GENESIS_V2_DIFFICULTY);
+        assert_eq!(block_a.timestamp, GENESIS_LAUNCH_TIMESTAMP);
+        assert_eq!(block_a.nonce, GENESIS_LAUNCH_NONCE);
+        assert_eq!(block_a.difficulty, GENESIS_LAUNCH_DIFFICULTY);
         assert_eq!(block_a.transactions.len(), 1);
 
         let tx = &block_a.transactions[0];
         assert_eq!(tx.sender, "MINING_REWARDS");
-        assert_eq!(tx.recipient, GENESIS_V2_RECIPIENT);
-        assert_eq!(tx.amount_units, Transaction::to_units(GENESIS_V2_AMOUNT));
+        assert_eq!(tx.recipient, GENESIS_LAUNCH_RECIPIENT);
+        assert_eq!(
+            tx.amount_units,
+            Transaction::to_units(GENESIS_LAUNCH_AMOUNT)
+        );
         assert_eq!(tx.fee_units, Transaction::to_units(NETWORK_FEE));
     }
 

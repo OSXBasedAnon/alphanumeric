@@ -87,7 +87,7 @@ const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
 // Protocol
-const NETWORK_VERSION: u32 = 2;
+const NETWORK_VERSION: u32 = 3;
 
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
@@ -338,6 +338,7 @@ pub struct HandshakeMessage {
     pub public_key: Vec<u8>,
     pub node_id: String,
     pub network_id: [u8; 32],
+    pub listen_port: u16,
     pub blockchain_height: u32,
     pub signature: Vec<u8>,
 }
@@ -789,6 +790,7 @@ struct ValidationCacheEntry {
 #[derive(Debug)]
 struct OutboundConnection {
     stream: TcpStream,
+    shared_secret: Vec<u8>,
     last_used: Instant,
 }
 
@@ -810,10 +812,12 @@ struct StatsState {
     blockchain: Arc<RwLock<Blockchain>>,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
     start_time: u64,
+    network_id: [u8; 32],
 }
 
 #[derive(Serialize)]
 struct StatsResponse {
+    network_id: String,
     height: u32,
     difficulty: u64,
     hashrate_ths: f64,
@@ -1129,6 +1133,9 @@ impl Node {
                 "Invalid handshake key/signature length".into(),
             ));
         }
+        if message.listen_port == 0 {
+            return Err(NodeError::Network("Invalid handshake listen port".into()));
+        }
         if message.public_key == self.handshake_public_key {
             return Err(NodeError::Network("Self-handshake rejected".into()));
         }
@@ -1147,6 +1154,16 @@ impl Node {
         public_key
             .verify(&payload, &message.signature)
             .map_err(|_| NodeError::Network("Invalid handshake signature".into()))
+    }
+
+    fn peer_listen_addr(
+        socket_addr: SocketAddr,
+        listen_port: u16,
+    ) -> Result<SocketAddr, NodeError> {
+        if listen_port == 0 {
+            return Err(NodeError::Network("Invalid peer listen port".into()));
+        }
+        Ok(SocketAddr::new(socket_addr.ip(), listen_port))
     }
 
     fn canonicalize_json(value: &Value) -> Value {
@@ -1189,9 +1206,9 @@ impl Node {
     }
 
     fn public_discovery_publish_enabled() -> bool {
-        let local_genesis = Self::env_flag_enabled("ALPHANUMERIC_USE_LOCAL_V2_GENESIS")
-            || Self::env_flag_enabled("ALPHANUMERIC_RESET_TO_V2_GENESIS");
-        !local_genesis || Self::env_flag_enabled("ALPHANUMERIC_ALLOW_LOCAL_DISCOVERY")
+        let launch_genesis = Self::env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
+            || Self::env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
+        !launch_genesis || Self::env_flag_enabled("ALPHANUMERIC_ALLOW_LOCAL_DISCOVERY")
     }
 
     fn dns_seeds() -> Vec<String> {
@@ -1421,6 +1438,7 @@ impl Node {
             let blockchain = self.blockchain.read().await;
             blockchain.get_latest_block_index() as u32
         };
+        let network_id = hex::encode(self.network_id);
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
             .map(|v| !v.eq_ignore_ascii_case("false"))
@@ -1446,6 +1464,7 @@ impl Node {
         message.insert("port".to_string(), json!(self.bind_addr.port()));
         message.insert("node_id".to_string(), json!(&self.node_id));
         message.insert("public_key".to_string(), json!(&self.node_id));
+        message.insert("network_id".to_string(), json!(&network_id));
         message.insert(
             "version".to_string(),
             json!(format!("rust-{}", NETWORK_VERSION)),
@@ -1468,6 +1487,7 @@ impl Node {
         payload.insert("port".to_string(), json!(self.bind_addr.port()));
         payload.insert("node_id".to_string(), json!(&self.node_id));
         payload.insert("public_key".to_string(), json!(&self.node_id));
+        payload.insert("network_id".to_string(), json!(network_id));
         payload.insert(
             "version".to_string(),
             json!(format!("rust-{}", NETWORK_VERSION)),
@@ -1621,6 +1641,7 @@ impl Node {
             blockchain.calculate_network_hashrate().await
         };
         let hashrate_ths_str = format!("{:.6}", hashrate_ths);
+        let network_id = hex::encode(self.network_id);
 
         let peers = self.peers.read().await.len() as u32;
         let uptime_secs = SystemTime::now()
@@ -1632,6 +1653,7 @@ impl Node {
         let message = json!({
             "node_id": &self.node_id,
             "public_key": &self.node_id,
+            "network_id": &network_id,
             "height": height,
             "difficulty": difficulty,
             "hashrate_ths": hashrate_ths_str,
@@ -1649,6 +1671,7 @@ impl Node {
         let payload = json!({
             "node_id": &self.node_id,
             "public_key": &self.node_id,
+            "network_id": &network_id,
             "height": height,
             "difficulty": difficulty,
             "hashrate_ths": hashrate_ths_str,
@@ -1675,6 +1698,18 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    async fn publish_discovery_state(&self, context: &str) {
+        if let Err(e) = self.announce_to_discovery().await {
+            warn!("{} discovery announce failed: {}", context, e);
+        }
+        if let Err(e) = self.post_header_snapshot().await {
+            warn!("{} header snapshot failed: {}", context, e);
+        }
+        if let Err(e) = self.post_stats_snapshot().await {
+            warn!("{} stats snapshot failed: {}", context, e);
+        }
     }
 
     pub async fn prepare_local_mining(&self) {
@@ -1711,7 +1746,17 @@ impl Node {
                 .ok_or_else(|| NodeError::Blockchain("No local chain tip found".to_string()))?
         };
 
-        let block_hash = tip.calculate_hash_for_block();
+        self.publish_block(tip, "Post-mine").await
+    }
+
+    pub async fn publish_block(&self, block: Block, context: &str) -> Result<(), NodeError> {
+        if self.peers.read().await.is_empty() {
+            if let Err(e) = self.connect_discovery_peers(8).await {
+                warn!("{} discovery failed: {}", context, e);
+            }
+        }
+
+        let block_hash = block.calculate_hash_for_block();
         let _ = self.network_bloom.insert(&block_hash);
 
         let selected_peers = {
@@ -1725,7 +1770,7 @@ impl Node {
             let mut delivered = 0usize;
             for addr in selected_peers {
                 match self
-                    .send_message(addr, &NetworkMessage::Block(tip.clone()))
+                    .send_message(addr, &NetworkMessage::Block(block.clone()))
                     .await
                 {
                     Ok(()) => delivered += 1,
@@ -1737,20 +1782,12 @@ impl Node {
             } else {
                 info!(
                     "Published mined block #{} to {} peer(s)",
-                    tip.index, delivered
+                    block.index, delivered
                 );
             }
         }
 
-        if let Err(e) = self.announce_to_discovery().await {
-            warn!("Post-mine discovery announce failed: {}", e);
-        }
-        if let Err(e) = self.post_header_snapshot().await {
-            warn!("Post-mine header snapshot failed: {}", e);
-        }
-        if let Err(e) = self.post_stats_snapshot().await {
-            warn!("Post-mine stats snapshot failed: {}", e);
-        }
+        self.publish_discovery_state(context).await;
 
         Ok(())
     }
@@ -1787,6 +1824,7 @@ impl Node {
             .saturating_sub(state.start_time);
 
         Json(StatsResponse {
+            network_id: hex::encode(state.network_id),
             height,
             difficulty,
             hashrate_ths,
@@ -1823,6 +1861,7 @@ impl Node {
             blockchain: Arc::clone(&self.blockchain),
             peers: Arc::clone(&self.peers),
             start_time: self.start_time,
+            network_id: self.network_id,
         };
 
         let app = Router::new()
@@ -2838,18 +2877,20 @@ impl Node {
             }
         }
 
-        // Keep libp2p swarm events flowing for the lifetime of the node.
-        let p2p_node = self.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = p2p_node.handle_p2p_events().await {
-                    warn!("P2P event pump cycle failed: {}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                } else {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+        // Keep libp2p swarm events flowing only when a swarm was initialized.
+        if self.p2p_swarm.lock().await.is_some() {
+            let p2p_node = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = p2p_node.handle_p2p_events().await {
+                        warn!("P2P event pump cycle failed: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Create message processing channel
         let (msg_tx, mut msg_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
@@ -2888,22 +2929,12 @@ impl Node {
 
                                     tokio::spawn(async move {
                                         let _permit = permit_owned;
-                                        let result = timeout(
-                                            Duration::from_secs(30),
-                                            node.handle_connection(stream, addr, tx),
-                                        )
-                                        .await;
-
-                                        match result {
-                                            Ok(Ok(_)) => {
+                                        match node.handle_connection(stream, addr, tx).await {
+                                            Ok(_) => {
                                                 info!("Connection handler completed successfully for {}", addr);
                                             }
-                                            Ok(Err(e)) => {
+                                            Err(e) => {
                                                 warn!("Connection error from {}: {}", addr, e);
-                                                node.record_peer_failure(addr).await;
-                                            }
-                                            Err(_) => {
-                                                warn!("Connection handler timed out for {}", addr);
                                                 node.record_peer_failure(addr).await;
                                             }
                                         }
@@ -3199,47 +3230,32 @@ impl Node {
             .ok_or_else(|| NodeError::Network("Swarm not initialized".to_string()))?;
 
         let event_count_limit = 200;
-        let mut event_count = 0;
 
-        // Create a temporary future to drive the swarm
-        let swarm_future = Box::pin(async move {
-            loop {
-                if event_count >= event_count_limit {
-                    return (swarm, Ok(()));
+        for _ in 0..event_count_limit {
+            match tokio::time::timeout(Duration::from_millis(100), swarm.select_next_some()).await {
+                Ok(SwarmEvent::Behaviour(HybridBehaviourEvent::Kademlia(
+                    KademliaEvent::OutboundQueryProgressed {
+                        result: QueryResult::GetClosestPeers(Ok(closest_peers)),
+                        ..
+                    },
+                ))) => {
+                    // Process closest peers
+                    debug!("Found {} closest peers", closest_peers.peers.len());
                 }
-
-                // Use select_next_some() instead of next_event()
-                match swarm.select_next_some().await {
-                    SwarmEvent::Behaviour(HybridBehaviourEvent::Kademlia(
-                        KademliaEvent::OutboundQueryProgressed {
-                            result: QueryResult::GetClosestPeers(Ok(closest_peers)),
-                            ..
-                        },
-                    )) => {
-                        // Process closest peers
-                        debug!("Found {} closest peers", closest_peers.peers.len());
-                    }
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!("P2P listening on {:?}", address);
-                    }
-                    _ => {}
+                Ok(SwarmEvent::NewListenAddr { address, .. }) => {
+                    info!("P2P listening on {:?}", address);
                 }
-
-                event_count += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(_) => {}
+                Err(_) => {
+                    break;
+                }
             }
-        });
-
-        // Run the future with timeout
-        let (swarm_result, result) = tokio::time::timeout(Duration::from_secs(30), swarm_future)
-            .await
-            .map_err(|_| NodeError::Timeout("P2P event processing timeout".to_string()))?;
+        }
 
         // Put the swarm back
-        *swarm_guard = Some(swarm_result);
+        *swarm_guard = Some(swarm);
 
-        // Return the result
-        result
+        Ok(())
     }
 
     // Maintain connections to peers
@@ -3788,10 +3804,7 @@ impl Node {
         // hold the read guard across the write().remove() below and self-deadlock.
         let existing = self.outbound_connections.read().await.get(&addr).cloned();
         if let Some(existing) = existing {
-            if self.peer_secrets.read().await.contains_key(&addr) {
-                return Ok(existing);
-            }
-            self.outbound_connections.write().await.remove(&addr);
+            return Ok(existing);
         }
 
         let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
@@ -3817,18 +3830,25 @@ impl Node {
             let mut peers = self.peers.write().await;
             peers.insert(addr, peer_info);
         }
-        self.peer_secrets.write().await.insert(addr, shared_secret);
+        self.peer_secrets
+            .write()
+            .await
+            .insert(addr, shared_secret.clone());
 
-        Ok(self.insert_outbound_connection(addr, stream).await)
+        Ok(self
+            .insert_outbound_connection(addr, stream, shared_secret)
+            .await)
     }
 
     async fn insert_outbound_connection(
         &self,
         addr: SocketAddr,
         stream: TcpStream,
+        shared_secret: Vec<u8>,
     ) -> Arc<Mutex<OutboundConnection>> {
         let connection = Arc::new(Mutex::new(OutboundConnection {
             stream,
+            shared_secret,
             last_used: Instant::now(),
         }));
         let max_pool_size = (self
@@ -3888,32 +3908,19 @@ impl Node {
                 }
             };
 
-            let shared_secret = match self.peer_secrets.read().await.get(&addr).cloned() {
-                Some(secret) => secret,
-                None => {
-                    let e = NodeError::Network(format!("Missing shared secret for {}", addr));
-                    self.record_outbound_failure(addr).await;
-                    self.remove_outbound_connection(addr).await;
-                    last_error = Some(e);
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
-                        continue;
-                    }
-                    break;
-                }
-            };
-            let data = self.encrypt_message(message, &shared_secret)?;
-            if data.is_empty() {
-                return Err(NodeError::Network(
-                    "Refusing to send empty request".to_string(),
-                ));
-            }
-            if data.len() > MAX_MESSAGE_SIZE {
-                return Err(NodeError::Network("Outgoing message too large".to_string()));
-            }
-
             let mut stream_guard = conn.lock().await;
             let result: Result<NetworkMessage, NodeError> = async {
+                let shared_secret = stream_guard.shared_secret.clone();
+                let data = self.encrypt_message(message, &shared_secret)?;
+                if data.is_empty() {
+                    return Err(NodeError::Network(
+                        "Refusing to send empty request".to_string(),
+                    ));
+                }
+                if data.len() > MAX_MESSAGE_SIZE {
+                    return Err(NodeError::Network("Outgoing message too large".to_string()));
+                }
+
                 tokio::time::timeout(CONNECTION_TIMEOUT, async {
                     stream_guard
                         .stream
@@ -4362,43 +4369,33 @@ impl Node {
                 }
             };
 
-            let shared_secret = match self.peer_secrets.read().await.get(&addr).cloned() {
-                Some(secret) => secret,
-                None => {
-                    let e = NodeError::Network(format!("Missing shared secret for {}", addr));
-                    self.record_outbound_failure(addr).await;
-                    self.remove_outbound_connection(addr).await;
-                    last_error = Some(e);
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
-                        continue;
-                    }
-                    break;
-                }
-            };
-            let data = self.encrypt_message(message, &shared_secret)?;
-            if data.is_empty() {
-                return Err(NodeError::Network(
-                    "Refusing to send empty message".to_string(),
-                ));
-            }
-            if data.len() > MAX_MESSAGE_SIZE {
-                return Err(NodeError::Network("Outgoing message too large".to_string()));
-            }
-
             let mut stream_guard = conn.lock().await;
-            let result: Result<(), NodeError> = tokio::time::timeout(TIMEOUT, async {
-                stream_guard
-                    .stream
-                    .write_all(&(data.len() as u32).to_be_bytes())
-                    .await?;
-                stream_guard.stream.write_all(&data).await?;
-                stream_guard.stream.flush().await?;
-                Ok::<_, std::io::Error>(())
-            })
-            .await
-            .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))?
-            .map_err(NodeError::from);
+            let result: Result<(), NodeError> = async {
+                let shared_secret = stream_guard.shared_secret.clone();
+                let data = self.encrypt_message(message, &shared_secret)?;
+                if data.is_empty() {
+                    return Err(NodeError::Network(
+                        "Refusing to send empty message".to_string(),
+                    ));
+                }
+                if data.len() > MAX_MESSAGE_SIZE {
+                    return Err(NodeError::Network("Outgoing message too large".to_string()));
+                }
+
+                tokio::time::timeout(TIMEOUT, async {
+                    stream_guard
+                        .stream
+                        .write_all(&(data.len() as u32).to_be_bytes())
+                        .await?;
+                    stream_guard.stream.write_all(&data).await?;
+                    stream_guard.stream.flush().await?;
+                    Ok::<_, std::io::Error>(())
+                })
+                .await
+                .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))?
+                .map_err(NodeError::from)
+            }
+            .await;
             stream_guard.last_used = Instant::now();
             drop(stream_guard);
 
@@ -4802,6 +4799,10 @@ impl Node {
                     self.record_peer_failure(addr).await;
                     return Err(NodeError::Network("Invalid block proof of work".into()));
                 }
+                let block_hash = block_ref.calculate_hash_for_block();
+                if !self.network_bloom.insert(&block_hash) {
+                    return Ok(None);
+                }
 
                 // Verify and propagate block
                 if self
@@ -4810,6 +4811,7 @@ impl Node {
                 {
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block_ref).await?;
+                    self.publish_discovery_state("Accepted block").await;
 
                     // Send network event
                     tx.send(NetworkEvent::NewBlock((*block_ref).clone()))
@@ -5229,8 +5231,10 @@ impl Node {
         addr: SocketAddr,
         tx: mpsc::Sender<NetworkEvent>,
     ) -> Result<(), NodeError> {
+        let socket_addr = addr;
+
         // Rate limit handshake attempts per IP
-        let rate_key = format!("handshake_{}", addr.ip());
+        let rate_key = format!("handshake_{}", socket_addr.ip());
         if !self.rate_limiter.check_limit(&rate_key) {
             return Err(NodeError::RateLimit("Handshake rate limit exceeded".into()));
         }
@@ -5242,7 +5246,7 @@ impl Node {
                 .unwrap_or_default()
                 .as_secs();
             let mut attempts = self.inbound_attempts.write().await;
-            let entry = attempts.entry(addr.ip()).or_insert((0, now));
+            let entry = attempts.entry(socket_addr.ip()).or_insert((0, now));
             if now.saturating_sub(entry.1) > INBOUND_ATTEMPT_WINDOW {
                 *entry = (0, now);
             }
@@ -5280,8 +5284,9 @@ impl Node {
         // Reset inbound attempts on successful handshake
         {
             let mut attempts = self.inbound_attempts.write().await;
-            attempts.remove(&addr.ip());
+            attempts.remove(&socket_addr.ip());
         }
+        let peer_addr = peer_info.address;
 
         // Version check
         if peer_info.version != NETWORK_VERSION {
@@ -5309,17 +5314,17 @@ impl Node {
             }
 
             // Add peer to our list
-            peers.insert(addr, peer_info.clone());
+            peers.insert(peer_addr, peer_info.clone());
         }
 
         // Store encryption secret
         self.peer_secrets
             .write()
             .await
-            .insert(addr, shared_secret.clone());
+            .insert(peer_addr, shared_secret.clone());
 
         // Notify peer join
-        tx.send(NetworkEvent::PeerJoin(addr))
+        tx.send(NetworkEvent::PeerJoin(peer_addr))
             .await
             .map_err(|e| NodeError::Network(format!("Failed to send join event: {}", e)))?;
 
@@ -5343,13 +5348,16 @@ impl Node {
             // Parse message length and validate
             let message_len = u32::from_be_bytes(len_bytes) as usize;
             if message_len == 0 {
-                warn!("Empty message frame from {}", addr);
-                self.record_peer_failure(addr).await;
+                warn!("Empty message frame from {}", peer_addr);
+                self.record_peer_failure(peer_addr).await;
                 break;
             }
             if message_len > MAX_MESSAGE_SIZE {
-                warn!("Oversized message from {}: {} bytes", addr, message_len);
-                self.record_peer_failure(addr).await;
+                warn!(
+                    "Oversized message from {}: {} bytes",
+                    peer_addr, message_len
+                );
+                self.record_peer_failure(peer_addr).await;
                 break;
             }
 
@@ -5372,8 +5380,8 @@ impl Node {
                         match self.decrypt_message(data_to_process, &shared_secret) {
                             Ok(data) => data,
                             Err(e) => {
-                                warn!("Decryption failed from {}: {}", addr, e);
-                                self.record_peer_failure(addr).await;
+                                warn!("Decryption failed from {}: {}", peer_addr, e);
+                                self.record_peer_failure(peer_addr).await;
                                 break 'connection;
                             }
                         };
@@ -5383,12 +5391,12 @@ impl Node {
 
                     // Process message
                     let response = match self
-                        .handle_peer_message(&serialized_message, addr, &tx)
+                        .handle_peer_message(&serialized_message, peer_addr, &tx)
                         .await
                     {
                         Ok(response) => response,
                         Err(e) => {
-                            warn!("Message handling error from {}: {}", addr, e);
+                            warn!("Message handling error from {}: {}", peer_addr, e);
 
                             // Check if error suggests malicious behavior
                             match &e {
@@ -5397,7 +5405,7 @@ impl Node {
                                         || msg.contains("too large")
                                         || msg.contains("Invalid") =>
                                 {
-                                    self.record_peer_failure(addr).await;
+                                    self.record_peer_failure(peer_addr).await;
                                 }
                                 _ => {}
                             }
@@ -5420,20 +5428,20 @@ impl Node {
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
-                                warn!("Response write failed to {}: {}", addr, e);
-                                self.record_peer_failure(addr).await;
+                                warn!("Response write failed to {}: {}", peer_addr, e);
+                                self.record_peer_failure(peer_addr).await;
                                 break 'connection;
                             }
                             Err(_) => {
-                                warn!("Response write timed out to {}", addr);
-                                self.record_peer_failure(addr).await;
+                                warn!("Response write timed out to {}", peer_addr);
+                                self.record_peer_failure(peer_addr).await;
                                 break 'connection;
                             }
                         }
                     }
 
                     // Update peer timestamp
-                    if let Some(peer) = self.peers.write().await.get_mut(&addr) {
+                    if let Some(peer) = self.peers.write().await.get_mut(&peer_addr) {
                         peer.last_seen = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
@@ -5441,24 +5449,27 @@ impl Node {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("Read error from {}: {}", addr, e);
+                    warn!("Read error from {}: {}", peer_addr, e);
                     break 'connection;
                 }
                 Err(_) => {
-                    warn!("Read timeout from {}", addr);
+                    warn!("Read timeout from {}", peer_addr);
                     break 'connection;
                 }
             }
         }
 
         // Cleanup
-        self.peers.write().await.remove(&addr);
-        self.peer_secrets.write().await.remove(&addr);
-        self.outbound_connections.write().await.remove(&addr);
-        self.outbound_circuit_breakers.write().await.remove(&addr);
+        self.peers.write().await.remove(&peer_addr);
+        self.peer_secrets.write().await.remove(&peer_addr);
+        self.outbound_connections.write().await.remove(&peer_addr);
+        self.outbound_circuit_breakers
+            .write()
+            .await
+            .remove(&peer_addr);
 
         // Notify disconnect
-        tx.send(NetworkEvent::PeerLeave(addr))
+        tx.send(NetworkEvent::PeerLeave(peer_addr))
             .await
             .map_err(|e| NodeError::Network(format!("Failed to send leave event: {}", e)))?;
 
@@ -5703,11 +5714,12 @@ impl Node {
 
         debug!("verify_peer({}): storing secret", addr);
         let mut peer_secrets = self.peer_secrets.write().await;
-        peer_secrets.insert(addr, shared_secret);
+        peer_secrets.insert(addr, shared_secret.clone());
         drop(peer_secrets);
 
         debug!("verify_peer({}): registering outbound connection", addr);
-        self.insert_outbound_connection(addr, stream).await;
+        self.insert_outbound_connection(addr, stream, shared_secret)
+            .await;
 
         debug!("verify_peer({}): advertising ML-DSA key", addr);
         if let Err(e) = self.advertise_mldsa_key(addr).await {
@@ -5972,6 +5984,7 @@ impl Node {
             public_key: self.handshake_public_key.clone(),
             node_id: self.node_id.clone(),
             network_id: self.network_id,
+            listen_port: self.bind_addr.port(),
             blockchain_height,
             signature: Vec::new(), // Will sign below
         };
@@ -6013,15 +6026,18 @@ impl Node {
             }
             self.verify_handshake(&peer_handshake)?;
 
+            let socket_addr = stream.peer_addr()?;
+            let peer_addr = Self::peer_listen_addr(socket_addr, peer_handshake.listen_port)?;
+
             // Create and return PeerInfo
             let peer_info = PeerInfo {
-                address: stream.peer_addr()?,
+                address: peer_addr,
                 version: peer_handshake.version,
                 last_seen: now,
                 blocks: peer_handshake.blockchain_height,
                 latency: 0,
                 subnet_group: SubnetGroup::from_ip(
-                    stream.peer_addr()?.ip(),
+                    peer_addr.ip(),
                     SUBNET_MASK_IPV4,
                     SUBNET_MASK_IPV6,
                 ),
@@ -6067,15 +6083,18 @@ impl Node {
             stream.write_all(&data).await?;
             stream.flush().await?;
 
+            let socket_addr = stream.peer_addr()?;
+            let peer_addr = Self::peer_listen_addr(socket_addr, peer_handshake.listen_port)?;
+
             // Create and return PeerInfo
             let peer_info = PeerInfo {
-                address: stream.peer_addr()?,
+                address: peer_addr,
                 version: peer_handshake.version,
                 last_seen: now,
                 blocks: peer_handshake.blockchain_height,
                 latency: 0,
                 subnet_group: SubnetGroup::from_ip(
-                    stream.peer_addr()?.ip(),
+                    peer_addr.ip(),
                     SUBNET_MASK_IPV4,
                     SUBNET_MASK_IPV6,
                 ),
@@ -6273,6 +6292,16 @@ mod tests {
             node_id: "node".to_string(),
         }));
         assert!(!Node::should_dedup_message(&NetworkMessage::BlockHeight(1)));
+    }
+
+    #[test]
+    fn peer_listen_addr_uses_signed_listen_port() {
+        let socket_addr = SocketAddr::from(([192, 0, 2, 1], 52_011));
+        assert_eq!(
+            Node::peer_listen_addr(socket_addr, 7242).unwrap(),
+            SocketAddr::from(([192, 0, 2, 1], 7242))
+        );
+        assert!(Node::peer_listen_addr(socket_addr, 0).is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 
 use crate::a9::blockchain::FEE_PERCENTAGE;
 use crate::a9::{
-    blockchain::{Blockchain, BlockchainError, Transaction},
+    blockchain::{Block, Blockchain, BlockchainError, Transaction},
     progpow::{BlockHeader as ProgPowHeader, Miner, ProgPowTransaction},
     wallet::Wallet,
 };
@@ -543,7 +543,7 @@ impl Mgmt {
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Db>>,
-    ) -> Result<()> {
+    ) -> Result<Block> {
         if command.len() < 2 {
             return Err("Usage: mine <wallet_name_or_address>".into());
         }
@@ -649,7 +649,7 @@ impl Mgmt {
             )
             .await
         {
-            Ok((_nonce, _hash)) => {
+            Ok((_nonce, _hash, mined_block)) => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                 writeln!(stdout, "\n Mining successful")?;
                 stdout.reset()?;
@@ -668,7 +668,7 @@ impl Mgmt {
                 writeln!(stdout, "New balance: {}", final_balance)?;
                 writeln!(stdout)?;
 
-                Ok(())
+                Ok(mined_block)
             }
             Err(e) => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;

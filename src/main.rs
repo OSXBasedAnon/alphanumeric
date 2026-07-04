@@ -308,10 +308,10 @@ async fn main() -> Result<()> {
         // Database init
         let _startup_locks = acquire_startup_locks(&db_path)?;
         pb.set_message("Checking bootstrap snapshot...");
-        let use_local_v2_genesis = env_flag_enabled("ALPHANUMERIC_USE_LOCAL_V2_GENESIS")
-            || env_flag_enabled("ALPHANUMERIC_RESET_TO_V2_GENESIS");
-        if use_local_v2_genesis && !has_local_block_data(&db_path) {
-            println!("Bootstrap skipped: creating deterministic local v2 genesis");
+        let create_launch_genesis = env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
+            || env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
+        if create_launch_genesis && !has_local_block_data(&db_path) {
+            println!("Bootstrap skipped: creating deterministic launch genesis");
         } else {
             // Fail closed: if there are no local blocks, bootstrap must succeed.
             ensure_bootstrap_db(&db_path).await?;
@@ -400,8 +400,8 @@ async fn main() -> Result<()> {
 
         pb.inc(1);
 
-        if use_local_v2_genesis && db.scan_prefix("block_").next().is_none() {
-            pb.set_message("Creating v2 genesis...");
+        if create_launch_genesis && db.scan_prefix("block_").next().is_none() {
+            pb.set_message("Creating launch genesis...");
             blockchain.write().await.create_genesis_block().await?;
         }
 
@@ -1114,14 +1114,19 @@ println!("Usage: mine <miner_wallet_name>");
 continue;
 }
 node.prepare_local_mining().await;
-if let Err(e) = mgmt
+match mgmt
 .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
 .await
 {
-println!("Mining error: {}", e);
-} else if let Err(e) = node.publish_local_tip().await {
+Ok(mined_block) => {
+if let Err(e) = node.publish_block(mined_block, "Post-mine").await {
 warn!("Failed to publish mined block: {}", e);
 println!("Warning: mined block saved locally, but network publish failed: {}", e);
+}
+}
+Err(e) => {
+println!("Mining error: {}", e);
+}
 }
 }
 Some("whisper") => {
@@ -1624,6 +1629,21 @@ async fn handle_chain_sync(
     let status_pb = mp.add(ProgressBar::new_spinner());
     status_pb.set_message("Finding fastest network peers...");
 
+    let local_height = {
+        let blockchain = node.blockchain.read().await;
+        blockchain.get_latest_block_index() as u32
+    };
+
+    let known_best_height = {
+        let peers = node.peers.read().await;
+        peers.values().map(|info| info.blocks).max().unwrap_or(0)
+    };
+
+    if known_best_height <= local_height {
+        status_pb.finish_with_message(format!("Already at current height: {}", local_height));
+        return Ok(());
+    }
+
     // IMPROVEMENT: Better peer selection with health metrics
     let network_health = node.network_health.read().await;
     let target_peers = (network_health.active_nodes / 4).clamp(3, MAX_PARALLEL_DOWNLOADS);
@@ -1687,11 +1707,6 @@ async fn handle_chain_sync(
         .map(|(_, height, _)| *height)
         .max()
         .unwrap_or(0);
-
-    let local_height = {
-        let blockchain = node.blockchain.read().await;
-        blockchain.get_latest_block_index() as u32
-    };
 
     if target_height <= local_height {
         status_pb.finish_with_message(format!("Already at current height: {}", local_height));
@@ -2509,6 +2524,14 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "bootstrap_publisher")]
+fn env_u64_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -2776,9 +2799,9 @@ async fn bootstrap_publish_loop(
     token: String,
 ) {
     let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
-    let cooldown_secs = 3600u64;
-    let min_delta = 10u64;
-    let stable_secs = 180u64;
+    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 3600);
+    let min_delta = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_MIN_DELTA", 10);
+    let stable_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_STABLE_SECS", 180);
 
     let db = { blockchain.read().await.db.clone() };
     let (mut last_published_at, mut last_published_height) =
@@ -3160,7 +3183,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 
     let publish_url = "https://alphanumeric.blue/api/bootstrap/publish".to_string();
 
-    let cooldown_secs = 3600u64;
+    let cooldown_secs = env_u64_or("ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS", 3600);
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

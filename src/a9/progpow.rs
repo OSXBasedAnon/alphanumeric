@@ -189,7 +189,7 @@ impl MiningManager {
         max_nonce: u64,
         miner_address: String,
         reward_amount: f64,
-    ) -> Result<(u64, String), MiningError> {
+    ) -> Result<(u64, String, Block), MiningError> {
         self.sync_params_with_blockchain().await?;
 
         let transactions: Vec<Transaction> = transactions
@@ -444,6 +444,7 @@ impl MiningManager {
                 new_block.hash = hash
                     .try_into()
                     .map_err(|_| MiningError::InvalidHashFormat)?;
+                let mined_block = new_block.clone();
 
                 // Separate verification step with timeout and logging
                 match tokio::time::timeout(Duration::from_secs(8), async {
@@ -499,7 +500,7 @@ impl MiningManager {
                                     if let Ok(pb) = progress_bar.lock() {
                                         pb.finish_with_message("Block mined successfully!");
                                     }
-                                    return Ok((nonce, hash_string));
+                                    return Ok((nonce, hash_string, mined_block));
                                 }
                                 Err(e) => {
                                     if let Ok(pb) = progress_bar.lock() {
@@ -565,7 +566,7 @@ impl Miner {
         _max_time: u64,
         miner_address: String,
         reward_amount: f64,
-    ) -> Result<(u64, String), MiningError> {
+    ) -> Result<(u64, String, Block), MiningError> {
         self.manager
             .mine_block(
                 header,
