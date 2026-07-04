@@ -965,6 +965,7 @@ async fn main() -> Result<()> {
             }
         };
         let mut last_console_command: Option<String> = None;
+        let console_prompt = ("αlphanumeric: ", "\x1b[1mαlphanumeric:\x1b[0m ");
 
         loop {
             if shutdown_requested.load(Ordering::Acquire) {
@@ -974,7 +975,7 @@ async fn main() -> Result<()> {
                 let read_result = line_editor
                     .as_mut()
                     .expect("line editor checked")
-                    .readline("αlphanumeric:\n");
+                    .readline(&console_prompt);
                 match read_result {
                     Ok(line) => line.trim().to_string(),
                     Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -990,12 +991,12 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let mut stdout = StandardStream::stdout(ColorChoice::Always);
-                let mut color_spec = ColorSpec::new();
-                color_spec.set_fg(Some(Color::White)).set_bold(true);
-                let _ = stdout.set_color(&color_spec);
-                print!("αlphanumeric:");
+                let mut prompt_style = ColorSpec::new();
+                prompt_style.set_fg(Some(Color::White)).set_bold(true);
+                let _ = stdout.set_color(&prompt_style);
+                let _ = write!(&mut stdout, "αlphanumeric: ");
                 let _ = stdout.reset();
-                println!();
+                let _ = stdout.flush();
 
                 let mut command = String::new();
                 match std::io::stdin().read_line(&mut command) {
@@ -1013,6 +1014,10 @@ async fn main() -> Result<()> {
                     }
                 }
             };
+            command = command
+                .trim_start_matches("αlphanumeric:")
+                .trim()
+                .to_string();
 
             let recalled_previous = matches!(command.as_str(), "\u{1b}[A" | "\u{1b}OA" | "^[[A")
                 || (command.starts_with('\u{1b}') && command.ends_with("[A"))

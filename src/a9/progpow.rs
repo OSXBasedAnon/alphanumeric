@@ -22,6 +22,8 @@ use crate::a9::wallet::Wallet;
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
+const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {msg}";
+const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {msg}";
 
 #[derive(Debug, Clone, Error)]
 pub enum CryptoError {
@@ -239,11 +241,9 @@ impl MiningManager {
         let progress_bar = Arc::new(Mutex::new(ProgressBar::new(max_nonce)));
         {
             if let Ok(pb) = progress_bar.lock() {
-                let style = ProgressStyle::with_template(
-                    "{prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
-                )
-                .map_err(|e| MiningError::MiningFailed(format!("Progress style error: {}", e)))?
-                .progress_chars("=> ");
+                let style = ProgressStyle::with_template(MINING_PROGRESS_TEMPLATE)
+                    .map_err(|e| MiningError::MiningFailed(format!("Progress style error: {}", e)))?
+                    .progress_chars("=  ");
                 pb.set_style(style);
                 pb.set_prefix(format!("Block #{}", header.number));
                 pb.enable_steady_tick(Duration::from_millis(100));
@@ -510,6 +510,12 @@ impl MiningManager {
                             match res {
                                 Ok(()) => {
                                     if let Ok(pb) = progress_bar.lock() {
+                                        if let Ok(style) =
+                                            ProgressStyle::with_template(MINING_SUCCESS_TEMPLATE)
+                                        {
+                                            pb.set_style(style.progress_chars("=  "));
+                                        }
+                                        pb.set_position(max_nonce);
                                         pb.finish_with_message("Block mined successfully!");
                                     }
                                     return Ok((nonce, hash_string, mined_block));
