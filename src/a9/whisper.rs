@@ -1,4 +1,3 @@
-use bincode;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use rayon::prelude::*;
@@ -12,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::a9::blockchain::{
     Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
+use crate::a9::codec;
 use crate::a9::wallet::Wallet;
 
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
@@ -255,7 +255,7 @@ impl WhisperModule {
         let tree = db.open_tree(Self::INDEX_TREE).ok()?;
         let key = format!("idx:{}", address);
         let bytes = tree.get(key.as_bytes()).ok()??;
-        bincode::deserialize(&bytes).ok()
+        codec::deserialize(&bytes).ok()
     }
 
     fn save_index_to_db(&self, address: &str) {
@@ -268,7 +268,7 @@ impl WhisperModule {
             Err(_) => return,
         };
         if let Some(index) = self.wallet_indices.get(address) {
-            if let Ok(bytes) = bincode::serialize(&*index) {
+            if let Ok(bytes) = codec::serialize(&*index) {
                 let key = format!("idx:{}", address);
                 let _ = tree.insert(key.as_bytes(), bytes);
             }

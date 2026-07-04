@@ -53,6 +53,7 @@ use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, RateLimiter, Transaction, SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
+use crate::a9::codec;
 use crate::a9::mempool::TemporalVerification;
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
 
@@ -86,7 +87,7 @@ const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 
 // Protocol
-const NETWORK_VERSION: u32 = 1;
+const NETWORK_VERSION: u32 = 2;
 
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
@@ -199,9 +200,9 @@ impl From<BlockchainError> for NodeError {
     }
 }
 
-impl From<Box<bincode::ErrorKind>> for NodeError {
-    fn from(err: Box<bincode::ErrorKind>) -> Self {
-        NodeError::Serialization(format!("Bincode error: {}", err))
+impl From<codec::CodecError> for NodeError {
+    fn from(err: codec::CodecError) -> Self {
+        NodeError::Serialization(format!("Codec error: {}", err))
     }
 }
 
@@ -376,9 +377,9 @@ pub enum NetworkMessage {
         node_id: String,
         signature: Vec<u8>,
     },
-    DilithiumKeyRegistration {
+    MldsaKeyRegistration {
         node_id: String,
-        dilithium_public_key: Vec<u8>,
+        mldsa_public_key: Vec<u8>,
         ed25519_signature: Vec<u8>,
     },
     Challenge(Vec<u8>),
@@ -1071,7 +1072,7 @@ impl Node {
     fn handshake_payload(message: &HandshakeMessage) -> Result<Vec<u8>, NodeError> {
         let mut msg = message.clone();
         msg.signature = Vec::new();
-        Ok(bincode::serialize(&msg)?)
+        Ok(codec::serialize(&msg)?)
     }
 
     fn sign_handshake(&self, message: &HandshakeMessage) -> Result<Vec<u8>, NodeError> {
@@ -1087,29 +1088,29 @@ impl Node {
         Ok(keypair.sign(payload).as_ref().to_vec())
     }
 
-    fn build_dilithium_registration_message(&self) -> Result<Option<NetworkMessage>, NodeError> {
+    fn build_mldsa_registration_message(&self) -> Result<Option<NetworkMessage>, NodeError> {
         let Some(sentinel) = &self.header_sentinel else {
             return Ok(None);
         };
 
-        let dilithium_public_key = sentinel.local_dilithium_public_key();
-        if dilithium_public_key.is_empty() {
+        let mldsa_public_key = sentinel.local_mldsa_public_key();
+        if mldsa_public_key.is_empty() {
             return Ok(None);
         }
 
         let payload =
-            crate::a9::bpos::build_dilithium_binding_payload(&self.node_id, &dilithium_public_key);
+            crate::a9::bpos::build_mldsa_binding_payload(&self.node_id, &mldsa_public_key);
         let ed25519_signature = self.sign_with_handshake_key(&payload)?;
 
-        Ok(Some(NetworkMessage::DilithiumKeyRegistration {
+        Ok(Some(NetworkMessage::MldsaKeyRegistration {
             node_id: self.node_id.clone(),
-            dilithium_public_key,
+            mldsa_public_key,
             ed25519_signature,
         }))
     }
 
-    pub async fn advertise_dilithium_key(&self, addr: SocketAddr) -> Result<(), NodeError> {
-        if let Some(message) = self.build_dilithium_registration_message()? {
+    pub async fn advertise_mldsa_key(&self, addr: SocketAddr) -> Result<(), NodeError> {
+        if let Some(message) = self.build_mldsa_registration_message()? {
             self.send_message(addr, &message).await?;
         }
         Ok(())
@@ -4345,7 +4346,7 @@ impl Node {
         let message = if let Some(secret) = shared_secret {
             self.decrypt_message(&data, &secret)?
         } else {
-            bincode::deserialize(&data)?
+            codec::deserialize(&data)?
         };
 
         Ok(message)
@@ -4355,7 +4356,7 @@ impl Node {
         match event {
             NetworkEvent::NewTransaction(tx) => {
                 // Deduplicate transactions using bloom filter
-                let tx_bytes = bincode::serialize(&tx)?;
+                let tx_bytes = codec::serialize(&tx)?;
                 if !self.network_bloom.insert(&tx_bytes) {
                     return Ok(());
                 }
@@ -4552,7 +4553,7 @@ impl Node {
         }
 
         // Deserialize message
-        let message: NetworkMessage = match bincode::deserialize(data) {
+        let message: NetworkMessage = match codec::deserialize(data) {
             Ok(msg) => msg,
             Err(_) => {
                 self.record_peer_failure(addr).await;
@@ -4910,19 +4911,19 @@ impl Node {
                 }
             }
 
-            NetworkMessage::DilithiumKeyRegistration {
+            NetworkMessage::MldsaKeyRegistration {
                 node_id,
-                dilithium_public_key,
+                mldsa_public_key,
                 ed25519_signature,
             } => {
                 if let Some(ref sentinel) = self.header_sentinel {
-                    if let Err(e) = sentinel.register_peer_dilithium_key(
+                    if let Err(e) = sentinel.register_peer_mldsa_key(
                         &node_id,
-                        dilithium_public_key,
+                        mldsa_public_key,
                         ed25519_signature,
                     ) {
                         debug!(
-                            "Dilithium key registration rejected from {} (node {}): {}",
+                            "ML-DSA key registration rejected from {} (node {}): {}",
                             addr, node_id, e
                         );
                     }
@@ -4944,7 +4945,7 @@ impl Node {
                 | NetworkMessage::AlertMessage(_)
                 | NetworkMessage::HeaderVerification { .. }
                 | NetworkMessage::HeaderSync { .. }
-                | NetworkMessage::DilithiumKeyRegistration { .. }
+                | NetworkMessage::MldsaKeyRegistration { .. }
                 | NetworkMessage::Shred(_)
         )
     }
@@ -5255,7 +5256,7 @@ impl Node {
                         };
 
                     // Serialize the message for handle_peer_message dedup/rate tracking.
-                    let serialized_message = bincode::serialize(&message)?;
+                    let serialized_message = codec::serialize(&message)?;
 
                     // Process message
                     let response = match self
@@ -5579,8 +5580,8 @@ impl Node {
 
         self.insert_outbound_connection(addr, stream).await;
 
-        if let Err(e) = self.advertise_dilithium_key(addr).await {
-            debug!("Failed to advertise Dilithium key to {}: {}", addr, e);
+        if let Err(e) = self.advertise_mldsa_key(addr).await {
+            debug!("Failed to advertise ML-DSA key to {}: {}", addr, e);
         }
 
         // Reset failure counter
@@ -5841,7 +5842,7 @@ impl Node {
 
         if is_initiator {
             // Send our handshake first
-            let data = bincode::serialize(&our_handshake)?;
+            let data = codec::serialize(&our_handshake)?;
             if data.is_empty() || data.len() > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Invalid handshake size".into()));
             }
@@ -5861,7 +5862,7 @@ impl Node {
             let mut data = vec![0u8; len];
             stream.read_exact(&mut data).await?;
 
-            let peer_handshake: HandshakeMessage = bincode::deserialize(&data)?;
+            let peer_handshake: HandshakeMessage = codec::deserialize(&data)?;
 
             // Verify peer's handshake
             if peer_handshake.network_id != self.network_id {
@@ -5900,7 +5901,7 @@ impl Node {
             let mut data = vec![0u8; len];
             stream.read_exact(&mut data).await?;
 
-            let peer_handshake: HandshakeMessage = bincode::deserialize(&data)?;
+            let peer_handshake: HandshakeMessage = codec::deserialize(&data)?;
 
             // Verify peer's handshake
             if peer_handshake.network_id != self.network_id {
@@ -5909,7 +5910,7 @@ impl Node {
             self.verify_handshake(&peer_handshake)?;
 
             // Send our response
-            let data = bincode::serialize(&our_handshake)?;
+            let data = codec::serialize(&our_handshake)?;
             if data.is_empty() || data.len() > MAX_HANDSHAKE_SIZE {
                 return Err(NodeError::Network("Invalid handshake size".into()));
             }
@@ -5958,7 +5959,7 @@ impl Node {
         let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
 
         // Serialize message
-        let message_bytes = bincode::serialize(message)?;
+        let message_bytes = codec::serialize(message)?;
 
         // Encrypt in-place
         let mut in_out = message_bytes;
@@ -6002,7 +6003,7 @@ impl Node {
             .map_err(|_| NodeError::Network("Decryption failed".into()))?;
 
         // Deserialize message
-        Ok(bincode::deserialize(decrypted)?)
+        Ok(codec::deserialize(decrypted)?)
     }
 
     // Method to derive shared secret for secure communication

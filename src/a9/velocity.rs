@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use crate::a9::blockchain::Block;
+use crate::a9::codec;
 use crate::a9::node::Node;
 use crate::a9::node::PeerInfo;
 
@@ -473,7 +474,7 @@ impl VelocityManager {
                 let data = self.erasure_manager.decode(shards)?;
 
                 // Deserialize the block
-                let reconstructed_block: Block = bincode::deserialize(&data)
+                let reconstructed_block: Block = codec::deserialize(&data)
                     .map_err(|e| VelocityError::DeserializationError(e.to_string()))?;
                 if reconstructed_block.calculate_hash_for_block() != *block_hash {
                     return Err(VelocityError::HashMismatch);
@@ -513,7 +514,7 @@ impl VelocityManager {
 
         // Calculate block size
         let block_bytes =
-            bincode::serialize(&block).map_err(|e| VelocityError::Encoding(e.to_string()))?;
+            codec::serialize(&block).map_err(|e| VelocityError::Encoding(e.to_string()))?;
 
         log::debug!(
             "Velocity: Processing block {} ({} bytes) with {} peers",
@@ -739,7 +740,7 @@ impl VelocityManager {
 
         // Serialize message
         let data =
-            bincode::serialize(&message).map_err(|e| VelocityError::Encoding(e.to_string()))?;
+            codec::serialize(&message).map_err(|e| VelocityError::Encoding(e.to_string()))?;
 
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(VelocityError::Network("Shred too large".into()));
@@ -805,7 +806,7 @@ impl VelocityManager {
             ));
         }
 
-        let block: Block = bincode::deserialize(&shred.data)
+        let block: Block = codec::deserialize(&shred.data)
             .map_err(|e| VelocityError::DeserializationError(e.to_string()))?;
         let calculated_hash = block.calculate_hash_for_block();
         if calculated_hash != block.hash || block.hash != shred.block_hash {
@@ -953,7 +954,7 @@ impl VelocityManager {
 
         // Serialize message
         let data =
-            bincode::serialize(&message).map_err(|e| VelocityError::Encoding(e.to_string()))?;
+            codec::serialize(&message).map_err(|e| VelocityError::Encoding(e.to_string()))?;
 
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(VelocityError::Network("Response too large".into()));
@@ -1228,7 +1229,7 @@ mod tests {
             block_hash: block.hash,
             index: 0,
             total_shreds: DIRECT_BLOCK_SHRED_COUNT,
-            data: bincode::serialize(&block).expect("block should serialize"),
+            data: codec::serialize(&block).expect("block should serialize"),
             subnet_hint: None,
             timestamp: block.timestamp,
             nonce: 0,

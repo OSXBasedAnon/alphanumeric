@@ -7,10 +7,9 @@ use tokio::sync::RwLock;
 
 use dashmap::DashMap;
 
-use bincode;
-
 use crate::a9::blockchain::{Blockchain, BlockchainError, Transaction};
 use crate::a9::bpos::BlockHeaderInfo;
+use crate::a9::codec;
 
 type CheckpointQueue = Arc<RwLock<VecDeque<([u8; 32], u64)>>>;
 
@@ -104,7 +103,7 @@ impl Mempool {
         self.prune_expired();
 
         // Now do the expensive serialization
-        let tx_size = bincode::serialize(&tx)
+        let tx_size = codec::serialize(&tx)
             .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?
             .len();
 

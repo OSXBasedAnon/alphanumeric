@@ -846,13 +846,13 @@ impl Mgmt {
             stdout.reset()?;
             writeln!(
                 stdout,
-                ": wallet key material is missing a Dilithium public key"
+                ": wallet key material is missing a ML-DSA public key"
             )?;
             writeln!(
                 stdout,
                 "wallet data appears incomplete; restore a full key backup or recreate this wallet"
             )?;
-            return Err("Wallet key data missing Dilithium public key".into());
+            return Err("Wallet key data missing ML-DSA public key".into());
         }
 
         // No wallet registry needed - transactions are self-contained with public keys

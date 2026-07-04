@@ -26,6 +26,7 @@ use alphanumeric::a9::{
         Block, Blockchain, RateLimiter, Transaction, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
+    codec,
     mgmt::{Mgmt, WalletKeyData},
     node::{Node, NodeError, DEFAULT_PORT},
     oracle::DifficultyOracle,
@@ -116,13 +117,9 @@ fn verify_bootstrap_manifest(manifest: &BootstrapManifestPointer) -> Result<()> 
         return Err("Bootstrap manifest publisher key is malformed".into());
     }
 
-    let Some(height) = manifest.height else {
+    if manifest.height.is_none() {
         return Err("Bootstrap manifest is missing height".into());
     };
-    if height == 0 {
-        return Err("Bootstrap manifest height must be non-zero".into());
-    }
-
     let Some(tip_hash) = manifest.tip_hash.as_deref() else {
         return Err("Bootstrap manifest is missing tip hash".into());
     };
@@ -308,8 +305,14 @@ async fn main() -> Result<()> {
         // Database init
         let _startup_locks = acquire_startup_locks(&db_path)?;
         pb.set_message("Checking bootstrap snapshot...");
-        // Fail closed: if there are no local blocks, bootstrap must succeed.
-        ensure_bootstrap_db(&db_path).await?;
+        let use_local_v2_genesis = env_flag_enabled("ALPHANUMERIC_USE_LOCAL_V2_GENESIS")
+            || env_flag_enabled("ALPHANUMERIC_RESET_TO_V2_GENESIS");
+        if use_local_v2_genesis && !has_local_block_data(&db_path) {
+            println!("Bootstrap skipped: creating deterministic local v2 genesis");
+        } else {
+            // Fail closed: if there are no local blocks, bootstrap must succeed.
+            ensure_bootstrap_db(&db_path).await?;
+        }
         pb.set_message("Initializing database...");
         let db = match sled::Config::new()
             .path(&db_path)
@@ -393,6 +396,11 @@ async fn main() -> Result<()> {
         )));
 
         pb.inc(1);
+
+        if use_local_v2_genesis && db.scan_prefix("block_").next().is_none() {
+            pb.set_message("Creating v2 genesis...");
+            blockchain.write().await.create_genesis_block().await?;
+        }
 
         // Set specific message for balance verification
         pb.set_message("Verifying blockchain state...");
@@ -1369,7 +1377,7 @@ let mut style = ColorSpec::new();
 
 style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(false);
 stdout.set_color(&style)?;
-writeln!(stdout, "\n    ...CRYSTALS-dilithium verification complete")?;
+writeln!(stdout, "\n    ...ML-DSA-87 verification complete")?;
 writeln!(stdout, "    ...Establishing secure atomic lock for transaction")?;
 stdout.reset()?;
 
@@ -2328,14 +2336,14 @@ fn print_ascii_intro() {
     // Replace with your ASCII art
     let ascii_art = r#"
 
-                        -++-    -++-                                  alphanumeric beta 7.3.3
+                        -++-    -++-                                  alphanumeric v7.3.7
                        -+++.   .+++
                 .++++++++++++++++++++++-                              Architecture: Rust
                 -####++++#####++++#####+                              Algorithm: SHA-256
                     -++++-   --+++.                                              BLAKE3
              .++++++++++++++++++++++++-                               Database: sled
              +#####+++######++++######+                               Encryption: Argon2
-                 -+++++----++++-                                      Quantum DSS: CRYSTALS-dilithium
+                 -+++++----++++-                                      Quantum DSS: ML-DSA-87
                 .+++++.  .-+++-
                  ++++     ++++.
 "#;
@@ -3097,13 +3105,13 @@ fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64)> {
         .get(BOOTSTRAP_META_LAST_PUBLISH_AT)
         .ok()
         .flatten()
-        .and_then(|v| bincode::deserialize::<u64>(&v).ok())
+        .and_then(|v| codec::deserialize::<u64>(&v).ok())
         .unwrap_or(0);
     let last_height = tree
         .get(BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT)
         .ok()
         .flatten()
-        .and_then(|v| bincode::deserialize::<u64>(&v).ok())
+        .and_then(|v| codec::deserialize::<u64>(&v).ok())
         .unwrap_or(0);
     Some((last_at, last_height))
 }
@@ -3118,11 +3126,11 @@ fn write_bootstrap_publish_meta(
     let mut batch = sled::Batch::default();
     batch.insert(
         BOOTSTRAP_META_LAST_PUBLISH_AT,
-        bincode::serialize(&last_at).unwrap_or_default(),
+        codec::serialize(&last_at).unwrap_or_default(),
     );
     batch.insert(
         BOOTSTRAP_META_LAST_PUBLISHED_HEIGHT,
-        bincode::serialize(&last_height).unwrap_or_default(),
+        codec::serialize(&last_height).unwrap_or_default(),
     );
     tree.apply_batch(batch)?;
     tree.flush()?;

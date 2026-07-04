@@ -1,6 +1,4 @@
-use bincode::serialize;
 use blake3;
-use chrono::Utc;
 use dashmap::DashMap;
 use futures::executor::block_on;
 use lazy_static::lazy_static;
@@ -9,7 +7,6 @@ use lru::LruCache;
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use parking_lot::Mutex as PLMutex;
-use pqcrypto_traits::sign::PublicKey as PqPublicKeyTrait;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
@@ -24,7 +21,9 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::a9::codec;
 use crate::a9::mempool::{Mempool, TemporalVerification};
+use crate::a9::mldsa;
 use crate::a9::oracle::DifficultyOracle;
 use crate::a9::progpow::MiningManager;
 use crate::a9::wallet::Wallet;
@@ -33,7 +32,7 @@ const BALANCES_TREE: &str = "balances";
 const PENDING_DEBITS_TREE: &str = "pending_debits";
 const PENDING_CREDITS_TREE: &str = "pending_credits";
 const PENDING_TRANSACTIONS_TREE: &str = "pending_transactions";
-// Full Dilithium signatures are intentionally NOT stored in the main tx record on disk.
+// Full ML-DSA signatures are intentionally NOT stored in the main tx record on disk.
 // We keep them in a sidecar tree for pending/mempool durability across restarts, and prune with the same TTL.
 const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
@@ -48,6 +47,11 @@ const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 const ORPHAN_REORG_DEPTH: u32 = 1024;
+const GENESIS_V2_TIMESTAMP: u64 = 1_776_000_000;
+const GENESIS_V2_AMOUNT: f64 = 17.76;
+const GENESIS_V2_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
+const GENESIS_V2_DIFFICULTY: u64 = 0;
+const GENESIS_V2_NONCE: u64 = 1_776;
 
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
@@ -650,7 +654,7 @@ impl Block {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>> {
-        bincode::serialize(self).map_err(|e| Box::new(e) as Box<dyn Error>)
+        codec::serialize(self).map_err(|e| Box::new(e) as Box<dyn Error>)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
@@ -660,7 +664,7 @@ impl Block {
 
 #[derive(Debug)]
 pub enum BlockchainError {
-    BincodeError(Box<bincode::ErrorKind>),
+    CodecError(codec::CodecError),
     DatabaseError(sled::Error),
     RateLimitExceeded(String),
     SerializationError(Box<dyn StdError>),
@@ -688,7 +692,7 @@ impl fmt::Display for BlockchainError {
             BlockchainError::RateLimitExceeded(ref msg) => {
                 write!(f, "Rate limit exceeded: {}", msg)
             }
-            BlockchainError::BincodeError(e) => write!(f, "Bincode error: {}", e),
+            BlockchainError::CodecError(e) => write!(f, "Codec error: {}", e),
             BlockchainError::DatabaseError(e) => write!(f, "Database error: {}", e),
             BlockchainError::SerializationError(e) => write!(f, "Serialization error: {}", e),
             BlockchainError::SelfTransferNotAllowed => write!(f, "Self-transfers are not allowed"),
@@ -754,18 +758,18 @@ impl From<Box<dyn StdError>> for BlockchainError {
     }
 }
 
-impl From<Box<bincode::ErrorKind>> for BlockchainError {
-    fn from(error: Box<bincode::ErrorKind>) -> Self {
-        BlockchainError::BincodeError(error)
+impl From<codec::CodecError> for BlockchainError {
+    fn from(error: codec::CodecError) -> Self {
+        BlockchainError::CodecError(error)
     }
 }
 
 fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction, BlockchainError> {
-    if let Ok(tx) = bincode::deserialize::<Transaction>(bytes) {
+    if let Ok(tx) = codec::deserialize::<Transaction>(bytes) {
         return Ok(tx);
     }
-    let legacy: LegacyTransaction = bincode::deserialize(bytes)
-        .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+    let legacy: LegacyTransaction =
+        codec::deserialize(bytes).map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
     Ok(Transaction {
         sender: legacy.sender,
         recipient: legacy.recipient,
@@ -779,11 +783,11 @@ fn deserialize_transaction(bytes: &[u8]) -> Result<Transaction, BlockchainError>
 }
 
 fn deserialize_block(bytes: &[u8]) -> Result<Block, BlockchainError> {
-    if let Ok(block) = bincode::deserialize::<Block>(bytes) {
+    if let Ok(block) = codec::deserialize::<Block>(bytes) {
         return Ok(block);
     }
-    let legacy: LegacyBlock = bincode::deserialize(bytes)
-        .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+    let legacy: LegacyBlock =
+        codec::deserialize(bytes).map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
     Ok(Block {
         index: legacy.index,
         previous_hash: legacy.previous_hash,
@@ -1012,7 +1016,7 @@ impl Blockchain {
         let Some(raw) = orphan_blocks.get(hash_hex.as_bytes())? else {
             return Ok(None);
         };
-        let entry: OrphanStoredBlock = bincode::deserialize(&raw)?;
+        let entry: OrphanStoredBlock = codec::deserialize(&raw)?;
         Ok(Some(entry.block))
     }
 
@@ -1117,10 +1121,10 @@ impl Blockchain {
     }
 
     fn deserialize_units_compatible(raw: &[u8]) -> Result<i128, BlockchainError> {
-        if let Ok(units) = bincode::deserialize::<i128>(raw) {
+        if let Ok(units) = codec::deserialize::<i128>(raw) {
             return Ok(units);
         }
-        let legacy_amount: f64 = bincode::deserialize(raw)?;
+        let legacy_amount: f64 = codec::deserialize(raw)?;
         Ok(Transaction::to_units(legacy_amount))
     }
 
@@ -1133,7 +1137,7 @@ impl Blockchain {
         if normalized <= 0 {
             tree.remove(address.as_bytes())?;
         } else {
-            tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
+            tree.insert(address.as_bytes(), codec::serialize(&normalized)?)?;
         }
         Ok(())
     }
@@ -1147,7 +1151,7 @@ impl Blockchain {
         if normalized <= 0 {
             tree.remove(address.as_bytes())?;
         } else {
-            tree.insert(address.as_bytes(), bincode::serialize(&normalized)?)?;
+            tree.insert(address.as_bytes(), codec::serialize(&normalized)?)?;
         }
         Ok(())
     }
@@ -1157,7 +1161,7 @@ impl Blockchain {
         let Some(raw) = meta_tree.get(CHAIN_TIP_KEY)? else {
             return Ok(None);
         };
-        Ok(Some(bincode::deserialize(&raw)?))
+        Ok(Some(codec::deserialize(&raw)?))
     }
 
     fn write_chain_tip_metadata(&self, block: &Block) -> Result<(), BlockchainError> {
@@ -1166,7 +1170,7 @@ impl Blockchain {
             height: block.index,
             hash: block.hash,
         };
-        meta_tree.insert(CHAIN_TIP_KEY, bincode::serialize(&tip)?)?;
+        meta_tree.insert(CHAIN_TIP_KEY, codec::serialize(&tip)?)?;
         Ok(())
     }
 
@@ -1212,7 +1216,7 @@ impl Blockchain {
             reason: reason.to_string(),
             marked_at: Self::now_unix_secs(),
         };
-        meta_tree.insert(CHAIN_STATE_DIRTY_KEY, bincode::serialize(&marker)?)?;
+        meta_tree.insert(CHAIN_STATE_DIRTY_KEY, codec::serialize(&marker)?)?;
         meta_tree.flush()?;
         Ok(())
     }
@@ -1229,7 +1233,7 @@ impl Blockchain {
         let Some(raw) = meta_tree.get(CHAIN_STATE_DIRTY_KEY)? else {
             return Ok(None);
         };
-        Ok(Some(bincode::deserialize(&raw)?))
+        Ok(Some(codec::deserialize(&raw)?))
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
@@ -1255,14 +1259,14 @@ impl Blockchain {
         for (address, total) in totals {
             let normalized = total.max(0);
             if normalized > 0 {
-                debit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
+                debit_batch.insert(address.as_bytes(), codec::serialize(&normalized)?);
             }
         }
         let mut credit_batch = sled::Batch::default();
         for (address, total) in incoming {
             let normalized = total.max(0);
             if normalized > 0 {
-                credit_batch.insert(address.as_bytes(), bincode::serialize(&normalized)?);
+                credit_batch.insert(address.as_bytes(), codec::serialize(&normalized)?);
             }
         }
         debits_tree.apply_batch(debit_batch)?;
@@ -1286,7 +1290,7 @@ impl Blockchain {
             received_at: Self::now_unix_secs(),
         };
 
-        orphan_blocks.insert(hash_key.as_bytes(), bincode::serialize(&orphan_entry)?)?;
+        orphan_blocks.insert(hash_key.as_bytes(), codec::serialize(&orphan_entry)?)?;
         orphan_index.insert(
             Self::orphan_index_key(&block.previous_hash, block.index, &block.hash).as_bytes(),
             &[] as &[u8],
@@ -1303,7 +1307,7 @@ impl Blockchain {
         let hash_key = Self::orphan_hash_key(hash);
 
         if let Some(raw) = orphan_blocks.remove(hash_key.as_bytes())? {
-            if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+            if let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) {
                 let index_key = Self::orphan_index_key(
                     &entry.block.previous_hash,
                     entry.block.index,
@@ -1328,7 +1332,7 @@ impl Blockchain {
                 continue;
             };
             if let Some(raw) = orphan_blocks.get(orphan_hash_hex.as_bytes())? {
-                if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+                if let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) {
                     if entry.block.previous_hash == *parent_hash {
                         children.push(entry.block);
                     }
@@ -1439,7 +1443,7 @@ impl Blockchain {
 
         for item in orphan_blocks.iter() {
             let (_, raw) = item?;
-            let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) else {
+            let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) else {
                 continue;
             };
             let b = entry.block;
@@ -1528,7 +1532,7 @@ impl Blockchain {
             let key = format!("block_{}", b.index);
             let storage = Self::to_storage_block(b);
             self.db
-                .insert(key.as_bytes(), bincode::serialize(&storage)?)?;
+                .insert(key.as_bytes(), codec::serialize(&storage)?)?;
         }
 
         let branch_tip = branch
@@ -1570,7 +1574,7 @@ impl Blockchain {
         let mut retained: Vec<OrphanStoredBlock> = Vec::new();
         for item in orphan_blocks.iter() {
             let (_, raw) = item?;
-            if let Ok(entry) = bincode::deserialize::<OrphanStoredBlock>(&raw) {
+            if let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) {
                 let expired = now.saturating_sub(entry.received_at) > ORPHAN_TTL_SECS;
                 let stale_height = tip
                     .map(|t| entry.block.index.saturating_add(ORPHAN_REORG_DEPTH) < t)
@@ -1710,7 +1714,7 @@ impl Blockchain {
         let storage_block = Self::to_storage_block(block);
 
         // Serialize and save block
-        let value = match bincode::serialize(&storage_block) {
+        let value = match codec::serialize(&storage_block) {
             Ok(value) => value,
             Err(err) => {
                 return Err(BlockchainError::SerializationError(Box::new(err)));
@@ -1850,7 +1854,7 @@ impl Blockchain {
 
     fn get_balances_height(tree: &sled::Tree) -> Result<Option<u64>, BlockchainError> {
         if let Some(raw) = tree.get(BALANCES_HEIGHT_KEY)? {
-            let height: u64 = bincode::deserialize(&raw)?;
+            let height: u64 = codec::deserialize(&raw)?;
             Ok(Some(height))
         } else {
             Ok(None)
@@ -1858,7 +1862,7 @@ impl Blockchain {
     }
 
     fn set_balances_height(tree: &sled::Tree, height: u64) -> Result<(), BlockchainError> {
-        tree.insert(BALANCES_HEIGHT_KEY, bincode::serialize(&height)?)?;
+        tree.insert(BALANCES_HEIGHT_KEY, codec::serialize(&height)?)?;
         Ok(())
     }
 
@@ -1922,7 +1926,7 @@ impl Blockchain {
 
         let mut batch = sled::Batch::default();
         for (address, balance) in balances {
-            batch.insert(address.as_bytes(), bincode::serialize(&balance)?);
+            batch.insert(address.as_bytes(), codec::serialize(&balance)?);
         }
         balances_tree.apply_batch(batch)?;
 
@@ -2115,7 +2119,7 @@ impl Blockchain {
 
     pub async fn save_receipt_verified_block(&self, block: &Block) -> Result<(), BlockchainError> {
         // Historical sync peers serve compact stored blocks. Those blocks carry a
-        // signature receipt + full-signature hash, not the full Dilithium witness.
+        // signature receipt + full-signature hash, not the full ML-DSA witness.
         self.prevalidate_unattached_block(block, SignatureValidationMode::AllowTruncatedStored)
             .await?;
 
@@ -2257,7 +2261,7 @@ impl Blockchain {
 
         // Save block with truncated signatures to reduce on-disk chain size.
         let storage_block = Self::to_storage_block(&block);
-        let value = match bincode::serialize(&storage_block) {
+        let value = match codec::serialize(&storage_block) {
             Ok(value) => value,
             Err(err) => {
                 return Err(BlockchainError::SerializationError(Box::new(err)));
@@ -2588,7 +2592,7 @@ impl Blockchain {
             .ok_or(BlockchainError::InvalidTransactionSignature)?;
         let pub_key_bytes =
             hex::decode(pub_key).map_err(|_| BlockchainError::InvalidTransactionSignature)?;
-        if pqcrypto_dilithium::dilithium5::PublicKey::from_bytes(&pub_key_bytes).is_err() {
+        if mldsa::validate_public_key(&pub_key_bytes).is_err() {
             return Err(BlockchainError::InvalidTransactionSignature);
         }
         let mut hasher = Sha256::new();
@@ -2877,7 +2881,7 @@ impl Blockchain {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
         let pending_credits_tree = self.open_pending_credits_tree()?;
-        let tx_bytes = bincode::serialize(&storage_tx)?;
+        let tx_bytes = codec::serialize(&storage_tx)?;
 
         // Use batch operation for atomic updates
         let mut batch = sled::Batch::default();
@@ -2949,6 +2953,10 @@ impl Blockchain {
     pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
         const REDUCTION_RATE: f64 = 0.83; // 17% reduction = multiply by 0.83
+
+        if block.index == 0 {
+            return Ok(GENESIS_V2_AMOUNT);
+        }
 
         // Calculate periods since genesis for halving
         let genesis = self.get_genesis_block()?;
@@ -3028,39 +3036,43 @@ impl Blockchain {
         }
     }
 
-    // Genesis block
-    pub async fn create_genesis_block(
-        &self,
-        _mining_manager: &MiningManager,
-    ) -> Result<(), BlockchainError> {
-        let transaction_amount = 17.76;
-        let fee = transaction_amount * FEE_PERCENTAGE;
-
-        let sender_address = "1A1zP1eP5QGefi2DMpileTL5SLmv7DivfNa".to_string();
-        let recipient_address = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy".to_string();
-
+    pub fn genesis_v2_block() -> Result<Block, BlockchainError> {
         let genesis_transaction = Transaction::new(
-            sender_address,
-            recipient_address,
-            transaction_amount,
-            fee,
-            Utc::now().timestamp() as u64,
+            "MINING_REWARDS".to_string(),
+            GENESIS_V2_RECIPIENT.to_string(),
+            GENESIS_V2_AMOUNT,
+            NETWORK_FEE,
+            GENESIS_V2_TIMESTAMP,
             None,
         );
+        let transactions = vec![genesis_transaction];
+        let merkle_root = Self::calculate_merkle_root(&transactions)?;
+        let mut block = Block {
+            index: 0,
+            previous_hash: [0u8; 32],
+            timestamp: GENESIS_V2_TIMESTAMP,
+            transactions,
+            nonce: GENESIS_V2_NONCE,
+            difficulty: GENESIS_V2_DIFFICULTY,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+        Ok(block)
+    }
 
-        let genesis_block = Block::new(
-            0,                             // Block index
-            [0u8; 32],                     // Previous block hash
-            Utc::now().timestamp() as u64, // Timestamp
-            vec![genesis_transaction],     // Include genesis transaction
-            0,                             // Nonce
-            100,                           // Initial difficulty
-        )?;
-
-        self.save_block(&genesis_block).await.map_err(|e| {
-            error!("Failed to save genesis block: {}", e);
-            e
-        })
+    // Frozen v2 genesis block. Empty beta DBs create this exact block; existing DBs never recreate it.
+    pub async fn create_genesis_block(&self) -> Result<(), BlockchainError> {
+        if self.get_block(0).is_ok() {
+            return Ok(());
+        }
+        let genesis_block = Self::genesis_v2_block()?;
+        self.save_receipt_verified_block(&genesis_block)
+            .await
+            .map_err(|e| {
+                error!("Failed to save genesis block: {}", e);
+                e
+            })
     }
 
     pub async fn sync_mempool_with_sled(&self) -> Result<(), BlockchainError> {
@@ -3272,7 +3284,7 @@ impl Blockchain {
         for (address, change) in balance_changes {
             let current = current_balances.get(&address).copied().unwrap_or(0);
             let new_balance = current + change;
-            batch.insert(address.as_bytes(), bincode::serialize(&new_balance)?);
+            batch.insert(address.as_bytes(), codec::serialize(&new_balance)?);
         }
 
         // Commit changes
@@ -3329,7 +3341,7 @@ impl Blockchain {
         }
         if auto_rebuild && index_height >= self.get_latest_block_index() {
             let balance_units: i128 = 0;
-            balances_tree.insert(address.as_bytes(), bincode::serialize(&balance_units)?)?;
+            balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
             return Ok(0.0);
         }
         // Slow path: calculate from blocks, then cache in balances tree.
@@ -3370,7 +3382,7 @@ impl Blockchain {
             }
         }
 
-        balances_tree.insert(address.as_bytes(), bincode::serialize(&balance_units)?)?;
+        balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
         Ok(Transaction::from_units(balance_units))
     }
 
@@ -3401,7 +3413,7 @@ impl Blockchain {
         // Store new balance
         balances_tree.insert(
             address.as_bytes(),
-            bincode::serialize(&new_balance_units)
+            codec::serialize(&new_balance_units)
                 .map_err(|_| BlockchainError::InvalidTransaction)?,
         )?;
 
@@ -3447,7 +3459,7 @@ impl Blockchain {
                     }
                 };
 
-                let tx_bytes = serialize(&tx_for_merkle)
+                let tx_bytes = codec::serialize(&tx_for_merkle)
                     .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
                 let mut hasher = Sha256::new();
                 hasher.update(&tx_bytes);
@@ -3621,7 +3633,6 @@ impl Default for ChainSentinel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pqcrypto_dilithium::dilithium5::keypair as dilithium_keypair;
     use serde_json::Value;
 
     fn test_blockchain() -> Blockchain {
@@ -3677,7 +3688,7 @@ mod tests {
         let key = format!("block_{}", block.index);
         blockchain
             .db
-            .insert(key.as_bytes(), bincode::serialize(block).unwrap())
+            .insert(key.as_bytes(), codec::serialize(block).unwrap())
             .expect("raw block insert should succeed");
     }
 
@@ -3730,7 +3741,32 @@ mod tests {
     }
 
     #[test]
-    fn legacy_transaction_bincode_is_deserialized() {
+    fn genesis_v2_is_deterministic_and_carries_1776_artifact() {
+        let block_a = Blockchain::genesis_v2_block().expect("genesis should build");
+        let block_b = Blockchain::genesis_v2_block().expect("genesis should rebuild identically");
+
+        assert_eq!(block_a.hash, block_b.hash);
+        assert_eq!(block_a.merkle_root, block_b.merkle_root);
+        assert_eq!(
+            block_a.calculate_hash_for_block(),
+            block_b.calculate_hash_for_block()
+        );
+        assert_eq!(block_a.index, 0);
+        assert_eq!(block_a.previous_hash, [0u8; 32]);
+        assert_eq!(block_a.timestamp, GENESIS_V2_TIMESTAMP);
+        assert_eq!(block_a.nonce, GENESIS_V2_NONCE);
+        assert_eq!(block_a.difficulty, GENESIS_V2_DIFFICULTY);
+        assert_eq!(block_a.transactions.len(), 1);
+
+        let tx = &block_a.transactions[0];
+        assert_eq!(tx.sender, "MINING_REWARDS");
+        assert_eq!(tx.recipient, GENESIS_V2_RECIPIENT);
+        assert_eq!(tx.amount_units, Transaction::to_units(GENESIS_V2_AMOUNT));
+        assert_eq!(tx.fee_units, Transaction::to_units(NETWORK_FEE));
+    }
+
+    #[test]
+    fn legacy_transaction_codec_envelope_is_deserialized() {
         let legacy = LegacyTransaction {
             sender: "alice".to_string(),
             recipient: "bob".to_string(),
@@ -3739,7 +3775,7 @@ mod tests {
             timestamp: 999,
             signature: Some("cafebabe".to_string()),
         };
-        let bytes = bincode::serialize(&legacy).expect("legacy tx should serialize");
+        let bytes = codec::serialize(&legacy).expect("legacy tx should serialize");
         let tx = deserialize_transaction(&bytes).expect("legacy tx should deserialize");
 
         assert_eq!(tx.sender, legacy.sender);
@@ -3752,10 +3788,9 @@ mod tests {
 
     #[test]
     fn receipt_validation_accepts_truncated_signature_commitment() {
-        let (public_key, _) = dilithium_keypair();
-        let public_key_bytes = PqPublicKeyTrait::as_bytes(&public_key);
+        let (public_key_bytes, _) = mldsa::generate_keypair();
         let mut hasher = Sha256::new();
-        hasher.update(public_key_bytes);
+        hasher.update(&public_key_bytes);
         let sender = hex::encode(&hasher.finalize()[..20]);
 
         let tx = Transaction {
@@ -3765,7 +3800,7 @@ mod tests {
             amount_units: Transaction::to_units(1.0),
             timestamp: 1234,
             signature: Some("aa".repeat(64)),
-            pub_key: Some(hex::encode(public_key_bytes)),
+            pub_key: Some(hex::encode(&public_key_bytes)),
             sig_hash: Some("bb".repeat(32)),
         };
 
@@ -3774,8 +3809,7 @@ mod tests {
 
     #[test]
     fn receipt_validation_rejects_pubkey_sender_mismatch() {
-        let (public_key, _) = dilithium_keypair();
-        let public_key_bytes = PqPublicKeyTrait::as_bytes(&public_key);
+        let (public_key_bytes, _) = mldsa::generate_keypair();
 
         let tx = Transaction {
             sender: "not-derived-from-key".to_string(),
@@ -3784,7 +3818,7 @@ mod tests {
             amount_units: Transaction::to_units(1.0),
             timestamp: 1234,
             signature: Some("aa".repeat(64)),
-            pub_key: Some(hex::encode(public_key_bytes)),
+            pub_key: Some(hex::encode(&public_key_bytes)),
             sig_hash: Some("bb".repeat(32)),
         };
 
@@ -3830,7 +3864,7 @@ mod tests {
             .open_tree(BALANCES_TREE)
             .expect("balances tree should open");
         balances_tree
-            .insert("miner1".as_bytes(), bincode::serialize(&999i128).unwrap())
+            .insert("miner1".as_bytes(), codec::serialize(&999i128).unwrap())
             .expect("stale balance should write");
         Blockchain::set_balances_height(&balances_tree, 0).unwrap();
 

@@ -1,11 +1,5 @@
 use dashmap::DashMap;
 use log::{error, info, warn};
-use pqcrypto_dilithium::dilithium5::{
-    detached_sign, keypair as dilithium_keypair, DetachedSignature, PublicKey, SecretKey,
-};
-use pqcrypto_traits::sign::{
-    DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
-};
 use rand::{thread_rng, Rng};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -17,6 +11,8 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 
 use crate::a9::blockchain::{Block, Blockchain, BlockchainError, Transaction};
+use crate::a9::codec;
+use crate::a9::mldsa;
 use crate::a9::node::NetworkMessage;
 use crate::a9::node::{Node, NodeError};
 
@@ -37,17 +33,17 @@ const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhausti
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
 #[allow(dead_code)]
 const SENTINEL_VERIFY_INTERVAL: u64 = 300; // 5 minute verification cycle
-const DILITHIUM_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_DILITHIUM_BIND_V1";
+const MLDSA_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_MLDSA87_BIND_V2";
 
-pub fn build_dilithium_binding_payload(node_id: &str, dilithium_public_key: &[u8]) -> Vec<u8> {
+pub fn build_mldsa_binding_payload(node_id: &str, mldsa_public_key: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(
-        DILITHIUM_BINDING_CONTEXT.len() + node_id.len() + dilithium_public_key.len() + 6,
+        MLDSA_BINDING_CONTEXT.len() + node_id.len() + mldsa_public_key.len() + 6,
     );
-    payload.extend_from_slice(DILITHIUM_BINDING_CONTEXT);
+    payload.extend_from_slice(MLDSA_BINDING_CONTEXT);
     payload.extend_from_slice(&(node_id.len() as u16).to_be_bytes());
     payload.extend_from_slice(node_id.as_bytes());
-    payload.extend_from_slice(&(dilithium_public_key.len() as u16).to_be_bytes());
-    payload.extend_from_slice(dilithium_public_key);
+    payload.extend_from_slice(&(mldsa_public_key.len() as u16).to_be_bytes());
+    payload.extend_from_slice(mldsa_public_key);
     payload
 }
 
@@ -346,7 +342,7 @@ impl BPoSSentinel {
     }
 
     fn start_monitoring_tasks(&self) {
-        // BPoS chain monitoring with Dilithium verification
+        // BPoS chain monitoring with ML-DSA verification
         let sentinel = self.clone();
         tokio::task::spawn(async move {
             let mut interval = interval(Duration::from_secs(CHAIN_VERIFICATION_INTERVAL));
@@ -899,10 +895,6 @@ impl BPoSSentinel {
         Ok(())
     }
 
-    fn convert_signature_to_bytes(sig: DetachedSignature) -> Vec<u8> {
-        PqDetachedSignature::as_bytes(&sig).to_vec()
-    }
-
     pub async fn record_action(
         &self,
         address: &str,
@@ -1170,7 +1162,7 @@ impl BPoSSentinel {
         signature: &[u8],
     ) -> Result<(), String> {
         self.node
-            .advertise_dilithium_key(addr)
+            .advertise_mldsa_key(addr)
             .await
             .map_err(|e| e.to_string())?;
         let message = NetworkMessage::HeaderVerification {
@@ -1592,11 +1584,11 @@ impl BPoSSentinel {
     }
 
     async fn initialize_sentinel(&mut self) -> Result<(), String> {
-        // Generate fresh dilithium keypair for this node instance
-        let (_public_key, secret_key) = dilithium_keypair();
+        // Generate fresh mldsa keypair for this node instance
+        let (_public_key, secret_key) = mldsa::generate_keypair();
 
         let sentinel = NodeSentinel {
-            secret_key: secret_key.as_bytes().to_vec(),
+            secret_key,
             last_challenge: 0,
             verified_peers: HashSet::new(),
         };
@@ -1712,17 +1704,14 @@ impl BPoSSentinel {
             challenge_data.extend_from_slice(&nonce);
             challenge_data.extend_from_slice(&header_hash);
 
-            // Sign with sentinel's dilithium key
-            let secret_key = SecretKey::from_bytes(&sentinel.secret_key)
-                .map_err(|e| format!("Invalid sentinel key: {}", e))?;
-
-            let signature = detached_sign(&challenge_data, &secret_key);
+            // Sign with sentinel's mldsa key
+            let signature = mldsa::sign(&challenge_data, &sentinel.secret_key)?;
 
             Ok(SentinelChallenge {
                 timestamp: now,
                 nonce,
                 header_hash,
-                signature: signature.as_bytes().to_vec(),
+                signature,
             })
         } else {
             Err("Sentinel not initialized".to_string())
@@ -1735,7 +1724,7 @@ impl BPoSSentinel {
         challenge: &SentinelChallenge,
     ) -> Result<(), String> {
         let message = NetworkMessage::Challenge(
-            bincode::serialize(challenge).map_err(|e| format!("Serialization error: {}", e))?,
+            codec::serialize(challenge).map_err(|e| format!("Serialization error: {}", e))?,
         );
 
         self.node.send_message(addr, &message).await?;
@@ -1753,15 +1742,8 @@ impl BPoSSentinel {
             ]
             .concat();
 
-            let peer_pub_key = PublicKey::from_bytes(peer_sentinel.as_slice())
-                .map_err(|e| format!("Invalid public key: {}", e))?;
-            let verification_result = pqcrypto_dilithium::dilithium5::verify_detached_signature(
-                &DetachedSignature::from_bytes(&response)
-                    .map_err(|e| format!("Invalid signature: {}", e))?,
-                &response_data,
-                &peer_pub_key,
-            )
-            .map_err(|e| format!("Response verification failed: {}", e));
+            let verification_result =
+                mldsa::verify(&response_data, &response, peer_sentinel.as_slice());
             if verification_result.is_ok() {
                 // ... rest of verification logic
                 Ok(())
@@ -2122,7 +2104,7 @@ struct HeaderState {
 struct VerificationState {
     timestamp: u64,
     verifiers: HashSet<String>,
-    dilithium_signatures: HashMap<String, Vec<u8>>,
+    mldsa_signatures: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -2134,7 +2116,7 @@ struct NetworkSyncState {
 pub struct HeaderSentinel {
     headers: Arc<RwLock<VecDeque<HeaderState>>>,
     verifications: Arc<DashMap<[u8; 32], VerificationState>>,
-    peer_dilithium_keys: Arc<DashMap<String, Vec<u8>>>,
+    peer_mldsa_keys: Arc<DashMap<String, Vec<u8>>>,
     sync_state: Arc<RwLock<NetworkSyncState>>,
     consensus_threshold: f64,
     max_headers: usize,
@@ -2186,31 +2168,22 @@ impl HeaderSentinel {
         if signature.is_empty() {
             return Ok(false);
         }
-        let detached_sig = DetachedSignature::from_bytes(signature)
-            .map_err(|e| format!("Invalid signature format: {}", e))?;
         let public_key_bytes = self
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .get(node_id)
             .map(|k| k.value().clone())
-            .ok_or_else(|| format!("No Dilithium key registered for node {}", node_id))?;
-        let pub_key = PublicKey::from_bytes(&public_key_bytes)
-            .map_err(|e| format!("Invalid public key format: {}", e))?;
-        Ok(pqcrypto_dilithium::dilithium5::verify_detached_signature(
-            &detached_sig,
-            payload,
-            &pub_key,
-        )
-        .is_ok())
+            .ok_or_else(|| format!("No ML-DSA key registered for node {}", node_id))?;
+        Ok(mldsa::verify(payload, signature, &public_key_bytes).is_ok())
     }
 
-    pub fn local_dilithium_public_key(&self) -> Vec<u8> {
+    pub fn local_mldsa_public_key(&self) -> Vec<u8> {
         self.public_key.clone()
     }
 
-    pub fn register_peer_dilithium_key(
+    pub fn register_peer_mldsa_key(
         &self,
         node_id: &str,
-        dilithium_public_key: Vec<u8>,
+        mldsa_public_key: Vec<u8>,
         ed25519_signature: Vec<u8>,
     ) -> Result<(), String> {
         if node_id.trim().is_empty() {
@@ -2226,48 +2199,47 @@ impl HeaderSentinel {
             return Err("Invalid Ed25519 public key length in node_id".to_string());
         }
 
-        let _dilithium = PublicKey::from_bytes(&dilithium_public_key)
-            .map_err(|e| format!("Invalid Dilithium public key bytes: {}", e))?;
+        mldsa::validate_public_key(&mldsa_public_key)?;
 
-        let payload = build_dilithium_binding_payload(node_id, &dilithium_public_key);
+        let payload = build_mldsa_binding_payload(node_id, &mldsa_public_key);
         let verifier = UnparsedPublicKey::new(&ED25519, &ed_pub);
         verifier
             .verify(&payload, &ed25519_signature)
             .map_err(|_| "Invalid Ed25519 attestation signature".to_string())?;
 
-        if let Some(existing) = self.peer_dilithium_keys.get(node_id) {
-            if existing.value().as_slice() != dilithium_public_key.as_slice() {
+        if let Some(existing) = self.peer_mldsa_keys.get(node_id) {
+            if existing.value().as_slice() != mldsa_public_key.as_slice() {
                 warn!(
-                    "Dilithium key rotated for node {} (updating attested key binding)",
+                    "ML-DSA key rotated for node {} (updating attested key binding)",
                     node_id
                 );
                 drop(existing);
-                self.peer_dilithium_keys
-                    .insert(node_id.to_string(), dilithium_public_key);
+                self.peer_mldsa_keys
+                    .insert(node_id.to_string(), mldsa_public_key);
                 return Ok(());
             }
             return Ok(());
         }
 
-        self.peer_dilithium_keys
-            .insert(node_id.to_string(), dilithium_public_key);
+        self.peer_mldsa_keys
+            .insert(node_id.to_string(), mldsa_public_key);
         Ok(())
     }
 
     pub fn new() -> Self {
-        let (public_key, secret_key) = dilithium_keypair();
+        let (public_key, secret_key) = mldsa::generate_keypair();
         Self {
             headers: Arc::new(RwLock::new(VecDeque::with_capacity(10000))),
             verifications: Arc::new(DashMap::new()),
-            peer_dilithium_keys: Arc::new(DashMap::new()),
+            peer_mldsa_keys: Arc::new(DashMap::new()),
             sync_state: Arc::new(RwLock::new(NetworkSyncState {
                 participating_nodes: HashSet::new(),
             })),
             consensus_threshold: 0.67,
             max_headers: 10000,
             sentinel: None,
-            public_key: public_key.as_bytes().to_vec(),
-            secret_key: secret_key.as_bytes().to_vec(),
+            public_key,
+            secret_key,
             node_sentinel: None,
             header_rules_version: HEADER_RULES_VERSION,
         }
@@ -2319,7 +2291,7 @@ impl HeaderSentinel {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let headers_payload = bincode::serialize(&headers)
+        let headers_payload = codec::serialize(&headers)
             .map_err(|e| format!("Headers serialization error: {}", e))?;
         let signature_valid =
             self.verify_signature_with_registered_node_key(&headers_payload, node_id, &signature)?;
@@ -2389,7 +2361,7 @@ impl HeaderSentinel {
                             VerificationState {
                                 timestamp: now,
                                 verifiers: HashSet::with_capacity(10),
-                                dilithium_signatures: HashMap::with_capacity(10),
+                                mldsa_signatures: HashMap::with_capacity(10),
                             }
                         });
 
@@ -2399,7 +2371,7 @@ impl HeaderSentinel {
                     }
                     if signature_valid {
                         verification
-                            .dilithium_signatures
+                            .mldsa_signatures
                             .insert(node_id.to_string(), signature.clone());
                     }
 
@@ -2438,7 +2410,7 @@ impl HeaderSentinel {
         };
 
         let participating = self.sync_state.read().await.participating_nodes.len();
-        let registered = self.peer_dilithium_keys.len();
+        let registered = self.peer_mldsa_keys.len();
         let eligible = participating.max(registered).max(1);
         let required = self.required_verifier_count(eligible);
         let actual = Self::external_verifier_count(&v.verifiers);
@@ -2448,7 +2420,7 @@ impl HeaderSentinel {
 
     pub async fn eligible_verifier_count(&self) -> usize {
         let participating = self.sync_state.read().await.participating_nodes.len();
-        let registered = self.peer_dilithium_keys.len();
+        let registered = self.peer_mldsa_keys.len();
         participating.max(registered).max(1)
     }
 
@@ -2581,7 +2553,7 @@ impl HeaderSentinel {
                     .or_insert_with(|| VerificationState {
                         timestamp: now,
                         verifiers: HashSet::new(),
-                        dilithium_signatures: HashMap::new(),
+                        mldsa_signatures: HashMap::new(),
                     });
             state.verifiers.insert(local_verifier);
         }
@@ -2593,7 +2565,7 @@ impl HeaderSentinel {
                 .or_insert_with(|| VerificationState {
                     timestamp: now,
                     verifiers: HashSet::new(),
-                    dilithium_signatures: HashMap::new(),
+                    mldsa_signatures: HashMap::new(),
                 })
                 .verifiers
                 .insert(node_id.clone());
@@ -2632,7 +2604,7 @@ impl HeaderSentinel {
             .unwrap_or_default()
             .as_secs();
         let header_payload =
-            bincode::serialize(&header).map_err(|e| format!("Serialization error: {}", e))?;
+            codec::serialize(&header).map_err(|e| format!("Serialization error: {}", e))?;
         let signature_valid =
             self.verify_signature_with_registered_node_key(&header_payload, node_id, &signature)?;
         if !signature_valid && self.signature_required() {
@@ -2666,14 +2638,14 @@ impl HeaderSentinel {
                 .or_insert_with(|| VerificationState {
                     timestamp: now,
                     verifiers: HashSet::with_capacity(10),
-                    dilithium_signatures: HashMap::with_capacity(10),
+                    mldsa_signatures: HashMap::with_capacity(10),
                 });
 
         // Add verification atomically
         verification.verifiers.insert(node_id.to_string());
         if signature_valid {
             verification
-                .dilithium_signatures
+                .mldsa_signatures
                 .insert(node_id.to_string(), signature);
         }
 
@@ -2712,51 +2684,25 @@ impl HeaderSentinel {
         signature: &[u8],
         public_key: &[u8],
     ) -> Result<bool, String> {
-        let detached_sig = DetachedSignature::from_bytes(signature)
-            .map_err(|e| format!("Invalid signature format: {}", e))?;
-        let pub_key = PublicKey::from_bytes(public_key)
-            .map_err(|e| format!("Invalid public key format: {}", e))?;
-
-        match pqcrypto_dilithium::dilithium5::verify_detached_signature(
-            &detached_sig,
-            data,
-            &pub_key,
-        ) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        Ok(mldsa::verify(data, signature, public_key).is_ok())
     }
 
     #[allow(dead_code)]
     async fn sign_single_header(&self, header: &BlockHeaderInfo) -> Result<Vec<u8>, String> {
         let header_bytes =
-            bincode::serialize(header).map_err(|e| format!("Serialization error: {}", e))?;
+            codec::serialize(header).map_err(|e| format!("Serialization error: {}", e))?;
 
-        let secret_key =
-            SecretKey::from_bytes(&self.secret_key).map_err(|e| format!("Invalid key: {}", e))?;
-
-        Ok(
-            pqcrypto_dilithium::dilithium5::detached_sign(&header_bytes, &secret_key)
-                .as_bytes()
-                .to_vec(),
-        )
+        mldsa::sign(&header_bytes, &self.secret_key)
     }
 
     // Add new method for signing multiple headers
     async fn sign_header(&self, headers: &[BlockHeaderInfo]) -> Result<Vec<u8>, String> {
         // Serialize all headers into a single byte array
-        let headers_bytes = bincode::serialize(headers)
-            .map_err(|e| format!("Headers serialization error: {}", e))?;
-
-        let secret_key =
-            SecretKey::from_bytes(&self.secret_key).map_err(|e| format!("Invalid key: {}", e))?;
+        let headers_bytes =
+            codec::serialize(headers).map_err(|e| format!("Headers serialization error: {}", e))?;
 
         // Sign the entire batch of headers
-        Ok(
-            pqcrypto_dilithium::dilithium5::detached_sign(&headers_bytes, &secret_key)
-                .as_bytes()
-                .to_vec(),
-        )
+        mldsa::sign(&headers_bytes, &self.secret_key)
     }
     pub async fn verify_chain_consistency(&self) -> Result<bool, String> {
         let headers = self.headers.read().await;
@@ -2783,7 +2729,7 @@ impl HeaderSentinel {
         signature: &[u8],
         node: &Arc<Node>,
     ) -> Result<(), String> {
-        node.advertise_dilithium_key(addr)
+        node.advertise_mldsa_key(addr)
             .await
             .map_err(|e| e.to_string())?;
         let message = NetworkMessage::HeaderSync {
@@ -2875,13 +2821,13 @@ mod tests {
     async fn header_quorum_enforcement_is_enabled_with_three_eligible_nodes() {
         let sentinel = HeaderSentinel::new();
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n1".to_string(), vec![1u8; 32]);
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n2".to_string(), vec![2u8; 32]);
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n3".to_string(), vec![3u8; 32]);
         assert!(sentinel.should_enforce_consensus_for_headers().await);
     }
@@ -2891,13 +2837,13 @@ mod tests {
         let sentinel = HeaderSentinel::new();
 
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n1".to_string(), vec![1u8; 32]);
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n2".to_string(), vec![2u8; 32]);
         sentinel
-            .peer_dilithium_keys
+            .peer_mldsa_keys
             .insert("n3".to_string(), vec![3u8; 32]);
 
         let conflicting_hash = [0xAA; 32];
@@ -2926,7 +2872,7 @@ mod tests {
                 verifiers: ["n1".to_string(), "n2".to_string(), "n3".to_string()]
                     .into_iter()
                     .collect(),
-                dilithium_signatures: HashMap::new(),
+                mldsa_signatures: HashMap::new(),
             },
         );
 

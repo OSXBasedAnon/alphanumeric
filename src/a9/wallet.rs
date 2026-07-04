@@ -3,12 +3,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{password_hash::SaltString, Argon2};
-use pqcrypto_dilithium::dilithium5::{
-    detached_sign, keypair as dilithium_keypair, DetachedSignature, PublicKey, SecretKey,
-};
-use pqcrypto_traits::sign::{
-    DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
-};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -16,10 +10,11 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const DILITHIUM5_SECRET_KEY_BYTES: usize = 4896;
-const DILITHIUM5_PUBLIC_KEY_BYTES: usize = 2592;
-const DILITHIUM5_COMBINED_KEY_BYTES: usize =
-    DILITHIUM5_SECRET_KEY_BYTES + DILITHIUM5_PUBLIC_KEY_BYTES;
+use crate::a9::mldsa;
+
+const MLDSA87_SECRET_KEY_BYTES: usize = mldsa::SECRET_KEY_BYTES;
+const MLDSA87_PUBLIC_KEY_BYTES: usize = mldsa::PUBLIC_KEY_BYTES;
+const MLDSA87_COMBINED_KEY_BYTES: usize = MLDSA87_SECRET_KEY_BYTES + MLDSA87_PUBLIC_KEY_BYTES;
 
 // Custom serializer for binary address
 fn serialize_address<S>(address_str: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -38,8 +33,8 @@ where
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WalletKeys {
-    dilithium_secret_key_bytes: Vec<u8>,
-    dilithium_public_key_bytes: Vec<u8>,
+    mldsa_secret_key_bytes: Vec<u8>,
+    mldsa_public_key_bytes: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -59,31 +54,31 @@ pub struct Wallet {
 
 impl Wallet {
     fn split_combined_key_bytes(combined_bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
-        if combined_bytes.len() < DILITHIUM5_COMBINED_KEY_BYTES {
+        if combined_bytes.len() < MLDSA87_COMBINED_KEY_BYTES {
             return Err(format!(
                 "Invalid key data: expected at least {} bytes (secret+public), got {}",
-                DILITHIUM5_COMBINED_KEY_BYTES,
+                MLDSA87_COMBINED_KEY_BYTES,
                 combined_bytes.len()
             ));
         }
 
-        let (secret_bytes, rest) = combined_bytes.split_at(DILITHIUM5_SECRET_KEY_BYTES);
+        let (secret_bytes, rest) = combined_bytes.split_at(MLDSA87_SECRET_KEY_BYTES);
 
-        if SecretKey::from_bytes(secret_bytes).is_err() {
-            return Err("Invalid key data: malformed Dilithium secret key".to_string());
+        if mldsa::validate_secret_key(secret_bytes).is_err() {
+            return Err("Invalid key data: malformed ML-DSA secret key".to_string());
         }
 
-        if rest.len() < DILITHIUM5_PUBLIC_KEY_BYTES {
+        if rest.len() < MLDSA87_PUBLIC_KEY_BYTES {
             return Err(format!(
                 "Invalid key data: expected {} public key bytes, got {}",
-                DILITHIUM5_PUBLIC_KEY_BYTES,
+                MLDSA87_PUBLIC_KEY_BYTES,
                 rest.len()
             ));
         }
 
-        let public_bytes = &rest[..DILITHIUM5_PUBLIC_KEY_BYTES];
-        if PublicKey::from_bytes(public_bytes).is_err() {
-            return Err("Invalid key data: malformed Dilithium public key".to_string());
+        let public_bytes = &rest[..MLDSA87_PUBLIC_KEY_BYTES];
+        if mldsa::validate_public_key(public_bytes).is_err() {
+            return Err("Invalid key data: malformed ML-DSA public key".to_string());
         }
 
         Ok((secret_bytes, public_bytes))
@@ -98,23 +93,22 @@ impl Wallet {
     }
 
     pub fn new(passphrase: Option<&[u8]>) -> Result<Self, String> {
-        // Generate dilithium keypair
-        let (public_key, secret_key) = dilithium_keypair();
+        let (public_key_bytes, secret_key_bytes) = mldsa::generate_keypair();
 
         // Create wallet address from public key
         let mut hasher = Sha256::new();
-        hasher.update(PqPublicKey::as_bytes(&public_key));
+        hasher.update(&public_key_bytes);
         let address = hex::encode(&hasher.finalize()[..20]);
         let wallet_name = format!("Wallet_{}", &address[0..6]);
 
         // Create combined key bytes with both secret and public
-        let mut combined_key_bytes = PqSecretKey::as_bytes(&secret_key).to_vec();
-        combined_key_bytes.extend(PqPublicKey::as_bytes(&public_key));
+        let mut combined_key_bytes = secret_key_bytes.clone();
+        combined_key_bytes.extend(&public_key_bytes);
 
         // Store the keypair
         let keys = WalletKeys {
-            dilithium_secret_key_bytes: PqSecretKey::as_bytes(&secret_key).to_vec(),
-            dilithium_public_key_bytes: PqPublicKey::as_bytes(&public_key).to_vec(),
+            mldsa_secret_key_bytes: secret_key_bytes,
+            mldsa_public_key_bytes: public_key_bytes,
         };
 
         // Handle encryption if needed
@@ -162,8 +156,8 @@ impl Wallet {
         }
 
         let keys = WalletKeys {
-            dilithium_secret_key_bytes: secret_bytes.to_vec(),
-            dilithium_public_key_bytes: public_bytes.to_vec(),
+            mldsa_secret_key_bytes: secret_bytes.to_vec(),
+            mldsa_public_key_bytes: public_bytes.to_vec(),
         };
 
         Ok(Self {
@@ -180,28 +174,13 @@ impl Wallet {
         signature: &[u8],
         public_key: &[u8],
     ) -> Result<bool, String> {
-        println!(
-            "Verifying dilithium: {},{}",
-            signature.len(),
-            public_key.len()
-        );
-
-        match (
-            DetachedSignature::from_bytes(signature),
-            PublicKey::from_bytes(public_key),
-        ) {
-            (Ok(sig), Ok(pub_key)) => {
-                match pqcrypto_dilithium::dilithium5::verify_detached_signature(
-                    &sig, message, &pub_key,
-                ) {
-                    Ok(_) => Ok(true),
-                    Err(e) => {
-                        println!("Verification error: {}", e);
-                        Ok(false)
-                    }
-                }
+        println!("Verifying ML-DSA: {},{}", signature.len(), public_key.len());
+        match mldsa::verify(message, signature, public_key) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                println!("Verification error: {}", e);
+                Ok(false)
             }
-            _ => Ok(false),
         }
     }
 
@@ -209,22 +188,18 @@ impl Wallet {
         let keypair = self.keypair.as_ref()?;
         let keypair = keypair.lock().await;
 
-        if let Ok(secret_key) = SecretKey::from_bytes(&keypair.dilithium_secret_key_bytes) {
-            let signature = detached_sign(transaction_data, &secret_key);
-            // Return hex encoded full signature
-            Some(hex::encode(PqDetachedSignature::as_bytes(&signature)))
-        } else {
-            None
-        }
+        mldsa::sign(transaction_data, &keypair.mldsa_secret_key_bytes)
+            .ok()
+            .map(hex::encode)
     }
 
     pub async fn get_public_key_hex(&self) -> Option<String> {
         let keypair = self.keypair.as_ref()?;
         let keypair = keypair.lock().await;
-        if keypair.dilithium_public_key_bytes.is_empty() {
+        if keypair.mldsa_public_key_bytes.is_empty() {
             return None;
         }
-        Some(hex::encode(&keypair.dilithium_public_key_bytes))
+        Some(hex::encode(&keypair.mldsa_public_key_bytes))
     }
 
     fn encrypt_private_key(private_key: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, String> {

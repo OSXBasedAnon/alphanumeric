@@ -110,7 +110,7 @@ The codebase includes multiple consensus/validation-related components (PoW/mini
 
 Transaction witnesses use a compact-finality model:
 
-- live mempool and new block admission require the full Dilithium signature and sender public key
+- live mempool and new block admission require the full ML-DSA signature and sender public key
 - confirmed block storage keeps a compact signature receipt plus `sig_hash = SHA256(full_signature)`
 - historical P2P sync validates block hash, merkle root, PoW, balances, reward rules, public-key/address binding, and receipt commitments without requiring archived full witnesses
 
