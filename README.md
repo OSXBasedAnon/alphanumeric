@@ -227,7 +227,6 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
 - `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP`
-- `ALPHANUMERIC_BOOTSTRAP_PUBLISH_TOKEN` (optional: enables bootstrap publishing + the `push` command for the canonical publisher node)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND` (default `127.0.0.1`; set `0.0.0.0` only when the stats API should be public)
@@ -256,6 +255,8 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_ENABLE_UPNP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`
 - `ALPHANUMERIC_TX_WITNESS_CACHE_SIZE`
+
+Bootstrap publishing is maintainer infrastructure, not part of normal macOS node setup. Operator-level details are kept in [docs/BOOTSTRAP_PUBLISHER.md](docs/BOOTSTRAP_PUBLISHER.md).
 
 ## CLI Surface
 
