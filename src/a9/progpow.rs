@@ -619,7 +619,6 @@ impl Miner {
         header: &mut BlockHeader,
         transactions: &[ProgPowTransaction],
         max_nonce: u64,
-        _max_time: u64,
         miner_address: String,
         reward_amount: f64,
     ) -> Result<(u64, String, Block), MiningError> {

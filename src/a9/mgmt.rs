@@ -659,7 +659,6 @@ impl Mgmt {
                 &mut header,
                 &progpow_transactions,
                 MINING_NONCE_WINDOW,
-                9001,
                 miner_wallet.address.clone(),
                 mining_reward,
             )
