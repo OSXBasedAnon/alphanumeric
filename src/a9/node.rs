@@ -5723,7 +5723,7 @@ impl Node {
 
                     // Broadcast block to peers
                     let peers = self.peers.read().await;
-                    let selected_peers = self.select_broadcast_peers(&peers, peers.len() / 2);
+                    let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
                     drop(peers);
 
                     if let Err(e) = self
