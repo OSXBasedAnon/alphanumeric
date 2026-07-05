@@ -2526,23 +2526,21 @@ impl Node {
         if selected_peers.is_empty() {
             warn!("Mined block saved locally, but no peers were available for block broadcast");
         } else {
-            let mut delivered = 0usize;
-            for addr in selected_peers {
-                match self
-                    .send_message(addr, &NetworkMessage::Block(block.clone()))
-                    .await
-                {
-                    Ok(()) => delivered += 1,
-                    Err(e) => warn!("Failed to publish mined block to {}: {}", addr, e),
+            match self
+                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                .await
+            {
+                Ok(0) => warn!("Mined block broadcast had no eligible target peers"),
+                Ok(delivered) => {
+                    info!(
+                        "Published mined block #{} to {} peer(s)",
+                        block.index, delivered
+                    );
                 }
-            }
-            if delivered == 0 {
-                warn!("Mined block broadcast failed for every selected peer");
-            } else {
-                info!(
-                    "Published mined block #{} to {} peer(s)",
-                    block.index, delivered
-                );
+                Err(e) => warn!(
+                    "Mined block broadcast failed for every selected peer: {}",
+                    e
+                ),
             }
         }
 
@@ -5420,11 +5418,16 @@ impl Node {
 
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
-                        let peers = self.peers.read().await;
-                        let peer_map: std::collections::HashMap<SocketAddr, PeerInfo> = peers
-                            .iter()
-                            .map(|(&addr, info)| (addr, info.clone()))
-                            .collect();
+                        let (peer_map, selected_peers) = {
+                            let peers = self.peers.read().await;
+                            let peer_map: std::collections::HashMap<SocketAddr, PeerInfo> = peers
+                                .iter()
+                                .map(|(&addr, info)| (addr, info.clone()))
+                                .collect();
+                            let selected_peers =
+                                self.select_broadcast_peers(&peers, peers.len().min(16));
+                            (peer_map, selected_peers)
+                        };
 
                         // Try velocity protocol first for efficient block propagation
                         if let Err(e) = velocity.process_block(&block, &peer_map).await {
@@ -5434,15 +5437,11 @@ impl Node {
                             );
 
                             // Fallback to traditional broadcast
-                            let selected_peers =
-                                self.select_broadcast_peers(&peers, peers.len().min(16));
-                            for &addr in &selected_peers {
-                                if let Err(e) = self
-                                    .send_message(addr, &NetworkMessage::Block(block.clone()))
-                                    .await
-                                {
-                                    warn!("Failed to broadcast block to {}: {}", addr, e);
-                                }
+                            if let Err(e) = self
+                                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                                .await
+                            {
+                                warn!("Failed to broadcast block to selected peers: {}", e);
                             }
                         }
                     } else {
@@ -5450,13 +5449,12 @@ impl Node {
                         let peers = self.peers.read().await;
                         let selected_peers =
                             self.select_broadcast_peers(&peers, peers.len().min(16));
-                        for &addr in &selected_peers {
-                            if let Err(e) = self
-                                .send_message(addr, &NetworkMessage::Block(block.clone()))
-                                .await
-                            {
-                                warn!("Failed to broadcast block to {}: {}", addr, e);
-                            }
+                        drop(peers);
+                        if let Err(e) = self
+                            .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                            .await
+                        {
+                            warn!("Failed to broadcast block to selected peers: {}", e);
                         }
                     }
                 }
@@ -5728,18 +5726,11 @@ impl Node {
                     let selected_peers = self.select_broadcast_peers(&peers, peers.len() / 2);
                     drop(peers);
 
-                    for peer_addr in selected_peers {
-                        if peer_addr != addr {
-                            if let Err(e) = self
-                                .send_message(
-                                    peer_addr,
-                                    &NetworkMessage::Block((*block_ref).clone()),
-                                )
-                                .await
-                            {
-                                warn!("Failed to propagate block to {}: {}", peer_addr, e);
-                            }
-                        }
+                    if let Err(e) = self
+                        .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers)
+                        .await
+                    {
+                        warn!("Failed to propagate block to selected peers: {}", e);
                     }
                 }
             }
@@ -6019,6 +6010,61 @@ impl Node {
             Err(first_error)
         } else {
             Ok(())
+        }
+    }
+
+    async fn broadcast_block(
+        &self,
+        block: Arc<Block>,
+        source: Option<SocketAddr>,
+        peers: Vec<SocketAddr>,
+    ) -> Result<usize, NodeError> {
+        let targets: Vec<_> = peers
+            .into_iter()
+            .filter(|addr| Some(*addr) != source)
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        const MAX_CONCURRENT: usize = 10;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+
+        let broadcast_futures = targets.into_iter().map(|peer| {
+            let block = Arc::clone(&block);
+            let permit = semaphore.clone().acquire_owned();
+            let node = self.clone();
+
+            async move {
+                let result = async {
+                    let _permit = permit.await.map_err(|e| {
+                        NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
+                    })?;
+                    node.send_message(peer, &NetworkMessage::Block((*block).clone()))
+                        .await
+                }
+                .await;
+                (peer, result)
+            }
+        });
+
+        let results: Vec<(SocketAddr, Result<(), NodeError>)> =
+            futures::future::join_all(broadcast_futures).await;
+        let delivered = results.iter().filter(|(_, result)| result.is_ok()).count();
+        for (peer, result) in &results {
+            if let Err(e) = result {
+                warn!("Failed to broadcast block to {}: {}", peer, e);
+            }
+        }
+
+        if delivered > 0 {
+            Ok(delivered)
+        } else if let Some((_, Err(first_error))) =
+            results.into_iter().find(|(_, result)| result.is_err())
+        {
+            Err(first_error)
+        } else {
+            Ok(0)
         }
     }
 
