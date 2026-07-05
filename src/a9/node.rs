@@ -87,6 +87,8 @@ const DEFAULT_DNS_SEEDS: &[&str] = &[
 ];
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
+const INBOUND_ATTEMPT_MAX_KEYS: usize = 10_000;
+const PEER_FAILURE_MAX_KEYS: usize = 10_000;
 
 // Protocol
 const NETWORK_VERSION: u32 = 3;
@@ -2291,27 +2293,37 @@ impl Node {
                 break;
             }
 
-            let blockchain = self.blockchain.write().await;
-            let before_batch = blockchain.get_latest_block_index() as u32;
+            let before_batch = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
             let mut relay_confirmed_blocks = Vec::new();
 
             for block in blocks {
-                let before = blockchain.get_latest_block_index() as u32;
-                match blockchain.save_receipt_verified_block(&block).await {
-                    Ok(()) => {
+                let save_result = {
+                    let blockchain = self.blockchain.write().await;
+                    let before = blockchain.get_latest_block_index() as u32;
+                    let result = blockchain.save_receipt_verified_block(&block).await;
+                    let after = blockchain.get_latest_block_index() as u32;
+                    (result, before, after)
+                };
+
+                match save_result {
+                    (Ok(()), before, after) => {
                         relay_confirmed_blocks.push(block.clone());
                         accepted_any = true;
-                        let after = blockchain.get_latest_block_index() as u32;
                         if after > before {
                             total_saved += after.saturating_sub(before) as usize;
                         }
                     }
-                    Err(e) => warn!("Failed to save relayed block {}: {}", block.index, e),
+                    (Err(e), _, _) => warn!("Failed to save relayed block {}: {}", block.index, e),
                 }
             }
 
-            let after_batch = blockchain.get_latest_block_index() as u32;
-            drop(blockchain);
+            let after_batch = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
             for block in relay_confirmed_blocks {
                 self.mark_block_relayed(&block).await;
             }
@@ -3733,6 +3745,7 @@ impl Node {
                     warn!("Peer maintenance error: {}", e);
                 }
                 node_clone.cleanup_outbound_connections().await;
+                node_clone.prune_runtime_maps().await;
                 node_clone.prune_validation_cache();
             }
         });
@@ -4426,6 +4439,45 @@ impl Node {
     async fn reset_peer_failures(&self, addr: SocketAddr) {
         let mut failures = self.peer_failures.write().await;
         failures.remove(&addr);
+    }
+
+    async fn prune_runtime_maps(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        {
+            let mut attempts = self.inbound_attempts.write().await;
+            attempts.retain(|_, (_, last_seen)| {
+                now.saturating_sub(*last_seen) <= INBOUND_ATTEMPT_WINDOW
+            });
+            if attempts.len() > INBOUND_ATTEMPT_MAX_KEYS {
+                let overflow = attempts.len().saturating_sub(INBOUND_ATTEMPT_MAX_KEYS);
+                let mut oldest: Vec<(IpAddr, u64)> = attempts
+                    .iter()
+                    .map(|(ip, (_, last_seen))| (*ip, *last_seen))
+                    .collect();
+                oldest.sort_unstable_by_key(|(_, last_seen)| *last_seen);
+                for (ip, _) in oldest.into_iter().take(overflow) {
+                    attempts.remove(&ip);
+                }
+            }
+        }
+
+        let active_peers: HashSet<SocketAddr> = {
+            let peers = self.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        let mut failures = self.peer_failures.write().await;
+        failures.retain(|addr, _| active_peers.contains(addr));
+        if failures.len() > PEER_FAILURE_MAX_KEYS {
+            let overflow = failures.len().saturating_sub(PEER_FAILURE_MAX_KEYS);
+            let remove: Vec<SocketAddr> = failures.keys().copied().take(overflow).collect();
+            for addr in remove {
+                failures.remove(&addr);
+            }
+        }
     }
 
     pub async fn request_blocks(
@@ -6729,20 +6781,26 @@ impl Node {
 
                             let actual_count = candidate_blocks.len();
                             if actual_count > 0 {
-                                let blockchain = self.blockchain.write().await;
                                 let mut saved_count = 0;
 
                                 for block in candidate_blocks {
-                                    let before = blockchain.get_latest_block_index() as u32;
-                                    match blockchain.save_receipt_verified_block(&block).await {
-                                        Ok(()) => {
-                                            let after = blockchain.get_latest_block_index() as u32;
+                                    let save_result = {
+                                        let blockchain = self.blockchain.write().await;
+                                        let before = blockchain.get_latest_block_index() as u32;
+                                        let result =
+                                            blockchain.save_receipt_verified_block(&block).await;
+                                        let after = blockchain.get_latest_block_index() as u32;
+                                        (result, before, after)
+                                    };
+
+                                    match save_result {
+                                        (Ok(()), before, after) => {
                                             if after > before {
                                                 saved_count += after.saturating_sub(before);
                                                 current_sync_height = after;
                                             }
                                         }
-                                        Err(e) => {
+                                        (Err(e), _, _) => {
                                             warn!("Failed to save block {}: {}", block.index, e)
                                         }
                                     }
