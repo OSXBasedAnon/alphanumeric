@@ -1261,6 +1261,24 @@ impl Node {
             && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC")
     }
 
+    fn kademlia_fallback_enabled() -> bool {
+        std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn is_expected_startup_sync_gap(error: &NodeError) -> bool {
+        match error {
+            NodeError::Network(message) => {
+                message.contains("No peers available")
+                    || message.contains("No peers reported their height")
+                    || message.contains("No suitable peers for sync")
+                    || message.contains("Block relay sync disabled")
+            }
+            _ => false,
+        }
+    }
+
     fn parse_seed_list(value: &str) -> Vec<String> {
         value
             .split(',')
@@ -2802,9 +2820,7 @@ impl Node {
         let enable_dns_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_DNS_FALLBACK")
             .map(|v| !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let enable_kad_fallback = std::env::var("ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let enable_kad_fallback = Self::kademlia_fallback_enabled();
         let enable_aggressive_discovery = std::env::var("ALPHANUMERIC_ENABLE_AGGRESSIVE_DISCOVERY")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -3674,8 +3690,11 @@ impl Node {
     pub async fn start(&self) -> Result<(), NodeError> {
         info!("Starting node on {}", self.bind_addr);
 
-        // Initialize P2P services
-        self.initialize_p2p().await?;
+        if Self::kademlia_fallback_enabled() {
+            self.initialize_p2p().await?;
+        } else {
+            debug!("Kademlia discovery fallback disabled; skipping libp2p swarm startup");
+        }
 
         // Start stats API (optional)
         if std::env::var("ALPHANUMERIC_STATS_ENABLED")
@@ -3767,7 +3786,7 @@ impl Node {
                 }
             });
         } else {
-            warn!("No listener configured - node will not accept incoming connections");
+            info!("No listener configured - node will not accept incoming connections");
         }
 
         // Start network maintenance in the background
@@ -3913,7 +3932,11 @@ impl Node {
         tokio::spawn(async move {
             sleep(Duration::from_secs(5)).await; // Small delay to let connections establish
             if let Err(e) = node_clone.sync_with_network().await {
-                warn!("Initial sync failed: {}", e);
+                if Node::is_expected_startup_sync_gap(&e) {
+                    debug!("Initial sync deferred: {}", e);
+                } else {
+                    warn!("Initial sync failed: {}", e);
+                }
             }
             if let Err(e) = node_clone.publish_local_tip().await {
                 warn!("Initial post-sync publish failed: {}", e);
@@ -6801,7 +6824,7 @@ impl Node {
 
             info!("Syncing from height {} to {}", current_height, best_height);
         } else {
-            warn!("No peers reported their height");
+            debug!("No peers reported their height");
             return self
                 .sync_with_block_relay(current_height)
                 .await
