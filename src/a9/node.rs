@@ -1267,6 +1267,10 @@ impl Node {
             .unwrap_or(false)
     }
 
+    fn private_discovery_peers_allowed() -> bool {
+        Self::env_flag_enabled("ALPHANUMERIC_ALLOW_PRIVATE_PEERS")
+    }
+
     fn stats_server_explicitly_enabled() -> bool {
         std::env::var("ALPHANUMERIC_STATS_ENABLED")
             .map(|v| !v.eq_ignore_ascii_case("false"))
@@ -1620,9 +1624,52 @@ impl Node {
         }
     }
 
+    fn is_dialable_discovery_addr(addr: &SocketAddr, allow_private: bool) -> bool {
+        if addr.port() == 0 {
+            return false;
+        }
+
+        if allow_private {
+            return !addr.ip().is_unspecified();
+        }
+
+        match addr.ip() {
+            IpAddr::V4(ip) => {
+                let octets = ip.octets();
+                let is_shared_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+                let is_benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
+                let is_protocol_assignment = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+                !(ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_multicast()
+                    || ip.is_documentation()
+                    || is_shared_cgnat
+                    || is_benchmark
+                    || is_protocol_assignment
+                    || octets[0] >= 240)
+            }
+            IpAddr::V6(ip) => {
+                let segments = ip.segments();
+                let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+                let is_unicast_link_local = (segments[0] & 0xffc0) == 0xfe80;
+                !(ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_multicast()
+                    || is_documentation
+                    || is_unicast_link_local)
+            }
+        }
+    }
+
     async fn fetch_discovery_peers(&self) -> Result<Vec<SocketAddr>, NodeError> {
         let mut all_addrs = Vec::new();
+        let mut seen_addrs = HashSet::new();
         let mut any_ok = false;
+        let allow_private = Self::private_discovery_peers_allowed();
         let peer_limit = self.max_peers.saturating_mul(4).max(32);
 
         for url in Self::discovery_peers_urls() {
@@ -1655,6 +1702,13 @@ impl Node {
                 if let Ok(ip) = peer.ip.parse::<IpAddr>() {
                     let addr = SocketAddr::new(ip, peer.port);
                     if addr == self.bind_addr {
+                        continue;
+                    }
+                    if !Self::is_dialable_discovery_addr(&addr, allow_private) {
+                        debug!("Ignoring non-routable discovery peer {}", addr);
+                        continue;
+                    }
+                    if !seen_addrs.insert(addr) {
                         continue;
                     }
                     all_addrs.push(addr);
@@ -1693,6 +1747,16 @@ impl Node {
                 fallback_addrs
             }
         };
+        let allow_private = Self::private_discovery_peers_allowed();
+        let mut seen_addrs = HashSet::new();
+        addrs.retain(|addr| {
+            *addr != self.bind_addr
+                && Self::is_dialable_discovery_addr(addr, allow_private)
+                && seen_addrs.insert(*addr)
+        });
+        if addrs.is_empty() {
+            return Err(NodeError::Network("No dialable discovery peers".into()));
+        }
         addrs.shuffle(&mut thread_rng());
 
         let attempts: Vec<_> = addrs
@@ -7412,6 +7476,68 @@ mod tests {
             SocketAddr::from(([192, 0, 2, 1], 7242))
         );
         assert!(Node::peer_listen_addr(socket_addr, 0).is_err());
+    }
+
+    #[test]
+    fn discovery_peer_filter_rejects_non_routable_addresses_by_default() {
+        let blocked = [
+            "0.0.0.0:7177",
+            "10.0.0.1:7177",
+            "100.64.0.1:7177",
+            "127.0.0.1:7177",
+            "169.254.1.1:7177",
+            "172.16.0.1:7177",
+            "192.168.1.10:7177",
+            "192.0.2.1:7177",
+            "198.18.0.1:7177",
+            "203.0.113.1:7177",
+            "224.0.0.1:7177",
+            "240.0.0.1:7177",
+            "[::]:7177",
+            "[::1]:7177",
+            "[fc00::1]:7177",
+            "[fe80::1]:7177",
+            "[2001:db8::1]:7177",
+            "8.8.8.8:0",
+        ];
+
+        for addr in blocked {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert!(
+                !Node::is_dialable_discovery_addr(&addr, false),
+                "{addr} should not be accepted from public discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_peer_filter_allows_public_addresses_by_default() {
+        let allowed = [
+            "1.1.1.1:7177",
+            "8.8.8.8:7177",
+            "[2606:4700:4700::1111]:7177",
+        ];
+
+        for addr in allowed {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert!(
+                Node::is_dialable_discovery_addr(&addr, false),
+                "{addr} should be accepted from public discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_peer_filter_allows_private_addresses_only_when_explicit() {
+        let private_addr: SocketAddr = "10.0.0.2:7177".parse().unwrap();
+        let loopback_addr: SocketAddr = "127.0.0.1:7177".parse().unwrap();
+        let unspecified_addr: SocketAddr = "0.0.0.0:7177".parse().unwrap();
+
+        assert!(!Node::is_dialable_discovery_addr(&private_addr, false));
+        assert!(!Node::is_dialable_discovery_addr(&loopback_addr, false));
+        assert!(Node::is_dialable_discovery_addr(&private_addr, true));
+        assert!(Node::is_dialable_discovery_addr(&loopback_addr, true));
+        assert!(!Node::is_dialable_discovery_addr(&unspecified_addr, true));
     }
 
     #[test]

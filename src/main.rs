@@ -43,6 +43,9 @@ const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
+const DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024;
+const MAX_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
@@ -2797,6 +2800,29 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn bootstrap_zip_size_limit_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_MAX_BOOTSTRAP_ZIP_BYTES, MAX_MAX_BOOTSTRAP_ZIP_BYTES))
+        .unwrap_or(DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES)
+}
+
+fn bootstrap_zip_size_limit_bytes() -> u64 {
+    let value = std::env::var("ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES").ok();
+    bootstrap_zip_size_limit_from_env_value(value.as_deref())
+}
+
+fn ensure_bootstrap_zip_size(size: u64, limit: u64, context: &str) -> Result<()> {
+    if size > limit {
+        return Err(format!(
+            "Bootstrap download too large: {} is {} bytes, limit is {} bytes",
+            context, size, limit
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "bootstrap_publisher")]
 fn env_u64_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -2934,10 +2960,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         return Err(format!("Bootstrap download failed: {}", res.status()).into());
     }
 
+    let bootstrap_zip_size_limit = bootstrap_zip_size_limit_bytes();
+    if let Some(content_length) = res.content_length() {
+        ensure_bootstrap_zip_size(
+            content_length,
+            bootstrap_zip_size_limit,
+            "advertised content length",
+        )?;
+    }
+
     let bytes = res
         .bytes()
         .await
         .map_err(|e| format!("Bootstrap download body read failed: {}", e))?;
+    let downloaded_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    ensure_bootstrap_zip_size(downloaded_size, bootstrap_zip_size_limit, "downloaded body")?;
 
     // Verified manifests must provide SHA-256. The only no-hash path is the
     // explicit unsafe fallback for local/dev recovery.
@@ -3690,6 +3727,42 @@ mod tests {
         let sig = signing.sign(&payload);
         manifest.manifest_sig = hex::encode(sig.to_bytes());
         manifest
+    }
+
+    #[test]
+    fn bootstrap_zip_limit_env_value_is_clamped() {
+        assert_eq!(
+            bootstrap_zip_size_limit_from_env_value(None),
+            DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES
+        );
+        assert_eq!(
+            bootstrap_zip_size_limit_from_env_value(Some("not-a-number")),
+            DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES
+        );
+        assert_eq!(
+            bootstrap_zip_size_limit_from_env_value(Some("1")),
+            MIN_MAX_BOOTSTRAP_ZIP_BYTES
+        );
+        assert_eq!(
+            bootstrap_zip_size_limit_from_env_value(Some("2097152")),
+            2_097_152
+        );
+        let over_max = (MAX_MAX_BOOTSTRAP_ZIP_BYTES + 1).to_string();
+        assert_eq!(
+            bootstrap_zip_size_limit_from_env_value(Some(over_max.as_str())),
+            MAX_MAX_BOOTSTRAP_ZIP_BYTES
+        );
+    }
+
+    #[test]
+    fn bootstrap_zip_size_rejects_oversized_downloads() {
+        assert!(ensure_bootstrap_zip_size(10, 10, "test body").is_ok());
+        let err = ensure_bootstrap_zip_size(11, 10, "test body")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("too large"));
+        assert!(err.contains("test body"));
     }
 
     #[test]

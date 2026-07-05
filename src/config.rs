@@ -1,6 +1,17 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr};
 
+const MIN_CONFIGURED_PEERS: usize = 3;
+const MAX_CONFIGURED_PEERS: usize = 512;
+const MIN_CONFIGURED_CONNECTIONS: usize = 10;
+const MAX_CONFIGURED_CONNECTIONS: usize = 4096;
+const MIN_SHRED_SIZE: usize = 1024;
+const MAX_SHRED_SIZE: usize = 1024 * 1024;
+const MIN_ERASURE_SHARDS: usize = 1;
+const MAX_ERASURE_SHARDS: usize = 128;
+const MAX_ERASURE_PARITY: usize = 128;
+const MAX_ERASURE_TOTAL_SHARDS: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub port: u16,
@@ -35,6 +46,30 @@ impl Default for NetworkConfig {
 }
 
 impl NetworkConfig {
+    fn clamp_usize(value: usize, min: usize, max: usize) -> usize {
+        value.max(min).min(max)
+    }
+
+    fn normalize_runtime_limits(&mut self) {
+        self.max_peers =
+            Self::clamp_usize(self.max_peers, MIN_CONFIGURED_PEERS, MAX_CONFIGURED_PEERS);
+        self.max_connections = Self::clamp_usize(
+            self.max_connections,
+            self.max_peers.max(MIN_CONFIGURED_CONNECTIONS),
+            MAX_CONFIGURED_CONNECTIONS,
+        );
+        self.max_shred_size =
+            Self::clamp_usize(self.max_shred_size, MIN_SHRED_SIZE, MAX_SHRED_SIZE);
+        self.erasure_shards =
+            Self::clamp_usize(self.erasure_shards, MIN_ERASURE_SHARDS, MAX_ERASURE_SHARDS);
+        self.erasure_parity = self.erasure_parity.min(MAX_ERASURE_PARITY);
+
+        let total_erasure_shards = self.erasure_shards.saturating_add(self.erasure_parity);
+        if total_erasure_shards > MAX_ERASURE_TOTAL_SHARDS {
+            self.erasure_parity = MAX_ERASURE_TOTAL_SHARDS.saturating_sub(self.erasure_shards);
+        }
+    }
+
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
@@ -52,13 +87,18 @@ impl NetworkConfig {
 
         if let Ok(max_peers) = env::var("ALPHANUMERIC_MAX_PEERS") {
             if let Ok(max_peers) = max_peers.parse::<usize>() {
-                config.max_peers = max_peers;
+                config.max_peers =
+                    Self::clamp_usize(max_peers, MIN_CONFIGURED_PEERS, MAX_CONFIGURED_PEERS);
             }
         }
 
         if let Ok(max_connections) = env::var("ALPHANUMERIC_MAX_CONNECTIONS") {
             if let Ok(max_connections) = max_connections.parse::<usize>() {
-                config.max_connections = max_connections;
+                config.max_connections = Self::clamp_usize(
+                    max_connections,
+                    MIN_CONFIGURED_CONNECTIONS,
+                    MAX_CONFIGURED_CONNECTIONS,
+                );
             }
         }
 
@@ -78,22 +118,24 @@ impl NetworkConfig {
 
         if let Ok(max_shred_size) = env::var("ALPHANUMERIC_MAX_SHRED_SIZE") {
             if let Ok(size) = max_shred_size.parse::<usize>() {
-                config.max_shred_size = size;
+                config.max_shred_size = Self::clamp_usize(size, MIN_SHRED_SIZE, MAX_SHRED_SIZE);
             }
         }
 
         if let Ok(erasure_shards) = env::var("ALPHANUMERIC_ERASURE_SHARDS") {
             if let Ok(shards) = erasure_shards.parse::<usize>() {
-                config.erasure_shards = shards;
+                config.erasure_shards =
+                    Self::clamp_usize(shards, MIN_ERASURE_SHARDS, MAX_ERASURE_SHARDS);
             }
         }
 
         if let Ok(erasure_parity) = env::var("ALPHANUMERIC_ERASURE_PARITY") {
             if let Ok(parity) = erasure_parity.parse::<usize>() {
-                config.erasure_parity = parity;
+                config.erasure_parity = parity.min(MAX_ERASURE_PARITY);
             }
         }
 
+        config.normalize_runtime_limits();
         config
     }
 }
@@ -156,5 +198,68 @@ impl AppConfig {
             self.network.seed_nodes.len(),
             self.database.path
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_config_clamps_peer_and_connection_limits() {
+        let mut config = NetworkConfig {
+            max_peers: 0,
+            max_connections: 0,
+            ..Default::default()
+        };
+        config.normalize_runtime_limits();
+        assert_eq!(config.max_peers, MIN_CONFIGURED_PEERS);
+        assert_eq!(config.max_connections, MIN_CONFIGURED_CONNECTIONS);
+
+        let mut config = NetworkConfig {
+            max_peers: usize::MAX,
+            max_connections: usize::MAX,
+            ..Default::default()
+        };
+        config.normalize_runtime_limits();
+        assert_eq!(config.max_peers, MAX_CONFIGURED_PEERS);
+        assert_eq!(config.max_connections, MAX_CONFIGURED_CONNECTIONS);
+    }
+
+    #[test]
+    fn network_config_connections_never_fall_below_peer_limit() {
+        let mut config = NetworkConfig {
+            max_peers: 400,
+            max_connections: 20,
+            ..Default::default()
+        };
+        config.normalize_runtime_limits();
+        assert_eq!(config.max_peers, 400);
+        assert_eq!(config.max_connections, 400);
+    }
+
+    #[test]
+    fn network_config_clamps_shred_and_erasure_limits() {
+        let mut config = NetworkConfig {
+            max_shred_size: 1,
+            erasure_shards: 0,
+            erasure_parity: usize::MAX,
+            ..Default::default()
+        };
+        config.normalize_runtime_limits();
+        assert_eq!(config.max_shred_size, MIN_SHRED_SIZE);
+        assert_eq!(config.erasure_shards, MIN_ERASURE_SHARDS);
+        assert_eq!(config.erasure_parity, MAX_ERASURE_PARITY);
+
+        let mut config = NetworkConfig {
+            max_shred_size: usize::MAX,
+            erasure_shards: usize::MAX,
+            erasure_parity: usize::MAX,
+            ..Default::default()
+        };
+        config.normalize_runtime_limits();
+        assert_eq!(config.max_shred_size, MAX_SHRED_SIZE);
+        assert_eq!(config.erasure_shards, MAX_ERASURE_SHARDS);
+        assert_eq!(config.erasure_parity, MAX_ERASURE_PARITY);
     }
 }
