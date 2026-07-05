@@ -232,13 +232,26 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND` (default `127.0.0.1`; set `0.0.0.0` only when the stats API should be public)
 - `ALPHANUMERIC_STATS_PORT`
-- `ALPHANUMERIC_SEED_NODES`
+- `ALPHANUMERIC_SEED_NODES` or `ALPHANUMERIC_BOOTSTRAP_PEERS` (comma-separated `host:port` peers tried before relying on gateway fallback)
 - `ALPHANUMERIC_DNS_SEEDS`
 - `ALPHANUMERIC_DISCOVERY_BASE`
 - `ALPHANUMERIC_DISCOVERY_BASES`
 - `ALPHANUMERIC_DISCOVERY_URL`
 - `ALPHANUMERIC_ANNOUNCE_URL`
 - `ALPHANUMERIC_HEADERS_URL`
+- `ALPHANUMERIC_ANNOUNCE_INTERVAL_SECS` (default `300`, minimum `60`)
+- `ALPHANUMERIC_ENABLE_HEADER_SNAPSHOTS` (default off; enable on trusted publisher/validator nodes only)
+- `ALPHANUMERIC_HEADER_SNAPSHOT_INTERVAL_SECS` (default `300`, minimum `60`)
+- `ALPHANUMERIC_ENABLE_STATS_SNAPSHOTS` (default off; enable on trusted publisher/validator nodes only)
+- `ALPHANUMERIC_STATS_SNAPSHOT_INTERVAL_SECS` (default `300`, minimum `60`)
+- `ALPHANUMERIC_ENABLE_BLOCK_RELAY` (default off; HTTP block relay publishing is fallback telemetry, not normal block sync)
+- `ALPHANUMERIC_ENABLE_BLOCK_RELAY_SYNC` (default off; opt in to HTTP block relay sync fallback)
+- `ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC` (force-disable HTTP relay fallback entirely)
+- `ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC` (opt in to background HTTP relay sync; off by default)
+- `ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS` (optional periodic relay sync interval; `0` disables, minimum `60`)
+- `ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH` (default `0`; opt-in relay backfill depth, max `256`)
+- `ALPHANUMERIC_RELAY_SYNC_MAX_ROUNDS` (default `4`, max `24`)
+- `ALPHANUMERIC_ENFORCE_GATEWAY_TIP_BEFORE_MINING` (default off; opt in if an isolated miner should pause when gateway status is ahead)
 - `ALPHANUMERIC_PUBLIC_IP`
 - `ALPHANUMERIC_ENABLE_UPNP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`

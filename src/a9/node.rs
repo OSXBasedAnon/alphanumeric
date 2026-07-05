@@ -71,9 +71,10 @@ const SUBNET_MASK_IPV6: u8 = 64; // /64 subnet
 // Timeouts and intervals
 const PEER_TIMEOUT: u64 = 300; // seconds
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
-const ANNOUNCE_INTERVAL: u64 = 60; // seconds
-const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
-const DEFAULT_RELAY_SYNC_INTERVAL_SECS: u64 = 3;
+const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
+const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 300;
+const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
+const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 300;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
 const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
@@ -745,6 +746,9 @@ pub struct Node {
     http_client: Client,
     discovery_state: Arc<Mutex<DiscoveryState>>,
     public_relay_tip: Arc<RwLock<Option<RelayTipState>>>,
+    last_public_announce_at: Arc<AtomicU64>,
+    last_header_snapshot_at: Arc<AtomicU64>,
+    last_stats_snapshot_at: Arc<AtomicU64>,
     p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
     pub peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
@@ -998,6 +1002,9 @@ impl Node {
             http_client,
             discovery_state: Arc::new(Mutex::new(DiscoveryState::new())),
             public_relay_tip: Arc::new(RwLock::new(None)),
+            last_public_announce_at: Arc::new(AtomicU64::new(0)),
+            last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
+            last_stats_snapshot_at: Arc::new(AtomicU64::new(0)),
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             temporal_verification,
@@ -1230,31 +1237,56 @@ impl Node {
             && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_PUBLIC_ANNOUNCE")
     }
 
+    fn public_header_snapshots_enabled() -> bool {
+        Self::public_discovery_publish_enabled()
+            && Self::env_flag_enabled("ALPHANUMERIC_ENABLE_HEADER_SNAPSHOTS")
+    }
+
+    fn public_stats_snapshots_enabled() -> bool {
+        Self::public_discovery_publish_enabled()
+            && Self::env_flag_enabled("ALPHANUMERIC_ENABLE_STATS_SNAPSHOTS")
+    }
+
     fn block_relay_publish_enabled() -> bool {
         Self::public_discovery_publish_enabled()
+            && Self::env_flag_enabled("ALPHANUMERIC_ENABLE_BLOCK_RELAY")
             && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY")
     }
 
     fn block_relay_sync_enabled() -> bool {
-        !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC")
+        (Self::env_flag_enabled("ALPHANUMERIC_ENABLE_BLOCK_RELAY_SYNC")
+            || Self::env_flag_enabled("ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC"))
+            && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC")
+    }
+
+    fn parse_seed_list(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .filter_map(|s| {
+                let t = s.trim();
+                (!t.is_empty()).then(|| t.to_owned())
+            })
+            .collect()
+    }
+
+    fn configured_seed_nodes() -> Vec<String> {
+        let seeds = std::env::var("ALPHANUMERIC_SEED_NODES")
+            .or_else(|_| std::env::var("ALPHANUMERIC_BOOTSTRAP_PEERS"))
+            .ok();
+        if let Some(seeds) = seeds {
+            return Self::parse_seed_list(&seeds);
+        }
+        Vec::new()
     }
 
     fn dns_seeds() -> Vec<String> {
-        let override_seeds = std::env::var("ALPHANUMERIC_DNS_SEEDS")
-            .or_else(|_| std::env::var("ALPHANUMERIC_SEED_NODES"))
-            .ok();
-        if let Some(seeds) = override_seeds {
-            let parsed: Vec<String> = seeds
-                .split(',')
-                .filter_map(|s| {
-                    let t = s.trim();
-                    (!t.is_empty()).then(|| t.to_owned())
-                })
-                .collect();
+        if let Ok(seeds) = std::env::var("ALPHANUMERIC_DNS_SEEDS") {
+            let parsed = Self::parse_seed_list(&seeds);
             if !parsed.is_empty() {
                 return parsed;
             }
         }
+
         DEFAULT_DNS_SEEDS.iter().map(|s| s.to_string()).collect()
     }
 
@@ -1334,12 +1366,79 @@ impl Node {
             .min(12)
     }
 
-    fn relay_sync_interval_secs() -> u64 {
-        std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS")
+    fn env_interval_secs(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> u64 {
+        std::env::var(name)
             .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_RELAY_SYNC_INTERVAL_SECS)
-            .clamp(1, 60)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(default_secs)
+            .clamp(min_secs, max_secs)
+    }
+
+    fn announce_interval_secs() -> u64 {
+        Self::env_interval_secs(
+            "ALPHANUMERIC_ANNOUNCE_INTERVAL_SECS",
+            DEFAULT_ANNOUNCE_INTERVAL_SECS,
+            60,
+            3600,
+        )
+    }
+
+    fn header_snapshot_interval_secs() -> u64 {
+        Self::env_interval_secs(
+            "ALPHANUMERIC_HEADER_SNAPSHOT_INTERVAL_SECS",
+            DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS,
+            60,
+            3600,
+        )
+    }
+
+    fn stats_snapshot_interval_secs() -> u64 {
+        Self::env_interval_secs(
+            "ALPHANUMERIC_STATS_SNAPSHOT_INTERVAL_SECS",
+            DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS,
+            60,
+            3600,
+        )
+    }
+
+    fn should_publish_now(last_publish: &AtomicU64, interval_secs: u64, now: u64) -> bool {
+        let previous = last_publish.load(Ordering::Acquire);
+        if previous > 0 && now.saturating_sub(previous) < interval_secs {
+            return false;
+        }
+
+        last_publish
+            .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn periodic_relay_sync_interval_secs() -> Option<u64> {
+        if let Ok(value) = std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS") {
+            let parsed = value.trim().parse::<u64>().ok()?;
+            return (parsed > 0).then_some(parsed.clamp(60, 3600));
+        }
+
+        if Self::env_flag_enabled("ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC") {
+            Some(DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS)
+        } else {
+            None
+        }
+    }
+
+    fn relay_sync_backfill_depth() -> u32 {
+        std::env::var("ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(256)
+    }
+
+    fn relay_sync_max_rounds() -> usize {
+        std::env::var("ALPHANUMERIC_RELAY_SYNC_MAX_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 24)
     }
 
     fn json_height(value: Option<&Value>) -> Option<u32> {
@@ -1417,30 +1516,27 @@ impl Node {
 
     async fn public_advertisable_tip(&self) -> Option<Block> {
         let relay_tip = *self.public_relay_tip.read().await;
-        let relay_tip = match relay_tip {
-            Some(tip) => tip,
-            None => {
-                debug!("Public discovery publish skipped until a local block is relay-confirmed");
-                return None;
-            }
+        let blockchain = self.blockchain.read().await;
+
+        let Some(relay_tip) = relay_tip else {
+            return blockchain.get_last_block();
         };
 
-        let blockchain = self.blockchain.read().await;
         match blockchain.get_block(relay_tip.height) {
             Ok(block) if block.hash == relay_tip.hash => Some(block),
             Ok(_) => {
                 warn!(
-                    "Relay-confirmed tip #{} no longer matches local canonical block; suppressing public announce",
+                    "Relay-confirmed tip #{} no longer matches local canonical block; using local tip for discovery announce",
                     relay_tip.height
                 );
-                None
+                blockchain.get_last_block()
             }
             Err(e) => {
                 warn!(
-                    "Relay-confirmed tip #{} is not available locally: {}",
+                    "Relay-confirmed tip #{} is not available locally: {}; using local tip for discovery announce",
                     relay_tip.height, e
                 );
-                None
+                blockchain.get_last_block()
             }
         }
     }
@@ -1548,7 +1644,23 @@ impl Node {
     }
 
     async fn connect_discovery_peers(&self, limit: usize) -> Result<(), NodeError> {
-        let mut addrs = self.fetch_discovery_peers().await?;
+        let mut addrs = match self.fetch_discovery_peers().await {
+            Ok(addrs) => addrs,
+            Err(fetch_err) => {
+                let mut fallback_addrs: Vec<SocketAddr> = self.load_peer_cache();
+                for seed in Self::configured_seed_nodes() {
+                    match tokio::net::lookup_host(seed.as_str()).await {
+                        Ok(addrs) => fallback_addrs.extend(addrs),
+                        Err(e) => debug!("Seed node lookup failed for {}: {}", seed, e),
+                    }
+                }
+
+                if fallback_addrs.is_empty() {
+                    return Err(fetch_err);
+                }
+                fallback_addrs
+            }
+        };
         addrs.shuffle(&mut thread_rng());
 
         let attempts: Vec<_> = addrs
@@ -1571,7 +1683,7 @@ impl Node {
         };
 
         if connected > 0 {
-            info!("Connected to {} peer(s) via discovery service", connected);
+            info!("Connected to {} peer(s) via discovery/bootstrap", connected);
         }
 
         Ok(())
@@ -1632,6 +1744,13 @@ impl Node {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        if !Self::should_publish_now(
+            &self.last_public_announce_at,
+            Self::announce_interval_secs(),
+            now,
+        ) {
+            return Ok(());
+        }
 
         let ip = if let Ok(public_ip) = std::env::var("ALPHANUMERIC_PUBLIC_IP") {
             if !public_ip.trim().is_empty() {
@@ -1742,8 +1861,20 @@ impl Node {
     }
 
     async fn post_header_snapshot(&self) -> Result<(), NodeError> {
-        if !Self::public_discovery_publish_enabled() {
-            debug!("Skipping public header snapshot for local genesis node");
+        if !Self::public_header_snapshots_enabled() {
+            debug!("Skipping public header snapshot because it is disabled by environment");
+            return Ok(());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !Self::should_publish_now(
+            &self.last_header_snapshot_at,
+            Self::header_snapshot_interval_secs(),
+            now,
+        ) {
             return Ok(());
         }
 
@@ -1842,8 +1973,20 @@ impl Node {
     }
 
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
-        if !Self::public_discovery_publish_enabled() {
-            debug!("Skipping public stats snapshot for local genesis node");
+        if !Self::public_stats_snapshots_enabled() {
+            debug!("Skipping public stats snapshot because it is disabled by environment");
+            return Ok(());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !Self::should_publish_now(
+            &self.last_stats_snapshot_at,
+            Self::stats_snapshot_interval_secs(),
+            now,
+        ) {
             return Ok(());
         }
 
@@ -2125,14 +2268,18 @@ impl Node {
         }
 
         const RELAY_BATCH_SIZE: u32 = 64;
-        const RELAY_BACKFILL_DEPTH: u32 = 256;
-        const MAX_RELAY_ROUNDS: usize = 24;
 
-        let mut cursor = current_height.saturating_sub(RELAY_BACKFILL_DEPTH);
+        let backfill_depth = Self::relay_sync_backfill_depth();
+        let max_rounds = Self::relay_sync_max_rounds();
+        let mut cursor = if backfill_depth > 0 {
+            current_height.saturating_sub(backfill_depth)
+        } else {
+            current_height.saturating_add(1)
+        };
         let mut total_saved = 0usize;
         let mut accepted_any = false;
 
-        for _ in 0..MAX_RELAY_ROUNDS {
+        for _ in 0..max_rounds {
             let start = cursor;
             let end = start.saturating_add(RELAY_BATCH_SIZE.saturating_sub(1));
             let blocks = self.fetch_relay_blocks(start, end).await?;
@@ -2325,18 +2472,10 @@ impl Node {
                 Ok(Err(e)) => warn!("Pre-mine relay sync skipped: {}", e),
                 Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
             }
-        } else {
-            let current_height = {
-                let blockchain = self.blockchain.read().await;
-                blockchain.get_latest_block_index() as u32
-            };
-            match timeout(max_wait, self.sync_with_block_relay(current_height)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => debug!("Pre-mine relay sync had no newer blocks: {}", e),
-                Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
-            }
         }
-        self.enforce_public_tip_before_mining(max_wait).await?;
+        if Self::env_flag_enabled("ALPHANUMERIC_ENFORCE_GATEWAY_TIP_BEFORE_MINING") {
+            self.enforce_public_tip_before_mining(max_wait).await?;
+        }
         Ok(())
     }
 
@@ -2397,10 +2536,10 @@ impl Node {
 
         if let Err(e) = self.post_block_relay(&block).await {
             warn!("{} block relay failed: {}", context, e);
-            return Err(e);
+        } else {
+            self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
+                .await;
         }
-        self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
-            .await;
 
         self.publish_discovery_state(context).await;
 
@@ -2630,6 +2769,17 @@ impl Node {
         };
 
         let needs_more_peers = current_peers.len() < MIN_TARGET_PEERS;
+        let configured_seed_nodes = Self::configured_seed_nodes();
+
+        if needs_more_peers {
+            discovered_addrs.extend(self.load_peer_cache());
+            for seed in &configured_seed_nodes {
+                match tokio::net::lookup_host(seed.as_str()).await {
+                    Ok(addrs) => discovered_addrs.extend(addrs),
+                    Err(e) => debug!("Seed node lookup failed for {}: {}", seed, e),
+                }
+            }
+        }
 
         // Priority 1: alphanumeric.blue discovery service
         let mut gateway_ok = false;
@@ -2648,10 +2798,9 @@ impl Node {
         }
 
         // Fallbacks are only used when gateway is unavailable, or explicitly allowed.
-        let allow_fallback = !gateway_ok || !gateway_only;
+        let allow_fallback =
+            !gateway_ok || !gateway_only || (needs_more_peers && discovered_addrs.is_empty());
         if allow_fallback {
-            discovered_addrs.extend(self.load_peer_cache());
-
             if !current_peers.is_empty() {
                 if let Ok(peer_addrs) = self.discover_from_existing_peers().await {
                     discovered_addrs.extend(peer_addrs);
@@ -3600,12 +3749,12 @@ impl Node {
         // Periodic announce to discovery service
         let node_clone = node.clone();
         tokio::spawn(async move {
-            let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_INTERVAL));
+            let mut announce_interval =
+                interval(Duration::from_secs(Self::announce_interval_secs()));
             loop {
                 announce_interval.tick().await;
                 if let Err(e) = node_clone.ensure_public_tip_relayed().await {
                     debug!("Public relay tip refresh failed: {}", e);
-                    continue;
                 }
                 if let Err(e) = node_clone.announce_to_discovery().await {
                     debug!("Announce error: {}", e);
@@ -3614,28 +3763,34 @@ impl Node {
         });
 
         // Periodic header snapshot submissions
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut header_interval = interval(Duration::from_secs(HEADER_SNAPSHOT_INTERVAL));
-            loop {
-                header_interval.tick().await;
-                if let Err(e) = node_clone.post_header_snapshot().await {
-                    debug!("Header snapshot error: {}", e);
+        if Self::public_header_snapshots_enabled() {
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                let mut header_interval =
+                    interval(Duration::from_secs(Self::header_snapshot_interval_secs()));
+                loop {
+                    header_interval.tick().await;
+                    if let Err(e) = node_clone.post_header_snapshot().await {
+                        debug!("Header snapshot error: {}", e);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Periodic stats snapshot submissions (push)
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut stats_interval = interval(Duration::from_secs(30));
-            loop {
-                stats_interval.tick().await;
-                if let Err(e) = node_clone.post_stats_snapshot().await {
-                    debug!("Stats snapshot error: {}", e);
+        if Self::public_stats_snapshots_enabled() {
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                let mut stats_interval =
+                    interval(Duration::from_secs(Self::stats_snapshot_interval_secs()));
+                loop {
+                    stats_interval.tick().await;
+                    if let Err(e) = node_clone.post_stats_snapshot().await {
+                        debug!("Stats snapshot error: {}", e);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Periodic peer cache persistence
         let node_clone = node.clone();
@@ -3715,28 +3870,38 @@ impl Node {
             }
         });
 
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut relay_interval =
-                interval(Duration::from_secs(Self::relay_sync_interval_secs()));
-            loop {
-                relay_interval.tick().await;
-                let current_height = {
-                    let blockchain = node_clone.blockchain.read().await;
-                    blockchain.get_latest_block_index() as u32
-                };
+        if let Some(relay_sync_interval_secs) = Self::periodic_relay_sync_interval_secs() {
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                let mut relay_interval = interval(Duration::from_secs(relay_sync_interval_secs));
+                loop {
+                    relay_interval.tick().await;
+                    let current_height = {
+                        let blockchain = node_clone.blockchain.read().await;
+                        blockchain.get_latest_block_index() as u32
+                    };
 
-                match node_clone.sync_with_block_relay(current_height).await {
-                    Ok(saved) if saved > 0 => {
-                        if let Err(e) = node_clone.publish_local_tip().await {
-                            warn!("Post-relay-sync publish failed: {}", e);
+                    match node_clone.fetch_public_tip_height().await {
+                        Ok(Some(public_height)) if public_height > current_height => {}
+                        Ok(_) => continue,
+                        Err(e) => {
+                            debug!("Periodic relay sync tip check skipped: {}", e);
+                            continue;
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => debug!("Periodic relay sync skipped: {}", e),
+
+                    match node_clone.sync_with_block_relay(current_height).await {
+                        Ok(saved) if saved > 0 => {
+                            if let Err(e) = node_clone.publish_local_tip().await {
+                                warn!("Post-relay-sync publish failed: {}", e);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => debug!("Periodic relay sync skipped: {}", e),
+                    }
                 }
-            }
-        });
+            });
+        }
 
         info!("Node startup complete - ready to accept connections");
         Ok(())
@@ -6453,9 +6618,16 @@ impl Node {
                 warn!("Fast discovery peer connect failed: {}", connect_err);
                 if let Err(discovery_err) = self.discover_network_nodes().await {
                     warn!("Failed to discover peers for sync: {}", discovery_err);
-                    return Err(NodeError::Network(
-                        "No peers available for sync".to_string(),
-                    ));
+                    return self
+                        .sync_with_block_relay(current_height)
+                        .await
+                        .map(|_| ())
+                        .map_err(|relay_err| {
+                            NodeError::Network(format!(
+                                "No peers available for sync and relay sync failed: {}",
+                                relay_err
+                            ))
+                        });
                 }
             }
         }
@@ -6483,11 +6655,6 @@ impl Node {
         // IMPROVEMENT: Check if we already have the latest blocks
         if let Some((_, best_height)) = peer_heights.first() {
             if *best_height <= current_height {
-                match self.sync_with_block_relay(current_height).await {
-                    Ok(saved) if saved > 0 => return Ok(()),
-                    Ok(_) => {}
-                    Err(e) => debug!("Block relay had no newer blocks: {}", e),
-                }
                 info!(
                     "Already at best height ({}/{})",
                     current_height, best_height

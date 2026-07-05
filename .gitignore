@@ -10,6 +10,7 @@
 /node_identity.key
 /logs/
 /run/
+/dist/
 /path/
 /alphanumeric_serverless_plan.txt
 
