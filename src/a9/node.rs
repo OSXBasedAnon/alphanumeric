@@ -1267,6 +1267,18 @@ impl Node {
             .unwrap_or(false)
     }
 
+    fn stats_server_explicitly_enabled() -> bool {
+        std::env::var("ALPHANUMERIC_STATS_ENABLED")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    }
+
+    fn upnp_explicitly_enabled() -> bool {
+        std::env::var("ALPHANUMERIC_ENABLE_UPNP")
+            .map(|v| !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    }
+
     fn is_expected_startup_sync_gap(error: &NodeError) -> bool {
         match error {
             NodeError::Network(message) => {
@@ -1697,7 +1709,7 @@ impl Node {
         let connected = match timeout(Duration::from_secs(6), join_all(attempts)).await {
             Ok(results) => results.into_iter().filter(|ok| *ok).count(),
             Err(_) => {
-                warn!("Discovery peer connect timed out");
+                debug!("Discovery peer connect timed out");
                 0
             }
         };
@@ -1863,18 +1875,18 @@ impl Node {
                 Ok(res) => {
                     let status = res.status();
                     let body = res.text().await.unwrap_or_default();
-                    warn!(
+                    debug!(
                         "Discovery announce failed: {} {}",
                         status,
                         Self::response_body_snippet(&body)
                     );
                 }
-                Err(e) => warn!("Discovery announce error: {}", e),
+                Err(e) => debug!("Discovery announce error: {}", e),
             }
         }
 
         if !any_ok {
-            warn!("Discovery announce failed on all endpoints");
+            debug!("Discovery announce failed on all endpoints");
         }
 
         Ok(())
@@ -2482,7 +2494,7 @@ impl Node {
 
     async fn publish_discovery_state(&self, context: &str) {
         if let Err(e) = self.announce_to_discovery().await {
-            warn!("{} discovery announce failed: {}", context, e);
+            debug!("{} discovery announce failed: {}", context, e);
         }
         if let Err(e) = self.post_header_snapshot().await {
             warn!("{} header snapshot failed: {}", context, e);
@@ -2551,7 +2563,7 @@ impl Node {
     pub async fn publish_local_tip(&self) -> Result<(), NodeError> {
         if self.peers.read().await.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
-                warn!("Post-mine discovery failed: {}", e);
+                debug!("Local tip discovery deferred: {}", e);
             }
         }
 
@@ -2562,13 +2574,18 @@ impl Node {
                 .ok_or_else(|| NodeError::Blockchain("No local chain tip found".to_string()))?
         };
 
-        self.publish_block(tip, "Post-mine").await
+        self.publish_block(tip, "Local tip").await
     }
 
     pub async fn publish_block(&self, block: Block, context: &str) -> Result<(), NodeError> {
+        let post_mine = context == "Post-mine";
         if self.peers.read().await.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
-                warn!("{} discovery failed: {}", context, e);
+                if post_mine {
+                    warn!("{} discovery failed: {}", context, e);
+                } else {
+                    debug!("{} discovery deferred: {}", context, e);
+                }
             }
         }
 
@@ -2581,23 +2598,49 @@ impl Node {
         };
 
         if selected_peers.is_empty() {
-            warn!("Mined block saved locally, but no peers were available for block broadcast");
+            if post_mine {
+                warn!("Mined block saved locally, but no peers were available for block broadcast");
+            } else {
+                debug!(
+                    "{} publish deferred: no peers available for broadcast",
+                    context
+                );
+            }
         } else {
             match self
                 .broadcast_block(Arc::new(block.clone()), None, selected_peers)
                 .await
             {
-                Ok(0) => warn!("Mined block broadcast had no eligible target peers"),
-                Ok(delivered) => {
-                    info!(
-                        "Published mined block #{} to {} peer(s)",
-                        block.index, delivered
-                    );
+                Ok(0) => {
+                    if post_mine {
+                        warn!("Mined block broadcast had no eligible target peers");
+                    } else {
+                        debug!("{} publish deferred: no eligible target peers", context);
+                    }
                 }
-                Err(e) => warn!(
-                    "Mined block broadcast failed for every selected peer: {}",
-                    e
-                ),
+                Ok(delivered) => {
+                    if post_mine {
+                        info!(
+                            "Published mined block #{} to {} peer(s)",
+                            block.index, delivered
+                        );
+                    } else {
+                        debug!(
+                            "{} published block #{} to {} peer(s)",
+                            context, block.index, delivered
+                        );
+                    }
+                }
+                Err(e) => {
+                    if post_mine {
+                        warn!(
+                            "Mined block broadcast failed for every selected peer: {}",
+                            e
+                        );
+                    } else {
+                        debug!("{} broadcast failed for selected peers: {}", context, e);
+                    }
+                }
             }
         }
 
@@ -2693,15 +2736,26 @@ impl Node {
         let listener = match std::net::TcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
-                warn!("Stats API disabled: failed to bind {} ({})", addr, e);
+                if Self::stats_server_explicitly_enabled() {
+                    warn!("Stats API disabled: failed to bind {} ({})", addr, e);
+                } else {
+                    debug!("Stats API disabled: failed to bind {} ({})", addr, e);
+                }
                 return Ok(());
             }
         };
         if let Err(e) = listener.set_nonblocking(true) {
-            warn!(
-                "Stats API disabled: failed to set nonblocking listener ({})",
-                e
-            );
+            if Self::stats_server_explicitly_enabled() {
+                warn!(
+                    "Stats API disabled: failed to set nonblocking listener ({})",
+                    e
+                );
+            } else {
+                debug!(
+                    "Stats API disabled: failed to set nonblocking listener ({})",
+                    e
+                );
+            }
             return Ok(());
         }
 
@@ -2858,7 +2912,7 @@ impl Node {
                 );
             }
             Err(e) => {
-                warn!("Discovery gateway unavailable: {}", e);
+                debug!("Discovery gateway unavailable: {}", e);
             }
         }
 
@@ -3652,10 +3706,18 @@ impl Node {
                     external_port = Some(port);
                 }
                 Ok(Err(e)) => {
-                    warn!("UPnP port mapping failed: {}", e);
+                    if Self::upnp_explicitly_enabled() {
+                        warn!("UPnP port mapping failed: {}", e);
+                    } else {
+                        debug!("UPnP port mapping failed: {}", e);
+                    }
                 }
                 Err(e) => {
-                    warn!("UPnP mapping task failed: {}", e);
+                    if Self::upnp_explicitly_enabled() {
+                        warn!("UPnP mapping task failed: {}", e);
+                    } else {
+                        debug!("UPnP mapping task failed: {}", e);
+                    }
                 }
             }
         }
@@ -3702,7 +3764,11 @@ impl Node {
             .unwrap_or(true)
         {
             if let Err(e) = self.start_stats_server().await {
-                warn!("Stats server failed to start: {}", e);
+                if Self::stats_server_explicitly_enabled() {
+                    warn!("Stats server failed to start: {}", e);
+                } else {
+                    debug!("Stats server failed to start: {}", e);
+                }
             }
         }
 
@@ -3811,7 +3877,7 @@ impl Node {
         tokio::spawn(async move {
             sleep(Duration::from_secs(3)).await;
             if let Err(e) = node_clone.connect_discovery_peers(8).await {
-                warn!("Discovery connect error: {}", e);
+                debug!("Discovery connect deferred: {}", e);
             }
         });
 
@@ -4310,7 +4376,7 @@ impl Node {
                 let node = self.clone();
                 async move {
                     if let Err(e) = node.discover_network_nodes().await {
-                        warn!("Peer discovery during maintenance failed: {}", e);
+                        debug!("Peer discovery during maintenance deferred: {}", e);
                     }
                 }
             });
@@ -6775,9 +6841,9 @@ impl Node {
             drop(peers); // Release lock before discovery
             info!("No peers available, discovering network nodes");
             if let Err(connect_err) = self.connect_discovery_peers(8).await {
-                warn!("Fast discovery peer connect failed: {}", connect_err);
+                debug!("Fast discovery peer connect deferred: {}", connect_err);
                 if let Err(discovery_err) = self.discover_network_nodes().await {
-                    warn!("Failed to discover peers for sync: {}", discovery_err);
+                    debug!("Failed to discover peers for sync: {}", discovery_err);
                     return self
                         .sync_with_block_relay(current_height)
                         .await
@@ -6804,7 +6870,7 @@ impl Node {
 
         if peer_heights.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
-                warn!("Discovery retry before sync failed: {}", e);
+                debug!("Discovery retry before sync failed: {}", e);
             }
             let peers = self.peers.read().await;
             let peer_ips: Vec<_> = peers.keys().cloned().collect();

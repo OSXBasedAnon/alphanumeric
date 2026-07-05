@@ -955,7 +955,7 @@ async fn main() -> Result<()> {
                 Some(editor)
             }
             Err(e) => {
-                warn!("Line editor unavailable; falling back to standard input: {}", e);
+                debug!("Line editor unavailable; falling back to standard input: {}", e);
                 None
             }
         };
@@ -979,7 +979,7 @@ async fn main() -> Result<()> {
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!("Line editor failed; falling back to standard input: {}", e);
+                        debug!("Line editor failed; falling back to standard input: {}", e);
                         line_editor = None;
                         continue;
                     }
