@@ -227,7 +227,8 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
 - `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP`
-- `ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES` (default `1073741824`; clamped to 1 MiB-10 GiB)
+- `ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES` (unverified fallback download limit; default `1073741824`; clamped to 1 MiB-10 GiB)
+- `ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES` (unverified fallback extraction limit; default 10 GiB)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND` (default `127.0.0.1`; set `0.0.0.0` only when the stats API should be public)
@@ -256,6 +257,8 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_ENABLE_UPNP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`
 - `ALPHANUMERIC_TX_WITNESS_CACHE_SIZE`
+
+Official bootstrap snapshots are accepted only when the blue gateway returns a pinned publisher manifest with a valid signature and SHA-256. New manifests also carry signed compressed size, extracted size, and file count metadata so the node can preflight disk space and verify extraction without imposing a fixed chain-size ceiling.
 
 Bootstrap publishing is maintainer infrastructure, not part of normal macOS node setup. Operator-level details are kept in [docs/BOOTSTRAP_PUBLISHER.md](docs/BOOTSTRAP_PUBLISHER.md).
 

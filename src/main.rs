@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -31,7 +32,7 @@ use alphanumeric::a9::{
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
-    node::{Node, NodeError, DEFAULT_PORT},
+    node::{Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT},
     oracle::DifficultyOracle,
     progpow::{Miner, MiningManager},
     whisper::WhisperModule,
@@ -46,6 +47,10 @@ const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/ma
 const DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024;
 const MAX_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024;
+const MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+const BOOTSTRAP_MIN_DISK_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
@@ -79,6 +84,12 @@ struct BootstrapManifestPointer {
     tip_hash: Option<String>,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default)]
+    compressed_bytes: Option<u64>,
+    #[serde(default)]
+    extracted_bytes: Option<u64>,
+    #[serde(default)]
+    file_count: Option<u64>,
     publisher_pubkey: String,
     manifest_sig: String,
     updated_at: u64,
@@ -102,7 +113,26 @@ struct BootstrapManifestSignedFields {
     tip_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compressed_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_count: Option<u64>,
     updated_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BootstrapArchiveStats {
+    extracted_bytes: u64,
+    file_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BootstrapArchiveExpectations {
+    expected_extracted_bytes: Option<u64>,
+    expected_file_count: Option<u64>,
+    unverified_extract_limit: Option<u64>,
 }
 
 impl BootstrapManifestPointer {
@@ -113,6 +143,9 @@ impl BootstrapManifestPointer {
             height: self.height,
             tip_hash: self.tip_hash.clone(),
             sha256: self.sha256.clone(),
+            compressed_bytes: self.compressed_bytes,
+            extracted_bytes: self.extracted_bytes,
+            file_count: self.file_count,
             updated_at: self.updated_at,
         }
     }
@@ -241,6 +274,8 @@ fn verify_bootstrap_manifest_with_publisher(
         return Err("Bootstrap manifest SHA-256 is malformed".into());
     }
 
+    validate_bootstrap_manifest_size_fields(manifest)?;
+
     let sig_hex = manifest.manifest_sig.trim();
     if !is_hex_with_len(sig_hex, 128) {
         return Err("Bootstrap manifest signature is malformed".into());
@@ -263,6 +298,19 @@ fn verify_bootstrap_manifest_with_publisher(
         .verify(&signed_payload, &signature)
         .map_err(|e| format!("Bootstrap manifest signature verification failed: {}", e))?;
 
+    Ok(())
+}
+
+fn validate_bootstrap_manifest_size_fields(manifest: &BootstrapManifestPointer) -> Result<()> {
+    if matches!(manifest.compressed_bytes, Some(0)) {
+        return Err("Bootstrap manifest compressed byte count must be nonzero".into());
+    }
+    if matches!(manifest.extracted_bytes, Some(0)) {
+        return Err("Bootstrap manifest extracted byte count must be nonzero".into());
+    }
+    if matches!(manifest.file_count, Some(0)) {
+        return Err("Bootstrap manifest file count must be nonzero".into());
+    }
     Ok(())
 }
 
@@ -589,10 +637,13 @@ async fn main() -> Result<()> {
             Arc::new(db.clone()),
             blockchain.clone(),
             key_pair_pkcs8.clone(),
-            bind_addr,
-            config.network.velocity_enabled,
-            config.network.max_peers,
-            config.network.max_connections,
+            NodeRuntimeConfig {
+                bind_addr,
+                velocity_enabled: config.network.velocity_enabled,
+                max_peers: config.network.max_peers,
+                max_connections: config.network.max_connections,
+                seed_nodes: config.network.seed_nodes.clone(),
+            },
         )
         .await {
             Ok(node) => Arc::new(node),
@@ -2812,6 +2863,23 @@ fn bootstrap_zip_size_limit_bytes() -> u64 {
     bootstrap_zip_size_limit_from_env_value(value.as_deref())
 }
 
+fn unverified_bootstrap_extract_limit_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| {
+            value.clamp(
+                MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
+                MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
+            )
+        })
+        .unwrap_or(DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES)
+}
+
+fn unverified_bootstrap_extract_limit_bytes() -> u64 {
+    let value = std::env::var("ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES").ok();
+    unverified_bootstrap_extract_limit_from_env_value(value.as_deref())
+}
+
 fn ensure_bootstrap_zip_size(size: u64, limit: u64, context: &str) -> Result<()> {
     if size > limit {
         return Err(format!(
@@ -2821,6 +2889,195 @@ fn ensure_bootstrap_zip_size(size: u64, limit: u64, context: &str) -> Result<()>
         .into());
     }
     Ok(())
+}
+
+fn ensure_bootstrap_download_progress(
+    size: u64,
+    expected_size: Option<u64>,
+    fallback_limit: Option<u64>,
+    context: &str,
+) -> Result<()> {
+    if let Some(expected_size) = expected_size {
+        if size > expected_size {
+            return Err(format!(
+                "Bootstrap download too large for signed manifest: {} is {} bytes, expected {} bytes",
+                context, size, expected_size
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if let Some(limit) = fallback_limit {
+        ensure_bootstrap_zip_size(size, limit, context)?;
+    }
+    Ok(())
+}
+
+fn ensure_bootstrap_download_complete(
+    size: u64,
+    expected_size: Option<u64>,
+    fallback_limit: Option<u64>,
+    context: &str,
+) -> Result<()> {
+    if let Some(expected_size) = expected_size {
+        if size != expected_size {
+            return Err(format!(
+                "Bootstrap download size mismatch: {} is {} bytes, signed manifest expected {} bytes",
+                context, size, expected_size
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if let Some(limit) = fallback_limit {
+        ensure_bootstrap_zip_size(size, limit, context)?;
+    }
+    Ok(())
+}
+
+fn bootstrap_disk_buffer_bytes(extracted_bytes: u64) -> u64 {
+    (extracted_bytes / 20).max(BOOTSTRAP_MIN_DISK_BUFFER_BYTES)
+}
+
+fn bootstrap_required_disk_bytes(compressed_bytes: Option<u64>, extracted_bytes: u64) -> u64 {
+    compressed_bytes
+        .unwrap_or(0)
+        .saturating_add(extracted_bytes)
+        .saturating_add(bootstrap_disk_buffer_bytes(extracted_bytes))
+}
+
+fn nearest_existing_path(path: &Path) -> Option<std::path::PathBuf> {
+    let mut candidate = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+
+    loop {
+        if candidate.exists() {
+            return std::fs::canonicalize(&candidate).ok();
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+fn available_disk_space_for_path(path: &Path) -> Option<u64> {
+    let target = nearest_existing_path(path)?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| target.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+}
+
+fn ensure_bootstrap_disk_space(
+    db_path: &Path,
+    compressed_bytes: Option<u64>,
+    extracted_bytes: Option<u64>,
+) -> Result<()> {
+    let Some(extracted_bytes) = extracted_bytes else {
+        return Ok(());
+    };
+    let required = bootstrap_required_disk_bytes(compressed_bytes, extracted_bytes);
+    let Some(available) = available_disk_space_for_path(db_path) else {
+        debug!(
+            "Bootstrap disk preflight skipped: could not determine available space for {}",
+            db_path.display()
+        );
+        return Ok(());
+    };
+    if available < required {
+        return Err(format!(
+            "Insufficient disk space for bootstrap: available {} bytes, need at least {} bytes for signed snapshot extraction",
+            available, required
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn update_bootstrap_archive_stats(
+    stats: &mut BootstrapArchiveStats,
+    copied_bytes: u64,
+    expectations: BootstrapArchiveExpectations,
+) -> std::result::Result<(), String> {
+    stats.file_count = stats
+        .file_count
+        .checked_add(1)
+        .ok_or_else(|| "Bootstrap archive file count overflow".to_string())?;
+    stats.extracted_bytes = stats
+        .extracted_bytes
+        .checked_add(copied_bytes)
+        .ok_or_else(|| "Bootstrap archive extracted byte count overflow".to_string())?;
+
+    if let Some(expected_file_count) = expectations.expected_file_count {
+        if stats.file_count > expected_file_count {
+            return Err(format!(
+                "Bootstrap archive has more files than signed manifest: saw {}, expected {}",
+                stats.file_count, expected_file_count
+            ));
+        }
+    }
+    if let Some(expected_extracted_bytes) = expectations.expected_extracted_bytes {
+        if stats.extracted_bytes > expected_extracted_bytes {
+            return Err(format!(
+                "Bootstrap archive extracted more data than signed manifest: saw {} bytes, expected {} bytes",
+                stats.extracted_bytes, expected_extracted_bytes
+            ));
+        }
+    } else if let Some(limit) = expectations.unverified_extract_limit {
+        if stats.extracted_bytes > limit {
+            return Err(format!(
+                "Unverified bootstrap archive extraction exceeded limit: saw {} bytes, limit is {} bytes",
+                stats.extracted_bytes, limit
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn finalize_bootstrap_archive_stats(
+    stats: BootstrapArchiveStats,
+    expectations: BootstrapArchiveExpectations,
+) -> std::result::Result<(), String> {
+    if let Some(expected_file_count) = expectations.expected_file_count {
+        if stats.file_count != expected_file_count {
+            return Err(format!(
+                "Bootstrap archive file count mismatch: extracted {}, signed manifest expected {}",
+                stats.file_count, expected_file_count
+            ));
+        }
+    }
+    if let Some(expected_extracted_bytes) = expectations.expected_extracted_bytes {
+        if stats.extracted_bytes != expected_extracted_bytes {
+            return Err(format!(
+                "Bootstrap archive extracted size mismatch: extracted {} bytes, signed manifest expected {} bytes",
+                stats.extracted_bytes, expected_extracted_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bootstrap_manifest_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?)
+}
+
+fn bootstrap_download_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .build()?)
 }
 
 #[cfg(feature = "bootstrap_publisher")]
@@ -2894,8 +3151,9 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         remove_local_db(db_path).await?;
     }
 
+    let manifest_client = bootstrap_manifest_http_client()?;
     let manifest_result: Result<BootstrapManifestPointer> =
-        match reqwest::get(BOOTSTRAP_MANIFEST_URL).await {
+        match manifest_client.get(BOOTSTRAP_MANIFEST_URL).send().await {
             Ok(r) if r.status().is_success() => match r.bytes().await {
                 Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
                     Ok(parsed) if parsed.ok => match verify_bootstrap_manifest(&parsed.manifest) {
@@ -2911,8 +3169,16 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
             Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
         };
 
-    let (download_url, expected_sha256, expected_height, expected_tip_hash) = match manifest_result
-    {
+    let (
+        download_url,
+        expected_sha256,
+        expected_height,
+        expected_tip_hash,
+        expected_compressed_bytes,
+        expected_extracted_bytes,
+        expected_file_count,
+        verified_manifest,
+    ) = match manifest_result {
         Ok(manifest) => {
             let expected_sha256 = manifest
                 .sha256
@@ -2927,6 +3193,10 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 expected_sha256,
                 manifest.height,
                 expected_tip_hash,
+                manifest.compressed_bytes,
+                manifest.extracted_bytes,
+                manifest.file_count,
+                true,
             )
         }
         Err(e) if allow_unverified_bootstrap => {
@@ -2934,7 +3204,16 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 "Using unverified bootstrap fallback because ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true: {}",
                 e
             );
-            (DEFAULT_BOOTSTRAP_URL.to_string(), None, None, None)
+            (
+                DEFAULT_BOOTSTRAP_URL.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
         }
         Err(e) => {
             return Err(format!(
@@ -2949,52 +3228,6 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         return Err("Bootstrap manifest URL must use https".into());
     }
 
-    let res = reqwest::get(&download_url).await.map_err(|e| {
-        format!(
-            "Bootstrap download request failed for {}: {}",
-            download_url, e
-        )
-    })?;
-
-    if !res.status().is_success() {
-        return Err(format!("Bootstrap download failed: {}", res.status()).into());
-    }
-
-    let bootstrap_zip_size_limit = bootstrap_zip_size_limit_bytes();
-    if let Some(content_length) = res.content_length() {
-        ensure_bootstrap_zip_size(
-            content_length,
-            bootstrap_zip_size_limit,
-            "advertised content length",
-        )?;
-    }
-
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| format!("Bootstrap download body read failed: {}", e))?;
-    let downloaded_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    ensure_bootstrap_zip_size(downloaded_size, bootstrap_zip_size_limit, "downloaded body")?;
-
-    // Verified manifests must provide SHA-256. The only no-hash path is the
-    // explicit unsafe fallback for local/dev recovery.
-    if let Some(expected) = expected_sha256
-        .as_deref()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let actual = hex::encode(hasher.finalize());
-        if actual != expected {
-            return Err(format!(
-                "Bootstrap SHA-256 mismatch: expected {}, got {}",
-                expected, actual
-            )
-            .into());
-        }
-    }
-
     if let Some(parent) = std::path::Path::new(db_path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).await.map_err(|e| {
@@ -3007,10 +3240,99 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         }
     }
 
+    ensure_bootstrap_disk_space(
+        std::path::Path::new(db_path),
+        expected_compressed_bytes,
+        expected_extracted_bytes,
+    )?;
+
     let zip_path = format!("{}.zip", db_path);
-    fs::write(&zip_path, &bytes)
+    let download_client = bootstrap_download_http_client()?;
+    let mut res = download_client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "Bootstrap download request failed for {}: {}",
+                download_url, e
+            )
+        })?;
+
+    if !res.status().is_success() {
+        return Err(format!("Bootstrap download failed: {}", res.status()).into());
+    }
+
+    let fallback_zip_limit = (!verified_manifest).then(bootstrap_zip_size_limit_bytes);
+    if let Some(content_length) = res.content_length() {
+        ensure_bootstrap_download_complete(
+            content_length,
+            expected_compressed_bytes,
+            fallback_zip_limit,
+            "advertised content length",
+        )?;
+    }
+
+    let mut zip_file = fs::File::create(&zip_path)
         .await
         .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
+    let mut downloaded_size = 0u64;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| format!("Bootstrap download body read failed: {}", e))?
+    {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        downloaded_size = downloaded_size
+            .checked_add(chunk_len)
+            .ok_or("Bootstrap download byte count overflow")?;
+        ensure_bootstrap_download_progress(
+            downloaded_size,
+            expected_compressed_bytes,
+            fallback_zip_limit,
+            "downloaded body",
+        )?;
+        hasher.update(&chunk);
+        zip_file
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
+    }
+    zip_file
+        .flush()
+        .await
+        .map_err(|e| format!("Bootstrap zip flush failed at {}: {}", zip_path, e))?;
+    drop(zip_file);
+
+    ensure_bootstrap_download_complete(
+        downloaded_size,
+        expected_compressed_bytes,
+        fallback_zip_limit,
+        "downloaded body",
+    )?;
+    ensure_bootstrap_disk_space(
+        std::path::Path::new(db_path),
+        None,
+        expected_extracted_bytes,
+    )?;
+
+    // Verified manifests must provide SHA-256. The only no-hash path is the
+    // explicit unsafe fallback for local/dev recovery.
+    if let Some(expected) = expected_sha256
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+    {
+        let actual = hex::encode(hasher.finalize());
+        if actual != expected {
+            return Err(format!(
+                "Bootstrap SHA-256 mismatch: expected {}, got {}",
+                expected, actual
+            )
+            .into());
+        }
+    }
 
     let bootstrap_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3023,51 +3345,63 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
 
     let extract_path = temp_extract_path.clone();
     let zip_path_clone = zip_path.clone();
-    let extract_result = tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
-        let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&extract_path).map_err(|e| e.to_string())?;
-        let base_dir = std::fs::canonicalize(&extract_path).map_err(|e| e.to_string())?;
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let entry_name = file.name();
-            let relative = std::path::Path::new(entry_name);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(format!(
-                    "Unsafe bootstrap archive entry path: {}",
-                    entry_name
-                ));
+    let archive_expectations = BootstrapArchiveExpectations {
+        expected_extracted_bytes,
+        expected_file_count,
+        unverified_extract_limit: (!verified_manifest)
+            .then(unverified_bootstrap_extract_limit_bytes),
+    };
+    let extract_result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<BootstrapArchiveStats, String> {
+            let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&extract_path).map_err(|e| e.to_string())?;
+            let base_dir = std::fs::canonicalize(&extract_path).map_err(|e| e.to_string())?;
+            let mut stats = BootstrapArchiveStats::default();
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                let entry_name = file.name();
+                let relative = std::path::Path::new(entry_name);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(format!(
+                        "Unsafe bootstrap archive entry path: {}",
+                        entry_name
+                    ));
+                }
+                let outpath = std::path::Path::new(&extract_path).join(relative);
+                if let Some(parent) = outpath.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let canonical_parent = std::fs::canonicalize(
+                    outpath
+                        .parent()
+                        .ok_or_else(|| "Invalid archive entry parent path".to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                if !canonical_parent.starts_with(&base_dir) {
+                    return Err(format!(
+                        "Blocked bootstrap archive escape path: {}",
+                        entry_name
+                    ));
+                }
+                if file.name().ends_with('/') {
+                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+                } else {
+                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+                    let copied =
+                        std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+                    update_bootstrap_archive_stats(&mut stats, copied, archive_expectations)?;
+                }
             }
-            let outpath = std::path::Path::new(&extract_path).join(relative);
-            if let Some(parent) = outpath.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let canonical_parent = std::fs::canonicalize(
-                outpath
-                    .parent()
-                    .ok_or_else(|| "Invalid archive entry parent path".to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            if !canonical_parent.starts_with(&base_dir) {
-                return Err(format!(
-                    "Blocked bootstrap archive escape path: {}",
-                    entry_name
-                ));
-            }
-            if file.name().ends_with('/') {
-                std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
-            } else {
-                let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-                std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
-            }
-        }
-        std::fs::remove_file(&zip_path_clone).ok();
-        Ok(())
-    })
+            finalize_bootstrap_archive_stats(stats, archive_expectations)?;
+            std::fs::remove_file(&zip_path_clone).ok();
+            Ok(stats)
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
 
@@ -3370,6 +3704,12 @@ async fn publish_bootstrap_snapshot(
         tip_hash: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compressed_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extracted_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_count: Option<u64>,
         updated_at: u64,
         publisher_pubkey: String,
         manifest_sig: String,
@@ -3393,78 +3733,95 @@ async fn publish_bootstrap_snapshot(
 
     // Build a zip of a re-imported sled database in a temp directory (not the live DB dir)
     // to avoid Windows file locks (os error 33) when reading active log files.
-    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
-        let export_path = std::path::Path::new(&export_dir_string);
-        if export_path.exists() {
-            std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
-        }
-        std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
-
-        // Flush and logically export/import into a temp DB directory.
-        db_clone.flush().map_err(|e| e.to_string())?;
-        let export = db_clone.export();
-        let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
-        // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
-        tmp_db.import(export);
-        tmp_db.flush().map_err(|e| e.to_string())?;
-        drop(tmp_db);
-
-        let file = std::fs::File::create(&zip_path_string).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored)
-            .unix_permissions(0o644);
-
-        fn add_dir(
-            zip: &mut zip::ZipWriter<std::fs::File>,
-            base: &std::path::Path,
-            path: &std::path::Path,
-            options: zip::write::SimpleFileOptions,
-        ) -> std::result::Result<(), String> {
-            for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let p = entry.path();
-                let rel = p
-                    .strip_prefix(base)
-                    .map_err(|e| format!("strip_prefix: {}", e))?;
-                let name = rel.to_string_lossy().replace('\\', "/");
-                if p.is_dir() {
-                    let dir_name = if name.ends_with('/') {
-                        name
-                    } else {
-                        format!("{}/", name)
-                    };
-                    zip.add_directory(dir_name, options)
-                        .map_err(|e| e.to_string())?;
-                    add_dir(zip, base, &p, options)?;
-                } else if p.is_file() {
-                    zip.start_file(name, options).map_err(|e| e.to_string())?;
-                    let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
-                }
+    let archive_stats = tokio::task::spawn_blocking(
+        move || -> std::result::Result<BootstrapArchiveStats, String> {
+            let export_path = std::path::Path::new(&export_dir_string);
+            if export_path.exists() {
+                std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
             }
-            Ok(())
-        }
+            std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
 
-        add_dir(&mut zip, export_path, export_path, options)?;
-        zip.finish().map_err(|e| e.to_string())?;
+            // Flush and logically export/import into a temp DB directory.
+            db_clone.flush().map_err(|e| e.to_string())?;
+            let export = db_clone.export();
+            let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
+            // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
+            tmp_db.import(export);
+            tmp_db.flush().map_err(|e| e.to_string())?;
+            drop(tmp_db);
 
-        // Best-effort cleanup of export directory.
-        let _ = std::fs::remove_dir_all(export_path);
-        Ok(())
-    })
+            let file = std::fs::File::create(&zip_path_string).map_err(|e| e.to_string())?;
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .unix_permissions(0o644);
+
+            fn add_dir(
+                zip: &mut zip::ZipWriter<std::fs::File>,
+                base: &std::path::Path,
+                path: &std::path::Path,
+                options: zip::write::SimpleFileOptions,
+                stats: &mut BootstrapArchiveStats,
+            ) -> std::result::Result<(), String> {
+                for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let p = entry.path();
+                    let rel = p
+                        .strip_prefix(base)
+                        .map_err(|e| format!("strip_prefix: {}", e))?;
+                    let name = rel.to_string_lossy().replace('\\', "/");
+                    if p.is_dir() {
+                        let dir_name = if name.ends_with('/') {
+                            name
+                        } else {
+                            format!("{}/", name)
+                        };
+                        zip.add_directory(dir_name, options)
+                            .map_err(|e| e.to_string())?;
+                        add_dir(zip, base, &p, options, stats)?;
+                    } else if p.is_file() {
+                        zip.start_file(name, options).map_err(|e| e.to_string())?;
+                        let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+                        let copied = std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+                        update_bootstrap_archive_stats(
+                            stats,
+                            copied,
+                            BootstrapArchiveExpectations::default(),
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+
+            let mut stats = BootstrapArchiveStats::default();
+            add_dir(&mut zip, export_path, export_path, options, &mut stats)?;
+            zip.finish().map_err(|e| e.to_string())?;
+
+            // Best-effort cleanup of export directory.
+            let _ = std::fs::remove_dir_all(export_path);
+            Ok(stats)
+        },
+    )
     .await
     .map_err(|e| format!("zip task failed: {}", e))??;
 
     let bytes = fs::read(&zip_path).await?;
+    let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let sha256 = hex::encode(hasher.finalize());
 
     // Step 1: upload snapshot to blue (server will store in Blob and return final blob URL).
     let upload_url = format!(
-        "{}?network_id={}&height={}&tip={}&sha256={}",
-        publish_url, network_id_hex, height, tip_hash_hex, sha256
+        "{}?network_id={}&height={}&tip={}&sha256={}&compressed_bytes={}&extracted_bytes={}&file_count={}",
+        publish_url,
+        network_id_hex,
+        height,
+        tip_hash_hex,
+        sha256,
+        compressed_bytes,
+        archive_stats.extracted_bytes,
+        archive_stats.file_count
     );
     // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
     let client = reqwest::Client::builder()
@@ -3522,6 +3879,9 @@ async fn publish_bootstrap_snapshot(
         height: Some(height),
         tip_hash: Some(tip_hash_hex.to_string()),
         sha256: Some(sha256),
+        compressed_bytes: Some(compressed_bytes),
+        extracted_bytes: Some(archive_stats.extracted_bytes),
+        file_count: Some(archive_stats.file_count),
         updated_at,
     };
     let msg = serde_json::to_vec(&signed_fields)?;
@@ -3558,6 +3918,9 @@ async fn publish_bootstrap_snapshot(
         height: signed_fields.height,
         tip_hash: signed_fields.tip_hash,
         sha256: signed_fields.sha256,
+        compressed_bytes: signed_fields.compressed_bytes,
+        extracted_bytes: signed_fields.extracted_bytes,
+        file_count: signed_fields.file_count,
         updated_at: signed_fields.updated_at,
         publisher_pubkey: pub_hex,
         manifest_sig: sig_hex,
@@ -3719,6 +4082,9 @@ mod tests {
             sha256: Some(
                 "f199e63d0a621e7df67a1c7644ba78a87c8706f96d5d52610026b2c2d27ed843".to_string(),
             ),
+            compressed_bytes: None,
+            extracted_bytes: None,
+            file_count: None,
             publisher_pubkey,
             manifest_sig: String::new(),
             updated_at: 1_783_184_400,
@@ -3766,6 +4132,97 @@ mod tests {
     }
 
     #[test]
+    fn unverified_bootstrap_extract_limit_env_value_is_clamped() {
+        assert_eq!(
+            unverified_bootstrap_extract_limit_from_env_value(None),
+            DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
+        );
+        assert_eq!(
+            unverified_bootstrap_extract_limit_from_env_value(Some("not-a-number")),
+            DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
+        );
+        assert_eq!(
+            unverified_bootstrap_extract_limit_from_env_value(Some("1")),
+            MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
+        );
+        let over_max = (MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES + 1).to_string();
+        assert_eq!(
+            unverified_bootstrap_extract_limit_from_env_value(Some(over_max.as_str())),
+            MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
+        );
+    }
+
+    #[test]
+    fn bootstrap_download_size_checks_signed_exact_size() {
+        assert!(ensure_bootstrap_download_progress(9, Some(10), Some(1), "body").is_ok());
+        assert!(ensure_bootstrap_download_complete(10, Some(10), Some(1), "body").is_ok());
+
+        let too_large = ensure_bootstrap_download_progress(11, Some(10), None, "body")
+            .unwrap_err()
+            .to_string();
+        assert!(too_large.contains("too large for signed manifest"));
+
+        let incomplete = ensure_bootstrap_download_complete(9, Some(10), None, "body")
+            .unwrap_err()
+            .to_string();
+        assert!(incomplete.contains("size mismatch"));
+    }
+
+    #[test]
+    fn bootstrap_required_disk_bytes_includes_archive_sizes_and_buffer() {
+        assert_eq!(
+            bootstrap_required_disk_bytes(Some(2_048), 8_192),
+            2_048 + 8_192 + BOOTSTRAP_MIN_DISK_BUFFER_BYTES
+        );
+
+        let large_extracted = 200 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            bootstrap_required_disk_bytes(None, large_extracted),
+            large_extracted + (large_extracted / 20)
+        );
+    }
+
+    #[test]
+    fn bootstrap_archive_stats_enforce_signed_expectations() {
+        let expectations = BootstrapArchiveExpectations {
+            expected_extracted_bytes: Some(12),
+            expected_file_count: Some(2),
+            unverified_extract_limit: None,
+        };
+        let mut stats = BootstrapArchiveStats::default();
+
+        update_bootstrap_archive_stats(&mut stats, 5, expectations).unwrap();
+        update_bootstrap_archive_stats(&mut stats, 7, expectations).unwrap();
+        finalize_bootstrap_archive_stats(stats, expectations).unwrap();
+
+        let mut too_many_bytes = BootstrapArchiveStats::default();
+        let err =
+            update_bootstrap_archive_stats(&mut too_many_bytes, 13, expectations).unwrap_err();
+        assert!(err.contains("more data than signed manifest"));
+
+        let mismatch = BootstrapArchiveStats {
+            extracted_bytes: 12,
+            file_count: 1,
+        };
+        let err = finalize_bootstrap_archive_stats(mismatch, expectations).unwrap_err();
+        assert!(err.contains("file count mismatch"));
+    }
+
+    #[test]
+    fn unverified_bootstrap_archive_stats_enforce_extract_limit() {
+        let expectations = BootstrapArchiveExpectations {
+            expected_extracted_bytes: None,
+            expected_file_count: None,
+            unverified_extract_limit: Some(10),
+        };
+        let mut stats = BootstrapArchiveStats::default();
+
+        update_bootstrap_archive_stats(&mut stats, 10, expectations).unwrap();
+        let err = update_bootstrap_archive_stats(&mut stats, 1, expectations).unwrap_err();
+        assert!(err.contains("Unverified bootstrap archive extraction exceeded limit"));
+    }
+
+    #[test]
     fn bootstrap_manifest_signature_accepts_pinned_publisher() {
         let manifest = signed_bootstrap_manifest();
 
@@ -3783,6 +4240,28 @@ mod tests {
             verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bootstrap_manifest_signature_rejects_size_metadata_tampering() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.extracted_bytes = Some(42);
+
+        assert!(
+            verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_rejects_zero_size_metadata() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.compressed_bytes = Some(0);
+
+        let err = verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compressed byte count must be nonzero"));
     }
 
     #[test]

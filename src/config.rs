@@ -32,11 +32,7 @@ impl Default for NetworkConfig {
             bind_ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             max_peers: 50,
             max_connections: 200,
-            seed_nodes: vec![
-                "seed.alphanumeric.network:7177".to_string(),
-                "seed2.alphanumeric.network:7177".to_string(),
-                "a9seed.mynode.network:7177".to_string(),
-            ],
+            seed_nodes: Vec::new(),
             velocity_enabled: false,
             max_shred_size: 32 * 1024, // 32KB
             erasure_shards: 16,
@@ -102,7 +98,9 @@ impl NetworkConfig {
             }
         }
 
-        if let Ok(seed_nodes) = env::var("ALPHANUMERIC_SEED_NODES") {
+        if let Ok(seed_nodes) = env::var("ALPHANUMERIC_SEED_NODES")
+            .or_else(|_| env::var("ALPHANUMERIC_BOOTSTRAP_PEERS"))
+        {
             config.seed_nodes = seed_nodes
                 .split(',')
                 .filter_map(|s| {
@@ -143,14 +141,12 @@ impl NetworkConfig {
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub path: String,
-    pub max_size: Option<u64>,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             path: "blockchain.db".to_string(),
-            max_size: Some(10 * 1024 * 1024 * 1024), // 10GB
         }
     }
 }
@@ -161,12 +157,6 @@ impl DatabaseConfig {
 
         if let Ok(path) = env::var("ALPHANUMERIC_DB_PATH") {
             config.path = path;
-        }
-
-        if let Ok(max_size) = env::var("ALPHANUMERIC_MAX_DB_SIZE") {
-            if let Ok(size) = max_size.parse::<u64>() {
-                config.max_size = Some(size);
-            }
         }
 
         config

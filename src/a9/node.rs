@@ -724,6 +724,15 @@ pub struct TcpNatConfig {
 // Node Implementation
 //----------------------------------------------------------------------
 
+#[derive(Clone, Debug, Default)]
+pub struct NodeRuntimeConfig {
+    pub bind_addr: Option<SocketAddr>,
+    pub velocity_enabled: bool,
+    pub max_peers: usize,
+    pub max_connections: usize,
+    pub seed_nodes: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Node {
     // Core components
@@ -755,6 +764,7 @@ pub struct Node {
     pub peer_id: String,
     inbound_attempts: Arc<RwLock<HashMap<IpAddr, (u32, u64)>>>,
     peer_cache_path: Arc<String>,
+    configured_seed_nodes: Arc<Vec<String>>,
 
     // Consensus state
     tx_response_channels: Arc<RwLock<HashMap<String, oneshot::Sender<Option<Transaction>>>>>,
@@ -891,11 +901,15 @@ impl Node {
         db: Arc<Db>,
         blockchain: Arc<RwLock<Blockchain>>,
         handshake_key_bytes: Vec<u8>,
-        bind_addr: Option<SocketAddr>,
-        velocity_enabled: bool,
-        max_peers: usize,
-        max_connections: usize,
+        runtime_config: NodeRuntimeConfig,
     ) -> Result<Self, NodeError> {
+        let NodeRuntimeConfig {
+            bind_addr,
+            velocity_enabled,
+            max_peers,
+            max_connections,
+            seed_nodes: configured_seed_nodes,
+        } = runtime_config;
         let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
             .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
@@ -1021,6 +1035,7 @@ impl Node {
             handshake_key_bytes: Arc::new(handshake_key_bytes),
             inbound_attempts: Arc::new(RwLock::new(HashMap::new())),
             peer_cache_path: Arc::new(peer_cache_path),
+            configured_seed_nodes: Arc::new(configured_seed_nodes),
         })
     }
 
@@ -1305,14 +1320,8 @@ impl Node {
             .collect()
     }
 
-    fn configured_seed_nodes() -> Vec<String> {
-        let seeds = std::env::var("ALPHANUMERIC_SEED_NODES")
-            .or_else(|_| std::env::var("ALPHANUMERIC_BOOTSTRAP_PEERS"))
-            .ok();
-        if let Some(seeds) = seeds {
-            return Self::parse_seed_list(&seeds);
-        }
-        Vec::new()
+    fn configured_seed_nodes(&self) -> &[String] {
+        self.configured_seed_nodes.as_slice()
     }
 
     fn dns_seeds() -> Vec<String> {
@@ -1665,6 +1674,27 @@ impl Node {
         }
     }
 
+    fn filter_dialable_discovery_candidates<I>(
+        addrs: I,
+        bind_addr: SocketAddr,
+        current_peers: &HashSet<SocketAddr>,
+        allow_private: bool,
+    ) -> Vec<SocketAddr>
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        let mut seen_addrs = HashSet::new();
+        addrs
+            .into_iter()
+            .filter(|addr| {
+                *addr != bind_addr
+                    && !current_peers.contains(addr)
+                    && Self::is_dialable_discovery_addr(addr, allow_private)
+                    && seen_addrs.insert(*addr)
+            })
+            .collect()
+    }
+
     async fn fetch_discovery_peers(&self) -> Result<Vec<SocketAddr>, NodeError> {
         let mut all_addrs = Vec::new();
         let mut seen_addrs = HashSet::new();
@@ -1734,7 +1764,7 @@ impl Node {
             Ok(addrs) => addrs,
             Err(fetch_err) => {
                 let mut fallback_addrs: Vec<SocketAddr> = self.load_peer_cache();
-                for seed in Self::configured_seed_nodes() {
+                for seed in self.configured_seed_nodes() {
                     match tokio::net::lookup_host(seed.as_str()).await {
                         Ok(addrs) => fallback_addrs.extend(addrs),
                         Err(e) => debug!("Seed node lookup failed for {}: {}", seed, e),
@@ -1748,12 +1778,13 @@ impl Node {
             }
         };
         let allow_private = Self::private_discovery_peers_allowed();
-        let mut seen_addrs = HashSet::new();
-        addrs.retain(|addr| {
-            *addr != self.bind_addr
-                && Self::is_dialable_discovery_addr(addr, allow_private)
-                && seen_addrs.insert(*addr)
-        });
+        let current_peers: HashSet<SocketAddr> = self.peers.read().await.keys().copied().collect();
+        addrs = Self::filter_dialable_discovery_candidates(
+            addrs,
+            self.bind_addr,
+            &current_peers,
+            allow_private,
+        );
         if addrs.is_empty() {
             return Err(NodeError::Network("No dialable discovery peers".into()));
         }
@@ -1801,12 +1832,19 @@ impl Node {
     fn save_peer_cache(&self, peers: &[SocketAddr]) -> Result<(), NodeError> {
         let path = &*self.peer_cache_path;
         let tmp_path = format!("{}.tmp", path);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| NodeError::Io(format!("Peer cache mkdir error: {}", e)))?;
+            }
+        }
         let list: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
         let data = serde_json::to_string(&list)
             .map_err(|e| NodeError::Serialization(format!("Peer cache error: {}", e)))?;
         std::fs::write(&tmp_path, data)
             .map_err(|e| NodeError::Io(format!("Peer cache write error: {}", e)))?;
-        let _ = std::fs::rename(&tmp_path, path);
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| NodeError::Io(format!("Peer cache rename error: {}", e)))?;
         Ok(())
     }
 
@@ -2952,11 +2990,11 @@ impl Node {
         };
 
         let needs_more_peers = current_peers.len() < MIN_TARGET_PEERS;
-        let configured_seed_nodes = Self::configured_seed_nodes();
+        let configured_seed_nodes = self.configured_seed_nodes();
 
         if needs_more_peers {
             discovered_addrs.extend(self.load_peer_cache());
-            for seed in &configured_seed_nodes {
+            for seed in configured_seed_nodes {
                 match tokio::net::lookup_host(seed.as_str()).await {
                     Ok(addrs) => discovered_addrs.extend(addrs),
                     Err(e) => debug!("Seed node lookup failed for {}: {}", seed, e),
@@ -3030,10 +3068,12 @@ impl Node {
             }
         }
 
-        let mut new_addrs: Vec<_> = discovered_addrs
-            .into_iter()
-            .filter(|addr| *addr != self.bind_addr && !current_peers.contains(addr))
-            .collect();
+        let mut new_addrs = Self::filter_dialable_discovery_candidates(
+            discovered_addrs,
+            self.bind_addr,
+            &current_peers,
+            Self::private_discovery_peers_allowed(),
+        );
 
         if new_addrs.is_empty() {
             info!("No new peers discovered");
@@ -7538,6 +7578,48 @@ mod tests {
         assert!(Node::is_dialable_discovery_addr(&private_addr, true));
         assert!(Node::is_dialable_discovery_addr(&loopback_addr, true));
         assert!(!Node::is_dialable_discovery_addr(&unspecified_addr, true));
+    }
+
+    #[test]
+    fn discovery_candidate_filter_dedupes_and_skips_current_or_private_peers() {
+        let bind_addr: SocketAddr = "0.0.0.0:7177".parse().unwrap();
+        let current_peer: SocketAddr = "1.1.1.1:7177".parse().unwrap();
+        let public_peer: SocketAddr = "8.8.8.8:7177".parse().unwrap();
+        let private_peer: SocketAddr = "10.0.0.2:7177".parse().unwrap();
+        let mut current_peers = HashSet::new();
+        current_peers.insert(current_peer);
+
+        let filtered = Node::filter_dialable_discovery_candidates(
+            [
+                bind_addr,
+                current_peer,
+                private_peer,
+                public_peer,
+                public_peer,
+                "8.8.4.4:0".parse().unwrap(),
+            ],
+            bind_addr,
+            &current_peers,
+            false,
+        );
+
+        assert_eq!(filtered, vec![public_peer]);
+    }
+
+    #[test]
+    fn discovery_candidate_filter_can_include_private_peers_when_explicit() {
+        let bind_addr: SocketAddr = "0.0.0.0:7177".parse().unwrap();
+        let private_peer: SocketAddr = "10.0.0.2:7177".parse().unwrap();
+        let current_peers = HashSet::new();
+
+        let filtered = Node::filter_dialable_discovery_candidates(
+            [private_peer],
+            bind_addr,
+            &current_peers,
+            true,
+        );
+
+        assert_eq!(filtered, vec![private_peer]);
     }
 
     #[test]

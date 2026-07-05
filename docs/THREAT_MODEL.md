@@ -7,7 +7,7 @@ This model covers consensus-critical behavior in `src/a9/blockchain.rs`, `src/a9
 - Deterministic block validity across nodes.
 - Strong transaction authenticity and sender-key binding.
 - Header verification resistant to small colluding sets when verifier context is available.
-- Bootstrap state integrity via canonical source + optional manifest hash validation.
+- Bootstrap state integrity via pinned publisher manifests, archive hash validation, and signed size metadata when available.
 - Bounded resource usage under malformed peer input.
 
 ## Trust Boundaries
@@ -28,9 +28,9 @@ Coverage: `verifier_threshold_is_ratio_based_for_small_sets`, `verifier_threshol
 Control: removed manual `unsafe impl Send/Sync` for `HybridSwarm`; rely on compiler-enforced trait bounds.
 Coverage: compile-time safety checks.
 
-4. Bootstrap poisoning via weak manifests or malformed hashes.
-Control: canonical bootstrap URL, manifest fallback, strict SHA-256 format checks, and hash enforcement when a valid manifest hash is present.
-Coverage: startup path in `ensure_bootstrap_db` and `is_valid_sha256_hex`.
+4. Bootstrap poisoning or resource exhaustion via weak manifests, malformed hashes, or oversized archives.
+Control: HTTPS bootstrap URLs, pinned publisher identity, signed manifest fields, strict SHA-256 format checks, streamed download verification, signed archive size/file-count checks, disk preflight, and bounded unverified fallback extraction.
+Coverage: startup path in `ensure_bootstrap_db`, manifest verification tests, and bootstrap archive size tests.
 
 5. Balance/amount divergence from floating-point comparisons in consensus checks.
 Control: integer unit-based minimum amount checks and integer tolerance logic for difficulty validation.
@@ -43,9 +43,9 @@ Coverage: `orphan_index_round_trip_extracts_hash`.
 ## Residual Risks
 - Multi-node adversarial integration coverage is still limited compared with mature L1 test harnesses.
 - Some consensus-adjacent modules still contain inactive/dead paths that increase audit surface.
-- Bootstrap authenticity is integrity-checked, but publisher identity pinning is not mandatory in default runtime mode.
+- Signed official bootstraps remain compatible with older manifests that do not yet include size metadata; those should be republished with current publisher tooling.
 
 ## Test And Control Mapping
 - Unit tests are embedded in consensus modules for deterministic math, thresholding behavior, and compatibility conversions.
 - Compile-time checks now enforce safe concurrency traits for swarm ownership.
-- Runtime startup checks enforce canonical source and hash integrity before trusting chain snapshots.
+- Runtime startup checks enforce pinned publisher identity, signed manifest integrity, hash integrity, and archive extraction constraints before trusting chain snapshots.
