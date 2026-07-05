@@ -24,6 +24,7 @@ const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
 const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {msg}";
 const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {msg}";
+const TIP_CHANGE_CHECK_INTERVAL: u64 = 256;
 
 #[derive(Debug, Clone, Error)]
 pub enum CryptoError {
@@ -190,7 +191,7 @@ impl MiningManager {
         transactions: &[ProgPowTransaction],
         max_nonce: u64,
         miner_address: String,
-        reward_amount: f64,
+        _reward_amount: f64,
     ) -> Result<(u64, String, Block), MiningError> {
         self.sync_params_with_blockchain().await?;
 
@@ -210,22 +211,10 @@ impl MiningManager {
                 tx
             })
             .collect();
-        let mut mining_transactions = transactions;
-        let reward_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let reward_tx = Transaction::new(
-            "MINING_REWARDS".to_string(),
-            miner_address.clone(),
-            reward_amount,
-            NETWORK_FEE,
-            reward_timestamp,
-            None,
-        );
-        mining_transactions.insert(0, reward_tx);
+        let mining_transactions = transactions;
 
         let found = Arc::new(AtomicBool::new(false));
+        let abort_for_tip_change = Arc::new(AtomicBool::new(false));
         let result_nonce = Arc::new(AtomicU64::new(0));
         let result_timestamp = Arc::new(AtomicU64::new(0));
         let result_difficulty = Arc::new(AtomicU64::new(0));
@@ -256,13 +245,18 @@ impl MiningManager {
 
         let mut current_nonce: u64 = 0;
         let update_interval = 1000;
+        let tip_change_counter = {
+            let blockchain_guard = self.blockchain.read().await;
+            blockchain_guard.tip_change_counter_handle()
+        };
 
-        loop {
+        'mining: loop {
             let (
                 previous_difficulty,
                 previous_block_hash,
                 previous_block_timestamp,
                 current_height,
+                template_tip_version,
             ) = {
                 let blockchain_guard = self.blockchain.read().await;
                 let previous_block = blockchain_guard.get_last_block().ok_or_else(|| {
@@ -273,6 +267,7 @@ impl MiningManager {
                     previous_block.hash,
                     previous_block.timestamp,
                     previous_block.index.saturating_add(1),
+                    blockchain_guard.tip_change_version(),
                 )
             };
 
@@ -280,6 +275,7 @@ impl MiningManager {
                 header.number = current_height;
                 if let Ok(pb) = progress_bar.lock() {
                     pb.set_prefix(format!("Block #{}", header.number));
+                    pb.set_message("New network tip detected; rebuilding block template...");
                 }
                 current_nonce = 0;
                 continue;
@@ -287,15 +283,10 @@ impl MiningManager {
 
             let block_transactions = {
                 let blockchain_lock = self.blockchain.write().await;
-                let mut selected = Vec::with_capacity(mining_transactions.len());
+                let mut selected_regular = Vec::with_capacity(mining_transactions.len());
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
 
                 for transaction in &mining_transactions {
-                    if transaction.sender == "MINING_REWARDS" {
-                        selected.push(transaction.clone());
-                        continue;
-                    }
-
                     let confirmed_balance = blockchain_lock
                         .get_confirmed_balance(&transaction.sender)
                         .await?;
@@ -307,12 +298,28 @@ impl MiningManager {
                     let required_units = transaction.total_debit_units();
 
                     if confirmed_units.saturating_sub(already_selected) >= required_units {
-                        selected.push(transaction.clone());
+                        selected_regular.push(transaction.clone());
                         *sender_debits.entry(transaction.sender.clone()).or_default() +=
                             required_units;
                     }
                 }
 
+                let reward_amount = blockchain_lock.get_block_reward(&selected_regular);
+                let reward_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let reward_tx = Transaction::new(
+                    "MINING_REWARDS".to_string(),
+                    miner_address.clone(),
+                    reward_amount,
+                    NETWORK_FEE,
+                    reward_timestamp,
+                    None,
+                );
+                let mut selected = Vec::with_capacity(selected_regular.len() + 1);
+                selected.push(reward_tx);
+                selected.extend(selected_regular);
                 selected
             };
 
@@ -321,8 +328,15 @@ impl MiningManager {
 
             let progress_bar = Arc::clone(&progress_bar);
 
+            found.store(false, Ordering::Release);
+            abort_for_tip_change.store(false, Ordering::Release);
+
             let result_timestamp = Arc::clone(&result_timestamp);
             let result_difficulty = Arc::clone(&result_difficulty);
+            let abort_for_tip_change_check = Arc::clone(&abort_for_tip_change);
+            let tip_change_counter_check = Arc::clone(&tip_change_counter);
+            let blockchain_for_tip_checks = Arc::clone(&self.blockchain);
+            let expected_parent_index = header.number.saturating_sub(1);
 
             let mining_result: Result<(), MiningError> = (0..num_threads as u64)
                 .into_par_iter()
@@ -341,7 +355,9 @@ impl MiningManager {
                     let mut cached_target = BigUint::from(0u8);
 
                     for nonce in start_nonce..end_nonce {
-                        if found.load(Ordering::Relaxed) {
+                        if found.load(Ordering::Relaxed)
+                            || abort_for_tip_change_check.load(Ordering::Relaxed)
+                        {
                             return Ok(());
                         }
 
@@ -400,6 +416,26 @@ impl MiningManager {
                             return Ok(());
                         }
 
+                        if nonce % TIP_CHANGE_CHECK_INTERVAL == 0 {
+                            if tip_change_counter_check.load(Ordering::Acquire)
+                                != template_tip_version
+                            {
+                                abort_for_tip_change_check.store(true, Ordering::Release);
+                                return Ok(());
+                            }
+
+                            if let Ok(blockchain) = blockchain_for_tip_checks.try_read() {
+                                if let Some(tip) = blockchain.get_last_block() {
+                                    if tip.index != expected_parent_index
+                                        || tip.hash != previous_block_hash
+                                    {
+                                        abort_for_tip_change_check.store(true, Ordering::Release);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+
                         if nonce % update_interval == 0 {
                             if let Ok(pb) = progress_bar.try_lock() {
                                 pb.set_position(nonce.saturating_sub(current_nonce));
@@ -427,6 +463,25 @@ impl MiningManager {
                 ));
             }
 
+            if abort_for_tip_change.load(Ordering::Acquire) && !found.load(Ordering::Acquire) {
+                let latest_height = {
+                    let blockchain_guard = self.blockchain.read().await;
+                    blockchain_guard
+                        .get_last_block()
+                        .map(|block| block.index.saturating_add(1))
+                };
+                if let Some(height) = latest_height {
+                    header.number = height;
+                }
+                current_nonce = 0;
+                if let Ok(pb) = progress_bar.lock() {
+                    pb.reset();
+                    pb.set_prefix(format!("Block #{}", header.number));
+                    pb.set_message("New network tip detected; mining next block...");
+                }
+                continue;
+            }
+
             if found.load(Ordering::Relaxed) {
                 let nonce = result_nonce.load(Ordering::Acquire);
                 let found_timestamp = result_timestamp.load(Ordering::Acquire);
@@ -440,9 +495,10 @@ impl MiningManager {
                     }
                 };
                 let hash_string = hex::encode(&hash);
+                let mined_index = header.number;
 
                 let mut new_block = Block {
-                    index: header.number,
+                    index: mined_index,
                     previous_hash: previous_block_hash,
                     timestamp: found_timestamp,
                     transactions: block_transactions,
@@ -521,6 +577,34 @@ impl MiningManager {
                                     return Ok((nonce, hash_string, mined_block));
                                 }
                                 Err(e) => {
+                                    if matches!(e, BlockchainError::InvalidBlockHeader) {
+                                        let stale_template = {
+                                            let blockchain_guard = self.blockchain.read().await;
+                                            blockchain_guard
+                                                .get_last_block()
+                                                .map(|block| {
+                                                    (
+                                                        block.index.saturating_add(1),
+                                                        block.hash != previous_block_hash
+                                                            || block.index.saturating_add(1)
+                                                                != mined_index,
+                                                    )
+                                                })
+                                        };
+                                        if let Some((height, true)) = stale_template {
+                                            header.number = height;
+                                            current_nonce = 0;
+                                            if let Ok(pb) = progress_bar.lock() {
+                                                pb.reset();
+                                                pb.set_prefix(format!("Block #{}", header.number));
+                                                pb.set_message(
+                                                    "Solved stale block; mining next network tip...",
+                                                );
+                                            }
+                                            continue 'mining;
+                                        }
+                                    }
+
                                     if let Ok(pb) = progress_bar.lock() {
                                         pb.finish_with_message("Block finalization failed");
                                     }

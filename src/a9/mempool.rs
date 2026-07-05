@@ -101,6 +101,10 @@ impl Mempool {
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
         self.prune_expired();
+        let tx_id = tx.get_tx_id();
+        if self.find_transaction_by_id(&tx_id).is_some() {
+            return Ok(());
+        }
 
         // Now do the expensive serialization
         let tx_size = codec::serialize(&tx)
@@ -142,7 +146,6 @@ impl Mempool {
         }
 
         // Create entry
-        let tx_id = tx.get_tx_id();
         let sender = tx.sender.clone();
         let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
         let entry = MempoolEntry {

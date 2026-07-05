@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::a9::codec;
 use crate::a9::mempool::{Mempool, TemporalVerification};
@@ -931,6 +931,16 @@ pub struct Blockchain {
     pub chain_sentinel: Arc<ChainSentinel>,
     pub temporal_verification: TemporalVerification,
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
+    state_mutation_lock: Arc<Mutex<()>>,
+    tip_change_counter: Arc<AtomicU64>,
+    tip_watch_tx: watch::Sender<ChainTipSignal>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChainTipSignal {
+    pub height: u32,
+    pub hash: [u8; 32],
+    pub version: u64,
 }
 
 impl fmt::Display for Blockchain {
@@ -985,6 +995,37 @@ impl Blockchain {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    pub fn tip_change_counter_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.tip_change_counter)
+    }
+
+    pub fn tip_change_version(&self) -> u64 {
+        self.tip_change_counter.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_tip_changes(&self) -> watch::Receiver<ChainTipSignal> {
+        self.tip_watch_tx.subscribe()
+    }
+
+    pub fn current_tip_signal(&self) -> ChainTipSignal {
+        *self.tip_watch_tx.borrow()
+    }
+
+    fn notify_tip_changed(&self, block: &Block) {
+        let version = self.tip_change_counter.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.tip_watch_tx.send(ChainTipSignal {
+            height: block.index,
+            hash: block.hash,
+            version,
+        });
+    }
+
+    fn refresh_tip_signal_from_current_tip(&self) {
+        if let Some(block) = self.get_last_block() {
+            self.notify_tip_changed(&block);
+        }
     }
 
     fn orphan_hash_key(hash: &[u8; 32]) -> String {
@@ -1628,6 +1669,7 @@ impl Blockchain {
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+        self.notify_tip_changed(&branch_tip);
 
         Ok(true)
     }
@@ -1816,6 +1858,7 @@ impl Blockchain {
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+        self.notify_tip_changed(block);
 
         Ok(())
     }
@@ -2013,6 +2056,8 @@ impl Blockchain {
         let signature_cache = Arc::new(PLMutex::new(LruCache::new(
             Self::signature_cache_capacity(),
         )));
+        let tip_change_counter = Arc::new(AtomicU64::new(0));
+        let (tip_watch_tx, _) = watch::channel(ChainTipSignal::default());
 
         // Create the blockchain instance using passed in difficulty
         let blockchain = Self {
@@ -2027,6 +2072,9 @@ impl Blockchain {
             chain_sentinel,
             temporal_verification: TemporalVerification::new(),
             signature_cache,
+            state_mutation_lock: Arc::new(Mutex::new(())),
+            tip_change_counter,
+            tip_watch_tx,
         };
 
         // Ensure pending tx trees exist (do not clear at startup).
@@ -2070,6 +2118,7 @@ impl Blockchain {
         }
         self.prune_orphans()?;
         let _ = self.promote_orphans_from_tip().await;
+        self.refresh_tip_signal_from_current_tip();
 
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
@@ -2150,6 +2199,8 @@ impl Blockchain {
         // This prevents trivial junk from occupying orphan capacity.
         self.prevalidate_unattached_block_strict(block).await?;
 
+        let _state_guard = self.state_mutation_lock.lock().await;
+
         // Enforce linear tip extension and park out-of-order blocks as orphans.
         match self.highest_block_index() {
             None => {
@@ -2195,6 +2246,8 @@ impl Blockchain {
         // signature receipt + full-signature hash, not the full ML-DSA witness.
         self.prevalidate_unattached_block(block, SignatureValidationMode::AllowTruncatedStored)
             .await?;
+
+        let _state_guard = self.state_mutation_lock.lock().await;
 
         match self.highest_block_index() {
             None => {
@@ -2244,6 +2297,7 @@ impl Blockchain {
         block: Block,
         _miner_address: String,
     ) -> Result<(), BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
         let trace_finalize = std::env::var("ALPHANUMERIC_TRACE_FINALIZE")
             .map(|v| !v.trim().is_empty() && v.trim() != "0")
             .unwrap_or(false);
@@ -2365,6 +2419,7 @@ impl Blockchain {
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+        self.notify_tip_changed(&block);
         let _ = self.promote_orphans_from_tip().await;
 
         Ok(())
@@ -2374,6 +2429,7 @@ impl Blockchain {
         &self,
         transactions: &[Transaction],
     ) -> Result<(), BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
         // Clear from pending transactions tree
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
@@ -2919,21 +2975,6 @@ impl Blockchain {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        // Get confirmed balance and pending debit index (O(1) lookup)
-        let mempool_guard = self.mempool.read().await;
-
-        let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
-        let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
-
-        // Calculate available balance considering pending transactions
-        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
-        let total_required = transaction.total_debit_units();
-
-        // Check if there's enough available balance
-        if available_balance < total_required {
-            return Err(BlockchainError::InsufficientFunds);
-        }
-
         // Signature verification with public key binding
         let pub_key = match transaction.pub_key.as_ref() {
             Some(pk) => pk,
@@ -2976,25 +3017,43 @@ impl Blockchain {
         let storage_tx = mempool_tx.with_truncated_signature(sig_hash);
         let tx_id = storage_tx.get_tx_id();
 
-        // Add to mempool first (faster in-memory operation)
-        drop(mempool_guard); // Release read lock before getting write lock
+        let _state_guard = self.state_mutation_lock.lock().await;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let pending_debits_tree = self.open_pending_debits_tree()?;
+        let pending_credits_tree = self.open_pending_credits_tree()?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
+        let sync_pending_writes = std::env::var("ALPHANUMERIC_SYNC_PENDING_WRITES")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if pending_tree.get(tx_id.as_bytes())?.is_some() {
+            if full_sigs_tree.get(tx_id.as_bytes())?.is_none() {
+                full_sigs_tree.insert(tx_id.as_bytes(), sig_bytes)?;
+                if sync_pending_writes {
+                    full_sigs_tree.flush()?;
+                }
+            }
+            self.add_to_mempool(mempool_tx).await?;
+            return Ok(());
+        }
+
+        let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
+        let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
+
+        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
+        let total_required = transaction.total_debit_units();
+        if available_balance < total_required {
+            return Err(BlockchainError::InsufficientFunds);
+        }
+
         self.add_to_mempool(mempool_tx).await?;
 
         // Store full signature witness in sidecar (keyed by tx_id) so mempool can be rehydrated after restart.
         // The main pending tx record remains compact (truncated signature + sig_hash).
-        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         full_sigs_tree.insert(tx_id.as_bytes(), sig_bytes)?;
 
-        // Store in pending transactions
-        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        let pending_debits_tree = self.open_pending_debits_tree()?;
-        let pending_credits_tree = self.open_pending_credits_tree()?;
         let tx_bytes = codec::serialize(&storage_tx)?;
-
-        // Use batch operation for atomic updates
-        let mut batch = sled::Batch::default();
-        batch.insert(tx_id.as_bytes(), tx_bytes);
-        pending_tree.apply_batch(batch)?;
+        pending_tree.insert(tx_id.as_bytes(), tx_bytes)?;
 
         let current_debit = self.get_pending_debit_units(&transaction.sender).await?;
         let next_debit = current_debit + storage_tx.total_debit_units();
@@ -3008,9 +3067,6 @@ impl Blockchain {
         // Hot path durability policy:
         // defer fsync to periodic DB flushing to avoid per-transaction stalls.
         // Set ALPHANUMERIC_SYNC_PENDING_WRITES=true to force immediate pending-tree flushes.
-        let sync_pending_writes = std::env::var("ALPHANUMERIC_SYNC_PENDING_WRITES")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         if sync_pending_writes {
             full_sigs_tree.flush()?;
             pending_tree.flush()?;
@@ -3184,6 +3240,7 @@ impl Blockchain {
     }
 
     pub async fn sync_mempool_with_sled(&self) -> Result<(), BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
         // Clear existing mempool
         let mut mempool = self.mempool.write().await;
 
@@ -3820,6 +3877,64 @@ mod tests {
     }
 
     #[test]
+    fn tip_signal_counter_and_watch_update_together() {
+        let blockchain = test_blockchain();
+        let block = metadata_test_block(1, [7u8; 32], "miner1", 1.0);
+        let mut receiver = blockchain.subscribe_tip_changes();
+
+        assert_eq!(blockchain.tip_change_version(), 0);
+
+        blockchain.notify_tip_changed(&block);
+
+        assert_eq!(blockchain.tip_change_version(), 1);
+        assert!(receiver
+            .has_changed()
+            .expect("tip receiver should observe update"));
+        let signal = *receiver.borrow_and_update();
+        assert_eq!(signal.height, block.index);
+        assert_eq!(signal.hash, block.hash);
+        assert_eq!(signal.version, 1);
+        assert_eq!(blockchain.current_tip_signal(), signal);
+    }
+
+    fn set_confirmed_balance(blockchain: &Blockchain, address: &str, amount_units: i128) {
+        let balances_tree = blockchain
+            .db
+            .open_tree(BALANCES_TREE)
+            .expect("balances tree should open");
+        balances_tree
+            .insert(address.as_bytes(), codec::serialize(&amount_units).unwrap())
+            .expect("balance insert should succeed");
+    }
+
+    async fn signed_transfer(
+        wallet: &Wallet,
+        recipient: &str,
+        amount: f64,
+        timestamp: u64,
+    ) -> Transaction {
+        let fee = amount * FEE_PERCENTAGE;
+        let message = format!(
+            "{}:{}:{:.8}:{:.8}:{}",
+            wallet.address, recipient, amount, fee, timestamp
+        );
+        let signature = wallet
+            .sign_transaction(message.as_bytes())
+            .await
+            .expect("test wallet should sign");
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            recipient.to_string(),
+            amount,
+            fee,
+            timestamp,
+            Some(signature),
+        );
+        tx.pub_key = wallet.get_public_key_hex().await;
+        tx
+    }
+
+    #[test]
     fn pow_target_zero_difficulty_is_max_target() {
         assert_eq!(pow_target_from_difficulty(0), *MAX_TARGET);
     }
@@ -4092,6 +4207,66 @@ mod tests {
             .await
             .expect_err("negative fee should be rejected before balance/signature checks");
         assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
+    }
+
+    #[tokio::test]
+    async fn duplicate_transaction_admission_is_idempotent() {
+        let blockchain = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let tx = signed_transfer(&wallet, "bob", 1.0, 10_000).await;
+        set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
+
+        blockchain
+            .add_transaction(tx.clone())
+            .await
+            .expect("first admission should succeed");
+        blockchain
+            .add_transaction(tx.clone())
+            .await
+            .expect("duplicate admission should be idempotent");
+
+        let pending_debit = blockchain
+            .get_pending_debit_units(&wallet.address)
+            .await
+            .expect("pending debit should load");
+        assert_eq!(pending_debit, tx.total_debit_units());
+
+        let mempool = blockchain
+            .get_mempool_transactions()
+            .await
+            .expect("mempool should load");
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_sender_admission_respects_pending_debits() {
+        let blockchain = Arc::new(test_blockchain());
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let tx1 = signed_transfer(&wallet, "bob", 1.0, 10_001).await;
+        let tx2 = signed_transfer(&wallet, "carol", 1.0, 10_002).await;
+        set_confirmed_balance(&blockchain, &wallet.address, tx1.total_debit_units());
+
+        let chain1 = Arc::clone(&blockchain);
+        let chain2 = Arc::clone(&blockchain);
+        let (res1, res2) = tokio::join!(
+            async move { chain1.add_transaction(tx1).await },
+            async move { chain2.add_transaction(tx2).await }
+        );
+
+        let results = [res1, res2];
+        let accepted = results.iter().filter(|res| res.is_ok()).count();
+        let insufficient = results
+            .iter()
+            .filter(|res| matches!(res, Err(BlockchainError::InsufficientFunds)))
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(insufficient, 1);
+
+        let mempool = blockchain
+            .get_mempool_transactions()
+            .await
+            .expect("mempool should load");
+        assert_eq!(mempool.len(), 1);
     }
 
     #[tokio::test]
