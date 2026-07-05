@@ -73,6 +73,7 @@ const PEER_TIMEOUT: u64 = 300; // seconds
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const ANNOUNCE_INTERVAL: u64 = 60; // seconds
 const HEADER_SNAPSHOT_INTERVAL: u64 = 60; // seconds
+const DEFAULT_RELAY_SYNC_INTERVAL_SECS: u64 = 3;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
 const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
@@ -1308,6 +1309,13 @@ impl Node {
             .collect()
     }
 
+    fn discovery_snapshot_urls() -> Vec<String> {
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/chain-snapshot", base))
+            .collect()
+    }
+
     fn discovery_blocks_urls() -> Vec<String> {
         if let Ok(url) = std::env::var("ALPHANUMERIC_BLOCKS_URL") {
             return vec![url];
@@ -1324,6 +1332,72 @@ impl Node {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(4)
             .min(12)
+    }
+
+    fn relay_sync_interval_secs() -> u64 {
+        std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RELAY_SYNC_INTERVAL_SECS)
+            .clamp(1, 60)
+    }
+
+    fn json_height(value: Option<&Value>) -> Option<u32> {
+        value
+            .and_then(|value| value.get("height"))
+            .and_then(Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+    }
+
+    fn public_tip_height_from_snapshot(body: &Value) -> Option<u32> {
+        let mut best = 0u32;
+
+        if body
+            .get("canonical_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(height) = Self::json_height(body.get("canonical_stats")) {
+                best = best.max(height);
+            }
+        }
+
+        if body
+            .get("observed_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(height) = Self::json_height(body.get("observed_stats")) {
+                best = best.max(height);
+            }
+        }
+
+        let source = body.get("source").and_then(Value::as_str).unwrap_or("");
+        let observed_source = body
+            .get("observed_source")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if matches!(source, "pending" | "push" | "snapshot" | "indexer")
+            || matches!(observed_source, "pending" | "push" | "snapshot" | "indexer")
+        {
+            if let Some(height) = Self::json_height(body.get("stats")) {
+                best = best.max(height);
+            }
+            if let Some(height) = Self::json_height(body.get("observed_stats")) {
+                best = best.max(height);
+            }
+        }
+
+        if let Some(height) = body
+            .get("diagnostics")
+            .and_then(|diagnostics| diagnostics.get("relay_backed_height"))
+            .and_then(Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+        {
+            best = best.max(height);
+        }
+
+        (best > 0).then_some(best)
     }
 
     async fn mark_block_relayed(&self, block: &Block) {
@@ -2123,6 +2197,96 @@ impl Node {
         }
     }
 
+    async fn fetch_public_tip_height(&self) -> Result<Option<u32>, NodeError> {
+        let expected_network_id = hex::encode(self.network_id);
+        let mut best_height: Option<u32> = None;
+
+        for url in Self::discovery_snapshot_urls() {
+            let res = match self.http_client.get(url).send().await {
+                Ok(res) => res,
+                Err(e) => {
+                    debug!("Public tip check failed: {}", e);
+                    continue;
+                }
+            };
+
+            if !res.status().is_success() {
+                debug!("Public tip check returned {}", res.status());
+                continue;
+            }
+
+            let body = match res.json::<Value>().await {
+                Ok(body) => body,
+                Err(e) => {
+                    debug!("Public tip response parse failed: {}", e);
+                    continue;
+                }
+            };
+
+            let same_network = body
+                .get("network_id")
+                .and_then(Value::as_str)
+                .map(|network_id| network_id.eq_ignore_ascii_case(&expected_network_id))
+                .unwrap_or(false);
+            if !same_network {
+                continue;
+            }
+
+            if let Some(height) = Self::public_tip_height_from_snapshot(&body) {
+                best_height = Some(best_height.map_or(height, |best| best.max(height)));
+            }
+        }
+
+        Ok(best_height)
+    }
+
+    async fn enforce_public_tip_before_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
+        let public_height = match timeout(max_wait, self.fetch_public_tip_height()).await {
+            Ok(Ok(height)) => height,
+            Ok(Err(e)) => {
+                debug!("Public tip check skipped: {}", e);
+                return Ok(());
+            }
+            Err(_) => {
+                debug!("Public tip check timed out");
+                return Ok(());
+            }
+        };
+
+        let Some(public_height) = public_height else {
+            return Ok(());
+        };
+
+        let started_at = Instant::now();
+        loop {
+            let local_height = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
+
+            if local_height >= public_height {
+                return Ok(());
+            }
+
+            let elapsed = started_at.elapsed();
+            if elapsed >= max_wait {
+                return Err(NodeError::ConsensusFailure(format!(
+                    "network tip {} is ahead of local tip {}; mining paused until the relayed block is imported",
+                    public_height, local_height
+                )));
+            }
+
+            let remaining = max_wait.saturating_sub(elapsed);
+            match timeout(remaining, self.sync_with_block_relay(local_height)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!("Public tip pre-mine relay sync skipped: {}", e),
+                Err(_) => debug!("Public tip pre-mine relay sync timed out"),
+            }
+
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     async fn publish_discovery_state(&self, context: &str) {
         if let Err(e) = self.announce_to_discovery().await {
             warn!("{} discovery announce failed: {}", context, e);
@@ -2172,6 +2336,7 @@ impl Node {
                 Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
             }
         }
+        self.enforce_public_tip_before_mining(max_wait).await?;
         Ok(())
     }
 
@@ -3552,7 +3717,8 @@ impl Node {
 
         let node_clone = node.clone();
         tokio::spawn(async move {
-            let mut relay_interval = interval(Duration::from_secs(15));
+            let mut relay_interval =
+                interval(Duration::from_secs(Self::relay_sync_interval_secs()));
             loop {
                 relay_interval.tick().await;
                 let current_height = {

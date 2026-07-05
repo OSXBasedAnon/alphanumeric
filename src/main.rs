@@ -1334,6 +1334,10 @@ println!("Wallet renamed successfully");
 
                     println!("Preparing mining: checking peers and network tip...");
                     if let Err(e) = node.prepare_local_mining(Duration::from_secs(3)).await {
+                        if matches!(e, NodeError::ConsensusFailure(_)) {
+                            println!("Mining paused: {}", e);
+                            continue;
+                        }
                         warn!("Pre-mine preparation skipped: {}", e);
                     }
 
