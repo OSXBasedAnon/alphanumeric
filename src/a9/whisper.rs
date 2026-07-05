@@ -52,7 +52,6 @@ pub struct WhisperMessage {
 pub struct WhisperModule {
     frequency_map: HashMap<char, (f64, f64, u64)>,
     wallet_indices: DashMap<String, WalletIndex>,
-    pending_amounts: DashMap<String, f64>,
     db: Option<Arc<Db>>,
 }
 
@@ -64,7 +63,6 @@ impl WhisperModule {
         Self {
             frequency_map: Self::build_frequency_map(),
             wallet_indices: DashMap::new(),
-            pending_amounts: DashMap::new(),
             db: None,
         }
     }
@@ -366,27 +364,14 @@ impl WhisperModule {
         }
     }
 
-    async fn check_balance(
+    fn check_balance(
         &self,
-        wallet: &Wallet,
         total_cost: f64,
-        sender_balance: f64,
+        spendable_balance: f64,
     ) -> Result<(), BlockchainError> {
-        let pending_amount = self
-            .pending_amounts
-            .get(&wallet.address)
-            .map(|amount| *amount)
-            .unwrap_or(0.0);
-
-        if (sender_balance - pending_amount) < total_cost {
+        if spendable_balance < total_cost {
             return Err(BlockchainError::InsufficientFunds);
         }
-
-        // Add to pending amounts
-        self.pending_amounts
-            .entry(wallet.address.clone())
-            .and_modify(|e| *e += total_cost)
-            .or_insert(total_cost);
 
         Ok(())
     }
@@ -416,9 +401,7 @@ impl WhisperModule {
         let total_fee = self.encode_message_as_fee(message, timestamp, base_amount);
         let total_cost = base_amount + total_fee;
 
-        // Check balance including pending amounts
-        self.check_balance(wallet, total_cost, sender_balance)
-            .await?;
+        self.check_balance(total_cost, sender_balance)?;
 
         let message_str = format!(
             "{}:{}:{:.8}:{:.8}:{}",
@@ -633,5 +616,46 @@ impl WhisperModule {
 impl Default for WhisperModule {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn whisper_creation_does_not_double_count_previous_local_send() {
+        let whisper = WhisperModule::new();
+        let wallet = Wallet::new(None).expect("wallet should be created");
+        let recipient = Wallet::new(None)
+            .expect("recipient should be created")
+            .address;
+
+        let first = Transaction::new(
+            wallet.address.clone(),
+            recipient.clone(),
+            10.0,
+            0.0,
+            1,
+            None,
+        );
+        whisper
+            .create_whisper_transaction(first, &recipient, "HEYD", &wallet, 25.0)
+            .await
+            .expect("first whisper should pass");
+
+        let spendable_after_pending_one = 14.98927892;
+        let second = Transaction::new(wallet.address.clone(), recipient.clone(), 5.0, 0.0, 2, None);
+
+        whisper
+            .create_whisper_transaction(
+                second,
+                &recipient,
+                "dude",
+                &wallet,
+                spendable_after_pending_one,
+            )
+            .await
+            .expect("second whisper should use caller-provided spendable balance only");
     }
 }
