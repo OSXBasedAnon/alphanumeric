@@ -368,7 +368,7 @@ async fn main() -> Result<()> {
     config.log_config();
     let headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
 
-    let pb = ProgressBar::new(9);
+    let pb = ProgressBar::new(7);
     pb.set_style(
         ProgressStyle::with_template("\r{spinner:.green} [{bar:40.cyan/blue}] {msg}")?
             .progress_chars("█▓░"),
@@ -852,11 +852,6 @@ async fn main() -> Result<()> {
     local.await;
 });
 
-        // Mining manager
-        pb.set_message("Setting up mining manager...");
-        let mining_manager = MiningManager::new(Arc::clone(&blockchain));
-        pb.inc(1);
-
         pb.set_message("Loading wallets...");
         let key_data_result = fs::read_to_string(KEY_FILE_PATH).await;
         let wallet_data: Vec<WalletKeyData> = key_data_result
@@ -926,12 +921,6 @@ async fn main() -> Result<()> {
                 }
             });
         }
-
-        // Mining params
-        pb.set_message("Setting up mining parameters...");
-
-        let miner = Miner::new(blockchain.clone(), mining_manager);
-        pb.inc(1);
 
         // Initialize BPoS sentinel at startup
         {
@@ -1332,15 +1321,21 @@ println!("Wallet renamed successfully");
                         continue;
                     }
 
-                    println!("Preparing mining: checking peers and network tip...");
-                    if let Err(e) = node.prepare_local_mining(Duration::from_secs(3)).await {
-                        if matches!(e, NodeError::ConsensusFailure(_)) {
-                            println!("Mining paused: {}", e);
-                            continue;
+                    println!("Preparing mining: checking connected peers and chain freshness...");
+                    if let Err(e) = node.prepare_local_mining(Duration::from_secs(15)).await {
+                        match e {
+                            NodeError::ConsensusFailure(reason) => {
+                                println!("Mining paused: {}", reason);
+                            }
+                            other => {
+                                println!("Mining paused: {}", other);
+                            }
                         }
-                        warn!("Pre-mine preparation skipped: {}", e);
+                        continue;
                     }
 
+                    let mining_manager = MiningManager::new(Arc::clone(&blockchain));
+                    let miner = Miner::new(blockchain.clone(), mining_manager);
                     match mgmt
                         .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
                         .await

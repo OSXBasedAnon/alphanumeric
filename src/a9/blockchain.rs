@@ -25,7 +25,6 @@ use crate::a9::codec;
 use crate::a9::mempool::{Mempool, TemporalVerification};
 use crate::a9::mldsa;
 use crate::a9::oracle::DifficultyOracle;
-use crate::a9::progpow::MiningManager;
 use crate::a9::wallet::Wallet;
 
 const BALANCES_TREE: &str = "balances";
@@ -2588,18 +2587,10 @@ impl Blockchain {
         }
     }
     // Validation
-    pub async fn validate_chain(
-        &self,
-        mining_manager: &MiningManager,
-    ) -> Result<bool, BlockchainError> {
+    pub async fn validate_chain(&self) -> Result<bool, BlockchainError> {
         let mut previous_block: Option<Block> = None;
 
         for current_block in self.get_blocks() {
-            let _epoch = mining_manager
-                .get_last_epoch()
-                .await
-                .map_err(|e| BlockchainError::MiningError(e.to_string()))?;
-
             if let Err(e) = self.validate_block(&current_block).await {
                 error!("Block validation failed: {:?}", e);
                 return Ok(false);

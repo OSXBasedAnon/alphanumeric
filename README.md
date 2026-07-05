@@ -250,7 +250,6 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS` (optional periodic relay sync interval; `0` disables, minimum `60`)
 - `ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH` (default `0`; opt-in relay backfill depth, max `256`)
 - `ALPHANUMERIC_RELAY_SYNC_MAX_ROUNDS` (default `4`, max `24`)
-- `ALPHANUMERIC_ENFORCE_GATEWAY_TIP_BEFORE_MINING` (default off; opt in if an isolated miner should pause when gateway status is ahead)
 - `ALPHANUMERIC_PUBLIC_IP`
 - `ALPHANUMERIC_ENABLE_UPNP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`

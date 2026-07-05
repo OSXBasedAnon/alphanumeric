@@ -17,7 +17,6 @@ use crate::a9::blockchain::{
     BlockchainError, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
-use crate::a9::wallet::Wallet;
 
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
@@ -81,14 +80,6 @@ impl From<Box<dyn std::error::Error>> for MiningError {
 }
 
 #[derive(Debug, Clone)]
-pub struct MiningParams {
-    pub difficulty: f64,
-    pub block_reward: f64,
-    pub min_tx_fee: f64,
-    pub target_block_time: f64,
-}
-
-#[derive(Debug, Clone)]
 pub struct ProgPowHeader {
     pub number: u32,
     pub parent_hash: [u8; 32],
@@ -142,47 +133,12 @@ impl From<ProgPowTransaction> for Transaction {
 
 #[derive(Debug)]
 pub struct MiningManager {
-    pub params: Arc<RwLock<MiningParams>>,
-    pub last_epoch: Arc<RwLock<u32>>,
-    pub wallets: RwLock<HashMap<String, Wallet>>,
     blockchain: Arc<RwLock<Blockchain>>,
 }
 
 impl MiningManager {
-    // Constructor for MiningManager struct
-    pub fn clone_manager(&self) -> MiningManager {
-        MiningManager::new(self.blockchain.clone())
-    }
-
     pub fn new(blockchain: Arc<RwLock<Blockchain>>) -> Self {
-        Self {
-            params: Arc::new(RwLock::new(MiningParams {
-                difficulty: 0.0,
-                block_reward: 0.0,
-                min_tx_fee: 0.0,
-                target_block_time: 0.0,
-            })),
-            last_epoch: Arc::new(RwLock::new(0)),
-            wallets: RwLock::new(HashMap::new()),
-            blockchain,
-        }
-    }
-
-    async fn sync_params_with_blockchain(&self) -> Result<(), MiningError> {
-        let blockchain = self.blockchain.read().await;
-        let mut params = self.params.write().await;
-
-        params.block_reward = blockchain.mining_reward;
-        params.min_tx_fee = blockchain.transaction_fee;
-        params.target_block_time = blockchain.block_time as f64;
-        // Convert blockchain difficulty to our format if needed
-        params.difficulty = blockchain.get_current_difficulty().await as f64;
-
-        Ok(())
-    }
-
-    pub async fn get_last_epoch(&self) -> Result<u32, MiningError> {
-        Ok(*self.last_epoch.read().await)
+        Self { blockchain }
     }
 
     pub async fn mine_block(
@@ -193,8 +149,6 @@ impl MiningManager {
         miner_address: String,
         _reward_amount: f64,
     ) -> Result<(u64, String, Block), MiningError> {
-        self.sync_params_with_blockchain().await?;
-
         let transactions: Vec<Transaction> = transactions
             .iter()
             .map(|ptx| {

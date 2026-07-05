@@ -2399,51 +2399,67 @@ impl Node {
         Ok(best_height)
     }
 
-    async fn enforce_public_tip_before_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
+    async fn best_connected_peer_height_for_mining(
+        &self,
+        max_wait: Duration,
+    ) -> Result<u32, NodeError> {
+        let peer_addrs = {
+            let peers = self.peers.read().await;
+            peers.keys().copied().collect::<Vec<_>>()
+        };
+
+        if peer_addrs.is_empty() {
+            return Err(NodeError::ConsensusFailure(
+                "no connected peers available for pre-mine sync".to_string(),
+            ));
+        }
+
+        let timeout_ms = u64::try_from(max_wait.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let peer_heights = timeout(max_wait, self.query_peer_heights(peer_addrs, timeout_ms))
+            .await
+            .map_err(|_| {
+                NodeError::ConsensusFailure(
+                    "connected peers did not report height before timeout".to_string(),
+                )
+            })?;
+
+        peer_heights
+            .first()
+            .map(|(_, height)| *height)
+            .ok_or_else(|| {
+                NodeError::ConsensusFailure("no connected peer reported chain height".to_string())
+            })
+    }
+
+    async fn guard_public_tip_before_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
         let public_height = match timeout(max_wait, self.fetch_public_tip_height()).await {
-            Ok(Ok(height)) => height,
+            Ok(Ok(Some(height))) => height,
+            Ok(Ok(None)) => return Ok(()),
             Ok(Err(e)) => {
-                debug!("Public tip check skipped: {}", e);
+                debug!("Public tip check unavailable before mining: {}", e);
                 return Ok(());
             }
             Err(_) => {
-                debug!("Public tip check timed out");
+                debug!("Public tip check timed out before mining");
                 return Ok(());
             }
         };
 
-        let Some(public_height) = public_height else {
-            return Ok(());
+        let local_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
         };
 
-        let started_at = Instant::now();
-        loop {
-            let local_height = {
-                let blockchain = self.blockchain.read().await;
-                blockchain.get_latest_block_index() as u32
-            };
-
-            if local_height >= public_height {
-                return Ok(());
-            }
-
-            let elapsed = started_at.elapsed();
-            if elapsed >= max_wait {
-                return Err(NodeError::ConsensusFailure(format!(
-                    "network tip {} is ahead of local tip {}; mining paused until the relayed block is imported",
-                    public_height, local_height
-                )));
-            }
-
-            let remaining = max_wait.saturating_sub(elapsed);
-            match timeout(remaining, self.sync_with_block_relay(local_height)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => debug!("Public tip pre-mine relay sync skipped: {}", e),
-                Err(_) => debug!("Public tip pre-mine relay sync timed out"),
-            }
-
-            sleep(Duration::from_millis(250)).await;
+        if local_height < public_height {
+            return Err(NodeError::ConsensusFailure(format!(
+                "verified network tip {} is ahead of local tip {}; mining paused until the node syncs",
+                public_height, local_height
+            )));
         }
+
+        Ok(())
     }
 
     async fn publish_discovery_state(&self, context: &str) {
@@ -2461,33 +2477,56 @@ impl Node {
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
         let has_peers = !self.peers.read().await.is_empty();
         if !has_peers {
-            match timeout(max_wait, self.connect_discovery_peers(8)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Pre-mine discovery failed: {}", e),
-                Err(_) => warn!("Pre-mine discovery timed out; continuing with local tip"),
-            }
+            timeout(max_wait, self.connect_discovery_peers(8))
+                .await
+                .map_err(|_| {
+                    NodeError::ConsensusFailure(
+                        "peer discovery timed out before mining".to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    NodeError::ConsensusFailure(format!(
+                        "peer discovery failed before mining: {}",
+                        e
+                    ))
+                })?;
         }
 
-        match timeout(max_wait, self.sync_with_network()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Pre-mine sync skipped: {}", e),
-            Err(_) => warn!("Pre-mine sync timed out; continuing with local tip"),
+        let _ = self.best_connected_peer_height_for_mining(max_wait).await?;
+
+        timeout(max_wait, self.sync_with_network())
+            .await
+            .map_err(|_| {
+                NodeError::ConsensusFailure("pre-mine network sync timed out".to_string())
+            })?
+            .map_err(|e| {
+                NodeError::ConsensusFailure(format!("pre-mine network sync failed: {}", e))
+            })?;
+
+        let peer_height = self.best_connected_peer_height_for_mining(max_wait).await?;
+        let local_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+
+        if peer_height > local_height {
+            return Err(NodeError::ConsensusFailure(format!(
+                "connected peer tip {} is ahead of local tip {}; wait for sync to finish",
+                peer_height, local_height
+            )));
         }
 
-        if self.peers.read().await.is_empty() {
-            let current_height = {
-                let blockchain = self.blockchain.read().await;
-                blockchain.get_latest_block_index() as u32
-            };
-            match timeout(max_wait, self.sync_with_block_relay(current_height)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!("Pre-mine relay sync skipped: {}", e),
-                Err(_) => warn!("Pre-mine relay sync timed out; continuing with local tip"),
+        if peer_height < local_height {
+            if let Err(e) = self.publish_local_tip().await {
+                warn!("Pre-mine local tip publish failed: {}", e);
             }
+            return Err(NodeError::ConsensusFailure(format!(
+                "local tip {} is ahead of connected peer tip {}; wait for propagation before mining another block",
+                local_height, peer_height
+            )));
         }
-        if Self::env_flag_enabled("ALPHANUMERIC_ENFORCE_GATEWAY_TIP_BEFORE_MINING") {
-            self.enforce_public_tip_before_mining(max_wait).await?;
-        }
+
+        self.guard_public_tip_before_mining(max_wait).await?;
         Ok(())
     }
 
