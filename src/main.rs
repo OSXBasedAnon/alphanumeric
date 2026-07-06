@@ -3162,11 +3162,58 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
     let allow_unverified_bootstrap = env_flag_enabled("ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP");
 
+    // Fetch and verify the signed bootstrap manifest up front. It carries the
+    // canonical tip (height + hash) we reconcile a genesis-valid local DB against,
+    // and the download URL if we do end up (re)bootstrapping.
+    let manifest_client = bootstrap_manifest_http_client()?;
+    let manifest_result: Result<BootstrapManifestPointer> =
+        match manifest_client.get(BOOTSTRAP_MANIFEST_URL).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
+                    Ok(parsed) if parsed.ok => match verify_bootstrap_manifest(&parsed.manifest) {
+                        Ok(()) => Ok(parsed.manifest),
+                        Err(e) => Err(e),
+                    },
+                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
+                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
+        };
+
     if !force_bootstrap {
         match local_launch_db_status(db_path) {
             LaunchDbStatus::Valid => {
-                println!("Bootstrap skipped: launch network DB found at {}", db_path);
-                return Ok(());
+                // Genesis is correct — but is this chain actually canonical? Compare
+                // our tip against the signed manifest tip. If we hold the canonical
+                // block (or are ahead of it on the same chain) we are in sync. If we
+                // forked or fell behind, re-bootstrap to the canonical chain rather
+                // than keep running on a stale/losing chain. Unreachable manifest =>
+                // keep the local DB (fail-open, so an offline start still works).
+                match canonical_reconcile_decision(db_path, &manifest_result) {
+                    CanonicalReconcile::InSyncOrUnknown => {
+                        println!(
+                            "Bootstrap skipped: launch network DB is on the canonical chain at {}",
+                            db_path
+                        );
+                        return Ok(());
+                    }
+                    CanonicalReconcile::Diverged {
+                        local,
+                        canonical_height,
+                        canonical_hash,
+                    } => {
+                        println!(
+                            "Local chain is not canonical (canonical tip {}={}…, local had {}); re-bootstrapping to the canonical chain",
+                            canonical_height,
+                            &canonical_hash[..canonical_hash.len().min(16)],
+                            local
+                        );
+                        remove_local_db(db_path).await?;
+                    }
+                }
             }
             LaunchDbStatus::Missing | LaunchDbStatus::Empty => {}
             LaunchDbStatus::WrongGenesis(actual) => {
@@ -3186,24 +3233,6 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         println!("Forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)");
         remove_local_db(db_path).await?;
     }
-
-    let manifest_client = bootstrap_manifest_http_client()?;
-    let manifest_result: Result<BootstrapManifestPointer> =
-        match manifest_client.get(BOOTSTRAP_MANIFEST_URL).send().await {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
-                    Ok(parsed) if parsed.ok => match verify_bootstrap_manifest(&parsed.manifest) {
-                        Ok(()) => Ok(parsed.manifest),
-                        Err(e) => Err(e),
-                    },
-                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
-                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
-                },
-                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
-            },
-            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
-            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
-        };
 
     let (
         download_url,
@@ -3546,6 +3575,62 @@ fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
         LaunchDbStatus::Valid
     } else {
         LaunchDbStatus::WrongGenesis(hex::encode(genesis.hash))
+    }
+}
+
+/// Hex hash of the local block at `height`, or None if the DB can't be read or has
+/// no block there. Opens the DB in its own short-lived handle (dropped on return).
+fn local_block_hash_at(db_path: &str, height: u32) -> Option<String> {
+    let db = sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .open()
+        .ok()?;
+    let raw = db.get(format!("block_{}", height).as_bytes()).ok()??;
+    let block = Block::from_bytes(raw.as_ref()).ok()?;
+    Some(hex::encode(block.hash))
+}
+
+/// Decision for whether a genesis-valid local DB is actually on the canonical
+/// chain, judged against the signed bootstrap manifest's tip (height + hash).
+enum CanonicalReconcile {
+    /// We hold the canonical tip block (or are ahead of it on the canonical
+    /// chain), or the manifest is unreachable/uninformative — keep the local DB.
+    InSyncOrUnknown,
+    /// The local chain is not the canonical block at the manifest height — it has
+    /// forked or fallen behind — so it must be re-bootstrapped to canonical.
+    Diverged {
+        local: String,
+        canonical_height: u64,
+        canonical_hash: String,
+    },
+}
+
+/// Reconcile a genesis-valid local DB against the signed canonical tip. We are in
+/// sync iff our block at the manifest height equals the manifest tip hash (which
+/// also covers being ahead of it on the same chain). A fork below the tip yields a
+/// different hash there, and being behind yields no block there — both re-bootstrap.
+/// Fail-open: if the manifest didn't verify or lacks a tip, we keep the local DB.
+fn canonical_reconcile_decision(
+    db_path: &str,
+    manifest: &Result<BootstrapManifestPointer>,
+) -> CanonicalReconcile {
+    let Ok(m) = manifest else {
+        return CanonicalReconcile::InSyncOrUnknown;
+    };
+    let (Some(height), Some(tip_hash)) = (m.height, m.tip_hash.as_ref()) else {
+        return CanonicalReconcile::InSyncOrUnknown;
+    };
+    let canonical_hash = tip_hash.trim().to_ascii_lowercase();
+    match local_block_hash_at(db_path, height as u32) {
+        Some(local_hash) if local_hash.eq_ignore_ascii_case(&canonical_hash) => {
+            CanonicalReconcile::InSyncOrUnknown
+        }
+        local => CanonicalReconcile::Diverged {
+            local: local.unwrap_or_else(|| "absent".to_string()),
+            canonical_height: height,
+            canonical_hash,
+        },
     }
 }
 
