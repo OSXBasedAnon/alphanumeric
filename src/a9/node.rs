@@ -771,6 +771,10 @@ pub struct Node {
     tx_witness_cache: Arc<PLMutex<LruCache<String, Transaction>>>,
     pub validation_pool: Arc<ValidationPool>,
     validation_cache: Arc<DashMap<String, ValidationCacheEntry>>,
+    // Peers we recently sent a GetBlocks request to. Inbound block responses are
+    // correlated against this set: a `ChainResponse` from a peer we did not
+    // solicit is untrusted and never applied to canonical state.
+    solicited_block_peers: Arc<DashMap<SocketAddr, Instant>>,
     tx: broadcast::Sender<NetworkEvent>,
 
     // Feature components
@@ -1008,6 +1012,7 @@ impl Node {
             start_time,
             validation_pool: Arc::new(ValidationPool::new()),
             validation_cache: Arc::new(DashMap::with_capacity(10000)),
+            solicited_block_peers: Arc::new(DashMap::new()),
             tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
             tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
@@ -4800,6 +4805,9 @@ impl Node {
         max_retries: u32,
     ) -> Result<Vec<Block>, NodeError> {
         let message = NetworkMessage::GetBlocks { start, end };
+        // Record that we solicited blocks from this peer so a matching inbound
+        // ChainResponse can be correlated (see handle_network_event).
+        self.solicited_block_peers.insert(addr, Instant::now());
         let mut retries = 0;
         while retries < max_retries {
             match self.send_message_with_response(addr, &message).await {
@@ -4834,6 +4842,42 @@ impl Node {
             "Failed to get blocks from {} after {} attempts",
             addr, max_retries
         )))
+    }
+
+    /// Request-correlation for inbound block responses: true only if we sent this
+    /// peer a GetBlocks recently. Opportunistically prunes stale entries so the
+    /// set cannot grow unbounded.
+    fn is_solicited_block_source(&self, addr: SocketAddr) -> bool {
+        const SOLICIT_TTL: Duration = Duration::from_secs(120);
+        let now = Instant::now();
+        self.solicited_block_peers
+            .retain(|_, ts| now.duration_since(*ts) < SOLICIT_TTL);
+        self.solicited_block_peers.contains_key(&addr)
+    }
+
+    /// Apply a peer-sourced block only after verifying every transaction's full
+    /// ML-DSA signature against a witness resolved from `peer`. Compact "receipt"
+    /// blocks carry a truncated signature plus a `sig_hash`, which is not a proof
+    /// of anything on its own; `save_receipt_verified_block` trusts it. Verifying
+    /// the witness first re-establishes the truncated-after-verification invariant
+    /// that receipt storage assumes, so a peer cannot inject forged transactions.
+    async fn accept_peer_block(
+        &self,
+        block: &Block,
+        peer: Option<SocketAddr>,
+    ) -> Result<(), NodeError> {
+        if !self.verify_block_with_witness(block, peer).await? {
+            return Err(NodeError::InvalidBlock(format!(
+                "block {} rejected: transaction witness/signature verification failed",
+                block.index
+            )));
+        }
+        self.blockchain
+            .write()
+            .await
+            .save_receipt_verified_block(block)
+            .await
+            .map_err(|e| NodeError::Blockchain(e.to_string()))
     }
 
     async fn remove_outbound_connection(&self, addr: SocketAddr) {
@@ -5775,17 +5819,28 @@ impl Node {
             }
 
             NetworkEvent::ChainResponse { blocks, sender } => {
+                // Request-correlation: a `Blocks` message from a peer we never
+                // asked is an unsolicited push. Legitimate sync responses are
+                // consumed inline by send_message_with_response and never reach
+                // this event, so unsolicited pushes are dropped without touching
+                // state. This closes the "any peer feeds a forged block" vector.
+                if !self.is_solicited_block_source(sender) {
+                    debug!(
+                        "Ignoring unsolicited ChainResponse ({} blocks) from {}",
+                        blocks.len(),
+                        sender
+                    );
+                    return Ok(());
+                }
                 for block in blocks {
                     if block.calculate_hash_for_block() != block.hash || !block.verify_pow() {
                         continue;
                     }
-
-                    let blockchain = self.blockchain.write().await;
-                    if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
-                        warn!(
-                            "Failed to save receipt-verified block {} from {}: {}",
-                            block.index, sender, e
-                        );
+                    // Verify transaction signatures (via witnesses fetched from the
+                    // serving peer) before applying balances. The bare receipt path
+                    // skips this and would apply forged transactions.
+                    if let Err(e) = self.accept_peer_block(&block, Some(sender)).await {
+                        warn!("Rejected block {} from {}: {}", block.index, sender, e);
                     }
                 }
             }
@@ -5832,12 +5887,22 @@ impl Node {
 
         match message {
             NetworkMessage::TxRequest { tx_id } => {
-                let tx_opt = self
+                let mempool_tx = self
                     .blockchain
                     .read()
                     .await
                     .get_mempool_transaction_by_id(&tx_id)
                     .await;
+                // Fall back to a retained confirmed-transaction witness so peers can
+                // verify recently-confirmed blocks during near-tip sync.
+                let tx_opt = match mempool_tx {
+                    Some(tx) => Some(tx),
+                    None => self
+                        .blockchain
+                        .read()
+                        .await
+                        .get_confirmed_witness_tx(&tx_id),
+                };
 
                 return Ok(Some(NetworkMessage::TxResponse { tx_id, tx: tx_opt }));
             }
@@ -7061,25 +7126,46 @@ impl Node {
                             if actual_count > 0 {
                                 let mut saved_count = 0;
 
+                                // Blocks approaching the tip are verified against full
+                                // ML-DSA witnesses fetched from the serving peer (witnesses
+                                // are retained for WITNESS_RETENTION_BLOCKS past confirmation).
+                                // Deeper catch-up blocks keep the receipt fast-path, anchored
+                                // by cumulative PoW and the signed bootstrap snapshot.
+                                let verify_from = (*peer_height).saturating_sub(
+                                    crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32,
+                                );
                                 for block in candidate_blocks {
-                                    let save_result = {
-                                        let blockchain = self.blockchain.write().await;
-                                        let before = blockchain.get_latest_block_index() as u32;
-                                        let result =
-                                            blockchain.save_receipt_verified_block(&block).await;
-                                        let after = blockchain.get_latest_block_index() as u32;
-                                        (result, before, after)
+                                    let before = {
+                                        self.blockchain.read().await.get_latest_block_index()
+                                            as u32
+                                    };
+                                    let result = if block.index >= verify_from {
+                                        self.accept_peer_block(&block, Some(*peer_addr)).await
+                                    } else {
+                                        self.blockchain
+                                            .write()
+                                            .await
+                                            .save_receipt_verified_block(&block)
+                                            .await
+                                            .map_err(|e| NodeError::Blockchain(e.to_string()))
                                     };
 
-                                    match save_result {
-                                        (Ok(()), before, after) => {
+                                    match result {
+                                        Ok(()) => {
+                                            let after = {
+                                                self.blockchain
+                                                    .read()
+                                                    .await
+                                                    .get_latest_block_index()
+                                                    as u32
+                                            };
                                             if after > before {
                                                 saved_count += after.saturating_sub(before);
                                                 current_sync_height = after;
                                             }
                                         }
-                                        (Err(e), _, _) => {
-                                            warn!("Failed to save block {}: {}", block.index, e)
+                                        Err(e) => {
+                                            warn!("Failed to accept block {}: {}", block.index, e)
                                         }
                                     }
                                 }

@@ -34,6 +34,16 @@ const PENDING_TRANSACTIONS_TREE: &str = "pending_transactions";
 // Full ML-DSA signatures are intentionally NOT stored in the main tx record on disk.
 // We keep them in a sidecar tree for pending/mempool durability across restarts, and prune with the same TTL.
 const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
+// Retained full-signature witnesses for recently-confirmed transactions, so peers
+// can serve them for near-tip verification during sync. `CONFIRMED_WITNESSES_TREE`
+// maps tx_id -> full-signature Transaction; `CONFIRMED_WITNESS_INDEX_TREE` maps
+// height_be(8)||tx_id -> [] for height-ordered pruning. Purely local: these trees
+// are never hashed and have no effect on block hashes, merkle roots, or validity.
+const CONFIRMED_WITNESSES_TREE: &str = "confirmed_witnesses";
+const CONFIRMED_WITNESS_INDEX_TREE: &str = "confirmed_witness_index";
+/// How many blocks past confirmation a transaction's full witness is retained so
+/// it remains verifiable during near-tip sync. No consensus impact.
+pub const WITNESS_RETENTION_BLOCKS: u64 = 256;
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const CHAIN_META_TREE: &str = "chain_meta";
@@ -1809,7 +1819,7 @@ impl Blockchain {
             SignatureValidationMode::AllowTruncatedStored => TransactionContext::ReceiptValidation,
         };
         if let Err(err) = self
-            .process_transactions_batch(block.transactions.clone(), tx_context)
+            .process_transactions_batch(block.transactions.clone(), tx_context, block.index as u64)
             .await
         {
             warn!(
@@ -2383,6 +2393,7 @@ impl Blockchain {
             .process_transactions_batch(
                 block.transactions.clone(),
                 TransactionContext::BlockValidation,
+                block.index as u64,
             )
             .await
         {
@@ -3405,6 +3416,7 @@ impl Blockchain {
         &self,
         transactions: Vec<Transaction>,
         context: TransactionContext,
+        confirm_height: u64,
     ) -> Result<(), BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
@@ -3474,9 +3486,24 @@ impl Blockchain {
             context,
             TransactionContext::BlockValidation | TransactionContext::ReceiptValidation
         ) {
+            let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
+            let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
             for tx in &transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
+                    // Retain the full witness for a bounded window (before purging the
+                    // pending copy) so peers can serve it for near-tip verification during
+                    // sync. Local-only: no effect on block hashes, merkle roots, or validity.
+                    if let Ok(Some(sig)) = full_sigs_tree.get(tx_id.as_bytes()) {
+                        let mut full_tx = tx.clone();
+                        full_tx.signature = Some(hex::encode(&sig));
+                        if let Ok(bytes) = codec::serialize(&full_tx) {
+                            let _ = cw_tree.insert(tx_id.as_bytes(), bytes);
+                            let mut idx_key = confirm_height.to_be_bytes().to_vec();
+                            idx_key.extend_from_slice(tx_id.as_bytes());
+                            let _ = cw_index.insert(idx_key, b"" as &[u8]);
+                        }
+                    }
                     pending_tree.remove(tx_id.as_bytes())?;
                     let _ = full_sigs_tree.remove(tx_id.as_bytes());
                     let current_debit = self.get_pending_debit_units(&tx.sender).await?;
@@ -3495,9 +3522,51 @@ impl Blockchain {
             pending_debits_tree.flush()?;
             pending_credits_tree.flush()?;
             full_sigs_tree.flush()?;
+            let _ = cw_tree.flush();
+            let _ = cw_index.flush();
+            self.prune_confirmed_witnesses(confirm_height)?;
         }
 
         Ok(())
+    }
+
+    /// Remove retained confirmed-transaction witnesses older than the retention
+    /// window. Index keys are height-big-endian prefixed, so a byte range prunes
+    /// everything confirmed at or below `tip_height - WITNESS_RETENTION_BLOCKS`.
+    fn prune_confirmed_witnesses(&self, tip_height: u64) -> Result<(), BlockchainError> {
+        if tip_height <= WITNESS_RETENTION_BLOCKS {
+            return Ok(());
+        }
+        let cutoff = tip_height - WITNESS_RETENTION_BLOCKS;
+        let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
+        let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
+        let upper = cutoff.saturating_add(1).to_be_bytes().to_vec();
+        let mut stale: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in cw_index.range(..upper) {
+            let (key, _) = item?;
+            let tx_id = if key.len() > 8 {
+                key[8..].to_vec()
+            } else {
+                Vec::new()
+            };
+            stale.push((key.to_vec(), tx_id));
+        }
+        for (idx_key, tx_id) in stale {
+            let _ = cw_index.remove(&idx_key);
+            if !tx_id.is_empty() {
+                let _ = cw_tree.remove(&tx_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Full-signature transaction retained for a recently-confirmed tx so this node
+    /// can serve it as a witness during a peer's near-tip sync verification. Returns
+    /// None once the retention window has pruned it.
+    pub fn get_confirmed_witness_tx(&self, tx_id: &str) -> Option<Transaction> {
+        let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE).ok()?;
+        let bytes = cw_tree.get(tx_id.as_bytes()).ok().flatten()?;
+        codec::deserialize::<Transaction>(&bytes).ok()
     }
 
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
@@ -3824,6 +3893,45 @@ mod tests {
             Arc::new(RateLimiter::new(60, 1_000)),
             Arc::new(Mutex::new(321)),
         )
+    }
+
+    #[test]
+    fn confirmed_witness_retention_prunes_below_window_and_serves_recent() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+        let cw_index = bc.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE).unwrap();
+
+        // Insert two retained witnesses at very different confirmation heights,
+        // mirroring the key layout used by process_transactions_batch.
+        let insert_at = |height: u64, tx_id: &str| {
+            let tx = metadata_test_block(1, [0u8; 32], "bob", 1.0)
+                .transactions
+                .remove(0);
+            let bytes = codec::serialize(&tx).unwrap();
+            cw_tree.insert(tx_id.as_bytes(), bytes).unwrap();
+            let mut key = height.to_be_bytes().to_vec();
+            key.extend_from_slice(tx_id.as_bytes());
+            cw_index.insert(key, b"" as &[u8]).unwrap();
+        };
+        insert_at(10, "old_tx");
+        insert_at(300, "recent_tx");
+
+        // Tip 400 -> cutoff = 400 - 256 = 144. Height <= 144 is pruned; >= 145 kept.
+        bc.prune_confirmed_witnesses(400).unwrap();
+
+        assert!(
+            bc.get_confirmed_witness_tx("old_tx").is_none(),
+            "witness older than the retention window should be pruned"
+        );
+        assert!(
+            bc.get_confirmed_witness_tx("recent_tx").is_some(),
+            "witness inside the retention window should still be served"
+        );
+
+        // Below the window threshold, nothing is pruned.
+        insert_at(5, "tiny_chain_tx");
+        bc.prune_confirmed_witnesses(100).unwrap();
+        assert!(bc.get_confirmed_witness_tx("tiny_chain_tx").is_some());
     }
 
     fn metadata_test_block(
