@@ -986,6 +986,59 @@ async fn main() -> Result<()> {
             });
         }
 
+        // Instant received-funds notification. Subscribes to the in-process tip
+        // signal (fired by the live beacon-watch sync on every applied block) and
+        // scans the newly-applied block(s) for credits to a local wallet — no
+        // polling, no server state, no per-wallet index; it rides the delta the
+        // node already pulled. This is what makes an incoming payment show up
+        // instantly without restarting or refreshing.
+        {
+            let wallet_addresses = wallet_addresses.clone();
+            let blockchain = blockchain.clone();
+            tokio::spawn(async move {
+                let mut rx = { blockchain.read().await.subscribe_tip_changes() };
+                let mut last_scanned: u32 =
+                    { blockchain.read().await.get_latest_block_index() as u32 };
+                loop {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                    let height = rx.borrow().height;
+                    let addresses = { wallet_addresses.read().await.clone() };
+                    if addresses.is_empty() {
+                        last_scanned = height;
+                        continue;
+                    }
+                    // Scan every block applied since the last signal (covers a
+                    // multi-block catch-up); on a reorg just re-scan the new tip.
+                    let from = if height > last_scanned {
+                        last_scanned.saturating_add(1)
+                    } else {
+                        height
+                    };
+                    for h in from..=height {
+                        let block = { blockchain.read().await.get_block(h).ok() };
+                        let Some(block) = block else { continue };
+                        for tx in &block.transactions {
+                            if tx.sender == "MINING_REWARDS" {
+                                continue; // mining rewards are reported by the miner
+                            }
+                            if addresses.iter().any(|a| *a == tx.recipient) {
+                                let amount = Transaction::from_units(tx.amount_units);
+                                let from_short = &tx.sender[..tx.sender.len().min(10)];
+                                let to_short = &tx.recipient[..tx.recipient.len().min(10)];
+                                println!(
+                                    "\n\x1b[1;96m◆ Received {:.8} ♦\x1b[0m  to {}…  from {}…  (block {})",
+                                    amount, to_short, from_short, block.index
+                                );
+                            }
+                        }
+                    }
+                    last_scanned = height;
+                }
+            });
+        }
+
         // Initialize BPoS sentinel at startup
         {
             let sentinel = staking_node.write().await;
@@ -3669,16 +3722,48 @@ fn canonical_reconcile_decision(
         return CanonicalReconcile::InSyncOrUnknown;
     };
     let canonical_hash = tip_hash.trim().to_ascii_lowercase();
-    match local_block_hash_at(db_path, height as u32) {
-        Some(local_hash) if local_hash.eq_ignore_ascii_case(&canonical_hash) => {
-            CanonicalReconcile::InSyncOrUnknown
+    let canonical_height = height as u32;
+
+    // Already holding the canonical tip block (or ahead of it on the same chain)?
+    // Then we are in sync.
+    if let Some(local_hash) = local_block_hash_at(db_path, canonical_height) {
+        if local_hash.eq_ignore_ascii_case(&canonical_hash) {
+            return CanonicalReconcile::InSyncOrUnknown;
         }
-        local => CanonicalReconcile::Diverged {
-            local: local.unwrap_or_else(|| "absent".to_string()),
-            canonical_height: height,
-            canonical_hash,
-        },
     }
+
+    // Behind or forked. If it is within the streamable window, the LIVE
+    // beacon-watch loop catches up incrementally (append) or reorgs to canonical
+    // (fork) once the node is running — we must NOT re-download the whole chain
+    // for a few blocks; that is what "syncing" means. Only a gap deeper than the
+    // window (or a near-empty DB) is worth a full bootstrap.
+    let local_tip = local_tip_height(db_path).unwrap_or(0);
+    if local_tip.saturating_add(STREAM_WINDOW) >= canonical_height {
+        return CanonicalReconcile::InSyncOrUnknown;
+    }
+
+    CanonicalReconcile::Diverged {
+        local: format!("tip {}", local_tip),
+        canonical_height: height,
+        canonical_hash,
+    }
+}
+
+/// How far behind/forked a genesis-valid chain may be and still be caught up by
+/// the live beacon-watch loop (incremental append + reorg) instead of a full
+/// re-download. Matches the signed header window used for reorg resolution.
+const STREAM_WINDOW: u32 = 64;
+
+/// Highest block index present in the local DB, or None if unreadable/empty.
+fn local_tip_height(db_path: &str) -> Option<u32> {
+    let db = sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .open()
+        .ok()?;
+    db.scan_prefix(b"block_")
+        .filter_map(|entry| entry.ok().and_then(|(k, _)| bootstrap_block_index_from_key(&k)))
+        .max()
 }
 
 /// Fetch and verify the signed bootstrap manifest, returning the canonical tip as
