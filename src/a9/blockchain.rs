@@ -2012,31 +2012,54 @@ impl Blockchain {
 
         self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
 
-        // Keep the replay registry consistent with the new canonical chain:
-        // unregister the transactions of the canonical blocks being reverted BEFORE
-        // they are overwritten; the new branch's are registered after the rewrite.
+        // Transactions the new branch (re-)confirms, so we do not return them to the
+        // mempool as if they were dropped.
+        let branch_tx_ids: std::collections::HashSet<String> = branch
+            .iter()
+            .flat_map(|b| b.transactions.iter())
+            .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+            .map(|tx| tx.get_tx_id())
+            .collect();
+
+        // Read the canonical blocks being reverted BEFORE they are overwritten:
+        // unregister their transactions from the replay registry, and remember the
+        // non-system ones the new branch does NOT re-confirm so they can be returned
+        // to the mempool — a reverted payment must not be silently lost.
+        let mut reverted_txs: Vec<Transaction> = Vec::new();
         for h in fork_start..=tip.index {
             if let Ok(old) = self.get_block(h) {
                 let _ = self.remove_confirmed_txs(&old);
+                for tx in &old.transactions {
+                    if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                        continue;
+                    }
+                    if !branch_tx_ids.contains(&tx.get_tx_id()) {
+                        reverted_txs.push(tx.clone());
+                    }
+                }
             }
-        }
-
-        // Apply reorg by rewriting canonical block slots with the selected branch.
-        for b in &branch {
-            let key = format!("block_{}", b.index);
-            let storage = Self::to_storage_block(b);
-            self.db
-                .insert(key.as_bytes(), codec::serialize(&storage)?)?;
         }
 
         let branch_tip = branch
             .last()
             .ok_or(BlockchainError::InvalidBlockHeader)?
             .clone();
+
+        // Apply the reorg ATOMICALLY: rewrite the branch's canonical slots and drop
+        // any now-stale higher slots in a single batch, so a crash can never leave a
+        // half-rewritten chain. The dirty marker (above) + startup recovery re-derive
+        // balances if we crash after this point.
+        let mut slot_batch = sled::Batch::default();
+        for b in &branch {
+            let key = format!("block_{}", b.index);
+            let storage = Self::to_storage_block(b);
+            slot_batch.insert(key.as_bytes(), codec::serialize(&storage)?);
+        }
         for stale_height in branch_tip.index.saturating_add(1)..=tip.index {
             let key = format!("block_{}", stale_height);
-            self.db.remove(key.as_bytes())?;
+            slot_batch.remove(key.as_bytes());
         }
+        self.db.apply_batch(slot_batch)?;
 
         // Remove adopted branch blocks from orphan pool.
         for b in &branch {
@@ -2061,6 +2084,18 @@ impl Blockchain {
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+
+        // Return the reverted transactions the new branch did not re-confirm to the
+        // mempool so they can be re-mined instead of being silently lost.
+        // add_transaction re-validates each against the new canonical state and drops
+        // any that are now invalid (e.g. spent by the winning branch).
+        if !reverted_txs.is_empty() {
+            let mut mempool = self.mempool.write().await;
+            for tx in reverted_txs {
+                let _ = mempool.add_transaction(tx);
+            }
+        }
+
         self.notify_tip_changed(&branch_tip);
 
         Ok(true)
