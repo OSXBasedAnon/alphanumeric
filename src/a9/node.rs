@@ -2806,16 +2806,23 @@ impl Node {
     }
 
     async fn guard_public_tip_before_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
-        let public_height = match timeout(max_wait, self.fetch_public_tip_height()).await {
-            Ok(Ok(Some(height))) => height,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(e)) => {
-                debug!("Public tip check unavailable before mining: {}", e);
-                return Ok(());
-            }
-            Err(_) => {
-                debug!("Public tip check timed out before mining");
-                return Ok(());
+        // Prefer the FRESH signed beacon as the canonical network tip (the header
+        // snapshot lags by its publish interval). Fall back to the snapshot only if
+        // the beacon is unavailable, and fail open if neither is reachable.
+        let public_height = if let Some(beacon) = self.fetch_tip_beacon().await {
+            beacon.height
+        } else {
+            match timeout(max_wait, self.fetch_public_tip_height()).await {
+                Ok(Ok(Some(height))) => height,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => {
+                    debug!("Public tip check unavailable before mining: {}", e);
+                    return Ok(());
+                }
+                Err(_) => {
+                    debug!("Public tip check timed out before mining");
+                    return Ok(());
+                }
             }
         };
 
@@ -2862,6 +2869,14 @@ impl Node {
         // before it mines, with no configuration.
         let _ = timeout(max_wait, self.sync_with_network()).await;
         self.relay_catch_up(max_wait).await;
+
+        // Confirm we are on the CANONICAL chain, not just at the right height,
+        // before mining. If our tip diverges from the signed beacon (a fork), this
+        // reorgs to canonical first — so we never extend a losing fork and cause
+        // the reorg churn that hurts multi-miner convergence.
+        if let Some(beacon) = self.fetch_tip_beacon().await {
+            self.reconcile_to_beacon(&beacon).await;
+        }
 
         let peers_available = !self.peers.read().await.is_empty();
         if peers_available {
