@@ -4409,14 +4409,20 @@ impl Node {
         // is kept as a safety net in case a beacon post was missed.
         {
             let node_clone = node.clone();
-            let safety_secs = Self::periodic_relay_sync_interval_secs()
-                .unwrap_or(60)
-                .max(BEACON_POLL_INTERVAL_SECS);
+            // The publisher INGESTS blocks that miners POST to the relay — nothing
+            // pushes those to it (miners are NAT'd) — so it pulls the relay on a
+            // FAST timer (~1s) and republishes the beacon that fans out to every
+            // client, keeping propagation under the block time so miners converge
+            // instead of forking. A plain client is driven by the beacon and only
+            // does a rare safety pull, so it never blind-polls the relay.
+            let is_publisher = Self::public_header_snapshots_enabled();
+            let tick_secs = if is_publisher { 1 } else { BEACON_POLL_INTERVAL_SECS };
+            let safety_secs = if is_publisher { 1 } else { 30 };
             tokio::spawn(async move {
-                let mut ticker = interval(Duration::from_secs(BEACON_POLL_INTERVAL_SECS));
+                let mut ticker = interval(Duration::from_secs(tick_secs));
                 let mut last_version: u64 = u64::MAX;
                 let mut ticks_since_full: u64 = 0;
-                let safety_ticks = (safety_secs / BEACON_POLL_INTERVAL_SECS).max(1);
+                let safety_ticks = (safety_secs / tick_secs).max(1);
                 loop {
                     ticker.tick().await;
                     let current_height = {
