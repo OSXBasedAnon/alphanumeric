@@ -3506,7 +3506,13 @@ async fn bootstrap_publish_loop(
     let mut next_attempt_at: u64 = 0;
 
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // Sample every ~3s, NOT every 30s. Tip stability is measured off last_tip_change,
+        // so a coarse 30s sample quantized "stable for stable_secs" to 30s and would stop
+        // republishing entirely once the block interval drops below ~30s (higher
+        // hashpower) — re-stranding fresh nodes at a stale snapshot. A fine sample keeps
+        // stability real-time; publishing is still gated by the cooldown/min-delta below,
+        // so this does not increase publish frequency, only its responsiveness.
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         let (height, tip_hash_hex, network_id_hex) = {
             let bc = blockchain.read().await;

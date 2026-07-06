@@ -113,8 +113,14 @@ enum Ancestor {
     /// A fully-linked canonical chain from the beacon tip down to the finality floor
     /// matched the local chain nowhere — genuine deep divergence -> bootstrap.
     NoneBelowFloor,
-    /// The relay could not supply a contiguous, prev-linked canonical chain right now
-    /// (missing body / empty-200 window / fetch error) -> transient, retry.
+    /// A gap/broken link deeper than a convergent reorg could ever reach (below
+    /// beacon.height - CHECKPOINT_REORG_MARGIN) — e.g. the needed history has aged out of
+    /// the relay's ~1h window. Incremental convergence is impossible; only a fresh
+    /// snapshot recovers it -> bootstrap.
+    NeedsBootstrap,
+    /// The relay could not supply a contiguous, prev-linked canonical chain right now but
+    /// the gap is still WITHIN reorg reach (missing body / empty-200 window / fetch error
+    /// near the tip) -> transient, retry (never bootstrap).
     Transient,
 }
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
@@ -2323,6 +2329,20 @@ impl Node {
         let mut expected_hash = beacon.hash;
         let mut expected_height = beacon.height;
         let max_rounds = (beacon.height.saturating_sub(floor) / WIN) + 2;
+        // A gap/broken link at a height deeper than a convergent reorg could reach
+        // (below beacon - margin) is not transient — the needed history is gone (aged out
+        // of the ~1h relay) and only a fresh snapshot recovers it. A gap WITHIN reorg
+        // reach near the tip is genuinely transient and must retry, never bootstrap.
+        let reorg_floor = beacon
+            .height
+            .saturating_sub(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN);
+        let gap_verdict = |needed: u32| -> Ancestor {
+            if needed < reorg_floor {
+                Ancestor::NeedsBootstrap
+            } else {
+                Ancestor::Transient
+            }
+        };
 
         for _ in 0..max_rounds {
             // Fetch the 64-aligned window containing the height we need next.
@@ -2334,17 +2354,19 @@ impl Node {
                         by_hash.entry(b.hash).or_insert(b);
                     }
                 }
-                // Empty-but-200 in a below-tip window, or an outright error: a gap we
-                // cannot prove is divergence. Retry, never bootstrap.
-                Ok(_) | Err(_) => return Ancestor::Transient,
+                // Empty-but-200 in a below-tip window, or an outright error: a gap. If it
+                // is within reorg reach retry (Transient); if deeper, the history is gone
+                // and only a snapshot recovers it (NeedsBootstrap).
+                Ok(_) | Err(_) => return gap_verdict(expected_height),
             }
 
             // Walk the prev-hash chain down through the bodies we now hold.
             loop {
                 let Some(cb) = by_hash.get(&expected_hash).cloned() else {
                     // The body for this exact (height,hash) is not on the relay even
-                    // after fetching its window -> broken link -> transient.
-                    return Ancestor::Transient;
+                    // after fetching its window -> broken link (same transient-vs-deep
+                    // distinction as an empty window).
+                    return gap_verdict(expected_height);
                 };
                 let h = cb.index;
                 canon_desc.push(cb.clone());
@@ -2370,7 +2392,7 @@ impl Node {
                 }
             }
         }
-        Ancestor::Transient
+        gap_verdict(expected_height)
     }
 
     /// The single always-converge operation. From ANY local state — behind, forked at
@@ -2399,7 +2421,9 @@ impl Node {
             let floor = self.blockchain.read().await.verification_floor();
             let (ancestor, canon) = match self.find_common_ancestor(beacon, floor).await {
                 Ancestor::Found(a, canon) => (a, canon),
-                Ancestor::NoneBelowFloor => return Converge::NeedsBootstrap,
+                Ancestor::NoneBelowFloor | Ancestor::NeedsBootstrap => {
+                    return Converge::NeedsBootstrap
+                }
                 Ancestor::Transient => return Converge::BeaconStale,
             };
 
@@ -2416,11 +2440,21 @@ impl Node {
                 if d <= checkpoint {
                     return Converge::NeedsBootstrap; // may not rewrite finalized history
                 }
+                // Finality bound: cap the local REWRITE depth (blocks we rewind), which
+                // is `tip - ancestor` — NOT `beacon.height - ancestor`. The forward part
+                // of the branch (tip..=beacon) is a pure APPEND, not a rewrite, so it is
+                // not finality-limited; capping the whole span wrongly refused a shallow
+                // fork that happens to sit far behind a tall winning chain (e.g. a node
+                // ~1h behind), wedging it into NeedsBootstrap when a normal reorg + append
+                // would have converged it.
+                if tip.saturating_sub(ancestor) > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN {
+                    return Converge::NeedsBootstrap;
+                }
+                // Separately bound the total branch we validate under the write lock, so
+                // a very long append can't hold it for an unbounded time.
                 if beacon.height.saturating_sub(ancestor)
-                    > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN
+                    > crate::a9::blockchain::ORPHAN_REORG_DEPTH
                 {
-                    // Deeper than a convergent reorg window; bounded so the adopt write
-                    // lock is never held across a huge branch. Genuine bootstrap case.
                     return Converge::NeedsBootstrap;
                 }
                 // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon].
@@ -2492,18 +2526,51 @@ impl Node {
     /// WORK-based fork choice (so we only ever switch to a genuinely heavier chain, never a
     /// merely "taller" low-work one). The reorg depth is bounded exactly as for clients.
     async fn converge_to_relay_tip(&self) -> Converge {
-        let local_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
-        // Look at a window spanning a little below our tip (to include a fork's ancestor
-        // side) up to well above it (to catch a heavier competing chain miners extended).
+        let (local_tip, local_hash) = {
+            let bc = self.blockchain.read().await;
+            (
+                bc.get_latest_block_index() as u32,
+                bc.get_last_block().map(|b| b.hash),
+            )
+        };
+
+        // Caught-up FAST PATH (runs ~every 1s on the publisher): a cheap, fresh probe of
+        // just the tip-adjacent range. If nothing sits above our tip AND the only block at
+        // our height is our own tip, we are caught up — skip the wide fork-aware scan
+        // entirely. Only when there IS a forward block or a FOREIGN competitor at our
+        // height do we pay for the full converge.
+        match self
+            .fetch_relay_blocks(local_tip, local_tip.saturating_add(1))
+            .await
+        {
+            Ok(probe) => {
+                let has_forward = probe.iter().any(|b| b.index > local_tip);
+                let foreign_at_tip = probe
+                    .iter()
+                    .any(|b| b.index == local_tip && Some(b.hash) != local_hash);
+                if !has_forward && !foreign_at_tip {
+                    return Converge::Converged;
+                }
+            }
+            Err(_) => return Converge::BeaconStale,
+        }
+
+        // Not caught up: find the relay's heaviest tip and converge to it.
         let from = local_tip.saturating_sub(8);
         let to = local_tip.saturating_add(256);
         let blocks = match self.fetch_relay_blocks(from, to).await {
             Ok(b) if !b.is_empty() => b,
             _ => return Converge::BeaconStale,
         };
-        // Target = the highest block on the relay. If several share the max height (a fork
-        // at the tip), any is fine: the engine's work check + lexical tie-break settles it.
-        let Some(tip) = blocks.iter().max_by_key(|b| b.index) else {
+        let max_h = blocks.iter().map(|b| b.index).max().unwrap_or(local_tip);
+        // Among blocks at the max height (a fork at the tip), nominate the LOWEST hash to
+        // match the engine's work-tie lexical rule, so target selection can't oscillate
+        // between competing tips on successive ticks. Adoption is still work-gated.
+        let Some(tip) = blocks
+            .iter()
+            .filter(|b| b.index == max_h)
+            .min_by_key(|b| b.hash)
+        else {
             return Converge::BeaconStale;
         };
         let target = TipBeaconInfo {
@@ -3113,14 +3180,28 @@ impl Node {
                         "chain diverged below the finality window; re-bootstrap required".into(),
                     ));
                 }
-                // Still converging (forward progress, or a transient relay gap). Keep
-                // trying with backoff until the deadline; then hand back Retryable so
-                // the caller re-invokes — we keep working toward the tip, never sit out.
-                Converge::Progressed | Converge::BeaconStale => {
+                // Made forward progress but not fully caught up: keep trying with backoff;
+                // after the deadline hand back Retryable so the caller re-invokes (the
+                // background loops keep pulling us forward between attempts).
+                Converge::Progressed => {
                     if Instant::now() >= deadline {
                         return Err(NodeError::Retryable(
                             "still converging to the canonical tip; retry".into(),
                         ));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                // Transient relay gap. A DEEP gap (history aged out) already escalated to
+                // NeedsBootstrap above (M3), so this is a near-the-tip hiccup: after the
+                // deadline, FAIL OPEN and mine on our local tip rather than sit out. We
+                // are near the tip, so the local tip is almost certainly current; a losing
+                // local block is reorged away by the normal path. This upholds the
+                // "never dead-pause" contract even when the relay momentarily can't answer.
+                Converge::BeaconStale => {
+                    if Instant::now() >= deadline {
+                        warn!("Relay gap while preparing to mine; mining on local tip (fail-open)");
+                        return Ok(());
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -3148,6 +3229,25 @@ impl Node {
 
     pub async fn publish_block(&self, block: Block, context: &str) -> Result<(), NodeError> {
         let post_mine = context == "Post-mine";
+
+        let block_hash = block.calculate_hash_for_block();
+        let _ = self.network_bloom.insert(&block_hash);
+
+        // PROPAGATION-CRITICAL, FIRST: POST to the gateway relay immediately — it is the
+        // authoritative propagation path across NAT, so it must NOT wait behind the
+        // peerless p2p discovery (~6s timeout) below, which almost never yields a
+        // reachable peer. Fronting the relay POST shaves that latency off the time a
+        // freshly-mined block takes to reach every other miner — the exact window during
+        // which they would otherwise mine a competing fork.
+        if let Err(e) = self.post_block_relay(&block).await {
+            warn!("{} block relay failed: {}", context, e);
+        } else {
+            self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
+                .await;
+        }
+
+        // Best-effort direct p2p broadcast (usually a no-op across NAT), done AFTER the
+        // relay post so its discovery timeout can never delay propagation.
         if self.peers.read().await.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
                 if post_mine {
@@ -3157,9 +3257,6 @@ impl Node {
                 }
             }
         }
-
-        let block_hash = block.calculate_hash_for_block();
-        let _ = self.network_bloom.insert(&block_hash);
 
         let selected_peers = {
             let peers = self.peers.read().await;
@@ -3211,13 +3308,6 @@ impl Node {
                     }
                 }
             }
-        }
-
-        if let Err(e) = self.post_block_relay(&block).await {
-            warn!("{} block relay failed: {}", context, e);
-        } else {
-            self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
-                .await;
         }
 
         self.publish_discovery_state(context).await;
@@ -4647,6 +4737,7 @@ impl Node {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
                 let mut last_version: u64 = u64::MAX;
                 let mut ticks_since_full: u64 = 0;
+                let mut publisher_bootstrap_strikes: u32 = 0;
                 let safety_ticks = (safety_secs / tick_secs).max(1);
                 loop {
                     ticker.tick().await;
@@ -4687,11 +4778,32 @@ impl Node {
                         // so it can never get stuck on a dead branch while miners extend a
                         // heavier one (which would freeze the beacon for the whole network).
                         match node_clone.converge_to_relay_tip().await {
-                            Converge::Converged | Converge::AtTipAhead | Converge::Progressed => {}
-                            Converge::NeedsBootstrap => {
-                                warn!("Publisher: relay chain diverged below finality window; bootstrap required");
+                            Converge::Converged | Converge::AtTipAhead | Converge::Progressed => {
+                                publisher_bootstrap_strikes = 0;
                             }
+                            // Transient — don't count toward a restart.
                             Converge::BeaconStale => {}
+                            // Genuine deep divergence the publisher cannot converge
+                            // incrementally (>64-block local rewrite, or needed history
+                            // aged out of the relay). Left unhandled this FREEZES the beacon
+                            // for the whole network. converge_to_relay_tip targets the
+                            // relay's heaviest tip, so NeedsBootstrap here already implies
+                            // "a heavier chain exists that we can't reach forward" — after 2
+                            // consecutive such ticks, restart into a fresh bootstrap from
+                            // that chain (launchd respawns us; the imported snapshot carries
+                            // tip-64 as the trusted checkpoint, so finality is preserved). A
+                            // single blip never triggers it.
+                            Converge::NeedsBootstrap => {
+                                publisher_bootstrap_strikes += 1;
+                                warn!(
+                                    "Publisher: relay chain diverged below the reorg window (strike {}/2); will re-bootstrap on 2",
+                                    publisher_bootstrap_strikes
+                                );
+                                if publisher_bootstrap_strikes >= 2 {
+                                    warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
+                                    std::process::exit(0);
+                                }
+                            }
                         }
                     } else if let Some(b) = beacon {
                         match node_clone.converge_to_canonical(&b).await {
