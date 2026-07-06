@@ -996,6 +996,53 @@ async fn main() -> Result<()> {
 
         if headless {
             println!("Headless mode enabled. Node services are running.");
+            // Runtime canonical reconciliation. A long-running headless node that
+            // drifts onto a fork (e.g. mined a block that lost a race) or falls far
+            // behind restarts to re-bootstrap onto the canonical chain, so it can
+            // never get stuck off-canonical. The canonical publisher never diverges
+            // from its own manifest, so this never fires for it. Two consecutive
+            // divergent checks are required so a transient/stale manifest read
+            // doesn't trigger a needless restart.
+            {
+                let blockchain_recon = blockchain.clone();
+                let shutdown_recon = shutdown_requested.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(120));
+                    let mut strikes = 0u32;
+                    loop {
+                        ticker.tick().await;
+                        if shutdown_recon.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let Some((canonical_height, canonical_hash)) =
+                            fetch_verified_canonical_tip().await
+                        else {
+                            strikes = 0;
+                            continue;
+                        };
+                        let diverged = {
+                            let bc = blockchain_recon.read().await;
+                            let local_tip = bc.get_latest_block_index() as u32;
+                            match bc.get_block(canonical_height as u32) {
+                                Ok(b) => !hex::encode(b.hash).eq_ignore_ascii_case(&canonical_hash),
+                                Err(_) => local_tip < canonical_height as u32,
+                            }
+                        };
+                        if diverged {
+                            strikes += 1;
+                            if strikes >= 2 {
+                                println!(
+                                    "Node chain diverged from canonical tip {} on two checks; restarting to reconcile onto the canonical chain",
+                                    canonical_height
+                                );
+                                std::process::exit(0);
+                            }
+                        } else {
+                            strikes = 0;
+                        }
+                    }
+                });
+            }
             while !shutdown_requested.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
@@ -3632,6 +3679,27 @@ fn canonical_reconcile_decision(
             canonical_hash,
         },
     }
+}
+
+/// Fetch and verify the signed bootstrap manifest, returning the canonical tip as
+/// (height, lowercased hex hash). None if unreachable or unverifiable — callers
+/// treat that as "canonical unknown" and take no action. Used for runtime drift
+/// detection against the same signed source the startup reconciliation uses.
+async fn fetch_verified_canonical_tip() -> Option<(u64, String)> {
+    let client = bootstrap_manifest_http_client().ok()?;
+    let resp = client.get(BOOTSTRAP_MANIFEST_URL).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.bytes().await.ok()?;
+    let parsed: BootstrapManifestResponse = serde_json::from_slice(&body).ok()?;
+    if !parsed.ok {
+        return None;
+    }
+    verify_bootstrap_manifest(&parsed.manifest).ok()?;
+    let height = parsed.manifest.height?;
+    let tip_hash = parsed.manifest.tip_hash.as_ref()?.trim().to_ascii_lowercase();
+    Some((height, tip_hash))
 }
 
 fn local_db_matches_launch_genesis(db_path: &str) -> bool {
