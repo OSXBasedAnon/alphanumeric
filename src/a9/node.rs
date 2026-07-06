@@ -74,7 +74,7 @@ const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
 const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
-const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 300;
+const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 60;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
 const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
@@ -1270,15 +1270,18 @@ impl Node {
     }
 
     fn block_relay_publish_enabled() -> bool {
-        Self::public_discovery_publish_enabled()
-            && Self::env_flag_enabled("ALPHANUMERIC_ENABLE_BLOCK_RELAY")
-            && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY")
+        // Unconditional. Posting mined and tip blocks to the gateway relay is the
+        // network's propagation path — without it a miner's block never leaves the
+        // machine and the node "mines into the void". On a live production network
+        // there is no reason to opt out, so it is not a toggle.
+        true
     }
 
     fn block_relay_sync_enabled() -> bool {
-        (Self::env_flag_enabled("ALPHANUMERIC_ENABLE_BLOCK_RELAY_SYNC")
-            || Self::env_flag_enabled("ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC"))
-            && !Self::env_flag_enabled("ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC")
+        // Unconditional. Pulling blocks from the gateway relay is how any node —
+        // including one behind NAT with no direct peers — learns the network tip
+        // and stays in sync. Core behaviour, never a toggle.
+        true
     }
 
     fn kademlia_fallback_enabled() -> bool {
@@ -1463,16 +1466,17 @@ impl Node {
     }
 
     fn periodic_relay_sync_interval_secs() -> Option<u64> {
+        // Always on: every node keeps itself current with the network tip by
+        // pulling the relay on a timer, so a node that falls behind catches up on
+        // its own with no configuration. The env var only tunes the cadence.
         if let Ok(value) = std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS") {
-            let parsed = value.trim().parse::<u64>().ok()?;
-            return (parsed > 0).then_some(parsed.clamp(60, 3600));
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                if parsed > 0 {
+                    return Some(parsed.clamp(60, 3600));
+                }
+            }
         }
-
-        if Self::env_flag_enabled("ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC") {
-            Some(DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS)
-        } else {
-            None
-        }
+        Some(DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS)
     }
 
     fn relay_sync_backfill_depth() -> u32 {
@@ -2673,12 +2677,14 @@ impl Node {
             let _ = timeout(max_wait, self.connect_discovery_peers(8)).await;
         }
 
-        // Best-effort catch-up to the network tip (p2p first, block relay
-        // fallback). This is intentionally NOT fatal: when we're already at the
-        // tip there is nothing new to fetch and sync_with_network reports that as
-        // an error. The authoritative "are we behind?" check is the peer-height
-        // comparison and guard_public_tip_before_mining below.
+        // Catch up to the network tip before mining. p2p first when we have peers,
+        // then ALWAYS pull the gateway relay — it is the authoritative propagation
+        // path for NAT'd nodes, so we sync it every time rather than only as a
+        // fallback. Not fatal: when already at the tip there is simply nothing to
+        // fetch. This is what makes a node that fell behind catch up on its own
+        // before it mines, with no configuration.
         let _ = timeout(max_wait, self.sync_with_network()).await;
+        self.relay_catch_up(max_wait).await;
 
         let peers_available = !self.peers.read().await.is_empty();
         if peers_available {
@@ -2706,18 +2712,24 @@ impl Node {
                     local_height, peer_height
                 )));
             }
-        } else if !Self::block_relay_sync_enabled() {
-            // No peers and no relay to anchor against — refuse to mine blind on a
-            // possibly-stale chain rather than forking the network.
-            return Err(NodeError::ConsensusFailure(
-                "no reachable peers and block relay sync is disabled; cannot establish the network tip before mining".to_string(),
-            ));
         }
 
-        // Always gate on the verified public (gateway/relay) tip, so a relay-only
-        // miner still refuses to mine on a stale chain.
-        self.guard_public_tip_before_mining(max_wait).await?;
+        // Gate on the verified public (gateway/relay) tip so we never mine on a
+        // stale chain. If we're behind, make one more focused relay pull to close
+        // the gap, then re-check — only refuse if we genuinely cannot reach the tip.
+        if self.guard_public_tip_before_mining(max_wait).await.is_err() {
+            self.relay_catch_up(max_wait).await;
+            self.guard_public_tip_before_mining(max_wait).await?;
+        }
         Ok(())
+    }
+
+    /// Pull the gateway block relay up to the current network tip. Best-effort and
+    /// never fatal — used before mining and as the always-on catch-up path so a
+    /// node behind the network syncs itself with no configuration.
+    async fn relay_catch_up(&self, max_wait: Duration) {
+        let current = { self.blockchain.read().await.get_latest_block_index() as u32 };
+        let _ = timeout(max_wait, self.sync_with_block_relay(current)).await;
     }
 
     pub async fn publish_local_tip(&self) -> Result<(), NodeError> {
