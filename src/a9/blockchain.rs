@@ -1643,6 +1643,18 @@ impl Blockchain {
                 .await?;
         }
 
+        // Enforce transaction semantics on the reorg path exactly like tip
+        // extension: a competing branch that double-spends or overspends must be
+        // rejected even though it arrived as a same-height competitor. Checked
+        // before any slot is rewritten so there is nothing to roll back.
+        if !self.branch_is_balance_valid(branch[0].index, &branch).await? {
+            debug!(
+                "Reorg rejected: branch at height {} fails balance validation (overspend/double-spend)",
+                branch[0].index
+            );
+            return Ok(false);
+        }
+
         self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
 
         // Apply reorg by rewriting canonical block slots with the selected branch.
@@ -2037,6 +2049,15 @@ impl Blockchain {
                 if tx.sender != "MINING_REWARDS" {
                     let debit = tx.total_debit_units();
                     let entry = balances.entry(tx.sender).or_insert(0);
+                    // Enforce sequential availability during replay, like the forward
+                    // apply path (process_transactions_batch). A chain that debits an
+                    // address below zero at any point is invalid; refuse to persist it
+                    // rather than writing a negative/phantom balance. This closes the
+                    // reorg/race hole where a same-height competitor bypassed the
+                    // InsufficientFunds guard that tip-extension goes through.
+                    if *entry < debit {
+                        return Err(BlockchainError::InsufficientFunds);
+                    }
                     *entry -= debit;
                 }
                 let entry = balances.entry(tx.recipient).or_insert(0);
@@ -2051,6 +2072,44 @@ impl Blockchain {
         balances_tree.apply_batch(batch)?;
 
         Ok(())
+    }
+
+    /// Dry-run: would the chain formed by canonical blocks below `fork_start`
+    /// plus `branch` keep every sender solvent at each step? Reads only; used to
+    /// reject a reorg to a competing branch that double-spends or overspends
+    /// BEFORE any canonical slots are rewritten (no rollback needed).
+    async fn branch_is_balance_valid(
+        &self,
+        fork_start: u32,
+        branch: &[Block],
+    ) -> Result<bool, BlockchainError> {
+        let mut blocks: Vec<Block> = self
+            .db
+            .scan_prefix(b"block_")
+            .filter_map(|entry| {
+                let (_, value) = entry.ok()?;
+                Block::from_bytes(value.as_ref()).ok()
+            })
+            .filter(|b| b.index < fork_start)
+            .collect();
+        blocks.sort_unstable_by_key(|b| b.index);
+        blocks.extend(branch.iter().cloned());
+
+        let mut balances: HashMap<String, i128> = HashMap::new();
+        for block in &blocks {
+            for tx in &block.transactions {
+                if tx.sender != "MINING_REWARDS" {
+                    let debit = tx.total_debit_units();
+                    let entry = balances.entry(tx.sender.clone()).or_insert(0);
+                    if *entry < debit {
+                        return Ok(false);
+                    }
+                    *entry -= debit;
+                }
+                *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+            }
+        }
+        Ok(true)
     }
     pub fn new(
         db: Db,
@@ -3567,6 +3626,52 @@ impl Blockchain {
         let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE).ok()?;
         let bytes = cw_tree.get(tx_id.as_bytes()).ok().flatten()?;
         codec::deserialize::<Transaction>(&bytes).ok()
+    }
+
+    /// Return a copy of `block` with every non-system transaction's full ML-DSA
+    /// signature restored from the retained witness store, if available. Used
+    /// before posting a block to the gateway relay so relay-only nodes (which
+    /// have no p2p peer to fetch witnesses from) can still verify signatures
+    /// instead of receipt-trusting the tip.
+    pub fn block_with_full_witnesses(&self, block: &Block) -> Block {
+        let mut hydrated = block.clone();
+        for tx in &mut hydrated.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            let tx_id = tx.get_tx_id();
+            if let Some(full) = self.get_confirmed_witness_tx(&tx_id) {
+                if full.signature.is_some() {
+                    tx.signature = full.signature;
+                }
+            }
+        }
+        hydrated
+    }
+
+    /// True if any non-system transaction carries a FULL (non-truncated) ML-DSA
+    /// signature that fails verification — an active forgery attempt. Truncated /
+    /// receipt-only signatures cannot be verified without the witness and are not
+    /// flagged here (see the S-01 limitation: fully verifying a relay-adopted tip
+    /// requires universal witness availability). Used to reject the forgeries we
+    /// CAN detect on the relay path without rejecting legitimate witness-absent
+    /// blocks.
+    pub fn block_has_invalid_present_signature(&self, block: &Block) -> bool {
+        for tx in &block.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            let full_sig_present = tx
+                .signature
+                .as_ref()
+                .and_then(|s| hex::decode(s).ok())
+                .map(|b| b.len() > 64)
+                .unwrap_or(false);
+            if full_sig_present && self.verify_transaction_signature(tx).is_err() {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
