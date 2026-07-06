@@ -52,6 +52,7 @@ const MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024;
 const MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
 const BOOTSTRAP_MIN_DISK_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
+const TIP_URL: &str = "https://alphanumeric.blue/api/tip";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
@@ -190,14 +191,33 @@ async fn fetch_gateway_overview() -> Option<GatewayOverview> {
             .await
             .ok()
     };
-    let (manifest_body, peers_body) = tokio::join!(manifest_request, peers_request);
+    // The live tip beacon is the freshest canonical height (~1-2s); the bootstrap
+    // manifest height lags by its publish cadence, so it is only a fallback.
+    let tip_request = async {
+        client
+            .get(TIP_URL)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+    };
+    let (manifest_body, peers_body, tip_body) =
+        tokio::join!(manifest_request, peers_request, tip_request);
 
-    let height = manifest_body
+    let beacon_height = tip_body
+        .as_ref()
+        .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
+        .and_then(|body| body.get("height"))
+        .and_then(|v| v.as_u64());
+    let manifest_height = manifest_body
         .as_ref()
         .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
         .and_then(|body| body.get("manifest"))
         .and_then(|manifest| manifest.get("height"))
         .and_then(|v| v.as_u64());
+    let height = beacon_height.or(manifest_height);
     let peers = peers_body
         .as_ref()
         .filter(|body| body.get("ok").and_then(|v| v.as_bool()) == Some(true))
