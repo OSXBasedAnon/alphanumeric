@@ -44,12 +44,30 @@ const CONFIRMED_WITNESS_INDEX_TREE: &str = "confirmed_witness_index";
 /// How many blocks past confirmation a transaction's full witness is retained so
 /// it remains verifiable during near-tip sync. No consensus impact.
 pub const WITNESS_RETENTION_BLOCKS: u64 = 256;
+/// How far behind the fully-verified frontier the trusted checkpoint trails.
+/// Blocks at/below the checkpoint are final: signature-trusted (not re-verified)
+/// and not reorgable. The margin preserves normal PoW reorg depth above the
+/// finalized point, so only a partition deeper than this could split finality —
+/// a scenario in which consensus is already broken.
+pub const CHECKPOINT_REORG_MARGIN: u32 = 64;
+/// Height of the last block whose full ML-DSA witnesses were permanently lost in
+/// a historical DB adoption (blocks 34-35). The frontier signature gate must
+/// never require verification at or below this height — those blocks can only be
+/// served truncated — so a node lagging beneath it can still receipt-trust its
+/// way through and catch up instead of stalling forever. This is a fixed network
+/// checkpoint floor; cumulative PoW and the signed bootstrap snapshot secure the
+/// history under it, exactly as they secure any block at/below the checkpoint.
+pub const WITNESS_LOSS_FLOOR: u32 = 35;
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const CHAIN_META_TREE: &str = "chain_meta";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const CHAIN_TIP_KEY: &[u8] = b"tip";
 const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
+/// Highest block height treated as final. At/below it blocks are
+/// signature-trusted and cannot be reorged; above it every adopted block must
+/// pass full ML-DSA verification. Monotonic. See CHECKPOINT_REORG_MARGIN.
+const TRUSTED_CHECKPOINT_KEY: &[u8] = b"trusted_checkpoint";
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
@@ -1301,6 +1319,72 @@ impl Blockchain {
         Ok(Some(codec::deserialize(&raw)?))
     }
 
+    /// Highest block height the node treats as final. Blocks at/below it are
+    /// signature-trusted (vouched for by a verified signed snapshot, or fully
+    /// verified locally then aged past the reorg margin) and cannot be reorged;
+    /// blocks above it — the unfinalized frontier — MUST pass full ML-DSA
+    /// verification to be adopted from a peer or the relay. 0 if never seeded.
+    pub fn trusted_checkpoint_height(&self) -> u32 {
+        self.open_chain_meta_tree()
+            .ok()
+            .and_then(|tree| tree.get(TRUSTED_CHECKPOINT_KEY).ok().flatten())
+            .and_then(|raw| codec::deserialize::<u32>(&raw).ok())
+            .unwrap_or(0)
+    }
+
+    /// The height at/below which blocks are receipt-trusted and above which they
+    /// must pass full ML-DSA verification: the greater of the local trusted
+    /// checkpoint and the network witness-loss floor. Anchoring to the floor lets
+    /// a node whose checkpoint sits below the permanently-truncated 34-35 still
+    /// sync through them instead of stalling.
+    pub fn verification_floor(&self) -> u32 {
+        self.trusted_checkpoint_height().max(WITNESS_LOSS_FLOOR)
+    }
+
+    /// Raise the trusted checkpoint to `height`. Monotonic — a lower value is
+    /// ignored, so finality can never regress. The compare-and-raise runs inside
+    /// sled's update_and_fetch so two concurrent sync tasks (relay + p2p) cannot
+    /// race a stale read and clobber a higher committed value.
+    pub fn raise_trusted_checkpoint(&self, height: u32) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        let encoded = codec::serialize(&height)?;
+        meta_tree.update_and_fetch(TRUSTED_CHECKPOINT_KEY, |old| {
+            let current = old
+                .and_then(|raw| codec::deserialize::<u32>(raw).ok())
+                .unwrap_or(0);
+            if height > current {
+                Some(encoded.clone())
+            } else {
+                old.map(|o| o.to_vec())
+            }
+        })?;
+        meta_tree.flush()?;
+        Ok(())
+    }
+
+    /// One-time seed: if no checkpoint has ever been recorded, trust the chain we
+    /// already hold as of this upgrade (its tip). Blocks already in the DB were
+    /// accepted under the prior rules and are never re-verified; only blocks that
+    /// arrive ABOVE this height must prove themselves. Idempotent.
+    pub fn seed_trusted_checkpoint_if_unset(&self) -> Result<(), BlockchainError> {
+        let meta_tree = self.open_chain_meta_tree()?;
+        if meta_tree.get(TRUSTED_CHECKPOINT_KEY)?.is_some() {
+            return Ok(());
+        }
+        let tip = self.get_latest_block_index() as u32;
+        meta_tree.insert(TRUSTED_CHECKPOINT_KEY, codec::serialize(&tip)?)?;
+        meta_tree.flush()?;
+        Ok(())
+    }
+
+    /// After a frontier block at `verified_height` is fully verified and applied,
+    /// trail the checkpoint behind it by the reorg margin. Keeps the verified
+    /// region (and thus the witness-retention requirement) bounded while leaving
+    /// normal PoW reorgs possible above the finalized point.
+    pub fn advance_checkpoint_behind(&self, verified_height: u32) -> Result<(), BlockchainError> {
+        self.raise_trusted_checkpoint(verified_height.saturating_sub(CHECKPOINT_REORG_MARGIN))
+    }
+
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let debits_tree = self.open_pending_debits_tree()?;
@@ -1641,6 +1725,36 @@ impl Blockchain {
         for b in &branch {
             self.validate_block_internal(b, SignatureValidationMode::AllowTruncatedStored)
                 .await?;
+        }
+
+        // Checkpoint finality: a reorg may not rewrite history at or below the
+        // trusted checkpoint. Those blocks were vouched for by a verified signed
+        // snapshot (or locally verified then finalized), so a competing branch
+        // forking that deep is rejected outright — this bounds reorg depth and
+        // stops a deep-reorg double-spend beneath the finalized point.
+        let checkpoint = self.trusted_checkpoint_height();
+        if branch[0].index <= checkpoint {
+            debug!(
+                "Reorg rejected: branch forks at height {} at/below finalized checkpoint {}",
+                branch[0].index, checkpoint
+            );
+            return Ok(false);
+        }
+
+        // Frontier signature gate on the reorg path (S-01). The validation above
+        // runs in AllowTruncatedStored mode, which only checks structure — so a
+        // forged competitor carrying a truncated/invalid user-tx signature could
+        // otherwise be adopted via reorg. Any branch block above the verification
+        // floor must therefore carry full, valid ML-DSA witnesses.
+        let floor = self.verification_floor();
+        for b in &branch {
+            if b.index > floor && !self.block_signatures_fully_verified(b) {
+                debug!(
+                    "Reorg rejected: branch block {} above floor {} lacks full witnesses",
+                    b.index, floor
+                );
+                return Ok(false);
+            }
         }
 
         // Enforce transaction semantics on the reorg path exactly like tip
@@ -3649,14 +3763,13 @@ impl Blockchain {
         hydrated
     }
 
-    /// True if any non-system transaction carries a FULL (non-truncated) ML-DSA
-    /// signature that fails verification — an active forgery attempt. Truncated /
-    /// receipt-only signatures cannot be verified without the witness and are not
-    /// flagged here (see the S-01 limitation: fully verifying a relay-adopted tip
-    /// requires universal witness availability). Used to reject the forgeries we
-    /// CAN detect on the relay path without rejecting legitimate witness-absent
-    /// blocks.
-    pub fn block_has_invalid_present_signature(&self, block: &Block) -> bool {
+    /// Strict gate for adopting a block ABOVE the trusted checkpoint: EVERY
+    /// non-system transaction must carry a full (non-truncated) ML-DSA signature
+    /// that verifies. On the unfinalized frontier there is no receipt fast-path —
+    /// a missing or truncated witness means we cannot prove the block, so we
+    /// decline it rather than trust it. Coinbase (system) transactions are
+    /// unsigned and exempt, so a coinbase-only block passes trivially.
+    pub fn block_signatures_fully_verified(&self, block: &Block) -> bool {
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
@@ -3667,11 +3780,14 @@ impl Blockchain {
                 .and_then(|s| hex::decode(s).ok())
                 .map(|b| b.len() > 64)
                 .unwrap_or(false);
-            if full_sig_present && self.verify_transaction_signature(tx).is_err() {
-                return true;
+            if !full_sig_present {
+                return false;
+            }
+            if self.verify_transaction_signature(tx).is_err() {
+                return false;
             }
         }
-        false
+        true
     }
 
     pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
@@ -4070,6 +4186,66 @@ mod tests {
         };
         block.hash = block.calculate_hash_for_block();
         block
+    }
+
+    #[test]
+    fn trusted_checkpoint_is_monotonic_and_seeds_once() {
+        let bc = test_blockchain();
+        // Unseeded reads as 0.
+        assert_eq!(bc.trusted_checkpoint_height(), 0);
+        // raise_trusted_checkpoint only ever moves up — finality never regresses.
+        bc.raise_trusted_checkpoint(100).unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 100);
+        bc.raise_trusted_checkpoint(50).unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 100);
+        bc.raise_trusted_checkpoint(100).unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 100);
+        // advance_checkpoint_behind trails a verified frontier by the reorg margin.
+        bc.advance_checkpoint_behind(100 + CHECKPOINT_REORG_MARGIN + 5)
+            .unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 105);
+        // A frontier height within the margin of the checkpoint cannot lower it.
+        bc.advance_checkpoint_behind(120).unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 105);
+        // Seeding is a no-op once any checkpoint exists.
+        bc.seed_trusted_checkpoint_if_unset().unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 105);
+    }
+
+    #[test]
+    fn verification_floor_never_drops_below_witness_loss_floor() {
+        let bc = test_blockchain();
+        // With no checkpoint recorded, the floor still sits at the witness-loss
+        // height, so a node lagging beneath the permanently-truncated 34-35
+        // receipt-trusts through them instead of stalling on the frontier gate.
+        assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR);
+        // Once the checkpoint rises above the floor, the checkpoint dominates.
+        bc.raise_trusted_checkpoint(WITNESS_LOSS_FLOOR + 100).unwrap();
+        assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR + 100);
+    }
+
+    #[test]
+    fn frontier_verification_exempts_coinbase_and_rejects_unwitnessed_spend() {
+        let bc = test_blockchain();
+        // A coinbase-only block has no user signatures to prove, so it passes the
+        // frontier gate trivially.
+        let coinbase = metadata_test_block(1, [0u8; 32], "alice", 50.0);
+        assert!(bc.block_signatures_fully_verified(&coinbase));
+        // A block carrying a user-sender spend whose witness is absent/truncated
+        // must be declined ABOVE the checkpoint: it cannot be proven, so it is not
+        // trusted (this is exactly the S-01 forgery vector closed on the frontier).
+        let mut with_spend = metadata_test_block(2, coinbase.hash, "bob", 50.0);
+        with_spend.transactions.push(Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 2_000,
+            signature: Some("deadbeef".to_string()), // 4 bytes: a truncated receipt stub
+            pub_key: None,
+            sig_hash: None,
+        });
+        assert!(!bc.block_signatures_fully_verified(&with_spend));
     }
 
     fn insert_raw_block(blockchain: &Blockchain, block: &Block) {

@@ -577,6 +577,16 @@ async fn main() -> Result<()> {
         }
         pb.inc(1);
 
+        // Seed the trusted checkpoint on first run under this build. Everything we
+        // already hold — genesis, the verified bootstrap snapshot, prior sync — is
+        // trusted as of this tip; only blocks arriving ABOVE it must pass full
+        // ML-DSA verification. For a fresh node this tip IS the signed bootstrap
+        // snapshot height, so witness-pruned history below it never has to be
+        // re-verified. Idempotent: a no-op once a checkpoint exists.
+        if let Err(e) = blockchain.read().await.seed_trusted_checkpoint_if_unset() {
+            warn!("Failed to seed trusted checkpoint: {}", e);
+        }
+
         let (consensus_descriptor, consensus_fingerprint) = {
             let blockchain_lock = blockchain.read().await;
             compute_consensus_fingerprint(&blockchain_lock)
@@ -2196,6 +2206,22 @@ async fn handle_chain_sync(
                             continue;
                         }
 
+                        // Frontier signature gate (S-01). request_blocks_batch checks
+                        // only hash self-consistency, so on this manual sync path any
+                        // block above the verification floor must carry full, valid
+                        // ML-DSA witnesses before we persist it — otherwise a hostile
+                        // peer could inject a forged spend above our tip.
+                        let floor = blockchain.verification_floor();
+                        if block.index > floor
+                            && !blockchain.block_signatures_fully_verified(&block)
+                        {
+                            println!(
+                                "Rejected block {} above floor {}: signatures not fully verifiable",
+                                block.index, floor
+                            );
+                            continue;
+                        }
+
                         if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
                             // Log error but continue with next blocks
                             println!("Error saving block {}: {}", block.index, e);
@@ -2240,6 +2266,16 @@ async fn handle_chain_sync(
 
                 for (_peer, block) in block_buffer.drain(..) {
                     if block.index <= last_save_height {
+                        continue;
+                    }
+
+                    // Frontier signature gate (S-01) — same as the batched path above.
+                    let floor = blockchain.verification_floor();
+                    if block.index > floor && !blockchain.block_signatures_fully_verified(&block) {
+                        println!(
+                            "Rejected final block {} above floor {}: signatures not fully verifiable",
+                            block.index, floor
+                        );
                         continue;
                     }
 

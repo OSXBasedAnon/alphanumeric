@@ -2454,28 +2454,37 @@ impl Node {
             let mut relay_confirmed_blocks = Vec::new();
 
             for block in blocks {
-                // Best-effort signature check: if a relay block carries FULL ML-DSA
-                // witnesses (post_block_relay rehydrates them) but any signature is
-                // present-and-INVALID, reject it — that is an active forgery attempt.
-                // Blocks whose witnesses are unavailable (truncated) fall through to
-                // the receipt path; fully closing that (S-01) requires universal
-                // witness retention so a relay-only node can always verify the tip.
-                if self
-                    .blockchain
-                    .read()
-                    .await
-                    .block_has_invalid_present_signature(&block)
+                // Checkpoint-anchored verification (S-01). Blocks ABOVE the trusted
+                // checkpoint are the unfinalized frontier: a relay-only node cannot
+                // receipt-trust the tip, so they MUST carry full, valid ML-DSA
+                // witnesses — post_block_relay rehydrates them from the miner — or we
+                // decline them. Blocks at/below the checkpoint were vouched for by a
+                // verified signed snapshot and are receipt-trusted, which is what lets
+                // catch-up over witness-pruned history proceed.
+                let floor = self.blockchain.read().await.verification_floor();
+                if block.index > floor
+                    && !self
+                        .blockchain
+                        .read()
+                        .await
+                        .block_signatures_fully_verified(&block)
                 {
                     warn!(
-                        "Rejected relayed block {}: a transaction carries an invalid signature",
-                        block.index
+                        "Rejected relayed frontier block {} (> floor {}): signatures not fully verifiable",
+                        block.index, floor
                     );
                     continue;
                 }
                 let save_result = {
                     let blockchain = self.blockchain.write().await;
                     let before = blockchain.get_latest_block_index() as u32;
-                    let result = blockchain.save_receipt_verified_block(&block).await;
+                    // Reduce the error to a String immediately: BlockchainError is
+                    // !Send, and this tuple is held across the checkpoint-advance
+                    // await below, which would make the spawned sync future !Send.
+                    let result = blockchain
+                        .save_receipt_verified_block(&block)
+                        .await
+                        .map_err(|e| e.to_string());
                     let after = blockchain.get_latest_block_index() as u32;
                     (result, before, after)
                 };
@@ -2486,6 +2495,16 @@ impl Node {
                         accepted_any = true;
                         if after > before {
                             total_saved += after.saturating_sub(before) as usize;
+                            if block.index > floor {
+                                // Frontier block passed full verification above; trail
+                                // the checkpoint behind it so finality advances and the
+                                // verified window stays bounded.
+                                let _ = self
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .advance_checkpoint_behind(block.index);
+                            }
                         }
                     }
                     (Err(e), _, _) => warn!("Failed to save relayed block {}: {}", block.index, e),
@@ -7212,19 +7231,21 @@ impl Node {
                             if actual_count > 0 {
                                 let mut saved_count = 0;
 
-                                // Blocks approaching the tip are verified against full
-                                // ML-DSA witnesses fetched from the serving peer (witnesses
-                                // are retained for WITNESS_RETENTION_BLOCKS past confirmation).
-                                // Deeper catch-up blocks keep the receipt fast-path, anchored
-                                // by cumulative PoW and the signed bootstrap snapshot.
+                                // Every block ABOVE the trusted checkpoint — the
+                                // unfinalized frontier — is verified against full ML-DSA
+                                // witnesses fetched from the serving peer. Catch-up blocks
+                                // at/below the checkpoint keep the receipt fast-path; the
+                                // signed snapshot vouches for that history, which is what
+                                // lets catch-up over witness-pruned blocks proceed.
                                 //
-                                // Anchor the window to OUR OWN tip, never the peer's claimed
-                                // height: an inflated handshake height would otherwise push
-                                // verify_from above the real tip and route real tip-extending
-                                // blocks into the receipt fast-path (no signature check).
-                                let verify_from = current_sync_height.saturating_sub(
-                                    crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32,
-                                );
+                                // Anchored to finality, never to the peer's claimed height:
+                                // an inflated handshake height cannot lower the checkpoint,
+                                // so it cannot route tip-extending blocks into the receipt
+                                // fast-path.
+                                let verify_from = {
+                                    self.blockchain.read().await.verification_floor()
+                                }
+                                .saturating_add(1);
                                 for block in candidate_blocks {
                                     let before = {
                                         self.blockchain.read().await.get_latest_block_index()
@@ -7253,6 +7274,16 @@ impl Node {
                                             if after > before {
                                                 saved_count += after.saturating_sub(before);
                                                 current_sync_height = after;
+                                                if block.index >= verify_from {
+                                                    // Frontier block verified against peer
+                                                    // witnesses; trail the checkpoint behind
+                                                    // it so finality advances.
+                                                    let _ = self
+                                                        .blockchain
+                                                        .read()
+                                                        .await
+                                                        .advance_checkpoint_behind(block.index);
+                                                }
                                             }
                                         }
                                         Err(e) => {
