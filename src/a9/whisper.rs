@@ -428,6 +428,13 @@ impl WhisperModule {
     }
 
     // Modify scan_blockchain_for_messages to use this more robust approach
+    /// Decode a whisper message carried by a single transaction's fee, if any.
+    /// Used for instant whisper notifications: scanning one just-applied block's
+    /// transactions instead of re-scanning the whole chain.
+    pub fn decode_whisper_in_tx(&self, tx: &Transaction) -> Option<String> {
+        self.decode_message_from_fee(tx.fee(), tx.timestamp, tx.amount())
+    }
+
     pub async fn scan_blockchain_for_messages(
         &self,
         blockchain: &Blockchain,

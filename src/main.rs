@@ -995,6 +995,7 @@ async fn main() -> Result<()> {
         {
             let wallet_addresses = wallet_addresses.clone();
             let blockchain = blockchain.clone();
+            let whisper_module = whisper_module.clone();
             tokio::spawn(async move {
                 let mut rx = { blockchain.read().await.subscribe_tip_changes() };
                 let mut last_scanned: u32 =
@@ -1023,9 +1024,20 @@ async fn main() -> Result<()> {
                             if tx.sender == "MINING_REWARDS" {
                                 continue; // mining rewards are reported by the miner
                             }
-                            if addresses.iter().any(|a| *a == tx.recipient) {
+                            if !addresses.iter().any(|a| *a == tx.recipient) {
+                                continue;
+                            }
+                            let from_short = &tx.sender[..tx.sender.len().min(10)];
+                            // A whisper carries its message in the fee; show the
+                            // message. Otherwise it is a plain payment.
+                            let whisper = { whisper_module.read().await.decode_whisper_in_tx(tx) };
+                            if let Some(message) = whisper {
+                                println!(
+                                    "\n\x1b[1;95m✉ Whisper\x1b[0m from {}…  (block {}):\n  {}",
+                                    from_short, block.index, message
+                                );
+                            } else {
                                 let amount = Transaction::from_units(tx.amount_units);
-                                let from_short = &tx.sender[..tx.sender.len().min(10)];
                                 let to_short = &tx.recipient[..tx.recipient.len().min(10)];
                                 println!(
                                     "\n\x1b[1;96m◆ Received {:.8} ♦\x1b[0m  to {}…  from {}…  (block {})",
