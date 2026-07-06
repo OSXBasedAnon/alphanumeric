@@ -1361,14 +1361,16 @@ async fn main() -> Result<()> {
         color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
         stdout.set_color(&color_spec)?;
         writeln!(stdout, "Active Nodes:    {}", active_nodes)?;
-        color_spec.set_fg(Some(Color::Rgb(167, 165, 198)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Connected Peers: {}", active_peers)?;
         if gateway_peers > 0 {
             color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
             stdout.set_color(&color_spec)?;
-            writeln!(stdout, "Gateway Peers:   {}", gateway_peers)?;
+            writeln!(stdout, "Network Peers:   {}", gateway_peers)?;
         }
+        color_spec.set_fg(Some(Color::Rgb(167, 165, 198)));
+        stdout.set_color(&color_spec)?;
+        // Direct p2p is expected to be 0 for NAT'd nodes — the network runs over the
+        // gateway relay, not a p2p mesh, so this being 0 is normal, not a fault.
+        writeln!(stdout, "Direct P2P:      {} (relay mode)", active_peers)?;
         color_spec.set_fg(Some(Color::Rgb(247, 111, 142)));
         stdout.set_color(&color_spec)?;
         writeln!(stdout, "Network Load:    {:.1}%", health.network_load * 100.0)?; 
@@ -2380,12 +2382,13 @@ async fn handle_network_commands(
 
         "--getpeers" => {
             let peers = node.peers.read().await;
-            println!("\nConnected Peers");
-            println!("---------------");
+            println!("\nNetwork Participants");
+            println!("--------------------");
 
             if peers.is_empty() {
-                println!("No peers connected");
-                println!("Try: --sync or --connect <ip:port>");
+                // Direct p2p is expected to be empty for NAT'd nodes — the network runs
+                // over the gateway relay, not a p2p mesh — so this is normal, not a fault.
+                println!("Direct p2p peers: 0 (relay mode — normal for NAT'd nodes)");
             } else {
                 for (addr, info) in peers.iter() {
                     let last_seen = SystemTime::now()
@@ -2395,9 +2398,20 @@ async fn handle_network_commands(
                         .saturating_sub(info.last_seen);
 
                     println!(
-                        "{} (latency: {}ms, last seen: {}s ago)",
+                        "  p2p {} (latency: {}ms, last seen: {}s ago)",
                         addr, info.latency, last_seen
                     );
+                }
+            }
+            drop(peers);
+
+            // Real network participation: the gateway roster of live nodes + the tip.
+            if let Some(overview) = fetch_gateway_overview().await {
+                if let Some(p) = overview.peers {
+                    println!("Network peers (gateway): {}", p);
+                }
+                if let Some(h) = overview.height {
+                    println!("Network height:          {}", h);
                 }
             }
         }
