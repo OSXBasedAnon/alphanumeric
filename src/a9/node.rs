@@ -4286,12 +4286,21 @@ impl Node {
             let node_clone = node.clone();
             tokio::spawn(async move {
                 let mut rx = { node_clone.blockchain.read().await.subscribe_tip_changes() };
+                // Heartbeat so the beacon never expires during idle (no mining): it
+                // is re-posted on every tip change AND at least this often, keeping
+                // the network's live tip visible to anyone who opens their client.
+                let mut heartbeat = interval(Duration::from_secs(60));
                 if let Err(e) = node_clone.post_tip_beacon().await {
                     debug!("Initial tip beacon post: {}", e);
                 }
                 loop {
-                    if rx.changed().await.is_err() {
-                        break;
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        _ = heartbeat.tick() => {}
                     }
                     if let Err(e) = node_clone.post_tip_beacon().await {
                         debug!("Tip beacon post: {}", e);
