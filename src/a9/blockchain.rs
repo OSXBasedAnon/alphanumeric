@@ -84,6 +84,12 @@ const GENESIS_LAUNCH_NONCE: u64 = 7_377;
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
 pub const MAX_BLOCK_REWARD: f64 = 50.0;
+/// Consensus cap on transactions per block. Without it a single block could carry
+/// an unbounded number of transactions and stall the serial block-processing loop
+/// (a cheap DoS). Generous for throughput (~800 tx/s at the 5s target) and raisable
+/// with the network; per-transaction size is bounded by the fixed ML-DSA fields, so
+/// this also bounds a block's byte size. The mining-reward transaction counts toward it.
+pub const MAX_BLOCK_TX_COUNT: usize = 4096;
 pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
@@ -3005,6 +3011,12 @@ impl Blockchain {
     ) -> Result<(), BlockchainError> {
         // First validate block header
         block.validate_header()?;
+
+        // Bound transactions per block (DoS): reject an over-full block before any
+        // further per-transaction work. Finalized history is small and unaffected.
+        if block.transactions.len() > MAX_BLOCK_TX_COUNT {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
 
         // Verify merkle root matches transactions
         let expected_root = Blockchain::calculate_merkle_root(&block.transactions)?;
