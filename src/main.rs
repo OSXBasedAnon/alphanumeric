@@ -1,8 +1,6 @@
-use dashmap::DashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
 use log::{debug, error, warn};
-use rand::Rng;
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
@@ -11,14 +9,14 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,7 +30,7 @@ use alphanumeric::a9::{
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
-    node::{Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT},
+    node::{Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT},
     oracle::DifficultyOracle,
     progpow::{Miner, MiningManager},
     whisper::WhisperModule,
@@ -725,6 +723,13 @@ async fn main() -> Result<()> {
             return;
         }
 
+        // Converge to the network tip immediately on launch. "Bootstrapped" only means
+        // the local DB is genesis-valid — NOT that it is at the current tip — so a node
+        // that was behind (or on a stale fork) used to start up "done" yet several
+        // blocks behind. Sync to the signed beacon now, before the node is usable; the
+        // live beacon-watch loop keeps it current afterward. Bounded and best-effort.
+        let _ = node_clone.sync_to_beacon().await;
+
         // Combined monitor for network and chain
         let monitor_handle = {
             let node = Arc::clone(&node_clone);
@@ -1096,7 +1101,7 @@ async fn main() -> Result<()> {
             // divergent checks are required so a transient/stale manifest read
             // doesn't trigger a needless restart.
             {
-                let blockchain_recon = blockchain.clone();
+                let node_recon = node.clone();
                 let shutdown_recon = shutdown_requested.clone();
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(Duration::from_secs(120));
@@ -1106,31 +1111,28 @@ async fn main() -> Result<()> {
                         if shutdown_recon.load(Ordering::Acquire) {
                             return;
                         }
-                        let Some((canonical_height, canonical_hash)) =
-                            fetch_verified_canonical_tip().await
-                        else {
-                            strikes = 0;
-                            continue;
-                        };
-                        let diverged = {
-                            let bc = blockchain_recon.read().await;
-                            let local_tip = bc.get_latest_block_index() as u32;
-                            match bc.get_block(canonical_height as u32) {
-                                Ok(b) => !hex::encode(b.hash).eq_ignore_ascii_case(&canonical_hash),
-                                Err(_) => local_tip < canonical_height as u32,
+                        // Heal IN PLACE against the signed beacon (forward-stream when
+                        // behind, incremental reorg when forked) instead of the old
+                        // manifest-drift check that restarted the whole process. Only a
+                        // genuine, repeated below-finality divergence — which incremental
+                        // convergence provably cannot fix — escalates to a restart +
+                        // re-bootstrap. A transient relay gap (BeaconStale) never does.
+                        match node_recon.sync_to_beacon().await {
+                            Converge::Converged
+                            | Converge::AtTipAhead
+                            | Converge::Progressed
+                            | Converge::BeaconStale => {
+                                strikes = 0;
                             }
-                        };
-                        if diverged {
-                            strikes += 1;
-                            if strikes >= 2 {
-                                println!(
-                                    "Node chain diverged from canonical tip {} on two checks; restarting to reconcile onto the canonical chain",
-                                    canonical_height
-                                );
-                                std::process::exit(0);
+                            Converge::NeedsBootstrap => {
+                                strikes += 1;
+                                if strikes >= 2 {
+                                    println!(
+                                        "Node chain diverged below the finality window on two checks; restarting to re-bootstrap onto the canonical chain"
+                                    );
+                                    std::process::exit(0);
+                                }
                             }
-                        } else {
-                            strikes = 0;
                         }
                     }
                 });
@@ -1524,16 +1526,49 @@ println!("Wallet renamed successfully");
                         continue;
                     }
 
-                    println!("Preparing mining: checking connected peers and chain freshness...");
-                    if let Err(e) = node.prepare_local_mining(Duration::from_secs(15)).await {
-                        match e {
-                            NodeError::ConsensusFailure(reason) => {
-                                println!("Mining paused: {}", reason);
+                    println!("Preparing mining: syncing to the network tip so we can compete...");
+                    // Converge-then-compete with a bounded retry. prepare_local_mining
+                    // actively syncs to the beacon tip and only returns Retryable if it
+                    // couldn't fully catch up within its window (deeply behind). We do
+                    // NOT concede on that — the background beacon-watch loop keeps
+                    // pulling us forward, so we retry a few times. Only a genuine
+                    // below-finality divergence (needs re-bootstrap) is a hard stop.
+                    const MINE_PREP_ATTEMPTS: u32 = 3;
+                    let mut prep_ok = false;
+                    let mut prep_stop: Option<String> = None;
+                    for attempt in 1..=MINE_PREP_ATTEMPTS {
+                        match node.prepare_local_mining(Duration::from_secs(15)).await {
+                            Ok(()) => {
+                                prep_ok = true;
+                                break;
                             }
-                            other => {
-                                println!("Mining paused: {}", other);
+                            Err(NodeError::Retryable(_)) => {
+                                if attempt < MINE_PREP_ATTEMPTS {
+                                    println!(
+                                        "Still catching up to the network tip (attempt {}/{})…",
+                                        attempt, MINE_PREP_ATTEMPTS
+                                    );
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                }
+                            }
+                            Err(NodeError::ConsensusFailure(reason)) => {
+                                prep_stop = Some(reason);
+                                break;
+                            }
+                            Err(other) => {
+                                prep_stop = Some(other.to_string());
+                                break;
                             }
                         }
+                    }
+                    if let Some(reason) = prep_stop {
+                        println!("Cannot mine right now: {}", reason);
+                        continue;
+                    }
+                    if !prep_ok {
+                        println!(
+                            "Still syncing to the network tip; it keeps catching up in the background — run `mine` again in a moment."
+                        );
                         continue;
                     }
 
@@ -2073,479 +2108,50 @@ None => println!("Please enter a command."),
 async fn handle_chain_sync(
     node: &Node,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const PARALLEL_BATCH_SIZE: usize = 16384; // Reduced batch size for better reliability
-    const MAX_PARALLEL_DOWNLOADS: usize = 64;
-    const QUEUE_SIZE: usize = 16384;
-    const MAX_PEER_LATENCY: u64 = 200; // Increased latency threshold
-    const SYNC_TIMEOUT: Duration = Duration::from_secs(600); // Increased timeout
-    const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60); // Timeout for individual requests
-    const RETRY_DELAY_BASE: u64 = 250; // Base delay in ms before retry
-    const MAX_RETRIES: u32 = 5; // Maximum number of retries per batch
-
+    // Beacon-driven sync. Across NAT the p2p peer table is empty, so the authoritative
+    // network tip is the signed beacon — NOT a peer-reported height. The old code read
+    // `peers.values().map(|i| i.blocks).max().unwrap_or(0)`, which with no peers always
+    // concluded "already at current height" and no-oped, so `--sync` never actually
+    // synced. converge_to_canonical drives us to the beacon tip from ANY state: forward-
+    // stream when merely behind, incremental reorg when our tip has diverged.
     let mp = MultiProgress::new();
     let status_pb = mp.add(ProgressBar::new_spinner());
-    status_pb.set_message("Finding fastest network peers...");
+    status_pb.enable_steady_tick(Duration::from_millis(120));
+    status_pb.set_message("Syncing to the network tip…");
 
-    let local_height = {
-        let blockchain = node.blockchain.read().await;
-        blockchain.get_latest_block_index() as u32
-    };
+    let local_height = { node.blockchain.read().await.get_latest_block_index() as u32 };
+    let outcome = node.sync_to_beacon().await;
+    let tip_now = { node.blockchain.read().await.get_latest_block_index() as u32 };
 
-    let known_best_height = {
-        let peers = node.peers.read().await;
-        peers.values().map(|info| info.blocks).max().unwrap_or(0)
-    };
-
-    if known_best_height <= local_height {
-        status_pb.finish_with_message(format!("Already at current height: {}", local_height));
-        return Ok(());
-    }
-
-    // IMPROVEMENT: Better peer selection with health metrics
-    let network_health = node.network_health.read().await;
-    let target_peers = (network_health.active_nodes / 4).clamp(3, MAX_PARALLEL_DOWNLOADS);
-    drop(network_health);
-
-    // Try to discover peers if we don't have enough
-    let peer_count = node.peers.read().await.len();
-    if peer_count < 5 {
-        status_pb.set_message("Discovering more network peers...");
-        match tokio::time::timeout(Duration::from_secs(10), node.discover_network_nodes()).await {
-            Ok(Ok(_)) => {
-                status_pb.set_message(format!(
-                    "Found new peers, now at {}",
-                    node.peers.read().await.len()
-                ));
-            }
-            _ => {
-                status_pb.set_message("Continuing with existing peers");
-            }
-        }
-    }
-
-    // IMPROVEMENT: Better peer selection with health checks and rating
-    let peers = node.peers.read().await;
-    let mut sync_peers: Vec<_> = peers
-        .iter()
-        .filter(|(_, info)| {
-            info.latency < MAX_PEER_LATENCY &&
-            // Avoid peers we haven't seen in 5 minutes
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .saturating_sub(info.last_seen) < 300
-        })
-        .map(|(addr, info)| (*addr, info.blocks, info.latency))
-        .collect();
-    drop(peers);
-
-    if sync_peers.is_empty() {
-        return Err(Box::new(std::io::Error::other(
-            "No peers available for sync",
-        )));
-    }
-
-    // IMPROVEMENT: Better peer sorting - prioritize higher blocks AND lower latency
-    sync_peers.sort_by(|a, b| {
-        // First by block height (descending)
-        let height_cmp = b.1.cmp(&a.1);
-        if height_cmp != std::cmp::Ordering::Equal {
-            return height_cmp;
-        }
-        // Then by latency (ascending)
-        a.2.cmp(&b.2)
-    });
-
-    // Get target height from best peers
-    let target_height = sync_peers
-        .iter()
-        .take(3) // Use consensus from top 3 peers
-        .map(|(_, height, _)| *height)
-        .max()
-        .unwrap_or(0);
-
-    if target_height <= local_height {
-        status_pb.finish_with_message(format!("Already at current height: {}", local_height));
-        return Ok(());
-    }
-
-    // Setup progress bars with better info
-    let blocks_remaining = target_height - local_height;
-    let main_pb = mp.add(ProgressBar::new(blocks_remaining as u64));
-    main_pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} blocks ({eta}) {msg}",
-        )?
-        .progress_chars("█▓░"),
-    );
-    main_pb.set_message("Syncing blockchain...");
-
-    // IMPROVEMENT: Sort peers by block height AND latency for better reliability
-    let mut sync_peers: Vec<_> = sync_peers.into_iter().collect();
-
-    sync_peers.sort_by(|a, b| {
-        let a_score = a.1 as f64 * 0.8 - a.2 as f64 * 0.2; // 80% height, 20% latency
-        let b_score = b.1 as f64 * 0.8 - b.2 as f64 * 0.2;
-        b_score
-            .partial_cmp(&a_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Setup sync channels with better buffer management
-    let (tx, mut rx) = mpsc::channel(QUEUE_SIZE);
-    let current_height = Arc::new(AtomicU32::new(local_height));
-    let processed_height = Arc::new(AtomicU32::new(local_height));
-    let active_requests = Arc::new(AtomicU32::new(0));
-    let failed_batches = Arc::new(DashMap::new());
-
-    // IMPROVEMENT: More resilient download tasks with retry logic
-    let download_tasks: Vec<_> = sync_peers
-        .iter()
-        .take(target_peers)
-        .map(|(peer, _, _)| {
-            let tx = tx.clone();
-            let current_height = Arc::clone(&current_height);
-            let failed_batches = Arc::clone(&failed_batches);
-            let active_requests = Arc::clone(&active_requests);
-            let node = node.clone();
-            let peer = *peer;
-
-            tokio::spawn(async move {
-                let mut consecutive_failures = 0;
-
-                'outer: while current_height.load(Ordering::Acquire) < target_height {
-                    // Get a batch to download
-                    let curr_height = current_height.load(Ordering::Acquire);
-                    if curr_height >= target_height {
-                        break;
-                    }
-
-                    let batch_start = curr_height.saturating_add(1);
-                    let batch_end = batch_start
-                        .saturating_add(PARALLEL_BATCH_SIZE as u32)
-                        .saturating_sub(1)
-                        .min(target_height);
-                    let batch_key = format!("{}-{}", batch_start, batch_end);
-
-                    // Check if this batch has already failed too many times
-                    if let Some(failures) = failed_batches.get(&batch_key) {
-                        if *failures > MAX_RETRIES {
-                            // Skip this batch, it's been tried too many times
-                            current_height.fetch_add(batch_end - curr_height, Ordering::Release);
-                            continue;
-                        }
-                    }
-
-                    // Track active requests for load balancing
-                    active_requests.fetch_add(1, Ordering::SeqCst);
-
-                    // FIX: Create RNG here - don't keep it across awaits
-                    if consecutive_failures > 0 {
-                        // Create new RNG each time to avoid Send issues
-                        let backoff = RETRY_DELAY_BASE * (1 << consecutive_failures.min(5));
-                        let jitter = rand::thread_rng().gen_range(0..=backoff / 4);
-                        tokio::time::sleep(Duration::from_millis(backoff + jitter)).await;
-                    }
-
-                    // Proper timeout and error handling
-                    let result = tokio::time::timeout(
-                        BLOCK_REQUEST_TIMEOUT,
-                        node.request_blocks(peer, batch_start, batch_end),
-                    )
-                    .await;
-
-                    match result {
-                        Ok(Ok(blocks)) => {
-                            let mut sent_count = 0;
-                            for block in blocks {
-                                // Validate hash before sending to process queue
-                                if block.index >= batch_start
-                                    && block.index <= batch_end
-                                    && block.hash == block.calculate_hash_for_block()
-                                {
-                                    match tx.send((peer, block)).await {
-                                        Ok(_) => sent_count += 1,
-                                        Err(_) => break 'outer, // Channel closed
-                                    }
-                                }
-                            }
-
-                            if sent_count > 0 {
-                                // Reset failure counter on success
-                                consecutive_failures = 0;
-                                current_height
-                                    .fetch_add(batch_end - curr_height, Ordering::Release);
-                            } else {
-                                // Got a response but no valid blocks
-                                consecutive_failures += 1;
-                                failed_batches
-                                    .entry(batch_key.clone())
-                                    .and_modify(|e| *e += 1)
-                                    .or_insert(1);
-                            }
-                        }
-                        _ => {
-                            // Request failed or timed out
-                            consecutive_failures += 1;
-                            failed_batches
-                                .entry(batch_key.clone())
-                                .and_modify(|e| *e += 1)
-                                .or_insert(1);
-
-                            // If we've failed too many times consecutively, back off this peer
-                            if consecutive_failures > 3 {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                            }
-                        }
-                    }
-
-                    active_requests.fetch_sub(1, Ordering::SeqCst);
-                }
-
-                // Task completed
-                Ok::<(), String>(())
-            })
-        })
-        .collect();
-
-    // IMPROVEMENT: Processing task with batching for efficiency
-    let process_handle = {
-        let blockchain = Arc::clone(&node.blockchain);
-        let processed_height = Arc::clone(&processed_height);
-        let main_pb = main_pb.clone();
-        let failed_batches = Arc::clone(&failed_batches);
-
-        tokio::spawn(async move {
-            // Use a buffer to batch process blocks
-            let mut block_buffer: Vec<(SocketAddr, Block)> = Vec::with_capacity(1000);
-            let mut last_update = Instant::now();
-            let mut last_save_height = local_height;
-
-            while let Some((peer, block)) = rx.recv().await {
-                // Basic validation again for safety
-                if block.calculate_hash_for_block() != block.hash {
-                    continue;
-                }
-
-                // Add to buffer
-                block_buffer.push((peer, block));
-
-                // Batch process when buffer gets large enough or every second
-                if block_buffer.len() >= 1000 || last_update.elapsed() > Duration::from_secs(1) {
-                    let blockchain = blockchain.write().await;
-
-                    // Sort blocks by index before processing
-                    block_buffer.sort_by_key(|(_, b)| b.index);
-
-                    let mut saved_count = 0;
-                    for (_peer, block) in block_buffer.drain(..) {
-                        // Skip blocks we already have
-                        if block.index <= last_save_height {
-                            continue;
-                        }
-
-                        // Frontier signature gate (S-01). request_blocks_batch checks
-                        // only hash self-consistency, so on this manual sync path any
-                        // block above the verification floor must carry full, valid
-                        // ML-DSA witnesses before we persist it — otherwise a hostile
-                        // peer could inject a forged spend above our tip.
-                        let floor = blockchain.verification_floor();
-                        if block.index > floor
-                            && !blockchain.block_signatures_fully_verified(&block)
-                        {
-                            println!(
-                                "Rejected block {} above floor {}: signatures not fully verifiable",
-                                block.index, floor
-                            );
-                            continue;
-                        }
-
-                        if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
-                            // Log error but continue with next blocks
-                            println!("Error saving block {}: {}", block.index, e);
-
-                            // Mark this batch as failed so it can be retried
-                            let batch_key = format!(
-                                "{}-{}",
-                                (block.index / PARALLEL_BATCH_SIZE as u32)
-                                    * PARALLEL_BATCH_SIZE as u32,
-                                ((block.index / PARALLEL_BATCH_SIZE as u32) + 1)
-                                    * PARALLEL_BATCH_SIZE as u32
-                            );
-
-                            failed_batches
-                                .entry(batch_key)
-                                .and_modify(|e| *e += 1)
-                                .or_insert(1);
-
-                            continue;
-                        }
-
-                        last_save_height = block.index;
-                        saved_count += 1;
-                        processed_height.store(block.index, Ordering::Release);
-                        main_pb.inc(1);
-                    }
-
-                    if saved_count > 0 {
-                        main_pb.set_message(format!("Saved to height {}", last_save_height));
-                    }
-
-                    last_update = Instant::now();
-                }
-            }
-
-            // Process any remaining blocks
-            if !block_buffer.is_empty() {
-                let blockchain = blockchain.write().await;
-
-                // Sort blocks by index before final processing
-                block_buffer.sort_by_key(|(_, b)| b.index);
-
-                for (_peer, block) in block_buffer.drain(..) {
-                    if block.index <= last_save_height {
-                        continue;
-                    }
-
-                    // Frontier signature gate (S-01) — same as the batched path above.
-                    let floor = blockchain.verification_floor();
-                    if block.index > floor && !blockchain.block_signatures_fully_verified(&block) {
-                        println!(
-                            "Rejected final block {} above floor {}: signatures not fully verifiable",
-                            block.index, floor
-                        );
-                        continue;
-                    }
-
-                    if let Err(e) = blockchain.save_receipt_verified_block(&block).await {
-                        println!("Error saving final block {}: {}", block.index, e);
-                        continue;
-                    }
-
-                    processed_height.store(block.index, Ordering::Release);
-                    main_pb.inc(1);
-                }
-            }
-
-            Ok::<(), String>(())
-        })
-    };
-
-    // IMPROVEMENT: Wait for completion with more robust error handling
-    match tokio::time::timeout(SYNC_TIMEOUT, async {
-        // Monitor progress and handle stalled sync
-        let monitor_handle = {
-            let current_height = Arc::clone(&current_height);
-            let processed_height = Arc::clone(&processed_height);
-            let active_requests = Arc::clone(&active_requests);
-            let status_pb = status_pb.clone();
-            let tx = tx.clone();
-            let node = node.clone();
-
-            tokio::spawn(async move {
-                let mut last_progress = Instant::now();
-                let mut last_processed = processed_height.load(Ordering::Acquire);
-
-                loop {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-
-                    let now_processed = processed_height.load(Ordering::Acquire);
-                    let active = active_requests.load(Ordering::Acquire);
-
-                    // Update status message
-                    status_pb.set_message(format!(
-                        "Progress: {}/{} (active: {})",
-                        now_processed - local_height,
-                        target_height - local_height,
-                        active
-                    ));
-
-                    // Check for progress
-                    if now_processed > last_processed {
-                        last_progress = Instant::now();
-                        last_processed = now_processed;
-                    } else if last_progress.elapsed() > Duration::from_secs(60) {
-                        // No progress for 60 seconds - try to recover
-                        status_pb.set_message("Sync stalled - attempting recovery");
-
-                        // Try to find a new peer to get blocks from
-                        if node.discover_network_nodes().await.is_ok() {
-                            let peers = node.peers.read().await;
-                            if let Some((addr, _)) = peers
-                                .iter()
-                                .filter(|(_, p)| p.blocks > now_processed)
-                                .min_by_key(|(_, p)| p.latency)
-                            {
-                                // Request blocks directly from this peer
-                                let start = now_processed.saturating_add(1);
-                                let end = (start + 100).min(target_height);
-
-                                if let Ok(blocks) = node.request_blocks(*addr, start, end).await {
-                                    // Send blocks to processing queue
-                                    for block in blocks {
-                                        let _ = tx.send((*addr, block)).await;
-                                    }
-                                    status_pb.set_message("Recovery successful - continuing sync");
-                                }
-                            }
-                        }
-
-                        // Reset timer so we don't retry too often
-                        last_progress = Instant::now();
-                    }
-
-                    // Check if we're done
-                    if now_processed >= target_height
-                        || current_height.load(Ordering::Acquire) >= target_height
-                    {
-                        break;
-                    }
-                }
-            })
-        };
-
-        // Only collect results, don't propagate individual task errors
-        futures::future::join_all(download_tasks).await;
-        drop(tx); // Drop sender to signal process_handle to finish
-
-        // Wait for processor and monitor to finish
-        let _ = tokio::join!(process_handle, monitor_handle);
-
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })
-    .await
-    {
-        Ok(Ok(_)) => {
-            let final_height = processed_height.load(Ordering::Acquire);
-            main_pb.finish_with_message(format!("Sync complete at height {}", final_height));
-            status_pb.finish_and_clear();
+    match outcome {
+        Converge::Converged => {
+            status_pb.finish_with_message(format!("Synced to the network tip: {}", tip_now));
             Ok(())
         }
-        _ => {
-            // Even with timeout, we still made progress
-            let final_height = processed_height.load(Ordering::Acquire);
-            let progress_pct = (final_height - local_height) as f64
-                / (target_height - local_height) as f64
-                * 100.0;
-
-            main_pb.finish_with_message(format!(
-                "Partial sync: {} blocks ({:.1}%) to height {}",
-                final_height - local_height,
-                progress_pct,
-                final_height
+        Converge::AtTipAhead => {
+            status_pb.finish_with_message(format!(
+                "At or ahead of the network tip ({}) — ready to mine",
+                tip_now
             ));
-            status_pb.finish_with_message("Sync timed out but made partial progress");
-
-            // Return success if we made significant progress (>80%)
-            if progress_pct > 80.0 {
-                Ok(())
-            } else {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Sync timed out at {:.1}% completion", progress_pct),
-                )))
-            }
+            Ok(())
+        }
+        Converge::Progressed => {
+            status_pb.finish_with_message(format!(
+                "Synced from {} to {} — run --sync again to finish catching up",
+                local_height, tip_now
+            ));
+            Ok(())
+        }
+        Converge::NeedsBootstrap => {
+            status_pb.finish_with_message(
+                "Local chain diverged below the finality window; a re-bootstrap is required",
+            );
+            Ok(())
+        }
+        Converge::BeaconStale => {
+            status_pb
+                .finish_with_message("Network tip beacon unavailable; try --sync again shortly");
+            Ok(())
         }
     }
 }
@@ -3899,12 +3505,19 @@ async fn bootstrap_publish_loop(
             (h, hex::encode(tip), network_id)
         };
 
+        // NOTE on stability: the snapshot only needs to be a VALID recent canonical
+        // point, not a perfectly-settled tip. On an active chain the tip changes every
+        // few seconds, so a large stability window would keep the snapshot frozen far
+        // behind the tip (the exact failure that stranded fresh nodes — they bootstrap
+        // to a stale snapshot the relay window can no longer bridge). A small window is
+        // enough to avoid snapshotting mid-reorg; if the published height is later
+        // reorged, the next snapshot corrects it and clients reconcile via converge.
         let (default_cooldown_secs, default_min_delta, default_stable_secs) = if height < 100 {
-            (30, 1, 15)
+            (30, 1, 3)
         } else if height < 10_000 {
-            (120, 5, 30)
+            (120, 5, 5)
         } else {
-            (300, 25, 60)
+            (300, 25, 8)
         };
         let cooldown_secs = env_u64_or(
             "ALPHANUMERIC_BOOTSTRAP_PUBLISH_COOLDOWN_SECS",

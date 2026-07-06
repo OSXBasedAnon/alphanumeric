@@ -85,6 +85,38 @@ struct TipBeaconInfo {
     hash: [u8; 32],
     version: u64,
 }
+
+/// Outcome of a single always-converge attempt toward the signed beacon tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Converge {
+    /// Local now holds the beacon tip block (in sync).
+    Converged,
+    /// Local is at or ahead of this beacon on an equal-or-heavier chain — a terminal
+    /// SUCCESS, never a concede: the node may mine to compete for the next block.
+    AtTipAhead,
+    /// Made forward progress but not yet at the beacon tip (caller retries).
+    Progressed,
+    /// Local diverges from canonical below the finality floor — only a full bootstrap
+    /// can fix it. Reserved for a contiguously-proven deep divergence.
+    NeedsBootstrap,
+    /// The relay/beacon could not be read coherently right now (gap / empty / error).
+    /// Transient — retry next tick; NEVER escalates to bootstrap/exit.
+    BeaconStale,
+}
+
+/// Result of the prev-hash-linked common-ancestor search.
+enum Ancestor {
+    /// Highest height where the LOCAL chain equals the CANONICAL chain the beacon
+    /// points to (the fork point), plus the canonical block bodies from that height
+    /// up to the beacon tip (ascending, contiguous) so the caller reuses them.
+    Found(u32, Vec<Block>),
+    /// A fully-linked canonical chain from the beacon tip down to the finality floor
+    /// matched the local chain nowhere — genuine deep divergence -> bootstrap.
+    NoneBelowFloor,
+    /// The relay could not supply a contiguous, prev-linked canonical chain right now
+    /// (missing body / empty-200 window / fetch error) -> transient, retry.
+    Transient,
+}
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 60;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
@@ -173,6 +205,9 @@ pub enum NodeError {
 
     #[error("Velocity error: {0}")]
     Velocity(String),
+
+    #[error("Retryable: {0}")]
+    Retryable(String),
 }
 
 // Implement Clone manually
@@ -192,6 +227,7 @@ impl Clone for NodeError {
             Self::Serialization(s) => Self::Serialization(s.clone()),
             Self::RateLimit(s) => Self::RateLimit(s.clone()),
             Self::Velocity(_) => Self::Network("Velocity error".to_string()),
+            Self::Retryable(s) => Self::Retryable(s.clone()),
         }
     }
 }
@@ -2219,16 +2255,29 @@ impl Node {
             if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 continue;
             }
+            // Reject a beacon for a different network outright: it must never drive
+            // convergence/bootstrap decisions on this chain. (Consensus safety still
+            // comes from independent block validation on apply; this is a cheap guard
+            // so a cross-network beacon can't even trigger a fetch or an exit path.)
+            let same_network = body
+                .get("network_id")
+                .and_then(|v| v.as_str())
+                .map(|nid| nid.eq_ignore_ascii_case(&hex::encode(self.network_id)))
+                .unwrap_or(true); // absent network_id: don't hard-fail (older gateway)
+            if !same_network {
+                continue;
+            }
             let Some(height) = body.get("height").and_then(|v| v.as_u64()) else {
                 continue;
             };
             let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-            let Some(hash) = body
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .and_then(|s| hex::decode(s).ok())
-                .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            else {
+            let parse_hash = |field: &str| -> Option<[u8; 32]> {
+                body.get(field)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            };
+            let Some(hash) = parse_hash("hash") else {
                 continue;
             };
             return Some(TipBeaconInfo {
@@ -2240,56 +2289,193 @@ impl Node {
         None
     }
 
-    /// Confirm we are on the canonical chain the beacon points to. Being behind
-    /// (no block at the beacon height yet) is not a fork — the forward stream
-    /// fetches it. A genuine fork (our block at that height has a different hash)
-    /// triggers an incremental reorg to the canonical branch; we never re-download.
+    /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
+    /// work is the single always-converge op below.
     async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {
-        let forked = {
-            let bc = self.blockchain.read().await;
-            matches!(bc.get_block(beacon.height), Ok(b) if b.hash != beacon.hash)
-        };
-        if !forked {
-            return;
+        let _ = self.converge_to_canonical(beacon).await;
+    }
+
+    /// Find the highest height at which the LOCAL chain agrees with the CANONICAL
+    /// chain the beacon points to — the fork point from which we adopt canonical
+    /// forward.
+    ///
+    /// CRITICAL (this is the algorithm that actually breaks the monopoly): the
+    /// canonical chain is reconstructed by following `previous_hash` DOWNWARD from
+    /// `beacon.hash`, NOT by a height->hash map. A stuck miner posts its own fork
+    /// blocks to the relay too, so `/api/blocks` returns BOTH sides of a fork at a
+    /// shared height; a height->hash map picks arbitrarily and can select the LOCAL
+    /// fork's block, yielding a false-HIGH ancestor — after which the adopt fetch
+    /// misses the true canonical block and the node stays stuck exactly as before.
+    /// The prev-hash walk can only ever UNDER-estimate the ancestor, which is safe
+    /// (the reorg engine re-derives the true root from the first differing height).
+    ///
+    /// Windows are 64-ALIGNED so every node issues identical relay ranges and the
+    /// CDN/gateway cache coalesces the reorg scan to one origin read per window.
+    /// Bounded, floored at `verification_floor()`; any relay gap/empty/break returns
+    /// `Transient` (retry) rather than a spurious deep-divergence verdict.
+    async fn find_common_ancestor(&self, beacon: &TipBeaconInfo, floor: u32) -> Ancestor {
+        const WIN: u32 = 64;
+        // Canonical blocks indexed by their OWN hash so we can follow previous_hash
+        // links regardless of which fork shares a given height.
+        let mut by_hash: std::collections::HashMap<[u8; 32], Block> =
+            std::collections::HashMap::new();
+        let mut canon_desc: Vec<Block> = Vec::new(); // canonical bodies, tip -> ancestor
+        let mut expected_hash = beacon.hash;
+        let mut expected_height = beacon.height;
+        let max_rounds = (beacon.height.saturating_sub(floor) / WIN) + 2;
+
+        for _ in 0..max_rounds {
+            // Fetch the 64-aligned window containing the height we need next.
+            let win_base = expected_height - (expected_height % WIN);
+            let win_end = win_base + WIN - 1;
+            match self.fetch_relay_blocks(win_base, win_end).await {
+                Ok(v) if !v.is_empty() => {
+                    for b in v {
+                        by_hash.entry(b.hash).or_insert(b);
+                    }
+                }
+                // Empty-but-200 in a below-tip window, or an outright error: a gap we
+                // cannot prove is divergence. Retry, never bootstrap.
+                Ok(_) | Err(_) => return Ancestor::Transient,
+            }
+
+            // Walk the prev-hash chain down through the bodies we now hold.
+            loop {
+                let Some(cb) = by_hash.get(&expected_hash).cloned() else {
+                    // The body for this exact (height,hash) is not on the relay even
+                    // after fetching its window -> broken link -> transient.
+                    return Ancestor::Transient;
+                };
+                let h = cb.index;
+                canon_desc.push(cb.clone());
+                let local_hash = self
+                    .blockchain
+                    .read()
+                    .await
+                    .get_block(h)
+                    .ok()
+                    .map(|lb| lb.hash);
+                if local_hash == Some(cb.hash) {
+                    canon_desc.reverse(); // ascending [ancestor ..= beacon.height]
+                    return Ancestor::Found(h, canon_desc);
+                }
+                if h <= floor {
+                    // Linked canonical contiguously to the floor with no local match.
+                    return Ancestor::NoneBelowFloor;
+                }
+                expected_hash = cb.previous_hash;
+                expected_height = h - 1;
+                if expected_height < win_base {
+                    break; // descend to the next lower window
+                }
+            }
         }
-        if let Err(e) = self.reorg_to_canonical(beacon.height).await {
-            debug!(
-                "Reorg to canonical at height {} deferred: {}",
-                beacon.height, e
-            );
+        Ancestor::Transient
+    }
+
+    /// The single always-converge operation. From ANY local state — behind, forked at
+    /// the tip, forked and behind, same-height fork, or already ahead — drive the local
+    /// chain to the signed-beacon canonical tip. Idempotent when already synced,
+    /// bounded in rounds and reorg depth, and it NEVER concedes: a node legitimately at
+    /// or ahead of the beacon returns `AtTipAhead` so it can mine and compete.
+    ///
+    /// Consensus safety is unchanged — every adoption still routes through the reorg
+    /// engine's work/checkpoint/S-01/replay guards; this only chooses WHICH canonical
+    /// blocks to stage. Adopted (canonical) blocks are NEVER re-published to the relay
+    /// (that would echo-storm the gateway and self-rate-limit the very catch-up it does).
+    async fn converge_to_canonical(&self, beacon: &TipBeaconInfo) -> Converge {
+        const MAX_ROUNDS: u32 = 6;
+        for _ in 0..MAX_ROUNDS {
+            let (tip, at_beacon) = {
+                let bc = self.blockchain.read().await;
+                let t = bc.get_latest_block_index() as u32;
+                let at = matches!(bc.get_block(beacon.height), Ok(b) if b.hash == beacon.hash);
+                (t, at)
+            };
+            if at_beacon {
+                return Converge::Converged; // holds the beacon tip (or is ahead of it on-chain)
+            }
+
+            let floor = self.blockchain.read().await.verification_floor();
+            let (ancestor, canon) = match self.find_common_ancestor(beacon, floor).await {
+                Ancestor::Found(a, canon) => (a, canon),
+                Ancestor::NoneBelowFloor => return Converge::NeedsBootstrap,
+                Ancestor::Transient => return Converge::BeaconStale,
+            };
+
+            let before = tip;
+            if ancestor >= tip {
+                // Same chain, strictly behind (ancestor == tip): forward-stream the
+                // canonical blocks that chain onto our tip. This path already applies
+                // the S-01 frontier gate + trails the finality checkpoint.
+                let _ = self.sync_with_block_relay(tip).await;
+            } else {
+                // Divergent: our tip forks from canonical at `ancestor` < tip.
+                let d = ancestor + 1;
+                let checkpoint = self.blockchain.read().await.trusted_checkpoint_height();
+                if d <= checkpoint {
+                    return Converge::NeedsBootstrap; // may not rewrite finalized history
+                }
+                if beacon.height.saturating_sub(ancestor)
+                    > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN
+                {
+                    // Deeper than a convergent reorg window; bounded so the adopt write
+                    // lock is never held across a huge branch. Genuine bootstrap case.
+                    return Converge::NeedsBootstrap;
+                }
+                // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon].
+                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index >= d).collect();
+                if branch.is_empty() {
+                    return Converge::BeaconStale;
+                }
+                let adopted = self
+                    .blockchain
+                    .write()
+                    .await
+                    .adopt_external_branch(branch)
+                    .await
+                    .unwrap_or(false);
+                if !adopted {
+                    // The engine declined because our branch's work is >= canonical
+                    // (we hold an equal-or-heavier chain, including the equal-work
+                    // lower-local-hash tie). That is a terminal SUCCESS for mining,
+                    // not a concede — extend our chain and let PoW settle it.
+                    return Converge::AtTipAhead;
+                }
+                info!(
+                    "Converged onto canonical branch via reorg (fork@{} -> beacon {})",
+                    ancestor, beacon.height
+                );
+                // Deliberately DO NOT publish_local_tip here: these are canonical
+                // blocks we adopted, not blocks we mined. Re-POSTing them echoes the
+                // relay and can trip the per-IP rate limit into non-convergence.
+            }
+
+            let after = self.blockchain.read().await.get_latest_block_index() as u32;
+            if after == before {
+                break; // no progress this round -> stop (avoid spin)
+            }
+        }
+
+        let synced = matches!(
+            self.blockchain.read().await.get_block(beacon.height),
+            Ok(b) if b.hash == beacon.hash
+        );
+        if synced {
+            Converge::Converged
+        } else {
+            Converge::Progressed
         }
     }
 
-    /// Incremental reorg to the canonical branch (no DB re-download). Fetches the
-    /// competing block bodies around the fork point from the gateway — which keys
-    /// blocks by (height,hash), so our fork and the canonical block coexist and
-    /// both come back in the range — and hands them to the fork-choice reorg,
-    /// which switches to the heavier canonical branch. Bounded by the signed
-    /// header window; a fork deeper than that is left to a full bootstrap.
-    async fn reorg_to_canonical(&self, fork_height: u32) -> Result<(), NodeError> {
-        let from = fork_height.saturating_sub(64);
-        let to = fork_height.saturating_add(1);
-        let blocks = self.fetch_relay_blocks(from, to).await?;
-        if blocks.is_empty() {
-            return Ok(());
+    /// Fetch the signed beacon and converge to it. Callable from `main.rs` (the `--sync`
+    /// command, launch, and the runtime reconcile loop). Beacon unreachable -> fail-open
+    /// as `BeaconStale` (never a hard stop).
+    pub async fn sync_to_beacon(&self) -> Converge {
+        match self.fetch_tip_beacon().await {
+            Some(beacon) => self.converge_to_canonical(&beacon).await,
+            None => Converge::BeaconStale,
         }
-        let before = { self.blockchain.read().await.get_latest_block_index() as u32 };
-        let adopted = self
-            .blockchain
-            .write()
-            .await
-            .adopt_external_branch(blocks)
-            .await
-            .map_err(|e| NodeError::Blockchain(e.to_string()))?;
-        if adopted {
-            let after = { self.blockchain.read().await.get_latest_block_index() as u32 };
-            info!(
-                "Reorged onto the canonical branch (height {} -> {})",
-                before, after
-            );
-            let _ = self.publish_local_tip().await;
-        }
-        Ok(())
     }
 
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
@@ -2854,74 +3040,57 @@ impl Node {
     }
 
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
-        // Best-effort peer discovery. NAT'd / relay-only miners may have no
-        // reachable p2p peers and instead propagate through the gateway block
-        // relay, so failure here is not fatal when relay sync is enabled.
+        // Best-effort peer discovery (harmless no-op when NAT'd and empty).
         if self.peers.read().await.is_empty() {
             let _ = timeout(max_wait, self.connect_discovery_peers(8)).await;
         }
 
-        // Catch up to the network tip before mining. p2p first when we have peers,
-        // then ALWAYS pull the gateway relay — it is the authoritative propagation
-        // path for NAT'd nodes, so we sync it every time rather than only as a
-        // fallback. Not fatal: when already at the tip there is simply nothing to
-        // fetch. This is what makes a node that fell behind catch up on its own
-        // before it mines, with no configuration.
-        let _ = timeout(max_wait, self.sync_with_network()).await;
-        self.relay_catch_up(max_wait).await;
-
-        // Confirm we are on the CANONICAL chain, not just at the right height,
-        // before mining. If our tip diverges from the signed beacon (a fork), this
-        // reorgs to canonical first — so we never extend a losing fork and cause
-        // the reorg churn that hurts multi-miner convergence.
-        if let Some(beacon) = self.fetch_tip_beacon().await {
-            self.reconcile_to_beacon(&beacon).await;
-        }
-
-        let peers_available = !self.peers.read().await.is_empty();
-        if peers_available {
-            // Peer path: don't mine while a connected peer is ahead of us, and
-            // re-publish our tip if we're ahead so it propagates.
-            let peer_height = self.best_connected_peer_height_for_mining(max_wait).await?;
-            let local_height = {
-                let blockchain = self.blockchain.read().await;
-                blockchain.get_latest_block_index() as u32
+        // ALWAYS CONVERGE, THEN COMPETE — never pause-and-concede.
+        //
+        // When behind or forked, actively converge to the signed-beacon canonical tip
+        // and THEN mine on that fresh tip to compete for the next block. This is the
+        // fix for the monopoly failure: a node that is behind used to just refuse to
+        // mine ("mining paused until the node syncs") and sit it out, so whoever was
+        // ahead kept winning and nobody could catch up. Now "behind" means "actively
+        // syncing then racing", from ANY state (behind, forked-at-tip, forked-and-
+        // behind). The loop re-fetches the beacon each round so a block that lands
+        // mid-prep is adopted and we re-target onto it before mining. The backoff keeps
+        // the cadence >= a block time so a run of rounds can't self-rate-limit the relay
+        // into the very non-convergence it is meant to cure.
+        let deadline = Instant::now() + max_wait;
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            let Some(beacon) = self.fetch_tip_beacon().await else {
+                // Beacon genuinely unreachable => FAIL OPEN and mine on the local tip.
+                // Producing on our best-known chain beats conceding; the reorg engine
+                // still resolves any fork when connectivity returns.
+                warn!("Tip beacon unreachable; mining on local tip (fail-open)");
+                return Ok(());
             };
-
-            if peer_height > local_height {
-                return Err(NodeError::ConsensusFailure(format!(
-                    "connected peer tip {} is ahead of local tip {}; wait for sync to finish",
-                    peer_height, local_height
-                )));
-            }
-
-            if peer_height < local_height {
-                if let Err(e) = self.publish_local_tip().await {
-                    warn!("Pre-mine local tip publish failed: {}", e);
+            match self.converge_to_canonical(&beacon).await {
+                // At the canonical tip, or holding an equal/heavier chain: go COMPETE.
+                Converge::Converged | Converge::AtTipAhead => return Ok(()),
+                // Diverged below the finality window — incremental convergence cannot
+                // fix this (rare); surface so the reconcile loop can escalate.
+                Converge::NeedsBootstrap => {
+                    return Err(NodeError::ConsensusFailure(
+                        "chain diverged below the finality window; re-bootstrap required".into(),
+                    ));
                 }
-                return Err(NodeError::ConsensusFailure(format!(
-                    "local tip {} is ahead of connected peer tip {}; wait for propagation before mining another block",
-                    local_height, peer_height
-                )));
+                // Still converging (forward progress, or a transient relay gap). Keep
+                // trying with backoff until the deadline; then hand back Retryable so
+                // the caller re-invokes — we keep working toward the tip, never sit out.
+                Converge::Progressed | Converge::BeaconStale => {
+                    if Instant::now() >= deadline {
+                        return Err(NodeError::Retryable(
+                            "still converging to the canonical tip; retry".into(),
+                        ));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
             }
         }
-
-        // Gate on the verified public (gateway/relay) tip so we never mine on a
-        // stale chain. If we're behind, make one more focused relay pull to close
-        // the gap, then re-check — only refuse if we genuinely cannot reach the tip.
-        if self.guard_public_tip_before_mining(max_wait).await.is_err() {
-            self.relay_catch_up(max_wait).await;
-            self.guard_public_tip_before_mining(max_wait).await?;
-        }
-        Ok(())
-    }
-
-    /// Pull the gateway block relay up to the current network tip. Best-effort and
-    /// never fatal — used before mining and as the always-on catch-up path so a
-    /// node behind the network syncs itself with no configuration.
-    async fn relay_catch_up(&self, max_wait: Duration) {
-        let current = { self.blockchain.read().await.get_latest_block_index() as u32 };
-        let _ = timeout(max_wait, self.sync_with_block_relay(current)).await;
     }
 
     pub async fn publish_local_tip(&self) -> Result<(), NodeError> {
@@ -4406,21 +4575,17 @@ impl Node {
             }
         });
 
-        // Periodic catch-up sync: a behind node (fresh miner, node that missed
-        // blocks) must keep pulling from peers until it converges to the network
-        // tip, not just try once at startup. Cheap no-op when already at the tip.
+        // Periodic catch-up safety net: a behind or forked node must keep converging
+        // to the network tip even if a live beacon-version tick was missed. Driven by
+        // the signed beacon (NOT p2p, which is empty across NAT), so it runs in BOTH
+        // interactive and headless modes and needs no peers. Cheap no-op at the tip.
         let node_clone = node.clone();
         tokio::spawn(async move {
             let mut sync_interval = interval(Duration::from_secs(20));
             sync_interval.tick().await; // consume immediate first tick
             loop {
                 sync_interval.tick().await;
-                if node_clone.peers.read().await.is_empty() {
-                    continue;
-                }
-                if let Err(e) = node_clone.sync_with_network().await {
-                    debug!("Periodic catch-up sync: {}", e);
-                }
+                let _ = node_clone.sync_to_beacon().await;
             }
         });
 
@@ -4449,9 +4614,6 @@ impl Node {
                 let safety_ticks = (safety_secs / tick_secs).max(1);
                 loop {
                     ticker.tick().await;
-                    let current_height = {
-                        node_clone.blockchain.read().await.get_latest_block_index() as u32
-                    };
 
                     let beacon = node_clone.fetch_tip_beacon().await;
                     let beacon_changed = beacon.map(|b| b.version != last_version).unwrap_or(false);
@@ -4466,21 +4628,47 @@ impl Node {
                         last_version = b.version;
                     }
 
-                    // Stream the delta forward (extension). A fork is caught by the
-                    // reorg reconciler; see reconcile_to_beacon.
-                    match node_clone.sync_with_block_relay(current_height).await {
-                        Ok(saved) if saved > 0 => {
-                            debug!("Live sync: applied {} block(s)", saved);
-                            if let Err(e) = node_clone.publish_local_tip().await {
-                                debug!("Post-sync publish failed: {}", e);
+                    // The PUBLISHER and a CLIENT have opposite relationships to the
+                    // beacon, so they sync differently:
+                    //
+                    // * Publisher: it is the SOURCE of the beacon. Miners POST their
+                    //   blocks to the relay, which therefore runs AHEAD of the
+                    //   publisher's tip; the publisher must INGEST those blocks (a
+                    //   forward relay pull), which advances its tip and — via the tip
+                    //   signal — posts the fresh beacon that fans out to everyone.
+                    //   converge_to_canonical(own_beacon) would be a no-op (it already
+                    //   holds its own beacon), so it must pull the relay directly. No
+                    //   extra publish: the ingested blocks are already on the relay.
+                    //
+                    // * Client: it FOLLOWS the beacon. converge_to_canonical drives it
+                    //   to the authoritative tip from any state — forward-stream when
+                    //   behind, reorg when forked — and never re-publishes the canonical
+                    //   blocks it adopts (that would echo-storm the relay).
+                    if is_publisher {
+                        let current_height = {
+                            node_clone.blockchain.read().await.get_latest_block_index() as u32
+                        };
+                        match node_clone.sync_with_block_relay(current_height).await {
+                            Ok(saved) if saved > 0 => {
+                                debug!("Publisher ingested {} block(s) from relay", saved);
                             }
+                            Ok(_) => {}
+                            Err(e) => debug!("Publisher relay ingest: {}", e),
                         }
-                        Ok(_) => {}
-                        Err(e) => debug!("Live sync: {}", e),
-                    }
-
-                    if let Some(b) = beacon {
-                        node_clone.reconcile_to_beacon(&b).await;
+                    } else if let Some(b) = beacon {
+                        match node_clone.converge_to_canonical(&b).await {
+                            Converge::Converged | Converge::AtTipAhead => {}
+                            Converge::Progressed => {
+                                debug!("Live sync: progressed toward beacon {}", b.height);
+                            }
+                            Converge::NeedsBootstrap => {
+                                warn!(
+                                    "Divergence below finality window at beacon {}; bootstrap required",
+                                    b.height
+                                );
+                            }
+                            Converge::BeaconStale => {}
+                        }
                     }
                 }
             });
