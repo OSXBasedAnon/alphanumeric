@@ -2478,6 +2478,42 @@ impl Node {
         }
     }
 
+    /// PUBLISHER-side sync: converge to the HEAVIEST chain the relay holds, reorging off
+    /// a losing fork if necessary.
+    ///
+    /// The publisher is the SOURCE of the beacon, so it cannot follow it — it must decide
+    /// canonical from the blocks miners actually posted. A plain forward relay pull can
+    /// latch the publisher onto a losing fork (e.g. two miners post competing blocks at the
+    /// same height and it ingests the wrong one first) and then get STUCK: the heavier
+    /// chain's newer blocks don't chain onto the fork it holds, and a forward pull never
+    /// re-fetches the lower blocks needed to reorg. So instead we take the relay's
+    /// highest block as the target and run the same fork-aware converge — which finds the
+    /// real common ancestor, fetches the competing branch, and hands it to the engine's
+    /// WORK-based fork choice (so we only ever switch to a genuinely heavier chain, never a
+    /// merely "taller" low-work one). The reorg depth is bounded exactly as for clients.
+    async fn converge_to_relay_tip(&self) -> Converge {
+        let local_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
+        // Look at a window spanning a little below our tip (to include a fork's ancestor
+        // side) up to well above it (to catch a heavier competing chain miners extended).
+        let from = local_tip.saturating_sub(8);
+        let to = local_tip.saturating_add(256);
+        let blocks = match self.fetch_relay_blocks(from, to).await {
+            Ok(b) if !b.is_empty() => b,
+            _ => return Converge::BeaconStale,
+        };
+        // Target = the highest block on the relay. If several share the max height (a fork
+        // at the tip), any is fine: the engine's work check + lexical tie-break settles it.
+        let Some(tip) = blocks.iter().max_by_key(|b| b.index) else {
+            return Converge::BeaconStale;
+        };
+        let target = TipBeaconInfo {
+            height: tip.index,
+            hash: tip.hash,
+            version: 0,
+        };
+        self.converge_to_canonical(&target).await
+    }
+
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
         if !Self::public_stats_snapshots_enabled() {
             debug!("Skipping public stats snapshot because it is disabled by environment");
@@ -4645,15 +4681,17 @@ impl Node {
                     //   behind, reorg when forked — and never re-publishes the canonical
                     //   blocks it adopts (that would echo-storm the relay).
                     if is_publisher {
-                        let current_height = {
-                            node_clone.blockchain.read().await.get_latest_block_index() as u32
-                        };
-                        match node_clone.sync_with_block_relay(current_height).await {
-                            Ok(saved) if saved > 0 => {
-                                debug!("Publisher ingested {} block(s) from relay", saved);
+                        // Publisher: converge to the HEAVIEST chain the relay holds
+                        // (fork-aware). This ingests miner blocks forward AND reorgs off a
+                        // losing fork the publisher may have latched onto during a race —
+                        // so it can never get stuck on a dead branch while miners extend a
+                        // heavier one (which would freeze the beacon for the whole network).
+                        match node_clone.converge_to_relay_tip().await {
+                            Converge::Converged | Converge::AtTipAhead | Converge::Progressed => {}
+                            Converge::NeedsBootstrap => {
+                                warn!("Publisher: relay chain diverged below finality window; bootstrap required");
                             }
-                            Ok(_) => {}
-                            Err(e) => debug!("Publisher relay ingest: {}", e),
+                            Converge::BeaconStale => {}
                         }
                     } else if let Some(b) = beacon {
                         match node_clone.converge_to_canonical(&b).await {
