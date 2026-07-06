@@ -41,6 +41,11 @@ const PENDING_FULL_SIGNATURES_TREE: &str = "pending_full_signatures";
 // are never hashed and have no effect on block hashes, merkle roots, or validity.
 const CONFIRMED_WITNESSES_TREE: &str = "confirmed_witnesses";
 const CONFIRMED_WITNESS_INDEX_TREE: &str = "confirmed_witness_index";
+/// Replay registry: maps a confirmed non-system transaction's id to the canonical
+/// block height that confirmed it. A block that re-includes an already-confirmed
+/// transaction (replay) is rejected, so a signed payment cannot be re-mined to
+/// drain a wallet. Maintained incrementally on tip extension and reorg.
+const CONFIRMED_TX_TREE: &str = "confirmed_tx";
 /// How many blocks past confirmation a transaction's full witness is retained so
 /// it remains verifiable during near-tip sync. No consensus impact.
 pub const WITNESS_RETENTION_BLOCKS: u64 = 256;
@@ -1403,6 +1408,103 @@ impl Blockchain {
         self.raise_trusted_checkpoint(verified_height.saturating_sub(CHECKPOINT_REORG_MARGIN))
     }
 
+    fn open_confirmed_tx_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(CONFIRMED_TX_TREE).map_err(Into::into)
+    }
+
+    /// The canonical height at which `tx_id` was confirmed, or None if unseen.
+    fn confirmed_tx_index(&self, tx_id: &str) -> Option<u32> {
+        let raw = self
+            .open_confirmed_tx_tree()
+            .ok()?
+            .get(tx_id.as_bytes())
+            .ok()??;
+        if raw.len() < 4 {
+            return None;
+        }
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&raw[..4]);
+        Some(u32::from_le_bytes(b))
+    }
+
+    /// Register a confirmed block's non-system transactions in the replay registry.
+    fn record_confirmed_txs(&self, block: &Block) -> Result<(), BlockchainError> {
+        let tree = self.open_confirmed_tx_tree()?;
+        let idx = block.index.to_le_bytes().to_vec();
+        let mut batch = sled::Batch::default();
+        for tx in &block.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            batch.insert(tx.get_tx_id().as_bytes(), idx.clone());
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    /// Remove a block's non-system transactions from the replay registry (used when
+    /// a block is reverted during a reorg).
+    fn remove_confirmed_txs(&self, block: &Block) -> Result<(), BlockchainError> {
+        let tree = self.open_confirmed_tx_tree()?;
+        let mut batch = sled::Batch::default();
+        for tx in &block.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            batch.remove(tx.get_tx_id().as_bytes());
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    /// True if the block replays a non-system transaction already confirmed at a
+    /// DIFFERENT height. A brand-new block's own transactions are not yet registered,
+    /// so this is false for legitimate blocks and true only on an actual replay
+    /// (re-mining a confirmed payment to drain a wallet).
+    fn block_has_replayed_tx(&self, block: &Block) -> bool {
+        for tx in &block.transactions {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            if let Some(idx) = self.confirmed_tx_index(&tx.get_tx_id()) {
+                if idx != block.index {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Build the replay registry from the canonical chain if it has not been built
+    /// yet (first run under this feature, or right after a bootstrap import). Existing
+    /// history is grandfathered — only newly-adopted blocks are replay-checked.
+    pub fn ensure_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
+        let tree = self.open_confirmed_tx_tree()?;
+        if tree.iter().next().is_some() {
+            return Ok(());
+        }
+        let Some(tip) = self.highest_block_index() else {
+            return Ok(());
+        };
+        let mut batch = sled::Batch::default();
+        for h in 0..=tip {
+            if let Ok(block) = self.get_block(h) {
+                let idx = block.index.to_le_bytes().to_vec();
+                for tx in &block.transactions {
+                    if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                        continue;
+                    }
+                    batch.insert(tx.get_tx_id().as_bytes(), idx.clone());
+                }
+            }
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        Ok(())
+    }
+
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let debits_tree = self.open_pending_debits_tree()?;
@@ -1806,7 +1908,38 @@ impl Blockchain {
             return Ok(false);
         }
 
+        // Replay guard (reorg, fork-aware): a branch may legitimately re-include a
+        // transaction from the range it replaces, but it must not replay one that is
+        // confirmed BELOW the fork point (in the history the branch keeps). Reject a
+        // branch that does — this closes replay via a crafted reorg.
+        let fork_start = branch[0].index;
+        for b in &branch {
+            for tx in &b.transactions {
+                if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                    continue;
+                }
+                if let Some(idx) = self.confirmed_tx_index(&tx.get_tx_id()) {
+                    if idx < fork_start {
+                        debug!(
+                            "Reorg rejected: branch replays tx confirmed at {} (below fork {})",
+                            idx, fork_start
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
         self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
+
+        // Keep the replay registry consistent with the new canonical chain:
+        // unregister the transactions of the canonical blocks being reverted BEFORE
+        // they are overwritten; the new branch's are registered after the rewrite.
+        for h in fork_start..=tip.index {
+            if let Ok(old) = self.get_block(h) {
+                let _ = self.remove_confirmed_txs(&old);
+            }
+        }
 
         // Apply reorg by rewriting canonical block slots with the selected branch.
         for b in &branch {
@@ -1830,6 +1963,11 @@ impl Blockchain {
             let _ = self.remove_orphan_by_hash(&b.hash);
         }
         self.prune_orphans()?;
+
+        // Register the newly-canonical branch's transactions in the replay registry.
+        for b in &branch {
+            let _ = self.record_confirmed_txs(b);
+        }
 
         // Rebuild balances index after reorg.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
@@ -1905,6 +2043,14 @@ impl Blockchain {
     ) -> Result<(), BlockchainError> {
         // Canonical validation gate for all persistence paths.
         self.validate_block_internal(block, sig_mode).await?;
+
+        // Replay guard (tip extension): reject a block that re-includes a
+        // transaction already confirmed at a different height. Without this a
+        // confirmed, validly-signed payment could be re-mined to drain the sender.
+        // The reorg path has its own fork-aware replay check.
+        if self.block_has_replayed_tx(block) {
+            return Err(BlockchainError::InvalidTransaction);
+        }
 
         // Run expensive full-chain integrity checks periodically.
         let now = SystemTime::now()
@@ -2005,6 +2151,10 @@ impl Blockchain {
                 mempool.clear_transaction(tx);
             }
         }
+
+        // Register this block's transactions in the replay registry so any later
+        // block that re-includes one is rejected as a replay.
+        let _ = self.record_confirmed_txs(block);
 
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
@@ -4251,6 +4401,57 @@ mod tests {
         };
         block.hash = block.calculate_hash_for_block();
         block
+    }
+
+    #[test]
+    fn replay_registry_flags_a_reused_transaction() {
+        let bc = test_blockchain();
+        let payment = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 5_000,
+            signature: Some("aa".repeat(2400)),
+            pub_key: None,
+            sig_hash: None,
+        };
+
+        // Confirm the payment in a block at height 5.
+        let mut b5 = metadata_test_block(5, [0u8; 32], "miner", 1.0);
+        b5.transactions.push(payment.clone());
+        bc.record_confirmed_txs(&b5).unwrap();
+
+        // Re-applying the SAME block at its own height is idempotent, not a replay.
+        assert!(
+            !bc.block_has_replayed_tx(&b5),
+            "same-height re-apply must not be flagged"
+        );
+
+        // A later block re-including the exact same payment IS a replay.
+        let mut b6 = metadata_test_block(6, b5.hash, "miner", 1.0);
+        b6.transactions.push(payment.clone());
+        assert!(
+            bc.block_has_replayed_tx(&b6),
+            "a replayed transaction must be flagged"
+        );
+
+        // A distinct payment (different timestamp -> different tx_id) is fine.
+        let mut fresh = payment.clone();
+        fresh.timestamp = 7_000;
+        let mut b7 = metadata_test_block(7, [0u8; 32], "miner", 1.0);
+        b7.transactions.push(fresh);
+        assert!(
+            !bc.block_has_replayed_tx(&b7),
+            "a fresh transaction must not be flagged"
+        );
+
+        // Reverting height 5 unregisters it, so the same payment is admissible again.
+        bc.remove_confirmed_txs(&b5).unwrap();
+        assert!(
+            !bc.block_has_replayed_tx(&b6),
+            "after revert the transaction is no longer a replay"
+        );
     }
 
     #[test]

@@ -607,6 +607,13 @@ async fn main() -> Result<()> {
             warn!("Failed to seed trusted checkpoint: {}", e);
         }
 
+        // Build the replay registry from the chain we already hold if it hasn't
+        // been built yet (first run under this feature, or after a bootstrap
+        // import). Existing history is grandfathered; only new blocks are checked.
+        if let Err(e) = blockchain.read().await.ensure_confirmed_tx_index() {
+            warn!("Failed to build the replay registry: {}", e);
+        }
+
         let (consensus_descriptor, consensus_fingerprint) = {
             let blockchain_lock = blockchain.read().await;
             compute_consensus_fingerprint(&blockchain_lock)
