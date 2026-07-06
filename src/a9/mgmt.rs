@@ -81,11 +81,39 @@ fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let metadata = std::fs::metadata(path)?;
-        let mut perms = metadata.permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(path, perms)?;
+        // Restricting NTFS READ access needs ACLs (winapi); `set_readonly` only affects
+        // WRITE, so the old code was a security no-op. Warn instead of pretending.
+        let _ = path;
+        eprintln!(
+            "WARNING: wallet key file {} cannot be permission-restricted on Windows without \
+             ACLs; protect it manually.",
+            path
+        );
     }
+    Ok(())
+}
+
+/// Write secret bytes to `path` at 0600 from creation (no world-readable TOCTOU window),
+/// re-asserting perms for a pre-existing file. Mirrors main.rs::write_secret_file.
+async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, data).await?;
+    }
+    let _ = set_restrictive_file_permissions(path);
     Ok(())
 }
 
@@ -220,8 +248,7 @@ impl Mgmt {
 
         // Save wallet to key file with timeout
         match tokio::time::timeout(Duration::from_secs(5), async {
-            fs::write(KEY_FILE_PATH, serialized_key_data).await?;
-            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
+            write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await
@@ -371,8 +398,7 @@ impl Mgmt {
 
         // Save wallet to key file with timeout
         match tokio::time::timeout(Duration::from_secs(5), async {
-            fs::write(KEY_FILE_PATH, serialized_key_data).await?;
-            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
+            write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await
@@ -476,8 +502,7 @@ impl Mgmt {
             .collect();
 
         let serialized_key_data = serde_json::to_string(&wallet_key_data)?;
-        tokio::fs::write(KEY_FILE_PATH, serialized_key_data).await?;
-        let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
+        write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
 
         let db_guard = db_arc.write().await;
         let wallets_tree = db_guard
@@ -527,8 +552,7 @@ impl Mgmt {
 
             // Write the updated wallet key data back to the file
             let updated_data = serde_json::to_string(&wallet_key_data)?;
-            fs::write(KEY_FILE_PATH, updated_data).await?;
-            let _ = set_restrictive_file_permissions(KEY_FILE_PATH);
+            write_secret_file(KEY_FILE_PATH, updated_data.as_ref()).await?;
 
             info!("Wallet renamed from '{}' to '{}'", old_name, new_name);
             Ok(())

@@ -2894,11 +2894,44 @@ fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let metadata = std::fs::metadata(path)?;
-        let mut perms = metadata.permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(path, perms)?;
+        // A private key MUST NOT be world-readable. Restricting NTFS access needs ACLs
+        // (winapi), which we don't apply here — and `set_readonly` restricts WRITE, not
+        // READ, so the previous code was a security no-op that pretended the key was
+        // protected. Warn loudly instead of silently lying about protection.
+        let _ = path;
+        eprintln!(
+            "WARNING: key file {} cannot be permission-restricted on Windows without ACLs; \
+             protect it manually (its directory should be user-only).",
+            path
+        );
     }
+    Ok(())
+}
+
+/// Write secret bytes to `path` such that the file is 0600 from the instant it is CREATED,
+/// closing the TOCTOU window in which a plain write-then-chmod leaves a freshly-created key
+/// briefly world/group-readable. For a pre-existing file we also re-assert 0600.
+async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600) // applied on creation, so the key is never world-readable
+            .open(path)
+            .await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, data).await?;
+    }
+    // Belt-and-suspenders: re-assert perms for a file that pre-existed this write (mode on
+    // OpenOptions only affects newly-created files). No-op-with-warning on Windows.
+    let _ = set_restrictive_file_permissions(path);
     Ok(())
 }
 
@@ -2914,8 +2947,7 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
     let rng = SystemRandom::new();
     let key_pair_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
         .map_err(|e| format!("Failed to generate node identity key pair: {}", e))?;
-    fs::write(path, key_pair_pkcs8.as_ref()).await?;
-    let _ = set_restrictive_file_permissions(path);
+    write_secret_file(path, key_pair_pkcs8.as_ref()).await?;
     Ok(key_pair_pkcs8.as_ref().to_vec())
 }
 
