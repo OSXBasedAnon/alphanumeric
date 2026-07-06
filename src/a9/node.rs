@@ -2324,6 +2324,7 @@ impl Node {
                     "{}?network_id={}&start={}&end={}&limit={}&offset={}",
                     base_url, network_id, start, end, limit, offset
                 );
+                debug!("relay GET {}", url);
                 let res = self.http_client.get(url).send().await;
                 let res = match res {
                     Ok(r) => r,
@@ -2359,15 +2360,22 @@ impl Node {
 
                 let records = body.blocks.unwrap_or_default();
                 let record_count = records.len() as u32;
+                debug!("relay response ok={} records={}", body.ok, record_count);
                 let mut page_keys = Vec::with_capacity(records.len());
                 for record in records {
                     match serde_json::from_value::<Block>(record.block) {
                         Ok(block) => {
+                            let range_ok = block.index >= start && block.index <= end;
+                            let hash_ok = block.calculate_hash_for_block() == block.hash;
+                            let pow_ok = block.verify_pow();
+                            debug!(
+                                "relay fetch block #{}: range_ok={} hash_ok={} pow_ok={}",
+                                block.index, range_ok, hash_ok, pow_ok
+                            );
                             page_keys.push((block.index, block.hash));
-                            if block.index >= start
-                                && block.index <= end
-                                && block.calculate_hash_for_block() == block.hash
-                                && block.verify_pow()
+                            if range_ok
+                                && hash_ok
+                                && pow_ok
                                 && seen_blocks.insert((block.index, block.hash))
                             {
                                 all_blocks.push(block);
@@ -2612,57 +2620,56 @@ impl Node {
     }
 
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
-        let has_peers = !self.peers.read().await.is_empty();
-        if !has_peers {
-            timeout(max_wait, self.connect_discovery_peers(8))
-                .await
-                .map_err(|_| {
-                    NodeError::ConsensusFailure(
-                        "peer discovery timed out before mining".to_string(),
-                    )
-                })?
-                .map_err(|e| {
-                    NodeError::ConsensusFailure(format!(
-                        "peer discovery failed before mining: {}",
-                        e
-                    ))
-                })?;
+        // Best-effort peer discovery. NAT'd / relay-only miners may have no
+        // reachable p2p peers and instead propagate through the gateway block
+        // relay, so failure here is not fatal when relay sync is enabled.
+        if self.peers.read().await.is_empty() {
+            let _ = timeout(max_wait, self.connect_discovery_peers(8)).await;
         }
 
-        let _ = self.best_connected_peer_height_for_mining(max_wait).await?;
+        // Best-effort catch-up to the network tip (p2p first, block relay
+        // fallback). This is intentionally NOT fatal: when we're already at the
+        // tip there is nothing new to fetch and sync_with_network reports that as
+        // an error. The authoritative "are we behind?" check is the peer-height
+        // comparison and guard_public_tip_before_mining below.
+        let _ = timeout(max_wait, self.sync_with_network()).await;
 
-        timeout(max_wait, self.sync_with_network())
-            .await
-            .map_err(|_| {
-                NodeError::ConsensusFailure("pre-mine network sync timed out".to_string())
-            })?
-            .map_err(|e| {
-                NodeError::ConsensusFailure(format!("pre-mine network sync failed: {}", e))
-            })?;
+        let peers_available = !self.peers.read().await.is_empty();
+        if peers_available {
+            // Peer path: don't mine while a connected peer is ahead of us, and
+            // re-publish our tip if we're ahead so it propagates.
+            let peer_height = self.best_connected_peer_height_for_mining(max_wait).await?;
+            let local_height = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_latest_block_index() as u32
+            };
 
-        let peer_height = self.best_connected_peer_height_for_mining(max_wait).await?;
-        let local_height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
-        };
-
-        if peer_height > local_height {
-            return Err(NodeError::ConsensusFailure(format!(
-                "connected peer tip {} is ahead of local tip {}; wait for sync to finish",
-                peer_height, local_height
-            )));
-        }
-
-        if peer_height < local_height {
-            if let Err(e) = self.publish_local_tip().await {
-                warn!("Pre-mine local tip publish failed: {}", e);
+            if peer_height > local_height {
+                return Err(NodeError::ConsensusFailure(format!(
+                    "connected peer tip {} is ahead of local tip {}; wait for sync to finish",
+                    peer_height, local_height
+                )));
             }
-            return Err(NodeError::ConsensusFailure(format!(
-                "local tip {} is ahead of connected peer tip {}; wait for propagation before mining another block",
-                local_height, peer_height
-            )));
+
+            if peer_height < local_height {
+                if let Err(e) = self.publish_local_tip().await {
+                    warn!("Pre-mine local tip publish failed: {}", e);
+                }
+                return Err(NodeError::ConsensusFailure(format!(
+                    "local tip {} is ahead of connected peer tip {}; wait for propagation before mining another block",
+                    local_height, peer_height
+                )));
+            }
+        } else if !Self::block_relay_sync_enabled() {
+            // No peers and no relay to anchor against — refuse to mine blind on a
+            // possibly-stale chain rather than forking the network.
+            return Err(NodeError::ConsensusFailure(
+                "no reachable peers and block relay sync is disabled; cannot establish the network tip before mining".to_string(),
+            ));
         }
 
+        // Always gate on the verified public (gateway/relay) tip, so a relay-only
+        // miner still refuses to mine on a stale chain.
         self.guard_public_tip_before_mining(max_wait).await?;
         Ok(())
     }
@@ -4118,6 +4125,24 @@ impl Node {
             }
         });
 
+        // Periodic catch-up sync: a behind node (fresh miner, node that missed
+        // blocks) must keep pulling from peers until it converges to the network
+        // tip, not just try once at startup. Cheap no-op when already at the tip.
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            let mut sync_interval = interval(Duration::from_secs(20));
+            sync_interval.tick().await; // consume immediate first tick
+            loop {
+                sync_interval.tick().await;
+                if node_clone.peers.read().await.is_empty() {
+                    continue;
+                }
+                if let Err(e) = node_clone.sync_with_network().await {
+                    debug!("Periodic catch-up sync: {}", e);
+                }
+            }
+        });
+
         if let Some(relay_sync_interval_secs) = Self::periodic_relay_sync_interval_secs() {
             let node_clone = node.clone();
             tokio::spawn(async move {
@@ -4129,23 +4154,20 @@ impl Node {
                         blockchain.get_latest_block_index() as u32
                     };
 
-                    match node_clone.fetch_public_tip_height().await {
-                        Ok(Some(public_height)) if public_height > current_height => {}
-                        Ok(_) => continue,
-                        Err(e) => {
-                            debug!("Periodic relay sync tip check skipped: {}", e);
-                            continue;
-                        }
-                    }
-
+                    // Always pull from the relay. Miners POST newly-mined blocks
+                    // there, but the header-snapshot tip (our own published height)
+                    // does not reflect them yet, so gating on it would never pull a
+                    // miner's block. sync_with_block_relay is a bounded fetch and a
+                    // no-op when nothing sits above our tip.
                     match node_clone.sync_with_block_relay(current_height).await {
                         Ok(saved) if saved > 0 => {
+                            info!("Pulled {} block(s) from the gateway relay", saved);
                             if let Err(e) = node_clone.publish_local_tip().await {
                                 warn!("Post-relay-sync publish failed: {}", e);
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => debug!("Periodic relay sync skipped: {}", e),
+                        Err(e) => debug!("Periodic relay sync: {}", e),
                     }
                 }
             });
@@ -4614,9 +4636,18 @@ impl Node {
         let message = NetworkMessage::GetBlockHeight;
 
         match self.send_message_with_response(addr, &message).await {
-            Ok(NetworkMessage::BlockHeight(height)) => Ok(height),
-            Ok(_) => Err(NodeError::Network("Invalid response type".into())),
-            Err(e) => Err(e),
+            Ok(NetworkMessage::BlockHeight(height)) => {
+                debug!("request_peer_height({}): BlockHeight={}", addr, height);
+                Ok(height)
+            }
+            Ok(_) => {
+                debug!("request_peer_height({}): unexpected response type", addr);
+                Err(NodeError::Network("Invalid response type".into()))
+            }
+            Err(e) => {
+                debug!("request_peer_height({}): ERR {}", addr, e);
+                Err(e)
+            }
         }
     }
 
@@ -7046,6 +7077,34 @@ impl Node {
             drop(peers);
             peer_heights = self.query_peer_heights(peer_ips, PEER_TIMEOUT_MS).await;
         }
+
+        // Reliability fallback: the GetBlockHeight RPC can miss responses, but the
+        // handshake always exchanges chain heights. Use the height each peer reported
+        // at connect time for any peer that is ahead of us, so a behind node still
+        // knows who to sync from instead of giving up.
+        if peer_heights.is_empty() {
+            let peers = self.peers.read().await;
+            let mut handshake_heights: Vec<(SocketAddr, u32)> = peers
+                .iter()
+                .filter(|(_, info)| info.blocks > current_height)
+                .map(|(addr, info)| (*addr, info.blocks))
+                .collect();
+            drop(peers);
+            handshake_heights.sort_by(|a, b| b.1.cmp(&a.1));
+            if !handshake_heights.is_empty() {
+                debug!(
+                    "sync_with_network: RPC returned no heights; using {} handshake-known peer(s), best={}",
+                    handshake_heights.len(),
+                    handshake_heights[0].1
+                );
+                peer_heights = handshake_heights;
+            }
+        }
+        debug!(
+            "sync_with_network: local={} candidates={}",
+            current_height,
+            peer_heights.len()
+        );
 
         // IMPROVEMENT: Check if we already have the latest blocks
         if let Some((_, best_height)) = peer_heights.first() {
