@@ -2855,10 +2855,11 @@ fn interpolate_color(start: (u8, u8, u8), end: (u8, u8, u8), t: f32) -> Color {
 }
 
 fn print_ascii_intro() {
-    // Replace with your ASCII art
+    // Version is templated from Cargo.toml at compile time so the banner never drifts
+    // out of sync with the actual build (it previously hardcoded an older version).
     let ascii_art = r#"
 
-                        -++-    -++-                                  alphanumeric v7.3.8
+                        -++-    -++-                                  alphanumeric v__VERSION__
                        -+++.   .+++
                 .++++++++++++++++++++++-                              Architecture: Rust
                 -####++++#####++++#####+                              Algorithm: SHA-256
@@ -2869,7 +2870,8 @@ fn print_ascii_intro() {
                 .+++++.  .-+++-
                 ++++     ++++.
 
-"#;
+"#
+    .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
 
     let start_color = (42, 93, 253); // White
     let end_color = (190, 252, 233); // Neon Green
