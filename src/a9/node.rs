@@ -2557,7 +2557,7 @@ impl Node {
                         Ok(block) => {
                             let range_ok = block.index >= start && block.index <= end;
                             let hash_ok = block.calculate_hash_for_block() == block.hash;
-                            let pow_ok = block.verify_pow();
+                            let pow_ok = block.verify_pow_meets_floor();
                             debug!(
                                 "relay fetch block #{}: range_ok={} hash_ok={} pow_ok={}",
                                 block.index, range_ok, hash_ok, pow_ok
@@ -5543,7 +5543,7 @@ impl Node {
             }
         };
 
-        if block.calculate_hash_for_block() != block.hash || !block.verify_pow() {
+        if block.calculate_hash_for_block() != block.hash || !block.verify_pow_meets_floor() {
             self.validation_cache.insert(
                 block_hash,
                 ValidationCacheEntry {
@@ -6140,7 +6140,7 @@ impl Node {
                     for idx in start..=end {
                         if let Ok(block) = blockchain.get_block(idx) {
                             // Basic validation for response blocks
-                            if block.verify_pow() && block.calculate_hash_for_block() == block.hash
+                            if block.verify_pow_meets_floor() && block.calculate_hash_for_block() == block.hash
                             {
                                 validated_blocks.push(block);
                             }
@@ -6177,7 +6177,7 @@ impl Node {
                     return Ok(());
                 }
                 for block in blocks {
-                    if block.calculate_hash_for_block() != block.hash || !block.verify_pow() {
+                    if block.calculate_hash_for_block() != block.hash || !block.verify_pow_meets_floor() {
                         continue;
                     }
                     // Verify transaction signatures (via witnesses fetched from the
@@ -6337,7 +6337,7 @@ impl Node {
                 let block_ref = Arc::new(block);
 
                 // Quick validation before processing
-                if !block_ref.verify_pow() {
+                if !block_ref.verify_pow_meets_floor() {
                     self.record_peer_failure(addr).await;
                     return Err(NodeError::Network("Invalid block proof of work".into()));
                 }
@@ -7489,7 +7489,7 @@ impl Node {
                                     block.index >= start
                                         && block.index <= end
                                         && block.calculate_hash_for_block() == block.hash
-                                        && block.verify_pow()
+                                        && block.verify_pow_meets_floor()
                                 })
                                 .collect();
                             candidate_blocks.sort_by_key(|block| block.index);

@@ -638,6 +638,18 @@ impl Block {
         hash_int <= target
     }
 
+    /// Proof-of-work AND the network minimum-difficulty floor. This is the check
+    /// ingress paths must use before accepting a network-supplied block: without
+    /// the floor a block could declare difficulty 0 and make its PoW a no-op.
+    /// Genesis (index 0) is pinned by hash, not PoW, so it is exempt. The exact
+    /// parent-linked difficulty is still enforced in validate_block_internal.
+    pub fn verify_pow_meets_floor(&self) -> bool {
+        if self.index > 0 && self.difficulty < NETWORK_MIN_DIFFICULTY {
+            return false;
+        }
+        self.verify_pow()
+    }
+
     pub fn calculate_hash_for_block(&self) -> [u8; 32] {
         // Use a fixed-size array to avoid heap allocation
         // Total: 4 + 32 + 8 + 8 + 8 + 32 = 92 bytes (fits on stack)
@@ -4205,6 +4217,29 @@ mod tests {
         };
         block.hash = block.calculate_hash_for_block();
         block
+    }
+
+    #[test]
+    fn pow_floor_rejects_below_minimum_difficulty_at_ingress() {
+        // A non-genesis block below the network minimum difficulty makes its PoW a
+        // no-op; the ingress check must reject it even though the bare mechanism
+        // "passes". Genesis (index 0) is pinned by hash and exempt.
+        let mut block = metadata_test_block(1, [0u8; 32], "alice", 1.0);
+        block.difficulty = 0;
+        block.hash = block.calculate_hash_for_block();
+        assert!(block.verify_pow(), "difficulty-0 PoW is trivially valid as a mechanism");
+        assert!(
+            !block.verify_pow_meets_floor(),
+            "the ingress floor must reject a sub-minimum-difficulty block"
+        );
+
+        let mut genesis = metadata_test_block(0, [0u8; 32], "miner", 1.0);
+        genesis.difficulty = 0;
+        genesis.hash = genesis.calculate_hash_for_block();
+        assert!(
+            genesis.verify_pow_meets_floor(),
+            "genesis is exempt from the floor (pinned by hash, not PoW)"
+        );
     }
 
     #[test]
