@@ -66,7 +66,11 @@ pub const DEFAULT_PORT: u16 = 7177;
 const MIN_PEERS: usize = 3;
 const MAX_PEERS_PER_SUBNET: usize = 3;
 const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
-const SUBNET_MASK_IPV6: u8 = 64; // /64 subnet
+// Group IPv6 peers by /48, NOT /64: a single rented /48 contains 65,536 /64s, so a /64
+// grouping let one attacker present that many distinct "subnets" and completely bypass the
+// MAX_PEERS_PER_SUBNET anti-eclipse cap. /48 is the typical site allocation, so all of an
+// attacker's addresses within one rental collapse to one group and the cap bites.
+const SUBNET_MASK_IPV6: u8 = 48; // /48 subnet
 
 // Timeouts and intervals
 const PEER_TIMEOUT: u64 = 300; // seconds
@@ -361,9 +365,19 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     pub fn new(addr: SocketAddr) -> Self {
-        let subnet_group = match addr.ip() {
-            IpAddr::V4(_) => SubnetGroup::from_ip(addr.ip(), SUBNET_MASK_IPV4, 0),
-            IpAddr::V6(_) => SubnetGroup::from_ip(addr.ip(), 0, SUBNET_MASK_IPV6),
+        // Normalize an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to real IPv4 before
+        // grouping, so it is capped as IPv4 /24 rather than treated as a distinct IPv6
+        // group an attacker could trivially vary to dodge the subnet-diversity cap.
+        let ip = match addr.ip() {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            v4 => v4,
+        };
+        let subnet_group = match ip {
+            IpAddr::V4(_) => SubnetGroup::from_ip(ip, SUBNET_MASK_IPV4, 0),
+            IpAddr::V6(_) => SubnetGroup::from_ip(ip, 0, SUBNET_MASK_IPV6),
         };
 
         Self {
