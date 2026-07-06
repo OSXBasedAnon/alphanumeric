@@ -1992,6 +1992,20 @@ impl Blockchain {
             return Err(err);
         }
 
+        // Evict the now-confirmed transactions from the IN-MEMORY mempool. Their
+        // on-disk pending records and pending-debit reservations were already
+        // cleared by process_transactions_batch, but nothing removed them from the
+        // in-memory pool — so without this they would linger forever (unbounded
+        // memory growth) and could be re-selected into a later block. The mempool
+        // has its own lock, so this cannot deadlock against the state guard held by
+        // the callers of this function.
+        {
+            let mut mempool = self.mempool.write().await;
+            for tx in &block.transactions {
+                mempool.clear_transaction(tx);
+            }
+        }
+
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
 
