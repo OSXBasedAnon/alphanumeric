@@ -1493,13 +1493,21 @@ impl Blockchain {
     /// Drop replay-registry entries whose transactions are older than MAX_TX_AGE and
     /// therefore can never be replayed again (a block re-including them is rejected by
     /// the freshness rule). Keeps the registry bounded to a recent window regardless
-    /// of total chain length. Uses the confirming block's timestamp, which is >= the
-    /// transaction's own timestamp, so pruning is conservative (never early).
+    /// of total chain length.
+    ///
+    /// The entry is keyed on the CONFIRMING BLOCK's timestamp, but the freshness rule
+    /// permits a transaction to be post-dated up to MAX_BLOCK_FUTURE_TIME ahead of that
+    /// block, so its real replay window closes at tx.timestamp + MAX_TX_AGE_SECS — up
+    /// to MAX_BLOCK_FUTURE_TIME LATER than the block-timestamp horizon. We therefore
+    /// retain an extra MAX_BLOCK_FUTURE_TIME of history so an entry is never pruned
+    /// while a block could still legitimately replay it (which would silently reopen
+    /// the double-spend the registry exists to close).
     fn prune_confirmed_txs(&self, tip_timestamp: u64) -> Result<(), BlockchainError> {
-        if tip_timestamp <= MAX_TX_AGE_SECS {
+        let horizon = MAX_TX_AGE_SECS.saturating_add(MAX_BLOCK_FUTURE_TIME);
+        if tip_timestamp <= horizon {
             return Ok(());
         }
-        let cutoff = tip_timestamp - MAX_TX_AGE_SECS;
+        let cutoff = tip_timestamp - horizon;
         let tree = self.open_confirmed_tx_tree()?;
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let upper = cutoff.to_be_bytes().to_vec();
@@ -1551,8 +1559,21 @@ impl Blockchain {
         if index.iter().next().is_some() {
             return Ok(());
         }
+        self.rebuild_confirmed_tx_index()
+    }
+
+    /// Force-rebuild the replay registry from the canonical chain, unconditionally.
+    /// Used by interrupted-commit (dirty-marker) recovery: a crash mid-reorg can commit
+    /// the canonical slot rewrite (which IS atomic) yet leave the registry's separate
+    /// remove/record loops half-applied. Because ensure_confirmed_tx_index keys on the
+    /// index merely being non-empty, it would not detect that inconsistency, so recovery
+    /// must rederive the registry from the (now-consistent) canonical blocks. O(chain),
+    /// but only on the rare recovery path.
+    pub fn rebuild_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
+        let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let tree = self.open_confirmed_tx_tree()?;
         tree.clear()?;
+        index.clear()?;
         let Some(tip) = self.highest_block_index() else {
             return Ok(());
         };
@@ -2616,6 +2637,12 @@ impl Blockchain {
         self.ensure_balances_index_with_force(dirty_state.is_some())
             .await?;
         if dirty_state.is_some() {
+            // A crash mid-reorg can leave the replay registry half-written (its
+            // remove/record loops run outside the atomic canonical-slot batch), so
+            // rederive it from the now-consistent canonical chain before clearing the
+            // marker. Otherwise a stale registry would silently let a confirmed tx be
+            // replayed after recovery.
+            self.rebuild_confirmed_tx_index()?;
             self.clear_chain_state_dirty()?;
         }
         self.prune_orphans()?;
@@ -2843,6 +2870,15 @@ impl Blockchain {
         trace_step("prevalidate");
         self.validate_block_strict(&block).await?;
 
+        // Mirror the persist path's replay guard on the local mining commit too:
+        // reject a block that re-includes a transaction already confirmed at a
+        // different height, before any balance mutation. Legitimate mined blocks draw
+        // from the mempool (now evicted of confirmed txs), so this fires only on a
+        // genuine replay rather than on the miner's own fresh transactions.
+        if self.block_has_replayed_tx(&block) {
+            return Err(BlockchainError::InvalidTransaction);
+        }
+
         // Get all current confirmed balances first
         let mut confirmed_balances: HashMap<String, i128> = HashMap::new();
         let mut pending_effects: HashMap<String, i128> = HashMap::new();
@@ -2922,6 +2958,22 @@ impl Blockchain {
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+
+        // Mirror the persist path's confirm side-effects on the LOCAL MINING commit
+        // path too: register this block's transactions in the replay registry (and
+        // prune stale entries), and evict them from the in-memory mempool. Without
+        // this a locally-mined transaction is absent from the replay registry (so it
+        // could be replayed within the freshness window) and lingers in the mempool
+        // to be re-selected into the very next block template.
+        let _ = self.record_confirmed_txs(&block);
+        let _ = self.prune_confirmed_txs(block.timestamp);
+        {
+            let mut mempool = self.mempool.write().await;
+            for tx in &block.transactions {
+                mempool.clear_transaction(tx);
+            }
+        }
+
         self.notify_tip_changed(&block);
         let _ = self.promote_orphans_from_tip().await;
 
@@ -4596,6 +4648,51 @@ mod tests {
         assert!(
             !bc.block_has_replayed_tx(&b6),
             "after revert the transaction is no longer a replay"
+        );
+    }
+
+    #[test]
+    fn prune_retains_post_dated_tx_until_its_own_freshness_window_closes() {
+        let bc = test_blockchain();
+        // A transaction post-dated to the maximum future skew: its own timestamp is
+        // MAX_BLOCK_FUTURE_TIME ahead of the block that confirms it (the freshness
+        // rule permits this), yet its registry entry is keyed on the block timestamp.
+        let block_ts = 1_000_000u64;
+        let payment = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: block_ts + MAX_BLOCK_FUTURE_TIME,
+            signature: Some("aa".repeat(2400)),
+            pub_key: None,
+            sig_hash: None,
+        };
+        let tx_id = payment.get_tx_id();
+
+        let mut b = metadata_test_block(5, [0u8; 32], "miner", 1.0);
+        b.timestamp = block_ts;
+        b.transactions.push(payment.clone());
+        bc.record_confirmed_txs(&b).unwrap();
+        assert!(bc.confirmed_tx_index(&tx_id).is_some(), "entry must be registered");
+
+        // At the block-timestamp horizon the transaction can STILL be replayed — its
+        // own freshness window closes MAX_BLOCK_FUTURE_TIME later — so the registry
+        // entry must survive. Keying prune on the block timestamp alone would drop it
+        // here and reopen the double-spend.
+        bc.prune_confirmed_txs(block_ts + MAX_TX_AGE_SECS).unwrap();
+        assert!(
+            bc.confirmed_tx_index(&tx_id).is_some(),
+            "post-dated tx must not be pruned while a block can still replay it"
+        );
+
+        // Once the transaction's own freshness window has fully closed it can never be
+        // replayed again, so it is safely pruned and the registry stays bounded.
+        bc.prune_confirmed_txs(block_ts + MAX_BLOCK_FUTURE_TIME + MAX_TX_AGE_SECS + 1)
+            .unwrap();
+        assert!(
+            bc.confirmed_tx_index(&tx_id).is_none(),
+            "fully-expired tx should be pruned to keep the registry bounded"
         );
     }
 
