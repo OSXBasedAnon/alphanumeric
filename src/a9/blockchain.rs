@@ -46,6 +46,18 @@ const CONFIRMED_WITNESS_INDEX_TREE: &str = "confirmed_witness_index";
 /// transaction (replay) is rejected, so a signed payment cannot be re-mined to
 /// drain a wallet. Maintained incrementally on tip extension and reorg.
 const CONFIRMED_TX_TREE: &str = "confirmed_tx";
+/// Prune index for the replay registry: `confirming_block_timestamp_be || tx_id`,
+/// so entries can be range-deleted once their transactions are too old to ever be
+/// replayed (see MAX_TX_AGE_SECS). Keeps the registry BOUNDED to a recent window
+/// instead of the whole chain.
+const CONFIRMED_TX_TS_INDEX: &str = "confirmed_tx_ts_index";
+/// Transaction-freshness window (Solana-style expiry). A non-system transaction
+/// must be mined within this many seconds of its signed timestamp; a block that
+/// includes an older one is rejected. This expires stale transactions so the
+/// replay registry only ever has to retain this recent window — it never grows
+/// with total chain history — while still making replay impossible (an old,
+/// already-confirmed transaction can no longer be re-mined either).
+pub const MAX_TX_AGE_SECS: u64 = 21_600; // 6 hours
 /// How many blocks past confirmation a transaction's full witness is retained so
 /// it remains verifiable during near-tip sync. No consensus impact.
 pub const WITNESS_RETENTION_BLOCKS: u64 = 256;
@@ -1427,19 +1439,29 @@ impl Blockchain {
         Some(u32::from_le_bytes(b))
     }
 
-    /// Register a confirmed block's non-system transactions in the replay registry.
+    /// Register a confirmed block's non-system transactions in the replay registry,
+    /// plus a timestamp-prefixed prune-index entry so old ones can be range-deleted.
     fn record_confirmed_txs(&self, block: &Block) -> Result<(), BlockchainError> {
         let tree = self.open_confirmed_tx_tree()?;
+        let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let idx = block.index.to_le_bytes().to_vec();
+        let ts_prefix = block.timestamp.to_be_bytes();
         let mut batch = sled::Batch::default();
+        let mut index_batch = sled::Batch::default();
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
             }
-            batch.insert(tx.get_tx_id().as_bytes(), idx.clone());
+            let tx_id = tx.get_tx_id();
+            batch.insert(tx_id.as_bytes(), idx.clone());
+            let mut index_key = ts_prefix.to_vec();
+            index_key.extend_from_slice(tx_id.as_bytes());
+            index_batch.insert(index_key, Vec::<u8>::new());
         }
         tree.apply_batch(batch)?;
+        index.apply_batch(index_batch)?;
         tree.flush()?;
+        index.flush()?;
         Ok(())
     }
 
@@ -1447,15 +1469,56 @@ impl Blockchain {
     /// a block is reverted during a reorg).
     fn remove_confirmed_txs(&self, block: &Block) -> Result<(), BlockchainError> {
         let tree = self.open_confirmed_tx_tree()?;
+        let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
+        let ts_prefix = block.timestamp.to_be_bytes();
         let mut batch = sled::Batch::default();
+        let mut index_batch = sled::Batch::default();
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
             }
-            batch.remove(tx.get_tx_id().as_bytes());
+            let tx_id = tx.get_tx_id();
+            batch.remove(tx_id.as_bytes());
+            let mut index_key = ts_prefix.to_vec();
+            index_key.extend_from_slice(tx_id.as_bytes());
+            index_batch.remove(index_key);
         }
         tree.apply_batch(batch)?;
+        index.apply_batch(index_batch)?;
         tree.flush()?;
+        index.flush()?;
+        Ok(())
+    }
+
+    /// Drop replay-registry entries whose transactions are older than MAX_TX_AGE and
+    /// therefore can never be replayed again (a block re-including them is rejected by
+    /// the freshness rule). Keeps the registry bounded to a recent window regardless
+    /// of total chain length. Uses the confirming block's timestamp, which is >= the
+    /// transaction's own timestamp, so pruning is conservative (never early).
+    fn prune_confirmed_txs(&self, tip_timestamp: u64) -> Result<(), BlockchainError> {
+        if tip_timestamp <= MAX_TX_AGE_SECS {
+            return Ok(());
+        }
+        let cutoff = tip_timestamp - MAX_TX_AGE_SECS;
+        let tree = self.open_confirmed_tx_tree()?;
+        let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
+        let upper = cutoff.to_be_bytes().to_vec();
+        let mut stale: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in index.range(..upper) {
+            let (key, _) = item?;
+            let tx_id = if key.len() > 8 {
+                key[8..].to_vec()
+            } else {
+                Vec::new()
+            };
+            stale.push((key.to_vec(), tx_id));
+        }
+        for (idx_key, tx_id) in stale {
+            let _ = index.remove(&idx_key);
+            if !tx_id.is_empty() {
+                let _ = tree.remove(&tx_id);
+            }
+        }
         Ok(())
     }
 
@@ -1481,27 +1544,44 @@ impl Blockchain {
     /// yet (first run under this feature, or right after a bootstrap import). Existing
     /// history is grandfathered — only newly-adopted blocks are replay-checked.
     pub fn ensure_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
-        let tree = self.open_confirmed_tx_tree()?;
-        if tree.iter().next().is_some() {
+        // Keyed on the prune index: if it's present the registry is already built in
+        // the current (prunable) format; if it's absent we (re)build both trees,
+        // which also migrates a registry built before the prune index existed.
+        let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
+        if index.iter().next().is_some() {
             return Ok(());
         }
+        let tree = self.open_confirmed_tx_tree()?;
+        tree.clear()?;
         let Some(tip) = self.highest_block_index() else {
             return Ok(());
         };
         let mut batch = sled::Batch::default();
+        let mut index_batch = sled::Batch::default();
         for h in 0..=tip {
             if let Ok(block) = self.get_block(h) {
                 let idx = block.index.to_le_bytes().to_vec();
+                let ts_prefix = block.timestamp.to_be_bytes();
                 for tx in &block.transactions {
                     if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                         continue;
                     }
-                    batch.insert(tx.get_tx_id().as_bytes(), idx.clone());
+                    let tx_id = tx.get_tx_id();
+                    batch.insert(tx_id.as_bytes(), idx.clone());
+                    let mut index_key = ts_prefix.to_vec();
+                    index_key.extend_from_slice(tx_id.as_bytes());
+                    index_batch.insert(index_key, Vec::<u8>::new());
                 }
             }
         }
         tree.apply_batch(batch)?;
+        index.apply_batch(index_batch)?;
         tree.flush()?;
+        index.flush()?;
+        // Drop anything already beyond the freshness window on this first build.
+        if let Some(tip_block) = self.get_last_block() {
+            let _ = self.prune_confirmed_txs(tip_block.timestamp);
+        }
         Ok(())
     }
 
@@ -1964,10 +2044,12 @@ impl Blockchain {
         }
         self.prune_orphans()?;
 
-        // Register the newly-canonical branch's transactions in the replay registry.
+        // Register the newly-canonical branch's transactions in the replay registry,
+        // then prune anything now past the freshness window.
         for b in &branch {
             let _ = self.record_confirmed_txs(b);
         }
+        let _ = self.prune_confirmed_txs(branch_tip.timestamp);
 
         // Rebuild balances index after reorg.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
@@ -2153,8 +2235,10 @@ impl Blockchain {
         }
 
         // Register this block's transactions in the replay registry so any later
-        // block that re-includes one is rejected as a replay.
+        // block that re-includes one is rejected as a replay, then prune entries
+        // now past the freshness window so the registry stays bounded.
         let _ = self.record_confirmed_txs(block);
+        let _ = self.prune_confirmed_txs(block.timestamp);
 
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
@@ -3256,6 +3340,21 @@ impl Blockchain {
             if tx.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
+            // Transaction freshness: a non-system transaction must be mined within
+            // MAX_TX_AGE_SECS of its signed timestamp and not be dated meaningfully
+            // ahead of the block. This expires stale transactions — which is what
+            // keeps the replay registry bounded to a recent window — while making
+            // replay of an old confirmed transaction impossible (a block re-including
+            // it would fail this same check). Grandfathered for finalized history,
+            // which validate_block_internal is never re-run over.
+            if block.index > 0 {
+                if tx.timestamp.saturating_add(MAX_TX_AGE_SECS) < block.timestamp {
+                    return Err(BlockchainError::InvalidTransaction);
+                }
+                if tx.timestamp > block.timestamp.saturating_add(MAX_BLOCK_FUTURE_TIME) {
+                    return Err(BlockchainError::InvalidTransaction);
+                }
+            }
             if tx.signature.is_none() {
                 return Err(BlockchainError::InvalidTransactionSignature);
             }
@@ -3474,7 +3573,18 @@ impl Blockchain {
     pub async fn get_transactions_for_block(&self) -> Vec<Transaction> {
         let mut mempool = self.mempool.write().await;
         mempool.prune_expired();
-        mempool.get_transactions_for_block()
+        let now = Self::now_unix_secs();
+        mempool
+            .get_transactions_for_block()
+            .into_iter()
+            .filter(|tx| {
+                // Never select a transaction the consensus freshness rule
+                // (MAX_TX_AGE_SECS) would reject — it would only get the whole
+                // mined block rejected. System transactions have no user timestamp.
+                SYSTEM_ADDRESSES.contains(&tx.sender.as_str())
+                    || tx.timestamp.saturating_add(MAX_TX_AGE_SECS) >= now
+            })
+            .collect()
     }
 
     pub async fn get_mempool_transactions(&self) -> Result<Vec<Transaction>, BlockchainError> {
