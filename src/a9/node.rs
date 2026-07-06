@@ -2450,6 +2450,25 @@ impl Node {
             } else {
                 // Divergent: our tip forks from canonical at `ancestor` < tip.
                 let d = ancestor + 1;
+                // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon].
+                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index >= d).collect();
+                if branch.is_empty() {
+                    return Converge::BeaconStale;
+                }
+                // WORK GATE, BEFORE the finality/depth guards: only ever reorg toward a
+                // strictly HEAVIER chain. converge_to_relay_tip nominates the relay's tallest
+                // block, so an attacker can post a tall-but-LIGHTER fork; if that merely-taller
+                // chain reached the depth guards below it would return NeedsBootstrap and,
+                // repeated, drive the publisher's 2-strike exit(0) — freezing the beacon for
+                // the whole network. A non-heavier target means we already hold the better
+                // chain: return AtTipAhead (keep mining, reset strikes), never bootstrap.
+                let heavier = {
+                    let bc = self.blockchain.read().await;
+                    bc.external_branch_is_heavier(&branch, ancestor, tip)
+                };
+                if !heavier {
+                    return Converge::AtTipAhead;
+                }
                 let checkpoint = self.blockchain.read().await.trusted_checkpoint_height();
                 if d <= checkpoint {
                     return Converge::NeedsBootstrap; // may not rewrite finalized history
@@ -2470,11 +2489,6 @@ impl Node {
                     > crate::a9::blockchain::ORPHAN_REORG_DEPTH
                 {
                     return Converge::NeedsBootstrap;
-                }
-                // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon].
-                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index >= d).collect();
-                if branch.is_empty() {
-                    return Converge::BeaconStale;
                 }
                 let adopted = self
                     .blockchain

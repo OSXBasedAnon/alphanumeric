@@ -1795,6 +1795,26 @@ impl Blockchain {
             })
     }
 
+    /// True if `branch` (canonical blocks [ancestor+1 ..= its tip]) carries strictly MORE
+    /// proof-of-work than the local canonical chain over the same span [ancestor+1 ..= tip].
+    /// Used to gate a convergence reorg BEFORE the finality/depth checks, so a merely
+    /// TALLER-but-lighter fork — which an attacker can post to the relay and which
+    /// `converge_to_relay_tip` targets by max HEIGHT — cannot trip the depth guard into
+    /// NeedsBootstrap and drive the publisher's restart escalation. A non-heavier branch
+    /// means we already hold the better chain, so the caller keeps mining instead of
+    /// reorging or bootstrapping.
+    pub fn external_branch_is_heavier(&self, branch: &[Block], ancestor: u32, tip: u32) -> bool {
+        let Some(branch_tip) = branch.last() else {
+            return false;
+        };
+        let canonical_work = match self.canonical_work_range(ancestor.saturating_add(1), tip) {
+            Ok(w) => w,
+            Err(_) => return false, // can't compute local work -> conservative: don't reorg
+        };
+        let branch_work = Self::branch_work_to_height(branch, branch_tip.index);
+        branch_work > canonical_work
+    }
+
     fn compare_work_delta(
         branch_work: &BigUint,
         canonical_work: &BigUint,
