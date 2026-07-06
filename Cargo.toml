@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric"
-version = "7.3.9"
+version = "7.4.0"
 edition = "2021"
 
 [dependencies]
