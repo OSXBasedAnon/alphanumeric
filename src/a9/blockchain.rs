@@ -3017,6 +3017,14 @@ impl Blockchain {
             return Err(BlockchainError::InvalidHash);
         }
 
+        // Pin genesis: the only valid block at height 0 is the deterministic launch
+        // genesis. Without this a fresh node (tip==0) could be forked onto an
+        // attacker chain rooted at a forged genesis — every subsequent block would
+        // link cleanly to the fake root. Pinning the root makes that impossible.
+        if block.index == 0 && block.hash != Self::genesis_launch_block()?.hash {
+            return Err(BlockchainError::InvalidBlockHeader);
+        }
+
         // Enhanced difficulty + linkage validation for non-genesis blocks.
         // IMPORTANT: validate against the referenced parent by hash (canonical or orphan), not "whatever is at height-1".
         if block.index > 0 {
