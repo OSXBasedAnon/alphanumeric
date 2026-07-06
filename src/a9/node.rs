@@ -72,7 +72,19 @@ const SUBNET_MASK_IPV6: u8 = 64; // /64 subnet
 const PEER_TIMEOUT: u64 = 300; // seconds
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
-const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 300;
+const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
+/// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
+/// origin/Redis nothing, so this stays O(1) in client count; a version change is
+/// the ONLY thing that triggers a block fetch, so there is no redundant pulling.
+const BEACON_POLL_INTERVAL_SECS: u64 = 2;
+
+/// The canonical tip as advertised by the signed beacon (height, hash, version).
+#[derive(Clone, Copy)]
+struct TipBeaconInfo {
+    height: u32,
+    hash: [u8; 32],
+    version: u64,
+}
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 60;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
@@ -1440,7 +1452,7 @@ impl Node {
         Self::env_interval_secs(
             "ALPHANUMERIC_HEADER_SNAPSHOT_INTERVAL_SECS",
             DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS,
-            60,
+            15,
             3600,
         )
     }
@@ -1466,13 +1478,14 @@ impl Node {
     }
 
     fn periodic_relay_sync_interval_secs() -> Option<u64> {
-        // Always on: every node keeps itself current with the network tip by
-        // pulling the relay on a timer, so a node that falls behind catches up on
-        // its own with no configuration. The env var only tunes the cadence.
+        // Always on and LIVE: every node stays current with the network tip by
+        // pulling the relay on a short timer (block-time cadence), so new blocks —
+        // and any payments they carry — land within a few seconds with no restart
+        // and no configuration. The env var only tunes the cadence.
         if let Ok(value) = std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS") {
             if let Ok(parsed) = value.trim().parse::<u64>() {
                 if parsed > 0 {
-                    return Some(parsed.clamp(60, 3600));
+                    return Some(parsed.clamp(1, 3600));
                 }
             }
         }
@@ -2027,7 +2040,10 @@ impl Node {
         let height = last_block.index;
         let difficulty = last_block.difficulty;
 
-        let start = height.saturating_sub(20);
+        // Widened to 64 so a client resolving a fork can always walk back to the
+        // common ancestor within the signed header window (the gateway accepts up
+        // to 256), instead of falling back to a full re-download.
+        let start = height.saturating_sub(64);
         let mut headers = Vec::new();
         {
             let blockchain = self.blockchain.read().await;
@@ -2112,6 +2128,167 @@ impl Node {
             warn!("Header snapshot post failed on all endpoints");
         }
 
+        Ok(())
+    }
+
+    fn discovery_tip_urls() -> Vec<String> {
+        Self::discovery_bases()
+            .into_iter()
+            .map(|base| format!("{}/api/tip", base))
+            .collect()
+    }
+
+    /// Publish the tiny signed tip beacon — the per-block liveness signal every
+    /// client polls from the CDN edge. Called event-driven on each tip change, so
+    /// it is per-block fresh (unlike the heavy, throttled header snapshot) while
+    /// being one small signed SET. Publisher only.
+    async fn post_tip_beacon(&self) -> Result<(), NodeError> {
+        if !Self::public_header_snapshots_enabled() {
+            return Ok(());
+        }
+        let (height, hash, prev_hash, block_time, difficulty, version) = {
+            let blockchain = self.blockchain.read().await;
+            let Some(tip) = blockchain.get_last_block() else {
+                return Ok(());
+            };
+            (
+                tip.index,
+                hex::encode(tip.hash),
+                hex::encode(tip.previous_hash),
+                tip.timestamp,
+                tip.difficulty,
+                blockchain.tip_change_version(),
+            )
+        };
+
+        // No floats in the signed message (ryu vs JS stringify diverge); all
+        // fields are ints/hex strings, matching the /api/tip canonicalization.
+        let message = json!({
+            "network_id": hex::encode(self.network_id),
+            "height": height,
+            "hash": hash,
+            "prev_hash": prev_hash,
+            "block_time": block_time,
+            "difficulty": difficulty,
+            "version": version,
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+        });
+        let canonical = Self::canonical_json_string(&message)?;
+        let keypair = Ed25519KeyPair::from_pkcs8(&self.handshake_key_bytes)
+            .map_err(|_| NodeError::Network("Invalid handshake key bytes".into()))?;
+        let signature = keypair.sign(canonical.as_bytes());
+
+        let payload = json!({
+            "network_id": hex::encode(self.network_id),
+            "height": height,
+            "hash": hash,
+            "prev_hash": prev_hash,
+            "block_time": block_time,
+            "difficulty": difficulty,
+            "version": version,
+            "node_id": &self.node_id,
+            "public_key": &self.node_id,
+            "signature": hex::encode(signature.as_ref()),
+        });
+
+        for url in Self::discovery_tip_urls() {
+            if let Err(e) = self.http_client.post(url).json(&payload).send().await {
+                debug!("Tip beacon post error: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the tiny signed tip beacon (the live liveness signal). Served from the
+    /// CDN edge, so this poll is essentially free at the origin. The beacon only
+    /// tells us WHERE the tip is; the blocks it points to are still independently
+    /// validated (PoW + linkage + signatures) on apply, so a poisoned beacon can
+    /// at worst cause a wasted fetch, never a bad adoption.
+    async fn fetch_tip_beacon(&self) -> Option<TipBeaconInfo> {
+        for url in Self::discovery_tip_urls() {
+            let Ok(res) = self.http_client.get(&url).send().await else {
+                continue;
+            };
+            if !res.status().is_success() {
+                continue;
+            }
+            let Ok(body) = res.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let Some(height) = body.get("height").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let Some(hash) = body
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                continue;
+            };
+            return Some(TipBeaconInfo {
+                height: height as u32,
+                hash,
+                version,
+            });
+        }
+        None
+    }
+
+    /// Confirm we are on the canonical chain the beacon points to. Being behind
+    /// (no block at the beacon height yet) is not a fork — the forward stream
+    /// fetches it. A genuine fork (our block at that height has a different hash)
+    /// triggers an incremental reorg to the canonical branch; we never re-download.
+    async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {
+        let forked = {
+            let bc = self.blockchain.read().await;
+            matches!(bc.get_block(beacon.height), Ok(b) if b.hash != beacon.hash)
+        };
+        if !forked {
+            return;
+        }
+        if let Err(e) = self.reorg_to_canonical(beacon.height).await {
+            debug!(
+                "Reorg to canonical at height {} deferred: {}",
+                beacon.height, e
+            );
+        }
+    }
+
+    /// Incremental reorg to the canonical branch (no DB re-download). Fetches the
+    /// competing block bodies around the fork point from the gateway — which keys
+    /// blocks by (height,hash), so our fork and the canonical block coexist and
+    /// both come back in the range — and hands them to the fork-choice reorg,
+    /// which switches to the heavier canonical branch. Bounded by the signed
+    /// header window; a fork deeper than that is left to a full bootstrap.
+    async fn reorg_to_canonical(&self, fork_height: u32) -> Result<(), NodeError> {
+        let from = fork_height.saturating_sub(64);
+        let to = fork_height.saturating_add(1);
+        let blocks = self.fetch_relay_blocks(from, to).await?;
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let before = { self.blockchain.read().await.get_latest_block_index() as u32 };
+        let adopted = self
+            .blockchain
+            .write()
+            .await
+            .adopt_external_branch(blocks)
+            .await
+            .map_err(|e| NodeError::Blockchain(e.to_string()))?;
+        if adopted {
+            let after = { self.blockchain.read().await.get_latest_block_index() as u32 };
+            info!(
+                "Reorged onto the canonical branch (height {} -> {})",
+                before, after
+            );
+            let _ = self.publish_local_tip().await;
+        }
         Ok(())
     }
 
@@ -4086,6 +4263,28 @@ impl Node {
             });
         }
 
+        // Event-driven tip beacon: the publisher pushes the tiny signed beacon on
+        // EVERY tip change (append or reorg) by subscribing to the in-process
+        // ChainTipSignal — no timer, per-block fresh — so a new block is visible
+        // to every client within one edge-cached beacon poll.
+        if Self::public_header_snapshots_enabled() {
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                let mut rx = { node_clone.blockchain.read().await.subscribe_tip_changes() };
+                if let Err(e) = node_clone.post_tip_beacon().await {
+                    debug!("Initial tip beacon post: {}", e);
+                }
+                loop {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                    if let Err(e) = node_clone.post_tip_beacon().await {
+                        debug!("Tip beacon post: {}", e);
+                    }
+                }
+            });
+        }
+
         // Periodic stats snapshot submissions (push)
         if Self::public_stats_snapshots_enabled() {
             let node_clone = node.clone();
@@ -4201,31 +4400,57 @@ impl Node {
             }
         });
 
-        if let Some(relay_sync_interval_secs) = Self::periodic_relay_sync_interval_secs() {
+        // LIVE beacon-watch sync. Poll the tiny edge-cached tip beacon every ~2s;
+        // a cache HIT costs the origin/Redis nothing, so this stays O(1) at any
+        // client count. Only when the beacon's VERSION moves do we fetch the delta
+        // blocks and apply them — so there is no redundant pulling when nothing
+        // changed. Applying a block fires the in-process ChainTipSignal, which
+        // drives mining-on-tip and wallet notifications for free. A slow full pull
+        // is kept as a safety net in case a beacon post was missed.
+        {
             let node_clone = node.clone();
+            let safety_secs = Self::periodic_relay_sync_interval_secs()
+                .unwrap_or(60)
+                .max(BEACON_POLL_INTERVAL_SECS);
             tokio::spawn(async move {
-                let mut relay_interval = interval(Duration::from_secs(relay_sync_interval_secs));
+                let mut ticker = interval(Duration::from_secs(BEACON_POLL_INTERVAL_SECS));
+                let mut last_version: u64 = u64::MAX;
+                let mut ticks_since_full: u64 = 0;
+                let safety_ticks = (safety_secs / BEACON_POLL_INTERVAL_SECS).max(1);
                 loop {
-                    relay_interval.tick().await;
+                    ticker.tick().await;
                     let current_height = {
-                        let blockchain = node_clone.blockchain.read().await;
-                        blockchain.get_latest_block_index() as u32
+                        node_clone.blockchain.read().await.get_latest_block_index() as u32
                     };
 
-                    // Always pull from the relay. Miners POST newly-mined blocks
-                    // there, but the header-snapshot tip (our own published height)
-                    // does not reflect them yet, so gating on it would never pull a
-                    // miner's block. sync_with_block_relay is a bounded fetch and a
-                    // no-op when nothing sits above our tip.
+                    let beacon = node_clone.fetch_tip_beacon().await;
+                    let beacon_changed = beacon.map(|b| b.version != last_version).unwrap_or(false);
+
+                    ticks_since_full += 1;
+                    let safety_due = ticks_since_full >= safety_ticks;
+                    if !beacon_changed && !safety_due {
+                        continue; // nothing new — no fetch, no origin/Redis touch
+                    }
+                    ticks_since_full = 0;
+                    if let Some(b) = beacon {
+                        last_version = b.version;
+                    }
+
+                    // Stream the delta forward (extension). A fork is caught by the
+                    // reorg reconciler; see reconcile_to_beacon.
                     match node_clone.sync_with_block_relay(current_height).await {
                         Ok(saved) if saved > 0 => {
-                            info!("Pulled {} block(s) from the gateway relay", saved);
+                            debug!("Live sync: applied {} block(s)", saved);
                             if let Err(e) = node_clone.publish_local_tip().await {
-                                warn!("Post-relay-sync publish failed: {}", e);
+                                debug!("Post-sync publish failed: {}", e);
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => debug!("Periodic relay sync: {}", e),
+                        Err(e) => debug!("Live sync: {}", e),
+                    }
+
+                    if let Some(b) = beacon {
+                        node_clone.reconcile_to_beacon(&b).await;
                     }
                 }
             });

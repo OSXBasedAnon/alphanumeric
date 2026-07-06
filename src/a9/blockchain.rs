@@ -1611,6 +1611,25 @@ impl Blockchain {
         storage_block
     }
 
+    /// Adopt an externally-fetched competing branch (pulled from the gateway
+    /// during a beacon-driven reorg). The blocks are staged as orphan candidates
+    /// and run through the SAME fork-choice reorg as any other adoption — so the
+    /// checkpoint-finality guard, balance validation, and frontier-signature gate
+    /// all apply — and on success it disconnects the losing blocks, connects the
+    /// heavier canonical branch, and fires notify_tip_changed. Never re-downloads.
+    pub async fn adopt_external_branch(
+        &self,
+        blocks: Vec<Block>,
+    ) -> Result<bool, BlockchainError> {
+        if blocks.is_empty() {
+            return Ok(false);
+        }
+        for block in &blocks {
+            let _ = self.store_orphan_block(block);
+        }
+        self.try_adopt_orphan_branch().await
+    }
+
     async fn try_adopt_orphan_branch(&self) -> Result<bool, BlockchainError> {
         let Some(tip) = self.get_last_block() else {
             return Ok(false);
