@@ -65,6 +65,10 @@ use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, 
 pub const DEFAULT_PORT: u16 = 7177;
 const MIN_PEERS: usize = 3;
 const MAX_PEERS_PER_SUBNET: usize = 3;
+// Max span a single GetBlocks request may ask for (and the client's batch size, kept in
+// lockstep). Bounds the per-request disk reads on the event loop and the reply size. 256 =
+// 4x the 64-aligned convergence window, so it never throttles catch-up.
+pub const MAX_GETBLOCKS_SPAN: u32 = 256;
 const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
 // Group IPv6 peers by /48, NOT /64: a single rented /48 contains 65,536 /64s, so a /64
 // grouping let one attacker present that many distinct "subnets" and completely bypass the
@@ -5436,7 +5440,9 @@ impl Node {
             return Err(NodeError::Network("Invalid block range".to_string()));
         }
 
-        const MAX_BATCH_SIZE: u32 = 500; // Limit batch size to avoid timeouts
+        // Keep the batch size in lockstep with the server's GetBlocks ingress cap, or a
+        // batch would be rejected outright.
+        const MAX_BATCH_SIZE: u32 = MAX_GETBLOCKS_SPAN;
         const MAX_RETRIES: u32 = 3;
 
         // Batch large requests so peers with strict range limits can still serve us.
@@ -5448,11 +5454,18 @@ impl Node {
                 let mut batch = self
                     .request_blocks_batch(addr, batch_start, batch_end, MAX_RETRIES)
                     .await?;
+                // Advance by what the server ACTUALLY returned, not the requested boundary:
+                // the server may size-cap its reply to a prefix [batch_start, k] with
+                // k < batch_end, and jumping to batch_end+1 would silently SKIP [k+1,
+                // batch_end], leaving a permanent hole in the synced chain.
+                let highest = batch.iter().map(|b| b.index).max();
                 all_blocks.append(&mut batch);
-                if batch_end == u32::MAX {
-                    break;
+                match highest {
+                    // Empty reply: the peer can't serve this range — stop rather than spin.
+                    None => break,
+                    Some(h) if h >= u32::MAX => break,
+                    Some(h) => batch_start = h.saturating_add(1),
                 }
-                batch_start = batch_end.saturating_add(1);
             }
             all_blocks.sort_by_key(|b| b.index);
             all_blocks.dedup_by_key(|b| b.index);
@@ -6502,17 +6515,23 @@ impl Node {
             } => {
                 let blocks = {
                     let blockchain = self.blockchain.read().await;
-                    let mut validated_blocks = Vec::new();
+                    let mut out = Vec::new();
+                    let mut bytes = 0usize;
                     for idx in start..=end {
                         if let Ok(block) = blockchain.get_block(idx) {
-                            // Basic validation for response blocks
-                            if block.verify_pow_meets_floor() && block.calculate_hash_for_block() == block.hash
-                            {
-                                validated_blocks.push(block);
+                            // Blocks were fully validated (PoW floor, hash, signatures) when
+                            // they were saved, so do NOT re-run verify_pow/rehash here — that
+                            // was up to ~1000 rehashes on the single event loop while holding
+                            // the read lock. Just bound the reply size so it can never exceed
+                            // the frame limit (the requester would otherwise get nothing).
+                            bytes += codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
+                            if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
+                                break;
                             }
+                            out.push(block);
                         }
                     }
-                    validated_blocks
+                    out
                 };
 
                 // Send response through dedicated channel
@@ -6744,7 +6763,7 @@ impl Node {
 
             NetworkMessage::GetBlocks { start, end } => {
                 // Validate request parameters
-                if end.saturating_sub(start) > 1000 {
+                if end.saturating_sub(start) >= MAX_GETBLOCKS_SPAN {
                     self.record_peer_failure(addr).await;
                     return Err(NodeError::Network("Requested block range too large".into()));
                 }
@@ -6825,31 +6844,47 @@ impl Node {
                             start_height,
                             end_height,
                         } => {
-                            if end_height.saturating_sub(start_height) > 1000 {
-                                return Err(NodeError::Network("Block range too large".into()));
+                            // ANTI-AMPLIFICATION: a Range request must NEVER trigger a
+                            // network-wide rebroadcast (velocity.process_block fanned every
+                            // block out to the whole peer set — one small request flooded
+                            // thousands of messages while holding blockchain+peers read locks
+                            // across all the I/O). Serve the requested blocks ONLY back to the
+                            // requester on this connection (same mechanism as GetBlocks), with
+                            // a small span cap, a dedicated per-peer rate limit, and the locks
+                            // dropped before any reply. (No sender of Range exists — this is an
+                            // attacker-only path, so tightening it regresses no real sync.)
+                            const MAX_SHRED_RANGE_SPAN: u32 = 128;
+                            if end_height < start_height
+                                || end_height.saturating_sub(start_height) >= MAX_SHRED_RANGE_SPAN
+                            {
+                                self.record_peer_failure(addr).await;
+                                return Err(NodeError::Network("Shred range too large".into()));
                             }
-
-                            let blockchain = self.blockchain.read().await;
-                            let peers = self.peers.read().await;
-
-                            // Move the loop inside to avoid keeping blockchain across await points
-                            for height in start_height..=end_height {
-                                // Get the block and clone it early to avoid Send issues
-                                let block_clone = match blockchain.get_block(height) {
-                                    Ok(block) => block.clone(),
-                                    Err(e) => {
-                                        warn!("Failed to get block {}: {}", height, e);
-                                        continue;
+                            if !self.rate_limiter.check_limit(&format!("shred_range:{}", addr)) {
+                                self.record_peer_failure(addr).await;
+                                return Err(NodeError::Network("Shred range rate limited".into()));
+                            }
+                            // Clone the blocks under a scoped read lock, accumulating serialized
+                            // size and stopping before the frame limit; drop the lock before
+                            // replying. No peers lock, no broadcast.
+                            let blocks: Vec<Block> = {
+                                let blockchain = self.blockchain.read().await;
+                                let mut out = Vec::new();
+                                let mut bytes = 0usize;
+                                for height in start_height..=end_height {
+                                    if let Ok(block) = blockchain.get_block(height) {
+                                        bytes += codec::serialize(&block)
+                                            .map(|v| v.len())
+                                            .unwrap_or(0);
+                                        if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
+                                            break;
+                                        }
+                                        out.push(block);
                                     }
-                                };
-
-                                // Use Arc to share immutable data safely
-                                let block_ref = Arc::new(block_clone);
-
-                                if let Err(e) = velocity.process_block(&block_ref, &peers).await {
-                                    warn!("Failed to process block {}: {}", height, e);
                                 }
-                            }
+                                out
+                            };
+                            return Ok(Some(NetworkMessage::Blocks(blocks)));
                         }
                     }
                 }
