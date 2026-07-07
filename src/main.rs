@@ -3372,8 +3372,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                     std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
                 } else {
                     let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-                    let copied =
-                        std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+                    // Cap the per-entry copy so a single oversized entry can't exhaust disk
+                    // BEFORE the cumulative-size check runs (the unverified path isn't SHA-pinned).
+                    // Read at most (budget - already-extracted + 1) bytes; the +1 guarantees
+                    // update_bootstrap_archive_stats sees the overflow and aborts mid-extract.
+                    let budget = archive_expectations
+                        .expected_extracted_bytes
+                        .or(archive_expectations.unverified_extract_limit);
+                    let copied = if let Some(limit) = budget {
+                        let remaining =
+                            limit.saturating_sub(stats.extracted_bytes).saturating_add(1);
+                        std::io::copy(&mut std::io::Read::take(&mut file, remaining), &mut outfile)
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?
+                    };
                     update_bootstrap_archive_stats(&mut stats, copied, archive_expectations)?;
                 }
             }
