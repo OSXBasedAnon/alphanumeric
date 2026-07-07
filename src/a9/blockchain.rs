@@ -75,6 +75,21 @@ pub const CHECKPOINT_REORG_MARGIN: u32 = 64;
 /// checkpoint floor; cumulative PoW and the signed bootstrap snapshot secure the
 /// history under it, exactly as they secure any block at/below the checkpoint.
 pub const WITNESS_LOSS_FLOOR: u32 = 35;
+/// Coinbase (MINING_REWARDS) maturity, in blocks (M06). A mined reward credited in
+/// block R is spendable only once buried >= MINING_REWARD_MATURITY deep, i.e. at
+/// spend height h with h - R >= MINING_REWARD_MATURITY. This is strictly greater
+/// than the finality margin (CHECKPOINT_REORG_MARGIN = 64), so a reward can never be
+/// spent while the block that minted it is still reorgable — closing the reorg-based
+/// reward double-spend. Enforced only as a read-time overlay at the affordability
+/// comparison; the stored ledger always holds RAW confirmed totals.
+pub const MINING_REWARD_MATURITY: u32 = 100;
+/// Activation height for MINING_REWARD_MATURITY (M06). The maturity overlay is a
+/// no-op below this height, so all existing history (tip was ~777 at ship time)
+/// replays byte-identically and no historical block or in-flight tx is invalidated.
+/// The rule is a strict tightening (soft fork): old-binary nodes accept every block a
+/// new-binary node produces and converge normally; only an old miner that itself
+/// spends an immature reward gets that block orphaned and self-heals via convergence.
+pub const MATURITY_ACTIVATION_HEIGHT: u32 = 1500;
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const CHAIN_META_TREE: &str = "chain_meta";
@@ -2568,29 +2583,24 @@ impl Blockchain {
         // WHOLE chain into memory — numeric order is exactly the index/solvency-replay order
         // the lexical `block_{n}` sort was reconstructing.
         let mut balances: HashMap<String, i128> = HashMap::new();
+        // Rolling immature-coinbase window (M06), maintained across the whole 0..=tip replay
+        // and byte-identical to branch_is_balance_valid via the shared helper. The helper
+        // enforces sequential availability (like the forward apply path) AND the maturity
+        // overlay above the activation height; `balances` stays RAW confirmed totals and
+        // feeds the atomic diff-batch below unchanged.
+        let mut recent: std::collections::VecDeque<(u32, String, i128)> =
+            std::collections::VecDeque::new();
         if let Some(tip) = self.highest_block_index() {
             for h in 0..=tip {
                 let Ok(block) = self.get_block(h) else {
                     continue;
                 };
-                for tx in block.transactions {
-                    if tx.sender != "MINING_REWARDS" {
-                        let debit = tx.total_debit_units();
-                        let entry = balances.entry(tx.sender).or_insert(0);
-                        // Enforce sequential availability during replay, like the forward
-                        // apply path (process_transactions_batch). A chain that debits an
-                        // address below zero at any point is invalid; refuse to persist it
-                        // rather than writing a negative/phantom balance. This closes the
-                        // reorg/race hole where a same-height competitor bypassed the
-                        // InsufficientFunds guard that tip-extension goes through.
-                        if *entry < debit {
-                            return Err(BlockchainError::InsufficientFunds);
-                        }
-                        *entry -= debit;
-                    }
-                    let entry = balances.entry(tx.recipient).or_insert(0);
-                    *entry += tx.amount_units;
-                }
+                Self::replay_apply_block_checked(
+                    h,
+                    &block.transactions,
+                    &mut balances,
+                    &mut recent,
+                )?;
             }
         }
 
@@ -2621,6 +2631,95 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Coinbase-maturity overlay (M06) for the two REPLAY gates (branch_is_balance_valid
+    /// and rebuild_balances_index). Applies one block to a RAW-totals `balances` map while
+    /// maintaining `recent` — a rolling window of still-immature MINING_REWARDS credits —
+    /// and gating each spend on `spendable = raw - immature >= debit`. Both replay gates
+    /// MUST call this so their maturity logic is byte-identical: a reorg rewrites canonical
+    /// slots (branch_is_balance_valid dry-run passes) BEFORE rebuild_balances_index re-applies,
+    /// so any divergence between them would corrupt the chain. `balances` is never reduced by
+    /// the immature amount — maturity is a comparison-time overlay only. Below the activation
+    /// height the overlay is 0 and this is identical to a plain solvency replay.
+    fn replay_apply_block_checked(
+        block_height: u32,
+        txs: &[Transaction],
+        balances: &mut HashMap<String, i128>,
+        recent: &mut std::collections::VecDeque<(u32, String, i128)>,
+    ) -> Result<(), BlockchainError> {
+        let h = block_height as u64;
+        let mat = MINING_REWARD_MATURITY as u64;
+        let enforce = block_height >= MATURITY_ACTIVATION_HEIGHT;
+        // Drop coinbases that are now mature (buried >= MATURITY deep) at this height.
+        while let Some(&(rh, _, _)) = recent.front() {
+            if (rh as u64).saturating_add(mat) <= h {
+                recent.pop_front();
+            } else {
+                break;
+            }
+        }
+        for tx in txs {
+            if tx.sender == "MINING_REWARDS" {
+                *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+                // The block's own coinbase (pushed before its regular txs) is immature at
+                // depth 0, so a same-block spend of the fresh reward is blocked.
+                recent.push_back((block_height, tx.recipient.clone(), tx.amount_units));
+                continue;
+            }
+            let debit = tx.total_debit_units();
+            let immature = if enforce {
+                recent
+                    .iter()
+                    .filter(|(_, r, _)| r == &tx.sender)
+                    .map(|(_, _, a)| *a)
+                    .sum::<i128>()
+            } else {
+                0
+            };
+            let entry = balances.entry(tx.sender.clone()).or_insert(0);
+            if *entry - immature < debit {
+                return Err(BlockchainError::InsufficientFunds);
+            }
+            *entry -= debit;
+            *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+        }
+        Ok(())
+    }
+
+    /// Coinbase-maturity overlay (M06) for the tip-extension and advisory gates: the total
+    /// MINING_REWARDS credited to `address` that is still immature at `spend_height` (rewards
+    /// from stored blocks in [spend_height-MATURITY+1, spend_height-1], plus any coinbase in
+    /// `in_flight` — the block being validated, whose own coinbase is not in storage yet).
+    /// Returns 0 below the activation height. Implements the SAME predicate rh+MATURITY>h as
+    /// replay_apply_block_checked, so the scan path and the replay path agree for a given chain.
+    fn immature_reward_units_scan(
+        &self,
+        address: &str,
+        spend_height: u64,
+        in_flight: &[Transaction],
+    ) -> i128 {
+        if (spend_height as u32) < MATURITY_ACTIVATION_HEIGHT {
+            return 0;
+        }
+        let mat = MINING_REWARD_MATURITY as u64;
+        let mut imm: i128 = 0;
+        for tx in in_flight {
+            if tx.sender == "MINING_REWARDS" && tx.recipient == address {
+                imm += tx.amount_units;
+            }
+        }
+        let low = spend_height.saturating_sub(mat).saturating_add(1);
+        for rh in low..spend_height {
+            if let Ok(b) = self.get_block(rh as u32) {
+                for tx in &b.transactions {
+                    if tx.sender == "MINING_REWARDS" && tx.recipient == address {
+                        imm += tx.amount_units;
+                    }
+                }
+            }
+        }
+        imm
+    }
+
     /// Dry-run: would the chain formed by canonical blocks below `fork_start`
     /// plus `branch` keep every sender solvent at each step? Reads only; used to
     /// reject a reorg to a competing branch that double-spends or overspends
@@ -2631,6 +2730,11 @@ impl Blockchain {
         branch: &[Block],
     ) -> Result<bool, BlockchainError> {
         let mut balances: HashMap<String, i128> = HashMap::new();
+        // One rolling immature-coinbase window (M06) shared across BOTH loops so it spans the
+        // fork boundary; must be byte-identical to rebuild_balances_index (the authoritative
+        // re-apply that runs after this dry-run passes) — both use replay_apply_block_checked.
+        let mut recent: std::collections::VecDeque<(u32, String, i128)> =
+            std::collections::VecDeque::new();
         // Stream canonical history below the fork by numeric height (O(1) block RAM instead of
         // loading + sorting the whole sub-chain), then the branch — numeric height order is
         // exactly the replay order.
@@ -2638,29 +2742,22 @@ impl Blockchain {
             let Ok(block) = self.get_block(h) else {
                 continue;
             };
-            for tx in &block.transactions {
-                if tx.sender != "MINING_REWARDS" {
-                    let debit = tx.total_debit_units();
-                    let entry = balances.entry(tx.sender.clone()).or_insert(0);
-                    if *entry < debit {
-                        return Ok(false);
-                    }
-                    *entry -= debit;
-                }
-                *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+            if Self::replay_apply_block_checked(h, &block.transactions, &mut balances, &mut recent)
+                .is_err()
+            {
+                return Ok(false);
             }
         }
         for block in branch {
-            for tx in &block.transactions {
-                if tx.sender != "MINING_REWARDS" {
-                    let debit = tx.total_debit_units();
-                    let entry = balances.entry(tx.sender.clone()).or_insert(0);
-                    if *entry < debit {
-                        return Ok(false);
-                    }
-                    *entry -= debit;
-                }
-                *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+            if Self::replay_apply_block_checked(
+                block.index,
+                &block.transactions,
+                &mut balances,
+                &mut recent,
+            )
+            .is_err()
+            {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -3000,7 +3097,11 @@ impl Blockchain {
 
             let confirmed = confirmed_balances.get(&tx.sender).copied().unwrap_or(0);
             let pending = pending_effects.get(&tx.sender).copied().unwrap_or(0);
-            let available = confirmed - pending;
+            // M06 (defense-in-depth): don't let the local miner commit a block that spends an
+            // immature reward — process_transactions_batch would reject it anyway.
+            let immature =
+                self.immature_reward_units_scan(&tx.sender, block.index as u64, &block.transactions);
+            let available = confirmed - pending - immature;
             let required = tx.total_debit_units();
 
             if available < required {
@@ -3314,7 +3415,17 @@ impl Blockchain {
             0.0
         };
 
-        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
+        // M06 (advisory): for mempool admission (block=None) don't offer to spend an immature
+        // reward at the prospective next height. The block=Some path is a local-miner check
+        // already covered by gate (1) / the finalize inline check, so it stays 0 here.
+        let immature = match block {
+            None => {
+                let h = self.get_latest_block_index() as u64 + 1;
+                self.immature_reward_units_scan(&tx.sender, h, &[])
+            }
+            Some(_) => 0,
+        };
+        let available_balance = Transaction::to_units(confirmed_balance - pending_amount) - immature;
         let required_amount = tx.total_debit_units();
 
         if available_balance < required_amount {
@@ -3636,7 +3747,10 @@ impl Blockchain {
 
             let pending_deducted = pending_deductions.get(&tx.sender).copied().unwrap_or(0);
 
-            let available_balance = current_confirmed - pending_deducted;
+            // M06 (defense-in-depth): reject a candidate block that spends an immature reward.
+            let immature =
+                self.immature_reward_units_scan(&tx.sender, block.index as u64, &block.transactions);
+            let available_balance = current_confirmed - pending_deducted - immature;
             let required_amount = tx.total_debit_units();
 
             if available_balance < required_amount {
@@ -3740,7 +3854,14 @@ impl Blockchain {
         let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
         let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
 
-        let available_balance = Transaction::to_units(confirmed_balance - pending_amount);
+        // M06 (advisory): don't admit a tx that spends an immature reward at the next height.
+        let immature = self.immature_reward_units_scan(
+            &transaction.sender,
+            self.get_latest_block_index() as u64 + 1,
+            &[],
+        );
+        let available_balance =
+            Transaction::to_units(confirmed_balance - pending_amount) - immature;
         let total_required = transaction.total_debit_units();
         if available_balance < total_required {
             return Err(BlockchainError::InsufficientFunds);
@@ -4149,6 +4270,36 @@ impl Blockchain {
             }
         }
 
+        // Coinbase-maturity overlay (M06) for this tip-extension apply. Precomputed once per
+        // block: the still-immature MINING_REWARDS credited to each address = this block's own
+        // coinbase (depth 0; not yet in storage, so sourced from `transactions`) plus stored
+        // canonical rewards in [confirm_height-MATURITY+1, confirm_height-1]. Subtracted from
+        // spendable at the affordability compare below; the stored ledger stays RAW. The
+        // current block's coinbase cancels: it is +amount in balance_changes and +amount here,
+        // so it nets out of spendable — a same-block spend of the fresh reward is blocked.
+        // No-op below the activation height, so all pre-activation history applies unchanged.
+        let mut immature_by_addr: HashMap<String, i128> = HashMap::new();
+        if (confirm_height as u32) >= MATURITY_ACTIVATION_HEIGHT {
+            for tx in &transactions {
+                if tx.sender == "MINING_REWARDS" {
+                    *immature_by_addr.entry(tx.recipient.clone()).or_default() += tx.amount_units;
+                }
+            }
+            let low = confirm_height
+                .saturating_sub(MINING_REWARD_MATURITY as u64)
+                .saturating_add(1);
+            for rh in low..confirm_height {
+                if let Ok(b) = self.get_block(rh as u32) {
+                    for tx in &b.transactions {
+                        if tx.sender == "MINING_REWARDS" {
+                            *immature_by_addr.entry(tx.recipient.clone()).or_default() +=
+                                tx.amount_units;
+                        }
+                    }
+                }
+            }
+        }
+
         // Second pass: Validate and calculate changes
         for tx in &transactions {
             match tx.sender.as_str() {
@@ -4167,9 +4318,11 @@ impl Blockchain {
                     let total_debit = tx.total_debit_units();
                     let current_balance = current_balances.get(&tx.sender).copied().unwrap_or(0);
                     let pending_change = balance_changes.get(&tx.sender).copied().unwrap_or(0);
+                    let immature = immature_by_addr.get(&tx.sender).copied().unwrap_or(0);
 
-                    // Check if sufficient funds available
-                    if current_balance + pending_change < total_debit {
+                    // Check if sufficient funds available (raw confirmed + intra-block change,
+                    // minus any still-immature coinbase — M06).
+                    if current_balance + pending_change - immature < total_debit {
                         return Err(BlockchainError::InsufficientFunds);
                     }
 
@@ -4395,8 +4548,13 @@ impl Blockchain {
     pub async fn get_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
         let confirmed = self.get_confirmed_balance(address).await?;
         let pending_debit = self.get_pending_debit_for(address).await?;
-        let net_units =
-            Transaction::to_units(confirmed).saturating_sub(Transaction::to_units(pending_debit));
+        // M06 (display): exclude still-immature rewards from the spendable balance the UI/send
+        // flow offers — they'd be rejected at consensus. Prospective next height, no in-flight.
+        let immature =
+            self.immature_reward_units_scan(address, self.get_latest_block_index() as u64 + 1, &[]);
+        let net_units = Transaction::to_units(confirmed)
+            .saturating_sub(Transaction::to_units(pending_debit))
+            .saturating_sub(immature);
         Ok(Transaction::from_units(net_units))
     }
 
@@ -4993,6 +5151,153 @@ mod tests {
     fn pow_target_saturates_to_zero_for_large_difficulty() {
         // 4096 / 16 == 256 -> shifted past full 256-bit target width.
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
+    }
+
+    // M06: the shared replay gate (used by both branch_is_balance_valid and
+    // rebuild_balances_index) must block spending an immature coinbase above the activation
+    // height, allow it once buried MATURITY deep, block a same-block spend of the fresh reward,
+    // and be a no-op below the activation height (so existing history replays unchanged).
+    #[test]
+    fn reward_maturity_replay_gates_immature_and_respects_activation() {
+        use std::collections::VecDeque;
+        let coinbase = |to: &str, amt: i128| Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: to.to_string(),
+            fee_units: 0,
+            amount_units: amt,
+            timestamp: 1,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        let spend = |from: &str, to: &str, amt: i128| Transaction {
+            sender: from.to_string(),
+            recipient: to.to_string(),
+            fee_units: 0,
+            amount_units: amt,
+            timestamp: 1,
+            signature: Some("sig".to_string()),
+            pub_key: None,
+            sig_hash: None,
+        };
+        let a = MATURITY_ACTIVATION_HEIGHT;
+        let m = MINING_REWARD_MATURITY;
+
+        // (1) Above activation, immature: reward at `a`, spend at a+m-1 (depth m-1) -> rejected.
+        {
+            let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
+            Blockchain::replay_apply_block_checked(a, &[coinbase("A", 1000)], &mut bal, &mut recent)
+                .unwrap();
+            let r = Blockchain::replay_apply_block_checked(
+                a + m - 1,
+                &[spend("A", "B", 500)],
+                &mut bal,
+                &mut recent,
+            );
+            assert!(r.is_err(), "reward buried only m-1 deep must not be spendable");
+        }
+        // (2) Above activation, mature: reward at `a`, spend at a+m (depth m) -> allowed.
+        {
+            let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
+            Blockchain::replay_apply_block_checked(a, &[coinbase("A", 1000)], &mut bal, &mut recent)
+                .unwrap();
+            let r = Blockchain::replay_apply_block_checked(
+                a + m,
+                &[spend("A", "B", 500)],
+                &mut bal,
+                &mut recent,
+            );
+            assert!(r.is_ok(), "reward buried m deep must be spendable");
+            assert_eq!(*bal.get("A").unwrap(), 500);
+        }
+        // (3) Same-block spend of the freshly-mined coinbase is blocked.
+        {
+            let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
+            let r = Blockchain::replay_apply_block_checked(
+                a,
+                &[coinbase("A", 1000), spend("A", "B", 500)],
+                &mut bal,
+                &mut recent,
+            );
+            assert!(r.is_err(), "spending the fresh coinbase in its own block must be rejected");
+        }
+        // (4) Below activation: identical immediate-spend scenario is unchanged (overlay off).
+        {
+            let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
+            let r = Blockchain::replay_apply_block_checked(
+                a - 1,
+                &[coinbase("A", 1000), spend("A", "B", 500)],
+                &mut bal,
+                &mut recent,
+            );
+            assert!(r.is_ok(), "below activation, an immediate reward spend must still be allowed");
+            assert_eq!(*bal.get("A").unwrap(), 500);
+        }
+    }
+
+    // M06: the scan overlay (tip-extension/advisory gates) and the replay overlay (reorg/rebuild
+    // gates) must compute the SAME immature total for the same chain — otherwise a reorg whose
+    // dry-run passes could fail the authoritative rebuild after slots are rewritten. Cross-check
+    // them on a window straddling the maturity boundary.
+    #[test]
+    fn reward_maturity_scan_matches_replay_over_window() {
+        use std::collections::VecDeque;
+        let bc = test_blockchain();
+        let a = MATURITY_ACTIVATION_HEIGHT;
+        let m = MINING_REWARD_MATURITY;
+        // Reward blocks: one just old enough to be mature at `spend_h`, one still immature.
+        let spend_h = a + m; // spend height
+        let mature_reward_h = spend_h - m; // exactly m deep -> mature
+        let immature_reward_h = spend_h - 1; // 1 deep -> immature
+        let coinbase_block = |idx: u32, amt: i128| {
+            let mut b = metadata_test_block(idx, [0u8; 32], "miner", 1.0);
+            // Replace the block's transactions with a single explicit coinbase to "X".
+            b.transactions = vec![Transaction {
+                sender: "MINING_REWARDS".to_string(),
+                recipient: "X".to_string(),
+                fee_units: 0,
+                amount_units: amt,
+                timestamp: 1,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            }];
+            b
+        };
+        let mature = coinbase_block(mature_reward_h, 700);
+        let immature = coinbase_block(immature_reward_h, 900);
+        insert_raw_block(&bc, &mature);
+        insert_raw_block(&bc, &immature);
+
+        // Scan at spend_h: only the immature (spend_h-1) reward counts; the mature one aged out.
+        let scanned = bc.immature_reward_units_scan("X", spend_h as u64, &[]);
+        assert_eq!(scanned, 900, "only the reward < MATURITY deep is immature");
+
+        // Replay the same two blocks through the replay helper and read its `recent` window.
+        let (mut bal, mut recent): (HashMap<String, i128>, VecDeque<(u32, String, i128)>) =
+            (HashMap::new(), VecDeque::new());
+        Blockchain::replay_apply_block_checked(
+            mature_reward_h,
+            &mature.transactions,
+            &mut bal,
+            &mut recent,
+        )
+        .unwrap();
+        Blockchain::replay_apply_block_checked(
+            immature_reward_h,
+            &immature.transactions,
+            &mut bal,
+            &mut recent,
+        )
+        .unwrap();
+        // At spend_h the mature reward (spend_h-m) is purged when a block at spend_h is applied;
+        // emulate the purge boundary: entries with rh + m <= spend_h are mature.
+        let replay_immature: i128 = recent
+            .iter()
+            .filter(|(rh, r, _)| r == "X" && (*rh as u64) + m as u64 > spend_h as u64)
+            .map(|(_, _, amt)| *amt)
+            .sum();
+        assert_eq!(replay_immature, scanned, "scan and replay must agree on the immature total");
     }
 
     // Regression for the mining-loop reentrant deadlock (the permanent freeze when a
