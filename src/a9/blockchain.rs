@@ -3185,9 +3185,20 @@ impl Blockchain {
     }
     // Validation
     pub async fn validate_chain(&self) -> Result<bool, BlockchainError> {
-        let mut previous_block: Option<Block> = None;
+        let Some(tip) = self.highest_block_index() else {
+            return Ok(true);
+        };
 
-        for current_block in self.get_blocks() {
+        // Stream one block at a time by height instead of materialising the whole
+        // chain into a Vec — peak RAM is O(1) regardless of chain length. Missing
+        // heights are skipped just as scan_prefix omits them, so a gap still surfaces
+        // as a previous_hash mismatch against the last block that did load.
+        let mut previous_block: Option<Block> = None;
+        for h in 0..=tip {
+            let Ok(current_block) = self.get_block(h) else {
+                continue;
+            };
+
             if let Err(e) = self.validate_block(&current_block).await {
                 error!("Block validation failed: {:?}", e);
                 return Ok(false);
@@ -4461,17 +4472,27 @@ impl ChainSentinel {
     }
 
     pub async fn verify_chain_integrity(&self, blockchain: &Blockchain) -> bool {
-        let blocks = blockchain.get_blocks();
-        if blocks.is_empty() {
+        let Some(tip) = blockchain.highest_block_index() else {
             return true;
-        }
+        };
 
-        let mut prev_hash = blocks[0].hash;
-        let mut prev_timestamp = blocks[0].timestamp;
-        let mut prev_difficulty = blocks[0].difficulty;
+        // Stream by height instead of loading the whole chain: peak RAM is O(1) and
+        // the ascending order still feeds the difficulty oracle the same sequence.
+        // Missing heights are skipped as scan_prefix would omit them, so a gap still
+        // surfaces as a previous_hash mismatch against the last present block.
         let mut difficulty_oracle = DifficultyOracle::new();
+        let mut prev: Option<([u8; 32], u64, u64)> = None; // (hash, timestamp, difficulty)
 
-        for block in blocks.iter().skip(1) {
+        for h in 0..=tip {
+            let Ok(block) = blockchain.get_block(h) else {
+                continue;
+            };
+
+            let Some((prev_hash, prev_timestamp, prev_difficulty)) = prev else {
+                prev = Some((block.hash, block.timestamp, block.difficulty));
+                continue;
+            };
+
             // Hash chain verification
             if block.previous_hash != prev_hash {
                 self.integrity_score.fetch_sub(10, Ordering::Relaxed);
@@ -4499,9 +4520,7 @@ impl ChainSentinel {
                 return false;
             }
 
-            prev_hash = block.hash;
-            prev_timestamp = block.timestamp;
-            prev_difficulty = block.difficulty;
+            prev = Some((block.hash, block.timestamp, block.difficulty));
         }
 
         true
