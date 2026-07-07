@@ -4,7 +4,7 @@ use rand::{thread_rng, Rng};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -2112,11 +2112,27 @@ struct NetworkSyncState {
     participating_nodes: HashSet<String>,
 }
 
+/// A peer's registered ML-DSA verifier key plus the source IP that registered it and when it
+/// was last seen active. Source IP is the anti-Sybil anchor (consensus counts DISTINCT IPs,
+/// not raw keys) and last_seen drives LRU eviction of the bounded map.
+#[derive(Debug, Clone)]
+struct RegisteredKey {
+    mldsa_public_key: Vec<u8>,
+    source_ip: IpAddr,
+    last_seen: u64,
+}
+
+/// Hard cap on the registered-verifier map (>> any real validator set; bounds memory).
+const MAX_PEER_MLDSA_KEYS: usize = 4096;
+/// Max distinct verifier keys accepted from one source IP — the primary DoS/Sybil bound:
+/// one host cannot fill the map or masquerade as many verifiers.
+const MAX_MLDSA_KEYS_PER_IP: usize = 2;
+
 #[derive(Debug)]
 pub struct HeaderSentinel {
     headers: Arc<RwLock<VecDeque<HeaderState>>>,
     verifications: Arc<DashMap<[u8; 32], VerificationState>>,
-    peer_mldsa_keys: Arc<DashMap<String, Vec<u8>>>,
+    peer_mldsa_keys: Arc<DashMap<String, RegisteredKey>>,
     sync_state: Arc<RwLock<NetworkSyncState>>,
     consensus_threshold: f64,
     max_headers: usize,
@@ -2168,11 +2184,19 @@ impl HeaderSentinel {
         if signature.is_empty() {
             return Ok(false);
         }
-        let public_key_bytes = self
-            .peer_mldsa_keys
-            .get(node_id)
-            .map(|k| k.value().clone())
-            .ok_or_else(|| format!("No ML-DSA key registered for node {}", node_id))?;
+        // get_mut so we can refresh last_seen: a verifier actively participating in header
+        // consensus must not be LRU-evicted from the bounded key map.
+        let public_key_bytes = {
+            let mut entry = self
+                .peer_mldsa_keys
+                .get_mut(node_id)
+                .ok_or_else(|| format!("No ML-DSA key registered for node {}", node_id))?;
+            entry.last_seen = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            entry.mldsa_public_key.clone()
+        };
         Ok(mldsa::verify(payload, signature, &public_key_bytes).is_ok())
     }
 
@@ -2185,6 +2209,7 @@ impl HeaderSentinel {
         node_id: &str,
         mldsa_public_key: Vec<u8>,
         ed25519_signature: Vec<u8>,
+        source_ip: IpAddr,
     ) -> Result<(), String> {
         if node_id.trim().is_empty() {
             return Err("Node ID is empty".to_string());
@@ -2207,23 +2232,69 @@ impl HeaderSentinel {
             .verify(&payload, &ed25519_signature)
             .map_err(|_| "Invalid Ed25519 attestation signature".to_string())?;
 
-        if let Some(existing) = self.peer_mldsa_keys.get(node_id) {
-            if existing.value().as_slice() != mldsa_public_key.as_slice() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Existing node_id: accept a key rotation, always refresh last_seen + source_ip.
+        if let Some(mut existing) = self.peer_mldsa_keys.get_mut(node_id) {
+            if existing.mldsa_public_key.as_slice() != mldsa_public_key.as_slice() {
                 warn!(
                     "ML-DSA key rotated for node {} (updating attested key binding)",
                     node_id
                 );
-                drop(existing);
-                self.peer_mldsa_keys
-                    .insert(node_id.to_string(), mldsa_public_key);
-                return Ok(());
+                existing.mldsa_public_key = mldsa_public_key;
             }
+            existing.last_seen = now;
+            existing.source_ip = source_ip;
             return Ok(());
         }
 
-        self.peer_mldsa_keys
-            .insert(node_id.to_string(), mldsa_public_key);
+        // NEW node_id. Primary bound: at most MAX_MLDSA_KEYS_PER_IP distinct keys per source
+        // IP, so one host can't fill the map or masquerade as many verifiers.
+        let per_ip = self
+            .peer_mldsa_keys
+            .iter()
+            .filter(|e| e.value().source_ip == source_ip)
+            .count();
+        if per_ip >= MAX_MLDSA_KEYS_PER_IP {
+            return Err(format!("Too many ML-DSA registrations from {}", source_ip));
+        }
+        // Backstop: if the map is genuinely full (only reachable with many diverse IPs given
+        // the per-IP cap), evict the least-recently-seen entry to make room. Active verifiers
+        // refresh last_seen on every signature check, so honest participants are not evicted.
+        if self.peer_mldsa_keys.len() >= MAX_PEER_MLDSA_KEYS {
+            if let Some(oldest) = self
+                .peer_mldsa_keys
+                .iter()
+                .min_by_key(|e| e.value().last_seen)
+                .map(|e| e.key().clone())
+            {
+                self.peer_mldsa_keys.remove(&oldest);
+            }
+        }
+        self.peer_mldsa_keys.insert(
+            node_id.to_string(),
+            RegisteredKey {
+                mldsa_public_key,
+                source_ip,
+                last_seen: now,
+            },
+        );
         Ok(())
+    }
+
+    /// Number of DISTINCT source IPs among registered verifier keys — the anti-Sybil
+    /// consensus denominator. A host registering many self-signed node_ids counts once, so it
+    /// cannot inflate the verifier set to self-satisfy the header quorum.
+    fn registered_verifier_ip_count(&self) -> usize {
+        let ips: std::collections::HashSet<IpAddr> = self
+            .peer_mldsa_keys
+            .iter()
+            .map(|e| e.value().source_ip)
+            .collect();
+        ips.len()
     }
 
     pub fn new() -> Self {
@@ -2410,7 +2481,7 @@ impl HeaderSentinel {
         };
 
         let participating = self.sync_state.read().await.participating_nodes.len();
-        let registered = self.peer_mldsa_keys.len();
+        let registered = self.registered_verifier_ip_count();
         let eligible = participating.max(registered).max(1);
         let required = self.required_verifier_count(eligible);
         let actual = Self::external_verifier_count(&v.verifiers);
@@ -2420,7 +2491,7 @@ impl HeaderSentinel {
 
     pub async fn eligible_verifier_count(&self) -> usize {
         let participating = self.sync_state.read().await.participating_nodes.len();
-        let registered = self.peer_mldsa_keys.len();
+        let registered = self.registered_verifier_ip_count();
         participating.max(registered).max(1)
     }
 
@@ -2794,6 +2865,16 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    // A registered key from a DISTINCT source IP (octet), so N such entries count as N
+    // distinct eligible verifiers under the anti-Sybil distinct-IP quorum count.
+    fn reg_key(pk: u8, ip_octet: u8) -> RegisteredKey {
+        RegisteredKey {
+            mldsa_public_key: vec![pk; 32],
+            source_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, ip_octet)),
+            last_seen: 0,
+        }
+    }
+
     #[test]
     fn verifier_threshold_is_ratio_based_for_small_sets() {
         let sentinel = HeaderSentinel::new();
@@ -2822,13 +2903,13 @@ mod tests {
         let sentinel = HeaderSentinel::new();
         sentinel
             .peer_mldsa_keys
-            .insert("n1".to_string(), vec![1u8; 32]);
+            .insert("n1".to_string(), reg_key(1, 1));
         sentinel
             .peer_mldsa_keys
-            .insert("n2".to_string(), vec![2u8; 32]);
+            .insert("n2".to_string(), reg_key(2, 2));
         sentinel
             .peer_mldsa_keys
-            .insert("n3".to_string(), vec![3u8; 32]);
+            .insert("n3".to_string(), reg_key(3, 3));
         assert!(sentinel.should_enforce_consensus_for_headers().await);
     }
 
@@ -2838,13 +2919,13 @@ mod tests {
 
         sentinel
             .peer_mldsa_keys
-            .insert("n1".to_string(), vec![1u8; 32]);
+            .insert("n1".to_string(), reg_key(1, 1));
         sentinel
             .peer_mldsa_keys
-            .insert("n2".to_string(), vec![2u8; 32]);
+            .insert("n2".to_string(), reg_key(2, 2));
         sentinel
             .peer_mldsa_keys
-            .insert("n3".to_string(), vec![3u8; 32]);
+            .insert("n3".to_string(), reg_key(3, 3));
 
         let conflicting_hash = [0xAA; 32];
         let expected_hash = [0xBB; 32];

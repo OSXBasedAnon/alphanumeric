@@ -6977,11 +6977,22 @@ impl Node {
                 mldsa_public_key,
                 ed25519_signature,
             } => {
-                if let Some(ref sentinel) = self.header_sentinel {
+                // Rate-limit registration globally AND per source IP before any work — an
+                // unauthenticated key-registration flood must never be free (memory DoS +
+                // verifier-Sybil). The sentinel additionally caps keys per IP and bounds the
+                // map, and counts distinct IPs (not raw keys) toward the quorum denominator.
+                if !self.rate_limiter.check_limit("mldsa_reg:global")
+                    || !self
+                        .rate_limiter
+                        .check_limit(&format!("mldsa_reg_ip:{}", addr.ip()))
+                {
+                    self.record_peer_failure(addr).await;
+                } else if let Some(ref sentinel) = self.header_sentinel {
                     if let Err(e) = sentinel.register_peer_mldsa_key(
                         &node_id,
                         mldsa_public_key,
                         ed25519_signature,
+                        addr.ip(),
                     ) {
                         debug!(
                             "ML-DSA key registration rejected from {} (node {}): {}",
