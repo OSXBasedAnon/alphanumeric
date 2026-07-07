@@ -2506,43 +2506,57 @@ impl Blockchain {
         &self,
         balances_tree: &sled::Tree,
     ) -> Result<(), BlockchainError> {
-        balances_tree.clear()?;
-
-        let mut blocks: Vec<Block> = self
-            .db
-            .scan_prefix(b"block_")
-            .filter_map(|entry| {
-                let (_, value) = entry.ok()?;
-                Block::from_bytes(value.as_ref()).ok()
-            })
-            .collect();
-        blocks.sort_unstable_by_key(|b| b.index);
-
+        // Stream blocks by numeric height (O(1) block RAM) instead of loading + sorting the
+        // WHOLE chain into memory — numeric order is exactly the index/solvency-replay order
+        // the lexical `block_{n}` sort was reconstructing.
         let mut balances: HashMap<String, i128> = HashMap::new();
-        for block in blocks {
-            for tx in block.transactions {
-                if tx.sender != "MINING_REWARDS" {
-                    let debit = tx.total_debit_units();
-                    let entry = balances.entry(tx.sender).or_insert(0);
-                    // Enforce sequential availability during replay, like the forward
-                    // apply path (process_transactions_batch). A chain that debits an
-                    // address below zero at any point is invalid; refuse to persist it
-                    // rather than writing a negative/phantom balance. This closes the
-                    // reorg/race hole where a same-height competitor bypassed the
-                    // InsufficientFunds guard that tip-extension goes through.
-                    if *entry < debit {
-                        return Err(BlockchainError::InsufficientFunds);
+        if let Some(tip) = self.highest_block_index() {
+            for h in 0..=tip {
+                let Ok(block) = self.get_block(h) else {
+                    continue;
+                };
+                for tx in block.transactions {
+                    if tx.sender != "MINING_REWARDS" {
+                        let debit = tx.total_debit_units();
+                        let entry = balances.entry(tx.sender).or_insert(0);
+                        // Enforce sequential availability during replay, like the forward
+                        // apply path (process_transactions_batch). A chain that debits an
+                        // address below zero at any point is invalid; refuse to persist it
+                        // rather than writing a negative/phantom balance. This closes the
+                        // reorg/race hole where a same-height competitor bypassed the
+                        // InsufficientFunds guard that tip-extension goes through.
+                        if *entry < debit {
+                            return Err(BlockchainError::InsufficientFunds);
+                        }
+                        *entry -= debit;
                     }
-                    *entry -= debit;
+                    let entry = balances.entry(tx.recipient).or_insert(0);
+                    *entry += tx.amount_units;
                 }
-                let entry = balances.entry(tx.recipient).or_insert(0);
-                *entry += tx.amount_units;
             }
         }
 
+        // Atomic swap — NO clear(). One batch removes addresses that vanished from the
+        // recomputed set and writes every new balance, so a concurrent lock-free reader
+        // (get_confirmed_balance -> ensure_balances_index) sees all-old or all-new, never the
+        // empty tree that clear() briefly exposed (which returned wrong balances and could
+        // trigger a re-entrant rebuild storm). The height marker key is preserved.
         let mut batch = sled::Batch::default();
-        for (address, balance) in balances {
-            batch.insert(address.as_bytes(), codec::serialize(&balance)?);
+        for entry in balances_tree.iter() {
+            let (key, _) = entry?;
+            if key.as_ref() == BALANCES_HEIGHT_KEY {
+                continue;
+            }
+            let vanished = match std::str::from_utf8(key.as_ref()) {
+                Ok(addr) => !balances.contains_key(addr),
+                Err(_) => true,
+            };
+            if vanished {
+                batch.remove(key);
+            }
+        }
+        for (address, balance) in &balances {
+            batch.insert(address.as_bytes(), codec::serialize(balance)?);
         }
         balances_tree.apply_batch(batch)?;
 
