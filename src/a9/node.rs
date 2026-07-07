@@ -2463,18 +2463,25 @@ impl Node {
                 if branch.is_empty() {
                     return Converge::BeaconStale;
                 }
-                // WORK GATE, BEFORE the finality/depth guards: only ever reorg toward a
-                // strictly HEAVIER chain. converge_to_relay_tip nominates the relay's tallest
-                // block, so an attacker can post a tall-but-LIGHTER fork; if that merely-taller
-                // chain reached the depth guards below it would return NeedsBootstrap and,
-                // repeated, drive the publisher's 2-strike exit(0) — freezing the beacon for
-                // the whole network. A non-heavier target means we already hold the better
-                // chain: return AtTipAhead (keep mining, reset strikes), never bootstrap.
-                let heavier = {
+                // FORK-CHOICE GATE, BEFORE the finality/depth guards. Proceed toward the
+                // canonical branch when it is strictly HEAVIER, OR when it is an EQUAL-work
+                // SAME-HEIGHT fork whose tip hash is strictly lower (the deterministic
+                // lowest-hash tie-break the reorg engine applies). The equal-work tie MUST be
+                // honoured here: without it, two miners producing a same-height block leave
+                // beacon/relay-only nodes stuck on their own higher-hash block forever (they
+                // never route the competitor through the engine), splitting them from the
+                // directly-P2P-meshed nodes that do — the "won't catch up" fork.
+                //
+                // Everything else returns AtTipAhead (keep mining, reset strikes), never
+                // bootstrap: a strictly-LIGHTER or taller-but-lighter fork (which
+                // converge_to_relay_tip can nominate by max height) must not reach the depth
+                // guards below, or a repeated NeedsBootstrap would drive the publisher's
+                // 2-strike exit(0) and freeze the beacon for the whole network.
+                let wins = {
                     let bc = self.blockchain.read().await;
-                    bc.external_branch_is_heavier(&branch, ancestor, tip)
+                    bc.external_branch_wins_fork_choice(&branch, ancestor, tip)
                 };
-                if !heavier {
+                if !wins {
                     return Converge::AtTipAhead;
                 }
                 let checkpoint = self.blockchain.read().await.trusted_checkpoint_height();

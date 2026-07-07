@@ -1836,6 +1836,52 @@ impl Blockchain {
         branch_work > canonical_work
     }
 
+    /// Fork-choice verdict for the convergence (beacon/relay) reorg path. Returns true iff
+    /// adopting `branch` (canonical [ancestor+1 ..= its tip]) is warranted over the local
+    /// chain over the same span [ancestor+1 ..= tip]:
+    ///   * strictly MORE proof-of-work, OR
+    ///   * EQUAL work AND a SAME-HEIGHT tip whose hash is strictly lower — the deterministic
+    ///     "lowest tip hash wins" tie-break the reorg engine (`try_adopt_orphan_branch`)
+    ///     already applies. A same-height equal-work fork whose tip hash is >= ours means we
+    ///     already hold the tie winner, so we keep it.
+    ///
+    /// This exists because `external_branch_is_heavier` uses a strict `>`: on an equal-work
+    /// same-height fork (the common case — two miners find a block at the same height and
+    /// floor difficulty) it returns false, and the caller short-circuits to AtTipAhead
+    /// WITHOUT ever routing the competitor through the engine's tie-break. Beacon/relay-only
+    /// nodes then never switch to the canonical lowest-hash block and stay split from the
+    /// directly-P2P-meshed nodes (which DO run the engine on ingest) — the "won't catch up /
+    /// 3-of-4 agreement" fork. Anything strictly lighter (incl. a taller-but-lighter attacker
+    /// fork, or an equal-work fork that is TALLER rather than same-height) returns false, so
+    /// the caller keeps mining and never trips the depth-guard/bootstrap escalation.
+    pub fn external_branch_wins_fork_choice(
+        &self,
+        branch: &[Block],
+        ancestor: u32,
+        tip: u32,
+    ) -> bool {
+        let Some(branch_tip) = branch.last() else {
+            return false;
+        };
+        let canonical_work = match self.canonical_work_range(ancestor.saturating_add(1), tip) {
+            Ok(w) => w,
+            Err(_) => return false, // can't compute local work -> conservative: don't reorg
+        };
+        let branch_work = Self::branch_work_to_height(branch, branch_tip.index);
+        if branch_work > canonical_work {
+            return true;
+        }
+        if branch_work == canonical_work {
+            // Equal work: adopt ONLY the deterministic lowest-hash winner at the SAME height,
+            // exactly as try_adopt_orphan_branch decides once the branch reaches the engine.
+            let Ok(local_tip) = self.get_block(tip) else {
+                return false;
+            };
+            return branch_tip.index == tip && branch_tip.hash < local_tip.hash;
+        }
+        false
+    }
+
     fn compare_work_delta(
         branch_work: &BigUint,
         canonical_work: &BigUint,
@@ -5558,6 +5604,70 @@ mod tests {
         assert_eq!(
             Blockchain::compare_work_delta(&high_work, &low_work, &low_work, &low_work),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn convergence_gate_breaks_equal_work_ties_by_lowest_hash() {
+        // Regression for the "won't catch up / 3-of-4 agreement" fork. Two miners producing a
+        // same-height, floor-difficulty (equal-work) block must deterministically converge on
+        // the lowest-hash tip. The beacon/relay convergence path (external_branch_wins_fork_choice)
+        // must therefore adopt a same-height EQUAL-work competitor iff its tip hash is strictly
+        // lower — matching try_adopt_orphan_branch — otherwise beacon-only nodes stay split from
+        // the directly-P2P-meshed nodes forever. The previous strict-`>` gate returned false on
+        // every tie and never reorged.
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "b0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "ancestor", 1.0);
+
+        // Three same-height (2), equal-work competitors off `block1`, ordered by hash so we can
+        // name lowest / middle / highest deterministically regardless of how they hash.
+        let mut competitors = vec![
+            metadata_test_block(2, block1.hash, "comp_a", 1.0),
+            metadata_test_block(2, block1.hash, "comp_b", 1.0),
+            metadata_test_block(2, block1.hash, "comp_c", 1.0),
+        ];
+        competitors.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let lowest = competitors[0].clone();
+        let middle = competitors[1].clone();
+        let highest = competitors[2].clone();
+        assert!(lowest.hash < middle.hash && middle.hash < highest.hash);
+
+        // Local node holds the MIDDLE-hash block at the tip (height 2).
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+        insert_raw_block(&blockchain, &middle);
+
+        // Equal work, same height, strictly LOWER hash -> adopt (the fix).
+        assert!(
+            blockchain.external_branch_wins_fork_choice(&[lowest.clone()], 1, 2),
+            "must adopt a same-height equal-work competitor with a strictly lower tip hash"
+        );
+        // Equal work, same height, strictly HIGHER hash -> keep ours.
+        assert!(
+            !blockchain.external_branch_wins_fork_choice(&[highest.clone()], 1, 2),
+            "must NOT reorg to a higher-hash same-height equal-work competitor"
+        );
+        // Our own tip (equal hash) never 'wins' over itself -> no needless reorg/flap.
+        assert!(
+            !blockchain.external_branch_wins_fork_choice(&[middle.clone()], 1, 2),
+            "equal hash is not strictly lower -> no reorg"
+        );
+
+        // Strictly HEAVIER (taller) branch -> adopt regardless of tip hash ordering.
+        let heavier_child = metadata_test_block(3, highest.hash, "child", 1.0);
+        assert!(
+            blockchain.external_branch_wins_fork_choice(&[highest.clone(), heavier_child], 1, 2),
+            "a strictly heavier (taller) branch must be adopted"
+        );
+
+        // Strictly LIGHTER branch -> never adopt, even with a lower tip hash. Extend the local
+        // chain to height 3 so the local span [2..=3] outweighs a single height-2 competitor.
+        let local3 = metadata_test_block(3, middle.hash, "local3", 1.0);
+        insert_raw_block(&blockchain, &local3);
+        assert!(
+            !blockchain.external_branch_wins_fork_choice(&[lowest.clone()], 1, 3),
+            "a strictly lighter branch must never be adopted, even with a lower tip hash"
         );
     }
 
