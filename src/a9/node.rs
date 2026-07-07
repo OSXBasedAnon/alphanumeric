@@ -79,6 +79,7 @@ const SUBNET_MASK_IPV6: u8 = 48; // /48 subnet
 // Timeouts and intervals
 const PEER_TIMEOUT: u64 = 300; // seconds
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
+const VERSION_CHECK_INTERVAL_SECS: u64 = 1800; // 30 min: notice-only client-version check
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
 const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
@@ -1438,6 +1439,62 @@ impl Node {
 
         vec![std::env::var("ALPHANUMERIC_DISCOVERY_BASE")
             .unwrap_or_else(|_| DEFAULT_DISCOVERY_BASE.to_string())]
+    }
+
+    /// Parse a dotted version ("7.5.0", tolerating a leading `v` and any pre-release suffix)
+    /// into a comparable (major, minor, patch) tuple; missing/garbage components read as 0.
+    fn parse_semver(v: &str) -> (u64, u64, u64) {
+        let mut it = v.trim().trim_start_matches('v').split('.').map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        });
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+
+    fn version_is_older(local: &str, remote: &str) -> bool {
+        Self::parse_semver(local) < Self::parse_semver(remote)
+    }
+
+    /// Notice-only client-version check. Asks the gateway which node version is recommended and,
+    /// if this build is older, logs a one-line update notice. The node keeps running and NOTHING
+    /// auto-updates — this is purely informational so an operator on a stale binary (e.g. one that
+    /// predates a convergence fix) learns to update. Best-effort: any network/parse error is
+    /// swallowed so it never disrupts the node.
+    async fn check_client_version_and_warn(&self) {
+        let local = env!("CARGO_PKG_VERSION");
+        for base in Self::discovery_bases() {
+            let url = format!("{}/api/client-release", base);
+            let res = match self.http_client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => continue,
+            };
+            let body: Value = match res.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(recommended) = body.get("recommended_version").and_then(|v| v.as_str()) else {
+                return; // gateway answered but advertises no version -> nothing to compare
+            };
+            if Self::version_is_older(local, recommended) {
+                let hint = body
+                    .get("download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("https://alphanumeric.blue");
+                warn!(
+                    "Node update available: {} (you are running {}). Update recommended — {}. \
+                     Your node keeps running; this is a notice only.",
+                    recommended, local, hint
+                );
+            }
+            return; // first reachable gateway answered
+        }
     }
 
     fn discovery_peers_urls() -> Vec<String> {
@@ -4709,6 +4766,21 @@ impl Node {
                     if let Err(e) = node_clone.post_stats_snapshot().await {
                         debug!("Stats snapshot error: {}", e);
                     }
+                }
+            });
+        }
+
+        // Notice-only client-version check (all nodes). The first interval tick fires
+        // immediately, giving a startup check, then repeats every VERSION_CHECK_INTERVAL_SECS.
+        // Notice only — never auto-updates.
+        {
+            let node_clone = node.clone();
+            tokio::spawn(async move {
+                let mut version_check =
+                    interval(Duration::from_secs(VERSION_CHECK_INTERVAL_SECS));
+                loop {
+                    version_check.tick().await;
+                    node_clone.check_client_version_and_warn().await;
                 }
             });
         }
@@ -8655,6 +8727,23 @@ mod tests {
         assert!(Node::routes_via_witness(36, 35));
         assert!(!Node::routes_via_witness(35, 35));
         assert!(!Node::routes_via_witness(10, 35));
+    }
+
+    #[test]
+    fn version_compare_flags_older_builds() {
+        // Older -> flagged.
+        assert!(Node::version_is_older("7.4.1", "7.5.0"));
+        assert!(Node::version_is_older("7.4.9", "7.5.0"));
+        assert!(Node::version_is_older("6.9.9", "7.0.0"));
+        assert!(Node::version_is_older("7.5.0", "7.5.1"));
+        // Equal or newer -> not flagged (no false update nag).
+        assert!(!Node::version_is_older("7.5.0", "7.5.0"));
+        assert!(!Node::version_is_older("7.5.1", "7.5.0"));
+        assert!(!Node::version_is_older("8.0.0", "7.5.0"));
+        // Tolerant parsing: leading `v`, pre-release suffix, short strings.
+        assert!(Node::version_is_older("v7.4.0", "7.5.0"));
+        assert!(!Node::version_is_older("7.5.0-rc1", "7.5.0"));
+        assert_eq!(Node::parse_semver("7.5"), (7, 5, 0));
     }
 
     #[test]
