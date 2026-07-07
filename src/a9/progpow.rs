@@ -236,7 +236,14 @@ impl MiningManager {
             }
 
             let block_transactions = {
-                let blockchain_lock = self.blockchain.write().await;
+                // READ, not write: this only reads confirmed balances to select txs
+                // (get_confirmed_balance is &self). Holding the EXCLUSIVE write lock here
+                // across get_confirmed_balance().await — which lazily runs a full
+                // balances-index rebuild right after a competing block advances the tip —
+                // starved block-ingest's write() and wedged the write-preferring RwLock,
+                // freezing the miner whenever the mempool held a pending tx. A shared read
+                // guard lets ingest proceed and never blocks it for the whole rebuild.
+                let blockchain_lock = self.blockchain.read().await;
                 let mut selected_regular = Vec::with_capacity(mining_transactions.len());
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
 
@@ -532,19 +539,23 @@ impl MiningManager {
                                 }
                                 Err(e) => {
                                     if matches!(e, BlockchainError::InvalidBlockHeader) {
-                                        let stale_template = {
-                                            let blockchain_guard = self.blockchain.read().await;
-                                            blockchain_guard
-                                                .get_last_block()
-                                                .map(|block| {
-                                                    (
-                                                        block.index.saturating_add(1),
-                                                        block.hash != previous_block_hash
-                                                            || block.index.saturating_add(1)
-                                                                != mined_index,
-                                                    )
-                                                })
-                                        };
+                                        // Reuse the write guard already held above (acquired at
+                                        // the top of this finalize block). Acquiring a SECOND
+                                        // guard on the same RwLock while this task holds the
+                                        // write guard is a reentrant self-deadlock on tokio's
+                                        // non-reentrant RwLock — this was the permanent freeze
+                                        // whenever the miner lost a block race. get_last_block
+                                        // is &self, so it is safe under the held guard.
+                                        let stale_template = blockchain_lock
+                                            .get_last_block()
+                                            .map(|block| {
+                                                (
+                                                    block.index.saturating_add(1),
+                                                    block.hash != previous_block_hash
+                                                        || block.index.saturating_add(1)
+                                                            != mined_index,
+                                                )
+                                            });
                                         if let Some((height, true)) = stale_template {
                                             header.number = height;
                                             current_nonce = 0;
