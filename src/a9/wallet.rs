@@ -8,6 +8,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -34,7 +35,7 @@ where
 
 #[derive(Clone)]
 struct WalletKeys {
-    mldsa_secret_key_bytes: Vec<u8>,
+    mldsa_secret_key_bytes: Zeroizing<Vec<u8>>,
     mldsa_public_key_bytes: Vec<u8>,
 }
 
@@ -100,10 +101,10 @@ impl Wallet {
         Ok((secret_bytes, public_bytes))
     }
 
-    fn derive_aes_key(passphrase: &[u8], salt: &[u8]) -> Result<[u8; 32], String> {
-        let mut key = [0u8; 32];
+    fn derive_aes_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+        let mut key = Zeroizing::new([0u8; 32]);
         Argon2::default()
-            .hash_password_into(passphrase, salt, &mut key)
+            .hash_password_into(passphrase, salt, &mut *key)
             .map_err(|e| format!("Argon2 key derivation error: {}", e))?;
         Ok(key)
     }
@@ -123,7 +124,7 @@ impl Wallet {
 
         // Store the keypair
         let keys = WalletKeys {
-            mldsa_secret_key_bytes: secret_key_bytes,
+            mldsa_secret_key_bytes: Zeroizing::new(secret_key_bytes),
             mldsa_public_key_bytes: public_key_bytes,
         };
 
@@ -172,7 +173,7 @@ impl Wallet {
         }
 
         let keys = WalletKeys {
-            mldsa_secret_key_bytes: secret_bytes.to_vec(),
+            mldsa_secret_key_bytes: Zeroizing::new(secret_bytes.to_vec()),
             mldsa_public_key_bytes: public_bytes.to_vec(),
         };
 
@@ -231,7 +232,7 @@ impl Wallet {
         let salt = SaltString::encode_b64(&salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
         let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice())
             .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         let mut nonce_bytes = [0u8; 12];
@@ -262,7 +263,7 @@ impl Wallet {
         let salt = SaltString::encode_b64(salt_bytes)
             .map_err(|e| format!("Failed to encode salt: {}", e))?;
         let key = Self::derive_aes_key(passphrase, salt.as_str().as_bytes())?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice())
             .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         cipher

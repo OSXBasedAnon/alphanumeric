@@ -34,6 +34,7 @@ lru = "0.8"
 reed-solomon-erasure = "6.0.0"
 ml-dsa = "0.1.1"
 aes-gcm = "0.10"
+zeroize = "1"
 inquire = "0.7.0"
 tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"

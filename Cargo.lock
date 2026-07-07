@@ -125,6 +125,7 @@ dependencies = [
  "tokio",
  "uuid",
  "winres",
+ "zeroize",
  "zip",
 ]
 

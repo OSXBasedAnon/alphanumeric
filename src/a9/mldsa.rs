@@ -3,15 +3,18 @@ use ml_dsa::{
     Verifier, VerifyingKey,
 };
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 pub const SECRET_KEY_BYTES: usize = 32;
 pub const PUBLIC_KEY_BYTES: usize = 2_592;
 pub const SIGNATURE_BYTES: usize = 4_627;
 
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-    let mut seed = [0u8; SECRET_KEY_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
-    let signing_key = SigningKey::<MlDsa87>::from_seed(&seed.into());
+    // Hold the raw seed in a Zeroizing buffer so the stack copy is wiped when this returns; the
+    // returned Vec is the persisted secret, protected downstream (WalletKeys is also Zeroizing).
+    let mut seed = Zeroizing::new([0u8; SECRET_KEY_BYTES]);
+    rand::rngs::OsRng.fill_bytes(&mut *seed);
+    let signing_key = SigningKey::<MlDsa87>::from_seed(&(*seed).into());
     let public_key = signing_key.verifying_key().encode().to_vec();
     (public_key, seed.to_vec())
 }
