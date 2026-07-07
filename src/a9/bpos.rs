@@ -526,6 +526,12 @@ impl BPoSSentinel {
         Ok(())
     }
 
+    // NOT a live canonical-override safety net. This bPoS fork-resolution layer
+    // (resolve_fork / emergency_fork_resolution / enforce_canonical_chain / get_block_from_network)
+    // is non-functional — get_block_from_network requests the fixed [0,0] height range and can't
+    // fetch a competing block — and is retained only for diagnostics/telemetry. Canonical choice is
+    // decided solely by PoW work-weight in the reorg engine (converge_to_canonical /
+    // try_adopt_orphan_branch). Do not wire this into block acceptance.
     async fn resolve_fork(
         &self,
         block_height: u32,

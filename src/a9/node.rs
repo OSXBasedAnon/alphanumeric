@@ -77,7 +77,10 @@ const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
 const SUBNET_MASK_IPV6: u8 = 48; // /48 subnet
 
 // Timeouts and intervals
-const PEER_TIMEOUT: u64 = 300; // seconds
+// Inbound idle read timeout. Peers ping every PING_INTERVAL (30s), so a live peer resets this
+// well within the window; 90s tolerates 3 missed pings before evicting an idle connection so it
+// can't hold a slot for minutes (was 300s).
+const PEER_TIMEOUT: u64 = 90; // seconds
 const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const VERSION_CHECK_INTERVAL_SECS: u64 = 1800; // 30 min: notice-only client-version check
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
