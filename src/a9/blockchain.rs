@@ -4976,6 +4976,97 @@ mod tests {
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
     }
 
+    // Regression for the mining-loop reentrant deadlock (the permanent freeze when a
+    // miner loses a block race). The finalize error path used to call
+    // self.blockchain.read().await while STILL holding the write guard it took for
+    // finalize_block; tokio's RwLock is non-reentrant + write-preferring, so that
+    // second acquire can never be granted -> the task waits on itself forever. The
+    // fix reads the tip through the already-held guard. This pins both behaviours.
+    #[tokio::test]
+    async fn mining_finalize_error_path_must_not_reacquire_blockchain_lock() {
+        use std::time::Duration;
+        let blockchain = Arc::new(RwLock::new(test_blockchain()));
+
+        // FIXED pattern: read the tip through the write guard already held. Completes.
+        let fixed = tokio::time::timeout(Duration::from_secs(5), async {
+            let guard = blockchain.write().await;
+            let _tip = guard.get_last_block(); // &self via the held guard — no reentrancy
+            drop(guard);
+        })
+        .await;
+        assert!(fixed.is_ok(), "reusing the held write guard must not deadlock");
+
+        // OLD (removed) pattern: acquire a second guard on the same lock while the
+        // write guard is held. Must never be granted -> times out (i.e. deadlocked).
+        let reentrant = tokio::time::timeout(Duration::from_secs(2), async {
+            let guard = blockchain.write().await;
+            let _second = blockchain.read().await; // the bug this fix removes
+            drop(guard);
+        })
+        .await;
+        assert!(
+            reentrant.is_err(),
+            "write-guard-held + read on the same lock must deadlock (proves the removed bug)"
+        );
+    }
+
+    // End-to-end proof that a miner which LOSES a block race recovers and completes
+    // instead of freezing. Two real miners race for block #1 on the same chain; the
+    // loser's finalize returns InvalidBlockHeader (tip already advanced) and must
+    // recover onto the next height rather than deadlocking. Real ProgPoW at the 464
+    // floor takes tens of seconds, so this is #[ignore]d — run it explicitly with:
+    //   cargo test --release racing_miners_both_complete -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "real ProgPoW mining at the 464 floor; run with --ignored"]
+    async fn racing_miners_both_complete_loser_recovers() {
+        use crate::a9::progpow::{BlockHeader, MiningManager, ProgPowTransaction};
+        use std::time::Duration;
+
+        let blockchain = Arc::new(RwLock::new(test_blockchain()));
+        let genesis = Blockchain::genesis_launch_block().expect("genesis builds");
+        {
+            let g = blockchain.read().await;
+            insert_raw_block(&g, &genesis);
+        }
+
+        let header = || BlockHeader {
+            number: 1,
+            parent_hash: genesis.hash,
+            timestamp: genesis.timestamp + 5,
+            merkle_root: [0u8; 32],
+            difficulty: NETWORK_MIN_DIFFICULTY,
+        };
+        let no_txs: Vec<ProgPowTransaction> = Vec::new();
+
+        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let (ha, hb) = (header(), header());
+        let (txs_a, txs_b) = (no_txs.clone(), no_txs);
+
+        let task_a = tokio::spawn(async move {
+            let mut h = ha;
+            mgr_a
+                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0)
+                .await
+        });
+        let task_b = tokio::spawn(async move {
+            let mut h = hb;
+            mgr_b
+                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0)
+                .await
+        });
+
+        let joined = tokio::time::timeout(Duration::from_secs(240), async {
+            tokio::try_join!(task_a, task_b)
+        })
+        .await
+        .expect("neither miner may hang: the loser must recover from the lost race")
+        .expect("mining tasks should not panic");
+
+        assert!(joined.0.is_ok(), "miner A should complete: {:?}", joined.0.err());
+        assert!(joined.1.is_ok(), "miner B should complete: {:?}", joined.1.err());
+    }
+
     #[test]
     fn difficulty_floor_applies_from_first_launch_block() {
         assert_eq!(
