@@ -3663,6 +3663,13 @@ impl Blockchain {
             if parent.hash != block.previous_hash {
                 return Err(BlockchainError::InvalidBlockHeader);
             }
+            // Complete the linkage check independent of the caller: the referenced parent must
+            // sit exactly one height below. get_parent_block_for can resolve an orphan at a
+            // different height whose hash happens to match, so without this a structurally
+            // invalid (height, parent) pair could slip through this canonical gate.
+            if parent.index != block.index.saturating_sub(1) {
+                return Err(BlockchainError::InvalidBlockHeader);
+            }
             Self::validate_parent_timestamp(block, &parent)?;
 
             let expected_difficulty = Block::adjust_dynamic_difficulty(

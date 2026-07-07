@@ -40,7 +40,6 @@ use alphanumeric::config::AppConfig;
 const KEY_FILE_PATH: &str = "private.key";
 const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
-const DEFAULT_BOOTSTRAP_URL: &str = "https://alphanumeric.blue/bootstrap/blockchain.db.zip";
 const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
 const DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024;
@@ -3075,7 +3074,6 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
-    let allow_unverified_bootstrap = env_flag_enabled("ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP");
 
     // Fetch and verify the signed bootstrap manifest up front. It carries the
     // canonical tip (height + hash) we reconcile a genesis-valid local DB against,
@@ -3179,28 +3177,12 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 true,
             )
         }
-        Err(e) if allow_unverified_bootstrap => {
-            warn!(
-                "Using unverified bootstrap fallback because ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true: {}",
-                e
-            );
-            (
-                DEFAULT_BOOTSTRAP_URL.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-        }
         Err(e) => {
-            return Err(format!(
-                "Bootstrap manifest verification failed and unverified fallback is disabled: {}",
-                e
-            )
-            .into());
+            // Fail closed: a chain snapshot must always carry a SHA-256-bound, signed manifest.
+            // The old ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP escape hatch is removed — a security
+            // control must not be defeatable by an env var (an attacker who can set env or MITM
+            // the download could otherwise seed a forged chain).
+            return Err(format!("Bootstrap manifest verification failed: {}", e).into());
         }
     };
 
