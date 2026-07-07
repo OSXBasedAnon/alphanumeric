@@ -2432,6 +2432,10 @@ impl HeaderSentinel {
                 let mut header_states = self.headers.write().await;
 
                 for header in verified_headers {
+                    // Bound the verification cache on the HeaderSync path too, so a peer
+                    // streaming long header chains can't grow it without bound.
+                    self.evict_oldest_verification_if_full(&header.hash);
+
                     let mut verification =
                         self.verifications.entry(header.hash).or_insert_with(|| {
                             VerificationState {
@@ -2595,6 +2599,26 @@ impl HeaderSentinel {
         Ok(())
     }
 
+    /// Evict the oldest verification entry when the cache is at MAX_VERIFICATIONS and
+    /// `hash` is not already present, so no header path can grow `verifications`
+    /// without bound — height-0 spam (verify_and_add_header), long HeaderSync chains
+    /// (verify_headers_batch), or fresh-hash announces (add_verified_header).
+    /// manage_header_cache only age-prunes (24h), so a count cap is still required.
+    fn evict_oldest_verification_if_full(&self, hash: &[u8; 32]) {
+        if !self.verifications.contains_key(hash)
+            && self.verifications.len() >= MAX_VERIFICATIONS
+        {
+            if let Some(oldest) = self
+                .verifications
+                .iter()
+                .min_by_key(|e| e.value().timestamp)
+                .map(|e| e.key().clone())
+            {
+                self.verifications.remove(&oldest);
+            }
+        }
+    }
+
     pub async fn add_verified_header(&self, header: BlockHeaderInfo) -> Result<(), String> {
         // Quick add to headers
         let now = SystemTime::now()
@@ -2622,6 +2646,11 @@ impl HeaderSentinel {
 
         // Get sync state and record verification
         let sync_state = self.sync_state.read().await;
+        // Bound the verification cache before inserting a new hash — this announce
+        // path adds one entry per unique header and manage_header_cache only
+        // age-prunes, so an attacker announcing many fresh hashes within 24h would
+        // otherwise grow it without bound.
+        self.evict_oldest_verification_if_full(&header.hash);
         {
             let mut state =
                 self.verifications
@@ -2707,20 +2736,9 @@ impl HeaderSentinel {
             }
         }
 
-        // Bound the verification cache before inserting a NEW hash: evict the oldest entry
-        // when at the cap, so height-0 spam (random hashes, no prev-link check) can't OOM us.
-        if !self.verifications.contains_key(&header.hash)
-            && self.verifications.len() >= MAX_VERIFICATIONS
-        {
-            if let Some(oldest) = self
-                .verifications
-                .iter()
-                .min_by_key(|e| e.value().timestamp)
-                .map(|e| e.key().clone())
-            {
-                self.verifications.remove(&oldest);
-            }
-        }
+        // Bound the verification cache before inserting a NEW hash, so height-0 spam
+        // (random hashes, no prev-link check) can't OOM us.
+        self.evict_oldest_verification_if_full(&header.hash);
 
         // Quick lookup in recent verifications using DashMap
         let mut verification =
