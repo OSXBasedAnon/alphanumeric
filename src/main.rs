@@ -893,14 +893,23 @@ async fn main() -> Result<()> {
 
                         // Chain health check
                         _ = health_interval.tick() => {
-                            let blockchain = node.blockchain.read().await;
-                            if let Some(last_block) = blockchain.get_last_block() {
+                            // Snapshot the tip timestamp under a short-lived guard and drop it
+                            // before any network await below. Holding the blockchain read lock
+                            // across discover_network_nodes().await deadlocks: the discovery ->
+                            // verify_peer -> perform_handshake path re-acquires blockchain.read(),
+                            // and a block-ingest write() queued between the two reads blocks the
+                            // re-entrant read forever (tokio's fair RwLock). Mirrors the sync arm.
+                            let last_ts = {
+                                let blockchain = node.blockchain.read().await;
+                                blockchain.get_last_block().map(|b| b.timestamp)
+                            };
+                            if let Some(last_ts) = last_ts {
                                 let now = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
 
-                                let block_time = now.saturating_sub(last_block.timestamp);
+                                let block_time = now.saturating_sub(last_ts);
                                 block_times.push_back(block_time);
                                 if block_times.len() > 50 {
                                     block_times.pop_front();
@@ -915,13 +924,20 @@ async fn main() -> Result<()> {
 
                                 // Handle slow blocks
                                 if avg_block_time > MAX_BLOCK_AGE as f64 {
-                                    let mut health = node.network_health.write().await;
-                                    health.adjust_for_slow_blocks(avg_block_time);
+                                    {
+                                        let mut health = node.network_health.write().await;
+                                        health.adjust_for_slow_blocks(avg_block_time);
+                                    }
 
-                                    let peers = node.peers.read().await;
-                                    if peers.len() < MIN_VIABLE_PEERS ||
-                                       peers.values().all(|p| p.latency > RECOVERY_LATENCY) {
-                                        drop(peers);
+                                    // Decide whether to rediscover under a short peers guard,
+                                    // then release it before the discovery await (same lock-
+                                    // across-await hazard as above).
+                                    let need_discovery = {
+                                        let peers = node.peers.read().await;
+                                        peers.len() < MIN_VIABLE_PEERS
+                                            || peers.values().all(|p| p.latency > RECOVERY_LATENCY)
+                                    };
+                                    if need_discovery {
                                         if let Err(e) = node.discover_network_nodes().await {
                                             error!("Failed to discover peers during health check: {}", e);
                                         }
