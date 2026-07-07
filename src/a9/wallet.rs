@@ -32,10 +32,25 @@ where
     String::deserialize(deserializer)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone)]
 struct WalletKeys {
     mldsa_secret_key_bytes: Vec<u8>,
     mldsa_public_key_bytes: Vec<u8>,
+}
+
+// Secret key material must never leak via Debug (a `{:?}` on a Wallet, which holds this) or via
+// serde. Serialize/Deserialize are removed (the encrypted key on Wallet is the only persisted
+// form; keypair is #[serde(skip)]), and Debug is hand-written to redact the secret bytes.
+impl std::fmt::Debug for WalletKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletKeys")
+            .field("mldsa_secret_key_bytes", &"<redacted>")
+            .field(
+                "mldsa_public_key_bytes",
+                &format_args!("{} bytes", self.mldsa_public_key_bytes.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

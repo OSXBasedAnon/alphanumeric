@@ -76,8 +76,16 @@ impl NetworkConfig {
         }
 
         if let Ok(bind_ip) = env::var("ALPHANUMERIC_BIND_IP") {
-            if let Ok(ip) = bind_ip.parse::<IpAddr>() {
-                config.bind_ip = ip;
+            match bind_ip.parse::<IpAddr>() {
+                Ok(ip) => config.bind_ip = ip,
+                // Don't silently ignore a bad value and fall back to the default bind address —
+                // an operator who fat-fingers this could otherwise unknowingly bind wider than
+                // intended. Surface it loudly so the effective bind address is never a surprise.
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_BIND_IP='{}' is not a valid IP address; ignoring it \
+                     and using the default bind address {}.",
+                    bind_ip, config.bind_ip
+                ),
             }
         }
 
