@@ -2179,12 +2179,21 @@ impl Blockchain {
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
 
-        // Return the reverted transactions the new branch did not re-confirm to the
-        // mempool so they can be re-mined instead of being silently lost.
-        // add_transaction re-validates each against the new canonical state and drops
-        // any that are now invalid (e.g. spent by the winning branch).
-        if !reverted_txs.is_empty() {
+        // Reconcile the mempool with the reorg (M14). First evict the branch's
+        // now-confirmed transactions so they are not double-counted as pending or
+        // re-selected into the next block template (mirrors the finalize/persist paths;
+        // clear_transaction is a no-op for txs that were never in the local mempool).
+        // Then return the reverted transactions the new branch did NOT re-confirm so
+        // they can be re-mined instead of being silently lost — add_transaction
+        // re-validates each against the new canonical state and drops any now invalid
+        // (e.g. spent by the winning branch).
+        {
             let mut mempool = self.mempool.write().await;
+            for b in &branch {
+                for tx in &b.transactions {
+                    mempool.clear_transaction(tx);
+                }
+            }
             for tx in reverted_txs {
                 let _ = mempool.add_transaction(tx);
             }
