@@ -92,6 +92,12 @@ const ORPHAN_MAX_COUNT: usize = 10_000;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 pub const ORPHAN_REORG_DEPTH: u32 = 1024;
 const ORPHAN_BRANCH_SEARCH_LIMIT: usize = 4_096;
+/// Ceiling on how many competing branches a single reorg attempt will score.
+/// Bounds worst-case CPU when an attacker floods the orphan store with many
+/// same-fork competitors; candidates are scored best-first so the heaviest real
+/// branch is reached well within this budget. Never bites normal operation,
+/// where a reorg sees only a handful of branches.
+const MAX_REORG_BRANCHES_EVALUATED: usize = 8_192;
 const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_191_900;
 const GENESIS_LAUNCH_AMOUNT: f64 = 17.76;
 const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
@@ -1916,24 +1922,71 @@ impl Blockchain {
             return Ok(false);
         }
 
+        // Score the most promising forks first: a higher fork height tends to carry
+        // more overlap work, then higher difficulty, then lexical hash for a
+        // deterministic tie-break. Combined with the per-attempt eval budget below,
+        // this stops a flood of low-value orphan competitors from starving
+        // evaluation of the genuinely heaviest branch.
+        candidates.sort_by(|a, b| {
+            b.index
+                .cmp(&a.index)
+                .then_with(|| b.difficulty.cmp(&a.difficulty))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+
+        // Memoise canonical work per fork height for this attempt. tip.index is
+        // fixed, so canonical_work_range(fork, tip) depends only on `fork`; many
+        // competing branches share a fork height and would otherwise re-read the
+        // same [fork..=tip] slice from sled on every branch. Precompute the suffix
+        // sum in a single walk down from the tip so each lookup is O(1) and total
+        // canonical block reads are bounded by the reorg window, not branches × span.
+        let mut canonical_suffix: HashMap<u32, BigUint> = HashMap::new();
+        if let Some(min_fork) = candidates.iter().map(|c| c.index).min() {
+            let mut running = BigUint::from(0u8);
+            let mut h = tip.index;
+            loop {
+                let block = self.get_block(h)?;
+                running += Self::work_units_for_difficulty(block.difficulty);
+                canonical_suffix.insert(h, running.clone());
+                if h == min_fork {
+                    break;
+                }
+                h = h.saturating_sub(1);
+            }
+        }
+
         let mut best_branch: Option<Vec<Block>> = None;
         let mut best_work_pair: Option<(BigUint, BigUint)> = None;
         let mut best_tip_hash: [u8; 32] = [0u8; 32];
+        let mut branches_evaluated: usize = 0;
 
-        for candidate in candidates {
+        'candidate: for candidate in candidates {
             let branches = self.collect_orphan_branches_from(
                 candidate,
                 ORPHAN_REORG_DEPTH as usize,
                 ORPHAN_BRANCH_SEARCH_LIMIT,
             )?;
             for branch in branches {
+                if branches_evaluated >= MAX_REORG_BRANCHES_EVALUATED {
+                    debug!(
+                        "Reorg scan hit branch-eval budget ({} branches); adopting best found so far",
+                        MAX_REORG_BRANCHES_EVALUATED
+                    );
+                    break 'candidate;
+                }
+                branches_evaluated += 1;
+
                 let Some(branch_tip) = branch.last() else {
                     continue;
                 };
                 // Branch may be same-height competitor or longer. Adoption decision is based on work.
 
                 let fork_height = branch[0].index;
-                let canonical_work = self.canonical_work_range(fork_height, tip.index)?;
+                // O(1) memoised lookup; the suffix covers every fork height in range.
+                let canonical_work = canonical_suffix
+                    .get(&fork_height)
+                    .cloned()
+                    .unwrap_or_else(|| BigUint::from(0u8));
                 let branch_work = Self::branch_work_to_height(&branch, branch_tip.index);
 
                 // Deterministic adoption rule:
