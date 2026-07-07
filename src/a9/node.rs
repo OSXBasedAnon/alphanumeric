@@ -6555,22 +6555,35 @@ impl Node {
                 response_channel,
             } => {
                 let blocks = {
-                    let blockchain = self.blockchain.read().await;
+                    // Read the range in bounded chunks, RELEASING the blockchain read
+                    // lock and yielding between chunks. Blocks were fully validated when
+                    // saved, so no verify_pow/rehash here (that was ~1000 rehashes on the
+                    // event loop); and holding one read guard across all ~256 sled reads
+                    // blocked a queued block-ingest write() for the whole range. Chunking
+                    // lets ingest and other events interleave. Serving is best-effort: a
+                    // block that changes across a chunk boundary is caught by the
+                    // requester's per-block hash check, so releasing the lock is safe.
+                    const CHAIN_SERVE_CHUNK: u32 = 32;
                     let mut out = Vec::new();
                     let mut bytes = 0usize;
-                    for idx in start..=end {
-                        if let Ok(block) = blockchain.get_block(idx) {
-                            // Blocks were fully validated (PoW floor, hash, signatures) when
-                            // they were saved, so do NOT re-run verify_pow/rehash here — that
-                            // was up to ~1000 rehashes on the single event loop while holding
-                            // the read lock. Just bound the reply size so it can never exceed
-                            // the frame limit (the requester would otherwise get nothing).
-                            bytes += codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
-                            if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
-                                break;
+                    let mut idx = start;
+                    'serve: while idx <= end {
+                        let chunk_end = idx.saturating_add(CHAIN_SERVE_CHUNK - 1).min(end);
+                        {
+                            let blockchain = self.blockchain.read().await;
+                            for i in idx..=chunk_end {
+                                if let Ok(block) = blockchain.get_block(i) {
+                                    bytes +=
+                                        codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
+                                    if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
+                                        break 'serve;
+                                    }
+                                    out.push(block);
+                                }
                             }
-                            out.push(block);
                         }
+                        idx = chunk_end.saturating_add(1);
+                        tokio::task::yield_now().await;
                     }
                     out
                 };
