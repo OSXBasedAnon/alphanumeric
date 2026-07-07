@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This download contains Alphanumeric client version 7.3.8 for macOS.
+This download contains Alphanumeric client version 7.5.0 for macOS.
 
 ## What Is Included
 
@@ -145,6 +145,31 @@ If you need to set it manually:
 ```bash
 ALPHANUMERIC_DISCOVERY_BASES=https://alphanumeric.blue ./alphanumeric
 ```
+
+## Running a Public Node (Optional)
+
+A normal client bootstraps from the gateway and connects out to peers — you do not need to
+open any ports. If you run a reachable machine (a VPS, or a home box behind a Cloudflare/
+Tailscale tunnel) you can optionally run a **public full-history node** that serves the whole
+chain to brand-new nodes over peer-to-peer, so onboarding no longer depends only on the
+gateway snapshot:
+
+```bash
+ALPHANUMERIC_PUBLIC_NODE=true \
+ALPHANUMERIC_PUBLIC_IP=<your.routable.ip> \
+ALPHANUMERIC_PORT=7367 \
+./alphanumeric
+```
+
+To point a fresh node at a specific public node instead of (or in addition to) the gateway,
+set its address as a seed:
+
+```bash
+ALPHANUMERIC_SEED_NODES=<ip:port> ./alphanumeric
+```
+
+A fresh node given a seed will reconstruct the chain directly from that peer if the gateway
+snapshot is ever unavailable.
 
 ## Troubleshooting
 
