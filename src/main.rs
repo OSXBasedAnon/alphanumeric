@@ -547,7 +547,29 @@ async fn main() -> Result<()> {
             let shutdown_flag = shutdown_requested.clone();
             let db_for_signal = db.clone();
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                // Treat SIGTERM (systemd/docker `stop`) identically to SIGINT (Ctrl-C):
+                // without it, `systemctl stop` kills the node with no graceful flush and
+                // the last ~interval of writes rely on sled log recovery.
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    match signal(SignalKind::terminate()) {
+                        Ok(mut term) => {
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {}
+                                _ = term.recv() => {}
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to install SIGTERM handler ({e}); Ctrl-C only");
+                            let _ = tokio::signal::ctrl_c().await;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
                 shutdown_flag.store(true, Ordering::Release);
                 let _ = db_for_signal.flush();
                 eprintln!("Shutting down cleanly...");
