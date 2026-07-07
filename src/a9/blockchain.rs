@@ -3525,7 +3525,12 @@ impl Blockchain {
             if tx.sender == "MINING_REWARDS" {
                 continue;
             }
-            if tx.amount_units < MIN_TRANSACTION_AMOUNT_UNITS {
+            // Self-sufficient amount gate (L35): min amount, fee >= 0, and no
+            // amount+fee overflow — so the canonical gate does not depend on an
+            // earlier prevalidate call having run. Every confirmed block already
+            // satisfies this (all live persist paths prevalidate first), so nothing
+            // in history is newly rejected.
+            if !tx.has_valid_regular_amounts() {
                 return Err(BlockchainError::InvalidTransactionAmount);
             }
             // Transaction freshness: a non-system transaction must be mined within
@@ -3650,6 +3655,15 @@ impl Blockchain {
 
         if !transaction.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
+        // Reject self-transfers at mempool admission (L06): sender == recipient is a
+        // near-free block/mempool filler (it only burns the fee) and enforces the
+        // long-defined SelfTransferNotAllowed intent. Kept to admission only — a
+        // block-validation reject would change block validity and could reject any
+        // self-transfer already in chain history, so it is not done here.
+        if transaction.sender == transaction.recipient {
+            return Err(BlockchainError::SelfTransferNotAllowed);
         }
 
         // Signature verification with public key binding
