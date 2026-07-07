@@ -5006,6 +5006,110 @@ mod tests {
         );
     }
 
+    // Exact reproduction of the user-reported freeze: a PENDING transaction in the
+    // mempool (which drives tx-selection through get_confirmed_balance -> the old
+    // write-lock-across-await, bug 2) PLUS a competing block that makes the loser hit
+    // the finalize error path (the old reentrant self-deadlock, bug 1). Two real
+    // miners race for block #1 with the same pending tx queued; both must complete.
+    //   cargo test --release racing_miners_with_pending_tx -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "real ProgPoW mining at the 464 floor; run with --ignored"]
+    async fn racing_miners_with_pending_tx_both_complete() {
+        use crate::a9::progpow::{BlockHeader, MiningManager, ProgPowTransaction};
+        use std::time::Duration;
+
+        let blockchain = Arc::new(RwLock::new(test_blockchain()));
+        let genesis = Blockchain::genesis_launch_block().expect("genesis builds");
+        {
+            let g = blockchain.read().await;
+            insert_raw_block(&g, &genesis);
+        }
+
+        // Fund a wallet and queue a real signed pending transaction — a non-empty
+        // mempool is the exact trigger (empty mempool never hit the freeze).
+        let wallet = Wallet::new(None).expect("wallet builds");
+        {
+            let g = blockchain.read().await;
+            set_confirmed_balance(&g, &wallet.address, Transaction::to_units(1000.0));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tx = signed_transfer(&wallet, "recipient_addr_for_test", 120.0, now).await;
+        {
+            let g = blockchain.read().await;
+            g.add_transaction(tx.clone())
+                .await
+                .expect("pending tx should be admitted");
+        }
+        // Build the ProgPow tx from the MEMPOOL entry exactly like the real miner,
+        // so it carries the sig_hash add_transaction computes on admission.
+        let ptx = {
+            let g = blockchain.read().await;
+            let mtxs = g.get_mempool_transactions().await.expect("mempool loads");
+            let mtx = mtxs
+                .into_iter()
+                .find(|t| t.sender == wallet.address)
+                .expect("our pending tx is in the mempool");
+            ProgPowTransaction {
+                fee: mtx.fee(),
+                sender: mtx.sender.clone(),
+                recipient: mtx.recipient.clone(),
+                amount: mtx.amount(),
+                timestamp: mtx.timestamp,
+                signature: mtx.signature.clone(),
+                pub_key: mtx.pub_key.clone(),
+                sig_hash: mtx.sig_hash.clone(),
+            }
+        };
+
+        let header = || BlockHeader {
+            number: 1,
+            parent_hash: genesis.hash,
+            timestamp: now,
+            merkle_root: [0u8; 32],
+            difficulty: NETWORK_MIN_DIFFICULTY,
+        };
+        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let (ha, hb) = (header(), header());
+        let (ta, tb) = (vec![ptx.clone()], vec![ptx]);
+
+        let task_a = tokio::spawn(async move {
+            let mut h = ha;
+            mgr_a
+                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0)
+                .await
+        });
+        let task_b = tokio::spawn(async move {
+            let mut h = hb;
+            mgr_b
+                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0)
+                .await
+        });
+
+        let (ra, rb) = tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::try_join!(task_a, task_b)
+        })
+        .await
+        .expect("FREEZE: a miner hung with a pending tx + a competing block (120s timeout)")
+        .expect("mining tasks should not panic");
+
+        // The reported bug was a PERMANENT hang; both miners returning within the
+        // timeout above is the anti-freeze guarantee. At least the race winner must
+        // have mined a block. The loser may legitimately fail to re-mine the same
+        // now-confirmed tx here because this test passes a FIXED template to
+        // mine_block — the real node re-reads the mempool per block, so it would
+        // simply build the next template without the evicted tx.
+        assert!(
+            ra.is_ok() || rb.is_ok(),
+            "at least one miner must mine a block; both failed: {:?} / {:?}",
+            ra.err(),
+            rb.err()
+        );
+    }
+
     // End-to-end proof that a miner which LOSES a block race recovers and completes
     // instead of freezing. Two real miners race for block #1 on the same chain; the
     // loser's finalize returns InvalidBlockHeader (tip already advanced) and must

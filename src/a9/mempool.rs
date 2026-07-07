@@ -287,7 +287,15 @@ impl Mempool {
     pub fn clear_transaction(&mut self, tx: &Transaction) {
         let tx_id = tx.get_tx_id();
         self.tx_locator.remove(&tx_id);
-        if let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) {
+
+        // Compute the removals under the `transactions` shard guard, then DROP that
+        // guard before touching any other map. Holding a DashMap RefMut across a
+        // lock acquisition on another shard/map risks a deadlock, and it previously
+        // wedged the whole node during block finalization (mempool eviction).
+        let (removed, removed_size) = {
+            let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) else {
+                return;
+            };
             let mut removed = 0usize;
             let mut removed_size = 0usize;
             addr_txs.retain(|entry| {
@@ -298,17 +306,27 @@ impl Mempool {
                 }
                 keep
             });
-            if removed > 0 {
-                self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
-                self.total_size
-                    .fetch_sub(removed_size, AtomicOrdering::SeqCst);
-                if let Some(mut count) = self.address_counts.get_mut(&tx.sender) {
-                    *count = count.saturating_sub(removed);
-                    if *count == 0 {
-                        self.address_counts.remove(&tx.sender);
-                    }
-                }
+            (removed, removed_size)
+        };
+
+        if removed == 0 {
+            return;
+        }
+        self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
+        self.total_size.fetch_sub(removed_size, AtomicOrdering::SeqCst);
+
+        // Decrement the per-address count. Decide whether to remove the entry
+        // WITHOUT holding the get_mut guard across the remove — removing a key on the
+        // same DashMap while its RefMut is alive re-locks that shard and deadlocks.
+        let now_zero = match self.address_counts.get_mut(&tx.sender) {
+            Some(mut count) => {
+                *count = count.saturating_sub(removed);
+                *count == 0
             }
+            None => false,
+        };
+        if now_zero {
+            self.address_counts.remove(&tx.sender);
         }
     }
 
