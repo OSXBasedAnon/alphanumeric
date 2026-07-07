@@ -4269,29 +4269,40 @@ impl Node {
         let mut buf = [0u8; 512];
         let (size, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await??;
 
-        // Parse STUN response
-        self.parse_stun_response(&buf[..size])
+        // Parse STUN response, binding it to the request's transaction id.
+        Self::parse_stun_response(&buf[..size], &transaction_id)
     }
 
-    fn parse_stun_response(&self, data: &[u8]) -> Result<IpAddr, NodeError> {
+    fn parse_stun_response(data: &[u8], expected_txid: &[u8; 12]) -> Result<IpAddr, NodeError> {
+        // RFC 5389 header: type(2) + length(2) + magic cookie(4) + transaction id(12).
         if data.len() < 20 {
             return Err(NodeError::Network("Invalid STUN response".into()));
+        }
+
+        // Reject spoofed / unsolicited responses: an off-path attacker source-spoofing
+        // the STUN server (or a hostile server) could otherwise feed us a forged public
+        // address. The magic cookie and the 96-bit transaction id must match the request.
+        if data[4..8] != STUN_MAGIC_COOKIE.to_be_bytes() || &data[8..20] != expected_txid {
+            return Err(NodeError::Network(
+                "STUN response cookie / transaction id mismatch".into(),
+            ));
         }
 
         let mut pos = 20;
         while pos + 4 <= data.len() {
             let attr_type = ((data[pos] as u16) << 8) | (data[pos + 1] as u16);
-            let attr_len = ((data[pos + 2] as u16) << 8) | (data[pos + 3] as u16);
+            let attr_len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
 
             if attr_type == 0x0020 || attr_type == 0x8020 {
-                // XOR-MAPPED-ADDRESS
-                if pos + 8 + attr_len as usize <= data.len() {
+                // XOR-MAPPED-ADDRESS for IPv4 is exactly 8 bytes: family(1) +
+                // reserved(1) + port(2) + address(4). Require that exact length AND that
+                // the 4 address bytes are in bounds before indexing. The old
+                // `pos + 8 + attr_len` guard passed for attr_len == 0 and then read
+                // data[pos + 8 ..= pos + 11] out of bounds — a remote panic (DoS).
+                if attr_len == 8 && pos + 12 <= data.len() {
                     let ip_family = data[pos + 5];
                     if ip_family == 0x01 {
                         // IPv4
-                        let xor_port = ((data[pos + 6] as u16) << 8) | (data[pos + 7] as u16);
-                        let _port = xor_port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-
                         let xor_ip = ((data[pos + 8] as u32) << 24)
                             | ((data[pos + 9] as u32) << 16)
                             | ((data[pos + 10] as u32) << 8)
@@ -4306,7 +4317,7 @@ impl Node {
                 }
             }
 
-            pos += 4 + attr_len as usize;
+            pos += 4 + attr_len;
         }
 
         Err(NodeError::Network(
@@ -8337,6 +8348,42 @@ mod tests {
         assert!(bloom.num_hashes > 0);
         assert!(bloom.max_items_before_reset > 0);
         assert!(bloom.max_items_before_reset < BLOOM_FILTER_SIZE);
+    }
+
+    #[test]
+    fn stun_parse_rejects_oob_and_spoofed_and_accepts_valid() {
+        let txid = [7u8; 12];
+        let mut header = vec![0x01u8, 0x01, 0x00, 0x00];
+        header.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        header.extend_from_slice(&txid);
+
+        // 1) Malicious XOR-MAPPED-ADDRESS: attr_len=0 with an IPv4 family byte, packet
+        //    ending exactly where the address bytes would begin. The old guard passed
+        //    and then indexed past the end (remote panic / DoS). Must return Err, not panic.
+        let mut oob = header.clone();
+        oob.extend_from_slice(&[0x00, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        assert!(Node::parse_stun_response(&oob, &txid).is_err());
+
+        // 2) Well-formed IPv4 XOR-MAPPED-ADDRESS for 1.2.3.4 with a matching txid.
+        let ip = [1u8, 2, 3, 4];
+        let magic = STUN_MAGIC_COOKIE.to_be_bytes();
+        let xor = [
+            ip[0] ^ magic[0],
+            ip[1] ^ magic[1],
+            ip[2] ^ magic[2],
+            ip[3] ^ magic[3],
+        ];
+        // Attribute value layout: reserved(1) + family(1=IPv4) + X-Port(2) + X-Address(4).
+        let mut valid = header.clone();
+        valid.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0x12, 0x34]);
+        valid.extend_from_slice(&xor);
+        assert_eq!(
+            Node::parse_stun_response(&valid, &txid).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))
+        );
+
+        // 3) Same packet, wrong transaction id -> rejected (defeats a spoofed response).
+        assert!(Node::parse_stun_response(&valid, &[9u8; 12]).is_err());
     }
 
     #[test]
