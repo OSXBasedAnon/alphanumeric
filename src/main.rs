@@ -2145,7 +2145,36 @@ let _ = remove_instance_lock();
 return Ok(());
 },
 
-Some(_) => println!("Invalid command. Type 'help' for command list or 'info' for blockchain details."),
+Some(_) => {
+                    // Bare-transfer shorthand: "<from_addr> <to_addr> <amount>" with no
+                    // "create" keyword is treated as a create transaction — two 40-hex
+                    // addresses followed by a positive amount has no other meaning, so
+                    // accept it instead of rejecting as an invalid command.
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    let is_addr =
+                        |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
+                    if parts.len() == 3
+                        && is_addr(parts[0])
+                        && is_addr(parts[1])
+                        && parts[2].parse::<f64>().map(|a| a > 0.0).unwrap_or(false)
+                    {
+                        let synthesized = format!("create {} {} {}", parts[0], parts[1], parts[2]);
+                        if let Err(e) = mgmt
+                            .handle_create_transaction(
+                                &synthesized,
+                                &mut wallets,
+                                &blockchain,
+                                &db_arc,
+                            )
+                            .await
+                        {
+                            println!("Error: {}", e);
+                            println!("Failed to create transaction: {}", e);
+                        }
+                    } else {
+                        println!("Invalid command. Type 'help' for command list or 'info' for blockchain details.");
+                    }
+                }
 None => println!("Please enter a command."),
 }
 }
