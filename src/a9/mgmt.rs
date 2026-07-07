@@ -96,22 +96,44 @@ fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
 /// Write secret bytes to `path` at 0600 from creation (no world-readable TOCTOU window),
 /// re-asserting perms for a pre-existing file. Mirrors main.rs::write_secret_file.
 async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    // Atomic replace: write to a sibling temp file, fsync it, then rename over the
+    // target. A crash / power loss / ENOSPC mid-write leaves either the intact old
+    // file or the complete new one — never a truncated key that fails to parse and
+    // bricks the wallet on next launch.
+    use tokio::io::AsyncWriteExt;
+    let tmp = format!("{}.tmp", path);
     #[cfg(unix)]
     {
-        use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)
+            .open(&tmp)
             .await?;
         f.write_all(data).await?;
         f.flush().await?;
+        f.sync_all().await?;
     }
     #[cfg(not(unix))]
     {
-        tokio::fs::write(path, data).await?;
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    // Best-effort: fsync the parent directory so the rename itself survives power loss.
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Ok(dir) = tokio::fs::File::open(&parent).await {
+            let _ = dir.sync_all().await;
+        }
     }
     let _ = set_restrictive_file_permissions(path);
     Ok(())

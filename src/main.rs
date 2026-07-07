@@ -2959,25 +2959,48 @@ fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
 /// closing the TOCTOU window in which a plain write-then-chmod leaves a freshly-created key
 /// briefly world/group-readable. For a pre-existing file we also re-assert 0600.
 async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
+    // Atomic replace: write to a sibling temp file, fsync it, then rename over the
+    // target. A crash / power loss / ENOSPC mid-write leaves either the intact old
+    // file or the complete new one — never a truncated key that fails to parse and
+    // bricks the wallet / node identity on next launch. mode(0o600) on creation keeps
+    // the temp (and thus the renamed target) from ever being world-readable.
+    use tokio::io::AsyncWriteExt;
+    let tmp = format!("{}.tmp", path);
     #[cfg(unix)]
     {
-        use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600) // applied on creation, so the key is never world-readable
-            .open(path)
+            .mode(0o600)
+            .open(&tmp)
             .await?;
         f.write_all(data).await?;
         f.flush().await?;
+        f.sync_all().await?;
     }
     #[cfg(not(unix))]
     {
-        tokio::fs::write(path, data).await?;
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await?;
     }
-    // Belt-and-suspenders: re-assert perms for a file that pre-existed this write (mode on
-    // OpenOptions only affects newly-created files). No-op-with-warning on Windows.
+    tokio::fs::rename(&tmp, path).await?;
+    // Best-effort: fsync the parent directory so the rename itself survives power loss.
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Ok(dir) = tokio::fs::File::open(&parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+    // Belt-and-suspenders: re-assert perms for a file that pre-existed this write.
+    // No-op-with-warning on Windows.
     let _ = set_restrictive_file_permissions(path);
     Ok(())
 }
