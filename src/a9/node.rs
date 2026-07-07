@@ -828,6 +828,11 @@ pub struct Node {
     pub rate_limiter: Arc<RateLimiter>,
     http_client: Client,
     discovery_state: Arc<Mutex<DiscoveryState>>,
+    // Single-flight flag for discover_network_nodes. Kept in an AtomicBool (not
+    // inside the async-Mutex DiscoveryState) so an RAII guard can clear it in a
+    // sync Drop on any exit — return, error, panic, or task cancellation — instead
+    // of a straight-line reset that unwinding skips (which wedged discovery off).
+    discovery_in_progress: Arc<AtomicBool>,
     public_relay_tip: Arc<RwLock<Option<RelayTipState>>>,
     last_public_announce_at: Arc<AtomicU64>,
     last_header_snapshot_at: Arc<AtomicU64>,
@@ -947,7 +952,6 @@ struct BlockRelayRecord {
 
 #[derive(Debug)]
 struct DiscoveryState {
-    in_progress: bool,
     failures: u32,
     next_attempt: Instant,
 }
@@ -961,7 +965,6 @@ struct RelayTipState {
 impl DiscoveryState {
     fn new() -> Self {
         Self {
-            in_progress: false,
             failures: 0,
             next_attempt: Instant::now(),
         }
@@ -1094,6 +1097,7 @@ impl Node {
             p2p_swarm: Arc::new(Mutex::new(None)),
             http_client,
             discovery_state: Arc::new(Mutex::new(DiscoveryState::new())),
+            discovery_in_progress: Arc::new(AtomicBool::new(false)),
             public_relay_tip: Arc::new(RwLock::new(None)),
             last_public_announce_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
@@ -3509,13 +3513,8 @@ impl Node {
         let before_count = self.peers.read().await.len();
 
         {
-            let mut state = self.discovery_state.lock().await;
+            let state = self.discovery_state.lock().await;
             let now = Instant::now();
-
-            if state.in_progress {
-                debug!("Discovery skipped: another discovery cycle is already running");
-                return Ok(());
-            }
 
             if before_count < MIN_PEERS && now < state.next_attempt {
                 debug!(
@@ -3524,9 +3523,27 @@ impl Node {
                 );
                 return Ok(());
             }
-
-            state.in_progress = true;
         }
+
+        // Claim the single-flight slot atomically. If another cycle already holds it,
+        // skip. The RAII guard below clears the flag on EVERY exit path (return, `?`,
+        // panic, cancellation) so an unwinding discovery can no longer wedge it true
+        // and permanently disable peer discovery.
+        if self
+            .discovery_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            debug!("Discovery skipped: another discovery cycle is already running");
+            return Ok(());
+        }
+        struct InProgressGuard(Arc<AtomicBool>);
+        impl Drop for InProgressGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _in_progress = InProgressGuard(Arc::clone(&self.discovery_in_progress));
 
         info!("Starting network discovery");
         let result = self.discover_network_nodes_with_retry(0).await;
@@ -3535,7 +3552,6 @@ impl Node {
 
         {
             let mut state = self.discovery_state.lock().await;
-            state.in_progress = false;
 
             if after_count >= MIN_PEERS || (result.is_ok() && improved) {
                 state.failures = 0;
