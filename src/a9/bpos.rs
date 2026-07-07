@@ -2375,12 +2375,15 @@ impl HeaderSentinel {
         if !signature_valid && batch_requires_signature {
             return Err("Header batch signature verification failed".to_string());
         }
-        let existing_headers: Vec<BlockHeaderInfo> = {
+        // Index stored headers by hash once (hash -> height, timestamp) instead of a linear scan
+        // per incoming header: the incoming batch is attacker-influenced, so the old
+        // O(incoming x stored) find made a large header batch quadratic.
+        let existing_headers: std::collections::HashMap<[u8; 32], (u32, u64)> = {
             self.headers
                 .read()
                 .await
                 .iter()
-                .map(|h| h.header.clone())
+                .map(|h| (h.header.hash, (h.header.height, h.header.timestamp)))
                 .collect()
         };
 
@@ -2407,10 +2410,7 @@ impl HeaderSentinel {
                         .iter()
                         .find(|h: &&BlockHeaderInfo| h.hash == header.prev_hash)
                         .map(|h| (h.height, h.timestamp));
-                    let prev_in_store = existing_headers
-                        .iter()
-                        .find(|h| h.hash == header.prev_hash)
-                        .map(|h| (h.height, h.timestamp));
+                    let prev_in_store = existing_headers.get(&header.prev_hash).copied();
                     let Some((prev_height, prev_timestamp)) = prev_in_chunk.or(prev_in_store)
                     else {
                         continue;

@@ -916,6 +916,7 @@ pub struct RateLimiter {
     windows: DashMap<String, Vec<tokio::time::Instant>>,
     window_size: chrono::Duration,
     max_requests: usize,
+    calls_since_sweep: std::sync::atomic::AtomicU64,
 }
 
 impl RateLimiter {
@@ -924,17 +925,31 @@ impl RateLimiter {
             windows: DashMap::new(),
             window_size: chrono::Duration::seconds(window_secs as i64),
             max_requests,
+            calls_since_sweep: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     pub fn check_limit(&self, address: &str) -> bool {
         let now = tokio::time::Instant::now();
-        let mut times = self.windows.entry(address.to_string()).or_default();
-
-        // Optimization: Only cleanup if we have entries to clean
-        // Most of the time, the vector will be small and all entries valid
         let window_secs = self.window_size.num_seconds() as u64;
         let cutoff = now - std::time::Duration::from_secs(window_secs);
+
+        // Evict idle keys periodically so `windows` can't grow without bound: a key whose newest
+        // timestamp has aged past the window is never revisited otherwise. Swept BEFORE taking the
+        // per-key entry guard below — never run a map-wide retain while holding a guard on the
+        // same DashMap (that self-deadlocks the shard).
+        if self
+            .calls_since_sweep
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= 1024
+        {
+            self.calls_since_sweep
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.windows
+                .retain(|_, v| v.last().is_some_and(|&t| t >= cutoff));
+        }
+
+        let mut times = self.windows.entry(address.to_string()).or_default();
 
         // Fast path: check if we need to cleanup at all
         if !times.is_empty() && times[0] < cutoff {

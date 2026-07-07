@@ -1271,6 +1271,13 @@ impl Node {
                 "Handshake timestamp outside allowed skew".into(),
             ));
         }
+        // Bind the advertised node_id to the signed public key: a peer must not present an
+        // identity string that doesn't correspond to the key it proves possession of below.
+        if message.node_id != hex::encode(&message.public_key) {
+            return Err(NodeError::Network(
+                "Handshake node_id not bound to public key".into(),
+            ));
+        }
         let payload = Self::handshake_payload(message)?;
         let public_key = UnparsedPublicKey::new(&ED25519, &message.public_key);
         public_key
@@ -5891,6 +5898,12 @@ impl Node {
 
         {
             let mut peers = self.peers.write().await;
+            // Bound the peer table on the outbound path too (the inbound path already enforces
+            // this): without it an attacker could grow the map past max_peers via connections we
+            // initiate. Existing peers may always reconnect.
+            if peers.len() >= self.max_peers && !peers.contains_key(&addr) {
+                return Err(NodeError::Network("Maximum peers reached".into()));
+            }
             peers.insert(addr, peer_info);
         }
         self.peer_secrets
@@ -7459,11 +7472,9 @@ impl Node {
         .await
         .map_err(|_| NodeError::Network("Handshake timeout".into()))??;
 
-        // Reset inbound attempts on successful handshake
-        {
-            let mut attempts = self.inbound_attempts.write().await;
-            attempts.remove(&socket_addr.ip());
-        }
+        // Do NOT clear this IP's inbound-attempt counter on a successful handshake: that let an
+        // attacker reset the per-IP limit at will by completing one handshake, neutering the cap.
+        // The counter already decays after INBOUND_ATTEMPT_WINDOW, which is the intended reset.
         let peer_addr = peer_info.address;
 
         // Version check
@@ -7884,6 +7895,11 @@ impl Node {
                 "Subnet limit reached for {}",
                 addr
             )));
+        }
+
+        // Bound the peer table (matches the inbound handshake path); existing peers may reconnect.
+        if peers.len() >= self.max_peers && !peers.contains_key(&addr) {
+            return Err(NodeError::Network("Maximum peers reached".into()));
         }
 
         // 4. Store peer information

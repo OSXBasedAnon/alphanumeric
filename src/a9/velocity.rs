@@ -1030,7 +1030,11 @@ impl SubnetManager {
     fn ip_to_index(&self, ip: IpAddr) -> usize {
         let mut hasher = blake3::Hasher::new();
         hasher.update(ip.to_string().as_bytes());
-        (hasher.finalize().as_bytes()[0] as usize) % self.coverage.len()
+        // Use two hash bytes: coverage has 65536 buckets, so a single byte collapsed all IPs
+        // into 256 buckets and defeated the subnet-diversity spread this feeds.
+        let h = hasher.finalize();
+        let b = h.as_bytes();
+        (u16::from_le_bytes([b[0], b[1]]) as usize) % self.coverage.len()
     }
 }
 
