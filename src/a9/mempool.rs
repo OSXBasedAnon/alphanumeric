@@ -284,6 +284,24 @@ impl Mempool {
         selected
     }
 
+    /// Decrement a sender's per-address mempool count by `n`, removing the entry when
+    /// it reaches zero. CRITICAL: it decides whether to remove under the get_mut guard
+    /// and drops that guard BEFORE calling remove — removing a key on the same DashMap
+    /// while its RefMut is alive re-locks the shard and deadlocks the whole node. Must
+    /// be called with NO other DashMap guard alive (never hold two DashMap guards).
+    fn decrement_address_count(&self, addr: &str, n: usize) {
+        let now_zero = match self.address_counts.get_mut(addr) {
+            Some(mut count) => {
+                *count = count.saturating_sub(n);
+                *count == 0
+            }
+            None => false,
+        };
+        if now_zero {
+            self.address_counts.remove(addr);
+        }
+    }
+
     pub fn clear_transaction(&mut self, tx: &Transaction) {
         let tx_id = tx.get_tx_id();
         self.tx_locator.remove(&tx_id);
@@ -314,20 +332,7 @@ impl Mempool {
         }
         self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
         self.total_size.fetch_sub(removed_size, AtomicOrdering::SeqCst);
-
-        // Decrement the per-address count. Decide whether to remove the entry
-        // WITHOUT holding the get_mut guard across the remove — removing a key on the
-        // same DashMap while its RefMut is alive re-locks that shard and deadlocks.
-        let now_zero = match self.address_counts.get_mut(&tx.sender) {
-            Some(mut count) => {
-                *count = count.saturating_sub(removed);
-                *count == 0
-            }
-            None => false,
-        };
-        if now_zero {
-            self.address_counts.remove(&tx.sender);
-        }
+        self.decrement_address_count(&tx.sender, removed);
     }
 
     pub fn find_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
@@ -379,7 +384,10 @@ impl Mempool {
 
         let mut removed = 0usize;
         for (addr, expired_ids) in to_remove {
-            if let Some(mut txs) = self.transactions.get_mut(&addr) {
+            // Compute removals under the transactions guard, then DROP it before
+            // touching address_counts (never hold two DashMap guards; never remove a
+            // key on a DashMap whose RefMut is alive — that deadlocks the node).
+            let removed_here = if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let mut removed_here = 0usize;
                 let mut removed_size = 0usize;
                 txs.retain(|entry| {
@@ -391,18 +399,18 @@ impl Mempool {
                     keep
                 });
                 if removed_here > 0 {
-                    removed += removed_here;
                     self.total_count
                         .fetch_sub(removed_here, AtomicOrdering::SeqCst);
                     self.total_size
                         .fetch_sub(removed_size, AtomicOrdering::SeqCst);
-                    if let Some(mut count) = self.address_counts.get_mut(&addr) {
-                        *count = count.saturating_sub(removed_here);
-                        if *count == 0 {
-                            self.address_counts.remove(&addr);
-                        }
-                    }
                 }
+                removed_here
+            } else {
+                0
+            };
+            if removed_here > 0 {
+                removed += removed_here;
+                self.decrement_address_count(&addr, removed_here);
             }
             // Keep the dedup index in lockstep (after dropping the transactions guard above).
             for id in &expired_ids {
@@ -452,7 +460,10 @@ impl Mempool {
 
         // Batch removals
         for (addr, tx_ids) in to_remove {
-            if let Some(mut txs) = self.transactions.get_mut(&addr) {
+            // Compute removals under the transactions guard, then DROP it before
+            // touching address_counts (never hold two DashMap guards; never remove a
+            // key on a DashMap whose RefMut is alive — that deadlocks the node).
+            let removed_here = if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let mut removed_here = 0usize;
                 let mut removed_size = 0usize;
                 txs.retain(|entry| {
@@ -468,13 +479,13 @@ impl Mempool {
                         .fetch_sub(removed_size, AtomicOrdering::SeqCst);
                     self.total_count
                         .fetch_sub(removed_here, AtomicOrdering::SeqCst);
-                    if let Some(mut count) = self.address_counts.get_mut(&addr) {
-                        *count = count.saturating_sub(removed_here);
-                        if *count == 0 {
-                            self.address_counts.remove(&addr);
-                        }
-                    }
                 }
+                removed_here
+            } else {
+                0
+            };
+            if removed_here > 0 {
+                self.decrement_address_count(&addr, removed_here);
             }
             // Keep the dedup index in lockstep (after dropping the transactions guard above).
             for id in &tx_ids {
