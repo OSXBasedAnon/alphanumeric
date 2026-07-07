@@ -1021,13 +1021,22 @@ async fn main() -> Result<()> {
                 let mut interval = tokio::time::interval(Duration::from_secs(15));
                 loop {
                     interval.tick().await;
-                    let addresses = wallet_addresses.read().await;
-                    if addresses.is_empty() {
-                        continue;
-                    }
-                    let blockchain_guard = blockchain.read().await;
+                    // Snapshot the address list so the wallet_addresses lock is not held
+                    // across the scan loop (a new-wallet writer would otherwise block).
+                    let addresses = {
+                        let guard = wallet_addresses.read().await;
+                        if guard.is_empty() {
+                            continue;
+                        }
+                        guard.clone()
+                    };
                     let whisper = whisper_module.read().await;
                     for addr in addresses.iter() {
+                        // Short-lived per-address blockchain read guard, dropped before the
+                        // next iteration. Holding ONE read guard across the whole per-wallet
+                        // scan loop starves a queued block-save writer (tokio's write-
+                        // preferring RwLock) for the entire batch, delaying block ingest.
+                        let blockchain_guard = blockchain.read().await;
                         let _ = whisper.sync_index_for_wallet(addr, &blockchain_guard).await;
                     }
                 }
