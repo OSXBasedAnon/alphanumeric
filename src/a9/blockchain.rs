@@ -2572,20 +2572,27 @@ impl Blockchain {
         fork_start: u32,
         branch: &[Block],
     ) -> Result<bool, BlockchainError> {
-        let mut blocks: Vec<Block> = self
-            .db
-            .scan_prefix(b"block_")
-            .filter_map(|entry| {
-                let (_, value) = entry.ok()?;
-                Block::from_bytes(value.as_ref()).ok()
-            })
-            .filter(|b| b.index < fork_start)
-            .collect();
-        blocks.sort_unstable_by_key(|b| b.index);
-        blocks.extend(branch.iter().cloned());
-
         let mut balances: HashMap<String, i128> = HashMap::new();
-        for block in &blocks {
+        // Stream canonical history below the fork by numeric height (O(1) block RAM instead of
+        // loading + sorting the whole sub-chain), then the branch — numeric height order is
+        // exactly the replay order.
+        for h in 0..fork_start {
+            let Ok(block) = self.get_block(h) else {
+                continue;
+            };
+            for tx in &block.transactions {
+                if tx.sender != "MINING_REWARDS" {
+                    let debit = tx.total_debit_units();
+                    let entry = balances.entry(tx.sender.clone()).or_insert(0);
+                    if *entry < debit {
+                        return Ok(false);
+                    }
+                    *entry -= debit;
+                }
+                *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
+            }
+        }
+        for block in branch {
             for tx in &block.transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let debit = tx.total_debit_units();
