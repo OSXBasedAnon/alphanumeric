@@ -2318,16 +2318,12 @@ impl Blockchain {
 
         self.chain_sentinel.add_block_verification(block, verifier);
 
-        // Only save if block is verified (or quorum is not required)
-        let require_quorum = std::env::var("ALPHANUMERIC_REQUIRE_QUORUM")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let verification_count = self.chain_sentinel.get_verification_count(block);
-        if require_quorum {
-            if !self.chain_sentinel.is_block_verified(block) {
-                return Err(BlockchainError::InvalidBlockHeader);
-            }
-        } else if verification_count == 0 {
+        // A block must carry at least the local verification recorded just above
+        // before it is persisted. The ALPHANUMERIC_REQUIRE_QUORUM toggle was removed:
+        // it demanded 3 verifiers that the normal single-node verification flow can
+        // never produce, so enabling it silently halted the chain (no block ever
+        // persisted). Default behaviour (toggle off) is unchanged.
+        if self.chain_sentinel.get_verification_count(block) == 0 {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
