@@ -201,50 +201,81 @@ impl Mempool {
 
     pub fn get_transactions_for_block(&self) -> Vec<Transaction> {
         use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
+        use std::collections::{BinaryHeap, HashMap};
 
         let mut selected = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK);
-        let mut total_size = 0;
+        let mut total_size = 0usize;
 
-        // Use a max-heap to efficiently get highest fee transactions
-        // Store metadata in heap, not the full transaction (avoids needing Ord on Transaction)
-        let mut heap: BinaryHeap<(FeePerByte, Reverse<u64>, String, usize, usize)> =
-            BinaryHeap::with_capacity(MAX_TRANSACTIONS_PER_BLOCK * 2);
+        // Fee-descending ordering of each sender's queued entries, so we can walk a
+        // sender's queue best-first with a cursor. Previously only ONE tx per sender
+        // was ever offered, so a hot wallet with a long payout queue drained at 1
+        // tx/block; the block now fills up to MAX_TRANSACTIONS_PER_BLOCK / MAX_BLOCK_SIZE
+        // across all senders. Per-sender solvency is still enforced downstream (the
+        // miner's balance-aware tx selection and block validation), so offering
+        // multiple txs per sender here cannot produce an overspending block.
+        let mut sender_order: HashMap<String, Vec<usize>> = HashMap::new();
 
-        // Collect only the best transaction per sender into the heap
-        // Store just the metadata for sorting, we'll fetch the transaction later
+        // Max-heap of each sender's NEXT candidate:
+        //   (fee_per_byte, older-first, sender, size, entry_idx, cursor_pos)
+        let mut heap: BinaryHeap<(FeePerByte, Reverse<u64>, String, usize, usize, usize)> =
+            BinaryHeap::new();
+
         for entry in self.transactions.iter() {
             let sender = entry.key();
-
-            // Get the highest fee transaction from this sender
-            if let Some((best_idx, best_tx)) = entry
-                .value()
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, tx)| tx.fee_per_byte)
-            {
-                heap.push((
-                    best_tx.fee_per_byte,
-                    Reverse(best_tx.timestamp),
-                    sender.clone(),
-                    best_tx.size,
-                    best_idx,
-                ));
+            let txs = entry.value();
+            if txs.is_empty() {
+                continue;
             }
+            let mut order: Vec<usize> = (0..txs.len()).collect();
+            order.sort_by(|&a, &b| {
+                txs[b]
+                    .fee_per_byte
+                    .cmp(&txs[a].fee_per_byte)
+                    .then_with(|| txs[a].timestamp.cmp(&txs[b].timestamp))
+            });
+            let first = order[0];
+            heap.push((
+                txs[first].fee_per_byte,
+                Reverse(txs[first].timestamp),
+                sender.clone(),
+                txs[first].size,
+                first,
+                0usize,
+            ));
+            sender_order.insert(sender.clone(), order);
         }
 
-        // Extract transactions from heap until we fill the block
-        while let Some((_, Reverse(_timestamp), sender, size, tx_idx)) = heap.pop() {
+        // Greedily take the globally highest-fee candidate, then re-offer that
+        // sender's next-best remaining tx (cursor advance) until the block is full.
+        while let Some((_, _, sender, size, entry_idx, cursor)) = heap.pop() {
             if selected.len() >= MAX_TRANSACTIONS_PER_BLOCK || total_size >= MAX_BLOCK_SIZE {
                 break;
             }
 
             if total_size + size <= MAX_BLOCK_SIZE {
-                // Fetch the actual transaction from the map
                 if let Some(txs) = self.transactions.get(&sender) {
-                    if let Some(entry) = txs.get(tx_idx) {
+                    if let Some(entry) = txs.get(entry_idx) {
                         selected.push(entry.transaction.clone());
                         total_size += size;
+                    }
+                }
+            }
+
+            // Re-offer this sender's next-best remaining transaction.
+            if let Some(&next_idx) = sender_order
+                .get(&sender)
+                .and_then(|order| order.get(cursor + 1))
+            {
+                if let Some(txs) = self.transactions.get(&sender) {
+                    if let Some(entry) = txs.get(next_idx) {
+                        heap.push((
+                            entry.fee_per_byte,
+                            Reverse(entry.timestamp),
+                            sender.clone(),
+                            entry.size,
+                            next_idx,
+                            cursor + 1,
+                        ));
                     }
                 }
             }
