@@ -68,12 +68,22 @@ impl Ord for MempoolEntry {
 
 impl Eq for MempoolEntry {}
 
+// Prune at most this often, NOT on every insert. A full expiry scan on every single insert
+// was O(N) per admission (quadratic-fill DoS as the pool grows toward MEMPOOL_MAX_TRANSACTIONS).
+const PRUNE_INTERVAL_SECS: usize = 30;
+
 #[derive(Debug)]
 pub struct Mempool {
     transactions: DashMap<String, Vec<MempoolEntry>>,
+    // tx_id -> sender: an O(1) dedup index so admission no longer scans the entire pool to
+    // reject a duplicate (was O(N) on every insert). Kept in lockstep with `transactions` on
+    // every add / clear / prune / evict.
+    tx_locator: DashMap<String, String>,
     total_size: AtomicUsize,
     total_count: AtomicUsize,
     address_counts: DashMap<String, usize>,
+    // Unix-seconds of the last expiry scan, so prune_expired is rate-limited off the hot path.
+    last_prune: AtomicUsize,
 }
 
 impl Mempool {
@@ -93,16 +103,30 @@ impl Mempool {
     pub fn new() -> Self {
         Self {
             transactions: DashMap::new(),
+            tx_locator: DashMap::new(),
             total_size: AtomicUsize::new(0),
             total_count: AtomicUsize::new(0),
             address_counts: DashMap::new(),
+            last_prune: AtomicUsize::new(0),
         }
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
-        self.prune_expired();
+        // Rate-limit the expiry scan off the admission hot path (was a full O(N) scan on every
+        // insert). Lazy TTL: a stale tx lingers at most PRUNE_INTERVAL_SECS longer, harmless.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0);
+        if now_secs.saturating_sub(self.last_prune.load(AtomicOrdering::Relaxed))
+            >= PRUNE_INTERVAL_SECS
+        {
+            self.last_prune.store(now_secs, AtomicOrdering::Relaxed);
+            self.prune_expired();
+        }
         let tx_id = tx.get_tx_id();
-        if self.find_transaction_by_id(&tx_id).is_some() {
+        // O(1) dedup via the locator index instead of scanning the whole pool.
+        if self.tx_locator.contains_key(&tx_id) {
             return Ok(());
         }
 
@@ -150,7 +174,7 @@ impl Mempool {
         let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
         let entry = MempoolEntry {
             transaction: tx,
-            tx_id,
+            tx_id: tx_id.clone(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -164,6 +188,7 @@ impl Mempool {
             .entry(sender.clone())
             .or_default()
             .push(entry);
+        self.tx_locator.insert(tx_id, sender.clone());
         self.address_counts
             .entry(sender)
             .and_modify(|e| *e += 1)
@@ -230,6 +255,7 @@ impl Mempool {
 
     pub fn clear_transaction(&mut self, tx: &Transaction) {
         let tx_id = tx.get_tx_id();
+        self.tx_locator.remove(&tx_id);
         if let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) {
             let mut removed = 0usize;
             let mut removed_size = 0usize;
@@ -329,6 +355,10 @@ impl Mempool {
                     }
                 }
             }
+            // Keep the dedup index in lockstep (after dropping the transactions guard above).
+            for id in &expired_ids {
+                self.tx_locator.remove(id);
+            }
         }
 
         removed
@@ -396,6 +426,10 @@ impl Mempool {
                         }
                     }
                 }
+            }
+            // Keep the dedup index in lockstep (after dropping the transactions guard above).
+            for id in &tx_ids {
+                self.tx_locator.remove(id);
             }
         }
     }
