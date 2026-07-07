@@ -4486,6 +4486,20 @@ impl Node {
     pub async fn start(&self) -> Result<(), NodeError> {
         info!("Starting node on {}", self.bind_addr);
 
+        // Public full-history node (role flag): a reachable node serves genesis..tip to peers
+        // over GetBlocks, so fresh nodes can bootstrap from it instead of only the gateway
+        // snapshot. Serving already works unconditionally; this only logs the role and warns
+        // if the bind address isn't publicly reachable (so operators publish a routable one).
+        if Self::public_full_history_node_enabled() {
+            info!("Public full-history node: serving GetBlocks [0..tip] to peers");
+            if self.bind_addr.ip().is_loopback() || self.bind_addr.ip().is_unspecified() {
+                warn!(
+                    "Public full-history node bound to {} — not publicly reachable. Publish a routable address via ALPHANUMERIC_PUBLIC_IP / ALPHANUMERIC_BIND_IP / ALPHANUMERIC_PORT (or a cloudflared/tailscale tunnel) so fresh nodes can reach you.",
+                    self.bind_addr
+                );
+            }
+        }
+
         if Self::kademlia_fallback_enabled() {
             self.initialize_p2p().await?;
         } else {
@@ -4873,8 +4887,24 @@ impl Node {
                                     publisher_bootstrap_strikes
                                 );
                                 if publisher_bootstrap_strikes >= 2 {
-                                    warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
-                                    std::process::exit(0);
+                                    // TIER 2 (gateway-independent): before restarting to
+                                    // re-bootstrap from the gateway snapshot, try to
+                                    // reconstruct the canonical chain directly from a seed
+                                    // peer over GetBlocks (same validation, beacon-anchored).
+                                    // No-op if no seed is configured -> falls through to the
+                                    // original restart, so behaviour is unchanged there.
+                                    match node_clone.sync_full_history_from_peer().await {
+                                        Converge::Converged
+                                        | Converge::AtTipAhead
+                                        | Converge::Progressed => {
+                                            publisher_bootstrap_strikes = 0;
+                                            info!("Publisher: recovered via peer full-history sync; not restarting");
+                                        }
+                                        _ => {
+                                            warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
+                                            std::process::exit(0);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4886,9 +4916,22 @@ impl Node {
                             }
                             Converge::NeedsBootstrap => {
                                 warn!(
-                                    "Divergence below finality window at beacon {}; bootstrap required",
+                                    "Divergence below finality window at beacon {}; trying peer full-history sync",
                                     b.height
                                 );
+                                // TIER 2: reconstruct the canonical chain from a seed peer
+                                // (gateway-independent body acquisition) instead of relying
+                                // solely on the gateway snapshot. No-op without a seed peer.
+                                match node_clone.sync_full_history_from_peer().await {
+                                    Converge::Converged
+                                    | Converge::AtTipAhead
+                                    | Converge::Progressed => {
+                                        info!("Client: recovered canonical chain via peer full-history sync");
+                                    }
+                                    _ => {
+                                        warn!("Client: peer full-sync unavailable; gateway bootstrap required");
+                                    }
+                                }
                             }
                             Converge::BeaconStale => {}
                         }
@@ -7799,6 +7842,164 @@ impl Node {
         Ok(())
     }
 
+    /// Role flag: mark this node as a PUBLIC full-history server so a reachable node
+    /// (VPS / cloudflared tunnel) can carry brand-new nodes genesis..tip over GetBlocks,
+    /// making the gateway a fallback rather than a single point of failure. This is a
+    /// ROLE / advertising flag ONLY — every validation and trust check stays unconditional
+    /// and unchanged, so it does not weaken security. Serving already works from height 0.
+    fn public_full_history_node_enabled() -> bool {
+        Self::env_flag_enabled("ALPHANUMERIC_PUBLIC_NODE")
+    }
+
+    /// Anchor height for a peer full-sync: the beacon tip, but only if the chosen peer is at
+    /// least that tall. An inflated peer height can never raise the target; a peer SHORTER
+    /// than the beacon is unusable (it would hand us a truncated chain) -> None.
+    fn full_sync_anchor_height(beacon_height: u32, peer_height: u32) -> Option<u32> {
+        if peer_height >= beacon_height {
+            Some(beacon_height)
+        } else {
+            None
+        }
+    }
+
+    /// Next GetBlocks span [start, end], bounded so (end - start) < MAX_GETBLOCKS_SPAN (the
+    /// server ingress cap) and `end` never exceeds the fixed target height.
+    fn full_sync_next_span(cursor: u32, target: u32) -> (u32, u32) {
+        let end = cursor
+            .saturating_add(MAX_GETBLOCKS_SPAN.saturating_sub(1))
+            .min(target);
+        (cursor, end)
+    }
+
+    /// Loop guard: continue only while below the target AND the last batch advanced the tip.
+    /// A no-progress batch (empty / all-orphaned / non-linking) terminates the sync — this is
+    /// what guarantees termination against a stalling peer.
+    fn full_sync_should_continue(cursor: u32, target: u32, made_progress: bool) -> bool {
+        cursor <= target && made_progress
+    }
+
+    /// A block at/above verification_floor()+1 is on the unfinalized frontier and MUST pass
+    /// full ML-DSA witness verification; at/below the floor it takes the receipt fast-path
+    /// (witness-pruned history, pinned by hash between genesis and the confirmed tip).
+    fn routes_via_witness(block_index: u32, verification_floor: u32) -> bool {
+        block_index >= verification_floor.saturating_add(1)
+    }
+
+    /// TIER-2 bootstrap fallback: reconstruct genesis..tip directly from a reachable SEED PEER
+    /// over GetBlocks when the gateway snapshot is unavailable/stale — removing the heavy
+    /// bootstrap zip as a single point of failure. This is BODY ACQUISITION only:
+    /// converge_to_canonical remains the sole canonicality arbiter (Step 4), every block passes
+    /// the IDENTICAL ingest validation as any other source (PoW floor, hash, difficulty
+    /// progression, parent linkage, genesis pin, full ML-DSA witnesses above the floor), and the
+    /// finality checkpoint is advanced ONLY after the reconstructed tip is confirmed == the
+    /// gateway-attested beacon hash. Genesis is the built-in pinned block, never fetched. Returns
+    /// a Converge outcome; touches NO state on the no-peer / no-beacon path, so every existing
+    /// gateway/relay path is byte-for-byte unchanged when this cannot help.
+    pub async fn sync_full_history_from_peer(&self) -> Converge {
+        // STEP 0: trusted anchor = the signed tip beacon (the SAME canonical (height,hash)
+        // converge_to_canonical already trusts). No beacon -> no anchor -> caller falls through.
+        let Some(beacon) = self.fetch_tip_beacon().await else {
+            return Converge::BeaconStale;
+        };
+
+        // STEP 1: choose ONE seed peer at least as tall as the beacon. Target is ALWAYS the
+        // beacon height, never the peer's self-reported height.
+        let mut chosen: Option<SocketAddr> = None;
+        'seed: for seed in self.configured_seed_nodes().to_vec() {
+            let Ok(addrs) = tokio::net::lookup_host(&seed).await else {
+                continue;
+            };
+            for addr in addrs {
+                if self.verify_peer(addr).await.is_err() {
+                    continue;
+                }
+                let Ok(peer_height) = self.request_peer_height(addr).await else {
+                    continue;
+                };
+                if Self::full_sync_anchor_height(beacon.height, peer_height).is_some() {
+                    chosen = Some(addr);
+                    break 'seed;
+                }
+            }
+        }
+        let Some(peer) = chosen else {
+            return Converge::NeedsBootstrap;
+        };
+        let target = beacon.height;
+
+        // STEP 2: tip PROBE (anti-forgery). The peer must return the block at beacon.height
+        // whose hash == beacon.hash BEFORE we apply any lower block — proving it holds the
+        // gateway-attested tip. A peer not on the canonical chain cannot pass this.
+        let probe_ok = matches!(self.request_blocks(peer, target, target).await, Ok(blocks) if blocks
+            .iter()
+            .any(|b| b.index == target && b.hash == beacon.hash && b.calculate_hash_for_block() == b.hash));
+        if !probe_ok {
+            return Converge::NeedsBootstrap;
+        }
+
+        // STEP 3: bulk-pull [local_tip+1 .. target] ascending, applying each block through the
+        // SAME ingest path as every other source. The checkpoint is NOT advanced here (Step 4).
+        let mut cursor = { self.blockchain.read().await.get_latest_block_index() as u32 }
+            .saturating_add(1);
+        loop {
+            if cursor > target {
+                break;
+            }
+            let (start, end) = Self::full_sync_next_span(cursor, target);
+            let Ok(blocks) = self.request_blocks(peer, start, end).await else {
+                break;
+            };
+            let mut candidates: Vec<_> = blocks
+                .into_iter()
+                .filter(|b| {
+                    b.index >= start
+                        && b.index <= end
+                        && b.calculate_hash_for_block() == b.hash
+                        && b.verify_pow_meets_floor()
+                })
+                .collect();
+            candidates.sort_by_key(|b| b.index);
+
+            let before_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
+            let floor = { self.blockchain.read().await.verification_floor() };
+            for block in candidates {
+                let res = if Self::routes_via_witness(block.index, floor) {
+                    self.accept_peer_block(&block, Some(peer)).await
+                } else {
+                    self.blockchain
+                        .write()
+                        .await
+                        .save_receipt_verified_block(&block)
+                        .await
+                        .map_err(|e| NodeError::Blockchain(e.to_string()))
+                };
+                if let Err(e) = res {
+                    warn!("peer full-sync: block {} rejected: {}", block.index, e);
+                }
+            }
+            let after_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
+            let made_progress = after_tip > before_tip;
+            cursor = after_tip.saturating_add(1);
+            if !Self::full_sync_should_continue(cursor, target, made_progress) {
+                break;
+            }
+        }
+
+        // STEP 4: confirm + finalize via the existing arbiter. converge_to_canonical returns
+        // Converged/AtTipAhead only if our reconstructed tip hash == the beacon hash; ONLY then
+        // do we trail the finality checkpoint (mirroring snapshot semantics). Peer data can
+        // never raise finality on its own.
+        let outcome = self.converge_to_canonical(&beacon).await;
+        if matches!(outcome, Converge::Converged | Converge::AtTipAhead) {
+            let _ = self
+                .blockchain
+                .read()
+                .await
+                .advance_checkpoint_behind(beacon.height);
+        }
+        outcome
+    }
+
     // Sync with network to keep blockchain updated
     pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         const MAX_RETRIES: u32 = 3;
@@ -8413,6 +8614,40 @@ mod tests {
 
         // 3) Same packet, wrong transaction id -> rejected (defeats a spoofed response).
         assert!(Node::parse_stun_response(&valid, &[9u8; 12]).is_err());
+    }
+
+    // Peer full-history sync (Tier-2 bootstrap fallback): the safety-relevant driver logic.
+    // The block VALIDATION itself is the same accept_peer_block / save_receipt_verified_block
+    // path every other source uses (covered by the genesis-pin / PoW-floor / linkage tests);
+    // these assert the driver can't be steered by a lying peer and always terminates.
+    #[test]
+    fn peer_full_sync_helpers_are_safe() {
+        // Anchor height: peer must be >= the beacon; an INFLATED peer height is clamped to the
+        // beacon (peer can't raise the target), and a peer BEHIND the beacon is unusable.
+        assert_eq!(Node::full_sync_anchor_height(500, 500), Some(500));
+        assert_eq!(Node::full_sync_anchor_height(500, 9_999_999), Some(500));
+        assert_eq!(Node::full_sync_anchor_height(500, 499), None);
+
+        // Span: end = min(cursor+255, target); (end-start) always < MAX_GETBLOCKS_SPAN so every
+        // batch passes the server ingress cap; end never overshoots the fixed target.
+        for &(cursor, target) in &[(1u32, 10u32), (1, 1000), (900, 1000), (1000, 1000)] {
+            let (s, e) = Node::full_sync_next_span(cursor, target);
+            assert_eq!(s, cursor);
+            assert!(e <= target);
+            assert!(e.saturating_sub(s) < MAX_GETBLOCKS_SPAN);
+        }
+        assert_eq!(Node::full_sync_next_span(1, 1000), (1, 256));
+
+        // Termination: stop once past the target OR on any no-progress batch (stalling peer).
+        assert!(Node::full_sync_should_continue(5, 10, true));
+        assert!(!Node::full_sync_should_continue(11, 10, true));
+        assert!(!Node::full_sync_should_continue(5, 10, false));
+
+        // Witness routing: a block at/above verification_floor()+1 must be witness-verified;
+        // at/below the floor it takes the receipt fast-path.
+        assert!(Node::routes_via_witness(36, 35));
+        assert!(!Node::routes_via_witness(35, 35));
+        assert!(!Node::routes_via_witness(10, 35));
     }
 
     #[test]

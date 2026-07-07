@@ -492,10 +492,32 @@ async fn main() -> Result<()> {
         pb.set_message("Checking bootstrap snapshot...");
         let create_launch_genesis = env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
             || env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
+        let seed_peer_configured = std::env::var("ALPHANUMERIC_SEED_NODES")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let mut peer_bootstrap_mode = false;
         if create_launch_genesis && !has_local_block_data(&db_path) {
             println!("Bootstrap skipped: creating deterministic launch genesis");
+        } else if !has_local_block_data(&db_path) {
+            // Fresh node (no local blocks): the gateway snapshot is the primary bootstrap.
+            // If it is unavailable (Upstash / gateway outage) AND a seed peer is configured,
+            // a snapshot failure is NOT fatal — create the deterministic genesis locally and
+            // reconstruct the chain from the seed peer over P2P GetBlocks (Tier-2 fallback; the
+            // reconcile loop's peer full-history sync does the pull, with the SAME validation).
+            // With no seed peer, fail closed exactly as before.
+            match ensure_bootstrap_db(&db_path).await {
+                Ok(()) => {}
+                Err(e) if seed_peer_configured => {
+                    println!(
+                        "Bootstrap snapshot unavailable ({}); will reconstruct the chain from a seed peer over P2P",
+                        e
+                    );
+                    peer_bootstrap_mode = true;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
-            // Fail closed: if there are no local blocks, bootstrap must succeed.
+            // Existing local chain: reconcile it against the signed manifest as before.
             ensure_bootstrap_db(&db_path).await?;
         }
         pb.set_message("Initializing database...");
@@ -604,7 +626,8 @@ async fn main() -> Result<()> {
 
         pb.inc(1);
 
-        if create_launch_genesis && db.scan_prefix("block_").next().is_none() {
+        if (create_launch_genesis || peer_bootstrap_mode) && db.scan_prefix("block_").next().is_none()
+        {
             pb.set_message("Creating launch genesis...");
             blockchain.write().await.create_genesis_block().await?;
         }
