@@ -2823,12 +2823,18 @@ impl Node {
             .saturating_add(1)
             .saturating_mul(4)
             .clamp(1, 200);
+        // Caps against a HOSTILE relay that paginates forever with distinct floor-difficulty
+        // blocks (the seen_pages dedup only breaks on an exact page REPEAT). Honest callers
+        // request <=64-height windows (<=2 pages at limit 200), so these never bite legit sync.
+        const MAX_RELAY_PAGES: u32 = 16;
+        const MAX_RELAY_BLOCKS: usize = 4096;
         let mut all_blocks = Vec::new();
         let mut any_ok = false;
         let mut seen_blocks: HashSet<(u32, [u8; 32])> = HashSet::new();
 
         for base_url in Self::discovery_blocks_urls() {
             let mut offset: u32 = 0;
+            let mut pages: u32 = 0;
             let mut seen_pages: HashSet<Vec<(u32, [u8; 32])>> = HashSet::new();
             loop {
                 let url = format!(
@@ -2903,6 +2909,10 @@ impl Node {
                     break;
                 }
                 offset = offset.saturating_add(record_count);
+                pages = pages.saturating_add(1);
+                if pages >= MAX_RELAY_PAGES || all_blocks.len() >= MAX_RELAY_BLOCKS {
+                    break;
+                }
             }
         }
 

@@ -2127,6 +2127,11 @@ const MAX_PEER_MLDSA_KEYS: usize = 4096;
 /// Max distinct verifier keys accepted from one source IP — the primary DoS/Sybil bound:
 /// one host cannot fill the map or masquerade as many verifiers.
 const MAX_MLDSA_KEYS_PER_IP: usize = 2;
+/// Cap on the in-memory header-verification cache. height>0 headers already require a valid
+/// prev-hash link (bounded), but height-0 headers insert unconditionally, so an attacker
+/// spamming random height-0 headers could grow this without limit (remote OOM). Bounded with
+/// oldest-first eviction; 8192 is far above any live reorg/fork-resolution window.
+const MAX_VERIFICATIONS: usize = 8192;
 
 #[derive(Debug)]
 pub struct HeaderSentinel {
@@ -2699,6 +2704,21 @@ impl HeaderSentinel {
             }
             if self.is_header_rules_v2_active() && header.timestamp <= prev.timestamp {
                 return Err("Header timestamp continuity check failed".to_string());
+            }
+        }
+
+        // Bound the verification cache before inserting a NEW hash: evict the oldest entry
+        // when at the cap, so height-0 spam (random hashes, no prev-link check) can't OOM us.
+        if !self.verifications.contains_key(&header.hash)
+            && self.verifications.len() >= MAX_VERIFICATIONS
+        {
+            if let Some(oldest) = self
+                .verifications
+                .iter()
+                .min_by_key(|e| e.value().timestamp)
+                .map(|e| e.key().clone())
+            {
+                self.verifications.remove(&oldest);
             }
         }
 
