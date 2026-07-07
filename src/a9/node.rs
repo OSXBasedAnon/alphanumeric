@@ -3748,24 +3748,28 @@ impl Node {
     async fn discover_from_kademlia(&self) -> Result<HashSet<SocketAddr>, NodeError> {
         let mut discovered = HashSet::new();
 
-        // Safely access the swarm without using addresses_of_peer
-        let swarm_guard = self.p2p_swarm.lock().await;
-        if swarm_guard.is_none() {
+        // Check-and-RELEASE: confirm the swarm exists, then drop the guard. handle_p2p_events
+        // below re-locks p2p_swarm itself, so holding the guard across that call was a
+        // reentrant tokio-Mutex deadlock (the guard is not re-entrant).
+        if self.p2p_swarm.lock().await.is_none() {
             return Ok(discovered);
         }
 
-        // Try to collect known peer addresses using safer methods
+        // Pump events WITHOUT holding the swarm lock.
         if self.handle_p2p_events().await.is_ok() {
-            // After handling events, extract any discovered addresses
-            // from swarm's connected peers using direct access methods
-            if let Some(swarm) = &*swarm_guard {
-                // Get connected peers from the swarm
-                for peer_id in swarm.0.connected_peers() {
-                    // Fixed: add .await here to properly await the future
-                    if let Ok(addrs) = self.get_peer_addresses_from_connections(peer_id).await {
-                        for addr in addrs {
-                            discovered.insert(addr);
-                        }
+            // Re-acquire only to snapshot the connected peer ids, then DROP the guard before
+            // any awaited per-peer work (never hold the swarm lock across an await).
+            let peer_ids: Vec<PeerId> = {
+                let swarm_guard = self.p2p_swarm.lock().await;
+                match &*swarm_guard {
+                    Some(swarm) => swarm.0.connected_peers().cloned().collect(),
+                    None => Vec::new(),
+                }
+            };
+            for peer_id in peer_ids {
+                if let Ok(addrs) = self.get_peer_addresses_from_connections(&peer_id).await {
+                    for addr in addrs {
+                        discovered.insert(addr);
                     }
                 }
             }
