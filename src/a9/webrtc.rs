@@ -264,6 +264,16 @@ pub struct WebRtcMesh {
     inbound_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
+// Opaque Debug so a `#[derive(Debug)]` holder (the Node) compiles — the inner webrtc/transport
+// types aren't Debug and their contents aren't useful to print anyway.
+impl std::fmt::Debug for WebRtcMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebRtcMesh")
+            .field("local_id", &self.local_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl WebRtcMesh {
     /// Build a mesh. Returns the mesh + the receiver the node drains for inbound peer messages
     /// (tagged with the sender's node_id).

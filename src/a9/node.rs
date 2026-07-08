@@ -868,6 +868,11 @@ pub struct Node {
     handshake_public_key: Vec<u8>,
     handshake_key_bytes: Arc<Vec<u8>>,
 
+    // WebRTC mesh (feature `webrtc_mesh`): direct P2P DataChannels to NAT'd peers, signaled by the
+    // gateway. Set once the mesh spawns; block/tx gossip is flooded here in parallel to TCP.
+    #[cfg(feature = "webrtc_mesh")]
+    webrtc_mesh: Arc<RwLock<Option<Arc<crate::a9::webrtc::WebRtcMesh>>>>,
+
     // Filesystem
     pub lock_path: Arc<String>,
 }
@@ -1118,6 +1123,8 @@ impl Node {
             outbound_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             handshake_public_key: keypair.public_key().as_ref().to_vec(),
             handshake_key_bytes: Arc::new(handshake_key_bytes),
+            #[cfg(feature = "webrtc_mesh")]
+            webrtc_mesh: Arc::new(RwLock::new(None)),
             inbound_attempts: Arc::new(RwLock::new(HashMap::new())),
             peer_cache_path: Arc::new(peer_cache_path),
             configured_seed_nodes: Arc::new(configured_seed_nodes),
@@ -5029,6 +5036,12 @@ impl Node {
             });
         }
 
+        // Bring up the WebRTC mesh (opt-in via ALPHANUMERIC_WEBRTC_MESH): direct P2P DataChannels to
+        // NAT'd peers, signaled through the gateway, so blocks gossip node-to-node instead of only
+        // through the bounded gateway relay. No-op unless the feature is compiled AND the flag is set.
+        #[cfg(feature = "webrtc_mesh")]
+        self.spawn_webrtc_mesh();
+
         info!("Node startup complete - ready to accept connections");
         Ok(())
     }
@@ -6568,6 +6581,9 @@ impl Node {
                         blockchain.add_transaction(tx.clone()).await?;
                     }
 
+                    #[cfg(feature = "webrtc_mesh")]
+                    self.mesh_gossip(&NetworkMessage::Transaction(tx.clone())).await;
+
                     // Broadcast to subset of peers
                     let peers = self.peers.read().await;
                     let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(8));
@@ -6593,6 +6609,11 @@ impl Node {
                 if self.verify_block_parallel(&block).await? {
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
+
+                    // Flood over the WebRTC mesh (the velocity path below skips broadcast_block, so
+                    // hook here too to propagate received blocks to direct DataChannel peers).
+                    #[cfg(feature = "webrtc_mesh")]
+                    self.mesh_gossip(&NetworkMessage::Block(block.clone())).await;
 
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
@@ -7258,12 +7279,160 @@ impl Node {
         }
     }
 
+    #[cfg(feature = "webrtc_mesh")]
+    fn webrtc_mesh_enabled() -> bool {
+        Self::env_flag_enabled("ALPHANUMERIC_WEBRTC_MESH")
+    }
+
+    /// Peer node_ids from the gateway directory — who to dial into the mesh (signaling is keyed by
+    /// node_id). Reuses the same /api/peers the TCP discovery already reads.
+    #[cfg(feature = "webrtc_mesh")]
+    async fn fetch_mesh_peer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for url in Self::discovery_peers_urls() {
+            if let Ok(res) = self.http_client.get(&url).send().await {
+                if let Ok(body) = res.json::<DiscoveryResponse>().await {
+                    if body.ok {
+                        for p in body.peers {
+                            if let Some(id) = p.node_id {
+                                if id != self.node_id && id.len() == 64 {
+                                    ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !ids.is_empty() {
+                break;
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Build + spawn the WebRTC mesh (opt-in via ALPHANUMERIC_WEBRTC_MESH): signaling poll, topology
+    /// dialer, and inbound processor. The node's own handshake key gives the mesh its real identity,
+    /// so the gateway accepts its signaling exactly like its announce.
+    #[cfg(feature = "webrtc_mesh")]
+    fn spawn_webrtc_mesh(&self) {
+        use crate::a9::webrtc::{
+            build_api, default_stun_urls, HttpSignalTransport, SignalTransport, WebRtcMesh,
+        };
+        const MESH_DEGREE: usize = 12;
+        if !Self::webrtc_mesh_enabled() {
+            return;
+        }
+        let gateway_base = Self::discovery_bases().into_iter().next().unwrap_or_default();
+        let transport: Arc<dyn SignalTransport> =
+            match HttpSignalTransport::new(self.handshake_key_bytes.as_ref().clone(), gateway_base) {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    warn!("WebRTC mesh: transport init failed: {}", e);
+                    return;
+                }
+            };
+        let api = match build_api() {
+            Ok(a) => Arc::new(a),
+            Err(e) => {
+                warn!("WebRTC mesh: API init failed: {}", e);
+                return;
+            }
+        };
+        let (mesh, mut inbound_rx) = match WebRtcMesh::new(transport, api, default_stun_urls()) {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("WebRTC mesh: init failed: {}", e);
+                return;
+            }
+        };
+        info!(
+            "WebRTC mesh enabled — gossiping blocks over direct DataChannels ({}…)",
+            &self.node_id[..8.min(self.node_id.len())]
+        );
+
+        {
+            let store = self.webrtc_mesh.clone();
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                *store.write().await = Some(mesh);
+            });
+        }
+        {
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                loop {
+                    let _ = mesh.poll_signals().await;
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+            });
+        }
+        {
+            let node = self.clone();
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                loop {
+                    let ids = node.fetch_mesh_peer_ids().await;
+                    for id in ids.into_iter().take(MESH_DEGREE) {
+                        let _ = mesh.dial(&id).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+            });
+        }
+        {
+            let node = self.clone();
+            tokio::spawn(async move {
+                while let Some((_peer, bytes)) = inbound_rx.recv().await {
+                    node.handle_mesh_message(bytes).await;
+                }
+            });
+        }
+    }
+
+    /// Inbound mesh bytes -> the SAME validated processing path as a TCP message (bloom dedup, PoW +
+    /// ML-DSA verify, save, re-flood). Transport-only: no consensus change.
+    #[cfg(feature = "webrtc_mesh")]
+    async fn handle_mesh_message(&self, bytes: Vec<u8>) {
+        let msg: NetworkMessage = match codec::deserialize(&bytes) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let event = match msg {
+            NetworkMessage::Block(b) => Some(NetworkEvent::NewBlock(b)),
+            NetworkMessage::Transaction(t) => Some(NetworkEvent::NewTransaction(t)),
+            _ => None,
+        };
+        if let Some(e) = event {
+            if let Err(err) = self.handle_network_event(e).await {
+                debug!("WebRTC mesh: message processing error: {}", err);
+            }
+        }
+    }
+
+    /// Flood a message to every connected mesh peer, parallel to the TCP flood. No-op if the mesh is
+    /// off or not yet up. Peers dedup via the bloom, so double-delivery is harmless.
+    #[cfg(feature = "webrtc_mesh")]
+    async fn mesh_gossip(&self, msg: &NetworkMessage) {
+        let mesh = { self.webrtc_mesh.read().await.clone() };
+        if let Some(mesh) = mesh {
+            if let Ok(bytes) = codec::serialize(msg) {
+                let _ = mesh.broadcast(&bytes).await;
+            }
+        }
+    }
+
     async fn broadcast_block(
         &self,
         block: Arc<Block>,
         source: Option<SocketAddr>,
         peers: Vec<SocketAddr>,
     ) -> Result<usize, NodeError> {
+        // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks;
+        // all broadcast_block callers). No-op unless the mesh feature is on and up.
+        #[cfg(feature = "webrtc_mesh")]
+        self.mesh_gossip(&NetworkMessage::Block((*block).clone())).await;
         let targets: Vec<_> = peers
             .into_iter()
             .filter(|addr| Some(*addr) != source)
