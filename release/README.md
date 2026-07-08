@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This download contains Alphanumeric client version 7.5.1 for macOS.
+This download contains Alphanumeric client version 7.6.0 for macOS.
 
 ## What Is Included
 
@@ -145,6 +145,20 @@ If you need to set it manually:
 ```bash
 ALPHANUMERIC_DISCOVERY_BASES=https://alphanumeric.blue ./alphanumeric
 ```
+
+## Faster Sync: WebRTC Mesh (Recommended)
+
+Most miners are behind home NAT with no open port, so by default blocks propagate through the
+gateway relay, which is slower. The WebRTC mesh lets your node hole-punch **direct** peer-to-peer
+links to other miners (coordinated by the gateway, no port-forwarding needed), so blocks gossip
+node-to-node and catch-up is much faster. Turn it on:
+
+```bash
+ALPHANUMERIC_WEBRTC_MESH=true ./alphanumeric
+```
+
+It falls back to the normal gateway relay automatically for the minority of peers it can't reach
+directly, so there's no downside to enabling it.
 
 ## Running a Public Node (Optional)
 

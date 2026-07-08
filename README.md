@@ -10,7 +10,7 @@ https://www.alphanumeric.blue/
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.5.1`.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.6.0`.
 
 ## Quick Nav
 
