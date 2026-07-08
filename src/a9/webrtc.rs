@@ -406,11 +406,16 @@ impl WebRtcMesh {
     }
 
     /// Replace the known-peer directory (called by the dialer after each fetch). Used to gate
-    /// inbound offers to peers actually announced on the gateway.
+    /// inbound offers to peers actually announced on the gateway, and to bound the dial-backoff map
+    /// by dropping entries for peers that have left the directory.
     pub async fn set_known_peers(&self, ids: &[String]) {
-        let mut k = self.known_peers.lock().await;
-        k.clear();
-        k.extend(ids.iter().cloned());
+        let fresh: HashSet<String> = ids.iter().cloned().collect();
+        {
+            let mut k = self.known_peers.lock().await;
+            *k = fresh.clone();
+        }
+        // Prune backoff for departed peers so the map can't grow without bound over a churning net.
+        self.dial_backoff.lock().await.retain(|id, _| fresh.contains(id));
     }
 
     /// Mark signaling activity now (a handshake in progress). The poll loop uses this to stay on the
@@ -707,10 +712,15 @@ impl WebRtcMesh {
         self.transport.post_signal(from, "answer", &answer.sdp).await
     }
 
-    /// Ok(true) only if the answer matched an outstanding local offer (a real pc).
+    /// Ok(true) only if the answer advanced a still-FORMING handshake. A stray answer to an
+    /// already-connected pc is junk and must not reset the poll cadence.
     async fn handle_answer(&self, from: &str, sdp: &str) -> Result<bool, String> {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
         let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
+            if matches!(pc.connection_state(), St::Connected) {
+                return Ok(false);
+            }
             let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?;
             pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
             return Ok(true);
@@ -718,16 +728,22 @@ impl WebRtcMesh {
         Ok(false)
     }
 
-    /// Ok(true) only if the candidate applied to an existing pc.
+    /// Ok(true) only if the candidate actually APPLIED to a still-forming handshake. Candidates are
+    /// bundled non-trickle, so a `candidate` envelope is never legitimately emitted — but a connected
+    /// peer could post signed junk ones every poll to pin the fast cadence, so a candidate on an
+    /// already-connected pc (or one that fails to apply) counts as no work.
     async fn handle_candidate(&self, from: &str, cand: &str) -> Result<bool, String> {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
         let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
+            if matches!(pc.connection_state(), St::Connected) {
+                return Ok(false);
+            }
             let init = RTCIceCandidateInit {
                 candidate: cand.to_string(),
                 ..Default::default()
             };
-            let _ = pc.add_ice_candidate(init).await;
-            return Ok(true);
+            return Ok(pc.add_ice_candidate(init).await.is_ok());
         }
         Ok(false)
     }
@@ -924,6 +940,21 @@ mod tests {
             Some(2),
             "consecutive failures are counted"
         );
+    }
+
+    // Guards the backoff-map bound: a peer that leaves the directory must not keep its backoff entry
+    // forever (else the map grows without bound on a churning network).
+    #[tokio::test]
+    async fn set_known_peers_prunes_departed_backoff() {
+        let t: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
+        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        mesh.note_dial_failure("gone").await;
+        mesh.note_dial_failure("stays").await;
+        mesh.set_known_peers(&["stays".to_string(), "other".to_string()]).await;
+        let b = mesh.dial_backoff.lock().await;
+        assert!(b.contains_key("stays"), "still-advertised peer keeps its backoff");
+        assert!(!b.contains_key("gone"), "departed peer's backoff is pruned");
     }
 
     // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
