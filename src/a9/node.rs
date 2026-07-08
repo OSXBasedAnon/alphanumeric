@@ -7364,7 +7364,13 @@ impl Node {
             tokio::spawn(async move {
                 loop {
                     let _ = mesh.poll_signals().await;
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    // Adaptive cadence, to keep the free-tier signaling budget ~flat in node count:
+                    // a node still building its mesh (below target degree) polls fast to complete
+                    // handshakes; once satisfied it only needs to catch the occasional NEW peer, so
+                    // it backs off hard. Signaling is one-time per edge, so a satisfied mesh is quiet.
+                    let degree = mesh.connected_peers().await.len();
+                    let delay_ms = if degree < MESH_DEGREE { 2500 } else { 20000 };
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             });
         }
