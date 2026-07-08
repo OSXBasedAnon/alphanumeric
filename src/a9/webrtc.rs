@@ -356,8 +356,12 @@ pub struct WebRtcMesh {
     /// The gateway peer directory, refreshed by the dialer. Inbound offers from ids NOT in here are
     /// ignored (anti-DoS) once it has been populated.
     known_peers: Arc<Mutex<HashSet<String>>>,
-    /// Timestamp of the last signaling activity (send or non-empty drain). Drives poll cadence.
+    /// Timestamp of the last signaling activity that ADVANCED a handshake. Drives poll cadence.
     last_signal: Arc<Mutex<Instant>>,
+    /// Per-peer dial backoff: (consecutive failures, earliest next dial). A peer that can't be
+    /// reached (symmetric NAT, offline) is retried on an exponentially growing interval instead of
+    /// every ~60s, so doomed handshakes don't hold the node at the fast poll cadence.
+    dial_backoff: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
 
 // Opaque Debug so a `#[derive(Debug)]` holder (the Node) compiles — the inner webrtc/transport
@@ -388,6 +392,7 @@ impl WebRtcMesh {
             inbound_tx,
             known_peers: Arc::new(Mutex::new(HashSet::new())),
             last_signal: Arc::new(Mutex::new(Instant::now())),
+            dial_backoff: Arc::new(Mutex::new(HashMap::new())),
         });
         Ok((mesh, inbound_rx))
     }
@@ -419,14 +424,49 @@ impl WebRtcMesh {
         self.last_signal.lock().await.elapsed()
     }
 
-    /// Close + forget a peer connection (removing from both maps AND calling close(), since webrtc
-    /// 0.17 has no Drop — dropping the Arc alone leaks the ICE agent + UDP socket).
-    async fn close_and_forget(&self, peer_id: &str) {
-        let removed = self.conns.lock().await.remove(peer_id);
-        self.channels.lock().await.remove(peer_id);
-        if let Some(c) = removed {
-            let _ = c.pc.close().await;
+    /// Remove `peer_id` from both maps ONLY if it still maps to exactly `pc` (Arc identity). This is
+    /// the guard against ABA: a stale callback or the reaper must never evict a NEWER pc that a
+    /// concurrent re-dial bound to the same id. Returns whether it removed. Does NOT close.
+    async fn forget_if_current(&self, peer_id: &str, pc: &Arc<RTCPeerConnection>) -> bool {
+        let removed = {
+            let mut conns = self.conns.lock().await;
+            if conns.get(peer_id).map_or(false, |c| Arc::ptr_eq(&c.pc, pc)) {
+                conns.remove(peer_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.channels.lock().await.remove(peer_id);
         }
+        removed
+    }
+
+    /// Identity-checked forget + close the SNAPSHOT pc (idempotent). Safe to await close() here —
+    /// callers are NOT inside a state-change callback (that path spawns close() to avoid re-entrancy).
+    /// webrtc 0.17 has no Drop, so close() is what actually frees the ICE agent + UDP socket.
+    async fn remove_if_current_and_close(&self, peer_id: &str, pc: &Arc<RTCPeerConnection>) {
+        self.forget_if_current(peer_id, pc).await;
+        let _ = pc.close().await;
+    }
+
+    /// May we dial this peer now, or is it in backoff after recent failed attempts?
+    async fn dial_allowed(&self, peer_id: &str) -> bool {
+        match self.dial_backoff.lock().await.get(peer_id) {
+            Some((_, next)) => Instant::now() >= *next,
+            None => true,
+        }
+    }
+
+    /// Record a failed dial to `peer_id`; grows the retry interval exponentially (15s, 30s, …, 600s).
+    async fn note_dial_failure(&self, peer_id: &str) {
+        let mut b = self.dial_backoff.lock().await;
+        let entry = b.entry(peer_id.to_string()).or_insert((0, Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        let shift = entry.0.min(6).saturating_sub(1);
+        let secs = 15u64.saturating_mul(1u64 << shift).min(600);
+        entry.1 = Instant::now() + Duration::from_secs(secs);
     }
 
     /// Close + remove any connection that has not reached Connected within MESH_STALE_SECS. Half-open
@@ -439,16 +479,28 @@ impl WebRtcMesh {
             conns
                 .iter()
                 .filter(|(_, c)| {
+                    // Only reap connections that never came up: New (half-open — offer sent, no
+                    // answer), Connecting (hole-punch that never finished), or a Failed that slipped
+                    // past the state-change callback. Deliberately NOT Disconnected: that is transient
+                    // and ICE escalates it to Failed on its own — reaping it here would kill a link
+                    // that is about to recover.
                     c.created.elapsed() > Duration::from_secs(MESH_STALE_SECS)
-                        && c.pc.connection_state() != St::Connected
+                        && matches!(
+                            c.pc.connection_state(),
+                            St::New | St::Connecting | St::Failed
+                        )
                 })
                 .map(|(id, c)| (id.clone(), c.pc.clone()))
                 .collect()
         };
+        let local = self.local_id().to_string();
         for (id, pc) in stale {
-            self.conns.lock().await.remove(&id);
-            self.channels.lock().await.remove(&id);
-            let _ = pc.close().await;
+            // Identity-checked: never evict a fresh pc a concurrent re-dial bound to this id.
+            self.remove_if_current_and_close(&id, &pc).await;
+            // A reaped never-connected pc means the dial to a peer we initiate to failed — back off.
+            if id > local {
+                self.note_dial_failure(&id).await;
+            }
         }
     }
 
@@ -481,17 +533,21 @@ impl WebRtcMesh {
             })
         }));
         let channels = self.channels.clone();
+        let backoff = self.dial_backoff.clone();
         // WEAK ref to the channel: a channel that NEVER opens (failed hole-punch) must not be pinned
         // alive by its own on_open handler, or it leaks when its pc is torn down.
         let dc_weak = Arc::downgrade(&dc);
         let peer_for_open = peer_id.clone();
         dc.on_open(Box::new(move || {
             let channels = channels.clone();
+            let backoff = backoff.clone();
             let dc_weak = dc_weak.clone();
             let peer = peer_for_open.clone();
             Box::pin(async move {
                 if let Some(dc) = dc_weak.upgrade() {
-                    channels.lock().await.insert(peer, dc);
+                    channels.lock().await.insert(peer.clone(), dc);
+                    // The channel is live — this peer connected, so clear any dial backoff.
+                    backoff.lock().await.remove(&peer);
                 }
             })
         }));
@@ -517,37 +573,35 @@ impl WebRtcMesh {
             })
         }));
         // Drop dead connections from the maps so they can be re-dialed — and CLOSE them (webrtc 0.17
-        // has no Drop, so without close() the ICE agent + UDP socket leak).
-        let conns = self.conns.clone();
-        let channels = self.channels.clone();
+        // has no Drop, so without close() the ICE agent + UDP socket leak). Capture WEAK refs to both
+        // the mesh and THIS pc: the removal is identity-checked (forget_if_current), so a stale
+        // callback that fires after a concurrent re-dial rebound this id to a fresh pc is a no-op and
+        // can't evict the newer connection (ABA).
+        let mesh_weak = Arc::downgrade(self);
+        let pc_weak = Arc::downgrade(&pc);
         let peer2 = peer_id.to_string();
         pc.on_peer_connection_state_change(Box::new(move |s| {
             use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
-            let conns = conns.clone();
-            let channels = channels.clone();
+            let mesh_weak = mesh_weak.clone();
+            let pc_weak = pc_weak.clone();
             let peer2 = peer2.clone();
             Box::pin(async move {
-                match s {
-                    St::Failed => {
-                        // Terminal. Remove and close off-task (close() itself drives more state
-                        // changes, so don't re-enter this handler synchronously).
-                        let removed = conns.lock().await.remove(&peer2);
-                        channels.lock().await.remove(&peer2);
-                        if let Some(c) = removed {
-                            tokio::spawn(async move {
-                                let _ = c.pc.close().await;
-                            });
-                        }
-                    }
-                    St::Closed => {
-                        conns.lock().await.remove(&peer2);
-                        channels.lock().await.remove(&peer2);
-                    }
+                if !matches!(s, St::Failed | St::Closed) {
                     // Disconnected is TRANSIENT (brief packet loss / NAT rebind): ICE often recovers
                     // to Connected with the DataChannel still open. Tearing down here would drop a
                     // live link (silent gossip black hole). Leave it; the reaper closes it only if it
                     // stays un-Connected past MESH_STALE_SECS, and ICE itself escalates to Failed.
-                    _ => {}
+                    return;
+                }
+                if let (Some(mesh), Some(pc)) = (mesh_weak.upgrade(), pc_weak.upgrade()) {
+                    let was_current = mesh.forget_if_current(&peer2, &pc).await;
+                    if matches!(s, St::Failed) && was_current {
+                        // Close off-task: close() drives more state changes, so awaiting it inside
+                        // this handler would re-enter synchronously.
+                        tokio::spawn(async move {
+                            let _ = pc.close().await;
+                        });
+                    }
                 }
             })
         }));
@@ -567,6 +621,9 @@ impl WebRtcMesh {
         if self.local_id() >= peer_id {
             return Ok(()); // polite side waits for the offer
         }
+        if !self.dial_allowed(peer_id).await {
+            return Ok(()); // in backoff after recent failures — don't hammer an unreachable peer
+        }
         if self.conns.lock().await.contains_key(peer_id) {
             return Ok(());
         }
@@ -582,7 +639,8 @@ impl WebRtcMesh {
                 Ok(())
             }
             Err(e) => {
-                self.close_and_forget(peer_id).await;
+                self.remove_if_current_and_close(peer_id, &pc).await;
+                self.note_dial_failure(peer_id).await;
                 Err(e)
             }
         }
@@ -603,13 +661,16 @@ impl WebRtcMesh {
         self.transport.post_signal(peer_id, "offer", &offer.sdp).await
     }
 
-    async fn handle_offer(self: &Arc<Self>, from: &str, sdp: &str) -> Result<(), String> {
+    /// Returns Ok(true) only if this offer ADVANCED a handshake (a fresh answer was posted). A dropped
+    /// offer (wrong role / not in directory / already connected / at cap) returns Ok(false) so it does
+    /// NOT reset the poll cadence — otherwise anyone could pin us fast with signed junk offers.
+    async fn handle_offer(self: &Arc<Self>, from: &str, sdp: &str) -> Result<bool, String> {
         // Perfect negotiation: only the polite (higher-id) side accepts an inbound offer.
         if self.local_id() < from {
-            return Ok(());
+            return Ok(false);
         }
         if self.conns.lock().await.contains_key(from) {
-            return Ok(()); // already have a connection to this peer
+            return Ok(false); // already have a connection to this peer
         }
         // Anti-DoS: only accept offers from peers actually in the gateway directory (once we've
         // fetched it), and cap total connections. Otherwise a spammer with throwaway lower-id keys
@@ -617,20 +678,17 @@ impl WebRtcMesh {
         {
             let known = self.known_peers.lock().await;
             if !known.is_empty() && !known.contains(from) {
-                return Ok(());
+                return Ok(false);
             }
         }
         if self.conns.lock().await.len() >= MESH_MAX_CONNS {
-            return Ok(());
+            return Ok(false);
         }
         let pc = self.new_pc(from).await?;
         match self.negotiate_answer(&pc, from, sdp).await {
-            Ok(()) => {
-                self.touch().await;
-                Ok(())
-            }
+            Ok(()) => Ok(true),
             Err(e) => {
-                self.close_and_forget(from).await;
+                self.remove_if_current_and_close(from, &pc).await;
                 Err(e)
             }
         }
@@ -649,16 +707,19 @@ impl WebRtcMesh {
         self.transport.post_signal(from, "answer", &answer.sdp).await
     }
 
-    async fn handle_answer(&self, from: &str, sdp: &str) -> Result<(), String> {
+    /// Ok(true) only if the answer matched an outstanding local offer (a real pc).
+    async fn handle_answer(&self, from: &str, sdp: &str) -> Result<bool, String> {
         let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
             let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?;
             pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    async fn handle_candidate(&self, from: &str, cand: &str) -> Result<(), String> {
+    /// Ok(true) only if the candidate applied to an existing pc.
+    async fn handle_candidate(&self, from: &str, cand: &str) -> Result<bool, String> {
         let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
             let init = RTCIceCandidateInit {
@@ -666,27 +727,37 @@ impl WebRtcMesh {
                 ..Default::default()
             };
             let _ = pc.add_ice_candidate(init).await;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Drain the mailbox once and dispatch each envelope to the right handler. Returns the number of
-    /// envelopes processed so the caller can drive an activity-based poll cadence.
+    /// envelopes processed. Resets the poll cadence ONLY if an envelope actually advanced a handshake
+    /// (not merely arrived) — so signed junk can't hold the node at the fast cadence.
     pub async fn poll_signals(self: &Arc<Self>) -> Result<usize, String> {
         let envelopes = self.transport.drain_signals().await?;
         let n = envelopes.len();
+        let mut worked = false;
         for e in envelopes {
             let r = match e.kind.as_str() {
                 "offer" => self.handle_offer(&e.from, &e.payload).await,
                 "answer" => self.handle_answer(&e.from, &e.payload).await,
                 "candidate" => self.handle_candidate(&e.from, &e.payload).await,
-                _ => Ok(()),
+                _ => Ok(false),
             };
-            if let Err(err) = r {
-                log::debug!("mesh signal {} from {} failed: {}", e.kind, &e.from[..8.min(e.from.len())], err);
+            match r {
+                Ok(true) => worked = true,
+                Ok(false) => {}
+                Err(err) => log::debug!(
+                    "mesh signal {} from {} failed: {}",
+                    e.kind,
+                    &e.from[..8.min(e.from.len())],
+                    err
+                ),
             }
         }
-        if n > 0 {
+        if worked {
             self.touch().await;
         }
         Ok(n)
@@ -813,6 +884,46 @@ mod tests {
                 assert!(degree[i] > 0, "n={n}: node {i} is isolated (zero mesh edges)");
             }
         }
+    }
+
+    // Guards the ABA fix: a stale pc's teardown (reaper or a late state-change callback) must NEVER
+    // evict a fresh pc that a concurrent re-dial rebound to the same peer id.
+    #[tokio::test]
+    async fn forget_if_current_only_removes_the_matching_pc() {
+        let t: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
+        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let peer = "peer-x";
+        let pc1 = mesh.new_pc(peer).await.unwrap();
+        // A re-dial rebinds `peer` to a fresh pc (HashMap insert replaces the entry).
+        let pc2 = mesh.new_pc(peer).await.unwrap();
+        assert!(!Arc::ptr_eq(&pc1, &pc2));
+        // A stale callback holding pc1 must be a no-op now that pc2 owns the id.
+        assert!(!mesh.forget_if_current(peer, &pc1).await, "stale pc1 must not evict current pc2");
+        assert!(mesh.conns.lock().await.contains_key(peer), "pc2 must still be tracked");
+        // The current pc removes correctly.
+        assert!(mesh.forget_if_current(peer, &pc2).await, "current pc2 removes");
+        assert!(!mesh.conns.lock().await.contains_key(peer));
+        let _ = pc1.close().await;
+        let _ = pc2.close().await;
+    }
+
+    // Guards the poll-cadence fix: an unreachable peer backs off exponentially instead of re-dialing
+    // every ~60s (each re-dial would otherwise pin the node at the fast signaling cadence).
+    #[tokio::test]
+    async fn dial_backoff_grows_after_failures() {
+        let t: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
+        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        assert!(mesh.dial_allowed("p").await, "no history -> allowed");
+        mesh.note_dial_failure("p").await;
+        assert!(!mesh.dial_allowed("p").await, "after a failure -> backing off");
+        mesh.note_dial_failure("p").await;
+        assert_eq!(
+            mesh.dial_backoff.lock().await.get("p").map(|e| e.0),
+            Some(2),
+            "consecutive failures are counted"
+        );
     }
 
     // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
