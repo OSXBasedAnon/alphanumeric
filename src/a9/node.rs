@@ -7333,7 +7333,7 @@ impl Node {
                     return;
                 }
             };
-        let api = match build_api() {
+        let api = match build_api(false) {
             Ok(a) => Arc::new(a),
             Err(e) => {
                 warn!("WebRTC mesh: API init failed: {}", e);
@@ -7364,12 +7364,14 @@ impl Node {
             tokio::spawn(async move {
                 loop {
                     let _ = mesh.poll_signals().await;
-                    // Adaptive cadence, to keep the free-tier signaling budget ~flat in node count:
-                    // a node still building its mesh (below target degree) polls fast to complete
-                    // handshakes; once satisfied it only needs to catch the occasional NEW peer, so
-                    // it backs off hard. Signaling is one-time per edge, so a satisfied mesh is quiet.
-                    let degree = mesh.connected_peers().await.len();
-                    let delay_ms = if degree < MESH_DEGREE { 2500 } else { 20000 };
+                    // Cadence follows ACTIVITY, not an absolute degree: poll fast only while signaling
+                    // is actively flowing (a handshake in progress within the last ~25s), then back
+                    // off hard to 20s once quiet. Keying on degree (the old `degree < 12`) pinned most
+                    // nodes — small networks, NAT-fail nodes, isolated nodes — at the 2.5s hot cadence
+                    // FOREVER, which would blow the free-tier gateway Redis budget. Activity-based
+                    // backoff keeps a quiet, formed (or unformable) mesh nearly silent.
+                    let quiet = mesh.quiet_for().await >= Duration::from_secs(25);
+                    let delay_ms = if quiet { 20_000 } else { 2_500 };
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             });
@@ -7378,12 +7380,31 @@ impl Node {
             let node = self.clone();
             let mesh = mesh.clone();
             tokio::spawn(async move {
+                use crate::a9::webrtc::select_dial_targets;
                 loop {
                     let ids = node.fetch_mesh_peer_ids().await;
-                    for id in ids.into_iter().take(MESH_DEGREE) {
+                    // Publish the directory so inbound offers can be gated to real, announced peers.
+                    mesh.set_known_peers(&ids).await;
+                    // Dial targets chosen RELATIVE to our own id (nearest higher-id successors +
+                    // spread), so every node forms edges and the whole network meshes — not just the
+                    // ~13 lowest-id nodes that the old "take the 12 smallest ids" rule connected.
+                    let local = mesh.local_id().to_string();
+                    for id in select_dial_targets(&local, &ids, MESH_DEGREE) {
                         let _ = mesh.dial(&id).await;
                     }
                     tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+            });
+        }
+        {
+            // Reaper: close + drop connections stuck un-Connected (half-open handshakes never reach
+            // Failed on their own, so nothing else frees them or unblocks a re-dial). webrtc 0.17 has
+            // no Drop, so this is also what actually releases the ICE agent + UDP socket.
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    mesh.reap_stale().await;
                 }
             });
         }

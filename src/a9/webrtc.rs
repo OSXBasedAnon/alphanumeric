@@ -36,14 +36,56 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// True for LAN / non-routable / link-local addresses — the ones we do NOT want as ICE candidates
+/// on an internet-only mesh. Loopback is intentionally excluded here (kept via the filter below) so
+/// same-machine tests still work.
+fn is_lan_or_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+    }
+}
+
 /// Build a webrtc API handle (data-channel only; no media codecs). Reused for all peer connections.
-pub fn build_api() -> Result<API, webrtc::Error> {
+///
+/// Configured for an INTERNET-only mesh: miners are across the internet, not a LAN. We disable mDNS
+/// (so the node never does local multicast — the thing that triggers the OS "Local Network"
+/// permission and Bonjour discovery) and filter private/LAN/link-local IPs out of ICE candidates
+/// (so no local address is gathered, used, sent to, or leaked to peers). The public address STUN
+/// discovers (server-reflexive) is what connects real peers and is unaffected.
+///
+/// `include_loopback` gathers 127.0.0.1/::1 candidates. Real deployments pass `false` — peers are
+/// never on each other's loopback, and same-machine STUN reflexive addresses hairpin and fail, so
+/// loopback is only meaningful when two meshes run in one process (the tests). Loopback is not a
+/// "local network" address and never triggers the OS permission, so enabling it for tests is safe;
+/// production keeps it off to keep SDPs minimal.
+pub fn build_api(include_loopback: bool) -> Result<API, webrtc::Error> {
     ensure_crypto_provider();
     let mut media = MediaEngine::default();
     let registry = register_default_interceptors(Registry::new(), &mut media)?;
+    let mut settings = webrtc::api::setting_engine::SettingEngine::default();
+    settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+    settings.set_include_loopback_candidate(include_loopback);
+    settings.set_ip_filter(Box::new(move |ip: std::net::IpAddr| {
+        if ip.is_loopback() {
+            return include_loopback;
+        }
+        !is_lan_or_local(ip)
+    }));
     Ok(APIBuilder::new()
         .with_media_engine(media)
         .with_interceptor_registry(registry)
+        .with_setting_engine(settings)
         .build())
 }
 
@@ -235,7 +277,8 @@ impl SignalTransport for HttpSignalTransport {
 // ---------------------------------------------------------------------------------------------
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use webrtc::data_channel::data_channel_message::DataChannelMessage as DcMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -250,6 +293,54 @@ pub fn default_stun_urls() -> Vec<String> {
     ]
 }
 
+/// Bounded inbound queue depth. try_send DROPS when full instead of growing without bound, so a
+/// peer that floods faster than validation can drain cannot OOM the node (blocks re-flood anyway).
+const MESH_INBOUND_CAP: usize = 128;
+/// Hard ceiling on simultaneous peer connections (inbound + outbound). Stops a random-key spammer
+/// from forcing unbounded RTCPeerConnections / STUN gathers. A legitimate node runs well under this.
+const MESH_MAX_CONNS: usize = 64;
+/// A connection that has not reached Connected within this long is reaped (closed + removed). A
+/// half-open pc (offer sent, no answer) never reaches Failed on its own — ICE needs a remote
+/// description to start its timers — so without the reaper it would linger and leak forever.
+const MESH_STALE_SECS: u64 = 45;
+/// Per-peer inbound rate limit (token bucket): sustained msgs/sec and burst. Sheds a single peer's
+/// flood at ingress so it can't monopolize the shared inbound queue (head-of-line blocking).
+const MESH_MSG_RATE: f64 = 100.0;
+const MESH_MSG_BURST: f64 = 200.0;
+
+/// A peer connection plus when we created it (for the stale reaper).
+struct PeerConn {
+    pc: Arc<RTCPeerConnection>,
+    created: Instant,
+}
+
+/// Simple per-peer token bucket for inbound message rate limiting.
+struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+    rate: f64,
+    burst: f64,
+}
+
+impl TokenBucket {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self { tokens: burst, last: Instant::now(), rate, burst }
+    }
+    /// Refill by elapsed time, then try to spend one token. false => over budget, drop the message.
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// A running mesh of direct WebRTC DataChannels to peers, established over the gateway signaling
 /// mailbox. Deterministic role assignment (perfect negotiation: the lexicographically-lower node_id
 /// is the initiator) prevents double-dial. Inbound bytes from every peer are funneled to one channel
@@ -259,9 +350,14 @@ pub struct WebRtcMesh {
     transport: Arc<dyn SignalTransport>,
     api: Arc<API>,
     config: RTCConfiguration,
-    conns: Arc<Mutex<HashMap<String, Arc<RTCPeerConnection>>>>,
+    conns: Arc<Mutex<HashMap<String, PeerConn>>>,
     channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-    inbound_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
+    inbound_tx: mpsc::Sender<(String, Vec<u8>)>,
+    /// The gateway peer directory, refreshed by the dialer. Inbound offers from ids NOT in here are
+    /// ignored (anti-DoS) once it has been populated.
+    known_peers: Arc<Mutex<HashSet<String>>>,
+    /// Timestamp of the last signaling activity (send or non-empty drain). Drives poll cadence.
+    last_signal: Arc<Mutex<Instant>>,
 }
 
 // Opaque Debug so a `#[derive(Debug)]` holder (the Node) compiles — the inner webrtc/transport
@@ -281,8 +377,8 @@ impl WebRtcMesh {
         transport: Arc<dyn SignalTransport>,
         api: Arc<API>,
         stun_urls: Vec<String>,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(String, Vec<u8>)>), String> {
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    ) -> Result<(Arc<Self>, mpsc::Receiver<(String, Vec<u8>)>), String> {
+        let (inbound_tx, inbound_rx) = mpsc::channel(MESH_INBOUND_CAP);
         let mesh = Arc::new(Self {
             transport,
             api,
@@ -290,6 +386,8 @@ impl WebRtcMesh {
             conns: Arc::new(Mutex::new(HashMap::new())),
             channels: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx,
+            known_peers: Arc::new(Mutex::new(HashSet::new())),
+            last_signal: Arc::new(Mutex::new(Instant::now())),
         });
         Ok((mesh, inbound_rx))
     }
@@ -302,27 +400,99 @@ impl WebRtcMesh {
         self.channels.lock().await.keys().cloned().collect()
     }
 
+    /// Replace the known-peer directory (called by the dialer after each fetch). Used to gate
+    /// inbound offers to peers actually announced on the gateway.
+    pub async fn set_known_peers(&self, ids: &[String]) {
+        let mut k = self.known_peers.lock().await;
+        k.clear();
+        k.extend(ids.iter().cloned());
+    }
+
+    /// Mark signaling activity now (a handshake in progress). The poll loop uses this to stay on the
+    /// fast cadence while forming and back off hard once quiet.
+    async fn touch(&self) {
+        *self.last_signal.lock().await = Instant::now();
+    }
+
+    /// How long since the last signaling activity.
+    pub async fn quiet_for(&self) -> Duration {
+        self.last_signal.lock().await.elapsed()
+    }
+
+    /// Close + forget a peer connection (removing from both maps AND calling close(), since webrtc
+    /// 0.17 has no Drop — dropping the Arc alone leaks the ICE agent + UDP socket).
+    async fn close_and_forget(&self, peer_id: &str) {
+        let removed = self.conns.lock().await.remove(peer_id);
+        self.channels.lock().await.remove(peer_id);
+        if let Some(c) = removed {
+            let _ = c.pc.close().await;
+        }
+    }
+
+    /// Close + remove any connection that has not reached Connected within MESH_STALE_SECS. Half-open
+    /// pcs (offer sent, no answer arrived) never transition to Failed on their own, so this is the
+    /// only thing that frees them and unblocks a re-dial of that peer.
+    pub async fn reap_stale(&self) {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
+        let stale: Vec<(String, Arc<RTCPeerConnection>)> = {
+            let conns = self.conns.lock().await;
+            conns
+                .iter()
+                .filter(|(_, c)| {
+                    c.created.elapsed() > Duration::from_secs(MESH_STALE_SECS)
+                        && c.pc.connection_state() != St::Connected
+                })
+                .map(|(id, c)| (id.clone(), c.pc.clone()))
+                .collect()
+        };
+        for (id, pc) in stale {
+            self.conns.lock().await.remove(&id);
+            self.channels.lock().await.remove(&id);
+            let _ = pc.close().await;
+        }
+    }
+
     /// Wire a DataChannel's lifecycle: on open, register it as a live link; on message, forward the
     /// bytes to the inbound sink tagged with the peer id.
     fn register_channel(&self, peer_id: String, dc: Arc<RTCDataChannel>) {
         let inbound = self.inbound_tx.clone();
         let peer_for_msg = peer_id.clone();
+        // One token bucket per peer (this closure is this peer's only message handler).
+        let bucket = Arc::new(std::sync::Mutex::new(TokenBucket::new(MESH_MSG_RATE, MESH_MSG_BURST)));
         dc.on_message(Box::new(move |msg: DcMessage| {
             let inbound = inbound.clone();
             let peer = peer_for_msg.clone();
+            let bucket = bucket.clone();
             Box::pin(async move {
-                let _ = inbound.send((peer, msg.data.to_vec()));
+                // Size cap (same 4 MiB frame limit as the TCP path), per-peer rate limit, then a
+                // NON-blocking try_send into the bounded queue: a flooding peer is dropped at ingress
+                // and can neither OOM the node nor starve other peers' blocks.
+                let len = msg.data.len();
+                if len == 0 || len > crate::a9::node::MAX_MESSAGE_SIZE {
+                    return;
+                }
+                {
+                    let allowed = bucket.lock().map(|mut b| b.allow()).unwrap_or(false);
+                    if !allowed {
+                        return;
+                    }
+                }
+                let _ = inbound.try_send((peer, msg.data.to_vec()));
             })
         }));
         let channels = self.channels.clone();
-        let dc_store = dc.clone();
+        // WEAK ref to the channel: a channel that NEVER opens (failed hole-punch) must not be pinned
+        // alive by its own on_open handler, or it leaks when its pc is torn down.
+        let dc_weak = Arc::downgrade(&dc);
         let peer_for_open = peer_id.clone();
         dc.on_open(Box::new(move || {
             let channels = channels.clone();
-            let dc_store = dc_store.clone();
+            let dc_weak = dc_weak.clone();
             let peer = peer_for_open.clone();
             Box::pin(async move {
-                channels.lock().await.insert(peer, dc_store);
+                if let Some(dc) = dc_weak.upgrade() {
+                    channels.lock().await.insert(peer, dc);
+                }
             })
         }));
     }
@@ -346,28 +516,45 @@ impl WebRtcMesh {
                 }
             })
         }));
-        // Drop dead connections from the maps so they can be re-dialed.
+        // Drop dead connections from the maps so they can be re-dialed — and CLOSE them (webrtc 0.17
+        // has no Drop, so without close() the ICE agent + UDP socket leak).
         let conns = self.conns.clone();
         let channels = self.channels.clone();
         let peer2 = peer_id.to_string();
         pc.on_peer_connection_state_change(Box::new(move |s| {
-            use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+            use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
             let conns = conns.clone();
             let channels = channels.clone();
             let peer2 = peer2.clone();
             Box::pin(async move {
-                if matches!(
-                    s,
-                    RTCPeerConnectionState::Failed
-                        | RTCPeerConnectionState::Disconnected
-                        | RTCPeerConnectionState::Closed
-                ) {
-                    conns.lock().await.remove(&peer2);
-                    channels.lock().await.remove(&peer2);
+                match s {
+                    St::Failed => {
+                        // Terminal. Remove and close off-task (close() itself drives more state
+                        // changes, so don't re-enter this handler synchronously).
+                        let removed = conns.lock().await.remove(&peer2);
+                        channels.lock().await.remove(&peer2);
+                        if let Some(c) = removed {
+                            tokio::spawn(async move {
+                                let _ = c.pc.close().await;
+                            });
+                        }
+                    }
+                    St::Closed => {
+                        conns.lock().await.remove(&peer2);
+                        channels.lock().await.remove(&peer2);
+                    }
+                    // Disconnected is TRANSIENT (brief packet loss / NAT rebind): ICE often recovers
+                    // to Connected with the DataChannel still open. Tearing down here would drop a
+                    // live link (silent gossip black hole). Leave it; the reaper closes it only if it
+                    // stays un-Connected past MESH_STALE_SECS, and ICE itself escalates to Failed.
+                    _ => {}
                 }
             })
         }));
-        self.conns.lock().await.insert(peer_id.to_string(), pc.clone());
+        self.conns
+            .lock()
+            .await
+            .insert(peer_id.to_string(), PeerConn { pc: pc.clone(), created: Instant::now() });
         Ok(pc)
     }
 
@@ -383,17 +570,37 @@ impl WebRtcMesh {
         if self.conns.lock().await.contains_key(peer_id) {
             return Ok(());
         }
+        if self.conns.lock().await.len() >= MESH_MAX_CONNS {
+            return Ok(());
+        }
         let pc = self.new_pc(peer_id).await?;
+        // Any failure after the pc is in `conns` must close + remove it. A half-open offerer never
+        // reaches Failed on its own, so without this it would linger forever and blackhole the edge.
+        match self.negotiate_offer(&pc, peer_id).await {
+            Ok(()) => {
+                self.touch().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.close_and_forget(peer_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn negotiate_offer(
+        self: &Arc<Self>,
+        pc: &Arc<RTCPeerConnection>,
+        peer_id: &str,
+    ) -> Result<(), String> {
         let dc = pc
             .create_data_channel(MESH_CHANNEL_LABEL, Some(mesh_channel_init()))
             .await
             .map_err(|e| e.to_string())?;
         self.register_channel(peer_id.to_string(), dc);
         let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
-        let offer = set_local_and_gather(&pc, offer).await.map_err(|e| e.to_string())?;
-        self.transport
-            .post_signal(peer_id, "offer", &offer.sdp)
-            .await
+        let offer = set_local_and_gather(pc, offer).await.map_err(|e| e.to_string())?;
+        self.transport.post_signal(peer_id, "offer", &offer.sdp).await
     }
 
     async fn handle_offer(self: &Arc<Self>, from: &str, sdp: &str) -> Result<(), String> {
@@ -404,16 +611,46 @@ impl WebRtcMesh {
         if self.conns.lock().await.contains_key(from) {
             return Ok(()); // already have a connection to this peer
         }
+        // Anti-DoS: only accept offers from peers actually in the gateway directory (once we've
+        // fetched it), and cap total connections. Otherwise a spammer with throwaway lower-id keys
+        // could force unbounded RTCPeerConnections + STUN gathers.
+        {
+            let known = self.known_peers.lock().await;
+            if !known.is_empty() && !known.contains(from) {
+                return Ok(());
+            }
+        }
+        if self.conns.lock().await.len() >= MESH_MAX_CONNS {
+            return Ok(());
+        }
         let pc = self.new_pc(from).await?;
+        match self.negotiate_answer(&pc, from, sdp).await {
+            Ok(()) => {
+                self.touch().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.close_and_forget(from).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn negotiate_answer(
+        self: &Arc<Self>,
+        pc: &Arc<RTCPeerConnection>,
+        from: &str,
+        sdp: &str,
+    ) -> Result<(), String> {
         let remote = RTCSessionDescription::offer(sdp.to_string()).map_err(|e| e.to_string())?;
         pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
         let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
-        let answer = set_local_and_gather(&pc, answer).await.map_err(|e| e.to_string())?;
+        let answer = set_local_and_gather(pc, answer).await.map_err(|e| e.to_string())?;
         self.transport.post_signal(from, "answer", &answer.sdp).await
     }
 
     async fn handle_answer(&self, from: &str, sdp: &str) -> Result<(), String> {
-        let pc = self.conns.lock().await.get(from).cloned();
+        let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
             let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?;
             pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
@@ -422,7 +659,7 @@ impl WebRtcMesh {
     }
 
     async fn handle_candidate(&self, from: &str, cand: &str) -> Result<(), String> {
-        let pc = self.conns.lock().await.get(from).cloned();
+        let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
             let init = RTCIceCandidateInit {
                 candidate: cand.to_string(),
@@ -433,9 +670,11 @@ impl WebRtcMesh {
         Ok(())
     }
 
-    /// Drain the mailbox once and dispatch each envelope to the right handler.
-    pub async fn poll_signals(self: &Arc<Self>) -> Result<(), String> {
+    /// Drain the mailbox once and dispatch each envelope to the right handler. Returns the number of
+    /// envelopes processed so the caller can drive an activity-based poll cadence.
+    pub async fn poll_signals(self: &Arc<Self>) -> Result<usize, String> {
         let envelopes = self.transport.drain_signals().await?;
+        let n = envelopes.len();
         for e in envelopes {
             let r = match e.kind.as_str() {
                 "offer" => self.handle_offer(&e.from, &e.payload).await,
@@ -447,7 +686,10 @@ impl WebRtcMesh {
                 log::debug!("mesh signal {} from {} failed: {}", e.kind, &e.from[..8.min(e.from.len())], err);
             }
         }
-        Ok(())
+        if n > 0 {
+            self.touch().await;
+        }
+        Ok(n)
     }
 
     /// Send bytes to one peer over its DataChannel. Returns false if not connected.
@@ -475,6 +717,39 @@ impl WebRtcMesh {
     }
 }
 
+/// Choose which peers this node should DIAL, given the full sorted directory. Perfect negotiation
+/// makes the lower-id side the initiator, so we only ever dial ids GREATER than our own. Selecting
+/// relative to `local_id` (not by absolute global rank) is what makes EVERY node form edges: the old
+/// "take the 12 smallest ids" rule combined with "only dial higher ids" left every node but the ~13
+/// lowest with zero mesh links.
+///
+/// The immediate successors guarantee full connectivity (each node links to its next-higher neighbor
+/// → one connected chain over all N), and the remaining slots are spread across the higher id space
+/// to add long-range shortcuts for low gossip diameter. `sorted_ids` MUST be ascending.
+pub fn select_dial_targets(local_id: &str, sorted_ids: &[String], degree: usize) -> Vec<String> {
+    if degree == 0 {
+        return Vec::new();
+    }
+    let higher: Vec<&String> = sorted_ids.iter().filter(|id| id.as_str() > local_id).collect();
+    if higher.len() <= degree {
+        return higher.into_iter().cloned().collect();
+    }
+    // Nearest successors (guarantee connectivity) ...
+    let near = (degree / 2).max(1);
+    let mut out: Vec<String> = higher[..near].iter().map(|s| (*s).clone()).collect();
+    // ... then evenly spread the rest across the remaining higher ids (low-diameter shortcuts).
+    let rest = &higher[near..];
+    let want = degree - near;
+    if want > 0 && !rest.is_empty() {
+        for i in 0..want {
+            let idx = (i * rest.len()) / want;
+            out.push(rest[idx].clone());
+        }
+    }
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +762,57 @@ mod tests {
         use ring::rand::SystemRandom;
         use ring::signature::Ed25519KeyPair;
         Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref().to_vec()
+    }
+
+    // The topology guarantee that was broken before: with the OLD "dial the 12 globally-smallest ids"
+    // rule, only ~13 nodes ever meshed. This proves the fixed relative selection yields a SINGLE
+    // connected component (every node reachable) with no isolated node, across many network sizes —
+    // the property "hundreds of miners actually mesh" depends on.
+    #[test]
+    fn dial_targets_yield_one_connected_component_at_every_size() {
+        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+            let mut root = x;
+            while parent[root] != root {
+                root = parent[root];
+            }
+            let mut cur = x;
+            while parent[cur] != cur {
+                let next = parent[cur];
+                parent[cur] = root;
+                cur = next;
+            }
+            root
+        }
+
+        for &n in &[2usize, 3, 5, 12, 13, 14, 25, 50, 200, 300] {
+            // Deterministic, strictly-increasing 64-hex node_ids (fixed width => lexicographic order
+            // matches numeric order, same as real hex pubkeys sorted by the gateway/dialer).
+            let mut ids: Vec<String> = (0..n).map(|i| format!("{:064x}", i * 131 + 17)).collect();
+            ids.sort();
+            let index: HashMap<&str, usize> =
+                ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let mut parent: Vec<usize> = (0..n).collect();
+            let mut degree = vec![0usize; n];
+
+            for id in &ids {
+                let targets = select_dial_targets(id, &ids, 12);
+                let a = index[id.as_str()];
+                for t in &targets {
+                    assert!(t.as_str() > id.as_str(), "n={n}: must only ever dial higher ids");
+                    let b = index[t.as_str()];
+                    degree[a] += 1;
+                    degree[b] += 1;
+                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                    parent[ra] = rb;
+                }
+            }
+
+            let root = find(&mut parent, 0);
+            for i in 0..n {
+                assert_eq!(find(&mut parent, i), root, "n={n}: node {i} is in a separate component");
+                assert!(degree[i] > 0, "n={n}: node {i} is isolated (zero mesh edges)");
+            }
+        }
     }
 
     // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
@@ -533,9 +859,9 @@ mod tests {
         let b_id = t_b.local_node_id().to_string();
 
         let (mesh_a, _rx_a) =
-            WebRtcMesh::new(t_a, Arc::new(build_api().unwrap()), default_stun_urls()).unwrap();
+            WebRtcMesh::new(t_a, Arc::new(build_api(true).unwrap()), default_stun_urls()).unwrap();
         let (mesh_b, mut rx_b) =
-            WebRtcMesh::new(t_b, Arc::new(build_api().unwrap()), default_stun_urls()).unwrap();
+            WebRtcMesh::new(t_b, Arc::new(build_api(true).unwrap()), default_stun_urls()).unwrap();
 
         // Both run their signaling loop.
         for m in [mesh_a.clone(), mesh_b.clone()] {
@@ -584,7 +910,7 @@ mod tests {
     // /api/signal mailbox) differs. If this passes, the Rust WebRTC theory is solid.
     #[tokio::test]
     async fn datachannel_handshake_delivers_a_message() {
-        let api = build_api().expect("api");
+        let api = build_api(true).expect("api");
         let offerer = new_peer_connection(&api, ice_config(&[])).await.expect("offerer pc");
         let answerer = new_peer_connection(&api, ice_config(&[])).await.expect("answerer pc");
 
@@ -634,5 +960,44 @@ mod tests {
 
         let _ = offerer.close().await;
         let _ = answerer.close().await;
+    }
+
+    // Guards the internet-only ICE config against the one way it could silently break: a real node
+    // uses build_api(false) (loopback OFF, mDNS off, LAN/private filtered), so its ONLY path to a
+    // reachable candidate is the server-reflexive address STUN reflects back. This asserts that
+    // config actually yields a srflx candidate, and that NO candidate advertises a LAN/private or
+    // loopback connection-address (no local-network access, no leak). Needs reachable public STUN.
+    #[tokio::test]
+    #[ignore]
+    async fn production_config_gathers_public_candidate_and_leaks_no_lan() {
+        let api = build_api(false).expect("api");
+        let pc = new_peer_connection(&api, ice_config(&default_stun_urls()))
+            .await
+            .expect("pc");
+        let _dc = pc
+            .create_data_channel(MESH_CHANNEL_LABEL, Some(mesh_channel_init()))
+            .await
+            .expect("dc");
+        let offer = pc.create_offer(None).await.expect("offer");
+        let offer = set_local_and_gather(&pc, offer).await.expect("gather");
+        let sdp = offer.sdp;
+
+        assert!(
+            sdp.contains("typ srflx"),
+            "production config gathered no server-reflexive candidate — internet-only mesh would \
+             have no reachable path:\n{sdp}"
+        );
+
+        // Every candidate's connection-address (SDP token 4) must be public: no LAN, no loopback.
+        for line in sdp.lines().filter(|l| l.contains("candidate:")) {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if let Some(addr) = toks.get(4) {
+                if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+                    assert!(!is_lan_or_local(ip), "leaked a LAN/private candidate: {line}");
+                    assert!(!ip.is_loopback(), "gathered a loopback candidate in prod: {line}");
+                }
+            }
+        }
+        let _ = pc.close().await;
     }
 }

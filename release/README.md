@@ -160,6 +160,10 @@ ALPHANUMERIC_WEBRTC_MESH=true ./alphanumeric
 It falls back to the normal gateway relay automatically for the minority of peers it can't reach
 directly, so there's no downside to enabling it.
 
+The mesh is **internet-only**: it connects using your public internet address (discovered via
+standard STUN) and never scans, advertises, or connects to devices on your local network — so it
+will not trigger any "allow access to your local network" prompt.
+
 ## Running a Public Node (Optional)
 
 A normal client bootstraps from the gateway and connects out to peers — you do not need to
