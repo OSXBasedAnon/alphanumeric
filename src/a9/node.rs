@@ -2891,6 +2891,36 @@ impl Node {
                 }
             }
         }
+        // FORWARD-DRAIN FALLBACK. Every tip candidate failed to converge — which,
+        // with a genuine relay hole somewhere above us (a block that was never
+        // successfully posted), means NO tip's prev-hash ancestry is walkable back
+        // to our tip. But the relay is still CONTIGUOUS from our tip up to that first
+        // hole, and those blocks chain cleanly onto what we hold. Greedily apply that
+        // hole-free prefix so the publisher (and the beacon, and every bootstrapping
+        // node) advances to the hole instead of freezing far below it while miners
+        // race ahead peer-to-peer (the 2026-07-08 evening stall: frozen at 2198 with
+        // the relay head at 2434 over a hole at 2246). sync_with_block_relay applies
+        // strictly-chaining blocks from local_tip forward and stops at the first gap;
+        // it re-runs every tick, so as the hole is later backfilled the drain resumes.
+        if tried > 0 && !matches!(last, Converge::Converged | Converge::AtTipAhead) {
+            let before = {
+                let bc = self.blockchain.read().await;
+                bc.get_latest_block_index() as u32
+            };
+            let _ = self.sync_with_block_relay(before).await;
+            let after = {
+                let bc = self.blockchain.read().await;
+                bc.get_latest_block_index() as u32
+            };
+            if after > before {
+                info!(
+                    "Publisher forward-drained relay prefix {} -> {} (stopped at a relay gap)",
+                    before, after
+                );
+                return Converge::Progressed;
+            }
+        }
+
         // Escalation semantics (M2, publisher exit->re-bootstrap) are preserved but
         // STRICTER: only report NeedsBootstrap when every tried candidate needed it
         // (genuine deep divergence). A mix that includes a mere relay gap reports
