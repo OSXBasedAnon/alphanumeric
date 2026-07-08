@@ -1616,11 +1616,20 @@ impl Node {
     }
 
     fn relay_backfill_limit() -> u32 {
+        // 32 (was 4, cap 12): after each mined/accepted block a node re-posts its
+        // recent tail to the relay. At 4-deep, a fork storm that drops posts (old
+        // 90/min limit) left the winning chain as Swiss cheese on the relay — ~70
+        // missing heights across 2200-2483 on 2026-07-08 — which no node could
+        // reorg across, stranding the majority on a losing fork. A deeper tail means
+        // every active miner continuously heals recent holes on the shared relay, so
+        // a scattered chain reconverges instead of fragmenting. The WASM PoW gate +
+        // 300/min per-IP limit keep this from being a write-amplification problem
+        // (re-posts of already-stored blocks are cheap SET NX no-ops).
         std::env::var("ALPHANUMERIC_RELAY_BACKFILL_LIMIT")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(4)
-            .min(12)
+            .unwrap_or(32)
+            .min(64)
     }
 
     fn env_interval_secs(name: &str, default_secs: u64, min_secs: u64, max_secs: u64) -> u64 {
@@ -2834,6 +2843,45 @@ impl Node {
             }
             false
         };
+
+        // DEEPEST-REACHABLE-TIP PRIORITY. When the winning branch has holes higher up
+        // (posts dropped during a fork storm), the max-height tip is unwalkable, but
+        // the branch is contiguous from our fork point up to the FIRST hole. Targeting
+        // the highest block just below that first gap lets the publisher reorg onto the
+        // winning branch and advance to the gap in one step, instead of the candidate
+        // budget burning on unreachable high tips (2026-07-08: stranded at 2199 on a
+        // dead fork while a reorg to ~2272 was available). This is a HINT prepended to
+        // the candidate list; it still routes through the same validated converge.
+        {
+            let present: std::collections::HashSet<u32> =
+                blocks.iter().map(|b| b.index).collect();
+            let max_h = blocks.iter().map(|b| b.index).max().unwrap_or(local_tip);
+            let mut first_gap = None;
+            let mut h = local_tip.saturating_add(1);
+            while h <= max_h {
+                if !present.contains(&h) {
+                    first_gap = Some(h);
+                    break;
+                }
+                h += 1;
+            }
+            let reachable_top = first_gap.map(|g| g.saturating_sub(1)).unwrap_or(max_h);
+            if reachable_top > local_tip {
+                // Lowest-hash block at the reachable-top height = deterministic target.
+                if let Some(b) = blocks
+                    .iter()
+                    .filter(|b| b.index == reachable_top)
+                    .min_by_key(|b| b.hash)
+                {
+                    let key = (b.index, b.hash);
+                    // Prepend if not already the first candidate.
+                    if candidates.first() != Some(&key) {
+                        candidates.retain(|c| *c != key);
+                        candidates.insert(0, key);
+                    }
+                }
+            }
+        }
 
         let mut last = Converge::BeaconStale;
         let mut tried = 0usize;
