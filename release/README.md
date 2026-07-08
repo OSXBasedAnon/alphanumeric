@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This download contains Alphanumeric client version 7.6.0 for macOS.
+This download contains Alphanumeric client version 7.6.1 for macOS.
 
 ## What Is Included
 
@@ -146,19 +146,21 @@ If you need to set it manually:
 ALPHANUMERIC_DISCOVERY_BASES=https://alphanumeric.blue ./alphanumeric
 ```
 
-## Faster Sync: WebRTC Mesh (Recommended)
+## Faster Sync: WebRTC Mesh (on by default)
 
-Most miners are behind home NAT with no open port, so by default blocks propagate through the
-gateway relay, which is slower. The WebRTC mesh lets your node hole-punch **direct** peer-to-peer
+Most miners are behind home NAT with no open port, so blocks would otherwise propagate only through
+the gateway relay, which is slower. The WebRTC mesh lets your node hole-punch **direct** peer-to-peer
 links to other miners (coordinated by the gateway, no port-forwarding needed), so blocks gossip
-node-to-node and catch-up is much faster. Turn it on:
+node-to-node and catch-up is much faster. As of v7.6.1 the mesh is **on by default** — there is
+nothing to configure.
+
+It falls back to the normal gateway relay automatically for any peer it can't reach directly, and a
+node with no mesh peers just runs on the relay exactly as before — so there is no downside. If you
+ever want to turn it off:
 
 ```bash
-ALPHANUMERIC_WEBRTC_MESH=true ./alphanumeric
+ALPHANUMERIC_WEBRTC_MESH=false ./alphanumeric
 ```
-
-It falls back to the normal gateway relay automatically for the minority of peers it can't reach
-directly, so there's no downside to enabling it.
 
 The mesh is **internet-only**: it connects using your public internet address (discovered via
 standard STUN) and never scans, advertises, or connects to devices on your local network — so it

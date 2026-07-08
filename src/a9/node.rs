@@ -6139,7 +6139,16 @@ impl Node {
             }
         };
 
-        if block.calculate_hash_for_block() != block.hash || !block.verify_pow_meets_floor() {
+        // A block's CLAIMED hash (block.hash, attacker-controlled off the wire) must equal its COMPUTED
+        // hash. If it lies, reject it WITHOUT negative-caching — the cache is keyed by the claimed hash,
+        // so caching a false verdict under an attacker-chosen hash would let a garbage block suppress the
+        // REAL block that legitimately has that hash (a low-cost valid-block censorship on every path).
+        if block.calculate_hash_for_block() != block.hash {
+            return Ok(false);
+        }
+        // Correct hash but PoW below floor -> definitively invalid; safe to negative-cache under its
+        // OWN (now verified-correct) hash so replays short-circuit.
+        if !block.verify_pow_meets_floor() {
             self.validation_cache.insert(
                 block_hash,
                 ValidationCacheEntry {
@@ -6297,7 +6306,21 @@ impl Node {
         peer: Option<SocketAddr>,
     ) -> Result<Option<Transaction>, NodeError> {
         let tx_id = tx.get_tx_id();
-        if let Some(cached) = self.tx_witness_cache.lock().get(&tx_id).cloned() {
+        // Defense-in-depth: only trust a cached witness whose id matches its key. An entry that doesn't
+        // (a bogus TxResponse poison) is dropped so resolution falls through to the block's own
+        // signature / mempool / peer fetch instead of censoring a valid block. Done under one lock.
+        let cached = {
+            let mut cache = self.tx_witness_cache.lock();
+            match cache.get(&tx_id).cloned() {
+                Some(c) if c.get_tx_id() == tx_id => Some(c),
+                Some(_) => {
+                    cache.pop(&tx_id);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(cached) = cached {
             return Ok(Some(cached));
         }
 
@@ -6876,8 +6899,14 @@ impl Node {
 
             NetworkMessage::TxResponse { tx_id, tx } => {
                 if let Some(ref full_tx) = tx {
-                    let mut cache = self.tx_witness_cache.lock();
-                    cache.put(tx_id.clone(), full_tx.clone());
+                    // Only cache a witness whose id actually matches its key. An unsolicited/bogus
+                    // TxResponse{tx_id:T, tx:<mismatched>} must NOT poison the witness cache — otherwise
+                    // it would censor every valid block carrying tx T (resolve_full_tx_for_block reads
+                    // this cache first). Downstream still verifies the signature, so this is liveness-only
+                    // defense, but it closes a low-cost targeted valid-block censorship on all paths.
+                    if full_tx.get_tx_id() == tx_id {
+                        self.tx_witness_cache.lock().put(tx_id.clone(), full_tx.clone());
+                    }
                 }
 
                 let sender = {
@@ -7306,7 +7335,15 @@ impl Node {
 
     #[cfg(feature = "webrtc_mesh")]
     fn webrtc_mesh_enabled() -> bool {
-        Self::env_flag_enabled("ALPHANUMERIC_WEBRTC_MESH")
+        // Default ON as of v7.6.1: the mesh is a pure additive layer — a node with no mesh peers is
+        // dormant and runs entirely on the gateway relay + TCP, blocks are validated identically on
+        // every path, and the gateway kill switch (mesh_enabled) can disable it network-wide in ~30s.
+        // So enabling it can only help propagation, never reduce base reachability. Opt out explicitly
+        // with ALPHANUMERIC_WEBRTC_MESH=false (or 0/no/off).
+        match std::env::var("ALPHANUMERIC_WEBRTC_MESH") {
+            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+            Err(_) => true,
+        }
     }
 
     /// Peer node_ids from the gateway directory — who to dial into the mesh (signaling is keyed by
@@ -7506,31 +7543,70 @@ impl Node {
         }
         {
             let node = self.clone();
+            // Mesh-local seen-set: dedups block replays / gossip loops WITHOUT touching the shared
+            // network_bloom, so a mesh block that fails standalone validation never poisons the shared
+            // dedup path (and can't be re-validated on every replay).
+            let mesh_seen: Arc<PLMutex<LruCache<String, ()>>> =
+                Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
             tokio::spawn(async move {
                 while let Some((_peer, bytes)) = inbound_rx.recv().await {
-                    node.handle_mesh_message(bytes).await;
+                    node.handle_mesh_message(bytes, &mesh_seen).await;
                 }
             });
         }
     }
 
-    /// Inbound mesh bytes -> the SAME validated processing path as a TCP message (bloom dedup, PoW +
-    /// ML-DSA verify, save, re-flood). Transport-only: no consensus change.
+    /// Inbound mesh bytes -> validated processing. Transport-only: no consensus change.
+    ///
+    /// The mesh runs peer=None (there is no request-a-witness channel over a DataChannel), so a block
+    /// that needs a peer-fetched ML-DSA witness cannot be validated here. Rather than feed such a block
+    /// into the shared bloom-before-validate path — where a witness-missing failure would poison the
+    /// bloom and suppress the later TCP delivery that CAN fetch the witness — we pre-validate STANDALONE
+    /// and only hand VALID blocks to the shared path. A block we can't validate standalone is simply
+    /// left for TCP/relay. Two properties make this safe where three consensus-core attempts failed:
+    /// (1) the shared consensus path is untouched; (2) peer=None means there is no peer witness for an
+    /// attacker to supply, so this ingest cannot be used to poison/censor. A mesh-local seen-set dedups
+    /// replays so an invalid block can't be re-validated on every arrival.
     #[cfg(feature = "webrtc_mesh")]
-    async fn handle_mesh_message(&self, bytes: Vec<u8>) {
+    async fn handle_mesh_message(&self, bytes: Vec<u8>, mesh_seen: &Arc<PLMutex<LruCache<String, ()>>>) {
         let msg: NetworkMessage = match codec::deserialize(&bytes) {
             Ok(m) => m,
             Err(_) => return,
         };
-        let event = match msg {
-            NetworkMessage::Block(b) => Some(NetworkEvent::NewBlock(b)),
-            NetworkMessage::Transaction(t) => Some(NetworkEvent::NewTransaction(t)),
-            _ => None,
-        };
-        if let Some(e) = event {
-            if let Err(err) = self.handle_network_event(e).await {
-                debug!("WebRTC mesh: message processing error: {}", err);
+        match msg {
+            NetworkMessage::Block(b) => {
+                let hash = hex::encode(b.calculate_hash_for_block());
+                {
+                    let mut seen = mesh_seen.lock();
+                    if seen.get(&hash).is_some() {
+                        return; // mesh-local dedup: replay or gossip loop
+                    }
+                    seen.put(hash, ());
+                }
+                // Reject below-floor PoW cheaply, BEFORE acquiring a validation permit — the same gate
+                // every other ingress applies (mirrors the TCP block handler). Keeps a no-PoW mesh flood
+                // from consuming validation work.
+                if !b.verify_pow_meets_floor() {
+                    return;
+                }
+                // Only forward blocks we can validate standalone; witness-requiring blocks are left for
+                // the TCP/relay path (peer=Some) which can fetch the witness. The shared path re-checks
+                // and hits its validation cache, so this costs no extra verification.
+                if self.verify_block_parallel(&b).await.unwrap_or(false) {
+                    if let Err(err) = self.handle_network_event(NetworkEvent::NewBlock(b)).await {
+                        debug!("WebRTC mesh: block processing error: {}", err);
+                    }
+                }
             }
+            NetworkMessage::Transaction(t) => {
+                if let Err(err) = self
+                    .handle_network_event(NetworkEvent::NewTransaction(t))
+                    .await
+                {
+                    debug!("WebRTC mesh: tx processing error: {}", err);
+                }
+            }
+            _ => {}
         }
     }
 
