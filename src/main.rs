@@ -1152,11 +1152,19 @@ async fn main() -> Result<()> {
             });
         }
 
-        // Initialize BPoS sentinel at startup
+        // Initialize BPoS sentinel at startup. TIME-BOXED: initialize() runs
+        // verify_chain_state, whose anomaly path can chase peers over the network —
+        // at a high block rate (constant same-height races) this reliably found work
+        // to chase and sat here FOREVER with zero output, right before the menu: the
+        // "client hangs after 'Loaded N wallets successfully', restart needed" bug.
+        // initialize() is idempotent and its monitoring tasks spawn before any await,
+        // so deferring the rest is safe — the 60s monitor loop covers it.
         {
             let sentinel = staking_node.write().await;
-            if let Err(e) = sentinel.initialize().await {
-                error!("Failed to initialize staking sentinel: {}", e);
+            match tokio::time::timeout(Duration::from_secs(8), sentinel.initialize()).await {
+                Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
+                Err(_) => warn!("Staking sentinel initialization deferred (node busy); continuing startup"),
+                Ok(Ok(())) => {}
             }
         }
 
