@@ -5435,16 +5435,18 @@ impl Node {
                     }
                     strikes += 1;
                     error!(
-                        "lock watchdog: core lock wedged (chain_ok={}, peers_ok={}) strike {}/2",
+                        "lock watchdog: core lock wedged (chain_ok={}, peers_ok={}) strike {}",
                         chain_ok, peers_ok, strikes
                     );
                     if strikes >= 2 {
                         if headless {
                             error!("lock watchdog: restarting to self-heal (supervisor respawns)");
                             std::process::exit(0);
-                        } else {
+                        } else if strikes == 2 {
+                            // Print the operator hint ONCE; keep counting quietly after
+                            // (an interactive session is never killed under the user).
                             println!(
-                                "A background task has deadlocked (watchdog: chain_ok={}, peers_ok={}). Please restart the client.",
+                                "A background task has stalled (watchdog: chain_ok={}, peers_ok={}). Mining/commands may degrade — restart the client when convenient.",
                                 chain_ok, peers_ok
                             );
                         }
@@ -7019,15 +7021,28 @@ impl Node {
                     #[cfg(feature = "webrtc_mesh")]
                     self.mesh_gossip(&NetworkMessage::Transaction(tx.clone())).await;
 
-                    // Broadcast to subset of peers
-                    let peers = self.peers.read().await;
-                    let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(8));
+                    // Broadcast to subset of peers. SNAPSHOT-THEN-DROP before sending:
+                    // this held the peers READ guard across per-peer TCP sends — one
+                    // stalled socket parked the guard indefinitely and (fair RwLock)
+                    // wedged every later peers-lock user. The SECOND wedge of
+                    // 2026-07-08, caught live by the lock watchdog (peers_ok=false)
+                    // on a client that had just gossiped transactions.
+                    let selected_peers = {
+                        let peers = self.peers.read().await;
+                        self.select_broadcast_peers(&peers, peers.len().min(8))
+                    };
                     for &addr in &selected_peers {
-                        if let Err(e) = self
-                            .send_message(addr, &NetworkMessage::Transaction(tx.clone()))
-                            .await
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            self.send_message(addr, &NetworkMessage::Transaction(tx.clone())),
+                        )
+                        .await
                         {
-                            warn!("Failed to broadcast transaction to {}: {}", addr, e);
+                            Ok(Err(e)) => {
+                                warn!("Failed to broadcast transaction to {}: {}", addr, e)
+                            }
+                            Err(_) => warn!("Transaction broadcast to {} timed out", addr),
+                            Ok(Ok(())) => {}
                         }
                     }
                 }

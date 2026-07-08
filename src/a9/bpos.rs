@@ -469,17 +469,21 @@ impl BPoSSentinel {
         }
 
         let max_peer_height = {
-            let peers = self.node.peers.read().await;
+            // Snapshot peers first, then read headers — never hold both guards at
+            // once (couples the locks: a wedged headers writer would wedge peers).
+            let peer_infos: Vec<(String, u32)> = {
+                let peers = self.node.peers.read().await;
+                peers
+                    .values()
+                    .map(|info| (info.address.to_string(), info.blocks))
+                    .collect()
+            };
             let headers = self.header_sentinel.headers.read().await;
 
-            peers
-                .values()
-                .filter(|info| {
-                    headers
-                        .iter()
-                        .any(|h| h.verified_by.contains(&info.address.to_string()))
-                })
-                .map(|info| info.blocks)
+            peer_infos
+                .iter()
+                .filter(|(address, _)| headers.iter().any(|h| h.verified_by.contains(address)))
+                .map(|(_, blocks)| *blocks)
                 .max()
                 .unwrap_or(0)
         };
@@ -1533,12 +1537,16 @@ impl BPoSSentinel {
         *last_broadcast = now;
         drop(last_broadcast);
 
-        let peers = self.node.peers.read().await;
-
-        for (addr, _) in peers.iter() {
+        // Snapshot-then-drop: never hold the peers guard across network sends (the
+        // guard-across-send pattern livelocked the whole node on 2026-07-08).
+        let addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        for addr in addrs {
             let message = NetworkMessage::AlertMessage(format!("ANOMALY:{}", height));
 
-            if let Err(e) = self.node.send_message(*addr, &message).await {
+            if let Err(e) = self.node.send_message(addr, &message).await {
                 error!("Failed to alert peer {} of critical anomaly: {}", addr, e);
             }
         }
@@ -1546,11 +1554,15 @@ impl BPoSSentinel {
     }
 
     async fn attempt_chain_recovery(&self, height: u32) -> Result<(), String> {
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop (see broadcast_anomaly_alert).
+        let peer_addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
         let mut valid_blocks = Vec::new();
 
         // Request blocks from peers in parallel
-        let requests = peers.keys().map(|addr| async {
+        let requests = peer_addrs.iter().map(|addr| async {
             match self.node.request_blocks(*addr, height, height).await {
                 Ok(mut blocks) => {
                     if blocks.len() == 1
@@ -1660,17 +1672,23 @@ impl BPoSSentinel {
 
     // Verify network integrity
     pub async fn verify_network_integrity(&self) -> Result<(), String> {
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop: this ran periodically holding the peers guard across
+        // challenge generation AND the whole network verification fan-out — a prime
+        // wedge/livelock source (2026-07-08 class: guard-across-network-io).
+        let peer_addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
         let mut verifications = Vec::new();
 
         // Generate and send challenges in parallel
-        for (addr, _) in peers.iter() {
+        for addr in peer_addrs {
             let challenge = self
                 .generate_challenge()
                 .await
                 .map_err(|e| format!("Failed to generate challenge: {}", e))?;
 
-            verifications.push((*addr, challenge));
+            verifications.push((addr, challenge));
         }
 
         // Clone the necessary data for each verification task
@@ -1790,14 +1808,18 @@ impl BPoSSentinel {
             sentinel.verified_peers.remove(&addr.to_string());
         }
 
-        let peers = self.node.peers.read().await;
-        for (peer_addr, _) in peers.iter() {
-            if *peer_addr != addr {
+        // Snapshot-then-drop: never hold the peers guard across sends.
+        let peer_addrs: Vec<SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        for peer_addr in peer_addrs {
+            if peer_addr != addr {
                 let alert = NetworkMessage::AlertMessage(format!(
                     "SENTINEL_ALERT:{}:VERIFICATION_FAILED",
                     addr
                 ));
-                if let Err(e) = self.node.send_message(*peer_addr, &alert).await {
+                if let Err(e) = self.node.send_message(peer_addr, &alert).await {
                     warn!("Failed to send sentinel alert to {}: {}", peer_addr, e);
                 }
             }
