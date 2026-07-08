@@ -553,6 +553,10 @@ impl WebRtcMesh {
                     channels.lock().await.insert(peer.clone(), dc);
                     // The channel is live — this peer connected, so clear any dial backoff.
                     backoff.lock().await.remove(&peer);
+                    // Operator-visible proof that a DIRECT peer-to-peer link hole-punched (as opposed
+                    // to falling back to the gateway relay). This is the signal to watch in a real
+                    // two-network test.
+                    log::info!("mesh: direct link UP to {}…", &peer[..8.min(peer.len())]);
                 }
             })
         }));

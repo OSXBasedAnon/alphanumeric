@@ -7409,6 +7409,20 @@ impl Node {
             });
         }
         {
+            // Heartbeat: periodic operator-visible mesh degree, so a rollout can watch how many DIRECT
+            // peer links are up (vs. relay fallback). Only logs when at least one link is up.
+            let mesh = mesh.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let peers = mesh.connected_peers().await;
+                    if !peers.is_empty() {
+                        info!("mesh: {} direct peer link(s) up", peers.len());
+                    }
+                }
+            });
+        }
+        {
             let node = self.clone();
             tokio::spawn(async move {
                 while let Some((_peer, bytes)) = inbound_rx.recv().await {
