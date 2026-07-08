@@ -5404,6 +5404,55 @@ impl Node {
         #[cfg(feature = "webrtc_mesh")]
         self.spawn_webrtc_mesh();
 
+        // LOCK WATCHDOG. Two distinct forever-wedges shipped in this codebase before
+        // being found (peers guard held across a join_all fan-out; an as-yet-unlocated
+        // blockchain-lock holder on 2026-07-08 that froze the publisher hourly). Each
+        // froze mining/status/beacon until a manual restart. The watchdog probes both
+        // core locks once a minute; two consecutive failed probes mean the node is
+        // wedged beyond recovery, so a HEADLESS node (publisher — launchd/systemd
+        // respawns it) exits to self-heal, capping any future wedge at ~3 minutes.
+        // Interactive clients only log loudly (killing a console with a typing user
+        // is worse than a degraded session). The probe log says WHICH lock wedged —
+        // the breadcrumb for root-causing any holder we haven't found yet.
+        {
+            let wd = self.clone();
+            let headless = std::env::var("ALPHANUMERIC_HEADLESS")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
+            tokio::spawn(async move {
+                let mut strikes: u32 = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let chain_ok = timeout(Duration::from_secs(10), wd.blockchain.read())
+                        .await
+                        .is_ok();
+                    let peers_ok = timeout(Duration::from_secs(10), wd.peers.read())
+                        .await
+                        .is_ok();
+                    if chain_ok && peers_ok {
+                        strikes = 0;
+                        continue;
+                    }
+                    strikes += 1;
+                    error!(
+                        "lock watchdog: core lock wedged (chain_ok={}, peers_ok={}) strike {}/2",
+                        chain_ok, peers_ok, strikes
+                    );
+                    if strikes >= 2 {
+                        if headless {
+                            error!("lock watchdog: restarting to self-heal (supervisor respawns)");
+                            std::process::exit(0);
+                        } else {
+                            println!(
+                                "A background task has deadlocked (watchdog: chain_ok={}, peers_ok={}). Please restart the client.",
+                                chain_ok, peers_ok
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
         info!("Node startup complete - ready to accept connections");
         Ok(())
     }
