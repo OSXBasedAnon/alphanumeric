@@ -1688,6 +1688,20 @@ println!("Wallet renamed successfully");
                                 "Preparing mining: syncing to the network tip so we can compete..."
                             );
                         }
+                        // Liveness heartbeat: every prep step is time-bounded, but the
+                        // bounds can stack to ~30s per attempt on a churning network,
+                        // which USERS read as "it's stuck, restart the client". Print
+                        // elapsed progress every 5s so silence never looks like a hang.
+                        let prep_heartbeat = tokio::spawn(async {
+                            let started = Instant::now();
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                println!(
+                                    "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
+                                    started.elapsed().as_secs()
+                                );
+                            }
+                        });
                         // Converge-then-compete with a bounded retry. Only a genuine
                         // below-finality divergence (needs re-bootstrap) is a hard stop.
                         const MINE_PREP_ATTEMPTS: u32 = 3;
@@ -1718,6 +1732,7 @@ println!("Wallet renamed successfully");
                                 }
                             }
                         }
+                        prep_heartbeat.abort();
                         if let Some(reason) = prep_stop {
                             println!("Cannot mine right now: {}", reason);
                             break 'mining;

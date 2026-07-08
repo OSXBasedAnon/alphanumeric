@@ -88,7 +88,11 @@ const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
 /// origin/Redis nothing, so this stays O(1) in client count; a version change is
 /// the ONLY thing that triggers a block fetch, so there is no redundant pulling.
-const BEACON_POLL_INTERVAL_SECS: u64 = 2;
+// 3s (was 2s): with ~10s+ block intervals the extra second of worst-case discovery
+// latency is invisible, but it cuts every client's edge-request volume against the
+// gateway by a third (43k -> 29k requests/day per node) — the fleet is the dominant
+// consumer of the Vercel edge budget.
+const BEACON_POLL_INTERVAL_SECS: u64 = 3;
 
 /// The canonical tip as advertised by the signed beacon (height, hash, version).
 #[derive(Clone, Copy)]
@@ -5205,11 +5209,42 @@ impl Node {
                 let mut last_version: u64 = u64::MAX;
                 let mut ticks_since_full: u64 = 0;
                 let mut publisher_bootstrap_strikes: u32 = 0;
+                let mut tick_no: u64 = 0;
                 let safety_ticks = (safety_secs / tick_secs).max(1);
                 loop {
                     ticker.tick().await;
+                    tick_no += 1;
 
-                    let beacon = node_clone.fetch_tip_beacon().await;
+                    // Publisher idle throttle: when the local tip hasn't moved in over
+                    // 2 minutes nobody is mining — probing the relay every second is
+                    // ~86k edge requests/day of pure idle burn. Probe every 5th tick
+                    // instead; the first block after an idle stretch is noticed within
+                    // <=5s, which is fine when blocks were minutes apart anyway. Full
+                    // 1s cadence resumes automatically once blocks flow again.
+                    if is_publisher {
+                        let tip_age = {
+                            let bc = node_clone.blockchain.read().await;
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            bc.get_last_block()
+                                .map(|b| now.saturating_sub(b.timestamp))
+                                .unwrap_or(0)
+                        };
+                        if tip_age > 120 && tick_no % 5 != 0 {
+                            continue;
+                        }
+                    }
+
+                    // The publisher is the SOURCE of the beacon: fetching its own
+                    // beacon back through the CDN every second was another ~86k wasted
+                    // edge requests/day. Only clients follow the beacon.
+                    let beacon = if is_publisher {
+                        None
+                    } else {
+                        node_clone.fetch_tip_beacon().await
+                    };
                     let beacon_changed = beacon.map(|b| b.version != last_version).unwrap_or(false);
 
                     ticks_since_full += 1;
