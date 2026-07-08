@@ -9,4 +9,6 @@ pub mod oracle;
 pub mod progpow;
 pub mod velocity;
 pub mod wallet;
+#[cfg(feature = "webrtc_mesh")]
+pub mod webrtc;
 pub mod whisper;

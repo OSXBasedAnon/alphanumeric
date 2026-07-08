@@ -35,6 +35,13 @@ reed-solomon-erasure = "6.0.0"
 ml-dsa = "0.1.1"
 aes-gcm = "0.10"
 zeroize = "1"
+# WebRTC DataChannel transport for the NAT-traversal mesh (feature `webrtc_mesh`). Optional so the
+# default binary stays lean (AV-false-positive surface) — release builds enable the feature.
+webrtc = { version = "0.17", optional = true }
+bytes = { version = "1", optional = true }
+# webrtc's DTLS uses rustls 0.23, which needs a process-wide crypto provider installed explicitly.
+# Pin it to `ring` (the provider this codebase already links) to resolve the provider ambiguity.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 inquire = "0.7.0"
 tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
@@ -74,6 +81,8 @@ default = []
 bootstrap_publisher = []
 # Reserved feature flag used by some libp2p/TCP-specific code paths.
 tcp = []
+# WebRTC DataChannel mesh: NAT'd miners hole-punch direct P2P links, signaled by the gateway.
+webrtc_mesh = ["dep:webrtc", "dep:bytes", "dep:rustls"]
 
 # NOTE:
 # Windows Defender ML detections are often triggered by small, stripped, unsigned binaries
