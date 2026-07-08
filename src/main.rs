@@ -1335,27 +1335,31 @@ async fn main() -> Result<()> {
     let mut total_balance = 0.0;
     let mut processed_wallets = 0;
 
-    // Get the blockchain guard once and use it for both operations
-    let blockchain_guard = blockchain.read().await;
-
-    // Calculate total balance
-    for wallet in wallets.values() {
-        if let Ok(balance) = blockchain_guard.get_wallet_balance(&wallet.address).await {
-            total_balance += balance;
-            processed_wallets += 1;
+    // Calculate total balance under a SHORT-LIVED guard, dropped before anything
+    // else runs. Holding this read across sentinel.initialize() deadlocked the whole
+    // REPL: initialize() re-reads the blockchain, and tokio's fair RwLock parks that
+    // second read behind any writer queued in between (block ingest queues writers
+    // every few seconds on a live chain) while the writer waits on our first read.
+    {
+        let blockchain_guard = blockchain.read().await;
+        for wallet in wallets.values() {
+            if let Ok(balance) = blockchain_guard.get_wallet_balance(&wallet.address).await {
+                total_balance += balance;
+                processed_wallets += 1;
+            }
         }
     }
 
-    // Initialize sentinel
+    // Initialize sentinel (idempotent; first info call only). Time-boxed so a busy
+    // node can never wedge the console — it will simply initialize on a later call.
     {
         let sentinel = staking_node.write().await;
-        if let Err(e) = sentinel.initialize().await {
-            error!("Failed to initialize staking sentinel: {}", e);
+        match tokio::time::timeout(Duration::from_secs(5), sentinel.initialize()).await {
+            Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
+            Err(_) => warn!("Staking sentinel initialization deferred (node busy)"),
+            Ok(Ok(())) => {}
         }
     }
-
-    // Drop blockchain guard explicitly after we're done with it
-    drop(blockchain_guard);
 
     // Wallet Summary
     color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
@@ -1417,9 +1421,25 @@ async fn main() -> Result<()> {
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "───────────────────")?;
 
-    if let Ok(health) = sentinel.get_network_metrics().await {
-        let peers = node.peers.read().await;
-        let active_peers = peers.len();
+    // Time-boxed: get_network_metrics reads a lock whose writer used to be held
+    // across slow chain reads for the length of a reorg — the "info prints the
+    // Network Status divider then hangs forever" bug. The lock ordering is fixed in
+    // bpos too; the timeout guarantees the console stays responsive regardless.
+    let network_snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+        let health = sentinel.get_network_metrics().await.ok()?;
+        let active_peers = node.peers.read().await.len();
+        Some((health, active_peers))
+    })
+    .await
+    .ok()
+    .flatten();
+    if network_snapshot.is_none() {
+        color_spec.set_fg(Some(Color::Rgb(128, 128, 128)));
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "Unavailable while the node syncs — try again shortly.")?;
+        stdout.reset()?;
+    }
+    if let Some((health, active_peers)) = network_snapshot {
         let gateway_peers = gateway_overview
             .as_ref()
             .and_then(|overview| overview.peers)
@@ -1452,8 +1472,22 @@ async fn main() -> Result<()> {
         writeln!(stdout, "Avg Response:    {}ms", health.average_response_time)?;
     }
 
-    // Chain Status
-    let blockchain_guard = blockchain.read().await;
+    // Chain Status. Time-boxed: a long reorg/branch adoption holds the chain WRITE
+    // lock for its whole validation pass, and an unbounded read here parked the
+    // console behind it (the "info hangs mid-print, restart the client" bug).
+    let Ok(blockchain_guard) =
+        tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await
+    else {
+        color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "\n Chain Status ")?;
+        color_spec.set_fg(Some(Color::Rgb(128, 128, 128))).set_bold(false);
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "───────────────────")?;
+        writeln!(stdout, "Chain busy (sync/reorg in progress) — try again shortly.")?;
+        stdout.reset()?;
+        continue;
+    };
     let current_height = blockchain_guard.get_latest_block_index();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1592,99 +1626,220 @@ println!("Wallet renamed successfully");
                 }
                 Some("mine") => {
                     let parts: Vec<&str> = command.split_whitespace().collect();
-                    if parts.len() != 2 {
-                        println!("Usage: mine <miner_wallet_name>");
+                    let continuous =
+                        parts.len() == 3 && matches!(parts[2], "--continuous" | "-c");
+                    if !(parts.len() == 2 || continuous) {
+                        println!("Usage: mine <miner_wallet_name> [--continuous]");
                         continue;
                     }
+                    // Normalized args for the handler regardless of trailing flags.
+                    let mine_parts: Vec<&str> = vec![parts[0], parts[1]];
 
-                    println!("Preparing mining: syncing to the network tip so we can compete...");
-                    // Converge-then-compete with a bounded retry. prepare_local_mining
-                    // actively syncs to the beacon tip and only returns Retryable if it
-                    // couldn't fully catch up within its window (deeply behind). We do
-                    // NOT concede on that — the background beacon-watch loop keeps
-                    // pulling us forward, so we retry a few times. Only a genuine
-                    // below-finality divergence (needs re-bootstrap) is a hard stop.
-                    const MINE_PREP_ATTEMPTS: u32 = 3;
-                    let mut prep_ok = false;
-                    let mut prep_stop: Option<String> = None;
-                    for attempt in 1..=MINE_PREP_ATTEMPTS {
-                        // 8s window (was 15s): with the discovery cap and per-round
-                        // backstop inside prepare_local_mining, shorter windows keep
-                        // the between-attempt progress lines flowing instead of long
-                        // silent stretches that read as a hang.
-                        match node.prepare_local_mining(Duration::from_secs(8)).await {
-                            Ok(()) => {
-                                prep_ok = true;
-                                break;
-                            }
-                            Err(NodeError::Retryable(_)) => {
-                                if attempt < MINE_PREP_ATTEMPTS {
-                                    println!(
-                                        "Still catching up to the network tip (attempt {}/{})…",
-                                        attempt, MINE_PREP_ATTEMPTS
-                                    );
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                }
-                            }
-                            Err(NodeError::ConsensusFailure(reason)) => {
-                                prep_stop = Some(reason);
-                                break;
-                            }
-                            Err(other) => {
-                                prep_stop = Some(other.to_string());
-                                break;
-                            }
+                    // Enter-to-stop for continuous mode: one detached reader consumes a
+                    // single stdin line and flips the flag; the mining loop checks it
+                    // between every wait slice and round.
+                    let stop_flag = Arc::new(AtomicBool::new(false));
+                    if continuous {
+                        println!(
+                            "Continuous mining started. Paced to the network: each block \
+                             waits to propagate before the next round, with jittered \
+                             delays and backoff so miners never hammer the gateway."
+                        );
+                        println!("Press Enter at any time to stop.");
+                        let stop = Arc::clone(&stop_flag);
+                        std::thread::spawn(move || {
+                            let mut buf = String::new();
+                            let _ = std::io::stdin().read_line(&mut buf);
+                            stop.store(true, Ordering::SeqCst);
+                        });
+                    }
+
+                    // Sleep in short slices so Enter stops continuous mode promptly.
+                    async fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
+                        let mut remaining = total;
+                        while remaining > Duration::ZERO && !stop.load(Ordering::SeqCst) {
+                            let slice = remaining.min(Duration::from_millis(250));
+                            tokio::time::sleep(slice).await;
+                            remaining = remaining.saturating_sub(slice);
                         }
                     }
-                    if let Some(reason) = prep_stop {
-                        println!("Cannot mine right now: {}", reason);
-                        continue;
-                    }
-                    if !prep_ok {
-                        println!(
-                            "Still syncing to the network tip; it keeps catching up in the background — run `mine` again in a moment."
-                        );
-                        continue;
-                    }
 
-                    let mining_manager = MiningManager::new(Arc::clone(&blockchain));
-                    let miner = Miner::new(blockchain.clone(), mining_manager);
-                    match mgmt
-                        .handle_mine_command(&parts, &miner, &mut wallets, &blockchain, &db_arc)
-                        .await
-                    {
-                        Ok(mined_block) => {
-                            let publish_node = Arc::clone(&node);
-                            tokio::spawn(async move {
-                                const MAX_PUBLISH_ATTEMPTS: u32 = 4;
-                                for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
-                                    match publish_node
-                                        .publish_block(mined_block.clone(), "Post-mine")
-                                        .await
-                                    {
-                                        Ok(()) => return,
-                                        Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
-                                            warn!(
-                                                "Failed to publish mined block (attempt {}/{}): {}",
-                                                attempt, MAX_PUBLISH_ATTEMPTS, e
-                                            );
-                                            tokio::time::sleep(Duration::from_secs(
-                                                2 * attempt as u64,
-                                            ))
-                                            .await;
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to publish mined block after {} attempts: {}",
-                                                MAX_PUBLISH_ATTEMPTS, e
-                                            );
-                                        }
+                    // Failure backoff: doubles on trouble (5s -> 60s cap), resets on a
+                    // mined block. Keeps a struggling client patient instead of letting
+                    // it hammer the relay, and keeps N continuous miners from
+                    // synchronizing their retries.
+                    let mut backoff = Duration::from_secs(5);
+                    let mut mined_count: u64 = 0;
+
+                    'mining: loop {
+                        if continuous && stop_flag.load(Ordering::SeqCst) {
+                            break 'mining;
+                        }
+
+                        if !continuous || mined_count == 0 {
+                            println!(
+                                "Preparing mining: syncing to the network tip so we can compete..."
+                            );
+                        }
+                        // Converge-then-compete with a bounded retry. Only a genuine
+                        // below-finality divergence (needs re-bootstrap) is a hard stop.
+                        const MINE_PREP_ATTEMPTS: u32 = 3;
+                        let mut prep_ok = false;
+                        let mut prep_stop: Option<String> = None;
+                        for attempt in 1..=MINE_PREP_ATTEMPTS {
+                            match node.prepare_local_mining(Duration::from_secs(8)).await {
+                                Ok(()) => {
+                                    prep_ok = true;
+                                    break;
+                                }
+                                Err(NodeError::Retryable(_)) => {
+                                    if attempt < MINE_PREP_ATTEMPTS {
+                                        println!(
+                                            "Still catching up to the network tip (attempt {}/{})…",
+                                            attempt, MINE_PREP_ATTEMPTS
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
                                     }
                                 }
-                            });
+                                Err(NodeError::ConsensusFailure(reason)) => {
+                                    prep_stop = Some(reason);
+                                    break;
+                                }
+                                Err(other) => {
+                                    prep_stop = Some(other.to_string());
+                                    break;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            println!("Mining error: {}", e);
+                        if let Some(reason) = prep_stop {
+                            println!("Cannot mine right now: {}", reason);
+                            break 'mining;
+                        }
+                        if !prep_ok {
+                            if continuous {
+                                println!(
+                                    "Network tip still syncing; waiting {}s before the next attempt…",
+                                    backoff.as_secs()
+                                );
+                                sleep_interruptible(backoff, &stop_flag).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(60));
+                                continue 'mining;
+                            }
+                            println!(
+                                "Still syncing to the network tip; it keeps catching up in the background — run `mine` again in a moment."
+                            );
+                            break 'mining;
+                        }
+
+                        let mining_manager = MiningManager::new(Arc::clone(&blockchain));
+                        let miner = Miner::new(blockchain.clone(), mining_manager);
+                        match mgmt
+                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc)
+                            .await
+                        {
+                            Ok(mined_block) => {
+                                backoff = Duration::from_secs(5);
+                                mined_count += 1;
+                                let mined_height = mined_block.index;
+                                let publish_node = Arc::clone(&node);
+                                tokio::spawn(async move {
+                                    const MAX_PUBLISH_ATTEMPTS: u32 = 4;
+                                    for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
+                                        match publish_node
+                                            .publish_block(mined_block.clone(), "Post-mine")
+                                            .await
+                                        {
+                                            Ok(()) => return,
+                                            Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
+                                                warn!(
+                                                    "Failed to publish mined block (attempt {}/{}): {}",
+                                                    attempt, MAX_PUBLISH_ATTEMPTS, e
+                                                );
+                                                tokio::time::sleep(Duration::from_secs(
+                                                    2 * attempt as u64,
+                                                ))
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to publish mined block after {} attempts: {}",
+                                                    MAX_PUBLISH_ATTEMPTS, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+
+                                if !continuous {
+                                    break 'mining;
+                                }
+
+                                // NETWORK-CITIZEN PACING between rounds:
+                                // 1) Absorption wait — poll the signed beacon (edge-
+                                //    cached, same cadence as the background watch)
+                                //    until the network reflects a block at our height
+                                //    (ours or a competitor's), so we never stack new
+                                //    blocks faster than the network can propagate
+                                //    them. Bounded at 20s and fail-open: a beacon
+                                //    hiccup falls through to the next prep, which
+                                //    re-converges anyway.
+                                // 2) Jittered courtesy delay — desynchronizes multiple
+                                //    continuous miners so their prep/poll cycles never
+                                //    line up into synchronized bursts against the
+                                //    free-tier gateway.
+                                let absorb_deadline = Instant::now() + Duration::from_secs(20);
+                                loop {
+                                    if stop_flag.load(Ordering::SeqCst)
+                                        || Instant::now() >= absorb_deadline
+                                    {
+                                        break;
+                                    }
+                                    match node.network_beacon_height().await {
+                                        Some(h) if h >= mined_height => break,
+                                        _ => sleep_interruptible(
+                                            Duration::from_secs(2),
+                                            &stop_flag,
+                                        )
+                                        .await,
+                                    }
+                                }
+                                let jitter_ms = 2_000
+                                    + (SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .subsec_nanos() as u64
+                                        % 3_000);
+                                sleep_interruptible(
+                                    Duration::from_millis(jitter_ms),
+                                    &stop_flag,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                println!("Mining error: {}", e);
+                                if !continuous {
+                                    break 'mining;
+                                }
+                                println!(
+                                    "Backing off {}s before the next attempt…",
+                                    backoff.as_secs()
+                                );
+                                sleep_interruptible(backoff, &stop_flag).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(60));
+                            }
+                        }
+                    }
+                    if continuous {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            println!(
+                                "Continuous mining stopped ({} block(s) mined this run).",
+                                mined_count
+                            );
+                        } else {
+                            println!(
+                                "Continuous mining ended ({} block(s) mined this run) — press Enter to return to the console.",
+                                mined_count
+                            );
                         }
                     }
                 }

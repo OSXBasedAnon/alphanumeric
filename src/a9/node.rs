@@ -2431,6 +2431,13 @@ impl Node {
         None
     }
 
+    /// Current signed network beacon height, if reachable. Public accessor for
+    /// pacing decisions (e.g. continuous mining waits for the network to absorb a
+    /// mined block before starting the next). Read-only; one edge-cached HTTP GET.
+    pub async fn network_beacon_height(&self) -> Option<u32> {
+        self.fetch_tip_beacon().await.map(|b| b.height)
+    }
+
     /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
     /// work is the single always-converge op below.
     async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {
@@ -2619,13 +2626,32 @@ impl Node {
                 {
                     return Converge::NeedsBootstrap;
                 }
-                let adopted = self
+                let adopted = match self
                     .blockchain
                     .write()
                     .await
                     .adopt_external_branch(branch)
                     .await
-                    .unwrap_or(false);
+                {
+                    Ok(adopted) => adopted,
+                    Err(e) => {
+                        // The branch FAILED validation (bad tx, PoW, linkage…). This is
+                        // NOT "we hold a heavier chain" — conflating the two returned a
+                        // fake AtTipAhead success that short-circuited the publisher's
+                        // candidate iteration: an INVALID fork posted by an incompatible
+                        // client (relay height 1388, "Transaction is invalid") pinned the
+                        // beacon at 1261 while a perfectly valid forward extension sat
+                        // one candidate further down the list. Report the target as
+                        // stale so the caller memoizes it dead and tries the next branch.
+                        debug!(
+                            "Rejected candidate branch toward {}@{}: {}",
+                            beacon.height,
+                            hex::encode(beacon.hash),
+                            e
+                        );
+                        return Converge::BeaconStale;
+                    }
+                };
                 if !adopted {
                     // The engine declined because our branch's work is >= canonical
                     // (we hold an equal-or-heavier chain, including the equal-work

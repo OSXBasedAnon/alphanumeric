@@ -976,33 +976,47 @@ impl BPoSSentinel {
     }
 
     async fn update_network_health(&self, force_full_update: bool) -> Result<(), String> {
-        let mut health = self.network_health.write().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Quick updates
-        {
+        // LOCK ORDER MATTERS: gather every slow input BEFORE taking the health write
+        // lock. This lock is read by interactive status paths (the `info` command);
+        // holding it across blockchain/peers/mempool reads meant a long reorg (which
+        // holds the chain write lock for its whole validation pass) wedged the entire
+        // console for minutes — the "info prints Network Status then hangs" bug.
+        let chain_height = {
             let blockchain = self.blockchain.read().await;
-            health.chain_height = blockchain.get_latest_block_index() as u32;
-        }
+            blockchain.get_latest_block_index() as u32
+        };
 
-        if force_full_update || (now - health.last_update > 300) {
+        let needs_full = force_full_update || {
+            let health = self.network_health.read().await;
+            now - health.last_update > 300
+        };
+        let full_snapshot = if needs_full {
             let peer_count = self.node.peers.read().await.len();
             // Active nodes should reflect live network participants (self + connected peers),
             // not wallet metric entries.
             let active_nodes = peer_count.saturating_add(1);
-            let total_nodes = active_nodes.max(1);
-
             let network_load = {
                 let blockchain = self.blockchain.read().await;
                 let pending_tx_count = blockchain.get_pending_transactions().await?.len();
                 (pending_tx_count as f64 / MAX_BLOCK_SIZE as f64).min(1.0)
             };
+            Some((peer_count, active_nodes, network_load))
+        } else {
+            None
+        };
 
+        // Store under a briefly-held write lock — no awaits on other locks inside.
+        let mut health = self.network_health.write().await;
+        health.chain_height = chain_height;
+        if let Some((peer_count, active_nodes, network_load)) = full_snapshot {
+            let total_nodes = active_nodes.max(1);
             health.active_nodes = active_nodes.max(1);
-            health.participation_rate = (active_nodes as f64 / total_nodes.max(1) as f64).min(1.0);
+            health.participation_rate = (active_nodes as f64 / total_nodes as f64).min(1.0);
             health.network_load = network_load;
             health.average_peer_count = peer_count as f64;
             health.last_update = now;
