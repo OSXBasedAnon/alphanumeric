@@ -121,6 +121,11 @@ pub enum Converge {
     /// The relay/beacon could not be read coherently right now (gap / empty / error).
     /// Transient — retry next tick; NEVER escalates to bootstrap/exit.
     BeaconStale,
+    /// The target's branch FAILED validation (bad tx / PoW / linkage) — e.g. a fork
+    /// mined by an incompatible client. Terminal for THIS target (its descendants
+    /// are equally invalid), but says nothing about other branches: callers skip
+    /// the branch (deadness propagates through its ancestry) and try the next one.
+    BranchInvalid,
 }
 
 /// Result of the prev-hash-linked common-ancestor search.
@@ -851,7 +856,12 @@ pub struct Node {
     // next-best live branch instead of re-walking the same dead fork forever (the
     // 2026-07-08 frozen-beacon incident: a dead max-height fork at 1240 pinned the
     // publisher at 1209 while live miners advanced).
-    relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), Instant>>>,
+    // Value = (when memoized, hard). `hard` marks a VALIDATION failure (invalid
+    // branch): hard deadness propagates to descendants via the ancestry check, so a
+    // growing invalid fork costs one validation total, not one per posted block.
+    // Soft entries (transient walk/gap failures) time out but never propagate —
+    // a momentary relay gap must not poison the live chain's fresh tips.
+    relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), (Instant, bool)>>>,
     last_public_announce_at: Arc<AtomicU64>,
     last_header_snapshot_at: Arc<AtomicU64>,
     last_stats_snapshot_at: Arc<AtomicU64>,
@@ -2649,7 +2659,7 @@ impl Node {
                             hex::encode(beacon.hash),
                             e
                         );
-                        return Converge::BeaconStale;
+                        return Converge::BranchInvalid;
                     }
                 };
                 if !adopted {
@@ -2774,7 +2784,7 @@ impl Node {
         // memoized (relay_dead_targets) with an expiry so each 1s tick moves straight
         // to the next live branch instead of re-walking the broken one.
         const MAX_TIP_CANDIDATES: usize = 4;
-        const DEAD_TARGET_RETRY_SECS: u64 = 120;
+        const DEAD_TARGET_RETRY_SECS: u64 = 300;
         // TRUE TIPS ONLY: a block some other wire block names as its parent is not a
         // tip — converging to its tip covers it. Without this filter, an abandoned
         // fork contributes EVERY one of its blocks as a candidate (a post-storm relay
@@ -2791,6 +2801,36 @@ impl Node {
         candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         candidates.dedup();
 
+        // Deadness PROPAGATES through ancestry: an incompatible client keeps
+        // EXTENDING its invalid fork, so every block it posts is a brand-new
+        // candidate tip that a plain (height,hash) memo has never seen — each one
+        // would cost a full ancestry walk plus a failed branch validation under the
+        // chain write lock. If a candidate's parent chain (within this window)
+        // passes through a memoized dead block, the candidate inherits the verdict
+        // for free and is memoized itself.
+        let wire_by_hash: HashMap<[u8; 32], (u32, [u8; 32])> = blocks
+            .iter()
+            .map(|b| (b.hash, (b.index, b.previous_hash)))
+            .collect();
+        let ancestry_dead = |start: [u8; 32],
+                             dead: &mut LruCache<(u32, [u8; 32]), (Instant, bool)>|
+         -> bool {
+            let mut cursor = start;
+            for _ in 0..1024 {
+                let Some(&(h, prev)) = wire_by_hash.get(&cursor) else {
+                    return false;
+                };
+                if let Some(&(when, hard)) = dead.peek(&(h, cursor)) {
+                    // Only HARD (validation-failure) deadness propagates.
+                    if hard && when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS) {
+                        return true;
+                    }
+                }
+                cursor = prev;
+            }
+            false
+        };
+
         let mut last = Converge::BeaconStale;
         let mut tried = 0usize;
         let mut all_needs_bootstrap = true;
@@ -2805,11 +2845,16 @@ impl Node {
             }
             {
                 let mut dead = self.relay_dead_targets.lock();
-                if let Some(when) = dead.get(&(height, hash)) {
+                if let Some(&(when, _)) = dead.get(&(height, hash)) {
                     if when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS) {
                         continue;
                     }
                     dead.pop(&(height, hash));
+                }
+                if ancestry_dead(hash, &mut dead) {
+                    // Inherit HARD deadness: this tip extends an invalid branch.
+                    dead.put((height, hash), (Instant::now(), true));
+                    continue;
                 }
             }
             tried += 1;
@@ -2822,13 +2867,16 @@ impl Node {
                 done @ (Converge::Converged | Converge::AtTipAhead | Converge::Progressed) => {
                     return done;
                 }
-                failed @ (Converge::BeaconStale | Converge::NeedsBootstrap) => {
+                failed @ (Converge::BeaconStale
+                | Converge::NeedsBootstrap
+                | Converge::BranchInvalid) => {
                     if !matches!(failed, Converge::NeedsBootstrap) {
                         all_needs_bootstrap = false;
                     }
+                    let hard = matches!(failed, Converge::BranchInvalid);
                     self.relay_dead_targets
                         .lock()
-                        .put((height, hash), Instant::now());
+                        .put((height, hash), (Instant::now(), hard));
                     debug!(
                         "Relay tip candidate {}@{} unconvergeable ({:?}); trying next branch",
                         height,
@@ -2846,7 +2894,9 @@ impl Node {
         if tried > 0 && all_needs_bootstrap && matches!(last, Converge::NeedsBootstrap) {
             return Converge::NeedsBootstrap;
         }
-        if matches!(last, Converge::NeedsBootstrap) {
+        if matches!(last, Converge::NeedsBootstrap | Converge::BranchInvalid) {
+            // Normalize for the caller: retry next tick. BranchInvalid is terminal
+            // only for the tried branch (memoized above), not for the network.
             return Converge::BeaconStale;
         }
         last
@@ -3553,6 +3603,14 @@ impl Node {
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                // The canonical branch we were pointed at failed validation locally.
+                // Terminal for that branch, not for us: mine on our local tip and let
+                // PoW settle it (same fail-open posture as a relay gap, immediately —
+                // retrying the same invalid branch cannot succeed).
+                Converge::BranchInvalid => {
+                    warn!("Canonical candidate branch failed validation; mining on local tip (fail-open)");
+                    return Ok(());
                 }
             }
         }
@@ -5192,6 +5250,10 @@ impl Node {
                             }
                             // Transient — don't count toward a restart.
                             Converge::BeaconStale => {}
+                            // A candidate branch failed validation (incompatible-client
+                            // fork). It is memoized dead inside converge_to_relay_tip;
+                            // never a strike — the live branch gets tried next tick.
+                            Converge::BranchInvalid => {}
                             // Genuine deep divergence the publisher cannot converge
                             // incrementally (>64-block local rewrite, or needed history
                             // aged out of the relay). Left unhandled this FREEZES the beacon
@@ -5256,6 +5318,13 @@ impl Node {
                                 }
                             }
                             Converge::BeaconStale => {}
+                            // The signed beacon pointed at a branch our engine rejects
+                            // (should not happen with an honest publisher; possible
+                            // transiently around its own reorg). Wait for the next
+                            // beacon rather than escalate.
+                            Converge::BranchInvalid => {
+                                debug!("Beacon branch failed local validation; awaiting next beacon");
+                            }
                         }
                     }
                 }

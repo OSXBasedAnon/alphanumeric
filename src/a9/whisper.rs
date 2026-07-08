@@ -1,6 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sled::Db;
@@ -9,7 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::a9::blockchain::{
-    Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
+    Block, Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
 use crate::a9::codec;
 use crate::a9::wallet::Wallet;
@@ -58,6 +57,41 @@ pub struct WhisperModule {
 impl WhisperModule {
     const INDEX_TREE: &'static str = "whisper_index";
     const MAX_INDEX_MESSAGES: usize = 2000;
+    /// Hard fuse on the number of blocks any single whisper/history scan may hold
+    /// in memory at once. The scans are time-windowed (48h whisper view, 7d
+    /// history), so this cap is never reached in practice (~29 days at 5s blocks);
+    /// it exists only so an adversarially-skewed timestamp stream cannot defeat the
+    /// early-cutoff break and drag the whole chain into RAM.
+    const MAX_WINDOW_BLOCKS: usize = 500_000;
+
+    /// Collect confirmed blocks whose timestamp is >= `cutoff_secs`, newest-first,
+    /// walking backward from the tip. Block timestamps are consensus-monotonic in
+    /// height (chain integrity rejects a block older than its parent), so the first
+    /// block older than the cutoff proves every earlier block is older too and the
+    /// walk can stop. Peak memory is bounded to the in-window blocks (plus the
+    /// MAX_WINDOW_BLOCKS fuse) instead of materializing the entire decoded chain the
+    /// way `Blockchain::get_blocks()` does — the unbounded-allocation DoS this
+    /// replaces on `scan_blockchain_for_messages` / `get_transaction_history`.
+    fn collect_blocks_since(blockchain: &Blockchain, cutoff_secs: u64) -> Vec<Block> {
+        let tip = blockchain.get_latest_block_index();
+        let mut out = Vec::new();
+        let mut idx = tip as i64;
+        while idx >= 0 && out.len() < Self::MAX_WINDOW_BLOCKS {
+            match blockchain.get_block(idx as u32) {
+                Ok(block) => {
+                    if block.timestamp < cutoff_secs {
+                        break;
+                    }
+                    out.push(block);
+                }
+                // Tolerate a transient/missing height (matches get_blocks' filter_map)
+                // without aborting the window walk.
+                Err(_) => {}
+            }
+            idx -= 1;
+        }
+        out
+    }
 
     pub fn new() -> Self {
         Self {
@@ -193,11 +227,33 @@ impl WhisperModule {
 
         let mut fee_cache = Vec::new();
 
-        // Scan blocks in parallel without building an intermediate height vector.
-        let mut blocks: Vec<_> = (start_height..=current_height)
-            .into_par_iter()
-            .filter_map(|height| blockchain.get_block(height).ok())
-            .collect();
+        // Bound the scan to the fee-cache retention window instead of the whole
+        // range. The cache is pruned to MESSAGE_HISTORY_HOURS (prune_fee_cache), so
+        // scanning older blocks is pure waste — and on a fresh wallet (start_height
+        // == 0) a par-materialization of `(0..=current)` would pull the entire
+        // decoded chain into RAM (unbounded-allocation DoS that worsens as the chain
+        // grows). Walk backward from the tip, stopping at whichever comes first:
+        // start_height (keeps the incremental path cheap) or a block older than the
+        // window (timestamps are consensus-monotonic in height).
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff_secs = now_secs.saturating_sub((MESSAGE_HISTORY_HOURS as u64) * 3600);
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut idx = current_height as i64;
+        while idx >= start_height as i64 && blocks.len() < Self::MAX_WINDOW_BLOCKS {
+            match blockchain.get_block(idx as u32) {
+                Ok(block) => {
+                    if block.timestamp < cutoff_secs {
+                        break;
+                    }
+                    blocks.push(block);
+                }
+                Err(_) => {}
+            }
+            idx -= 1;
+        }
         blocks.sort_unstable_by_key(|b| b.index);
 
         // Process transactions
@@ -444,8 +500,11 @@ impl WhisperModule {
         let now = Utc::now();
         let cutoff = now - Duration::hours(MESSAGE_HISTORY_HOURS);
 
-        // Get all blocks from blockchain
-        let blocks = blockchain.get_blocks();
+        // Bounded, time-windowed scan (walk back from the tip to the cutoff) rather
+        // than materializing the entire decoded chain via get_blocks() — the latter
+        // OOM-crashes the node as the chain ages (millions of Blocks in one Vec).
+        let cutoff_secs = cutoff.timestamp().max(0) as u64;
+        let blocks = Self::collect_blocks_since(blockchain, cutoff_secs);
 
         // Scan confirmed transactions
         for block in blocks {
@@ -542,8 +601,10 @@ impl WhisperModule {
         let now = Utc::now();
         let cutoff = now - Duration::days(days);
 
-        // Get confirmed transactions from blockchain
-        let blocks = blockchain.get_blocks();
+        // Bounded, time-windowed scan to the cutoff instead of loading the whole
+        // decoded chain into RAM via get_blocks() (unbounded-allocation DoS).
+        let cutoff_secs = cutoff.timestamp().max(0) as u64;
+        let blocks = Self::collect_blocks_since(blockchain, cutoff_secs);
         for block in blocks {
             for tx in &block.transactions {
                 if tx.sender == address || tx.recipient == address {

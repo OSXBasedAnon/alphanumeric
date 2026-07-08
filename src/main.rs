@@ -1190,7 +1190,8 @@ async fn main() -> Result<()> {
                             Converge::Converged
                             | Converge::AtTipAhead
                             | Converge::Progressed
-                            | Converge::BeaconStale => {
+                            | Converge::BeaconStale
+                            | Converge::BranchInvalid => {
                                 strikes = 0;
                             }
                             Converge::NeedsBootstrap => {
@@ -1670,6 +1671,12 @@ println!("Wallet renamed successfully");
                     // synchronizing their retries.
                     let mut backoff = Duration::from_secs(5);
                     let mut mined_count: u64 = 0;
+                    // Permanent-error guard for continuous mode: a mining error that
+                    // repeats back-to-back (bad wallet name, corrupt state) will never
+                    // heal by retrying — stop with a clear message instead of backing
+                    // off forever. Network-side prep trouble does NOT count here.
+                    const MAX_CONSECUTIVE_MINE_ERRORS: u32 = 5;
+                    let mut consecutive_mine_errors: u32 = 0;
 
                     'mining: loop {
                         if continuous && stop_flag.load(Ordering::SeqCst) {
@@ -1739,6 +1746,7 @@ println!("Wallet renamed successfully");
                         {
                             Ok(mined_block) => {
                                 backoff = Duration::from_secs(5);
+                                consecutive_mine_errors = 0;
                                 mined_count += 1;
                                 let mined_height = mined_block.index;
                                 let publish_node = Arc::clone(&node);
@@ -1818,6 +1826,14 @@ println!("Wallet renamed successfully");
                             Err(e) => {
                                 println!("Mining error: {}", e);
                                 if !continuous {
+                                    break 'mining;
+                                }
+                                consecutive_mine_errors += 1;
+                                if consecutive_mine_errors >= MAX_CONSECUTIVE_MINE_ERRORS {
+                                    println!(
+                                        "Stopping continuous mining: {} mining errors in a row — fix the issue and run mine again.",
+                                        consecutive_mine_errors
+                                    );
                                     break 'mining;
                                 }
                                 println!(
@@ -2410,6 +2426,12 @@ async fn handle_chain_sync(
         Converge::BeaconStale => {
             status_pb
                 .finish_with_message("Network tip beacon unavailable; try --sync again shortly");
+            Ok(())
+        }
+        Converge::BranchInvalid => {
+            status_pb.finish_with_message(
+                "Canonical branch failed local validation; staying on the local chain — try --sync again shortly",
+            );
             Ok(())
         }
     }
