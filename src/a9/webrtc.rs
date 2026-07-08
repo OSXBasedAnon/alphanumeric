@@ -97,6 +97,374 @@ pub async fn set_local_and_gather(
         .ok_or_else(|| "no local description after gathering".into())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Signaling client: the node's side of the gateway's /api/signal mailbox.
+// ---------------------------------------------------------------------------------------------
+
+/// One signaling envelope, wire-identical to what the gateway (lib/signal.ts) stores + verifies.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignalEnvelope {
+    pub from: String,
+    pub to: String,
+    pub kind: String, // "offer" | "answer" | "candidate"
+    pub payload: String,
+    pub ts: u64,
+    pub signature: String,
+}
+
+/// Canonical JSON string, byte-identical to the gateway's canonicalize() (lib/canonical.ts) and the
+/// node's canonicalize_json(): object keys sorted by codepoint, compact serialization. This is the
+/// preimage both sides sign/verify — it MUST match or every envelope is rejected.
+pub fn canonicalize(value: &serde_json::Value) -> String {
+    fn sort(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sort(&m[k]));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(sort).collect()),
+            _ => v.clone(),
+        }
+    }
+    serde_json::to_string(&sort(value)).unwrap_or_default()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Signs signaling envelopes with an Ed25519 key and moves them over the gateway mailbox. The node
+/// implements this with its existing handshake key (node_id = hex(pubkey)); tests use a throwaway
+/// key. Decoupling the mesh from the node behind this trait makes both testable in isolation.
+#[async_trait::async_trait]
+pub trait SignalTransport: Send + Sync {
+    fn local_node_id(&self) -> &str;
+    async fn post_signal(&self, to: &str, kind: &str, payload: &str) -> Result<(), String>;
+    async fn drain_signals(&self) -> Result<Vec<SignalEnvelope>, String>;
+}
+
+/// Concrete HTTP transport: signs with a ring Ed25519 key and POSTs to a gateway base URL. Used by
+/// the integration tests; the node provides its own impl reusing sign_with_handshake_key.
+pub struct HttpSignalTransport {
+    pub node_id: String,
+    key_pkcs8: Vec<u8>,
+    http: reqwest::Client,
+    gateway_base: String,
+}
+
+impl HttpSignalTransport {
+    pub fn new(key_pkcs8: Vec<u8>, gateway_base: String) -> Result<Self, String> {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let kp = Ed25519KeyPair::from_pkcs8(&key_pkcs8).map_err(|e| e.to_string())?;
+        let node_id = hex::encode(kp.public_key().as_ref());
+        Ok(Self {
+            node_id,
+            key_pkcs8,
+            http: reqwest::Client::new(),
+            gateway_base,
+        })
+    }
+
+    fn sign(&self, canonical: &str) -> Result<String, String> {
+        use ring::signature::Ed25519KeyPair;
+        let kp = Ed25519KeyPair::from_pkcs8(&self.key_pkcs8).map_err(|e| e.to_string())?;
+        Ok(hex::encode(kp.sign(canonical.as_bytes()).as_ref()))
+    }
+}
+
+#[async_trait::async_trait]
+impl SignalTransport for HttpSignalTransport {
+    fn local_node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    async fn post_signal(&self, to: &str, kind: &str, payload: &str) -> Result<(), String> {
+        let ts = now_secs();
+        let canonical = canonicalize(&serde_json::json!({
+            "from": self.node_id, "to": to, "kind": kind, "payload": payload, "ts": ts,
+        }));
+        let signature = self.sign(&canonical)?;
+        let body = serde_json::json!({
+            "from": self.node_id, "to": to, "kind": kind, "payload": payload, "ts": ts,
+            "signature": signature,
+        });
+        let resp = self
+            .http
+            .post(format!("{}/api/signal", self.gateway_base))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("post_signal {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+        }
+        Ok(())
+    }
+
+    async fn drain_signals(&self) -> Result<Vec<SignalEnvelope>, String> {
+        let ts = now_secs();
+        let canonical = canonicalize(&serde_json::json!({ "peer": self.node_id, "ts": ts }));
+        let signature = self.sign(&canonical)?;
+        let body = serde_json::json!({ "peer": self.node_id, "ts": ts, "signature": signature });
+        let resp = self
+            .http
+            .post(format!("{}/api/signal/drain", self.gateway_base))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("drain {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let envs = v.get("envelopes").cloned().unwrap_or(serde_json::Value::Null);
+        Ok(serde_json::from_value(envs).unwrap_or_default())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// WebRtcMesh: orchestrates DataChannel connections to peers via the gateway signaling.
+// ---------------------------------------------------------------------------------------------
+
+use bytes::Bytes;
+use std::collections::HashMap;
+use tokio::sync::{mpsc, Mutex};
+use webrtc::data_channel::data_channel_message::DataChannelMessage as DcMessage;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+
+/// Google's public STUN servers — how each NAT'd node learns its server-reflexive (public) address
+/// so a peer can hole-punch to it. Free, no account, no TURN.
+pub fn default_stun_urls() -> Vec<String> {
+    vec![
+        "stun:stun.l.google.com:19302".to_string(),
+        "stun:stun1.l.google.com:19302".to_string(),
+    ]
+}
+
+/// A running mesh of direct WebRTC DataChannels to peers, established over the gateway signaling
+/// mailbox. Deterministic role assignment (perfect negotiation: the lexicographically-lower node_id
+/// is the initiator) prevents double-dial. Inbound bytes from every peer are funneled to one channel
+/// the node drains; `broadcast` writes to every open channel — so the node's block flood "just works"
+/// over it. The gateway only carries the one-time offer/answer; blocks flow peer-to-peer.
+pub struct WebRtcMesh {
+    transport: Arc<dyn SignalTransport>,
+    api: Arc<API>,
+    config: RTCConfiguration,
+    conns: Arc<Mutex<HashMap<String, Arc<RTCPeerConnection>>>>,
+    channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
+    inbound_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
+}
+
+impl WebRtcMesh {
+    /// Build a mesh. Returns the mesh + the receiver the node drains for inbound peer messages
+    /// (tagged with the sender's node_id).
+    pub fn new(
+        transport: Arc<dyn SignalTransport>,
+        api: Arc<API>,
+        stun_urls: Vec<String>,
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(String, Vec<u8>)>), String> {
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let mesh = Arc::new(Self {
+            transport,
+            api,
+            config: ice_config(&stun_urls),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            inbound_tx,
+        });
+        Ok((mesh, inbound_rx))
+    }
+
+    pub fn local_id(&self) -> &str {
+        self.transport.local_node_id()
+    }
+
+    pub async fn connected_peers(&self) -> Vec<String> {
+        self.channels.lock().await.keys().cloned().collect()
+    }
+
+    /// Wire a DataChannel's lifecycle: on open, register it as a live link; on message, forward the
+    /// bytes to the inbound sink tagged with the peer id.
+    fn register_channel(&self, peer_id: String, dc: Arc<RTCDataChannel>) {
+        let inbound = self.inbound_tx.clone();
+        let peer_for_msg = peer_id.clone();
+        dc.on_message(Box::new(move |msg: DcMessage| {
+            let inbound = inbound.clone();
+            let peer = peer_for_msg.clone();
+            Box::pin(async move {
+                let _ = inbound.send((peer, msg.data.to_vec()));
+            })
+        }));
+        let channels = self.channels.clone();
+        let dc_store = dc.clone();
+        let peer_for_open = peer_id.clone();
+        dc.on_open(Box::new(move || {
+            let channels = channels.clone();
+            let dc_store = dc_store.clone();
+            let peer = peer_for_open.clone();
+            Box::pin(async move {
+                channels.lock().await.insert(peer, dc_store);
+            })
+        }));
+    }
+
+    /// Create a peer connection and, for the responder side, capture the inbound DataChannel.
+    async fn new_pc(self: &Arc<Self>, peer_id: &str) -> Result<Arc<RTCPeerConnection>, String> {
+        let pc = new_peer_connection(&self.api, self.config.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        // Responder path: the remote opened the channel; wire it when it arrives. Hold a WEAK ref
+        // to self — the pc is stored in self.conns and this callback lives on the pc, so a strong
+        // ref would form a cycle that never frees the mesh on a long-running node.
+        let me = Arc::downgrade(self);
+        let peer = peer_id.to_string();
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let me = me.clone();
+            let peer = peer.clone();
+            Box::pin(async move {
+                if let Some(me) = me.upgrade() {
+                    me.register_channel(peer, dc);
+                }
+            })
+        }));
+        // Drop dead connections from the maps so they can be re-dialed.
+        let conns = self.conns.clone();
+        let channels = self.channels.clone();
+        let peer2 = peer_id.to_string();
+        pc.on_peer_connection_state_change(Box::new(move |s| {
+            use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+            let conns = conns.clone();
+            let channels = channels.clone();
+            let peer2 = peer2.clone();
+            Box::pin(async move {
+                if matches!(
+                    s,
+                    RTCPeerConnectionState::Failed
+                        | RTCPeerConnectionState::Disconnected
+                        | RTCPeerConnectionState::Closed
+                ) {
+                    conns.lock().await.remove(&peer2);
+                    channels.lock().await.remove(&peer2);
+                }
+            })
+        }));
+        self.conns.lock().await.insert(peer_id.to_string(), pc.clone());
+        Ok(pc)
+    }
+
+    /// Initiate a connection IF we are the impolite (lower-id) side. Idempotent: skips peers we're
+    /// already connecting to / connected to.
+    pub async fn dial(self: &Arc<Self>, peer_id: &str) -> Result<(), String> {
+        if peer_id == self.local_id() {
+            return Ok(());
+        }
+        if self.local_id() >= peer_id {
+            return Ok(()); // polite side waits for the offer
+        }
+        if self.conns.lock().await.contains_key(peer_id) {
+            return Ok(());
+        }
+        let pc = self.new_pc(peer_id).await?;
+        let dc = pc
+            .create_data_channel(MESH_CHANNEL_LABEL, Some(mesh_channel_init()))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.register_channel(peer_id.to_string(), dc);
+        let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
+        let offer = set_local_and_gather(&pc, offer).await.map_err(|e| e.to_string())?;
+        self.transport
+            .post_signal(peer_id, "offer", &offer.sdp)
+            .await
+    }
+
+    async fn handle_offer(self: &Arc<Self>, from: &str, sdp: &str) -> Result<(), String> {
+        // Perfect negotiation: only the polite (higher-id) side accepts an inbound offer.
+        if self.local_id() < from {
+            return Ok(());
+        }
+        if self.conns.lock().await.contains_key(from) {
+            return Ok(()); // already have a connection to this peer
+        }
+        let pc = self.new_pc(from).await?;
+        let remote = RTCSessionDescription::offer(sdp.to_string()).map_err(|e| e.to_string())?;
+        pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
+        let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
+        let answer = set_local_and_gather(&pc, answer).await.map_err(|e| e.to_string())?;
+        self.transport.post_signal(from, "answer", &answer.sdp).await
+    }
+
+    async fn handle_answer(&self, from: &str, sdp: &str) -> Result<(), String> {
+        let pc = self.conns.lock().await.get(from).cloned();
+        if let Some(pc) = pc {
+            let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?;
+            pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn handle_candidate(&self, from: &str, cand: &str) -> Result<(), String> {
+        let pc = self.conns.lock().await.get(from).cloned();
+        if let Some(pc) = pc {
+            let init = RTCIceCandidateInit {
+                candidate: cand.to_string(),
+                ..Default::default()
+            };
+            let _ = pc.add_ice_candidate(init).await;
+        }
+        Ok(())
+    }
+
+    /// Drain the mailbox once and dispatch each envelope to the right handler.
+    pub async fn poll_signals(self: &Arc<Self>) -> Result<(), String> {
+        let envelopes = self.transport.drain_signals().await?;
+        for e in envelopes {
+            let r = match e.kind.as_str() {
+                "offer" => self.handle_offer(&e.from, &e.payload).await,
+                "answer" => self.handle_answer(&e.from, &e.payload).await,
+                "candidate" => self.handle_candidate(&e.from, &e.payload).await,
+                _ => Ok(()),
+            };
+            if let Err(err) = r {
+                log::debug!("mesh signal {} from {} failed: {}", e.kind, &e.from[..8.min(e.from.len())], err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Send bytes to one peer over its DataChannel. Returns false if not connected.
+    pub async fn send_to(&self, peer_id: &str, data: &[u8]) -> bool {
+        let dc = self.channels.lock().await.get(peer_id).cloned();
+        if let Some(dc) = dc {
+            dc.send(&Bytes::copy_from_slice(data)).await.is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Send bytes to every connected peer (the block flood over the mesh).
+    pub async fn broadcast(&self, data: &[u8]) -> usize {
+        let channels: Vec<Arc<RTCDataChannel>> =
+            self.channels.lock().await.values().cloned().collect();
+        let bytes = Bytes::copy_from_slice(data);
+        let mut sent = 0;
+        for dc in channels {
+            if dc.send(&bytes).await.is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +472,100 @@ mod tests {
     use std::time::Duration;
     use webrtc::data_channel::data_channel_message::DataChannelMessage;
     use webrtc::data_channel::RTCDataChannel;
+
+    fn gen_key() -> Vec<u8> {
+        use ring::rand::SystemRandom;
+        use ring::signature::Ed25519KeyPair;
+        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref().to_vec()
+    }
+
+    // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
+    // gateway's verification (lib/signal.ts) against the LIVE deployment — the exact interop contract
+    // the whole mesh depends on. Ignored by default (needs network); run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn rust_signaling_interops_with_live_gateway() {
+        let base = std::env::var("GW").unwrap_or_else(|_| "https://alphanumeric.blue".to_string());
+        let alice = HttpSignalTransport::new(gen_key(), base.clone()).unwrap();
+        let bob = HttpSignalTransport::new(gen_key(), base).unwrap();
+        let payload = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\na=ice-ufrag:aB3\r\na=ice-pwd:secretpwd\r\n";
+
+        alice
+            .post_signal(&bob.node_id, "offer", payload)
+            .await
+            .expect("gateway accepted the Rust-signed offer");
+
+        let drained = bob.drain_signals().await.expect("drain");
+        assert_eq!(drained.len(), 1, "bob received exactly the offer");
+        assert_eq!(drained[0].payload, payload, "payload preserved byte-for-byte");
+        assert_eq!(drained[0].from, alice.node_id, "from = alice");
+        assert_eq!(drained[0].kind, "offer");
+
+        let again = bob.drain_signals().await.expect("drain2");
+        assert_eq!(again.len(), 0, "second drain empty (atomic clear)");
+    }
+
+    // THE CAPSTONE: two independent meshes, two keys, establish a DIRECT DataChannel purely through
+    // the LIVE gateway signaling (offer -> answer, perfect-negotiation roles) and exchange a payload
+    // over it. This is the entire mesh mechanism end-to-end — signing, mailbox, offer/answer, ICE,
+    // DataChannel, message delivery. On one machine ICE uses host/loopback candidates; between two
+    // NAT'd machines it hole-punches via the STUN srflx candidates gathered here. Ignored by default
+    // (needs network + STUN + the live gateway); run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn two_meshes_connect_via_live_gateway_and_exchange_a_message() {
+        let base = std::env::var("GW").unwrap_or_else(|_| "https://alphanumeric.blue".to_string());
+        let t_a: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), base.clone()).unwrap());
+        let t_b: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), base).unwrap());
+        let a_id = t_a.local_node_id().to_string();
+        let b_id = t_b.local_node_id().to_string();
+
+        let (mesh_a, _rx_a) =
+            WebRtcMesh::new(t_a, Arc::new(build_api().unwrap()), default_stun_urls()).unwrap();
+        let (mesh_b, mut rx_b) =
+            WebRtcMesh::new(t_b, Arc::new(build_api().unwrap()), default_stun_urls()).unwrap();
+
+        // Both run their signaling loop.
+        for m in [mesh_a.clone(), mesh_b.clone()] {
+            tokio::spawn(async move {
+                for _ in 0..120 {
+                    let _ = m.poll_signals().await;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            });
+        }
+
+        // Both dial; perfect-negotiation makes the lexicographically-lower id the initiator.
+        mesh_a.dial(&b_id).await.expect("dial b");
+        mesh_b.dial(&a_id).await.expect("dial a");
+
+        // Wait for the DataChannel to open on both ends.
+        let opened = tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if !mesh_a.connected_peers().await.is_empty()
+                    && !mesh_b.connected_peers().await.is_empty()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "DataChannel did not open via gateway signaling in time");
+
+        // Alice pushes a "block" to Bob directly over the mesh.
+        assert!(mesh_a.send_to(&b_id, b"mesh-block-payload").await, "send over channel");
+        let got = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
+            .await
+            .expect("no inbound message")
+            .expect("inbound channel closed");
+        assert_eq!(got.0, a_id, "message tagged with the sender's node_id");
+        assert_eq!(&got.1, b"mesh-block-payload", "payload delivered intact P2P");
+
+        let _ = mesh_a.broadcast(b"x").await;
+    }
 
     // Proves the whole DataChannel handshake end-to-end IN PROCESS (both peers local, SDP exchanged
     // directly instead of via the gateway): offerer opens a channel, they exchange offer/answer with
