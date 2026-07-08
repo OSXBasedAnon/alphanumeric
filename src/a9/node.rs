@@ -2528,11 +2528,26 @@ impl Node {
 
             // Walk the prev-hash chain down through the bodies we now hold.
             loop {
-                let Some(cb) = by_hash.get(&expected_hash).cloned() else {
-                    // The body for this exact (height,hash) is not on the relay even
-                    // after fetching its window -> broken link (same transient-vs-deep
-                    // distinction as an empty window).
-                    return gap_verdict(expected_height);
+                let cb = match by_hash.get(&expected_hash).cloned() {
+                    Some(cb) => cb,
+                    None => {
+                        // The windowed fetch is fork-capped + limited, so under heavy
+                        // forking it can omit the EXACT parent this walk needs even
+                        // though the block exists on the relay — which stranded nodes
+                        // on losing forks (2026-07-08). Before declaring a gap, ask for
+                        // the exact block by (height, hash); it can never be hidden by
+                        // fork density. Only a genuine miss falls through to gap_verdict.
+                        match self
+                            .fetch_relay_block_exact(expected_height, expected_hash)
+                            .await
+                        {
+                            Some(b) => {
+                                by_hash.entry(b.hash).or_insert(b.clone());
+                                b
+                            }
+                            None => return gap_verdict(expected_height),
+                        }
+                    }
                 };
                 let h = cb.index;
                 canon_desc.push(cb.clone());
@@ -2982,6 +2997,50 @@ impl Node {
             return Converge::BeaconStale;
         }
         last
+    }
+
+    /// Fetch ONE relay block by exact (height, hash) via GET /api/block. Used by the
+    /// ancestor/reorg walk when the fork-capped windowed list omits the specific
+    /// parent it needs. None if unreachable, not found, or malformed (walk then
+    /// treats it as a genuine gap). Blocks are immutable so this is edge-cached.
+    async fn fetch_relay_block_exact(&self, height: u32, hash: [u8; 32]) -> Option<Block> {
+        let network_id = hex::encode(self.network_id);
+        for base in Self::discovery_bases() {
+            let url = format!(
+                "{}/api/block?network_id={}&height={}&hash={}",
+                base,
+                network_id,
+                height,
+                hex::encode(hash)
+            );
+            let Ok(res) = self.http_client.get(&url).send().await else {
+                continue;
+            };
+            if !res.status().is_success() {
+                continue;
+            }
+            let Ok(body) = res.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let Some(block_val) = body.get("block") else {
+                continue;
+            };
+            if let Ok(block) = serde_json::from_value::<Block>(block_val.clone()) {
+                // Trust nothing: the block must match the exact (height, hash) asked
+                // for and carry valid PoW. Everything else is still enforced on adopt.
+                if block.index == height
+                    && block.hash == hash
+                    && block.calculate_hash_for_block() == hash
+                    && block.verify_pow_meets_floor()
+                {
+                    return Some(block);
+                }
+            }
+        }
+        None
     }
 
     /// Fetch the gateway's relay-head hint: the {height, hash} of the newest block
