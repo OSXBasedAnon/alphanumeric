@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rand::{thread_rng, Rng};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -495,7 +495,11 @@ impl BPoSSentinel {
         let mut stats = self.stats.write().await;
         stats.anomalies_detected += 1;
 
-        info!("Fork detected at blocks: {:?}", fork_blocks);
+        // Same-height races are routine on this network (multiple miners at the
+        // difficulty floor) and canonical choice is settled by the PoW reorg engine,
+        // not this layer — see the note above resolve_fork. Log at debug: an error
+        // here reads as "unresolved fork" when nothing is wrong.
+        debug!("Competing headers observed at blocks: {:?}", fork_blocks);
 
         // Get reputable validators (Emerald tier and above)
         let trusted_validators: HashSet<String> = self
@@ -511,7 +515,12 @@ impl BPoSSentinel {
             .collect();
 
         if trusted_validators.is_empty() {
-            return Err("No trusted validators available to resolve fork".to_string());
+            // node_metrics is never populated on a live node (register_wallet_metrics
+            // has no callers), so this set is always empty and the diagnostics-only
+            // resolution below has nothing to do. That is the expected state, not an
+            // error: the PoW reorg engine resolves the race independently.
+            debug!("bPoS validator registry empty; leaving fork resolution to the reorg engine");
+            return Ok(());
         }
 
         // Resolve each fork point
