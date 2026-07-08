@@ -3522,15 +3522,31 @@ impl Node {
     }
 
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
+        debug!("mine-prep: enter");
         // Best-effort peer discovery (harmless no-op when NAT'd and empty). Capped
         // WELL below max_wait: across NAT this almost never yields a peer, and at the
         // old cap (= max_wait) it silently ate the entire mining-prep window before
         // convergence even started — the "mine command hangs with no output" stall.
         // Convergence uses the relay, not p2p peers, so a short cap loses nothing.
-        if self.peers.read().await.is_empty() {
+        // The peers-lock read is itself time-boxed: a wedged peers lock elsewhere
+        // must degrade this into "skip discovery", never into a hang.
+        let peers_empty = match timeout(Duration::from_secs(2), async {
+            self.peers.read().await.is_empty()
+        })
+        .await
+        {
+            Ok(empty) => empty,
+            Err(_) => {
+                debug!("mine-prep: peers lock busy; skipping discovery");
+                false
+            }
+        };
+        debug!("mine-prep: peers checked (empty={})", peers_empty);
+        if peers_empty {
             let cap = max_wait.min(Duration::from_secs(3));
             let _ = timeout(cap, self.connect_discovery_peers(8)).await;
         }
+        debug!("mine-prep: discovery done, entering converge loop");
 
         // ALWAYS CONVERGE, THEN COMPETE — never pause-and-concede.
         //
@@ -3547,6 +3563,7 @@ impl Node {
         let deadline = Instant::now() + max_wait;
         let mut backoff = Duration::from_millis(500);
         loop {
+            debug!("mine-prep: fetching beacon");
             let Some(beacon) = self.fetch_tip_beacon().await else {
                 // Beacon genuinely unreachable => FAIL OPEN and mine on the local tip.
                 // Producing on our best-known chain beats conceding; the reorg engine
@@ -3554,6 +3571,7 @@ impl Node {
                 warn!("Tip beacon unreachable; mining on local tip (fail-open)");
                 return Ok(());
             };
+            debug!("mine-prep: beacon h{} v{}; converge round", beacon.height, beacon.version);
             // Backstop timeout per round: the deadline is only checked BETWEEN rounds,
             // and one converge round can fan out into many relay window fetches (each
             // individually HTTP-bounded but unbounded in count on a deeply forked
@@ -4588,14 +4606,28 @@ impl Node {
 
     async fn discover_from_existing_peers(&self) -> Result<HashSet<SocketAddr>, NodeError> {
         let mut discovered = HashSet::new();
-        let peers = self.peers.read().await;
+        // THE 2026-07-08 NETWORK-WIDE WEDGE: this used to hold the peers READ guard
+        // across the whole join_all network fan-out. One unresponsive peer (dead NAT
+        // socket) kept the guard alive indefinitely; tokio's fair RwLock then parked
+        // the first queued WRITER and, behind it, EVERY later reader — mine-prep's
+        // first await, info's network section, the publisher's converge — freezing
+        // the node (and the beacon, when it was the publisher) until restart.
+        // Snapshot the addresses under a short guard, drop it, THEN query, and bound
+        // every query so the fan-out itself always terminates.
+        let addrs: Vec<SocketAddr> = {
+            let peers = self.peers.read().await;
+            peers.keys().copied().collect()
+        };
 
-        let mut futures = Vec::with_capacity(peers.len());
-        for &addr in peers.keys() {
-            futures.push(self.request_peer_list(addr));
-        }
-
-        for peer_list in join_all(futures).await.into_iter().flatten() {
+        let futures: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| timeout(Duration::from_secs(5), self.request_peer_list(addr)))
+            .collect();
+        for peer_list in join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|res| res.ok().and_then(|inner| inner.ok()))
+        {
             discovered.extend(peer_list);
         }
 
@@ -5720,20 +5752,21 @@ impl Node {
             }
         }
 
-        // IMPROVEMENT: Update network health metrics
+        // Update network health metrics. LOCK ORDER: read peers BEFORE taking the
+        // health write lock — holding health.write across a peers.read await chained
+        // a wedged peers lock into a wedged health lock (info's network section).
+        let average_response_time = {
+            let peers = self.peers.read().await;
+            if peers.is_empty() {
+                0
+            } else {
+                peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
+            }
+        };
         {
             let mut network_health = self.network_health.write().await;
-            // Fix the type issue - use proper type for active_nodes
-            network_health.active_nodes = active_peers; // Assuming active_peers is already a usize
-
-            network_health.average_response_time = {
-                let peers = self.peers.read().await;
-                if peers.is_empty() {
-                    0
-                } else {
-                    peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
-                }
-            };
+            network_health.active_nodes = active_peers;
+            network_health.average_response_time = average_response_time;
         }
 
         Ok(())

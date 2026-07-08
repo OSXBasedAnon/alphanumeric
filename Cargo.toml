@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric"
-version = "7.6.2"
+version = "7.6.3"
 edition = "2021"
 
 [dependencies]
@@ -75,8 +75,11 @@ bindgen = "0.64"
 winres = "0.1.12"
 
 [features]
-# Keep default binaries lean to reduce AV/EDR false positives.
-default = []
+# The mesh is part of the product: a plain `cargo build --release` (what every
+# source-building Linux/Windows user runs) must produce a mesh-capable binary —
+# without this, source builders silently lost direct P2P and never knew (bit real
+# users on 2026-07-08). Runtime opt-out remains: ALPHANUMERIC_WEBRTC_MESH=false.
+default = ["webrtc_mesh"]
 # Enables DB snapshot publishing (zip+upload+sign) and the `push` command.
 bootstrap_publisher = []
 # Reserved feature flag used by some libp2p/TCP-specific code paths.
