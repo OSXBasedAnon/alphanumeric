@@ -283,18 +283,26 @@ impl BPoSSentinel {
     }
 
     async fn cleanup_memory(&self) -> Result<(), String> {
-        // Clean header cache - only keep last blocks
-        let mut header_cache = self.header_cache.write().await;
-        if header_cache.len() > Self::MAX_VERIFIED_BLOCKS {
-            let drain_count = header_cache.len() - Self::MAX_VERIFIED_BLOCKS;
-            header_cache.drain(..drain_count);
+        // Each section scopes its own guard: the old flow held header_cache.write
+        // while acquiring verified_headers.write while acquiring anomaly_detector
+        // .write — a four-lock chain where one contended lock wedges them all
+        // (2026-07-08 guard-chaining class). The cleanups are independent.
+        {
+            // Clean header cache - only keep last blocks
+            let mut header_cache = self.header_cache.write().await;
+            if header_cache.len() > Self::MAX_VERIFIED_BLOCKS {
+                let drain_count = header_cache.len() - Self::MAX_VERIFIED_BLOCKS;
+                header_cache.drain(..drain_count);
+            }
         }
 
-        // Clean verified headers
-        let mut verified = self.verified_headers.write().await;
-        if verified.len() > Self::MAX_VERIFIED_BLOCKS {
-            let drain_count = verified.len() - Self::MAX_VERIFIED_BLOCKS;
-            verified.drain(..drain_count);
+        {
+            // Clean verified headers
+            let mut verified = self.verified_headers.write().await;
+            if verified.len() > Self::MAX_VERIFIED_BLOCKS {
+                let drain_count = verified.len() - Self::MAX_VERIFIED_BLOCKS;
+                verified.drain(..drain_count);
+            }
         }
 
         // Cleanup NodeMetrics
@@ -321,8 +329,10 @@ impl BPoSSentinel {
         }
 
         // Cleanup anomaly detector
-        let mut detector = self.anomaly_detector.write().await;
-        detector.recent_anomalies.truncate(Self::MAX_ANOMALIES);
+        {
+            let mut detector = self.anomaly_detector.write().await;
+            detector.recent_anomalies.truncate(Self::MAX_ANOMALIES);
+        }
 
         // Cleanup peer sentinels
         let now = SystemTime::now()
@@ -842,29 +852,41 @@ impl BPoSSentinel {
                     continue;
                 }
 
-                // Get only new headers since last check
+                // Get only new headers since last check — RANGED reads, never
+                // get_blocks(): that decoded the ENTIRE chain into memory every 10s
+                // cycle just to take 100 headers (O(chain) RAM + CPU, growing
+                // forever), the same unbounded-materialization class as the whisper
+                // scan fix.
                 let headers = {
                     let chain = blockchain.read().await;
-                    let blocks = chain.get_blocks();
-                    blocks
-                        .into_iter()
-                        .skip(last_height as usize)
-                        .take(100)
-                        .map(|block| BlockHeaderInfo {
-                            height: block.index,
-                            hash: block.hash,
-                            prev_hash: block.previous_hash,
-                            timestamp: block.timestamp,
-                        })
-                        .collect::<Vec<_>>()
+                    let from = last_height.saturating_add(1);
+                    let to = current_height.min(last_height.saturating_add(100));
+                    let mut out = Vec::with_capacity((to.saturating_sub(from) + 1) as usize);
+                    for i in from..=to {
+                        if let Ok(block) = chain.get_block(i) {
+                            out.push(BlockHeaderInfo {
+                                height: block.index,
+                                hash: block.hash,
+                                prev_hash: block.previous_hash,
+                                timestamp: block.timestamp,
+                            });
+                        }
+                    }
+                    out
                 };
 
                 if let Ok(signature) = sentinel.sign_header(&headers).await {
-                    let peers = node.peers.read().await;
-                    for (addr, _) in peers.iter().take(5) {
-                        // Limit peer broadcasts
+                    // Snapshot-then-drop: this held the peers guard across up to 5
+                    // network broadcasts plus inter-peer sleeps every cycle — with one
+                    // stalled peer socket that is a repeated ~10-50s guard hold, i.e.
+                    // the 2026-07-08 livelock class.
+                    let targets: Vec<SocketAddr> = {
+                        let peers = node.peers.read().await;
+                        peers.keys().copied().take(5).collect()
+                    };
+                    for addr in targets {
                         if let Err(e) = sentinel
-                            .broadcast_verified_headers(*addr, &headers, &signature, &node_copy)
+                            .broadcast_verified_headers(addr, &headers, &signature, &node_copy)
                             .await
                         {
                             warn!("Failed to broadcast headers to {}: {}", addr, e);

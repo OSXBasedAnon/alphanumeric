@@ -7452,8 +7452,16 @@ impl Node {
                 .map_err(|e| NodeError::Network(format!("Failed to send chain request: {}", e)))?;
 
                 // Wait for response and return it to the active connection writer.
-                if let Ok(blocks) = response_rx.await {
-                    return Ok(Some(NetworkMessage::Blocks(blocks)));
+                // BOUNDED: an unbounded await here parked this connection's reader
+                // task forever whenever the event pump was backed up — and a parked
+                // reader also can't consume responses for in-flight requests to the
+                // same peer. 30s comfortably covers serving a full 64-block window.
+                match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
+                    Ok(Ok(blocks)) => return Ok(Some(NetworkMessage::Blocks(blocks))),
+                    Ok(Err(_)) => {}
+                    Err(_) => {
+                        warn!("GetBlocks [{}..{}] response timed out internally", start, end);
+                    }
                 }
             }
 

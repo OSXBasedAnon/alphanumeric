@@ -5411,7 +5411,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "real ProgPoW mining at the 464 floor; run with --ignored"]
     async fn racing_miners_with_pending_tx_both_complete() {
-        use crate::a9::progpow::{BlockHeader, MiningManager, ProgPowTransaction};
+        use crate::a9::miner::{BlockHeader, MiningManager, ProgPowTransaction};
         use std::time::Duration;
 
         let blockchain = Arc::new(RwLock::new(test_blockchain()));
@@ -5515,7 +5515,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "real ProgPoW mining at the 464 floor; run with --ignored"]
     async fn racing_miners_both_complete_loser_recovers() {
-        use crate::a9::progpow::{BlockHeader, MiningManager, ProgPowTransaction};
+        use crate::a9::miner::{BlockHeader, MiningManager, ProgPowTransaction};
         use std::time::Duration;
 
         let blockchain = Arc::new(RwLock::new(test_blockchain()));

@@ -32,7 +32,7 @@ use alphanumeric::a9::{
     mgmt::{Mgmt, WalletKeyData},
     node::{Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT},
     oracle::DifficultyOracle,
-    progpow::{Miner, MiningManager},
+    miner::{Miner, MiningManager},
     whisper::WhisperModule,
 };
 use alphanumeric::config::AppConfig;
@@ -2557,13 +2557,17 @@ async fn handle_network_commands(
                                     println!("✓ Peer verification successful!");
                                     println!("✓ Successfully connected to {}", addr);
 
-                                    // Show peer details
-                                    let peers = node.peers.read().await;
-                                    if let Some(peer_info) = peers.get(&socket_addr) {
-                                        println!("\nPeer Details:");
-                                        println!("Version: {}", peer_info.version);
-                                        println!("Blocks: {}", peer_info.blocks);
-                                        println!("Latency: {}ms", peer_info.latency);
+                                    // Show peer details (guard dropped BEFORE the long
+                                    // sync below — never hold the peers lock across
+                                    // network work).
+                                    {
+                                        let peers = node.peers.read().await;
+                                        if let Some(peer_info) = peers.get(&socket_addr) {
+                                            println!("\nPeer Details:");
+                                            println!("Version: {}", peer_info.version);
+                                            println!("Blocks: {}", peer_info.blocks);
+                                            println!("Latency: {}ms", peer_info.latency);
+                                        }
                                     }
 
                                     println!("\nAttempting initial sync...");
@@ -2631,19 +2635,22 @@ async fn handle_network_commands(
             // Call the comprehensive discover_network_nodes implementation
             match node.discover_network_nodes().await {
                 Ok(_) => {
-                    // Get final peer count to show progress
-                    let peers = node.peers.read().await;
-                    let final_peers = peers.len();
+                    // Snapshot peer stats and DROP the guard before the sync below —
+                    // never hold the peers lock across network work.
+                    let (final_peers, connected_subnets) = {
+                        let peers = node.peers.read().await;
+                        let mut subnets = HashSet::new();
+                        for (addr, info) in peers.iter() {
+                            if let Some(subnet) = info.get_subnet(addr.ip()) {
+                                subnets.insert(subnet);
+                            }
+                        }
+                        (peers.len(), subnets)
+                    };
                     let new_peers = final_peers.saturating_sub(initial_peers);
 
                     // Show detailed peer information
                     if new_peers > 0 {
-                        let mut connected_subnets = HashSet::new();
-                        for (addr, info) in peers.iter() {
-                            if let Some(subnet) = info.get_subnet(addr.ip()) {
-                                connected_subnets.insert(subnet);
-                            }
-                        }
 
                         pb.finish_with_message(format!(
                             "Found {} new peers (total: {}) across {} subnets",

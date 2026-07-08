@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use crate::a9::blockchain::FEE_PERCENTAGE;
 use crate::a9::{
     blockchain::{Block, Blockchain, BlockchainError, Transaction},
-    progpow::{BlockHeader as ProgPowHeader, Miner, ProgPowTransaction},
+    miner::{BlockHeader as ProgPowHeader, Miner, ProgPowTransaction},
     wallet::Wallet,
 };
 
@@ -1132,7 +1132,15 @@ impl Mgmt {
         println!("────────────────────");
         let _ = stdout.reset();
 
-        let blockchain_guard = self.blockchain.read().await;
+        // Time-boxed: after a re-bootstrap/deep sync the chain lock can be held by
+        // block application for a long stretch, and an unbounded read here made
+        // `balance` sit silently forever ("client hangs, needs restart" reports).
+        let Ok(blockchain_guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.blockchain.read()).await
+        else {
+            println!("Chain busy (syncing/reorg in progress) — try `balance` again shortly.");
+            return;
+        };
 
         for (name, wallet) in wallets {
             match blockchain_guard.get_wallet_balance(&wallet.address).await {
@@ -1165,6 +1173,35 @@ impl Mgmt {
                         .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181))))
                         .ok();
                     let _ = writeln!(stdout, " ♦");
+
+                    // Coinbase-maturity style hint: rewards mined into the last few
+                    // blocks can still be reorged away in a same-height race, which
+                    // users experience as "my balance goes up and down". Label that
+                    // portion instead of letting it read as corruption. Display-only;
+                    // spendability/consensus are unchanged.
+                    const IMMATURE_DEPTH: u32 = 12;
+                    let tip = blockchain_guard.get_latest_block_index() as u32;
+                    let mut immature = 0.0f64;
+                    for i in tip.saturating_sub(IMMATURE_DEPTH.saturating_sub(1))..=tip {
+                        if let Ok(block) = blockchain_guard.get_block(i) {
+                            for tx in &block.transactions {
+                                if tx.sender == "MINING_REWARDS" && tx.recipient == wallet.address
+                                {
+                                    immature += tx.amount();
+                                }
+                            }
+                        }
+                    }
+                    if immature > 0.0 {
+                        stdout
+                            .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))
+                            .ok();
+                        let _ = writeln!(
+                            stdout,
+                            "  (includes {:.8} ♦ fresh mining rewards from the last {} blocks — may fluctuate briefly during chain races)",
+                            immature, IMMATURE_DEPTH
+                        );
+                    }
 
                     let _ = stdout.reset();
                     println!("-------------------");
