@@ -1114,7 +1114,10 @@ impl Node {
             tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
             tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
             relay_dead_targets: Arc::new(PLMutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(64).expect("nonzero"),
+                // Must comfortably exceed the number of distinct dead tips a post-storm
+                // relay window can hold, or eviction re-admits chewed-through dead
+                // candidates and starves the live tip out of the per-tick budget.
+                std::num::NonZeroUsize::new(512).expect("nonzero"),
             ))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
@@ -2746,9 +2749,17 @@ impl Node {
         // to the next live branch instead of re-walking the broken one.
         const MAX_TIP_CANDIDATES: usize = 4;
         const DEAD_TARGET_RETRY_SECS: u64 = 120;
+        // TRUE TIPS ONLY: a block some other wire block names as its parent is not a
+        // tip — converging to its tip covers it. Without this filter, an abandoned
+        // fork contributes EVERY one of its blocks as a candidate (a post-storm relay
+        // held a ~120-block dead fork), and the per-tick candidate budget could burn
+        // entirely on dead mid-fork blocks before ever reaching the live chain's
+        // fresh tip.
+        let parent_hashes: HashSet<[u8; 32]> =
+            blocks.iter().map(|b| b.previous_hash).collect();
         let mut candidates: Vec<(u32, [u8; 32])> = blocks
             .iter()
-            .filter(|b| b.index >= local_tip)
+            .filter(|b| b.index >= local_tip && !parent_hashes.contains(&b.hash))
             .map(|b| (b.index, b.hash))
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
