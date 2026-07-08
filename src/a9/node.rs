@@ -2755,6 +2755,7 @@ impl Node {
             )
         };
 
+
         // Caught-up FAST PATH (runs ~every 1s on the publisher). Cheapest first: the
         // gateway-maintained relay-head hint ({height,hash} of the newest ACCEPTED
         // block POST, refreshed/purged on every write). One CDN-fresh read replaces a
@@ -5322,6 +5323,32 @@ impl Node {
                 if let Err(e) = node_clone.handle_network_event(msg).await {
                     error!("Error handling network event: {}", e);
                 }
+            }
+        });
+
+        // ONE-TIME DEEP RELAY HEAL. Normal per-block backfill only re-posts the last
+        // ~32 blocks, so a hole deeper than that in the relay's history (blocks that
+        // were dropped when they were first mined, e.g. under a rate-limit storm) is
+        // NEVER refilled and permanently blocks the ancestor/reorg walk that lets a
+        // node converge to the heaviest chain — the 2026-07-08 stall, where the
+        // winning chain was un-walkable across ~70 missing middle heights. On startup
+        // every node re-posts a DEEP window of its own history to the relay; a node
+        // holding the heaviest chain thereby floods it back onto the shared relay so
+        // ALL nodes can walk and converge to it (pure work-based resolution, no
+        // authority fork). Cheap: re-posting an already-stored block is a SET NX
+        // no-op gated by the WASM PoW check, and it runs once. Depth is generous by
+        // default and env-tunable for a big recovery.
+        let heal_node = node.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(8)).await;
+            let depth = std::env::var("ALPHANUMERIC_RELAY_DEEP_REPOST")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(512)
+                .min(4096);
+            if depth > 0 {
+                info!("Deep relay heal: re-posting last {} blocks to refill any gaps", depth);
+                heal_node.post_recent_blocks_to_relay(depth).await;
             }
         });
 
