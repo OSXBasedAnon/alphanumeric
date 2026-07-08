@@ -1514,6 +1514,26 @@ impl Node {
         }
     }
 
+    /// Poll the gateway's mesh kill switch. Returns false ONLY if the gateway explicitly advertises
+    /// `mesh_enabled: false`; any error, timeout, or missing field returns true (fail-safe — a
+    /// transient blip must never disable the mesh network-wide).
+    #[cfg(feature = "webrtc_mesh")]
+    async fn fetch_mesh_enabled(&self) -> bool {
+        for base in Self::discovery_bases() {
+            let url = format!("{}/api/client-release", base);
+            let res = match self.http_client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => continue,
+            };
+            let body: Value = match res.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            return body.get("mesh_enabled").and_then(|v| v.as_bool()) != Some(false);
+        }
+        true // no gateway answered -> stay enabled
+    }
+
     fn discovery_peers_urls() -> Vec<String> {
         if let Ok(url) = std::env::var("ALPHANUMERIC_DISCOVERY_URL") {
             return vec![url];
@@ -3391,6 +3411,11 @@ impl Node {
         };
 
         if selected_peers.is_empty() {
+            // No TCP peers — but we may have DIRECT mesh peers. Gossip the mined block over the mesh
+            // so a peerless NAT miner (exactly the case the mesh targets) still propagates P2P, not
+            // only via the relay. The peered branch below already gossips inside broadcast_block.
+            #[cfg(feature = "webrtc_mesh")]
+            self.mesh_gossip_block(&block).await;
             if post_mine {
                 warn!("Mined block saved locally, but no peers were available for block broadcast");
             } else {
@@ -6610,11 +6635,6 @@ impl Node {
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
 
-                    // Flood over the WebRTC mesh (the velocity path below skips broadcast_block, so
-                    // hook here too to propagate received blocks to direct DataChannel peers).
-                    #[cfg(feature = "webrtc_mesh")]
-                    self.mesh_gossip(&NetworkMessage::Block(block.clone())).await;
-
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
                         let (peer_map, selected_peers) = {
@@ -6635,13 +6655,18 @@ impl Node {
                                 e
                             );
 
-                            // Fallback to traditional broadcast
+                            // Fallback to traditional broadcast (broadcast_block also floods the mesh)
                             if let Err(e) = self
                                 .broadcast_block(Arc::new(block.clone()), None, selected_peers)
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
                             }
+                        } else {
+                            // Velocity succeeded and SKIPS broadcast_block, so flood the mesh here —
+                            // exactly once (the fallback branch above already gossips via broadcast_block).
+                            #[cfg(feature = "webrtc_mesh")]
+                            self.mesh_gossip_block(&block).await;
                         }
                     } else {
                         // Traditional broadcast method
@@ -7352,6 +7377,11 @@ impl Node {
             &self.node_id[..8.min(self.node_id.len())]
         );
 
+        // Remote kill switch: nodes disable the mesh within ~30s if the gateway flips mesh_enabled to
+        // false, so the whole additive layer can be turned off WITHOUT a node re-release if it ever
+        // misbehaves at scale. `enabled` gates every loop below; the base network is unaffected.
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
         {
             let store = self.webrtc_mesh.clone();
             let mesh = mesh.clone();
@@ -7360,29 +7390,73 @@ impl Node {
             });
         }
         {
+            let node = self.clone();
             let mesh = mesh.clone();
+            let store = self.webrtc_mesh.clone();
+            let enabled = enabled.clone();
             tokio::spawn(async move {
                 loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    // Fail-safe: only an explicit gateway `mesh_enabled: false` disables the mesh.
+                    if !node.fetch_mesh_enabled().await {
+                        warn!("WebRTC mesh disabled by gateway kill switch — shutting the mesh down");
+                        enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                        *store.write().await = None; // stop mesh_gossip immediately
+                        mesh.wake(); // break the poll loop out of its sleep so it exits promptly
+                        mesh.shutdown().await; // close all direct connections
+                        return;
+                    }
+                }
+            });
+        }
+        {
+            let mesh = mesh.clone();
+            let enabled = enabled.clone();
+            tokio::spawn(async move {
+                loop {
+                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     let _ = mesh.poll_signals().await;
-                    // Cadence follows ACTIVITY, not an absolute degree: poll fast only while signaling
-                    // is actively flowing (a handshake in progress within the last ~25s), then back
-                    // off hard to 20s once quiet. Keying on degree (the old `degree < 12`) pinned most
-                    // nodes — small networks, NAT-fail nodes, isolated nodes — at the 2.5s hot cadence
-                    // FOREVER, which would blow the free-tier gateway Redis budget. Activity-based
-                    // backoff keeps a quiet, formed (or unformable) mesh nearly silent.
-                    let quiet = mesh.quiet_for().await >= Duration::from_secs(25);
-                    let delay_ms = if quiet { 20_000 } else { 2_500 };
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    // EVENT-DRIVEN cadence: poll fast only while a handshake is actually forming, or
+                    // signaling was recently active / expected (a dial, an inbound offer, a directory
+                    // change, or a lost lower-id link — all of which call touch()). Otherwise fall to a
+                    // cheap safety-net cadence. A settled node in a stable network barely touches the
+                    // gateway, so Redis cost scales with CHURN, not with N*time — the free-tier budget
+                    // stops being the scaling constraint. The directory it watches is edge-cached (~0
+                    // Redis), so detecting "a new peer might dial me" costs nothing.
+                    let active = mesh.has_forming_conns().await
+                        || mesh.quiet_for().await < Duration::from_secs(25);
+                    let delay_ms = if active { 2_500 } else { 180_000 };
+                    // Interruptible: a touch() (dial, inbound offer, directory change, lost lower-id
+                    // link) or the kill switch wakes us out of the long safety-net sleep at once, so
+                    // event-driven draining is actually prompt — not delayed up to 180s.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        _ = mesh.wait_for_wake() => {}
+                    }
                 }
             });
         }
         {
             let node = self.clone();
             let mesh = mesh.clone();
+            let enabled = enabled.clone();
             tokio::spawn(async move {
                 use crate::a9::webrtc::select_dial_targets;
+                let mut prev_ids: Vec<String> = Vec::new();
                 loop {
+                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     let ids = node.fetch_mesh_peer_ids().await;
+                    // A directory change (fetched from the ~free edge-cached /api/peers) may mean a new
+                    // peer will dial us — wake the signaling poll so it drains promptly instead of
+                    // waiting out the slow safety cadence. This is what makes draining event-driven.
+                    if ids != prev_ids {
+                        mesh.touch().await;
+                        prev_ids = ids.clone();
+                    }
                     // Publish the directory so inbound offers can be gated to real, announced peers.
                     mesh.set_known_peers(&ids).await;
                     // Dial targets chosen RELATIVE to our own id (nearest higher-id successors +
@@ -7401,8 +7475,12 @@ impl Node {
             // Failed on their own, so nothing else frees them or unblocks a re-dial). webrtc 0.17 has
             // no Drop, so this is also what actually releases the ICE agent + UDP socket.
             let mesh = mesh.clone();
+            let enabled = enabled.clone();
             tokio::spawn(async move {
                 loop {
+                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_secs(20)).await;
                     mesh.reap_stale().await;
                 }
@@ -7412,8 +7490,12 @@ impl Node {
             // Heartbeat: periodic operator-visible mesh degree, so a rollout can watch how many DIRECT
             // peer links are up (vs. relay fallback). Only logs when at least one link is up.
             let mesh = mesh.clone();
+            let enabled = enabled.clone();
             tokio::spawn(async move {
                 loop {
+                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     let peers = mesh.connected_peers().await;
                     if !peers.is_empty() {
@@ -7453,13 +7535,38 @@ impl Node {
     }
 
     /// Flood a message to every connected mesh peer, parallel to the TCP flood. No-op if the mesh is
-    /// off or not yet up. Peers dedup via the bloom, so double-delivery is harmless.
+    /// off / not up / has no peers. The actual send is SPAWNED, so a slow or backpressured DataChannel
+    /// can never add latency to the caller's base-path (TCP/relay) propagation. Peers dedup via the
+    /// bloom, so double-delivery is harmless.
     #[cfg(feature = "webrtc_mesh")]
     async fn mesh_gossip(&self, msg: &NetworkMessage) {
         let mesh = { self.webrtc_mesh.read().await.clone() };
         if let Some(mesh) = mesh {
+            if mesh.connected_peers().await.is_empty() {
+                return;
+            }
             if let Ok(bytes) = codec::serialize(msg) {
-                let _ = mesh.broadcast(&bytes).await;
+                tokio::spawn(async move {
+                    let _ = mesh.broadcast(&bytes).await;
+                });
+            }
+        }
+    }
+
+    /// Block-specific gossip: identical to `mesh_gossip` but defers the (up to ~1 MiB) Block clone
+    /// until AFTER confirming the mesh is up and has peers, so the base path pays nothing — not even
+    /// the clone — when the mesh is off or empty.
+    #[cfg(feature = "webrtc_mesh")]
+    async fn mesh_gossip_block(&self, block: &Block) {
+        let mesh = { self.webrtc_mesh.read().await.clone() };
+        if let Some(mesh) = mesh {
+            if mesh.connected_peers().await.is_empty() {
+                return;
+            }
+            if let Ok(bytes) = codec::serialize(&NetworkMessage::Block(block.clone())) {
+                tokio::spawn(async move {
+                    let _ = mesh.broadcast(&bytes).await;
+                });
             }
         }
     }
@@ -7473,7 +7580,7 @@ impl Node {
         // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks;
         // all broadcast_block callers). No-op unless the mesh feature is on and up.
         #[cfg(feature = "webrtc_mesh")]
-        self.mesh_gossip(&NetworkMessage::Block((*block).clone())).await;
+        self.mesh_gossip_block(block.as_ref()).await;
         let targets: Vec<_> = peers
             .into_iter()
             .filter(|addr| Some(*addr) != source)

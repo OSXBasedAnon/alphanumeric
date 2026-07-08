@@ -362,6 +362,13 @@ pub struct WebRtcMesh {
     /// reached (symmetric NAT, offline) is retried on an exponentially growing interval instead of
     /// every ~60s, so doomed handshakes don't hold the node at the fast poll cadence.
     dial_backoff: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
+    /// Wakes the signaling poll loop out of its long safety-net sleep the instant there's a reason to
+    /// drain (a dial, an inbound offer, a directory change, a lost link). Without this the event-
+    /// driven cadence would still wait out the full 180s slow sleep before noticing.
+    wake: Arc<tokio::sync::Notify>,
+    /// Terminal flag set by the kill switch's shutdown(). Checked under the conns lock in new_pc so a
+    /// dial/offer already in flight when shutdown() runs can't re-insert (and leak) a pc afterwards.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Opaque Debug so a `#[derive(Debug)]` holder (the Node) compiles — the inner webrtc/transport
@@ -393,6 +400,8 @@ impl WebRtcMesh {
             known_peers: Arc::new(Mutex::new(HashSet::new())),
             last_signal: Arc::new(Mutex::new(Instant::now())),
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         Ok((mesh, inbound_rx))
     }
@@ -418,15 +427,58 @@ impl WebRtcMesh {
         self.dial_backoff.lock().await.retain(|id, _| fresh.contains(id));
     }
 
-    /// Mark signaling activity now (a handshake in progress). The poll loop uses this to stay on the
-    /// fast cadence while forming and back off hard once quiet.
-    async fn touch(&self) {
+    /// Mark signaling activity now (a handshake in progress, or a reason to expect one soon — e.g. a
+    /// directory change) AND wake the poll loop so it drains immediately. Public so the node can wake
+    /// the poll on a directory change without draining Redis to find out.
+    pub async fn touch(&self) {
         *self.last_signal.lock().await = Instant::now();
+        self.wake.notify_one();
     }
 
     /// How long since the last signaling activity.
     pub async fn quiet_for(&self) -> Duration {
         self.last_signal.lock().await.elapsed()
+    }
+
+    /// Await the next wake signal (a touch() or an explicit wake()). The poll loop selects on this
+    /// against its safety-net sleep so a touch() interrupts the long quiet cadence immediately.
+    pub async fn wait_for_wake(&self) {
+        self.wake.notified().await;
+    }
+
+    /// Wake the poll loop without recording activity — used by the kill switch to make it re-check
+    /// the enabled flag and exit promptly.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// True if any connection is still negotiating (New/Connecting) — i.e. we're expecting an answer
+    /// or completing a hole-punch, so the poll loop should stay fast to finish it.
+    pub async fn has_forming_conns(&self) -> bool {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as St;
+        self.conns
+            .lock()
+            .await
+            .values()
+            .any(|c| matches!(c.pc.connection_state(), St::New | St::Connecting))
+    }
+
+    /// Close every connection and clear both maps — used by the remote kill switch to stop the mesh
+    /// cleanly (webrtc 0.17 has no Drop, so each pc must be close()d to free its ICE agent + socket).
+    pub async fn shutdown(&self) {
+        // Set BEFORE clearing conns so any dial/offer racing this (checking `closed` under the conns
+        // lock in new_pc) refuses to insert instead of leaking a pc we never close here.
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        let pcs: Vec<Arc<RTCPeerConnection>> = {
+            let mut conns = self.conns.lock().await;
+            let pcs = conns.values().map(|c| c.pc.clone()).collect();
+            conns.clear();
+            pcs
+        };
+        self.channels.lock().await.clear();
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
     }
 
     /// Remove `peer_id` from both maps ONLY if it still maps to exactly `pc` (Arc identity). This is
@@ -444,6 +496,11 @@ impl WebRtcMesh {
         };
         if removed {
             self.channels.lock().await.remove(peer_id);
+            // A lost link to a LOWER-id peer means that peer (the impolite initiator for this edge)
+            // will re-dial us — stay responsive on the poll so we catch the re-offer promptly.
+            if peer_id < self.local_id() {
+                self.touch().await;
+            }
         }
         removed
     }
@@ -614,10 +671,17 @@ impl WebRtcMesh {
                 }
             })
         }));
-        self.conns
-            .lock()
-            .await
-            .insert(peer_id.to_string(), PeerConn { pc: pc.clone(), created: Instant::now() });
+        {
+            let mut conns = self.conns.lock().await;
+            // If the kill switch shut us down while this pc was being built, don't track it (nothing
+            // would ever close it) — close it now and bail.
+            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                drop(conns);
+                let _ = pc.close().await;
+                return Err("mesh shut down".to_string());
+            }
+            conns.insert(peer_id.to_string(), PeerConn { pc: pc.clone(), created: Instant::now() });
+        }
         Ok(pc)
     }
 
@@ -753,12 +817,13 @@ impl WebRtcMesh {
     }
 
     /// Drain the mailbox once and dispatch each envelope to the right handler. Returns the number of
-    /// envelopes processed. Resets the poll cadence ONLY if an envelope actually advanced a handshake
-    /// (not merely arrived) — so signed junk can't hold the node at the fast cadence.
+    /// envelopes processed. Does NOT touch()/wake: it runs INSIDE the poll loop, so self-waking would
+    /// just re-enter immediately. Staying fast while a handshake is in flight is handled by
+    /// has_forming_conns(); the poll loop is woken for NEW work only by EXTERNAL touches (a dial, a
+    /// directory change, a lost lower-id link) — which is what keeps signed junk from pinning it.
     pub async fn poll_signals(self: &Arc<Self>) -> Result<usize, String> {
         let envelopes = self.transport.drain_signals().await?;
         let n = envelopes.len();
-        let mut worked = false;
         for e in envelopes {
             let r = match e.kind.as_str() {
                 "offer" => self.handle_offer(&e.from, &e.payload).await,
@@ -766,19 +831,14 @@ impl WebRtcMesh {
                 "candidate" => self.handle_candidate(&e.from, &e.payload).await,
                 _ => Ok(false),
             };
-            match r {
-                Ok(true) => worked = true,
-                Ok(false) => {}
-                Err(err) => log::debug!(
+            if let Err(err) = r {
+                log::debug!(
                     "mesh signal {} from {} failed: {}",
                     e.kind,
                     &e.from[..8.min(e.from.len())],
                     err
-                ),
+                );
             }
-        }
-        if worked {
-            self.touch().await;
         }
         Ok(n)
     }
@@ -793,18 +853,27 @@ impl WebRtcMesh {
         }
     }
 
-    /// Send bytes to every connected peer (the block flood over the mesh).
+    /// Send bytes to every connected peer (the block flood over the mesh). Sends CONCURRENTLY with a
+    /// per-peer timeout, so a single slow / backpressured DataChannel can't stall delivery to the
+    /// other peers (or keep the spawned gossip task alive indefinitely).
     pub async fn broadcast(&self, data: &[u8]) -> usize {
         let channels: Vec<Arc<RTCDataChannel>> =
             self.channels.lock().await.values().cloned().collect();
         let bytes = Bytes::copy_from_slice(data);
-        let mut sent = 0;
-        for dc in channels {
-            if dc.send(&bytes).await.is_ok() {
-                sent += 1;
+        let sends = channels.into_iter().map(|dc| {
+            let bytes = bytes.clone(); // Bytes clone is a refcount bump, not a data copy
+            async move {
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(5), dc.send(&bytes)).await,
+                    Ok(Ok(_))
+                )
             }
-        }
-        sent
+        });
+        futures_util::future::join_all(sends)
+            .await
+            .into_iter()
+            .filter(|ok| *ok)
+            .count()
     }
 }
 
@@ -959,6 +1028,109 @@ mod tests {
         let b = mesh.dial_backoff.lock().await;
         assert!(b.contains_key("stays"), "still-advertised peer keeps its backoff");
         assert!(!b.contains_key("gone"), "departed peer's backoff is pruned");
+    }
+
+    // In-memory signal transport for multi-node tests: a shared map of per-recipient mailboxes —
+    // exactly the store-and-forward the gateway provides, minus the network + signatures (the node
+    // trusts the gateway and never verifies inbound envelope signatures).
+    struct MockTransport {
+        id: String,
+        boxes: Arc<std::sync::Mutex<HashMap<String, Vec<SignalEnvelope>>>>,
+    }
+    #[async_trait::async_trait]
+    impl SignalTransport for MockTransport {
+        fn local_node_id(&self) -> &str {
+            &self.id
+        }
+        async fn post_signal(&self, to: &str, kind: &str, payload: &str) -> Result<(), String> {
+            let env = SignalEnvelope {
+                from: self.id.clone(),
+                to: to.to_string(),
+                kind: kind.to_string(),
+                payload: payload.to_string(),
+                ts: 0,
+                signature: String::new(),
+            };
+            self.boxes.lock().unwrap().entry(to.to_string()).or_default().push(env);
+            Ok(())
+        }
+        async fn drain_signals(&self) -> Result<Vec<SignalEnvelope>, String> {
+            Ok(self.boxes.lock().unwrap().remove(&self.id).unwrap_or_default())
+        }
+    }
+
+    // End-to-end multi-node proof: N meshes with a shared in-memory signal relay + real WebRTC over
+    // loopback form a connected overlay via select_dial_targets, and a block sent to a connected peer
+    // is delivered P2P. Exercises the whole dial/answer/topology stack with N>2 real nodes — the
+    // "hundreds of miners actually mesh" property, minus real-internet NAT (which no local test can
+    // prove; the gateway relay is the documented fallback for pairs that can't hole-punch). Ignored by
+    // default (spins up N real ICE stacks over loopback); run explicitly.
+    #[tokio::test]
+    #[ignore]
+    async fn multi_node_mesh_forms_and_delivers_over_loopback() {
+        const N: usize = 4;
+        let boxes = Arc::new(std::sync::Mutex::new(HashMap::<String, Vec<SignalEnvelope>>::new()));
+        let mut ids: Vec<String> = (0..N).map(|i| format!("{:064x}", i * 7 + 3)).collect();
+        ids.sort();
+
+        let mut meshes = Vec::new();
+        let mut rxs = Vec::new();
+        for id in &ids {
+            let t: Arc<dyn SignalTransport> =
+                Arc::new(MockTransport { id: id.clone(), boxes: boxes.clone() });
+            let (mesh, rx) =
+                WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+            mesh.set_known_peers(&ids).await;
+            meshes.push(mesh);
+            rxs.push(rx);
+        }
+
+        // Each node polls signaling and dials its selected targets until the overlay forms.
+        for mesh in &meshes {
+            let mesh = mesh.clone();
+            let ids = ids.clone();
+            tokio::spawn(async move {
+                let local = mesh.local_id().to_string();
+                for _ in 0..300 {
+                    let _ = mesh.poll_signals().await;
+                    for target in select_dial_targets(&local, &ids, 12) {
+                        let _ = mesh.dial(&target).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
+
+        // Every node ends up with at least one DIRECT link (the overlay formed across all N).
+        let formed = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let mut all = true;
+                for mesh in &meshes {
+                    if mesh.connected_peers().await.is_empty() {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await;
+        assert!(formed.is_ok(), "not every node formed a direct mesh link");
+
+        // A block sent to one of node 0's connected peers is delivered P2P intact.
+        let peers0 = meshes[0].connected_peers().await;
+        assert!(!peers0.is_empty(), "node 0 has a direct peer");
+        let target = peers0[0].clone();
+        let target_idx = ids.iter().position(|id| *id == target).unwrap();
+        assert!(meshes[0].send_to(&target, b"multi-block").await, "send to a connected peer");
+        let got = tokio::time::timeout(Duration::from_secs(5), rxs[target_idx].recv())
+            .await
+            .expect("no inbound message")
+            .expect("channel closed");
+        assert_eq!(&got.1, b"multi-block", "block delivered intact P2P across the overlay");
     }
 
     // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
