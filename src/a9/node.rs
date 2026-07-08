@@ -5241,6 +5241,7 @@ impl Node {
                 let mut last_version: u64 = u64::MAX;
                 let mut ticks_since_full: u64 = 0;
                 let mut publisher_bootstrap_strikes: u32 = 0;
+                let mut publisher_relay_gap_strikes: u32 = 0;
                 let mut tick_no: u64 = 0;
                 let safety_ticks = (safety_secs / tick_secs).max(1);
                 loop {
@@ -5311,7 +5312,41 @@ impl Node {
                         // losing fork the publisher may have latched onto during a race —
                         // so it can never get stuck on a dead branch while miners extend a
                         // heavier one (which would freeze the beacon for the whole network).
-                        match node_clone.converge_to_relay_tip().await {
+                        //
+                        // P2P GAP-FILL FALLBACK: at high block rates the relay can develop
+                        // ancestry HOLES (posts dropped by rate limits / lost requests), and
+                        // then NO relay candidate is walkable — converge keeps returning
+                        // BeaconStale while miners (who share blocks peer-to-peer) sprint
+                        // ahead and the beacon crawls (2026-07-08 evening stall). The miners
+                        // ARE our peers, so after repeated walk failures with the relay head
+                        // visibly ahead, pull the missing span directly over p2p GetBlocks
+                        // (fully validated, existing path) and let converge resume.
+                        let outcome = node_clone.converge_to_relay_tip().await;
+                        if matches!(outcome, Converge::BeaconStale) {
+                            publisher_relay_gap_strikes += 1;
+                        } else {
+                            publisher_relay_gap_strikes = 0;
+                        }
+                        if publisher_relay_gap_strikes >= 10 {
+                            publisher_relay_gap_strikes = 0;
+                            let behind = match node_clone.fetch_relay_head().await {
+                                Some(head) => {
+                                    let local = {
+                                        let bc = node_clone.blockchain.read().await;
+                                        bc.get_latest_block_index() as u32
+                                    };
+                                    head.height > local.saturating_add(2)
+                                }
+                                None => false,
+                            };
+                            if behind {
+                                warn!("Publisher: relay ancestry unwalkable while behind; pulling gap from p2p peers");
+                                if let Err(e) = node_clone.sync_with_network().await {
+                                    debug!("p2p gap-fill sync failed: {}", e);
+                                }
+                            }
+                        }
+                        match outcome {
                             Converge::Converged | Converge::AtTipAhead | Converge::Progressed => {
                                 publisher_bootstrap_strikes = 0;
                             }
