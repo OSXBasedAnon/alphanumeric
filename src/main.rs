@@ -3751,13 +3751,34 @@ fn canonical_reconcile_decision(
         if local_hash.eq_ignore_ascii_case(&canonical_hash) {
             return CanonicalReconcile::InSyncOrUnknown;
         }
+        // BOOT-TIME SIGNED CHECKPOINT (v7.6.5, from the 2026-07-08 shatter): we HOLD
+        // a block at the canonical height but its hash DIFFERS from the signed
+        // manifest's — this node is on a genuine fork, not merely behind. Treating
+        // "ahead by height" as in-sync here left a forked miner that had out-mined
+        // the canonical tip stranded FOREVER (its fork's history was unservable, so
+        // no one could join it, and no restart could bring it back). At BOOT, the
+        // publisher-signed manifest is the recovery anchor: re-bootstrap onto it.
+        // This never overrides live work-based fork choice — a running node still
+        // follows the heaviest chain; this only makes "restart the node" a reliable
+        // way OUT of a stranded fork. Same-height race blocks are unaffected: their
+        // holder is not at boot mid-race, and losing 1-2 racing blocks on a restart
+        // is normal reorg cost.
+        return CanonicalReconcile::Diverged {
+            local: format!(
+                "forked at {} (local {}…)",
+                canonical_height,
+                &local_hash[..local_hash.len().min(12)]
+            ),
+            canonical_height: height,
+            canonical_hash,
+        };
     }
 
-    // Behind or forked. If it is within the streamable window, the LIVE
-    // beacon-watch loop catches up incrementally (append) or reorgs to canonical
-    // (fork) once the node is running — we must NOT re-download the whole chain
-    // for a few blocks; that is what "syncing" means. Only a gap deeper than the
-    // window (or a near-empty DB) is worth a full bootstrap.
+    // Behind (no block at the canonical height). If it is within the streamable
+    // window, the LIVE beacon-watch loop catches up incrementally (append) or
+    // reorgs to canonical (fork) once the node is running — we must NOT re-download
+    // the whole chain for a few blocks; that is what "syncing" means. Only a gap
+    // deeper than the window (or a near-empty DB) is worth a full bootstrap.
     let local_tip = local_tip_height(db_path).unwrap_or(0);
     if local_tip.saturating_add(STREAM_WINDOW) >= canonical_height {
         return CanonicalReconcile::InSyncOrUnknown;

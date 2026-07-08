@@ -3756,8 +3756,26 @@ impl Node {
                 // are near the tip, so the local tip is almost certainly current; a losing
                 // local block is reorged away by the normal path. This upholds the
                 // "never dead-pause" contract even when the relay momentarily can't answer.
+                //
+                // EXCEPT when the signed beacon is far above us (v7.6.5, 2026-07-08): a
+                // node stranded across a deep reorg kept "failing open" here and silently
+                // mined orphans forever while printing normal mining output — the operator
+                // had no idea their blocks were worthless. Beyond a stream window of
+                // deficit, mining the local tip is never useful work: stop with an
+                // explicit "restart to re-sync" instead (boot-time reconcile then pulls
+                // the node onto the canonical chain).
                 Converge::BeaconStale => {
                     if Instant::now() >= deadline {
+                        let local_tip = {
+                            let bc = self.blockchain.read().await;
+                            bc.get_latest_block_index() as u32
+                        };
+                        if beacon.height > local_tip.saturating_add(64) {
+                            return Err(NodeError::ConsensusFailure(format!(
+                                "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; restart this node to re-sync onto the canonical chain",
+                                beacon.height.saturating_sub(local_tip), local_tip, beacon.height
+                            )));
+                        }
                         warn!("Relay gap while preparing to mine; mining on local tip (fail-open)");
                         return Ok(());
                     }
