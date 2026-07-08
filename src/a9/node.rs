@@ -98,6 +98,13 @@ struct TipBeaconInfo {
     version: u64,
 }
 
+/// The gateway's relay-head hint: newest ACCEPTED block POST. A freshness/wake
+/// signal only — never a consensus input (see fetch_relay_head).
+struct RelayHeadInfo {
+    height: u32,
+    hash: [u8; 32],
+}
+
 /// Outcome of a single always-converge attempt toward the signed beacon tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Converge {
@@ -838,6 +845,13 @@ pub struct Node {
     // of a straight-line reset that unwinding skips (which wedged discovery off).
     discovery_in_progress: Arc<AtomicBool>,
     public_relay_tip: Arc<RwLock<Option<RelayTipState>>>,
+    // Relay tip candidates that recently FAILED to converge (ancestry unfetchable —
+    // e.g. a gap-broken abandoned fork whose owner's POSTs were rate-limited away).
+    // converge_to_relay_tip memoizes them so the 1s publisher tick moves on to the
+    // next-best live branch instead of re-walking the same dead fork forever (the
+    // 2026-07-08 frozen-beacon incident: a dead max-height fork at 1240 pinned the
+    // publisher at 1209 while live miners advanced).
+    relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), Instant>>>,
     last_public_announce_at: Arc<AtomicU64>,
     last_header_snapshot_at: Arc<AtomicU64>,
     last_stats_snapshot_at: Arc<AtomicU64>,
@@ -1099,6 +1113,9 @@ impl Node {
             solicited_block_peers: Arc::new(DashMap::new()),
             tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
             tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
+            relay_dead_targets: Arc::new(PLMutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(64).expect("nonzero"),
+            ))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
             bind_addr,
@@ -2671,51 +2688,175 @@ impl Node {
             )
         };
 
-        // Caught-up FAST PATH (runs ~every 1s on the publisher): a cheap, fresh probe of
-        // just the tip-adjacent range. If nothing sits above our tip AND the only block at
-        // our height is our own tip, we are caught up — skip the wide fork-aware scan
-        // entirely. Only when there IS a forward block or a FOREIGN competitor at our
-        // height do we pay for the full converge.
-        match self
-            .fetch_relay_blocks(local_tip, local_tip.saturating_add(1))
-            .await
-        {
-            Ok(probe) => {
-                let has_forward = probe.iter().any(|b| b.index > local_tip);
-                let foreign_at_tip = probe
-                    .iter()
-                    .any(|b| b.index == local_tip && Some(b.hash) != local_hash);
-                if !has_forward && !foreign_at_tip {
+        // Caught-up FAST PATH (runs ~every 1s on the publisher). Cheapest first: the
+        // gateway-maintained relay-head hint ({height,hash} of the newest ACCEPTED
+        // block POST, refreshed/purged on every write). One CDN-fresh read replaces a
+        // block-range scan whose non-empty response gets edge/instance cached for
+        // 5-30s — the measured 5-25s ingest lag that widened every mining race. The
+        // head is a HINT about when to look, never a source of truth: adoption below
+        // still routes through the full validation/work-choice engine, so a wrong head
+        // can only delay or waste a look. If the endpoint is missing or unreachable
+        // (older gateway, transient error), fall back to the original tip-adjacent
+        // range probe, byte-for-byte today's behavior.
+        match self.fetch_relay_head().await {
+            Some(head) => {
+                let caught_up = head.height < local_tip
+                    || (head.height == local_tip && Some(head.hash) == local_hash);
+                if caught_up {
                     return Converge::Converged;
                 }
+                // Something new or foreign at/above our tip: pay for the wide scan.
             }
-            Err(_) => return Converge::BeaconStale,
+            None => {
+                match self
+                    .fetch_relay_blocks(local_tip, local_tip.saturating_add(1))
+                    .await
+                {
+                    Ok(probe) => {
+                        let has_forward = probe.iter().any(|b| b.index > local_tip);
+                        let foreign_at_tip = probe
+                            .iter()
+                            .any(|b| b.index == local_tip && Some(b.hash) != local_hash);
+                        if !has_forward && !foreign_at_tip {
+                            return Converge::Converged;
+                        }
+                    }
+                    Err(_) => return Converge::BeaconStale,
+                }
+            }
         }
 
-        // Not caught up: find the relay's heaviest tip and converge to it.
+        // Not caught up: find the relay's heaviest LIVE tip and converge to it.
         let from = local_tip.saturating_sub(8);
         let to = local_tip.saturating_add(256);
         let blocks = match self.fetch_relay_blocks(from, to).await {
             Ok(b) if !b.is_empty() => b,
             _ => return Converge::BeaconStale,
         };
-        let max_h = blocks.iter().map(|b| b.index).max().unwrap_or(local_tip);
-        // Among blocks at the max height (a fork at the tip), nominate the LOWEST hash to
-        // match the engine's work-tie lexical rule, so target selection can't oscillate
-        // between competing tips on successive ticks. Adoption is still work-gated.
-        let Some(tip) = blocks
+
+        // Candidate tips, best-first: height DESC then LOWEST hash (the engine's
+        // work-tie lexical rule, so selection can't oscillate between competing tips
+        // on successive ticks). We iterate candidates instead of pinning the single
+        // max-height block: the relay holds first-seen blocks from EVERY fork, and an
+        // abandoned fork with a relay gap in its ancestry (its owner's POSTs were
+        // rate-limited away during a race storm) is UNCONVERGEABLE-BY-DESIGN — walking
+        // only that one target froze the beacon for the whole network at height 1209
+        // on 2026-07-08 while live miners advanced 24+ blocks. Dead candidates are
+        // memoized (relay_dead_targets) with an expiry so each 1s tick moves straight
+        // to the next live branch instead of re-walking the broken one.
+        const MAX_TIP_CANDIDATES: usize = 4;
+        const DEAD_TARGET_RETRY_SECS: u64 = 120;
+        let mut candidates: Vec<(u32, [u8; 32])> = blocks
             .iter()
-            .filter(|b| b.index == max_h)
-            .min_by_key(|b| b.hash)
-        else {
+            .filter(|b| b.index >= local_tip)
+            .map(|b| (b.index, b.hash))
+            .collect();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates.dedup();
+
+        let mut last = Converge::BeaconStale;
+        let mut tried = 0usize;
+        let mut all_needs_bootstrap = true;
+        for (height, hash) in candidates {
+            if tried >= MAX_TIP_CANDIDATES {
+                break;
+            }
+            if height == local_tip && Some(hash) == local_hash {
+                // Our own tip: nothing above us that converged — we are as caught up
+                // as the relay allows this tick.
+                return if tried == 0 { Converge::Converged } else { last };
+            }
+            {
+                let mut dead = self.relay_dead_targets.lock();
+                if let Some(when) = dead.get(&(height, hash)) {
+                    if when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS) {
+                        continue;
+                    }
+                    dead.pop(&(height, hash));
+                }
+            }
+            tried += 1;
+            let target = TipBeaconInfo {
+                height,
+                hash,
+                version: 0,
+            };
+            match self.converge_to_canonical(&target).await {
+                done @ (Converge::Converged | Converge::AtTipAhead | Converge::Progressed) => {
+                    return done;
+                }
+                failed @ (Converge::BeaconStale | Converge::NeedsBootstrap) => {
+                    if !matches!(failed, Converge::NeedsBootstrap) {
+                        all_needs_bootstrap = false;
+                    }
+                    self.relay_dead_targets
+                        .lock()
+                        .put((height, hash), Instant::now());
+                    debug!(
+                        "Relay tip candidate {}@{} unconvergeable ({:?}); trying next branch",
+                        height,
+                        hex::encode(hash),
+                        failed
+                    );
+                    last = failed;
+                }
+            }
+        }
+        // Escalation semantics (M2, publisher exit->re-bootstrap) are preserved but
+        // STRICTER: only report NeedsBootstrap when every tried candidate needed it
+        // (genuine deep divergence). A mix that includes a mere relay gap reports
+        // BeaconStale (retry) so one broken fork can never drive the 2-strike exit.
+        if tried > 0 && all_needs_bootstrap && matches!(last, Converge::NeedsBootstrap) {
+            return Converge::NeedsBootstrap;
+        }
+        if matches!(last, Converge::NeedsBootstrap) {
             return Converge::BeaconStale;
-        };
-        let target = TipBeaconInfo {
-            height: tip.index,
-            hash: tip.hash,
-            version: 0,
-        };
-        self.converge_to_canonical(&target).await
+        }
+        last
+    }
+
+    /// Fetch the gateway's relay-head hint: the {height, hash} of the newest block
+    /// POST the relay ACCEPTED. Served purge-on-write from the CDN so it is fresh
+    /// within ~1s of a block landing. Returns None when the endpoint is missing
+    /// (older gateway), unreachable, or answers for a different network — callers
+    /// treat None as "use the legacy probe", never as an error.
+    async fn fetch_relay_head(&self) -> Option<RelayHeadInfo> {
+        for base in Self::discovery_bases() {
+            let url = format!("{}/api/blocks/head", base);
+            let Ok(res) = self.http_client.get(&url).send().await else {
+                continue;
+            };
+            if !res.status().is_success() {
+                continue;
+            }
+            let Ok(body) = res.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let same_network = body
+                .get("network_id")
+                .and_then(|v| v.as_str())
+                .map(|nid| nid.eq_ignore_ascii_case(&hex::encode(self.network_id)))
+                .unwrap_or(false);
+            if !same_network {
+                continue;
+            }
+            let Some(height) = body.get("height").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let hash = body
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
+            return Some(RelayHeadInfo {
+                height: height as u32,
+                hash,
+            });
+        }
+        None
     }
 
     async fn post_stats_snapshot(&self) -> Result<(), NodeError> {
@@ -3290,9 +3431,14 @@ impl Node {
     }
 
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
-        // Best-effort peer discovery (harmless no-op when NAT'd and empty).
+        // Best-effort peer discovery (harmless no-op when NAT'd and empty). Capped
+        // WELL below max_wait: across NAT this almost never yields a peer, and at the
+        // old cap (= max_wait) it silently ate the entire mining-prep window before
+        // convergence even started — the "mine command hangs with no output" stall.
+        // Convergence uses the relay, not p2p peers, so a short cap loses nothing.
         if self.peers.read().await.is_empty() {
-            let _ = timeout(max_wait, self.connect_discovery_peers(8)).await;
+            let cap = max_wait.min(Duration::from_secs(3));
+            let _ = timeout(cap, self.connect_discovery_peers(8)).await;
         }
 
         // ALWAYS CONVERGE, THEN COMPETE — never pause-and-concede.
@@ -3317,7 +3463,25 @@ impl Node {
                 warn!("Tip beacon unreachable; mining on local tip (fail-open)");
                 return Ok(());
             };
-            match self.converge_to_canonical(&beacon).await {
+            // Backstop timeout per round: the deadline is only checked BETWEEN rounds,
+            // and one converge round can fan out into many relay window fetches (each
+            // individually HTTP-bounded but unbounded in count on a deeply forked
+            // relay) — the rare "mine hangs for a minute with zero output" stall.
+            // Cancelling here is state-safe: adoption is atomic (apply_batch) and any
+            // partially staged sync work is re-derived on the next round.
+            let round = match timeout(
+                Duration::from_secs(20),
+                self.converge_to_canonical(&beacon),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    warn!("Converge round timed out; retrying against a fresh beacon");
+                    Converge::BeaconStale
+                }
+            };
+            match round {
                 // At the canonical tip, or holding an equal/heavier chain: go COMPETE.
                 Converge::Converged | Converge::AtTipAhead => return Ok(()),
                 // Diverged below the finality window — incremental convergence cannot

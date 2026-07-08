@@ -1608,7 +1608,11 @@ println!("Wallet renamed successfully");
                     let mut prep_ok = false;
                     let mut prep_stop: Option<String> = None;
                     for attempt in 1..=MINE_PREP_ATTEMPTS {
-                        match node.prepare_local_mining(Duration::from_secs(15)).await {
+                        // 8s window (was 15s): with the discovery cap and per-round
+                        // backstop inside prepare_local_mining, shorter windows keep
+                        // the between-attempt progress lines flowing instead of long
+                        // silent stretches that read as a hang.
+                        match node.prepare_local_mining(Duration::from_secs(8)).await {
                             Ok(()) => {
                                 prep_ok = true;
                                 break;
