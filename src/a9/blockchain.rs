@@ -175,6 +175,20 @@ pub(crate) fn pow_target_from_difficulty(difficulty: u64) -> BigUint {
     MAX_TARGET.clone() >> (exponent as usize)
 }
 
+/// A PoW target as fixed-width big-endian bytes. Targets are always < 2^256, so
+/// the 32-byte left-padded form is exact — and for fixed-width big-endian
+/// values, lexicographic byte comparison IS numeric comparison. The mining hot
+/// loop compares `[u8; 32]` hashes against this directly instead of allocating
+/// a BigUint per nonce; equivalence is locked by
+/// pow_byte_compare_matches_biguint_compare.
+pub(crate) fn pow_target_bytes(target: &BigUint) -> [u8; 32] {
+    let raw = target.to_bytes_be();
+    let mut bytes = [0u8; 32];
+    let len = raw.len().min(32);
+    bytes[32 - len..].copy_from_slice(&raw[raw.len() - len..]);
+    bytes
+}
+
 static FINALIZE_STAGE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn current_finalize_stage() -> usize {
@@ -6914,6 +6928,46 @@ mod tests {
         assert!(bc.address_txs_page("alice", 3, Some((1, 0))).unwrap().is_empty());
         // Prefix addresses must not bleed into the page window.
         assert!(bc.address_txs_page("ali", 10, Some((5, 2))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pow_byte_compare_matches_biguint_compare() {
+        // The mining hot loop replaced `BigUint::from_bytes_be(&hash) <= target`
+        // with a fixed-width byte comparison. Prove them interchangeable across
+        // difficulty edge cases and structured + pseudorandom hashes, including
+        // exact-equality and off-by-one boundaries around each target.
+        let difficulties: [u64; 9] = [0, 1, 15, 16, 17, 464, 550, 4080, 4096];
+        for difficulty in difficulties {
+            let target = pow_target_from_difficulty(difficulty);
+            let target_bytes = pow_target_bytes(&target);
+            assert_eq!(
+                BigUint::from_bytes_be(&target_bytes),
+                target,
+                "byte form must round-trip exactly (difficulty {})",
+                difficulty
+            );
+
+            let mut candidates: Vec<[u8; 32]> = vec![[0u8; 32], [0xffu8; 32], target_bytes];
+            if target > BigUint::from(0u8) {
+                candidates.push(pow_target_bytes(&(target.clone() - 1u8)));
+            }
+            if target < *MAX_TARGET {
+                candidates.push(pow_target_bytes(&(target.clone() + 1u8)));
+            }
+            for seed in 0u64..64 {
+                candidates.push(*blake3::hash(&seed.to_le_bytes()).as_bytes());
+            }
+
+            for hash in candidates {
+                let via_biguint = BigUint::from_bytes_be(&hash) <= target;
+                let via_bytes = hash <= target_bytes;
+                assert_eq!(
+                    via_biguint, via_bytes,
+                    "compare divergence at difficulty {} hash {:02x?}",
+                    difficulty, hash
+                );
+            }
+        }
     }
 
     #[test]

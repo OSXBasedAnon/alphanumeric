@@ -1,7 +1,6 @@
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::warn;
-use num_bigint::BigUint;
 use num_cpus;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -13,7 +12,8 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 
 use crate::a9::blockchain::{
-    current_finalize_stage, finalize_stage_name, pow_target_from_difficulty, set_finalize_stage,
+    current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
+    set_finalize_stage,
     BlockchainError, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
@@ -23,7 +23,17 @@ const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
 const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {msg}";
 const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {msg}";
+/// How often (in nonces, per thread) the hot loop polls the ATOMIC tip-change
+/// counter. One Acquire load — cheap enough to keep tight so a solved block
+/// elsewhere aborts wasted work within microseconds.
 const TIP_CHANGE_CHECK_INTERVAL: u64 = 256;
+/// How often (in nonces, per thread) the loop additionally re-confirms the
+/// parent against the DATABASE (try_read + get_last_block = a sled read and a
+/// full block decode). This is only a belt-and-braces net under the atomic
+/// counter — every commit path bumps the counter — but at the old 256-nonce
+/// cadence it was hundreds of thousands of block decodes per second across a
+/// many-core miner, throttling the very machines the thread pool freed up.
+const DB_TIP_CONFIRM_INTERVAL: u64 = 262_144;
 
 #[derive(Debug, Clone, Error)]
 pub enum CryptoError {
@@ -178,7 +188,16 @@ impl MiningManager {
             return Err(MiningError::MaxNonceExceeded);
         }
 
-        let num_threads = std::cmp::min(num_cpus::get(), 32).max(1);
+        // All cores by default. The old hard cap of 32 left big rigs (e.g. a
+        // 258-thread EPYC) mining at ~12% capacity; header PoW is embarrassingly
+        // parallel, so there is no reason to cap below the machine. Operators
+        // who want to keep cores free set ALPHANUMERIC_MINE_THREADS.
+        let num_threads = std::env::var("ALPHANUMERIC_MINE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 1024))
+            .unwrap_or_else(|| num_cpus::get())
+            .max(1);
         let nonces_per_thread = max_nonce.div_ceil(num_threads as u64);
 
         let progress_bar = Arc::new(Mutex::new(ProgressBar::new(max_nonce)));
@@ -198,7 +217,10 @@ impl MiningManager {
         }
 
         let mut current_nonce: u64 = 0;
-        let update_interval = 1000;
+        // Progress-bar refresh cadence per thread. try_lock keeps losers from
+        // blocking, but with hundreds of threads even the attempts are traffic —
+        // 8192 still repaints many times a second while staying off the hot path.
+        let update_interval = 8192;
         let tip_change_counter = {
             let blockchain_guard = self.blockchain.read().await;
             blockchain_guard.tip_change_counter_handle()
@@ -313,7 +335,13 @@ impl MiningManager {
                     let end_nonce = start_nonce.saturating_add(nonces_per_thread).min(range_end);
                     let mut cached_timestamp = 0u64;
                     let mut cached_difficulty = 0u64;
-                    let mut cached_target = BigUint::from(0u8);
+                    // Target as fixed-width big-endian bytes: for 256-bit values,
+                    // lexicographic [u8; 32] comparison IS numeric comparison, so
+                    // the hot loop compares the hash directly and never heap-
+                    // allocates a BigUint per nonce (the allocator was the scaling
+                    // ceiling on many-core rigs). Equivalence is unit-tested
+                    // (pow_byte_compare_matches_biguint_compare in blockchain.rs).
+                    let mut cached_target_bytes = [0u8; 32];
 
                     for nonce in start_nonce..end_nonce {
                         if found.load(Ordering::Relaxed)
@@ -335,7 +363,8 @@ impl MiningManager {
                                 timestamp.saturating_sub(previous_block_timestamp),
                                 local_header.number,
                             );
-                            cached_target = pow_target_from_difficulty(cached_difficulty);
+                            cached_target_bytes =
+                                pow_target_bytes(&pow_target_from_difficulty(cached_difficulty));
                         }
                         let hash = {
                             let mut header_data = [0u8; 92];
@@ -364,8 +393,7 @@ impl MiningManager {
                             *blake3::hash(&header_data).as_bytes()
                         };
 
-                        let hash_int = BigUint::from_bytes_be(&hash);
-                        if hash_int <= cached_target {
+                        if hash <= cached_target_bytes {
                             if !found.swap(true, Ordering::Relaxed) {
                                 result_nonce.store(nonce, Ordering::Release);
                                 result_timestamp.store(timestamp, Ordering::Release);
@@ -384,7 +412,9 @@ impl MiningManager {
                                 abort_for_tip_change_check.store(true, Ordering::Release);
                                 return Ok(());
                             }
+                        }
 
+                        if nonce % DB_TIP_CONFIRM_INTERVAL == 0 {
                             if let Ok(blockchain) = blockchain_for_tip_checks.try_read() {
                                 if let Some(tip) = blockchain.get_last_block() {
                                     if tip.index != expected_parent_index
