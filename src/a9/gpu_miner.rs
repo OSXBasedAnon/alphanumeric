@@ -371,8 +371,12 @@ pub fn gpu_mine_attempt(
     const THREADS: u32 = 65535 * 256;
     const ITERS: u32 = 64;
 
+    const PER_DISPATCH: u64 = THREADS as u64 * ITERS as u64;
     let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
+    let start = Instant::now();
     let mut base: u64 = 0;
+    let mut dispatches: u64 = 0;
+    let mut last_report = start;
     while Instant::now() < deadline && !tip_moved() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -392,7 +396,25 @@ pub fn gpu_mine_attempt(
             let hash = *blake3::hash(&full).as_bytes();
             return Some((nonce, timestamp, difficulty, hash));
         }
-        base = base.wrapping_add(THREADS as u64 * ITERS as u64);
+        base = base.wrapping_add(PER_DISPATCH);
+        dispatches += 1;
+
+        // Progress heartbeat (~every 2s): without it, GPU mode shows nothing between
+        // "rebuilding block template" lines and looks stalled. Also the duty-cycle
+        // meter — hashed/elapsed is the REAL rate the node mines at (vs the raw
+        // kernel rate) once template-rebuild time is counted.
+        let now = Instant::now();
+        if now.duration_since(last_report).as_secs_f64() >= 2.0 {
+            let elapsed = now.duration_since(start).as_secs_f64().max(1e-6);
+            let ghs = (dispatches * PER_DISPATCH) as f64 / elapsed / 1e9;
+            print!(
+                "\r  GPU mining block #{}: {:.2} GH/s  ({} batches, diff {})   ",
+                number, ghs, dispatches, difficulty
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            last_report = now;
+        }
     }
     None
 }
