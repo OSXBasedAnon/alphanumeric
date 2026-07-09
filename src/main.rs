@@ -420,8 +420,42 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
     (descriptor, fingerprint)
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+/// App-thread stack. Windows gives the process main thread only 1MB (Unix: 8MB),
+/// and debug builds use far larger frames — `cargo run` on Windows overflowed in
+/// node creation (STATUS_STACK_OVERFLOW). #[tokio::main]'s block_on runs the
+/// whole async body on that 1MB thread, so instead main() spawns the runtime on
+/// a thread with an explicit stack. Reserve is address space, not committed
+/// memory, so generous is free; this also makes every platform/toolchain behave
+/// identically (no MSVC vs GNU linker-flag games).
+const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+/// Tokio worker stacks (default 2MB) get the same debug-frame headroom.
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let app = std::thread::Builder::new()
+        .name("alphanumeric-main".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(|| -> std::result::Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(WORKER_THREAD_STACK_BYTES)
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to start async runtime: {}", e))?;
+            // Errors cross the thread join as strings because the error chain is
+            // not Send (BlockchainError); the message is what main reported anyway.
+            runtime.block_on(async_main()).map_err(|e| e.to_string())
+        })
+        .expect("failed to spawn app thread")
+        .join();
+    match app {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(message.into()),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn async_main() -> Result<()> {
     // Initialize logging with ERROR level during startup to avoid UI interference.
     // RUST_LOG still wins when set so field diagnostics stay possible.
     env_logger::Builder::new()
