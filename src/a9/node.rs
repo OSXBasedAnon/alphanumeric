@@ -2851,7 +2851,11 @@ impl Node {
         // on 2026-07-08 while live miners advanced 24+ blocks. Dead candidates are
         // memoized (relay_dead_targets) with an expiry so each 1s tick moves straight
         // to the next live branch instead of re-walking the broken one.
-        const MAX_TIP_CANDIDATES: usize = 4;
+        // 8 (was 4): a dead far-ahead fork keeps MINTING fresh tips, and each new tip
+        // is a brand-new candidate the memo has never seen — at 4, those burned the
+        // whole per-tick budget and the LIVE lineage never got tried (2026-07-08
+        // night crawl). 8 leaves room for the live branch behind a noisy dead one.
+        const MAX_TIP_CANDIDATES: usize = 8;
         const DEAD_TARGET_RETRY_SECS: u64 = 300;
         // TRUE TIPS ONLY: a block some other wire block names as its parent is not a
         // tip — converging to its tip covers it. Without this filter, an abandoned
@@ -2922,18 +2926,20 @@ impl Node {
             }
             let reachable_top = first_gap.map(|g| g.saturating_sub(1)).unwrap_or(max_h);
             if reachable_top > local_tip {
-                // Lowest-hash block at the reachable-top height = deterministic target.
-                if let Some(b) = blocks
+                // EVERY fork at the reachable-top height, hash-ascending (was: lowest
+                // hash only). Under same-height racing the lowest-hash block is often
+                // a dead fork; once it failed and was memoized, the LIVE fork at the
+                // same height never got hinted and the publisher fell back to burning
+                // candidates on unreachable high tips (2026-07-08 night crawl).
+                let mut tops: Vec<(u32, [u8; 32])> = blocks
                     .iter()
                     .filter(|b| b.index == reachable_top)
-                    .min_by_key(|b| b.hash)
-                {
-                    let key = (b.index, b.hash);
-                    // Prepend if not already the first candidate.
-                    if candidates.first() != Some(&key) {
-                        candidates.retain(|c| *c != key);
-                        candidates.insert(0, key);
-                    }
+                    .map(|b| (b.index, b.hash))
+                    .collect();
+                tops.sort_by(|a, b| a.1.cmp(&b.1));
+                for key in tops.into_iter().rev() {
+                    candidates.retain(|c| *c != key);
+                    candidates.insert(0, key);
                 }
             }
         }
@@ -3478,6 +3484,28 @@ impl Node {
                 blockchain.get_latest_block_index() as u32
             };
             let mut relay_confirmed_blocks = Vec::new();
+
+            // LINEAGE-SURVIVING ORDER (v7.6.5, 2026-07-08 night): under same-height
+            // racing every height holds several forks and the engine appends whichever
+            // chaining block it meets FIRST — appending a CHILDLESS dead fork strands
+            // the drain one block later ("stopped at a relay gap" on a fully
+            // contiguous relay; the publisher crawled at ~2 blocks per 10 minutes
+            // while five miners raced). Per height, try the blocks some LATER wire
+            // block builds on first: a child-witnessed block provably has a
+            // continuation, so the drain stays on a lineage that survives.
+            let child_witnessed: std::collections::HashSet<[u8; 32]> =
+                blocks.iter().map(|b| b.previous_hash).collect();
+            let mut blocks = blocks;
+            blocks.sort_by(|a, b| {
+                a.index
+                    .cmp(&b.index)
+                    .then_with(|| {
+                        child_witnessed
+                            .contains(&b.hash)
+                            .cmp(&child_witnessed.contains(&a.hash))
+                    })
+                    .then_with(|| a.hash.cmp(&b.hash))
+            });
 
             for block in blocks {
                 // Checkpoint-anchored verification (S-01). Blocks ABOVE the trusted
