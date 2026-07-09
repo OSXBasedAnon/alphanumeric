@@ -158,6 +158,7 @@ impl MiningManager {
         max_nonce: u64,
         miner_address: String,
         _reward_amount: f64,
+        #[cfg_attr(not(feature = "gpu_miner"), allow(unused_variables))] use_gpu: bool,
     ) -> Result<(u64, String, Block), MiningError> {
         let transactions: Vec<Transaction> = transactions
             .iter()
@@ -320,6 +321,34 @@ impl MiningManager {
             let tip_change_counter_check = Arc::clone(&tip_change_counter);
             let blockchain_for_tip_checks = Arc::clone(&self.blockchain);
             let expected_parent_index = header.number.saturating_sub(1);
+
+            // GPU FAST PATH (feature gpu_miner + runtime `mine --gpu`). Propose a
+            // winning nonce on the GPU; on success set the SAME result atomics the
+            // CPU search would, so the finalization below builds and re-verifies the
+            // block through the identical consensus path. The GPU only supplies a
+            // nonce — a wrong hash is caught by the normal block verify (fail-closed).
+            // The CPU rayon search below then no-ops (its threads see `found`).
+            #[cfg(feature = "gpu_miner")]
+            if use_gpu {
+                if let Some((n, ts, diff, hash)) = crate::a9::gpu_miner::gpu_mine_attempt(
+                    header.number,
+                    &previous_block_hash,
+                    &merkle_root,
+                    previous_difficulty,
+                    previous_block_timestamp,
+                    std::time::Duration::from_secs(2),
+                    &found, // reused as a stop flag; set below on success
+                ) {
+                    if !found.swap(true, Ordering::Release) {
+                        result_nonce.store(n, Ordering::Release);
+                        result_timestamp.store(ts, Ordering::Release);
+                        result_difficulty.store(diff, Ordering::Release);
+                        if let Ok(mut g) = hash_result.lock() {
+                            *g = hash.to_vec();
+                        }
+                    }
+                }
+            }
 
             let mining_result: Result<(), MiningError> = (0..num_threads as u64)
                 .into_par_iter()
@@ -662,6 +691,7 @@ impl Miner {
         max_nonce: u64,
         miner_address: String,
         reward_amount: f64,
+        use_gpu: bool,
     ) -> Result<(u64, String, Block), MiningError> {
         self.manager
             .mine_block(
@@ -670,6 +700,7 @@ impl Miner {
                 max_nonce,
                 miner_address,
                 reward_amount,
+                use_gpu,
             )
             .await
             .map_err(|e| MiningError::MiningFailed(e.to_string()))

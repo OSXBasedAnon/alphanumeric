@@ -7,6 +7,8 @@ pub mod mldsa;
 pub mod node;
 pub mod oracle;
 pub mod miner;
+#[cfg(feature = "gpu_miner")]
+pub mod gpu_miner;
 pub mod velocity;
 pub mod wallet;
 #[cfg(feature = "webrtc_mesh")]

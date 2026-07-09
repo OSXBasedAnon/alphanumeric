@@ -6051,13 +6051,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0)
+                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0, false)
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0)
+                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0, false)
                 .await
         });
 
@@ -6118,13 +6118,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0)
+                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0, false)
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0)
+                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0, false)
                 .await
         });
 

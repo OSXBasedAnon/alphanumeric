@@ -1692,13 +1692,39 @@ println!("Wallet renamed successfully");
                 }
                 Some("mine") => {
                     let parts: Vec<&str> = command.split_whitespace().collect();
-                    let continuous =
-                        parts.len() == 3 && matches!(parts[2], "--continuous" | "-c");
-                    if !(parts.len() == 2 || continuous) {
-                        println!("Usage: mine <miner_wallet_name> [--continuous]");
+                    if parts.len() < 2 {
+                        println!("Usage: mine <miner_wallet_name> [--continuous] [--gpu]");
                         continue;
                     }
-                    // Normalized args for the handler regardless of trailing flags.
+                    // Order-independent flags after the wallet name: --continuous/-c
+                    // and --gpu can appear in any order. Anything else is an error.
+                    let mut continuous = false;
+                    let mut use_gpu = false;
+                    let mut bad_flag: Option<&str> = None;
+                    for flag in &parts[2..] {
+                        match *flag {
+                            "--continuous" | "-c" => continuous = true,
+                            "--gpu" => use_gpu = true,
+                            other => bad_flag = Some(other),
+                        }
+                    }
+                    if let Some(f) = bad_flag {
+                        println!("Unknown mine flag '{}'. Usage: mine <miner_wallet_name> [--continuous] [--gpu]", f);
+                        continue;
+                    }
+                    // --gpu only does something in a binary built with the gpu_miner
+                    // feature. In a default build (publisher / VPS / exchange nodes),
+                    // say so clearly instead of silently mining on CPU.
+                    #[cfg(not(feature = "gpu_miner"))]
+                    if use_gpu {
+                        println!(
+                            "This binary was built without GPU support. Rebuild with \
+                             `cargo build --release --features gpu_miner`, or use the GPU \
+                             beta build, to mine with --gpu. Falling back to CPU mining."
+                        );
+                        use_gpu = false;
+                    }
+                    // Normalized args for the handler regardless of flags.
                     let mine_parts: Vec<&str> = vec![parts[0], parts[1]];
 
                     // Enter-to-stop for continuous mode: one detached reader consumes a
@@ -1821,7 +1847,7 @@ println!("Wallet renamed successfully");
                         let mining_manager = MiningManager::new(Arc::clone(&blockchain));
                         let miner = Miner::new(blockchain.clone(), mining_manager);
                         match mgmt
-                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc)
+                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc, use_gpu)
                             .await
                         {
                             Ok(mined_block) => {

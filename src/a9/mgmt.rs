@@ -590,6 +590,7 @@ impl Mgmt {
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Db>>,
+        use_gpu: bool,
     ) -> Result<Block> {
         if command.len() < 2 {
             return Err("Usage: mine <wallet_name_or_address>".into());
@@ -716,6 +717,7 @@ impl Mgmt {
                 MINING_NONCE_WINDOW,
                 miner_wallet.address.clone(),
                 mining_reward,
+                use_gpu,
             )
             .await
         {
