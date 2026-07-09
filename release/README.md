@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This download contains Alphanumeric client version 7.6.1 for macOS.
+This download contains Alphanumeric client version 7.7.1 for macOS.
 
 ## What Is Included
 
