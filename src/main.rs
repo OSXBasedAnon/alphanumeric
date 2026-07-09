@@ -1205,20 +1205,27 @@ async fn async_main() -> Result<()> {
             });
         }
 
-        // Initialize BPoS sentinel at startup. TIME-BOXED: initialize() runs
-        // verify_chain_state, whose anomaly path can chase peers over the network —
-        // at a high block rate (constant same-height races) this reliably found work
-        // to chase and sat here FOREVER with zero output, right before the menu: the
-        // "client hangs after 'Loaded N wallets successfully', restart needed" bug.
-        // initialize() is idempotent and its monitoring tasks spawn before any await,
-        // so deferring the rest is safe — the 60s monitor loop covers it.
+        // Initialize the BPoS sentinel in the BACKGROUND. initialize() runs
+        // verify_chain_state, whose anomaly path chases peers over the network — at a
+        // high block rate it reliably finds work and takes the full time-box, which
+        // (when awaited in-band) stalled EVERY startup for up to 8s right after
+        // "Loaded N wallets successfully" before the menu appeared. It is idempotent,
+        // its monitoring tasks spawn before the blocking part, and the 60s monitor
+        // loop covers the rest — so running it off the startup path is safe and just
+        // removes the visible stall; the menu now appears immediately. Still
+        // time-boxed inside the task so it can never sit forever.
         {
-            let sentinel = staking_node.write().await;
-            match tokio::time::timeout(Duration::from_secs(8), sentinel.initialize()).await {
-                Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
-                Err(_) => warn!("Staking sentinel initialization deferred (node busy); continuing startup"),
-                Ok(Ok(())) => {}
-            }
+            let staking_bg = staking_node.clone();
+            tokio::spawn(async move {
+                let sentinel = staking_bg.write().await;
+                match tokio::time::timeout(Duration::from_secs(8), sentinel.initialize()).await {
+                    Ok(Err(e)) => error!("Failed to initialize staking sentinel: {}", e),
+                    Err(_) => {
+                        warn!("Staking sentinel initialization deferred (node busy)")
+                    }
+                    Ok(Ok(())) => {}
+                }
+            });
         }
 
         // Runtime canonical reconciliation — for EVERY node, interactive included
