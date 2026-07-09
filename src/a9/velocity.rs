@@ -1066,13 +1066,24 @@ impl VelocityProtocol for Node {
     }
 
     async fn broadcast_block_velocity(&self, block: &Block) -> Result<(), VelocityError> {
-        let peers = self.peers.read().await;
+        // SNAPSHOT-THEN-DROP: process_block fans out to peers over the network, and
+        // holding the peers READ guard across it is the fair-RwLock wedge class that
+        // froze nodes repeatedly on 2026-07-08/09 (one parked writer blocks every
+        // later lock user). Latent today (velocity is off by default) but it must
+        // not be a trap when velocity turns on.
+        let peer_map: HashMap<SocketAddr, PeerInfo> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .map(|(&addr, info)| (addr, info.clone()))
+                .collect()
+        };
         let velocity = self
             .velocity_manager
             .as_ref()
             .ok_or_else(|| VelocityError::Network("Velocity manager not initialized".into()))?;
 
-        velocity.process_block(block, &peers).await
+        velocity.process_block(block, &peer_map).await
     }
 
     async fn handle_shred_velocity(

@@ -2709,6 +2709,14 @@ impl Node {
                                     hex::encode(beacon.hash),
                                     e
                                 );
+                                // Storage/serialization trouble is TRANSIENT — report it
+                                // as a stale view so the caller retries soon. BranchInvalid
+                                // here gets memoized lineage-dead and PROPAGATES to every
+                                // child, so one sled hiccup mid-append would sideline our
+                                // own live lineage for the whole 300s cooldown.
+                                if e.contains("Database error") || e.contains("Serialization") {
+                                    return Converge::BeaconStale;
+                                }
                                 return Converge::BranchInvalid;
                             }
                         }
@@ -2936,6 +2944,12 @@ impl Node {
         // night crawl). 8 leaves room for the live branch behind a noisy dead one.
         const MAX_TIP_CANDIDATES: usize = 8;
         const DEAD_TARGET_RETRY_SECS: u64 = 300;
+        // Soft (non-lineage) verdicts get a SHORT block: a single per-candidate
+        // timeout or transient relay gap on a LIVE branch must not sideline it for
+        // the full 300s window — during racing that is 30-60 blocks of beacon lag
+        // self-inflicted by one hiccup. Only lineage-dead verdicts (validation
+        // failure / fork point below finality) deserve the long cooldown.
+        const SOFT_TARGET_RETRY_SECS: u64 = 15;
         // TRUE TIPS ONLY: a block some other wire block names as its parent is not a
         // tip — converging to its tip covers it. Without this filter, an abandoned
         // fork contributes EVERY one of its blocks as a candidate (a post-storm relay
@@ -3099,8 +3113,13 @@ impl Node {
             }
             {
                 let mut dead = self.relay_dead_targets.lock();
-                if let Some(&(when, _)) = dead.get(&(height, hash)) {
-                    if when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS) {
+                if let Some(&(when, lineage_dead)) = dead.get(&(height, hash)) {
+                    let retry_secs = if lineage_dead {
+                        DEAD_TARGET_RETRY_SECS
+                    } else {
+                        SOFT_TARGET_RETRY_SECS
+                    };
+                    if when.elapsed() < Duration::from_secs(retry_secs) {
                         continue;
                     }
                     dead.pop(&(height, hash));
@@ -4117,6 +4136,24 @@ impl Node {
         // which they would otherwise mine a competing fork.
         if let Err(e) = self.post_block_relay(&block).await {
             warn!("{} block relay failed: {}", context, e);
+            // A rate-limited FRESH block is the one post that matters most for
+            // propagation (everyone else forks against it until it lands). Give it a
+            // single detached retry once the per-IP window has rolled over; if that
+            // also fails, the periodic backfill covers it. One shot only — looping
+            // here would recreate the amplification this path just stopped doing.
+            if e.to_string().contains(RELAY_POST_RATE_LIMITED) {
+                let node = self.clone();
+                let retry_block = block.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if let Err(e) = node.post_block_relay(&retry_block).await {
+                        warn!(
+                            "Rate-limited block #{} retry also failed: {}",
+                            retry_block.index, e
+                        );
+                    }
+                });
+            }
         } else if !RELAY_BACKFILL_INFLIGHT.swap(true, Ordering::SeqCst) {
             // DETACHED + SINGLE-FLIGHT: the backfill is a best-effort gap heal, and it
             // is now paced (~10 posts/s inside post_recent_blocks_to_relay) — awaited
@@ -5685,6 +5722,31 @@ impl Node {
             }
             if let Err(e) = node_clone.publish_local_tip().await {
                 warn!("Initial post-sync publish failed: {}", e);
+            }
+        });
+
+        // Periodic pending-tx re-announce. gossip_transaction fires ONCE at create
+        // time — a tx submitted while this node had no mesh links or peers (a NAT'd
+        // client right after boot, mid mesh churn) reached nobody and would otherwise
+        // sit local-only until the sender mined it themselves, resurrecting the
+        // pre-v7.6.8 behavior through a timing hole. Re-announcing is cheap and
+        // idempotent: receivers dedup via their network bloom, duplicate mempool adds
+        // are rejected, and the mesh send is a no-op with no links up.
+        let regossip_node = node.clone();
+        tokio::spawn(async move {
+            let mut regossip_interval = interval(Duration::from_secs(45));
+            regossip_interval.tick().await; // consume the immediate first tick
+            loop {
+                regossip_interval.tick().await;
+                let pending = {
+                    let bc = regossip_node.blockchain.read().await;
+                    bc.get_pending_transactions().await.unwrap_or_default()
+                };
+                // Small cap: the mempool is tiny on this network, and a pathological
+                // backlog must not turn this loop into its own gossip storm.
+                for tx in pending.into_iter().take(8) {
+                    regossip_node.gossip_transaction(&tx).await;
+                }
             }
         });
 
