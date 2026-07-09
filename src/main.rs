@@ -1168,53 +1168,52 @@ async fn main() -> Result<()> {
             }
         }
 
-        if headless {
-            println!("Headless mode enabled. Node services are running.");
-            // Runtime canonical reconciliation. A long-running headless node that
-            // drifts onto a fork (e.g. mined a block that lost a race) or falls far
-            // behind restarts to re-bootstrap onto the canonical chain, so it can
-            // never get stuck off-canonical. The canonical publisher never diverges
-            // from its own manifest, so this never fires for it. Two consecutive
-            // divergent checks are required so a transient/stale manifest read
-            // doesn't trigger a needless restart.
-            {
-                let node_recon = node.clone();
-                let shutdown_recon = shutdown_requested.clone();
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(Duration::from_secs(120));
-                    let mut strikes = 0u32;
-                    loop {
-                        ticker.tick().await;
-                        if shutdown_recon.load(Ordering::Acquire) {
-                            return;
+        // Runtime canonical reconciliation — for EVERY node, interactive included
+        // (v7.6.5: this used to run only in headless mode, so an interactive `a#:`
+        // client had NO background sync at all — it only converged inside mine-prep,
+        // fell behind the racing tip the whole time it sat at the menu, and then had
+        // to cross the entire accumulated gap inside one prep budget: the "my client
+        // is always behind / can't compete" complaint all night). A 20s cadence
+        // keeps an idle client within a block or two of the tip; when already at the
+        // tip a check is one CDN-cached beacon poll and a local compare. A node that
+        // drifts onto a fork heals in place (incremental reorg); only a genuine,
+        // repeated below-finality divergence escalates to restart + re-bootstrap.
+        {
+            let node_recon = node.clone();
+            let shutdown_recon = shutdown_requested.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(20));
+                let mut strikes = 0u32;
+                loop {
+                    ticker.tick().await;
+                    if shutdown_recon.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match node_recon.sync_to_beacon().await {
+                        Converge::Converged
+                        | Converge::AtTipAhead
+                        | Converge::Progressed
+                        | Converge::BeaconStale
+                        | Converge::BranchInvalid => {
+                            strikes = 0;
                         }
-                        // Heal IN PLACE against the signed beacon (forward-stream when
-                        // behind, incremental reorg when forked) instead of the old
-                        // manifest-drift check that restarted the whole process. Only a
-                        // genuine, repeated below-finality divergence — which incremental
-                        // convergence provably cannot fix — escalates to a restart +
-                        // re-bootstrap. A transient relay gap (BeaconStale) never does.
-                        match node_recon.sync_to_beacon().await {
-                            Converge::Converged
-                            | Converge::AtTipAhead
-                            | Converge::Progressed
-                            | Converge::BeaconStale
-                            | Converge::BranchInvalid => {
-                                strikes = 0;
-                            }
-                            Converge::NeedsBootstrap => {
-                                strikes += 1;
-                                if strikes >= 2 {
-                                    println!(
-                                        "Node chain diverged below the finality window on two checks; restarting to re-bootstrap onto the canonical chain"
-                                    );
-                                    std::process::exit(0);
-                                }
+                        Converge::NeedsBootstrap => {
+                            strikes += 1;
+                            if strikes >= 2 {
+                                println!(
+                                    "Node chain diverged below the finality window on two checks; restarting to re-bootstrap onto the canonical chain"
+                                );
+                                std::process::exit(0);
                             }
                         }
                     }
-                });
-            }
+                }
+            });
+        }
+
+        if headless {
+            println!("Headless mode enabled. Node services are running.");
+            // (Runtime canonical reconciliation runs for every node — spawned above.)
             while !shutdown_requested.load(Ordering::Acquire) {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
