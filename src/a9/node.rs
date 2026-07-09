@@ -976,12 +976,17 @@ struct StatsResponse {
     uptime_secs: u64,
 }
 
-/// State for the opt-in read-only explorer API (see start_explorer_server).
+/// State for the opt-in explorer API (see start_explorer_server).
 #[derive(Clone)]
 struct ExplorerState {
     blockchain: Arc<RwLock<Blockchain>>,
+    node: Node,
     start_time: u64,
     network_id: [u8; 32],
+    // Coarse per-process token bucket for the write endpoint (submit-tx). The
+    // per-sender mempool rate limit is the real guard; this only blunts a flood
+    // of junk that would fail validation, keeping it off the mempool lock.
+    submit_bucket: Arc<PLMutex<(Instant, f64)>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4512,6 +4517,7 @@ impl Node {
                 "/explorer/tx/{height}/{position}",
                 "/explorer/address/{address}?limit=&before_height=&before_pos=",
                 "/explorer/supply",
+                "POST /explorer/submit-tx  (body: signed transaction JSON)",
             ],
         }))
     }
@@ -4682,6 +4688,60 @@ impl Node {
         (StatusCode::OK, Json(payload))
     }
 
+    /// Submit a signed transaction to the network (opt-in explorer API write path).
+    /// This is the endpoint web wallets / exchanges POST a signed tx to. It changes
+    /// NO consensus surface: the tx goes through the SAME add_transaction validation
+    /// the CLI `create` uses (signature, balance, replay guard, already-confirmed
+    /// gate), and on acceptance is announced via the SAME gossip path. A node only
+    /// serves this when its operator sets ALPHANUMERIC_EXPLORER_API — the publisher
+    /// and ordinary clients never do, so existing infra is untouched.
+    async fn explorer_submit_tx_handler(
+        State(state): State<ExplorerState>,
+        Json(tx): Json<Transaction>,
+    ) -> (StatusCode, Json<Value>) {
+        // Coarse token bucket (refill 5/s, cap 20): a cheap flood guard so junk
+        // that would fail validation can't hammer the mempool write lock. The real
+        // rule is the per-sender rate limit inside add_transaction.
+        {
+            let mut b = state.submit_bucket.lock();
+            let now = Instant::now();
+            b.1 = (b.1 + now.duration_since(b.0).as_secs_f64() * 5.0).min(20.0);
+            b.0 = now;
+            if b.1 < 1.0 {
+                return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+            }
+            b.1 -= 1.0;
+        }
+        if tx.sender.is_empty() || tx.recipient.is_empty() {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "missing sender or recipient");
+        }
+        // Validate + admit through the canonical path.
+        let submit = {
+            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.write()).await else {
+                return Self::explorer_busy();
+            };
+            chain.add_transaction(tx.clone()).await
+        };
+        match submit {
+            Ok(()) => {
+                // Announce now (mesh + peers) instead of waiting for the periodic
+                // re-gossip, so a withdrawal propagates immediately. Detached: the
+                // HTTP response never blocks on network I/O.
+                let node = state.node.clone();
+                let announce = tx.clone();
+                tokio::spawn(async move { node.gossip_transaction(&announce).await });
+                (
+                    StatusCode::OK,
+                    Json(json!({ "ok": true, "tx_id": tx.get_tx_id() })),
+                )
+            }
+            Err(e) => Self::explorer_err(
+                StatusCode::BAD_REQUEST,
+                &format!("transaction rejected: {}", e),
+            ),
+        }
+    }
+
     /// Start the explorer API iff ALPHANUMERIC_EXPLORER_API is set. Accepts
     /// `host:port` or a bare port (bound to 127.0.0.1). Loopback is the intended
     /// deployment; binding wider is allowed but warned — the operator's reverse
@@ -4710,8 +4770,10 @@ impl Node {
 
         let state = ExplorerState {
             blockchain: Arc::clone(&self.blockchain),
+            node: self.clone(),
             start_time: self.start_time,
             network_id: self.network_id,
+            submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
         };
 
         let app = Router::new()
@@ -4729,6 +4791,10 @@ impl Node {
                 get(Self::explorer_address_handler),
             )
             .route("/explorer/supply", get(Self::explorer_supply_handler))
+            .route(
+                "/explorer/submit-tx",
+                axum::routing::post(Self::explorer_submit_tx_handler),
+            )
             .with_state(state);
 
         let listener = std::net::TcpListener::bind(addr).map_err(|e| {
