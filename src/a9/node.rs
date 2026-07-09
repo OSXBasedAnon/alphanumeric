@@ -875,6 +875,7 @@ pub struct Node {
     relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), (Instant, bool)>>>,
     last_public_announce_at: Arc<AtomicU64>,
     last_header_snapshot_at: Arc<AtomicU64>,
+    last_header_snapshot_height: Arc<AtomicU64>,
     last_stats_snapshot_at: Arc<AtomicU64>,
     p2p_swarm: Arc<Mutex<Option<HybridSwarm>>>,
     pub peer_id: String,
@@ -1151,6 +1152,7 @@ impl Node {
             public_relay_tip: Arc::new(RwLock::new(None)),
             last_public_announce_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
+            last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
             last_stats_snapshot_at: Arc::new(AtomicU64::new(0)),
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
@@ -2234,7 +2236,20 @@ impl Node {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !Self::should_publish_now(
+        // HEIGHT-DELTA BYPASS of the wall-clock interval: under heavy racing the
+        // chain mints every ~5-6s, so a 30s cadence left the site's VERIFIED height
+        // 30-50 blocks behind LATEST — stale exactly when activity (and operator
+        // attention) peaks. If the tip has advanced >= 8 blocks since the last
+        // snapshot, post now; a 5s burst floor still bounds the POST rate during
+        // storms, and a quiet chain keeps the old 30s cadence untouched.
+        let tip_now = { self.blockchain.read().await.get_latest_block_index() as u64 };
+        let last_h = self.last_header_snapshot_height.load(Ordering::Acquire);
+        let last_at = self.last_header_snapshot_at.load(Ordering::Acquire);
+        let delta_due =
+            tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 5;
+        if delta_due {
+            self.last_header_snapshot_at.store(now, Ordering::Release);
+        } else if !Self::should_publish_now(
             &self.last_header_snapshot_at,
             Self::header_snapshot_interval_secs(),
             now,
@@ -2246,6 +2261,8 @@ impl Node {
             return Ok(());
         };
         let height = last_block.index;
+        self.last_header_snapshot_height
+            .store(height as u64, Ordering::Release);
         let difficulty = last_block.difficulty;
 
         // Widened to 64 so a client resolving a fork can always walk back to the
@@ -5541,12 +5558,16 @@ impl Node {
             }
         });
 
-        // Periodic header snapshot submissions
+        // Periodic header snapshot submissions. The loop ticks FAST (5s) and lets
+        // post_header_snapshot's internal gating decide: normally the 30s wall-clock
+        // interval, but during racing the >=8-block delta trigger fires early so the
+        // site's VERIFIED height stays within ~8 blocks of LATEST instead of drifting
+        // 30-50 behind at a 5s block time. Ticking at the old 30s starved the delta
+        // check of chances to run — the gate must own the cadence, not the timer.
         if Self::public_header_snapshots_enabled() {
             let node_clone = node.clone();
             tokio::spawn(async move {
-                let mut header_interval =
-                    interval(Duration::from_secs(Self::header_snapshot_interval_secs()));
+                let mut header_interval = interval(Duration::from_secs(5));
                 loop {
                     header_interval.tick().await;
                     if let Err(e) = node_clone.post_header_snapshot().await {

@@ -1855,6 +1855,34 @@ println!("Wallet renamed successfully");
                                 .await;
                             }
                             Err(e) => {
+                                // LOST RACE, not a fault: we solved a height, but the
+                                // network's block for it arrived first and the background
+                                // sync adopted it, so finalization correctly rejects our
+                                // now-stale header ("Block header is invalid"). Routine
+                                // under heavy racing (difficulty climbing = more miners) —
+                                // it must NOT count toward the permanent-error stop, or 5
+                                // straight photo-finish losses would kill the mining loop
+                                // exactly when competition is most interesting. Retarget
+                                // the new tip immediately with only the small jitter.
+                                let lost_race = e.to_string().contains("Block header is invalid");
+                                if lost_race && continuous {
+                                    consecutive_mine_errors = 0;
+                                    println!(
+                                        "Lost the race for this block (another miner's was adopted) — retargeting the new tip…"
+                                    );
+                                    let jitter_ms = 1_000
+                                        + (SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .subsec_nanos() as u64
+                                            % 2_000);
+                                    sleep_interruptible(
+                                        Duration::from_millis(jitter_ms),
+                                        &stop_flag,
+                                    )
+                                    .await;
+                                    continue 'mining;
+                                }
                                 println!("Mining error: {}", e);
                                 if !continuous {
                                     break 'mining;
