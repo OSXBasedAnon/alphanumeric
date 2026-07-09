@@ -2588,6 +2588,11 @@ impl Node {
     /// (that would echo-storm the gateway and self-rate-limit the very catch-up it does).
     async fn converge_to_canonical(&self, beacon: &TipBeaconInfo) -> Converge {
         const MAX_ROUNDS: u32 = 6;
+        // Per-round adoption cap: large enough to catch up fast (6 rounds x 128 =
+        // 768 blocks per converge call), small enough that one engine adoption
+        // always finishes inside the caller's round timeout. See the chunked-
+        // adoption comment below.
+        const CONVERGE_CHUNK: u32 = 128;
         for _ in 0..MAX_ROUNDS {
             let (tip, at_beacon) = {
                 let bc = self.blockchain.read().await;
@@ -2630,7 +2635,17 @@ impl Node {
                 if beacon.height.saturating_sub(tip) > crate::a9::blockchain::ORPHAN_REORG_DEPTH {
                     return Converge::NeedsBootstrap;
                 }
-                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index > tip).collect();
+                // CHUNKED ADOPTION (v7.6.5): adopt at most CONVERGE_CHUNK blocks per
+                // round. A 180-block branch validated atomically under the write lock
+                // outlived the caller's per-round timeout, the cancelled adoption
+                // applied NOTHING, and every retry restarted from scratch — a node a
+                // few hours behind could provably never converge (2026-07-08 night).
+                // A capped chunk always finishes inside the round budget; the loop
+                // re-runs and RESUMES from the new tip, so progress is monotonic.
+                let branch: Vec<Block> = canon
+                    .into_iter()
+                    .filter(|b| b.index > tip && b.index <= tip.saturating_add(CONVERGE_CHUNK))
+                    .collect();
                 if branch.is_empty() {
                     let _ = self.sync_with_block_relay(tip).await;
                 } else {
@@ -2656,8 +2671,14 @@ impl Node {
             } else {
                 // Divergent: our tip forks from canonical at `ancestor` < tip.
                 let d = ancestor + 1;
-                // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon].
-                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index >= d).collect();
+                // Reuse the bodies find_common_ancestor already fetched: [d ..= beacon],
+                // capped per round (chunked adoption — see the append path) so one
+                // engine call always finishes inside the caller's round timeout. The
+                // rewrite segment (<= CHECKPOINT_REORG_MARGIN = 64) always fits.
+                let branch: Vec<Block> = canon
+                    .into_iter()
+                    .filter(|b| b.index >= d && b.index <= ancestor.saturating_add(CONVERGE_CHUNK))
+                    .collect();
                 if branch.is_empty() {
                     return Converge::BeaconStale;
                 }

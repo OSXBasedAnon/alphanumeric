@@ -3827,10 +3827,12 @@ fn canonical_reconcile_decision(
 
 /// How far behind/forked a genesis-valid chain may be and still be caught up by
 /// the live beacon-watch loop instead of a full re-download. The live loop's
-/// exact-walked branch adoption (v7.6.5) converges spans up to ORPHAN_REORG_DEPTH
-/// (1024); 512 leaves comfortable headroom for chain growth during the catch-up
-/// itself while still avoiding a needless full snapshot re-download.
-const STREAM_WINDOW: u32 = 512;
+/// chunked branch adoption (v7.6.5) converges deficits far larger than this, but
+/// the boot decision must stay CONSERVATIVE: if live convergence is broken for
+/// any reason, "restart the node" has to reliably trigger a re-bootstrap — a
+/// wide window here once told a 181-behind node it was in sync at boot while its
+/// live loop couldn't converge either, trapping it with no way out (2026-07-08).
+const STREAM_WINDOW: u32 = 96;
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
