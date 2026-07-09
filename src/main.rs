@@ -1,6 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
@@ -3316,7 +3316,31 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 // forked or fell behind, re-bootstrap to the canonical chain rather
                 // than keep running on a stale/losing chain. Unreachable manifest =>
                 // keep the local DB (fail-open, so an offline start still works).
-                match canonical_reconcile_decision(db_path, &manifest_result) {
+                // Best-effort live tip beacon: the freshest canonical height for the
+                // behind/in-sync decision (the manifest can lag by its publish
+                // cadence — or by hours when snapshot publishing is broken).
+                let live_beacon_height: Option<u32> = async {
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_millis(2500))
+                        .build()
+                        .ok()?;
+                    let body = client
+                        .get(TIP_URL)
+                        .send()
+                        .await
+                        .ok()?
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()?;
+                    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        return None;
+                    }
+                    body.get("height")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|h| u32::try_from(h).ok())
+                }
+                .await;
+                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height) {
                     CanonicalReconcile::InSyncOrUnknown => {
                         println!(
                             "Bootstrap skipped: launch network DB is on the canonical chain at {}",
@@ -3735,6 +3759,7 @@ enum CanonicalReconcile {
 fn canonical_reconcile_decision(
     db_path: &str,
     manifest: &Result<BootstrapManifestPointer>,
+    live_beacon_height: Option<u32>,
 ) -> CanonicalReconcile {
     let Ok(m) = manifest else {
         return CanonicalReconcile::InSyncOrUnknown;
@@ -3744,6 +3769,15 @@ fn canonical_reconcile_decision(
     };
     let canonical_hash = tip_hash.trim().to_ascii_lowercase();
     let canonical_height = height as u32;
+    // FRESHNESS (v7.6.5, 2026-07-08 night): the manifest height lags by its publish
+    // cadence — and when snapshot publishing broke (413s), it lagged by HOURS, so a
+    // node 150+ blocks behind read as "in sync with the manifest" at boot, skipped
+    // re-bootstrap, and stayed stranded. The live tip beacon is the freshest signed
+    // canonical height (~1-2s), so use it for the AM-I-TOO-FAR-BEHIND decision; the
+    // manifest keeps the checkpoint-hash comparison at ITS height (the snapshot is
+    // what we would download). A wrong/poisoned beacon can at worst trigger one
+    // unnecessary re-bootstrap whose snapshot manifest is still signature-verified.
+    let live_height = live_beacon_height.unwrap_or(0).max(canonical_height);
 
     // Already holding the canonical tip block (or ahead of it on the same chain)?
     // Then we are in sync.
@@ -3775,26 +3809,28 @@ fn canonical_reconcile_decision(
     }
 
     // Behind (no block at the canonical height). If it is within the streamable
-    // window, the LIVE beacon-watch loop catches up incrementally (append) or
-    // reorgs to canonical (fork) once the node is running — we must NOT re-download
-    // the whole chain for a few blocks; that is what "syncing" means. Only a gap
+    // window OF THE LIVE TIP, the beacon-watch loop catches up once the node is
+    // running (exact-walked branch adoption, v7.6.5) — we must NOT re-download the
+    // whole chain for a streamable gap; that is what "syncing" means. Only a gap
     // deeper than the window (or a near-empty DB) is worth a full bootstrap.
     let local_tip = local_tip_height(db_path).unwrap_or(0);
-    if local_tip.saturating_add(STREAM_WINDOW) >= canonical_height {
+    if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
 
     CanonicalReconcile::Diverged {
-        local: format!("tip {}", local_tip),
+        local: format!("tip {} ({} behind live tip {})", local_tip, live_height.saturating_sub(local_tip), live_height),
         canonical_height: height,
         canonical_hash,
     }
 }
 
 /// How far behind/forked a genesis-valid chain may be and still be caught up by
-/// the live beacon-watch loop (incremental append + reorg) instead of a full
-/// re-download. Matches the signed header window used for reorg resolution.
-const STREAM_WINDOW: u32 = 64;
+/// the live beacon-watch loop instead of a full re-download. The live loop's
+/// exact-walked branch adoption (v7.6.5) converges spans up to ORPHAN_REORG_DEPTH
+/// (1024); 512 leaves comfortable headroom for chain growth during the catch-up
+/// itself while still avoiding a needless full snapshot re-download.
+const STREAM_WINDOW: u32 = 512;
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
@@ -4140,8 +4176,119 @@ async fn publish_bootstrap_snapshot(
     hasher.update(&bytes);
     let sha256 = hex::encode(hasher.finalize());
 
-    // Step 1: upload snapshot to blue (server will store in Blob and return final blob URL).
-    let upload_url = format!(
+    // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    // Step 1: upload the snapshot zip DIRECTLY to Vercel Blob (v7.6.5). The zip
+    // outgrew the gateway's ~4.5MB platform request-body cap, so shipping it
+    // THROUGH /api/bootstrap/publish 413s before the function even runs — the
+    // manifest then goes stale for hours and stranded/fresh nodes bootstrap
+    // against an ancient snapshot (the 2026-07-08 night incident). The gateway
+    // hands us its Blob credentials over the same bearer-authenticated channel
+    // (upload-grant), we PUT straight to the Blob API (no body cap), and then
+    // publish only the tiny manifest pointer. If the grant endpoint is missing
+    // (older gateway) or the direct PUT fails, fall back to the legacy
+    // through-the-gateway upload, which still works for small snapshots.
+    let publish_base = publish_url
+        .trim_end_matches("/api/bootstrap/publish")
+        .to_string();
+    let mut direct_blob_url: Option<String> = None;
+    'direct: {
+        #[derive(serde::Deserialize)]
+        struct UploadGrant {
+            ok: bool,
+            token: String,
+            api_url: String,
+            api_version: String,
+            store_id: String,
+        }
+        let grant_resp = match client
+            .post(format!("{}/api/bootstrap/upload-grant", publish_base))
+            .header("authorization", format!("Bearer {}", token))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!("bootstrap upload-grant unavailable ({}); using legacy upload", r.status());
+                break 'direct;
+            }
+            Err(e) => {
+                warn!("bootstrap upload-grant request failed ({}); using legacy upload", e);
+                break 'direct;
+            }
+        };
+        let grant: UploadGrant = match grant_resp.json().await {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("bootstrap upload-grant parse failed ({}); using legacy upload", e);
+                break 'direct;
+            }
+        };
+        if !grant.ok || grant.token.trim().is_empty() {
+            warn!("bootstrap upload-grant response invalid; using legacy upload");
+            break 'direct;
+        }
+        let pathname = format!(
+            "bootstrap/{}/blockchain.db-h{}-{}.zip",
+            network_id_hex, height, tip_hash_hex
+        );
+        let put_url = {
+            let mut u = match reqwest::Url::parse(&format!("{}/", grant.api_url.trim_end_matches('/'))) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("bootstrap upload-grant api_url invalid ({}); using legacy upload", e);
+                    break 'direct;
+                }
+            };
+            u.query_pairs_mut().append_pair("pathname", &pathname);
+            u.to_string()
+        };
+        #[derive(serde::Deserialize)]
+        struct BlobPutResponse {
+            url: String,
+        }
+        match client
+            .put(&put_url)
+            .header("authorization", format!("Bearer {}", grant.token))
+            .header("x-api-version", grant.api_version.as_str())
+            .header("x-vercel-blob-store-id", grant.store_id.as_str())
+            .header("x-vercel-blob-access", "public")
+            .header("x-add-random-suffix", "1")
+            .header("x-content-type", "application/zip")
+            .body(bytes.clone())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => match r.json::<BlobPutResponse>().await {
+                Ok(b) if !b.url.trim().is_empty() => {
+                    info!(
+                        "bootstrap snapshot uploaded directly to blob ({} bytes): {}",
+                        compressed_bytes, b.url
+                    );
+                    direct_blob_url = Some(b.url);
+                }
+                Ok(_) => warn!("blob put returned empty url; using legacy upload"),
+                Err(e) => warn!("blob put response parse failed ({}); using legacy upload", e),
+            },
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                warn!(
+                    "blob put failed ({}: {}); using legacy upload",
+                    status,
+                    body.trim()
+                );
+            }
+            Err(e) => warn!("blob put request failed ({}); using legacy upload", e),
+        }
+    }
+
+    // Step 2: publish through the gateway — manifest-only when the direct blob
+    // upload succeeded (tiny request), full zip body otherwise (legacy).
+    let mut upload_url = format!(
         "{}?network_id={}&height={}&tip={}&sha256={}&compressed_bytes={}&extracted_bytes={}&file_count={}",
         publish_url,
         network_id_hex,
@@ -4152,17 +4299,20 @@ async fn publish_bootstrap_snapshot(
         archive_stats.extracted_bytes,
         archive_stats.file_count
     );
-    // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let resp = client
+    if let Some(blob_url) = &direct_blob_url {
+        let mut u = reqwest::Url::parse(&upload_url)?;
+        u.query_pairs_mut().append_pair("blob_url", blob_url);
+        upload_url = u.to_string();
+    }
+    let request = client
         .post(&upload_url)
         .header("authorization", format!("Bearer {}", token))
-        .header("content-type", "application/zip")
-        .body(bytes)
-        .send()
-        .await?;
+        .header("content-type", "application/zip");
+    let resp = if direct_blob_url.is_some() {
+        request.send().await?
+    } else {
+        request.body(bytes).send().await?
+    };
 
     if resp.status().is_redirection() {
         let loc = resp

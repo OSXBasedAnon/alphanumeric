@@ -2610,10 +2610,49 @@ impl Node {
 
             let before = tip;
             if ancestor >= tip {
-                // Same chain, strictly behind (ancestor == tip): forward-stream the
-                // canonical blocks that chain onto our tip. This path already applies
-                // the S-01 frontier gate + trails the finality checkpoint.
-                let _ = self.sync_with_block_relay(tip).await;
+                // Same chain, strictly behind (ancestor == tip). v7.6.5 FIX (2026-07-08
+                // night): this used to forward-stream via windowed relay fetches ONLY —
+                // but the windowed list is fork-capped ("2 oldest + 1 newest" per
+                // height), and in a reorg-overtake zone the canonical block at a height
+                // is often a LATER post that holds neither slot, so the stream saw the
+                // canonical child only in the brief moment it was "newest". Catch-up was
+                // therefore pinned to ~mint speed (or fully stuck), and a node that fell
+                // behind could NEVER close the gap — the network-wide "everyone at a
+                // different height" complaint. find_common_ancestor already walked the
+                // exact canonical bodies down to our tip (exact-by-(height,hash) fetches
+                // that fork density cannot hide), so ADOPT that branch directly — a pure
+                // append (rewrite depth 0) through the same fully-validated engine path
+                // the reorg case uses. The windowed stream remains only as a fallback
+                // for the no-new-bodies edge (beacon exactly at our tip).
+                // Same bound as the divergent path: a very long append may not hold the
+                // write lock for an unbounded validation — a node THAT far behind
+                // re-bootstraps from the snapshot instead.
+                if beacon.height.saturating_sub(tip) > crate::a9::blockchain::ORPHAN_REORG_DEPTH {
+                    return Converge::NeedsBootstrap;
+                }
+                let branch: Vec<Block> = canon.into_iter().filter(|b| b.index > tip).collect();
+                if branch.is_empty() {
+                    let _ = self.sync_with_block_relay(tip).await;
+                } else {
+                    match self
+                        .blockchain
+                        .write()
+                        .await
+                        .adopt_external_branch(branch)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!(
+                                "Rejected forward branch toward {}@{}: {}",
+                                beacon.height,
+                                hex::encode(beacon.hash),
+                                e
+                            );
+                            return Converge::BranchInvalid;
+                        }
+                    }
+                }
             } else {
                 // Divergent: our tip forks from canonical at `ancestor` < tip.
                 let d = ancestor + 1;
