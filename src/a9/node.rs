@@ -3092,7 +3092,21 @@ impl Node {
             if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 continue;
             }
-            let Some(block_val) = body.get("block") else {
+            let Some(record) = body.get("block") else {
+                continue;
+            };
+            // The relay wraps the node Block in an ENVELOPE record ({height, hash,
+            // node_id, ..., block: <Block>}) — the same shape as /api/blocks entries.
+            // This used to parse the envelope itself as a Block, which always failed
+            // (silently), so the exact-lookup fallback below the fork-capped window
+            // NEVER worked: every fork-loser walked into a phantom gap, reported
+            // BeaconStale forever, and kept mining its own stale tip (2026-07-09
+            // rotating-stall incident). Unwrap the inner Block like the windowed path.
+            let Some(block_val) = record.get("block") else {
+                debug!(
+                    "exact-block fetch #{}: response record missing inner block field",
+                    height
+                );
                 continue;
             };
             if let Ok(block) = serde_json::from_value::<Block>(block_val.clone()) {
@@ -3105,6 +3119,12 @@ impl Node {
                 {
                     return Some(block);
                 }
+                debug!(
+                    "exact-block fetch #{}: parsed block failed (height/hash/pow) check",
+                    height
+                );
+            } else {
+                debug!("exact-block fetch #{}: inner block failed to deserialize", height);
             }
         }
         None
@@ -3862,6 +3882,22 @@ impl Node {
                             return Err(NodeError::ConsensusFailure(format!(
                                 "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; restart this node to re-sync onto the canonical chain",
                                 beacon.height.saturating_sub(local_tip), local_tip, beacon.height
+                            )));
+                        }
+                        // Fail-open is only competitive when we are within RACING
+                        // distance of the beacon (a live same/next-height race). At a
+                        // larger — but still reachable — deficit, mining the local tip
+                        // is guaranteed waste and silently forks the miner off (the
+                        // 2026-07-09 rotating stall: nodes 4-12 behind kept "failing
+                        // open" and mining orphans for 20+ minutes while printing
+                        // normal mining output). Report Retryable instead: the caller
+                        // retries/backs off and the background reconcile keeps pulling
+                        // us forward; we mine the moment converge actually lands.
+                        if beacon.height > local_tip.saturating_add(2) {
+                            return Err(NodeError::Retryable(format!(
+                                "network tip {} is {} blocks ahead and the relay gap has not healed yet; not mining a stale tip",
+                                beacon.height,
+                                beacon.height.saturating_sub(local_tip)
                             )));
                         }
                         warn!("Relay gap while preparing to mine; mining on local tip (fail-open)");
