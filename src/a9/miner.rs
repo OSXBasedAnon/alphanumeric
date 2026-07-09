@@ -336,8 +336,9 @@ impl MiningManager {
                     &merkle_root,
                     previous_difficulty,
                     previous_block_timestamp,
-                    std::time::Duration::from_secs(2),
-                    &found, // reused as a stop flag; set below on success
+                    std::time::Duration::from_secs(5),
+                    &tip_change_counter,
+                    template_tip_version,
                 ) {
                     if !found.swap(true, Ordering::Release) {
                         result_nonce.store(n, Ordering::Release);
@@ -347,6 +348,15 @@ impl MiningManager {
                             *g = hash.to_vec();
                         }
                     }
+                }
+                // GPU is the whole search when active: if it found a block, fall
+                // through to finalization (found=true, the CPU rayon below no-ops);
+                // if not (budget hit / tip moved), skip the pointless CPU scan and
+                // loop to a fresh GPU attempt against the current tip. Running the
+                // CPU window here was ~half the wasted duty cycle that stopped the
+                // GPU from winning blocks.
+                if !found.load(Ordering::Acquire) {
+                    continue;
                 }
             }
 

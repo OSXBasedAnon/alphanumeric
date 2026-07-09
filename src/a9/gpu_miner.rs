@@ -24,7 +24,12 @@ struct Params {
     nonce_lo: u32,
     nonce_hi: u32,
     zero_bits: u32,
-    batch: u32,
+    threads: u32,
+    iters: u32,
+    // Pad the whole struct to 128 bytes: a WGSL uniform struct is 16-byte
+    // aligned, so the shader-side size rounds 120 -> 128 and the binding must
+    // match (wgpu rejects a 120-byte buffer as < minimum 128).
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -189,14 +194,17 @@ impl GpuMiner {
         out
     }
 
-    /// Search `batch` nonces starting at `base_nonce`. Returns the first winning
-    /// nonce found, if any. One synchronous GPU round-trip.
-    pub fn search_batch(
+    /// Search `threads * iters` nonces from `base_nonce` in ONE dispatch. Each
+    /// thread tests `iters` consecutive nonces, so the single GPU->CPU readback is
+    /// amortized across the whole batch (the ~10x throughput fix). Caller keeps
+    /// `threads * iters <= 2^32` so the kernel's per-thread u32 offset is exact.
+    pub fn search_batch_iters(
         &self,
         header: &[u8; 92],
         zero_bits: u32,
         base_nonce: u64,
-        batch: u32,
+        threads: u32,
+        iters: u32,
     ) -> Option<u64> {
         debug_assert!(zero_bits != DEBUG_HASH_SENTINEL);
         let params = Params {
@@ -204,14 +212,27 @@ impl GpuMiner {
             nonce_lo: base_nonce as u32,
             nonce_hi: (base_nonce >> 32) as u32,
             zero_bits,
-            batch,
+            threads,
+            iters,
+            _pad: [0; 3],
         };
-        let out = self.dispatch(&params, batch.div_ceil(WORKGROUP));
+        let out = self.dispatch(&params, threads.div_ceil(WORKGROUP));
         if out.found != 0 {
             Some(((out.nonce_hi as u64) << 32) | out.nonce_lo as u64)
         } else {
             None
         }
+    }
+
+    /// Convenience: search `batch` nonces with one nonce per thread (used by tests).
+    pub fn search_batch(
+        &self,
+        header: &[u8; 92],
+        zero_bits: u32,
+        base_nonce: u64,
+        batch: u32,
+    ) -> Option<u64> {
+        self.search_batch_iters(header, zero_bits, base_nonce, batch, 1)
     }
 
     /// Search up to `max_nonces` nonces from `start_nonce` in batches, honoring
@@ -245,7 +266,9 @@ impl GpuMiner {
             nonce_lo: nonce as u32,
             nonce_hi: (nonce >> 32) as u32,
             zero_bits: DEBUG_HASH_SENTINEL,
-            batch: 1,
+            threads: 1,
+            iters: 1,
+            _pad: [0; 3],
         };
         let out = self.dispatch(&params, 1);
         let mut bytes = [0u8; 32];
@@ -323,9 +346,11 @@ fn build_header(
 
 /// GPU nonce search for one block attempt. Refreshes the timestamp/difficulty
 /// per sub-batch (like the CPU miner), searching until it finds a winning nonce,
-/// hits the wall-clock `budget`, or `stop` is set. On success returns
-/// `(nonce, timestamp, difficulty, hash)` for the existing CPU finalizer to
-/// build+verify — the GPU only proposes a nonce; consensus is unchanged.
+/// hits the wall-clock `budget`, or the network tip moves (tip_counter no longer
+/// equals tip_version — so a block someone else mined ends this attempt in ~1
+/// dispatch instead of wasting the rest of the budget on a stale template). On
+/// success returns `(nonce, timestamp, difficulty, hash)` for the existing CPU
+/// finalizer to build+verify — the GPU only proposes a nonce; consensus unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_mine_attempt(
     number: u32,
@@ -334,14 +359,21 @@ pub fn gpu_mine_attempt(
     previous_difficulty: u64,
     previous_block_timestamp: u64,
     budget: std::time::Duration,
-    stop: &std::sync::atomic::AtomicBool,
+    tip_counter: &std::sync::atomic::AtomicU64,
+    tip_version: u64,
 ) -> Option<(u64, u64, u64, [u8; 32])> {
     let gpu = shared_gpu()?;
     let deadline = Instant::now() + budget;
-    const BATCH: u32 = 1 << 22; // 4M nonces / dispatch
+    // Big per-dispatch batch amortizes the readback: THREADS threads each testing
+    // ITERS nonces = ~1.07B nonces per GPU->CPU sync (THREADS*ITERS < 2^32 keeps the
+    // kernel's per-thread u32 offset exact). Threads stay under wgpu's 65535
+    // workgroups-per-dimension limit (65535 * 256 = 16.7M).
+    const THREADS: u32 = 65535 * 256;
+    const ITERS: u32 = 64;
 
+    let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
     let mut base: u64 = 0;
-    while Instant::now() < deadline && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while Instant::now() < deadline && !tip_moved() {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -355,12 +387,12 @@ pub fn gpu_mine_attempt(
         // Header with a placeholder nonce; the kernel substitutes each thread's.
         let header = build_header(number, previous_hash, timestamp, 0, difficulty, merkle_root);
 
-        if let Some(nonce) = gpu.search_batch(&header, zero_bits, base, BATCH) {
+        if let Some(nonce) = gpu.search_batch_iters(&header, zero_bits, base, THREADS, ITERS) {
             let full = build_header(number, previous_hash, timestamp, nonce, difficulty, merkle_root);
             let hash = *blake3::hash(&full).as_bytes();
             return Some((nonce, timestamp, difficulty, hash));
         }
-        base = base.wrapping_add(BATCH as u64);
+        base = base.wrapping_add(THREADS as u64 * ITERS as u64);
     }
     None
 }

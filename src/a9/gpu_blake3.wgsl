@@ -28,7 +28,9 @@ struct Params {
     nonce_lo: u32,
     nonce_hi: u32,
     zero_bits: u32,
-    batch: u32,
+    threads: u32, // number of GPU threads dispatched
+    iters: u32,   // nonces each thread tests (throughput: amortizes readback)
+    _pad: u32,
 };
 
 struct Result {
@@ -145,40 +147,30 @@ fn leading_zero_bits(h: array<u32, 8>) -> u32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.batch) { return; }
-    if (atomicLoad(&result.found) != 0u) { return; }
-
-    // 64-bit nonce = base + gid.x (manual carry).
-    let lo = params.nonce_lo + gid.x;
-    var hi = params.nonce_hi;
-    if (lo < params.nonce_lo) { hi = hi + 1u; }
+    if (gid.x >= params.threads) { return; }
 
     // header words: header[0]=w0..3, [1]=w4..7, [2]=w8..11, [3]=w12..15,
     // [4]=w16..19, [5]=w20..23. Nonce occupies w11 (lo) and w12 (hi).
     let h0 = params.header[0]; let h1 = params.header[1]; let h2 = params.header[2];
     let h3 = params.header[3]; let h4 = params.header[4]; let h5 = params.header[5];
+    let cv = array<u32, 8>(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]);
 
-    // block0 = w0..w15, with w11=lo (nonce), w12=hi (nonce). Constant indices only.
-    let block0 = array<u32, 16>(
-        h0.x, h0.y, h0.z, h0.w,
-        h1.x, h1.y, h1.z, h1.w,
-        h2.x, h2.y, h2.z, lo,
-        hi,   h3.y, h3.z, h3.w
-    );
-    // block1 = w16..w22 (28 bytes), zero-padded to 16 words.
+    // block1 is nonce-independent (w16..w22); build once per thread.
     let block1 = array<u32, 16>(
         h4.x, h4.y, h4.z, h4.w,
         h5.x, h5.y, h5.z, 0u,
         0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
     );
 
-    let cv = array<u32, 8>(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]);
-    let cv1 = compress(cv, block0, 64u, CHUNK_START);
-    let root = compress(cv1, block1, 28u, CHUNK_END | ROOT);
-
+    // Self-check: emit thread 0's raw hash for the exact base nonce, then stop.
     if (params.zero_bits == 0xFFFFFFFFu) {
-        // Self-check mode: emit thread 0's raw hash, never "find" anything.
         if (gid.x == 0u) {
+            let block0 = array<u32, 16>(
+                h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w,
+                h2.x, h2.y, h2.z, params.nonce_lo, params.nonce_hi, h3.y, h3.z, h3.w
+            );
+            let cv1 = compress(cv, block0, 64u, CHUNK_START);
+            let root = compress(cv1, block1, 28u, CHUNK_END | ROOT);
             result.hash[0] = root[0]; result.hash[1] = root[1];
             result.hash[2] = root[2]; result.hash[3] = root[3];
             result.hash[4] = root[4]; result.hash[5] = root[5];
@@ -187,10 +179,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if (leading_zero_bits(root) >= params.zero_bits) {
-        if (atomicExchange(&result.found, 1u) == 0u) {
-            result.nonce_lo = lo;
-            result.nonce_hi = hi;
+    // THROUGHPUT: this thread tests `iters` consecutive nonces. One dispatch thus
+    // covers threads*iters nonces per GPU->CPU readback, amortizing the sync that
+    // capped a one-nonce-per-thread kernel at ~0.8 GH/s. Offset = gid.x*iters + i
+    // stays < 2^32 per dispatch (caller bounds threads*iters), so a single u32
+    // add-with-carry onto the 64-bit base is exact.
+    let thread_base = gid.x * params.iters;
+    for (var i = 0u; i < params.iters; i = i + 1u) {
+        // Cheap early-out so a found block ends the batch fast (checked per-iter,
+        // it is a uniform-ish atomic read — negligible next to a BLAKE3 double
+        // compression).
+        if ((i & 63u) == 0u && atomicLoad(&result.found) != 0u) { return; }
+
+        let offset = thread_base + i;
+        let lo = params.nonce_lo + offset;
+        var hi = params.nonce_hi;
+        if (lo < params.nonce_lo) { hi = hi + 1u; }
+
+        let block0 = array<u32, 16>(
+            h0.x, h0.y, h0.z, h0.w,
+            h1.x, h1.y, h1.z, h1.w,
+            h2.x, h2.y, h2.z, lo,
+            hi,   h3.y, h3.z, h3.w
+        );
+        let cv1 = compress(cv, block0, 64u, CHUNK_START);
+        let root = compress(cv1, block1, 28u, CHUNK_END | ROOT);
+
+        if (leading_zero_bits(root) >= params.zero_bits) {
+            if (atomicExchange(&result.found, 1u) == 0u) {
+                result.nonce_lo = lo;
+                result.nonce_hi = hi;
+            }
+            return;
         }
     }
 }
