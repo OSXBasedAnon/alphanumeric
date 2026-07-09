@@ -1,15 +1,14 @@
 # Alphanumeric Client User Guide
 
-This download contains Alphanumeric client version 7.7.1 for macOS.
+This is the user guide for Alphanumeric client version 7.7.1.
 
-## What Is Included
-
-- `alphanumeric` - the client program
-- `README.md` - this user guide
+The prebuilt download is for **macOS (Apple Silicon)**. On **Windows** and
+**Linux** you build from source — it takes a few minutes and one `cargo`
+command; see the setup sections below.
 
 The client stores its chain database, node identity, wallets, and lock files beside the folder you run it from unless you set a custom database path.
 
-## Recommended Setup
+## Setup — macOS (prebuilt download)
 
 Create one folder for the client and always run it from that folder:
 
@@ -24,33 +23,76 @@ Move the `alphanumeric` file into that folder, then make it executable if needed
 chmod +x ./alphanumeric
 ```
 
+If macOS blocks the program because it was downloaded from the internet, open it from Finder with right-click, then Open. If you prefer Terminal, you can remove the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine ./alphanumeric
+```
+
 Start the client:
 
 ```bash
 ./alphanumeric
 ```
 
-On first run, the client will create or download local chain data into:
+## Setup — Windows (build from source)
 
-```bash
-~/Alphanumeric/blockchain.db
+1. Install Rust from <https://rustup.rs> (run `rustup-init.exe`, accept the
+   default MSVC toolchain). If the installer asks for the Visual Studio C++
+   Build Tools, let it install them — Rust needs them to link programs.
+2. Install Git from <https://git-scm.com> if you do not have it.
+3. In PowerShell:
+
+```powershell
+git clone https://github.com/OSXBasedAnon/alphanumeric
+cd alphanumeric
+cargo build --release
 ```
 
-It will also create local identity and wallet files in the same working folder.
+4. Run the client from its own folder so your chain data stays together:
 
-## macOS First-Run Note
+```powershell
+mkdir ~\Alphanumeric
+copy target\release\alphanumeric.exe ~\Alphanumeric\
+cd ~\Alphanumeric
+.\alphanumeric.exe
+```
 
-If macOS blocks the program because it was downloaded from the internet, open it from Finder with right-click, then Open.
+Always run the **release** build as shown above. A debug build (plain
+`cargo run`) is many times slower — fine for a quick look, wrong for mining.
 
-If you prefer Terminal, you can remove the quarantine flag:
+Environment variables in PowerShell are set like this (any variable in this
+guide works the same way):
+
+```powershell
+$env:ALPHANUMERIC_HEADLESS = "true"
+.\alphanumeric.exe
+```
+
+## Setup — Linux (build from source)
+
+On Debian/Ubuntu:
 
 ```bash
-xattr -dr com.apple.quarantine ./alphanumeric
+sudo apt install build-essential pkg-config libssl-dev cmake git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/OSXBasedAnon/alphanumeric
+cd alphanumeric
+cargo build --release
+mkdir -p ~/Alphanumeric && cp target/release/alphanumeric ~/Alphanumeric/
+cd ~/Alphanumeric && ./alphanumeric
 ```
+
+Other distributions need the same things under their own package names: a C
+compiler, pkg-config, OpenSSL headers, cmake, git, and Rust via rustup.
 
 ## First Run
 
-When the client starts, it checks local chain data against the launch network. If no usable `blockchain.db` exists, or if the local DB belongs to the wrong network, it downloads the current bootstrap snapshot from the Alphanumeric gateway and verifies it before using it.
+When the client starts, it checks local chain data against the launch network. If no usable `blockchain.db` exists, or if the local DB belongs to the wrong network, it downloads the current bootstrap snapshot from the Alphanumeric gateway and verifies it before using it. On first run, the client creates local identity and wallet files in the working folder, and the chain database:
+
+```text
+blockchain.db
+```
 
 If bootstrap succeeds, the command prompt appears:
 
@@ -86,6 +128,12 @@ Mine to a wallet:
 mine my_wallet
 ```
 
+Look up any account (balance and full transaction history):
+
+```text
+account 84dab431b53e6522fe2e74914eec99f17758f4e3
+```
+
 Send funds:
 
 ```text
@@ -109,6 +157,32 @@ Exit:
 ```text
 exit
 ```
+
+## Running a Node Without Mining
+
+Nodes never mine on their own — mining only starts if you type `mine`. To run
+a light, hands-off node that just follows and verifies the chain (works fine
+on modest machines and small VPSes):
+
+```bash
+ALPHANUMERIC_HEADLESS=true ./alphanumeric
+```
+
+## Run Your Own Explorer (Optional)
+
+Any node can serve read-only chain data over local HTTP for a block-explorer
+website, an exchange integration, or scripts:
+
+```bash
+ALPHANUMERIC_EXPLORER_API=127.0.0.1:8790 ALPHANUMERIC_HEADLESS=true ./alphanumeric
+```
+
+Endpoints: `/explorer/tip`, `/explorer/block/{height}`,
+`/explorer/tx/{height}/{position}`, `/explorer/address/{address}`,
+`/explorer/supply`, `/explorer/status`. It is off by default and costs nothing
+when disabled. Keep the port on localhost and put your web server in front if
+your site is public. Full guide: `EXPLORER_API.md` (included with this
+download and in the repository under `docs/`).
 
 ## Keeping Your Data Safe
 
