@@ -51,6 +51,15 @@ const CONFIRMED_TX_TREE: &str = "confirmed_tx";
 /// replayed (see MAX_TX_AGE_SECS). Keeps the registry BOUNDED to a recent window
 /// instead of the whole chain.
 const CONFIRMED_TX_TS_INDEX: &str = "confirmed_tx_ts_index";
+/// Address history index: `address || 0x00 || height_be || tx_position_be` ->
+/// compact entry (role flags, amount, fee, timestamp, counterparty). One entry per
+/// (transaction, involved address); MINING_REWARDS receipts ARE indexed (unlike the
+/// replay registry) — the whole point is answering "what happened to this account",
+/// and mining income is most of it. Full-history (never pruned), display/query only:
+/// consensus never reads it, and every write is fail-open so an index error can
+/// never fail a block commit. Maintained on tip extension and reorg alongside the
+/// replay registry; (re)built via ensure_address_tx_index / rebuild_address_tx_index.
+const ADDRESS_TX_TREE: &str = "address_tx_index";
 /// Transaction-freshness window (Solana-style expiry). A non-system transaction
 /// must be mined within this many seconds of its signed timestamp; a block that
 /// includes an older one is rejected. This expires stale transactions so the
@@ -100,6 +109,12 @@ const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
 /// signature-trusted and cannot be reorged; above it every adopted block must
 /// pass full ML-DSA verification. Monotonic. See CHECKPOINT_REORG_MARGIN.
 const TRUSTED_CHECKPOINT_KEY: &[u8] = b"trusted_checkpoint";
+/// (height, hash) of the last canonical block whose transactions are reflected in
+/// ADDRESS_TX_TREE. Missing = index never built; hash mismatch at that height =
+/// chain was rewritten while the index was offline (e.g. by an older binary) so it
+/// must be rebuilt; height behind tip = catch up incrementally. Advanced on every
+/// indexed block, so it is safe for it to lag (re-indexing a block is idempotent).
+const ADDRESS_TX_META_KEY: &[u8] = b"address_tx_indexed_tip";
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
@@ -1553,6 +1568,16 @@ impl Blockchain {
         index.apply_batch(index_batch)?;
         tree.flush()?;
         index.flush()?;
+        // Address history index rides the same commit sites (tip extension, local
+        // mining finalize, reorg branch adoption) but AFTER the registry writes and
+        // fail-open, so an address-index error can neither corrupt the replay
+        // registry nor fail the block commit. Self-heals via ensure/rebuild.
+        if let Err(e) = self.record_address_tx_entries(block) {
+            warn!(
+                "Address history index update failed at block {} (display-only, will self-heal): {}",
+                block.index, e
+            );
+        }
         Ok(())
     }
 
@@ -1578,6 +1603,14 @@ impl Blockchain {
         index.apply_batch(index_batch)?;
         tree.flush()?;
         index.flush()?;
+        // Mirror the reverted block out of the address history index (fail-open;
+        // see record_confirmed_txs).
+        if let Err(e) = self.remove_address_tx_entries(block) {
+            warn!(
+                "Address history index revert failed at block {} (display-only, will self-heal): {}",
+                block.index, e
+            );
+        }
         Ok(())
     }
 
@@ -1695,6 +1728,339 @@ impl Blockchain {
             let _ = self.prune_confirmed_txs(tip_block.timestamp);
         }
         Ok(())
+    }
+
+    fn open_address_tx_tree(&self) -> Result<sled::Tree, BlockchainError> {
+        self.db.open_tree(ADDRESS_TX_TREE).map_err(Into::into)
+    }
+
+    /// `address || 0x00 || height_be || position_be`. Addresses are ASCII (hex or
+    /// the MINING_REWARDS literal) so the 0x00 terminator cannot collide and makes
+    /// the per-address prefix exact ("abc" never matches "abcd"). Big-endian
+    /// height/position keep a prefix scan ordered by confirmation order.
+    fn address_tx_key(address: &str, height: u32, position: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(address.len() + 9);
+        key.extend_from_slice(address.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&position.to_be_bytes());
+        key
+    }
+
+    fn address_tx_prefix(address: &str) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(address.len() + 1);
+        prefix.extend_from_slice(address.as_bytes());
+        prefix.push(0);
+        prefix
+    }
+
+    /// Fixed layout, hand-rolled so the entry format never depends on codec
+    /// evolution: flags(1) || amount_units_le(16) || fee_units_le(16) ||
+    /// timestamp_le(8) || counterparty_utf8(rest). Changing this layout requires a
+    /// new tree name — decode tolerates (skips) undersized values, not reshaped ones.
+    fn encode_address_tx_value(
+        flags: u8,
+        amount_units: i128,
+        fee_units: i128,
+        timestamp: u64,
+        counterparty: &str,
+    ) -> Vec<u8> {
+        let mut value = Vec::with_capacity(41 + counterparty.len());
+        value.push(flags);
+        value.extend_from_slice(&amount_units.to_le_bytes());
+        value.extend_from_slice(&fee_units.to_le_bytes());
+        value.extend_from_slice(&timestamp.to_le_bytes());
+        value.extend_from_slice(counterparty.as_bytes());
+        value
+    }
+
+    fn decode_address_tx_entry(prefix_len: usize, key: &[u8], value: &[u8]) -> Option<AddressTxEntry> {
+        if key.len() != prefix_len + 8 || value.len() < 41 {
+            return None;
+        }
+        let mut height = [0u8; 4];
+        let mut position = [0u8; 4];
+        height.copy_from_slice(&key[prefix_len..prefix_len + 4]);
+        position.copy_from_slice(&key[prefix_len + 4..]);
+        let mut amount = [0u8; 16];
+        let mut fee = [0u8; 16];
+        let mut ts = [0u8; 8];
+        amount.copy_from_slice(&value[1..17]);
+        fee.copy_from_slice(&value[17..33]);
+        ts.copy_from_slice(&value[33..41]);
+        Some(AddressTxEntry {
+            height: u32::from_be_bytes(height),
+            position: u32::from_be_bytes(position),
+            flags: value[0],
+            amount_units: i128::from_le_bytes(amount),
+            fee_units: i128::from_le_bytes(fee),
+            timestamp: u64::from_le_bytes(ts),
+            counterparty: String::from_utf8_lossy(&value[41..]).into_owned(),
+        })
+    }
+
+    /// The (key, value) pairs a block contributes to the address index. Derived
+    /// only from fields that survive to_storage_block truncation, so entries built
+    /// live at commit time and entries rebuilt from stored blocks are identical —
+    /// which is what makes re-indexing idempotent.
+    fn address_index_ops(block: &Block) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut ops = Vec::new();
+        for (position, tx) in block.transactions.iter().enumerate() {
+            let position = position as u32;
+            let sender_indexed = !SYSTEM_ADDRESSES.contains(&tx.sender.as_str());
+            let recipient_indexed = !SYSTEM_ADDRESSES.contains(&tx.recipient.as_str());
+            if sender_indexed && recipient_indexed && tx.sender == tx.recipient {
+                ops.push((
+                    Self::address_tx_key(&tx.sender, block.index, position),
+                    Self::encode_address_tx_value(
+                        ADDRESS_TX_FLAG_SENDER | ADDRESS_TX_FLAG_RECIPIENT,
+                        tx.amount_units,
+                        tx.fee_units,
+                        tx.timestamp,
+                        &tx.sender,
+                    ),
+                ));
+                continue;
+            }
+            if sender_indexed {
+                ops.push((
+                    Self::address_tx_key(&tx.sender, block.index, position),
+                    Self::encode_address_tx_value(
+                        ADDRESS_TX_FLAG_SENDER,
+                        tx.amount_units,
+                        tx.fee_units,
+                        tx.timestamp,
+                        &tx.recipient,
+                    ),
+                ));
+            }
+            if recipient_indexed {
+                ops.push((
+                    Self::address_tx_key(&tx.recipient, block.index, position),
+                    Self::encode_address_tx_value(
+                        ADDRESS_TX_FLAG_RECIPIENT,
+                        tx.amount_units,
+                        tx.fee_units,
+                        tx.timestamp,
+                        &tx.sender,
+                    ),
+                ));
+            }
+        }
+        ops
+    }
+
+    /// Write a block's address-history entries and advance the index meta to it.
+    /// Callers treat errors as non-fatal (fail-open): this index is display-only
+    /// and must never be able to fail a block commit. A skipped/failed write only
+    /// leaves the meta behind the tip, which ensure_address_tx_index heals by
+    /// re-indexing — idempotent because keys and values are deterministic.
+    fn record_address_tx_entries(&self, block: &Block) -> Result<(), BlockchainError> {
+        let tree = self.open_address_tx_tree()?;
+        let mut batch = sled::Batch::default();
+        for (key, value) in Self::address_index_ops(block) {
+            batch.insert(key, value);
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        let meta = self.open_chain_meta_tree()?;
+        meta.insert(
+            ADDRESS_TX_META_KEY,
+            codec::serialize(&(block.index, block.hash))?,
+        )?;
+        Ok(())
+    }
+
+    /// Remove a reverted block's address-history entries (reorg path). Fail-open
+    /// like record: a miss only strands display rows that the dirty-marker force
+    /// rebuild (or the next full rebuild) clears.
+    fn remove_address_tx_entries(&self, block: &Block) -> Result<(), BlockchainError> {
+        let tree = self.open_address_tx_tree()?;
+        let mut batch = sled::Batch::default();
+        for (key, _) in Self::address_index_ops(block) {
+            batch.remove(key);
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    /// True once the address index has ever completed a build — the signal the
+    /// display paths use to distinguish "no activity" from "index unavailable".
+    pub fn address_index_ready(&self) -> bool {
+        self.open_chain_meta_tree()
+            .ok()
+            .and_then(|tree| tree.get(ADDRESS_TX_META_KEY).ok().flatten())
+            .is_some()
+    }
+
+    /// Force-rebuild the address index from the canonical chain. Invalidates the
+    /// meta FIRST so a crash mid-rebuild is detected (missing meta => rebuild) and
+    /// batches inserts so a long chain does not accumulate one giant batch in RAM.
+    /// O(chain); runs once on first upgrade, then only on dirty-marker recovery.
+    pub fn rebuild_address_tx_index(&self) -> Result<(), BlockchainError> {
+        let tree = self.open_address_tx_tree()?;
+        let meta = self.open_chain_meta_tree()?;
+        meta.remove(ADDRESS_TX_META_KEY)?;
+        meta.flush()?;
+        tree.clear()?;
+        let Some(tip) = self.highest_block_index() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let mut batch = sled::Batch::default();
+        let mut pending = 0usize;
+        let mut last_indexed: Option<(u32, [u8; 32])> = None;
+        for height in 0..=tip {
+            if let Ok(block) = self.get_block(height) {
+                for (key, value) in Self::address_index_ops(&block) {
+                    batch.insert(key, value);
+                    pending += 1;
+                }
+                last_indexed = Some((block.index, block.hash));
+                if pending >= 4096 {
+                    tree.apply_batch(std::mem::take(&mut batch))?;
+                    pending = 0;
+                }
+            }
+        }
+        tree.apply_batch(batch)?;
+        tree.flush()?;
+        if let Some(indexed_tip) = last_indexed {
+            meta.insert(ADDRESS_TX_META_KEY, codec::serialize(&indexed_tip)?)?;
+            meta.flush()?;
+        }
+        debug!(
+            "Address history index rebuilt to height {} in {:?}",
+            tip,
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    /// Bring the address index in line with the canonical chain: build it on first
+    /// run under this feature, rebuild if the chain was rewritten while the index
+    /// was offline (meta block no longer canonical — e.g. an older binary reorged
+    /// under us), or catch up incrementally when merely behind (blocks committed by
+    /// an older binary). No-op when current, so it is cheap to call at every start.
+    pub fn ensure_address_tx_index(&self) -> Result<(), BlockchainError> {
+        let Some(tip) = self.highest_block_index() else {
+            return Ok(());
+        };
+        let meta = self.open_chain_meta_tree()?;
+        let recorded: Option<(u32, [u8; 32])> = meta
+            .get(ADDRESS_TX_META_KEY)?
+            .and_then(|raw| codec::deserialize::<(u32, [u8; 32])>(&raw).ok());
+        let Some((meta_height, meta_hash)) = recorded else {
+            return self.rebuild_address_tx_index();
+        };
+        if meta_height > tip {
+            return self.rebuild_address_tx_index();
+        }
+        match self.get_block(meta_height) {
+            Ok(block) if block.hash == meta_hash => {}
+            _ => return self.rebuild_address_tx_index(),
+        }
+        for height in meta_height.saturating_add(1)..=tip {
+            if let Ok(block) = self.get_block(height) {
+                self.record_address_tx_entries(&block)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whole-chain history totals for one address, or None while the index has
+    /// never finished a build (callers show "unavailable" instead of fake zeros).
+    pub fn address_history_summary(
+        &self,
+        address: &str,
+    ) -> Result<Option<AddressHistorySummary>, BlockchainError> {
+        if !self.address_index_ready() {
+            return Ok(None);
+        }
+        let tree = self.open_address_tx_tree()?;
+        let prefix = Self::address_tx_prefix(address);
+        let mut summary = AddressHistorySummary::default();
+        for item in tree.scan_prefix(&prefix) {
+            let (key, value) = item?;
+            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
+                continue;
+            };
+            summary.tx_count += 1;
+            if entry.is_sender() {
+                summary.sent_units = summary.sent_units.saturating_add(entry.amount_units);
+                summary.fees_units = summary.fees_units.saturating_add(entry.fee_units);
+            }
+            if entry.is_recipient() {
+                summary.received_units = summary.received_units.saturating_add(entry.amount_units);
+            }
+            if summary.first_height.is_none() {
+                summary.first_height = Some(entry.height);
+            }
+            summary.last_height = Some(entry.height);
+        }
+        Ok(Some(summary))
+    }
+
+    /// Newest-first confirmed history for one address straight off the index (no
+    /// block loads). `since_timestamp` bounds the scan: entries are height-ordered
+    /// and block timestamps are only loosely monotonic (MAX_BLOCK_FUTURE_TIME skew),
+    /// so the reverse scan keeps going through stragglers and stops only once an
+    /// entry is older than the cutoff by a full skew margin.
+    pub fn address_recent_txs(
+        &self,
+        address: &str,
+        limit: usize,
+        since_timestamp: Option<u64>,
+    ) -> Result<Vec<AddressTxEntry>, BlockchainError> {
+        let tree = self.open_address_tx_tree()?;
+        let prefix = Self::address_tx_prefix(address);
+        let mut entries = Vec::new();
+        for item in tree.scan_prefix(&prefix).rev() {
+            let (key, value) = item?;
+            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
+                continue;
+            };
+            if let Some(cutoff) = since_timestamp {
+                if entry.timestamp < cutoff {
+                    if entry.timestamp.saturating_add(2 * MAX_BLOCK_FUTURE_TIME) < cutoff {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            entries.push(entry);
+            if entries.len() >= limit {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Sum of all positive confirmed balances — the actual circulating supply.
+    /// Replaces the old "sum every transaction amount in every block" estimate,
+    /// which double-counted transfers (a mined 50 sent onward counted as 100) and
+    /// decoded the entire chain to do it. One cheap tree scan, no block loads.
+    pub fn total_confirmed_supply_units(&self) -> Result<i128, BlockchainError> {
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let mut total: i128 = 0;
+        for item in balances_tree.iter() {
+            let (key, value) = item?;
+            if key.as_ref() == BALANCES_HEIGHT_KEY {
+                continue;
+            }
+            if let Ok(address) = std::str::from_utf8(&key) {
+                if SYSTEM_ADDRESSES.contains(&address) {
+                    continue;
+                }
+            }
+            if let Ok(units) = Self::deserialize_units_compatible(&value) {
+                if units > 0 {
+                    total = total.saturating_add(units);
+                }
+            }
+        }
+        Ok(total)
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
@@ -2955,7 +3321,21 @@ impl Blockchain {
             // marker. Otherwise a stale registry would silently let a confirmed tx be
             // replayed after recovery.
             self.rebuild_confirmed_tx_index()?;
+            // The address history index has the same half-applied exposure as the
+            // registry (its remove/record run outside the atomic slot batch), but it
+            // is display-only: a failed rebuild must not abort startup. Fail-open —
+            // a failure leaves its meta invalidated, so ensure retries next start.
+            if let Err(e) = self.rebuild_address_tx_index() {
+                warn!("Address history index rebuild failed during recovery: {}", e);
+            }
             self.clear_chain_state_dirty()?;
+        }
+        // Build the address history index on first run under this feature, rebuild
+        // it if the chain was rewritten while it was offline, or catch up if merely
+        // behind. Cheap no-op when current. Fail-open: the account/history displays
+        // degrade to "index unavailable", never a startup failure.
+        if let Err(e) = self.ensure_address_tx_index() {
+            warn!("Address history index unavailable (build failed): {}", e);
         }
         self.prune_orphans()?;
         let _ = self.promote_orphans_from_tip().await;
@@ -3273,7 +3653,6 @@ impl Blockchain {
         self.db.flush()?;
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
-        self.clear_chain_state_dirty()?;
 
         // Mirror the persist path's confirm side-effects on the LOCAL MINING commit
         // path too: register this block's transactions in the replay registry (and
@@ -3281,6 +3660,11 @@ impl Blockchain {
         // this a locally-mined transaction is absent from the replay registry (so it
         // could be replayed within the freshness window) and lingers in the mempool
         // to be re-selected into the very next block template.
+        //
+        // Ordered BEFORE clear_chain_state_dirty (like the persist path): a crash
+        // between the block commit and these derived-state writes must leave the
+        // dirty marker set so startup recovery force-rebuilds the registry and the
+        // address index instead of silently missing this block's entries.
         let _ = self.record_confirmed_txs(&block);
         let _ = self.prune_confirmed_txs(block.timestamp);
         {
@@ -3289,6 +3673,7 @@ impl Blockchain {
                 mempool.clear_transaction(tx);
             }
         }
+        self.clear_chain_state_dirty()?;
 
         self.notify_tip_changed(&block);
         let _ = self.promote_orphans_from_tip().await;
@@ -4805,6 +5190,45 @@ impl Blockchain {
     }
 }
 
+/// Role bits for an address-history entry. An entry carries both bits for a
+/// self-send so it is stored (and counted) once.
+pub const ADDRESS_TX_FLAG_SENDER: u8 = 0b01;
+pub const ADDRESS_TX_FLAG_RECIPIENT: u8 = 0b10;
+
+/// One confirmed transaction as seen from one address's point of view, decoded
+/// from ADDRESS_TX_TREE. Self-contained for display (no block load needed);
+/// `height`/`position` locate the full transaction in the chain when required.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressTxEntry {
+    pub height: u32,
+    pub position: u32,
+    pub flags: u8,
+    pub amount_units: i128,
+    pub fee_units: i128,
+    pub timestamp: u64,
+    pub counterparty: String,
+}
+
+impl AddressTxEntry {
+    pub fn is_sender(&self) -> bool {
+        self.flags & ADDRESS_TX_FLAG_SENDER != 0
+    }
+    pub fn is_recipient(&self) -> bool {
+        self.flags & ADDRESS_TX_FLAG_RECIPIENT != 0
+    }
+}
+
+/// Whole-chain accumulation over one address's ADDRESS_TX_TREE entries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AddressHistorySummary {
+    pub tx_count: u64,
+    pub sent_units: i128,
+    pub received_units: i128,
+    pub fees_units: i128,
+    pub first_height: Option<u32>,
+    pub last_height: Option<u32>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockchainInfo {
     pub height: u32,
@@ -6165,5 +6589,214 @@ mod tests {
             .get_orphan_block_by_hash(&competing.hash)
             .unwrap()
             .is_some());
+    }
+
+    fn user_tx(sender: &str, recipient: &str, amount: f64, timestamp: u64) -> Transaction {
+        Transaction {
+            sender: sender.to_string(),
+            recipient: recipient.to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(amount),
+            timestamp,
+            signature: Some("aa".repeat(2400)),
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    #[test]
+    fn address_index_unavailable_before_first_build() {
+        let bc = test_blockchain();
+        assert!(!bc.address_index_ready());
+        assert_eq!(
+            bc.address_history_summary("anyone").unwrap(),
+            None,
+            "an unbuilt index must read as unavailable, not as zero activity"
+        );
+    }
+
+    #[test]
+    fn address_index_records_coinbase_transfers_and_self_sends() {
+        let bc = test_blockchain();
+        // Coinbase to "miner" + payment alice->bob + self-send carol->carol.
+        let mut block = metadata_test_block(5, [0u8; 32], "miner", 2.0);
+        block.transactions.push(user_tx("alice", "bob", 2.5, 5_000));
+        block.transactions.push(user_tx("carol", "carol", 1.0, 5_001));
+        bc.record_confirmed_txs(&block).unwrap();
+
+        // The miner's coinbase receipt IS indexed (the replay registry skips
+        // system txs; the address index must not — that was the "balance with
+        // zero history" bug).
+        let miner = bc.address_history_summary("miner").unwrap().unwrap();
+        assert_eq!(miner.tx_count, 1);
+        assert_eq!(miner.received_units, Transaction::to_units(2.0));
+        assert_eq!(miner.sent_units, 0);
+        assert_eq!(miner.fees_units, 0);
+        assert_eq!(miner.first_height, Some(5));
+        assert_eq!(miner.last_height, Some(5));
+        let miner_txs = bc.address_recent_txs("miner", 10, None).unwrap();
+        assert_eq!(miner_txs.len(), 1);
+        assert_eq!(miner_txs[0].counterparty, "MINING_REWARDS");
+        assert!(miner_txs[0].is_recipient() && !miner_txs[0].is_sender());
+
+        let alice = bc.address_history_summary("alice").unwrap().unwrap();
+        assert_eq!(alice.tx_count, 1);
+        assert_eq!(alice.sent_units, Transaction::to_units(2.5));
+        assert_eq!(alice.fees_units, Transaction::to_units(NETWORK_FEE));
+        assert_eq!(alice.received_units, 0);
+
+        let bob = bc.address_history_summary("bob").unwrap().unwrap();
+        assert_eq!(bob.tx_count, 1);
+        assert_eq!(bob.received_units, Transaction::to_units(2.5));
+        assert_eq!(bob.sent_units, 0);
+
+        // Self-send: ONE entry carrying both roles, counted once.
+        let carol = bc.address_history_summary("carol").unwrap().unwrap();
+        assert_eq!(carol.tx_count, 1);
+        assert_eq!(carol.sent_units, Transaction::to_units(1.0));
+        assert_eq!(carol.received_units, Transaction::to_units(1.0));
+
+        // The system address itself is never indexed.
+        let system = bc.address_history_summary("MINING_REWARDS").unwrap().unwrap();
+        assert_eq!(system.tx_count, 0);
+
+        // A prefix address must not leak entries from a longer address.
+        let prefix = bc.address_history_summary("mine").unwrap().unwrap();
+        assert_eq!(prefix.tx_count, 0);
+    }
+
+    #[test]
+    fn address_index_reverts_with_reorged_blocks() {
+        let bc = test_blockchain();
+        let mut old_block = metadata_test_block(5, [0u8; 32], "miner_old", 2.0);
+        old_block
+            .transactions
+            .push(user_tx("alice", "bob", 2.5, 5_000));
+        bc.record_confirmed_txs(&old_block).unwrap();
+        assert_eq!(
+            bc.address_history_summary("alice").unwrap().unwrap().tx_count,
+            1
+        );
+
+        // Reorg: the block is reverted and a competitor at the same height with a
+        // different payment becomes canonical (mirrors try_adopt_orphan_branch's
+        // remove-then-record sequence).
+        bc.remove_confirmed_txs(&old_block).unwrap();
+        let mut new_block = metadata_test_block(5, [1u8; 32], "miner_new", 2.0);
+        new_block
+            .transactions
+            .push(user_tx("dave", "erin", 4.0, 5_002));
+        bc.record_confirmed_txs(&new_block).unwrap();
+
+        assert_eq!(
+            bc.address_history_summary("alice").unwrap().unwrap().tx_count,
+            0,
+            "reverted payment must leave the sender's history"
+        );
+        assert_eq!(
+            bc.address_history_summary("miner_old")
+                .unwrap()
+                .unwrap()
+                .tx_count,
+            0,
+            "reverted coinbase must leave the old miner's history"
+        );
+        assert_eq!(
+            bc.address_history_summary("dave").unwrap().unwrap().tx_count,
+            1
+        );
+        assert_eq!(
+            bc.address_history_summary("miner_new")
+                .unwrap()
+                .unwrap()
+                .received_units,
+            Transaction::to_units(2.0)
+        );
+    }
+
+    #[test]
+    fn address_index_rebuild_ensure_catchup_and_rewrite_detection() {
+        let bc = test_blockchain();
+        let mut prev = [0u8; 32];
+        for height in 0..=4u32 {
+            let block = metadata_test_block(height, prev, &format!("miner{}", height), 1.0);
+            prev = block.hash;
+            insert_raw_block(&bc, &block);
+        }
+
+        // First build under the feature: full rebuild from stored blocks.
+        bc.rebuild_address_tx_index().unwrap();
+        assert!(bc.address_index_ready());
+        assert_eq!(
+            bc.address_history_summary("miner3").unwrap().unwrap().tx_count,
+            1
+        );
+
+        // A block committed while the index was offline (older binary) is picked
+        // up by the incremental catch-up path, not a full rebuild. Real commit
+        // paths maintain the tip metadata; raw test inserts must refresh it.
+        let late = metadata_test_block(5, prev, "miner5", 1.0);
+        insert_raw_block(&bc, &late);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_address_tx_index().unwrap();
+        assert_eq!(
+            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            1
+        );
+
+        // Ensure is idempotent: re-running must not duplicate entries.
+        bc.ensure_address_tx_index().unwrap();
+        assert_eq!(
+            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            1
+        );
+
+        // Chain rewritten at the indexed tip while the index was offline (hash at
+        // the meta height no longer matches) => full rebuild, stale entries gone.
+        let replacement = metadata_test_block(5, [9u8; 32], "usurper", 1.0);
+        insert_raw_block(&bc, &replacement);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_address_tx_index().unwrap();
+        assert_eq!(
+            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            0,
+            "entries from the rewritten block must not survive"
+        );
+        assert_eq!(
+            bc.address_history_summary("usurper").unwrap().unwrap().tx_count,
+            1
+        );
+    }
+
+    #[test]
+    fn address_recent_txs_orders_newest_first_and_honors_cutoff() {
+        let bc = test_blockchain();
+        for height in 1..=3u32 {
+            let mut block = metadata_test_block(height, [height as u8; 32], "miner", 1.0);
+            // metadata_test_block stamps timestamp 1_000 + height; the payment
+            // rides the same block timestamp for the cutoff check.
+            block.transactions.push(user_tx(
+                "alice",
+                "bob",
+                height as f64,
+                1_000 + height as u64,
+            ));
+            bc.record_confirmed_txs(&block).unwrap();
+        }
+
+        let newest_first = bc.address_recent_txs("alice", 10, None).unwrap();
+        assert_eq!(
+            newest_first.iter().map(|e| e.height).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+
+        let limited = bc.address_recent_txs("alice", 2, None).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].height, 3);
+
+        // A cutoff far past every entry (beyond the skew slack) returns nothing.
+        let cutoff = 1_000 + 3 + 2 * MAX_BLOCK_FUTURE_TIME + 1;
+        let recent = bc.address_recent_txs("alice", 10, Some(cutoff)).unwrap();
+        assert!(recent.is_empty());
     }
 }

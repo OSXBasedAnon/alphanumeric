@@ -601,20 +601,47 @@ impl WhisperModule {
         let now = Utc::now();
         let cutoff = now - Duration::days(days);
 
-        // Bounded, time-windowed scan to the cutoff instead of loading the whole
-        // decoded chain into RAM via get_blocks() (unbounded-allocation DoS).
         let cutoff_secs = cutoff.timestamp().max(0) as u64;
-        let blocks = Self::collect_blocks_since(blockchain, cutoff_secs);
-        for block in blocks {
-            for tx in &block.transactions {
-                if tx.sender == address || tx.recipient == address {
+        if blockchain.address_index_ready() {
+            // Read confirmed history straight off the address index: touches only
+            // this address's entries (no block decodes at all) and includes mining
+            // rewards. Capped to bound a pathological display; newest-first.
+            const HISTORY_SCAN_CAP: usize = 5_000;
+            if let Ok(confirmed) =
+                blockchain.address_recent_txs(address, HISTORY_SCAN_CAP, Some(cutoff_secs))
+            {
+                for entry in confirmed {
+                    let (from, to) = if entry.is_sender() && entry.is_recipient() {
+                        (address.to_string(), address.to_string())
+                    } else if entry.is_sender() {
+                        (address.to_string(), entry.counterparty)
+                    } else {
+                        (entry.counterparty, address.to_string())
+                    };
                     transactions.push(FeeInfo {
-                        fee: tx.fee(),
-                        amount: tx.amount(),
-                        from: tx.sender.clone(),
-                        to: tx.recipient.clone(),
-                        timestamp: tx.timestamp,
+                        fee: Transaction::from_units(entry.fee_units),
+                        amount: Transaction::from_units(entry.amount_units),
+                        from,
+                        to,
+                        timestamp: entry.timestamp,
                     });
+                }
+            }
+        } else {
+            // Index not built (first-run build failed) — fall back to the bounded,
+            // time-windowed block walk rather than showing nothing.
+            let blocks = Self::collect_blocks_since(blockchain, cutoff_secs);
+            for block in blocks {
+                for tx in &block.transactions {
+                    if tx.sender == address || tx.recipient == address {
+                        transactions.push(FeeInfo {
+                            fee: tx.fee(),
+                            amount: tx.amount(),
+                            from: tx.sender.clone(),
+                            to: tx.recipient.clone(),
+                            timestamp: tx.timestamp,
+                        });
+                    }
                 }
             }
         }

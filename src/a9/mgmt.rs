@@ -1026,21 +1026,13 @@ impl Mgmt {
                     }
                 }
 
-                // Get recent history stats
-                let mut tx_stats = (0, 0.0, 0.0, 0.0); // (count, sent, received, fees)
-                for block in blockchain_guard.get_blocks().iter().rev().take(2000) {
-                    for tx in &block.transactions {
-                        if tx.sender == addr {
-                            tx_stats.0 += 1;
-                            tx_stats.1 += tx.amount();
-                            tx_stats.3 += tx.fee();
-                        }
-                        if tx.recipient == addr {
-                            tx_stats.0 += 1;
-                            tx_stats.2 += tx.amount();
-                        }
-                    }
-                }
+                // Whole-chain history off the address index. The old code scanned
+                // only the newest 2000 blocks (a full decoded-chain load, twice),
+                // so any account whose activity predated that window showed a
+                // correct balance next to "Total Transactions: 0".
+                let history = blockchain_guard
+                    .address_history_summary(addr)
+                    .unwrap_or_default();
 
                 // Print account information with proper formatting
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(40, 204, 217))))?;
@@ -1095,23 +1087,42 @@ impl Mgmt {
 
                 // Transaction History Section
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
-                writeln!(stdout, "\n Transaction History (Recent)")?;
+                writeln!(stdout, "\n Transaction History")?;
                 stdout.reset()?;
                 println!("───────────────────");
-                println!("Total Transactions: {}", tx_stats.0);
-                println!("Volume Sent: {:.8}", tx_stats.1);
-                println!("Volume Received: {:.8}", tx_stats.2);
-                println!("Total Fees Paid: {:.8}", tx_stats.3);
+                match &history {
+                    Some(stats) => {
+                        println!("Total Transactions: {}", stats.tx_count);
+                        println!("Volume Sent: {:.8}", Transaction::from_units(stats.sent_units));
+                        println!(
+                            "Volume Received: {:.8}",
+                            Transaction::from_units(stats.received_units)
+                        );
+                        println!(
+                            "Total Fees Paid: {:.8}",
+                            Transaction::from_units(stats.fees_units)
+                        );
+                        if let (Some(first), Some(last)) = (stats.first_height, stats.last_height)
+                        {
+                            println!("First Activity: block {}", first);
+                            println!("Last Activity: block {}", last);
+                        }
+                    }
+                    None => {
+                        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                        writeln!(
+                            stdout,
+                            "History index unavailable — it builds at startup; restart the node if this persists."
+                        )?;
+                        stdout.reset()?;
+                    }
+                }
 
-                // Network Statistics Section
-                let blocks = blockchain_guard.get_blocks();
-                if !blocks.is_empty() {
-                    let total_supply: f64 = blocks
-                        .iter()
-                        .flat_map(|block| &block.transactions)
-                        .map(|tx| tx.amount())
-                        .sum();
-
+                // Network Statistics Section. Circulating supply = sum of positive
+                // confirmed balances; the old per-transaction sum double-counted
+                // every onward transfer and decoded the whole chain to do it.
+                if let Ok(total_supply_units) = blockchain_guard.total_confirmed_supply_units() {
+                    let total_supply = Transaction::from_units(total_supply_units);
                     if total_supply > 0.0 {
                         let network_share = (balance / total_supply) * 100.0;
                         stdout
