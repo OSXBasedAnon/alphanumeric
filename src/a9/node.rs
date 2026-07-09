@@ -2593,6 +2593,7 @@ impl Node {
         // always finishes inside the caller's round timeout. See the chunked-
         // adoption comment below.
         const CONVERGE_CHUNK: u32 = 128;
+        let entry_tip = self.blockchain.read().await.get_latest_block_index() as u32;
         for _ in 0..MAX_ROUNDS {
             let (tip, at_beacon) = {
                 let bc = self.blockchain.read().await;
@@ -2649,22 +2650,60 @@ impl Node {
                 if branch.is_empty() {
                     let _ = self.sync_with_block_relay(tip).await;
                 } else {
-                    match self
-                        .blockchain
-                        .write()
-                        .await
-                        .adopt_external_branch(branch)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            debug!(
-                                "Rejected forward branch toward {}@{}: {}",
-                                beacon.height,
-                                hex::encode(beacon.hash),
-                                e
+                    // Apply the walked bodies through the SAME per-block ingest the relay
+                    // stream uses (frontier sig gate -> save_receipt_verified_block ->
+                    // checkpoint trail). This path used to call adopt_external_branch,
+                    // which routes through try_adopt_orphan_branch — and that filter
+                    // DISCARDS every block above the current tip (`b.index > tip.index
+                    // -> continue`), so a pure forward APPEND always came back Ok(false),
+                    // the `Ok(_)` arm swallowed it, and the round reported Progressed
+                    // having applied NOTHING: the publisher pinned at 2800 re-walking the
+                    // same branch every tick while the site froze (2026-07-09). The
+                    // orphan machinery is for reorgs (branch roots at/below tip) and
+                    // still handles the divergent path below.
+                    for block in branch {
+                        let floor = self.blockchain.read().await.verification_floor();
+                        if block.index > floor
+                            && !self
+                                .blockchain
+                                .read()
+                                .await
+                                .block_signatures_fully_verified(&block)
+                        {
+                            warn!(
+                                "Rejected forward block {} (> floor {}): signatures not fully verifiable",
+                                block.index, floor
                             );
                             return Converge::BranchInvalid;
+                        }
+                        let saved = {
+                            let bc = self.blockchain.write().await;
+                            // String-ify immediately: BlockchainError is !Send and this
+                            // value is held across the checkpoint await below.
+                            bc.save_receipt_verified_block(&block)
+                                .await
+                                .map_err(|e| e.to_string())
+                        };
+                        match saved {
+                            Ok(()) => {
+                                if block.index > floor {
+                                    let _ = self
+                                        .blockchain
+                                        .read()
+                                        .await
+                                        .advance_checkpoint_behind(block.index);
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Rejected forward block {} toward {}@{}: {}",
+                                    block.index,
+                                    beacon.height,
+                                    hex::encode(beacon.hash),
+                                    e
+                                );
+                                return Converge::BranchInvalid;
+                            }
                         }
                     }
                 }
@@ -2772,14 +2811,26 @@ impl Node {
             }
         }
 
-        let synced = matches!(
-            self.blockchain.read().await.get_block(beacon.height),
-            Ok(b) if b.hash == beacon.hash
-        );
+        let (synced, final_tip) = {
+            let bc = self.blockchain.read().await;
+            (
+                matches!(bc.get_block(beacon.height), Ok(b) if b.hash == beacon.hash),
+                bc.get_latest_block_index() as u32,
+            )
+        };
         if synced {
             Converge::Converged
-        } else {
+        } else if final_tip > entry_tip {
             Converge::Progressed
+        } else {
+            // ZERO blocks were applied across every round. Reporting Progressed here
+            // let a broken apply path masquerade as success: the publisher's candidate
+            // iterator treats Progressed as a terminal win for the tick (it returns
+            // immediately, skipping other candidates AND the forward-drain fallback),
+            // so the same no-op "progress" repeated every tick forever — the frozen-
+            // at-2800 site stall. No progress = a stale/gapped view of this branch:
+            // report it as such so callers try other branches and fallbacks.
+            Converge::BeaconStale
         }
     }
 
