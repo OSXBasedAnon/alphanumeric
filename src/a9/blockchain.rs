@@ -2037,6 +2037,62 @@ impl Blockchain {
         Ok(entries)
     }
 
+    /// Cursor-paged confirmed history for one address, newest-first: entries
+    /// strictly BELOW the exclusive `(height, position)` cursor, `limit` at a
+    /// time. Page 1 = before None (from the newest); the caller passes the last
+    /// entry's (height, position) to fetch the next page. Bounded work per call
+    /// regardless of how much history the address has — built for the explorer
+    /// API, where an unpaged scan would be a free DoS.
+    pub fn address_txs_page(
+        &self,
+        address: &str,
+        limit: usize,
+        before: Option<(u32, u32)>,
+    ) -> Result<Vec<AddressTxEntry>, BlockchainError> {
+        let Some((before_height, before_position)) = before else {
+            return self.address_recent_txs(address, limit, None);
+        };
+        let tree = self.open_address_tx_tree()?;
+        let prefix = Self::address_tx_prefix(address);
+        // Keys in [prefix, cursor) all carry our exact prefix: addresses are
+        // ASCII so no other address's keys can sort into that window (the 0x00
+        // terminator is smaller than any address byte). The range end is
+        // exclusive, which is exactly the cursor semantic.
+        let cursor = Self::address_tx_key(address, before_height, before_position);
+        let mut entries = Vec::new();
+        for item in tree.range(prefix.clone()..cursor).rev() {
+            let (key, value) = item?;
+            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
+                continue;
+            };
+            entries.push(entry);
+            if entries.len() >= limit {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Confirmed balance in units straight off the balances tree — NO
+    /// ensure/rebuild side effects, unlike get_confirmed_balance. The explorer
+    /// API must never let an anonymous GET trigger index-rebuild writes; a
+    /// missing entry is simply 0.
+    pub fn confirmed_balance_units_readonly(&self, address: &str) -> Result<i128, BlockchainError> {
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        match balances_tree.get(address.as_bytes())? {
+            Some(raw) => Self::deserialize_units_compatible(&raw),
+            None => Ok(0),
+        }
+    }
+
+    /// (height, hash) the address index is built through, if it has ever built.
+    pub fn address_index_meta(&self) -> Option<(u32, [u8; 32])> {
+        self.open_chain_meta_tree()
+            .ok()
+            .and_then(|tree| tree.get(ADDRESS_TX_META_KEY).ok().flatten())
+            .and_then(|raw| codec::deserialize::<(u32, [u8; 32])>(&raw).ok())
+    }
+
     /// Sum of all positive confirmed balances — the actual circulating supply.
     /// Replaces the old "sum every transaction amount in every block" estimate,
     /// which double-counted transfers (a mined 50 sent onward counted as 100) and
@@ -6798,5 +6854,63 @@ mod tests {
         let cutoff = 1_000 + 3 + 2 * MAX_BLOCK_FUTURE_TIME + 1;
         let recent = bc.address_recent_txs("alice", 10, Some(cutoff)).unwrap();
         assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn address_txs_page_cursors_through_full_history() {
+        let bc = test_blockchain();
+        // 2 entries per height for alice (a payment out and one in) across 5 blocks.
+        for height in 1..=5u32 {
+            let mut block = metadata_test_block(height, [height as u8; 32], "miner", 1.0);
+            block
+                .transactions
+                .push(user_tx("alice", "bob", 1.0, 1_000 + height as u64));
+            block
+                .transactions
+                .push(user_tx("carol", "alice", 2.0, 1_000 + height as u64));
+            bc.record_confirmed_txs(&block).unwrap();
+        }
+
+        // Page through with limit 3 and reassemble; must equal the unpaged scan.
+        let mut paged = Vec::new();
+        let mut before = None;
+        loop {
+            let page = bc.address_txs_page("alice", 3, before).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().map(|e| (e.height, e.position));
+            let full_page = page.len() == 3;
+            paged.extend(page);
+            if !full_page {
+                break;
+            }
+        }
+        let unpaged = bc.address_recent_txs("alice", 100, None).unwrap();
+        assert_eq!(paged, unpaged);
+        assert_eq!(paged.len(), 10);
+        // Newest-first, cursor is exclusive: no duplicates, strictly descending.
+        for pair in paged.windows(2) {
+            assert!(
+                (pair[0].height, pair[0].position) > (pair[1].height, pair[1].position),
+                "pages must be strictly descending with no duplicates"
+            );
+        }
+        // A cursor below everything returns an empty page.
+        assert!(bc.address_txs_page("alice", 3, Some((1, 0))).unwrap().is_empty());
+        // Prefix addresses must not bleed into the page window.
+        assert!(bc.address_txs_page("ali", 10, Some((5, 2))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn readonly_balance_reads_without_rebuilding() {
+        let bc = test_blockchain();
+        // No balances tree entry -> 0, and crucially no index build side effects.
+        assert_eq!(bc.confirmed_balance_units_readonly("nobody").unwrap(), 0);
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&123_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.confirmed_balance_units_readonly("alice").unwrap(), 123);
     }
 }

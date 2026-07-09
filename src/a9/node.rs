@@ -1,5 +1,10 @@
 use arrayref::array_ref;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::{Path as AxumPath, Query, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use igd_next::{search_gateway, PortMappingProtocol};
@@ -969,6 +974,21 @@ struct StatsResponse {
     peers: usize,
     version: String,
     uptime_secs: u64,
+}
+
+/// State for the opt-in read-only explorer API (see start_explorer_server).
+#[derive(Clone)]
+struct ExplorerState {
+    blockchain: Arc<RwLock<Blockchain>>,
+    start_time: u64,
+    network_id: [u8; 32],
+}
+
+#[derive(Debug, Deserialize)]
+struct ExplorerAddressQuery {
+    limit: Option<usize>,
+    before_height: Option<u32>,
+    before_pos: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4392,6 +4412,350 @@ impl Node {
     }
 
     //----------------------------------------------------------------------
+    // Explorer API (opt-in, read-only)
+    //----------------------------------------------------------------------
+    //
+    // A localhost JSON surface for SELF-HOSTED explorers/integrations: run your
+    // own node, point your website at it. Design rules, in order:
+    //   1. OFF by default — unset env var means no task, no socket, zero cost.
+    //   2. Read-only — no handler may ever write (no ensure/rebuild side
+    //      effects), so anonymous GETs cannot amplify into DB work.
+    //   3. Bounded — every read is cursor-paged or single-block, and chain-lock
+    //      acquisition is time-boxed (503 "chain busy" instead of queueing
+    //      handlers behind a busy write lock).
+    //   4. Never held across await — lock guards live in sync scopes only.
+    // The node serves data, not a website: JSON only, loopback bind unless the
+    // operator explicitly chooses otherwise (their reverse proxy is the public
+    // face, handling TLS/caching/rate limits).
+
+    fn explorer_err(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
+        (status, Json(json!({ "error": message })))
+    }
+
+    fn explorer_busy() -> (StatusCode, Json<Value>) {
+        Self::explorer_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chain busy, retry shortly",
+        )
+    }
+
+    /// Addresses are hex strings (or the MINING_REWARDS literal); reject anything
+    /// else before it reaches a tree scan.
+    fn explorer_valid_address(address: &str) -> bool {
+        !address.is_empty()
+            && address.len() <= 128
+            && address
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn explorer_tx_json(tx: &Transaction, position: usize) -> Value {
+        json!({
+            "position": position,
+            "from": tx.sender,
+            "to": tx.recipient,
+            "coinbase": SYSTEM_ADDRESSES.contains(&tx.sender.as_str()),
+            "amount": Transaction::from_units(tx.amount_units),
+            "amount_units": tx.amount_units.to_string(),
+            "fee": Transaction::from_units(tx.fee_units),
+            "fee_units": tx.fee_units.to_string(),
+            "timestamp": tx.timestamp,
+        })
+    }
+
+    fn explorer_block_json(block: &Block, tip_height: u32) -> Value {
+        json!({
+            "height": block.index,
+            "hash": hex::encode(block.hash),
+            "previous_hash": hex::encode(block.previous_hash),
+            "merkle_root": hex::encode(block.merkle_root),
+            "timestamp": block.timestamp,
+            "difficulty": block.difficulty,
+            "nonce": block.nonce,
+            "confirmations": tip_height.saturating_sub(block.index) as u64 + 1,
+            "transaction_count": block.transactions.len(),
+            "transactions": block
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(position, tx)| Self::explorer_tx_json(tx, position))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn explorer_entry_json(entry: &crate::a9::blockchain::AddressTxEntry) -> Value {
+        let direction = match (entry.is_sender(), entry.is_recipient()) {
+            (true, true) => "self",
+            (true, false) => "out",
+            _ => "in",
+        };
+        json!({
+            "height": entry.height,
+            "position": entry.position,
+            "direction": direction,
+            "counterparty": entry.counterparty,
+            "amount": Transaction::from_units(entry.amount_units),
+            "amount_units": entry.amount_units.to_string(),
+            "fee": Transaction::from_units(entry.fee_units),
+            "fee_units": entry.fee_units.to_string(),
+            "timestamp": entry.timestamp,
+        })
+    }
+
+    async fn explorer_index_handler() -> Json<Value> {
+        Json(json!({
+            "service": "alphanumeric explorer api",
+            "endpoints": [
+                "/explorer/status",
+                "/explorer/tip",
+                "/explorer/block/{height}",
+                "/explorer/tx/{height}/{position}",
+                "/explorer/address/{address}?limit=&before_height=&before_pos=",
+                "/explorer/supply",
+            ],
+        }))
+    }
+
+    async fn explorer_status_handler(
+        State(state): State<ExplorerState>,
+    ) -> (StatusCode, Json<Value>) {
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let payload = {
+            let tip = chain.get_last_block();
+            let index_meta = chain.address_index_meta();
+            json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "network_id": hex::encode(state.network_id),
+                "height": tip.as_ref().map(|b| b.index),
+                "tip_hash": tip.as_ref().map(|b| hex::encode(b.hash)),
+                "index_height": index_meta.map(|(height, _)| height),
+                "index_ready": index_meta.is_some(),
+                "uptime_secs": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(state.start_time),
+            })
+        };
+        (StatusCode::OK, Json(payload))
+    }
+
+    async fn explorer_tip_handler(
+        State(state): State<ExplorerState>,
+    ) -> (StatusCode, Json<Value>) {
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        match chain.get_last_block() {
+            Some(block) => {
+                let tip_height = block.index;
+                (
+                    StatusCode::OK,
+                    Json(Self::explorer_block_json(&block, tip_height)),
+                )
+            }
+            None => Self::explorer_err(StatusCode::NOT_FOUND, "chain is empty"),
+        }
+    }
+
+    async fn explorer_block_handler(
+        State(state): State<ExplorerState>,
+        AxumPath(height): AxumPath<u32>,
+    ) -> (StatusCode, Json<Value>) {
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let tip_height = chain.get_latest_block_index() as u32;
+        match chain.get_block(height) {
+            Ok(block) => (
+                StatusCode::OK,
+                Json(Self::explorer_block_json(&block, tip_height)),
+            ),
+            Err(_) => Self::explorer_err(StatusCode::NOT_FOUND, "block not found"),
+        }
+    }
+
+    async fn explorer_tx_handler(
+        State(state): State<ExplorerState>,
+        AxumPath((height, position)): AxumPath<(u32, u32)>,
+    ) -> (StatusCode, Json<Value>) {
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let tip_height = chain.get_latest_block_index() as u32;
+        let Ok(block) = chain.get_block(height) else {
+            return Self::explorer_err(StatusCode::NOT_FOUND, "block not found");
+        };
+        let Some(tx) = block.transactions.get(position as usize) else {
+            return Self::explorer_err(StatusCode::NOT_FOUND, "transaction not found");
+        };
+        let mut payload = Self::explorer_tx_json(tx, position as usize);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("height".into(), json!(height));
+            object.insert("block_hash".into(), json!(hex::encode(block.hash)));
+            object.insert(
+                "confirmations".into(),
+                json!(tip_height.saturating_sub(height) as u64 + 1),
+            );
+        }
+        (StatusCode::OK, Json(payload))
+    }
+
+    async fn explorer_address_handler(
+        State(state): State<ExplorerState>,
+        AxumPath(address): AxumPath<String>,
+        Query(query): Query<ExplorerAddressQuery>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::explorer_valid_address(&address) {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "invalid address");
+        }
+        let limit = query.limit.unwrap_or(50).clamp(1, 200);
+        let before = match (query.before_height, query.before_pos) {
+            (Some(height), Some(position)) => Some((height, position)),
+            (None, None) => None,
+            _ => {
+                return Self::explorer_err(
+                    StatusCode::BAD_REQUEST,
+                    "before_height and before_pos must be passed together",
+                )
+            }
+        };
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let payload = {
+            let balance_units = chain.confirmed_balance_units_readonly(&address).unwrap_or(0);
+            let index_meta = chain.address_index_meta();
+            let summary = chain.address_history_summary(&address).unwrap_or(None);
+            let entries = chain.address_txs_page(&address, limit, before).unwrap_or_default();
+            let next = if entries.len() == limit {
+                entries.last().map(|entry| {
+                    json!({ "before_height": entry.height, "before_pos": entry.position })
+                })
+            } else {
+                None
+            };
+            json!({
+                "address": address,
+                "balance": Transaction::from_units(balance_units),
+                "balance_units": balance_units.to_string(),
+                "index_ready": index_meta.is_some(),
+                "index_height": index_meta.map(|(height, _)| height),
+                "summary": summary.map(|s| json!({
+                    "transactions": s.tx_count,
+                    "sent": Transaction::from_units(s.sent_units),
+                    "sent_units": s.sent_units.to_string(),
+                    "received": Transaction::from_units(s.received_units),
+                    "received_units": s.received_units.to_string(),
+                    "fees": Transaction::from_units(s.fees_units),
+                    "fees_units": s.fees_units.to_string(),
+                    "first_height": s.first_height,
+                    "last_height": s.last_height,
+                })),
+                "transactions": entries
+                    .iter()
+                    .map(Self::explorer_entry_json)
+                    .collect::<Vec<_>>(),
+                "next": next,
+            })
+        };
+        (StatusCode::OK, Json(payload))
+    }
+
+    async fn explorer_supply_handler(
+        State(state): State<ExplorerState>,
+    ) -> (StatusCode, Json<Value>) {
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let payload = {
+            let supply_units = chain.total_confirmed_supply_units().unwrap_or(0);
+            json!({
+                "height": chain.get_latest_block_index() as u32,
+                "supply": Transaction::from_units(supply_units),
+                "supply_units": supply_units.to_string(),
+            })
+        };
+        (StatusCode::OK, Json(payload))
+    }
+
+    /// Start the explorer API iff ALPHANUMERIC_EXPLORER_API is set. Accepts
+    /// `host:port` or a bare port (bound to 127.0.0.1). Loopback is the intended
+    /// deployment; binding wider is allowed but warned — the operator's reverse
+    /// proxy, not the node, should face the internet.
+    async fn start_explorer_server(&self) -> Result<(), NodeError> {
+        let Ok(raw) = std::env::var("ALPHANUMERIC_EXPLORER_API") else {
+            return Ok(());
+        };
+        let raw = raw.trim().to_string();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off") {
+            return Ok(());
+        }
+        let addr: SocketAddr = if let Ok(port) = raw.parse::<u16>() {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        } else {
+            raw.parse().map_err(|e| {
+                NodeError::Network(format!("ALPHANUMERIC_EXPLORER_API bind address: {}", e))
+            })?
+        };
+        if !addr.ip().is_loopback() {
+            warn!(
+                "Explorer API binding non-loopback {} — it serves unauthenticated chain data; keep it behind a reverse proxy",
+                addr
+            );
+        }
+
+        let state = ExplorerState {
+            blockchain: Arc::clone(&self.blockchain),
+            start_time: self.start_time,
+            network_id: self.network_id,
+        };
+
+        let app = Router::new()
+            .route("/", get(Self::explorer_index_handler))
+            .route("/explorer", get(Self::explorer_index_handler))
+            .route("/explorer/status", get(Self::explorer_status_handler))
+            .route("/explorer/tip", get(Self::explorer_tip_handler))
+            .route("/explorer/block/:height", get(Self::explorer_block_handler))
+            .route(
+                "/explorer/tx/:height/:position",
+                get(Self::explorer_tx_handler),
+            )
+            .route(
+                "/explorer/address/:address",
+                get(Self::explorer_address_handler),
+            )
+            .route("/explorer/supply", get(Self::explorer_supply_handler))
+            .with_state(state);
+
+        let listener = std::net::TcpListener::bind(addr).map_err(|e| {
+            NodeError::Network(format!("Explorer API failed to bind {}: {}", addr, e))
+        })?;
+        listener.set_nonblocking(true).map_err(|e| {
+            NodeError::Network(format!("Explorer API nonblocking listener: {}", e))
+        })?;
+
+        tokio::spawn(async move {
+            match axum::Server::from_tcp(listener) {
+                Ok(server) => {
+                    if let Err(e) = server.serve(app.into_make_service()).await {
+                        error!("Explorer API server error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Explorer API setup error: {}", e);
+                }
+            }
+        });
+
+        info!("Explorer API listening on {}", addr);
+        Ok(())
+    }
+
+    //----------------------------------------------------------------------
     // Network Discovery
     //----------------------------------------------------------------------
 
@@ -5442,6 +5806,14 @@ impl Node {
                     debug!("Stats server failed to start: {}", e);
                 }
             }
+        }
+
+        // Explorer API (opt-in): read-only JSON for self-hosted explorers and
+        // integrations. Zero cost when ALPHANUMERIC_EXPLORER_API is unset — no
+        // task, no socket. A failure here is loud (the operator asked for it)
+        // but never blocks the node from starting.
+        if let Err(e) = self.start_explorer_server().await {
+            warn!("Explorer API failed to start: {}", e);
         }
 
         // Keep libp2p swarm events flowing only when a swarm was initialized.
