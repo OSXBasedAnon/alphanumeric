@@ -357,10 +357,23 @@ fn verify_bootstrap_snapshot_tip(
         .max()
         .ok_or("Bootstrap snapshot does not contain block data")?;
 
+    // The downloaded zip is already SHA-256-bound to the signed manifest (checked
+    // before this runs), so its content is authentic canonical data no matter what.
+    // The manifest's DECLARED height/tip_hash, though, can legitimately differ from
+    // the blob's actual tip by a block or two: the publisher reads the height and
+    // exports the DB at slightly different instants, and the manifest we read for
+    // the reconcile decision may be one publish behind the blob we downloaded (the
+    // "expected 12832, got 12833" abort that stranded catching-up clients). So these
+    // checks tolerate a small skew — they still catch a truncated / wrong snapshot
+    // (a large discrepancy) while never rejecting authentic, slightly-fresher data.
+    const BOOTSTRAP_HEIGHT_SKEW: u64 = 16;
     if let Some(expected_height) = expected_height {
-        if u64::from(tip_index) != expected_height {
+        let th = u64::from(tip_index);
+        let below = expected_height.saturating_sub(th);
+        let above = th.saturating_sub(expected_height);
+        if below > BOOTSTRAP_HEIGHT_SKEW || above > BOOTSTRAP_HEIGHT_SKEW {
             return Err(format!(
-                "Bootstrap snapshot height mismatch: expected {}, got {}",
+                "Bootstrap snapshot height mismatch beyond tolerance: expected ~{}, got {}",
                 expected_height, tip_index
             )
             .into());
@@ -376,16 +389,22 @@ fn verify_bootstrap_snapshot_tip(
         return Err("Bootstrap snapshot tip block hash is invalid".into());
     }
 
-    if let Some(expected_tip_hash) = expected_tip_hash {
-        let expected_tip_hash = expected_tip_hash.trim().to_ascii_lowercase();
-        if !expected_tip_hash.is_empty() {
-            let actual = hex::encode(block.hash);
-            if actual != expected_tip_hash {
-                return Err(format!(
-                    "Bootstrap snapshot tip mismatch: expected {}, got {}",
-                    expected_tip_hash, actual
-                )
-                .into());
+    // Only bind against the manifest tip hash when the heights match exactly; a
+    // fresher snapshot has a different (newer) tip whose hash can't equal the
+    // manifest's declared one — its own hash integrity (checked above) plus the
+    // SHA-256 manifest binding are the authenticity guarantees there.
+    if let (Some(expected_tip_hash), Some(expected_height)) = (expected_tip_hash, expected_height) {
+        if u64::from(tip_index) == expected_height {
+            let expected_tip_hash = expected_tip_hash.trim().to_ascii_lowercase();
+            if !expected_tip_hash.is_empty() {
+                let actual = hex::encode(block.hash);
+                if actual != expected_tip_hash {
+                    return Err(format!(
+                        "Bootstrap snapshot tip mismatch: expected {}, got {}",
+                        expected_tip_hash, actual
+                    )
+                    .into());
+                }
             }
         }
     }
