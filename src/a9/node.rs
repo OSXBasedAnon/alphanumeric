@@ -2245,8 +2245,14 @@ impl Node {
         let tip_now = { self.blockchain.read().await.get_latest_block_index() as u64 };
         let last_h = self.last_header_snapshot_height.load(Ordering::Acquire);
         let last_at = self.last_header_snapshot_at.load(Ordering::Acquire);
+        // Burst floor 7s: the gateway allows 10 header POSTs/min per IP, so the
+        // floor must keep worst-case bursts under that (60/7 ≈ 8.5/min). At 5s it
+        // permitted 12/min and every overflow post 429'd — and worse, the failed
+        // posts still advanced the height marker (stored pre-POST at the time), so
+        // the trigger skipped ahead without the snapshot ever landing and VERIFIED
+        // drifted 38+ behind during the very bursts this exists to cover.
         let delta_due =
-            tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 5;
+            tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 7;
         if delta_due {
             self.last_header_snapshot_at.store(now, Ordering::Release);
         } else if !Self::should_publish_now(
@@ -2261,8 +2267,6 @@ impl Node {
             return Ok(());
         };
         let height = last_block.index;
-        self.last_header_snapshot_height
-            .store(height as u64, Ordering::Release);
         let difficulty = last_block.difficulty;
 
         // Widened to 64 so a client resolving a fork can always walk back to the
@@ -2351,7 +2355,14 @@ impl Node {
 
         if !any_ok {
             warn!("Header snapshot post failed on all endpoints");
+            return Ok(());
         }
+        // Mark the posted height ONLY on success: a rejected post (429 during a
+        // burst, transient network error) must leave the delta trigger armed so the
+        // next window retries, instead of "skipping ahead" past a snapshot that
+        // never landed.
+        self.last_header_snapshot_height
+            .store(height as u64, Ordering::Release);
 
         Ok(())
     }
