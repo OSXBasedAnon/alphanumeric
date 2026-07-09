@@ -63,6 +63,13 @@ use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, 
 
 // Network parameters
 pub const DEFAULT_PORT: u16 = 7177;
+/// Marker error for a relay block POST rejected by the gateway's per-IP rate limit.
+/// Callers match on this to BACK OFF instead of backfilling (which amplifies the storm).
+const RELAY_POST_RATE_LIMITED: &str = "Block relay post rate-limited";
+/// Single-flight latch for the detached post-mine relay backfill (process-wide: one
+/// node per process in practice). Overlapping runs re-post the same recent window and
+/// only burn POST budget — the newest run supersedes the older one's purpose.
+static RELAY_BACKFILL_INFLIGHT: AtomicBool = AtomicBool::new(false);
 const MIN_PEERS: usize = 3;
 const MAX_PEERS_PER_SUBNET: usize = 3;
 // Max span a single GetBlocks request may ask for (and the client's batch size, kept in
@@ -3447,12 +3454,16 @@ impl Node {
         }
 
         let mut any_ok = false;
+        let mut rate_limited = false;
         for url in Self::discovery_blocks_urls() {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
                 Ok(res) if res.status().is_success() => any_ok = true,
                 Ok(res) => {
                     let status = res.status();
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        rate_limited = true;
+                    }
                     let body = res.text().await.unwrap_or_default();
                     warn!(
                         "Block relay post failed: {} {}",
@@ -3466,6 +3477,14 @@ impl Node {
 
         if !any_ok {
             warn!("Block relay post failed on all endpoints");
+            // Distinguish rate-limiting so callers can BACK OFF instead of amplifying:
+            // the old uniform error made publish_block answer every failed POST with a
+            // 32-block backfill — under a 429 that backfill is 32 MORE posts into the
+            // same closed window, which is how one burst snowballed into 2,409 failed
+            // posts during the 2026-07-08 recovery storms.
+            if rate_limited {
+                return Err(NodeError::Network(RELAY_POST_RATE_LIMITED.into()));
+            }
             return Err(NodeError::Network(
                 "Block relay post failed on all endpoints".into(),
             ));
@@ -3498,8 +3517,24 @@ impl Node {
 
         for block in blocks {
             if let Err(e) = self.post_block_relay(&block).await {
+                // A rate-limited POST means the per-IP window is CLOSED: every further
+                // post in this run is guaranteed fuel on the fire (this loop runs after
+                // EVERY mined block at backfill=32, and at startup with deep-heal depths
+                // of 512-1024 — the 2,409-failure storms of 2026-07-08). Abort the run;
+                // the next mined block / heal tick retries against a fresh window.
+                if e.to_string().contains(RELAY_POST_RATE_LIMITED) {
+                    warn!(
+                        "Relay backfill rate-limited at #{}; aborting this backfill run",
+                        block.index
+                    );
+                    return;
+                }
                 debug!("Recent block relay failed for #{}: {}", block.index, e);
             }
+            // Pace the burst: ~10 posts/s keeps even a 1024-deep heal well under the
+            // gateway's per-IP POST budget, leaving headroom for the fresh mined-block
+            // posts that actually advance the network.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -4082,9 +4117,19 @@ impl Node {
         // which they would otherwise mine a competing fork.
         if let Err(e) = self.post_block_relay(&block).await {
             warn!("{} block relay failed: {}", context, e);
-        } else {
-            self.post_recent_blocks_to_relay(Self::relay_backfill_limit())
-                .await;
+        } else if !RELAY_BACKFILL_INFLIGHT.swap(true, Ordering::SeqCst) {
+            // DETACHED + SINGLE-FLIGHT: the backfill is a best-effort gap heal, and it
+            // is now paced (~10 posts/s inside post_recent_blocks_to_relay) — awaited
+            // here it would add ~3s to every mined block's publish path, and one run
+            // per mined block at 32 posts each was the biggest contributor to the
+            // per-IP POST budget (the 2026-07-08 429 storms). The fresh block above
+            // already posted; the recent-window re-post can trail behind.
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.post_recent_blocks_to_relay(Node::relay_backfill_limit())
+                    .await;
+                RELAY_BACKFILL_INFLIGHT.store(false, Ordering::SeqCst);
+            });
         }
 
         // Best-effort direct p2p broadcast (usually a no-op across NAT), done AFTER the

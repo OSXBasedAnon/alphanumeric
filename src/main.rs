@@ -4110,7 +4110,17 @@ async fn publish_bootstrap_snapshot(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let zip_path = tmp.join(format!("alphanumeric-bootstrap-{}.zip", height));
+    // UNIQUE per attempt (timestamp + pid): this used to be keyed on height alone,
+    // so two publisher processes racing the same height (watchdog respawn overlap,
+    // manual-vs-launchd) shared ONE temp file — writer B truncating/rewriting it
+    // under reader A is the standing suspect for the h2727 manifest whose sha/size
+    // didn't match the blob its own url served (2026-07-09 audit finding).
+    let zip_path = tmp.join(format!(
+        "alphanumeric-bootstrap-{}-{}-{}.zip",
+        height,
+        now_secs,
+        std::process::id()
+    ));
     let zip_path_string = zip_path.to_string_lossy().to_string();
     let export_dir = tmp.join(format!(
         "alphanumeric-bootstrap-export-{}-{}",
@@ -4462,6 +4472,50 @@ async fn publish_bootstrap_snapshot(
             return Err(format!("bootstrap pointer update failed: {}", status).into());
         }
         return Err(format!("bootstrap pointer update failed: {}: {}", status, body).into());
+    }
+
+    // READ-BACK SELF-CONSISTENCY CHECK (2026-07-09). Whatever manifest the gateway
+    // now serves, the blob its `url` points at must actually serve `compressed_bytes`
+    // bytes — the one invariant every bootstrapping node depends on before sha
+    // verification even runs. The audit caught a live manifest violating it (fresh
+    // nodes failed verification until the next publish happened to overwrite it).
+    // FAIL-OPEN on any transient error (a Blob/CDN hiccup must never fail a good
+    // publish — a frozen manifest is its own past incident); fail ONLY on a
+    // confirmed byte-count mismatch, which returns Err WITHOUT writing the publish
+    // meta so the publish loop re-publishes (and overwrites the bad manifest) on
+    // its next cycle instead of sleeping through the full cadence.
+    let manifest_url = pointer_url.replace("/api/bootstrap/pointer", "/api/bootstrap/manifest");
+    let readback: Option<(String, u64, u64)> = async {
+        let resp = client.get(&manifest_url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        let m = v.get("manifest")?;
+        let url = m.get("url")?.as_str()?.to_string();
+        let claimed = m.get("compressed_bytes")?.as_u64()?;
+        let head = client.head(&url).send().await.ok()?;
+        if !head.status().is_success() {
+            return None;
+        }
+        let served = head
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        Some((url, claimed, served))
+    }
+    .await;
+    if let Some((url, claimed, served)) = readback {
+        if claimed != served {
+            return Err(format!(
+                "bootstrap manifest readback INCONSISTENT: manifest claims {} bytes but its blob {} serves {}; retrying publish next cycle to overwrite it",
+                claimed, url, served
+            )
+            .into());
+        }
     }
 
     let _ = write_bootstrap_publish_meta(db, updated_at, height, network_id_hex);
