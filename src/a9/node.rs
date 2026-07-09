@@ -2913,9 +2913,18 @@ impl Node {
                 let Some(&(h, prev)) = wire_by_hash.get(&cursor) else {
                     return false;
                 };
-                if let Some(&(when, hard)) = dead.peek(&(h, cursor)) {
-                    // Only HARD (validation-failure) deadness propagates.
-                    if hard && when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS) {
+                if let Some(&(when, lineage_dead)) = dead.peek(&(h, cursor)) {
+                    // LINEAGE deadness propagates: BranchInvalid (fails validation) and
+                    // NeedsBootstrap (fork point below the finality window) are properties
+                    // of the whole branch — every child shares the ancestor/validity — so
+                    // a stranded old-version miner minting a fresh tip every few seconds
+                    // costs ONE lookup here instead of a full multi-window ancestry walk.
+                    // Without NeedsBootstrap propagation those walks burned the entire
+                    // candidate budget every tick and the beacon froze for minutes while
+                    // OUR OWN lineage's fresh tips waited in line (2026-07-09 stall).
+                    // Transient gap verdicts (BeaconStale) stay non-propagating.
+                    if lineage_dead && when.elapsed() < Duration::from_secs(DEAD_TARGET_RETRY_SECS)
+                    {
                         return true;
                     }
                 }
@@ -2965,11 +2974,64 @@ impl Node {
             }
         }
 
+        // OWN-LINEAGE EXTENSION FIRST. The height-presence hint above LIES under
+        // multi-lineage forks: a stranded miner cohort fills EVERY height of the scan
+        // window with its own (unadoptable) blocks, so `first_gap` is never found and
+        // the hint crowns THEIR far-ahead tip — while the block that actually extends
+        // the canonical chain (a live miner's fresh POST that chains onto our tip)
+        // waits behind 8 doomed candidates and the beacon freezes (2026-07-09 stall).
+        // Walk the child links FROM OUR OWN TIP HASH through the fetched window; the
+        // deepest descendants of the block we hold are the one set of candidates that
+        // can extend the beacon without any reorg at all, so they are tried first.
+        // Pure prioritization: same validated converge path decides, and a heavier
+        // adoptable fork still wins the engine's work-choice when its turn comes.
+        if let Some(local_hash) = local_hash {
+            let mut children: HashMap<[u8; 32], Vec<(u32, [u8; 32])>> = HashMap::new();
+            for b in &blocks {
+                children
+                    .entry(b.previous_hash)
+                    .or_default()
+                    .push((b.index, b.hash));
+            }
+            let mut frontier = vec![local_hash];
+            let mut deepest: Vec<(u32, [u8; 32])> = Vec::new();
+            for _ in 0..512 {
+                let mut next = Vec::new();
+                for h in &frontier {
+                    if let Some(kids) = children.get(h) {
+                        for &(kh, khash) in kids {
+                            next.push((kh, khash));
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                deepest = next.clone();
+                frontier = next.into_iter().map(|(_, h)| h).collect();
+            }
+            deepest.sort_by(|a, b| a.1.cmp(&b.1));
+            for key in deepest.into_iter().rev() {
+                candidates.retain(|c| *c != key);
+                candidates.insert(0, key);
+            }
+        }
+
         let mut last = Converge::BeaconStale;
         let mut tried = 0usize;
         let mut all_needs_bootstrap = true;
+        // Hard wall-clock budget for the WHOLE candidate pass. A single candidate's
+        // converge can fan out into many relay window walks; before this bound, a
+        // handful of deep foreign lineages made one "1s tick" take minutes — which WAS
+        // the site's LAST-BLOCK-6m-ago stall, no lock wedge required. Cancelling is
+        // state-safe (branch adoption is atomic; partial walk state is re-derived) and
+        // the forward-drain fallback below still runs, so a budget hit degrades into
+        // "advance what chains, try the rest next tick" instead of a frozen beacon.
+        const CANDIDATE_PASS_BUDGET: Duration = Duration::from_secs(20);
+        const PER_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(12);
+        let pass_start = Instant::now();
         for (height, hash) in candidates {
-            if tried >= MAX_TIP_CANDIDATES {
+            if tried >= MAX_TIP_CANDIDATES || pass_start.elapsed() >= CANDIDATE_PASS_BUDGET {
                 break;
             }
             if height == local_tip && Some(hash) == local_hash {
@@ -2997,7 +3059,16 @@ impl Node {
                 hash,
                 version: 0,
             };
-            match self.converge_to_canonical(&target).await {
+            let outcome = match timeout(PER_CANDIDATE_TIMEOUT, self.converge_to_canonical(&target))
+                .await
+            {
+                Ok(outcome) => outcome,
+                // Ran out its slice (deep walk / slow relay): treat as a transient gap.
+                // Soft-memoized below so the next tick tries a DIFFERENT branch first
+                // instead of re-sinking the budget into the same slow walk.
+                Err(_) => Converge::BeaconStale,
+            };
+            match outcome {
                 done @ (Converge::Converged | Converge::AtTipAhead | Converge::Progressed) => {
                     return done;
                 }
@@ -3007,10 +3078,16 @@ impl Node {
                     if !matches!(failed, Converge::NeedsBootstrap) {
                         all_needs_bootstrap = false;
                     }
-                    let hard = matches!(failed, Converge::BranchInvalid);
+                    // Lineage-dead (propagates to children via ancestry_dead): a branch
+                    // that fails validation OR whose fork point is below the finality
+                    // window damns every future tip minted on it. Gap verdicts stay soft.
+                    let lineage_dead = matches!(
+                        failed,
+                        Converge::BranchInvalid | Converge::NeedsBootstrap
+                    );
                     self.relay_dead_targets
                         .lock()
-                        .put((height, hash), (Instant::now(), hard));
+                        .put((height, hash), (Instant::now(), lineage_dead));
                     debug!(
                         "Relay tip candidate {}@{} unconvergeable ({:?}); trying next branch",
                         height,
@@ -3032,7 +3109,12 @@ impl Node {
         // the relay head at 2434 over a hole at 2246). sync_with_block_relay applies
         // strictly-chaining blocks from local_tip forward and stops at the first gap;
         // it re-runs every tick, so as the hole is later backfilled the drain resumes.
-        if tried > 0 && !matches!(last, Converge::Converged | Converge::AtTipAhead) {
+        // Runs even when tried == 0: once the dead-target memo has absorbed every
+        // foreign tip, a tick can skip ALL candidates — but a fresh block that chains
+        // onto our tip must still be applied or the beacon freezes with a warm memo
+        // (the drain is cheap: one windowed fetch, applies only strictly-chaining
+        // blocks, stops at the first gap).
+        if !matches!(last, Converge::Converged | Converge::AtTipAhead) {
             let before = {
                 let bc = self.blockchain.read().await;
                 bc.get_latest_block_index() as u32
@@ -7359,33 +7441,7 @@ impl Node {
                         blockchain.add_transaction(tx.clone()).await?;
                     }
 
-                    #[cfg(feature = "webrtc_mesh")]
-                    self.mesh_gossip(&NetworkMessage::Transaction(tx.clone())).await;
-
-                    // Broadcast to subset of peers. SNAPSHOT-THEN-DROP before sending:
-                    // this held the peers READ guard across per-peer TCP sends — one
-                    // stalled socket parked the guard indefinitely and (fair RwLock)
-                    // wedged every later peers-lock user. The SECOND wedge of
-                    // 2026-07-08, caught live by the lock watchdog (peers_ok=false)
-                    // on a client that had just gossiped transactions.
-                    let selected_peers = {
-                        let peers = self.peers.read().await;
-                        self.select_broadcast_peers(&peers, peers.len().min(8))
-                    };
-                    for &addr in &selected_peers {
-                        match tokio::time::timeout(
-                            Duration::from_secs(5),
-                            self.send_message(addr, &NetworkMessage::Transaction(tx.clone())),
-                        )
-                        .await
-                        {
-                            Ok(Err(e)) => {
-                                warn!("Failed to broadcast transaction to {}: {}", addr, e)
-                            }
-                            Err(_) => warn!("Transaction broadcast to {} timed out", addr),
-                            Ok(Ok(())) => {}
-                        }
-                    }
+                    self.gossip_transaction(&tx).await;
                 }
             }
 
@@ -8358,6 +8414,47 @@ impl Node {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Announce a transaction to the network: mesh DataChannel flood + a bounded TCP
+    /// broadcast to a subset of direct peers. This is the ONLY tx propagation there is —
+    /// the gateway relay carries blocks, not transactions — and until v7.6.8 the CLI
+    /// `create`/`send` path never called it: a locally-created tx sat in the sender's own
+    /// mempool, invisible to every other miner, so in practice only the sender could ever
+    /// confirm it. Now both the network ingest path (NewTransaction event) and the local
+    /// create path announce through here.
+    ///
+    /// The bloom insert makes this idempotent AND absorbs our own echo: a peer that
+    /// gossips the tx back to us is dropped at the NewTransaction dedup gate instead of
+    /// erroring on a duplicate mempool add. Sends are time-boxed and the peers guard is
+    /// snapshot-then-drop (never held across an await — the 2026-07-08/09 wedge class).
+    pub async fn gossip_transaction(&self, tx_ref: &Transaction) {
+        if let Ok(tx_bytes) = codec::serialize(tx_ref) {
+            let _ = self.network_bloom.insert(&tx_bytes);
+        }
+
+        #[cfg(feature = "webrtc_mesh")]
+        self.mesh_gossip(&NetworkMessage::Transaction(tx_ref.clone()))
+            .await;
+
+        let selected_peers = {
+            let peers = self.peers.read().await;
+            self.select_broadcast_peers(&peers, peers.len().min(8))
+        };
+        for &addr in &selected_peers {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.send_message(addr, &NetworkMessage::Transaction(tx_ref.clone())),
+            )
+            .await
+            {
+                Ok(Err(e)) => {
+                    warn!("Failed to broadcast transaction to {}: {}", addr, e)
+                }
+                Err(_) => warn!("Transaction broadcast to {} timed out", addr),
+                Ok(Ok(())) => {}
+            }
         }
     }
 

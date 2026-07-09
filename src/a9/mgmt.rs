@@ -741,13 +741,16 @@ impl Mgmt {
         }
     }
 
+    /// Create, sign, and submit a transaction to the LOCAL mempool. On success returns
+    /// the submitted transaction so the caller can announce it to the network
+    /// (`Node::gossip_transaction`) — submission alone reaches no other miner.
     pub async fn handle_create_transaction(
         &self,
         command: &str,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Db>>,
-    ) -> Result<()> {
+    ) -> Result<Transaction> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
         // Parse command
@@ -927,7 +930,7 @@ impl Mgmt {
         // (get_wallet_balance), causing a self-deadlock right after "Done".
         let submit_result = {
             let chain = blockchain.write().await;
-            chain.add_transaction(transaction).await
+            chain.add_transaction(transaction.clone()).await
         };
         match submit_result {
             Ok(_) => {
@@ -956,7 +959,7 @@ impl Mgmt {
                 writeln!(stdout, "  Fee:      {}", fee)?;
                 writeln!(stdout, "  Balance:  {}\n", new_sender_balance)?;
 
-                Ok(())
+                Ok(transaction)
             }
             Err(e) => {
                 writeln!(stdout)?;

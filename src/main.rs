@@ -1326,12 +1326,21 @@ async fn main() -> Result<()> {
             match command.split_whitespace().next() {
                 Some("create") | Some("send") | Some("transfer") => {
                     // Handle the creation of the transaction
-                    if let Err(e) = mgmt
+                    match mgmt
                         .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
                         .await
                     {
-                        println!("Error: {}", e);
-                        println!("Failed to create transaction: {}", e);
+                        Ok(tx) => {
+                            // Announce it: submission only reaches the LOCAL mempool, and
+                            // the gateway relay carries blocks, not transactions — without
+                            // this gossip no other miner ever hears about the tx and only
+                            // the sender could confirm it (pre-v7.6.8 behavior).
+                            node.gossip_transaction(&tx).await;
+                        }
+                        Err(e) => {
+                            println!("Error: {}", e);
+                            println!("Failed to create transaction: {}", e);
+                        }
                     }
                 }
                 Some("info") => {
@@ -2137,10 +2146,19 @@ match whisper.create_whisper_transaction(
 Ok(whisper_tx) => {
     // Drop blockchain guard before getting write lock
     drop(blockchain_guard);
-    let blockchain_guard = blockchain.write().await;
-    // No wallet registry needed - transactions are self-contained with public keys
-    match blockchain_guard.add_transaction(whisper_tx.clone()).await {
+    // Scope the WRITE guard to the submit itself: the success arm below does console
+    // IO and (since v7.6.8) network gossip, and holding a chain write guard across
+    // awaits is the known wedge class.
+    let submit_res = {
+        let blockchain_guard = blockchain.write().await;
+        // No wallet registry needed - transactions are self-contained with public keys
+        blockchain_guard.add_transaction(whisper_tx.clone()).await
+    };
+    match submit_res {
         Ok(_) => {
+// Announce like any other tx: whispers ride the same mempool/gossip path, and
+// without this only the sender could ever mine the whisper into a block.
+node.gossip_transaction(&whisper_tx).await;
 let mut stdout = StandardStream::stdout(ColorChoice::Always);
 let mut style = ColorSpec::new();
 
@@ -2378,7 +2396,7 @@ Some(_) => {
                         && parts[2].parse::<f64>().map(|a| a > 0.0).unwrap_or(false)
                     {
                         let synthesized = format!("create {} {} {}", parts[0], parts[1], parts[2]);
-                        if let Err(e) = mgmt
+                        match mgmt
                             .handle_create_transaction(
                                 &synthesized,
                                 &mut wallets,
@@ -2387,8 +2405,14 @@ Some(_) => {
                             )
                             .await
                         {
-                            println!("Error: {}", e);
-                            println!("Failed to create transaction: {}", e);
+                            Ok(tx) => {
+                                // Same as the explicit create arm: announce or nobody mines it.
+                                node.gossip_transaction(&tx).await;
+                            }
+                            Err(e) => {
+                                println!("Error: {}", e);
+                                println!("Failed to create transaction: {}", e);
+                            }
                         }
                     } else {
                         println!("Invalid command. Type 'help' for command list or 'info' for blockchain details.");
