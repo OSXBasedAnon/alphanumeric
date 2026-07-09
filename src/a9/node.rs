@@ -9219,12 +9219,15 @@ impl Node {
             blockchain.get_latest_block_index() as u32
         };
 
-        // 2. Check peer count and discover if needed
-        let peers = self.peers.read().await;
-        let peer_count = peers.len();
+        // 2. Check peer count and discover if needed. Scope the read guard to the
+        // count itself: binding it to a named `peers` and re-binding later SHADOWED
+        // the first guard instead of dropping it, so on the peer_count > 0 path it
+        // stayed held across every network await below (query_peer_heights fan-out,
+        // the whole batch sync) — a fair-RwLock writer queued behind it parked every
+        // later reader and wedged the node (watchdog peers_ok=false, 2026-07-09).
+        let peer_count = self.peers.read().await.len();
 
         if peer_count == 0 {
-            drop(peers); // Release lock before discovery
             info!("No peers available, discovering network nodes");
             if let Err(connect_err) = self.connect_discovery_peers(8).await {
                 debug!("Fast discovery peer connect deferred: {}", connect_err);
