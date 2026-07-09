@@ -1461,6 +1461,38 @@ impl Blockchain {
     }
 
     /// The canonical height at which `tx_id` was confirmed, or None if unseen.
+    /// True if this transaction is already confirmed in a canonical block. Public
+    /// wrapper over the replay registry for mempool-hygiene callers (template
+    /// building, tx re-announce) — consensus paths keep using the index directly.
+    pub fn is_tx_confirmed(&self, tx_id: &str) -> bool {
+        self.confirmed_tx_index(tx_id).is_some()
+    }
+
+    /// Remove every mempool transaction that is already confirmed on the canonical
+    /// chain. Confirmed txs can re-enter the mempool through gossip echoes or reorg
+    /// reconciliation; any block template built while one is present fails
+    /// finalization via the replay guard AFTER the full nonce grind — a wasted solve
+    /// per attempt (the 2026-07-09 mining-failure loop). Returns how many were
+    /// dropped. Cheap: one registry read per pending tx, and mempools are tiny.
+    pub async fn drop_confirmed_mempool_txs(&self) -> usize {
+        let pending = {
+            let mempool = self.mempool.read().await;
+            mempool.get_all_transactions()
+        };
+        let stale: Vec<Transaction> = pending
+            .into_iter()
+            .filter(|tx| self.confirmed_tx_index(&tx.get_tx_id()).is_some())
+            .collect();
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut mempool = self.mempool.write().await;
+        for tx in &stale {
+            mempool.clear_transaction(tx);
+        }
+        stale.len()
+    }
+
     fn confirmed_tx_index(&self, tx_id: &str) -> Option<u32> {
         let raw = self
             .open_confirmed_tx_tree()
@@ -3834,6 +3866,19 @@ impl Blockchain {
 
     pub async fn add_transaction(&self, transaction: Transaction) -> Result<(), BlockchainError> {
         if transaction.sender == "MINING_REWARDS" {
+            return Err(BlockchainError::InvalidTransaction);
+        }
+
+        // ALREADY-CONFIRMED gate (one cheap registry read): a tx that is already in
+        // a canonical block must never re-enter the mempool. Without this, a
+        // confirmed tx bounces back in (peer gossip echo, the periodic re-announce,
+        // reorg mempool reconciliation) and poisons every block template built from
+        // this mempool — the miner grinds the full nonce window and finalize rejects
+        // the block via the replay guard, repeatedly, while miners without the stale
+        // tx win every height (the 2026-07-09 "Transaction is invalid" mining loop).
+        // Rejecting at admission kills the loop at every entry point at once, since
+        // all of them funnel through here.
+        if self.confirmed_tx_index(&transaction.get_tx_id()).is_some() {
             return Err(BlockchainError::InvalidTransaction);
         }
 

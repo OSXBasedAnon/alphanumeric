@@ -5772,6 +5772,12 @@ impl Node {
                 regossip_interval.tick().await;
                 let pending = {
                     let bc = regossip_node.blockchain.read().await;
+                    // Never re-announce a tx that already confirmed: re-gossiping one
+                    // refills every peer's mempool with a replay-guard poison pill
+                    // (each peer then wastes a full solve per mined block until their
+                    // mempool cleans up). Evict instead — this loop is exactly where
+                    // stale entries would otherwise get a megaphone.
+                    let _ = bc.drop_confirmed_mempool_txs().await;
                     bc.get_pending_transactions().await.unwrap_or_default()
                 };
                 // Small cap: the mempool is tiny on this network, and a pathological

@@ -631,11 +631,20 @@ impl Mgmt {
 
             // Get mempool transactions (full signatures only)
             prep_bar.set_message("Selecting pending transactions...");
+            // Drop already-confirmed txs FIRST: one poisoned mempool entry makes the
+            // finalize replay guard reject the block AFTER the full nonce grind —
+            // a wasted solve per attempt until the mempool is cleaned (the
+            // 2026-07-09 "Transaction is invalid" mining loop that also tripped the
+            // 5-error stop). The per-tx filter below is the belt to this suspender.
+            let _ = blockchain_guard.drop_confirmed_mempool_txs().await;
             let mempool_transactions = blockchain_guard.get_mempool_transactions().await?;
             let regular_transactions: Vec<Transaction> = mempool_transactions
                 .into_iter()
                 .filter(|tx| {
                     if tx.sender == "MINING_REWARDS" {
+                        return false;
+                    }
+                    if blockchain_guard.is_tx_confirmed(&tx.get_tx_id()) {
                         return false;
                     }
                     if !tx.has_valid_regular_amounts() {
