@@ -1483,14 +1483,37 @@ impl Blockchain {
             .into_iter()
             .filter(|tx| self.confirmed_tx_index(&tx.get_tx_id()).is_some())
             .collect();
-        if stale.is_empty() {
+        // ALSO sweep the persisted pending tree: `info`, the re-announce, and
+        // sync_mempool_with_sled (which REBUILDS the in-memory mempool from sled)
+        // all read the tree, so clearing memory alone lets the very next sync
+        // re-poison it — the "mempool still shows 1 pending after a clean mine"
+        // symptom. The tree can also hold confirmed txs the in-memory set never
+        // saw (written by an older binary), so sweep it independently.
+        let mut tree_stale: Vec<Transaction> = Vec::new();
+        if let Ok(pending_tree) = self.db.open_tree(PENDING_TRANSACTIONS_TREE) {
+            for entry in pending_tree.iter().flatten() {
+                if let Ok(tx) = deserialize_transaction(&entry.1) {
+                    if self.confirmed_tx_index(&tx.get_tx_id()).is_some() {
+                        tree_stale.push(tx);
+                    }
+                }
+            }
+        }
+        if stale.is_empty() && tree_stale.is_empty() {
             return 0;
         }
-        let mut mempool = self.mempool.write().await;
-        for tx in &stale {
-            mempool.clear_transaction(tx);
+        {
+            let mut mempool = self.mempool.write().await;
+            for tx in stale.iter().chain(tree_stale.iter()) {
+                mempool.clear_transaction(tx);
+            }
         }
-        stale.len()
+        // clear_processed_transactions removes tree rows (pending + signature
+        // sidecar + pending-debit index) by tx_id — the same path block
+        // confirmation uses, so hygiene cannot diverge from it.
+        let all: Vec<Transaction> = stale.into_iter().chain(tree_stale).collect();
+        let _ = self.clear_processed_transactions(&all).await;
+        all.len()
     }
 
     fn confirmed_tx_index(&self, tx_id: &str) -> Option<u32> {
