@@ -68,16 +68,20 @@ a block.
 
 ### Signing (client side — you build this)
 
-Transactions are signed with **ML-DSA-87 (FIPS 204)**, a post-quantum lattice
-signature. There is no browser-native support; a web wallet must sign
-**client-side** so the private key never leaves the device. Options:
+Transactions are signed with **ML-DSA-87 (FIPS 204)**, a standards-track
+post-quantum signature with existing libraries in most languages (e.g.
+`@noble/post-quantum`'s `ml_dsa87` in JS/TS) — so no code from this repo is
+needed. A wallet must sign **client-side** so the private key never leaves the
+device.
 
-- Compile the node's Rust signing code to **WASM** and sign in the browser.
-- Sign in a backend/CLI you control and POST the result.
+**See [`SIGNING_SPEC.md`](SIGNING_SPEC.md)** for the exact signed-message format,
+key/signature encodings, and a deterministic test vector to validate your
+implementation byte-for-byte. In short: sign the UTF-8 string
+`sender:recipient:amount:fee:timestamp` (amount/fee at 8 decimals) with
+ML-DSA-87, then POST the transaction JSON to `/explorer/submit-tx`.
 
-The signed message and field layout match what the node validates (see the
-`Transaction` type and the `create` command in the source). This repo does not
-ship a wallet or a WASM signer — that is intentionally left to the community.
+This repo intentionally ships no wallet UI — the spec is everything the
+community needs to build one.
 
 ## Notes for exchanges
 
