@@ -4570,19 +4570,33 @@ impl Blockchain {
 
     // Network hashrate
     pub async fn calculate_network_hashrate(&self) -> f64 {
-        if let Some(last_block) = self.get_last_block() {
-            if let Ok(prev_block) = self.get_block(last_block.index.saturating_sub(1)) {
-                let time_diff = last_block.timestamp.saturating_sub(prev_block.timestamp);
-                if time_diff > 0 {
-                    let target = pow_target_from_difficulty(last_block.difficulty);
-                    let hashrate = MAX_TARGET.to_f64().unwrap_or(0.0)
-                        / target.to_f64().unwrap_or(1.0)
-                        / time_diff as f64;
-                    return hashrate / 1_000_000_000_000.0; // TH/s
-                }
+        // Windowed estimate over the last 32 intervals. The old 2-block sample
+        // broke down at a fast block time: consecutive blocks routinely share a
+        // 1-second timestamp, so time_diff was 0 and the reported hashrate was a
+        // hard 0 even while difficulty climbed past 550 (the "hashrate 0 but
+        // difficulty rising" confusion) — and when it did fire, one noisy interval
+        // swung it wildly. Sum expected work per block and divide by the span.
+        const WINDOW: u32 = 32;
+        let Some(tip) = self.get_last_block() else {
+            return 0.0;
+        };
+        let start_index = tip.index.saturating_sub(WINDOW);
+        let Ok(start_block) = self.get_block(start_index) else {
+            return 0.0;
+        };
+        let span = tip.timestamp.saturating_sub(start_block.timestamp);
+        if span == 0 || tip.index == start_index {
+            return 0.0;
+        }
+        let mut expected_hashes = 0.0f64;
+        for h in (start_index + 1)..=tip.index {
+            if let Ok(b) = self.get_block(h) {
+                let target = pow_target_from_difficulty(b.difficulty);
+                expected_hashes +=
+                    MAX_TARGET.to_f64().unwrap_or(0.0) / target.to_f64().unwrap_or(1.0);
             }
         }
-        0.0
+        (expected_hashes / span as f64) / 1_000_000_000_000.0 // TH/s
     }
 
     pub fn get_block_reward(&self, transactions: &[Transaction]) -> f64 {

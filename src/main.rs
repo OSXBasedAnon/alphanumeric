@@ -1551,7 +1551,22 @@ async fn main() -> Result<()> {
     }
     color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
     stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Hashrate:          {:.2} TH/s", blockchain_guard.calculate_network_hashrate().await)?;
+    // Auto-scale: a CPU-mined BLAKE3 network's hashrate lives in MH/s-GH/s, and a
+    // fixed TH/s display read "0.00" even while difficulty climbed past 550.
+    let hashrate_ths = blockchain_guard.calculate_network_hashrate().await;
+    let hashrate_hs = hashrate_ths * 1e12;
+    let (hr_value, hr_unit) = if hashrate_hs >= 1e12 {
+        (hashrate_hs / 1e12, "TH/s")
+    } else if hashrate_hs >= 1e9 {
+        (hashrate_hs / 1e9, "GH/s")
+    } else if hashrate_hs >= 1e6 {
+        (hashrate_hs / 1e6, "MH/s")
+    } else if hashrate_hs >= 1e3 {
+        (hashrate_hs / 1e3, "kH/s")
+    } else {
+        (hashrate_hs, "H/s")
+    };
+    writeln!(stdout, "Hashrate:          {:.2} {}", hr_value, hr_unit)?;
     color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Fee Rate:          {:.8}%", blockchain_guard.transaction_fee * 100.0)?;
