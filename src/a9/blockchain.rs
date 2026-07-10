@@ -1002,6 +1002,14 @@ pub struct Blockchain {
     pub temporal_verification: TemporalVerification,
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
     state_mutation_lock: Arc<Mutex<()>>,
+    /// Single-flight gate for balances-index maintenance (rebuild / catch-up).
+    /// Concurrent get_confirmed_balance callers finding a stale index WAIT here
+    /// and re-check instead of each launching their own O(chain) replay — the
+    /// stampede that wedged nodes once 5s blocks outpaced the rebuild. Lock
+    /// order where both are held is state_mutation_lock -> balances_index_gate
+    /// (writers hold the state lock and read balances inside it); the gate is
+    /// never held while acquiring the state lock.
+    balances_index_gate: Arc<Mutex<()>>,
     tip_change_counter: Arc<AtomicU64>,
     tip_watch_tx: watch::Sender<ChainTipSignal>,
 }
@@ -2657,6 +2665,14 @@ impl Blockchain {
             .ok_or(BlockchainError::InvalidBlockHeader)?
             .clone();
 
+        // Hold the balances-index gate across the whole mutation window: a lazy
+        // catch-up (ensure_balances_index) must never read canonical slots
+        // mid-rewrite. The dirty marker (set above) makes a gate-waiter skip once
+        // it gets in; this closes the window where one could already be running.
+        // Lock order state_mutation_lock -> balances_index_gate, same as the
+        // writers' in-lock balance reads; dropped before the mempool reconcile.
+        let index_guard = self.balances_index_gate.lock().await;
+
         // Apply the reorg ATOMICALLY: rewrite the branch's canonical slots and drop
         // any now-stale higher slots in a single batch, so a crash can never leave a
         // half-rewritten chain. The dirty marker (above) + startup recovery re-derive
@@ -2686,16 +2702,17 @@ impl Blockchain {
         }
         let _ = self.prune_confirmed_txs(branch_tip.timestamp);
 
-        // Rebuild balances index after reorg.
+        // Rebuild balances index after reorg (the marker commits atomically inside
+        // the rebuild's own batch, set to the post-rewrite tip it replayed).
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         self.rebuild_balances_index(&balances_tree).await?;
-        Self::set_balances_height(&balances_tree, branch_tip.index as u64)?;
         self.write_chain_tip_metadata(&branch_tip)?;
         let _ = self.get_network_difficulty().await?;
         self.db.flush()?;
         balances_tree.flush()?;
         self.open_chain_meta_tree()?.flush()?;
         self.clear_chain_state_dirty()?;
+        drop(index_guard);
 
         // Reconcile the mempool with the reorg (M14). First evict the branch's
         // now-confirmed transactions so they are not double-counted as pending or
@@ -2919,8 +2936,12 @@ impl Blockchain {
             *current_difficulty = block.difficulty;
         }
 
+        // The index marker already advanced atomically with the balance content
+        // inside process_transactions_batch's apply batch — and tip metadata is
+        // written only after it, so a reader that can see the new tip can never
+        // observe a lagging marker (the window that used to trigger stampeding
+        // full rebuilds on every block). The tree is opened here only to flush.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        Self::set_balances_height(&balances_tree, block.index as u64)?;
         self.write_chain_tip_metadata(block)?;
 
         // Ensure all changes are persisted
@@ -3044,6 +3065,10 @@ impl Blockchain {
         }
     }
 
+    // Production paths now advance the marker atomically inside the same batch as
+    // the balance content (process_transactions_batch / rebuild / catch-up); this
+    // standalone setter remains for tests that stage stale-marker scenarios.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn set_balances_height(tree: &sled::Tree, height: u64) -> Result<(), BlockchainError> {
         tree.insert(BALANCES_HEIGHT_KEY, codec::serialize(&height)?)?;
         Ok(())
@@ -3058,23 +3083,151 @@ impl Blockchain {
         force_rebuild_requested: bool,
     ) -> Result<(), BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        let tip = self.get_latest_block_index();
         let force_rebuild_env = std::env::var("ALPHANUMERIC_REBUILD_BALANCES")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let force = force_rebuild_requested || force_rebuild_env;
 
-        let current_height = Self::get_balances_height(&balances_tree)?;
-        let needs_rebuild = force_rebuild_requested
-            || force_rebuild_env
-            || current_height.is_none()
-            || current_height.unwrap_or(0) != tip;
-
-        if needs_rebuild {
-            self.rebuild_balances_index(&balances_tree).await?;
-            Self::set_balances_height(&balances_tree, tip)?;
-            balances_tree.flush()?;
+        // Fast path, no lock: index exactly at the tip and nothing forced. This is
+        // the steady-state outcome for every reader (the apply paths advance the
+        // marker atomically with the content), so the gate below stays uncontended
+        // in normal operation and the writers' in-lock balance reads never block.
+        if !force {
+            if let Some(height) = Self::get_balances_height(&balances_tree)? {
+                if height == self.get_latest_block_index() {
+                    return Ok(());
+                }
+            }
         }
 
+        // Single-flight: exactly one rebuild/catch-up runs; concurrent callers WAIT
+        // here, then re-check and read the fresh result. Previously each stale-index
+        // reader launched its own full O(chain) replay — once 5s blocks arrived
+        // faster than a replay completed, nodes ground through back-to-back rebuilds
+        // (starving block ingest via the write-preferring RwLock) until block
+        // arrivals paused: the observed multi-minute wedges.
+        let _index_guard = self.balances_index_gate.lock().await;
+
+        // A writer (persist/finalize/reorg) is mid-mutation: the tree is a consistent
+        // as-of-marker snapshot and the writer advances the marker atomically with
+        // its content. Mutating here would race the writer's absolute balance writes.
+        // Crashed-writer markers are owned by startup recovery, which re-derives the
+        // tip and calls back in with force=true (never skipped).
+        if !force && self.chain_state_dirty()?.is_some() {
+            return Ok(());
+        }
+
+        let tip = self.get_latest_block_index();
+        let current_height = Self::get_balances_height(&balances_tree)?;
+
+        match current_height {
+            // Raced: another caller brought it current while we waited on the gate.
+            Some(height) if !force && height == tip => Ok(()),
+            // Merely behind: close the gap in O(gap) through the SAME replay
+            // function the full rebuild uses — identical values by construction.
+            Some(height) if !force && height < tip => {
+                self.catch_up_balances_index(&balances_tree, height, tip)
+                    .await
+            }
+            // Forced, no marker yet, or marker ahead of the tip (chain shrank or
+            // unknown state): re-derive everything from the canonical chain.
+            _ => {
+                self.rebuild_balances_index(&balances_tree).await?;
+                balances_tree.flush()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// O(gap) catch-up for an index that is merely BEHIND the tip: applies blocks
+    /// [from+1, tip] through replay_apply_block_checked — the same function the
+    /// full rebuild and the reorg dry-run use — against the tree's current values,
+    /// so the result is identical to a from-genesis replay by construction (raw
+    /// balances are exact integer sums; the maturity overlay is comparison-only).
+    /// Each block's deltas commit atomically WITH the advanced marker, so a crash
+    /// can only lose whole suffixes, never tear the (content, marker) pair. Any
+    /// unloadable or non-replaying block falls back to the full rebuild, which owns
+    /// the loud M23 corruption alarm and re-derives from scratch.
+    async fn catch_up_balances_index(
+        &self,
+        balances_tree: &sled::Tree,
+        from: u64,
+        tip: u64,
+    ) -> Result<(), BlockchainError> {
+        // Seed the rolling immature-coinbase window exactly as a from-genesis
+        // replay would hold it entering block from+1. Seeding slightly deeper than
+        // necessary is self-correcting (the replay pops stale fronts), so start at
+        // the conservative (from+1)-MATURITY bound, ascending — the pop loop only
+        // inspects the front, so order must match the replay's push order.
+        let first = from.saturating_add(1);
+        let mut recent: std::collections::VecDeque<(u32, String, i128)> =
+            std::collections::VecDeque::new();
+        let seed_low = first.saturating_sub(MINING_REWARD_MATURITY as u64);
+        for rh in seed_low..=from {
+            let Ok(block) = self.get_block(rh as u32) else {
+                self.rebuild_balances_index(balances_tree).await?;
+                balances_tree.flush()?;
+                return Ok(());
+            };
+            for tx in &block.transactions {
+                if tx.sender == "MINING_REWARDS" {
+                    recent.push_back((block.index, tx.recipient.clone(), tx.amount_units));
+                }
+            }
+        }
+
+        let mut balances: HashMap<String, i128> = HashMap::new();
+        for h in first..=tip {
+            let Ok(block) = self.get_block(h as u32) else {
+                self.rebuild_balances_index(balances_tree).await?;
+                balances_tree.flush()?;
+                return Ok(());
+            };
+            // Load current confirmed values for every address this block's replay
+            // will touch (absent == 0, exactly a fresh accumulator's start). The
+            // touch set mirrors replay_apply_block_checked: a coinbase touches its
+            // recipient only; a regular tx touches sender and recipient.
+            let mut touched: Vec<String> = Vec::new();
+            for tx in &block.transactions {
+                if tx.sender != "MINING_REWARDS" {
+                    touched.push(tx.sender.clone());
+                }
+                touched.push(tx.recipient.clone());
+            }
+            for addr in &touched {
+                if !balances.contains_key(addr.as_str()) {
+                    let value = match balances_tree.get(addr.as_bytes())? {
+                        Some(raw) => Self::deserialize_units_compatible(&raw)?,
+                        None => 0,
+                    };
+                    balances.insert(addr.clone(), value);
+                }
+            }
+            if Self::replay_apply_block_checked(
+                block.index,
+                &block.transactions,
+                &mut balances,
+                &mut recent,
+            )
+            .is_err()
+            {
+                // A persisted canonical block must replay cleanly; if it does not,
+                // the marker (or the history under it) is not trustworthy here —
+                // re-derive from scratch instead of guessing.
+                self.rebuild_balances_index(balances_tree).await?;
+                balances_tree.flush()?;
+                return Ok(());
+            }
+            let mut batch = sled::Batch::default();
+            for addr in &touched {
+                if let Some(balance) = balances.get(addr.as_str()) {
+                    batch.insert(addr.as_bytes(), codec::serialize(balance)?);
+                }
+            }
+            batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&h)?);
+            balances_tree.apply_batch(batch)?;
+        }
+        balances_tree.flush()?;
         Ok(())
     }
 
@@ -3093,7 +3246,8 @@ impl Blockchain {
         // feeds the atomic diff-batch below unchanged.
         let mut recent: std::collections::VecDeque<(u32, String, i128)> =
             std::collections::VecDeque::new();
-        if let Some(tip) = self.highest_block_index() {
+        let covered = self.highest_block_index();
+        if let Some(tip) = covered {
             let mut missing = 0u32;
             let mut first_missing = 0u32;
             for h in 0..=tip {
@@ -3153,6 +3307,14 @@ impl Blockchain {
         for (address, balance) in &balances {
             batch.insert(address.as_bytes(), codec::serialize(balance)?);
         }
+        // The marker commits in the SAME atomic batch as the recomputed content,
+        // recording the tip this replay actually covered — NOT a caller-captured
+        // tip. Under 5s blocks the tip can advance during a long replay; marking
+        // the stale capture left the index permanently one-behind and re-armed
+        // the rebuild on every subsequent read (the treadmill). Any gap that
+        // opens mid-replay is closed by the next ensure via O(gap) catch-up.
+        let covered_height = covered.map(u64::from).unwrap_or(0);
+        batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&covered_height)?);
         balances_tree.apply_batch(batch)?;
 
         Ok(())
@@ -3319,6 +3481,7 @@ impl Blockchain {
             temporal_verification: TemporalVerification::new(),
             signature_cache,
             state_mutation_lock: Arc::new(Mutex::new(())),
+            balances_index_gate: Arc::new(Mutex::new(())),
             tip_change_counter,
             tip_watch_tx,
         };
@@ -3690,8 +3853,9 @@ impl Blockchain {
         }
         set_finalize_stage(5);
         trace_step("db_insert");
+        // Marker advanced atomically with the balances inside
+        // process_transactions_batch's batch; tree opened only to flush below.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        Self::set_balances_height(&balances_tree, block.index as u64)?;
         self.write_chain_tip_metadata(&block)?;
         set_finalize_stage(6);
         trace_step("balances_height");
@@ -4923,13 +5087,21 @@ impl Blockchain {
             }
         }
 
-        // Apply all changes atomically
+        // Apply all changes atomically — the balance deltas AND the advanced index
+        // marker land in ONE batch, so the (content, marker) pair can never tear.
+        // The marker is only trustworthy if it always equals the replay height of
+        // the content; the O(gap) catch-up in ensure_balances_index relies on that
+        // to apply exactly the missing blocks and nothing twice. Both callers
+        // (persist_validated_block_with_mode, finalize_block) are strict tip
+        // extensions guarded by the state-mutation lock, so confirm_height here is
+        // always the new canonical tip.
         let mut batch = sled::Batch::default();
         for (address, change) in balance_changes {
             let current = current_balances.get(&address).copied().unwrap_or(0);
             let new_balance = current + change;
             batch.insert(address.as_bytes(), codec::serialize(&new_balance)?);
         }
+        batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&confirm_height)?);
 
         // Commit changes
         balances_tree.apply_batch(batch)?;
@@ -5518,6 +5690,71 @@ mod tests {
         };
         block.hash = block.calculate_hash_for_block();
         block
+    }
+
+    /// Like metadata_test_block, but with regular transactions appended after the
+    /// coinbase. Signatures are irrelevant here: the balances replay
+    /// (replay_apply_block_checked) applies amounts only.
+    fn test_block_with_txs(
+        index: u32,
+        previous_hash: [u8; 32],
+        miner: &str,
+        reward: f64,
+        transfers: &[(&str, &str, f64)],
+    ) -> Block {
+        let mut transactions = vec![Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: miner.to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(reward),
+            timestamp: 1_000 + index as u64,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }];
+        for (sender, recipient, amount) in transfers {
+            transactions.push(Transaction {
+                sender: sender.to_string(),
+                recipient: recipient.to_string(),
+                fee_units: Transaction::to_units(NETWORK_FEE),
+                amount_units: Transaction::to_units(*amount),
+                timestamp: 1_000 + index as u64,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            });
+        }
+        let merkle_root =
+            Blockchain::calculate_merkle_root(&transactions).expect("merkle root should build");
+        let mut block = Block {
+            index,
+            previous_hash,
+            timestamp: 1_000 + index as u64,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+        block
+    }
+
+    /// Every (address -> units) pair in the balances tree, marker excluded.
+    /// Missing keys are semantically 0, so comparisons should go through
+    /// balance_units_of over a key union rather than raw map equality.
+    fn dump_balances(blockchain: &Blockchain) -> std::collections::BTreeMap<String, i128> {
+        let tree = blockchain.db.open_tree(BALANCES_TREE).unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for item in tree.iter() {
+            let (k, v) = item.unwrap();
+            if k.as_ref() == BALANCES_HEIGHT_KEY {
+                continue;
+            }
+            let addr = String::from_utf8(k.to_vec()).unwrap();
+            out.insert(addr, Blockchain::deserialize_units_compatible(&v).unwrap());
+        }
+        out
     }
 
     #[test]
@@ -6599,6 +6836,276 @@ mod tests {
             blockchain.get_confirmed_balance("miner1").await.unwrap(),
             2.0
         );
+    }
+
+    /// The O(gap) catch-up must produce exactly the values a from-genesis full
+    /// rebuild produces — same replay function, same integer arithmetic — across
+    /// regular transfers, multiple txs per block, and repeated same-sender spends.
+    /// The sentinel key proves the CATCH-UP path ran (a full rebuild removes keys
+    /// absent from its replay map; catch-up never removes).
+    #[tokio::test]
+    async fn balances_catch_up_matches_full_rebuild() {
+        let build_chain = || -> Vec<Block> {
+            let mut blocks = Vec::new();
+            let mut prev = [0u8; 32];
+            // Blocks 0..=3: fund alice and bob via coinbase.
+            for (i, miner) in [(0u32, "alice"), (1, "bob"), (2, "alice"), (3, "carol")] {
+                let b = metadata_test_block(i, prev, miner, 10.0);
+                prev = b.hash;
+                blocks.push(b);
+            }
+            // Block 4: two transfers in one block, one shared sender.
+            let b4 = test_block_with_txs(
+                4,
+                prev,
+                "miner4",
+                10.0,
+                &[("alice", "dave", 3.0), ("alice", "bob", 2.0)],
+            );
+            prev = b4.hash;
+            blocks.push(b4);
+            // Block 5: chained transfer of freshly received funds.
+            let b5 = test_block_with_txs(5, prev, "miner5", 10.0, &[("dave", "erin", 1.0)]);
+            prev = b5.hash;
+            blocks.push(b5);
+            // Blocks 6..=8: more coinbase + a bob spend.
+            let b6 = metadata_test_block(6, prev, "bob", 10.0);
+            prev = b6.hash;
+            blocks.push(b6);
+            let b7 = test_block_with_txs(7, prev, "miner7", 10.0, &[("bob", "frank", 7.5)]);
+            prev = b7.hash;
+            blocks.push(b7);
+            let b8 = metadata_test_block(8, prev, "alice", 10.0);
+            blocks.push(b8);
+            blocks
+        };
+
+        // Instance A: index built through height 3, then blocks 4..=8 arrive raw —
+        // ensure must close the gap via catch-up.
+        let a = test_blockchain();
+        let chain = build_chain();
+        for b in &chain[..=3] {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        a.ensure_balances_index().await.unwrap();
+        let a_tree = a.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(3));
+        // Sentinel: survives catch-up, would be removed by a full rebuild.
+        a_tree
+            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .unwrap();
+        for b in &chain[4..] {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        a.ensure_balances_index().await.unwrap();
+        assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(8));
+        assert_eq!(
+            a_tree.get("zz_sentinel".as_bytes()).unwrap().map(|v| v.to_vec()),
+            Some(codec::serialize(&777i128).unwrap()),
+            "catch-up path should have run (full rebuild would remove the sentinel)"
+        );
+
+        // Instance B: identical chain, single from-genesis rebuild.
+        let b_chain = test_blockchain();
+        for b in &chain {
+            insert_raw_block(&b_chain, b);
+        }
+        b_chain.rebuild_chain_tip_metadata().unwrap();
+        b_chain.ensure_balances_index().await.unwrap();
+
+        // Value identity over the union of addresses (absent == 0).
+        let mut a_vals = dump_balances(&a);
+        a_vals.remove("zz_sentinel");
+        let b_vals = dump_balances(&b_chain);
+        let keys: std::collections::BTreeSet<String> =
+            a_vals.keys().chain(b_vals.keys()).cloned().collect();
+        for k in keys {
+            assert_eq!(
+                a_vals.get(&k).copied().unwrap_or(0),
+                b_vals.get(&k).copied().unwrap_or(0),
+                "address {k} diverged between catch-up and full rebuild"
+            );
+        }
+    }
+
+    /// Catch-up starting MID-WAY through the coinbase-maturity window must seed
+    /// the rolling immature set exactly as a from-genesis replay would hold it:
+    /// a spend that is valid only because its funding coinbase just matured has
+    /// to replay cleanly (over-seeding would false-fail it and silently fall back
+    /// to the full rebuild — which the sentinel detects).
+    #[tokio::test]
+    async fn balances_catch_up_seeds_maturity_window() {
+        let mat = MINING_REWARD_MATURITY; // 100
+        let act = MATURITY_ACTIVATION_HEIGHT; // 1500
+        let spend_height = act + mat + 2; // 1602: coinbase from 1500 is mature, 1503+ are not
+        let build_chain = |upto: u32| -> Vec<Block> {
+            let mut blocks = Vec::new();
+            let mut prev = [0u8; 32];
+            for i in 0..=upto {
+                let block = if i == spend_height {
+                    // earner raw = 102 coinbases x 10; immature = 99 x 10; spendable = 30.
+                    test_block_with_txs(i, prev, "closer", 10.0, &[("earner", "shop", 5.0)])
+                } else if i >= act {
+                    metadata_test_block(i, prev, "earner", 10.0)
+                } else {
+                    metadata_test_block(i, prev, "filler", 10.0)
+                };
+                prev = block.hash;
+                blocks.push(block);
+            }
+            blocks
+        };
+
+        let a = test_blockchain();
+        let chain = build_chain(spend_height);
+        let resume_from = (act + 50) as usize; // marker 1550: seed spans the window mid-flight
+        for b in &chain[..=resume_from] {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        a.ensure_balances_index().await.unwrap();
+        let a_tree = a.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(
+            Blockchain::get_balances_height(&a_tree).unwrap(),
+            Some(resume_from as u64)
+        );
+        a_tree
+            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .unwrap();
+        for b in &chain[resume_from + 1..] {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        a.ensure_balances_index().await.unwrap();
+        assert_eq!(
+            Blockchain::get_balances_height(&a_tree).unwrap(),
+            Some(spend_height as u64)
+        );
+        assert!(
+            a_tree.get("zz_sentinel".as_bytes()).unwrap().is_some(),
+            "maturity seeding false-failed a valid mature spend (fell back to full rebuild)"
+        );
+
+        // And the values still match a from-genesis rebuild.
+        let b_chain = test_blockchain();
+        for b in &chain {
+            insert_raw_block(&b_chain, b);
+        }
+        b_chain.rebuild_chain_tip_metadata().unwrap();
+        b_chain.ensure_balances_index().await.unwrap();
+        let expected_earner = b_chain.get_confirmed_balance("earner").await.unwrap();
+        let got_earner = a.get_confirmed_balance("earner").await.unwrap();
+        assert_eq!(got_earner, expected_earner);
+        assert_eq!(
+            a.get_confirmed_balance("shop").await.unwrap(),
+            b_chain.get_confirmed_balance("shop").await.unwrap()
+        );
+    }
+
+    /// While a writer's dirty marker is up, a lazy ensure must leave the index
+    /// alone (consistent as-of-marker snapshot); once cleared it catches up.
+    #[tokio::test]
+    async fn balances_ensure_skips_while_dirty_then_catches_up() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let b1 = metadata_test_block(1, b0.hash, "miner1", 2.0);
+        let b2 = metadata_test_block(2, b1.hash, "miner2", 3.0);
+        insert_raw_block(&bc, &b0);
+        insert_raw_block(&bc, &b1);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&tree).unwrap(), Some(1));
+
+        insert_raw_block(&bc, &b2);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.mark_chain_state_dirty(2, "test_writer_in_flight").unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        assert_eq!(
+            Blockchain::get_balances_height(&tree).unwrap(),
+            Some(1),
+            "ensure must not mutate while the dirty marker is up"
+        );
+
+        bc.clear_chain_state_dirty().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        assert_eq!(Blockchain::get_balances_height(&tree).unwrap(), Some(2));
+        assert_eq!(bc.get_confirmed_balance("miner2").await.unwrap(), 3.0);
+    }
+
+    /// A marker AHEAD of the tip means the content's provenance is unknown
+    /// (chain shrank, foreign DB, manual surgery): ensure must fall back to the
+    /// authoritative full rebuild, not trust or extend the content.
+    #[tokio::test]
+    async fn balances_marker_ahead_forces_full_rebuild() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let b1 = metadata_test_block(1, b0.hash, "miner1", 2.0);
+        insert_raw_block(&bc, &b0);
+        insert_raw_block(&bc, &b1);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+        set_confirmed_balance(&bc, "miner1", Transaction::to_units(999.0));
+        Blockchain::set_balances_height(&tree, 10).unwrap();
+
+        bc.ensure_balances_index().await.unwrap();
+        assert_eq!(Blockchain::get_balances_height(&tree).unwrap(), Some(1));
+        assert_eq!(
+            bc.get_confirmed_balance("miner1").await.unwrap(),
+            2.0,
+            "full rebuild must correct the poisoned balance"
+        );
+    }
+
+    /// Concurrent stale-index readers must all succeed with fresh values and no
+    /// deadlock: the single-flight gate lets one catch-up run while the rest wait
+    /// and re-check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn balances_concurrent_stale_reads_single_flight() {
+        let bc = Arc::new(test_blockchain());
+        let mut prev = [0u8; 32];
+        let mut blocks = Vec::new();
+        for i in 0..=30u32 {
+            let b = metadata_test_block(i, prev, &format!("miner{i}"), 1.0);
+            prev = b.hash;
+            blocks.push(b);
+        }
+        for b in &blocks[..=5] {
+            insert_raw_block(&bc, b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        for b in &blocks[6..] {
+            insert_raw_block(&bc, b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let bc = Arc::clone(&bc);
+            handles.push(tokio::spawn(async move {
+                let addr = format!("miner{}", 7 + (i % 20));
+                // Resolve inside the task: BlockchainError is !Send (boxed dyn
+                // StdError), so it cannot cross the JoinHandle. A failure panics
+                // the task, which surfaces as a JoinError below.
+                bc.get_confirmed_balance(&addr)
+                    .await
+                    .expect("concurrent confirmed-balance read failed")
+            }));
+        }
+        for h in handles {
+            let balance = tokio::time::timeout(std::time::Duration::from_secs(30), h)
+                .await
+                .expect("deadlocked: concurrent reads did not complete")
+                .unwrap();
+            assert_eq!(balance, 1.0);
+        }
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&tree).unwrap(), Some(30));
     }
 
     #[tokio::test]
