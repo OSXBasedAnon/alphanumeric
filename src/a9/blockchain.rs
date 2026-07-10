@@ -98,6 +98,13 @@ pub const MINING_REWARD_MATURITY: u32 = 100;
 /// new-binary node produces and converge normally; only an old miner that itself
 /// spends an immature reward gets that block orphaned and self-heals via convergence.
 pub const MATURITY_ACTIVATION_HEIGHT: u32 = 1500;
+/// Frontier window (blocks) for the periodic in-persist integrity check. 256
+/// blocks ≈ 21 minutes of history at the 5s target — far deeper than any live
+/// reorg surface (reorgs at/below the trusted checkpoint are rejected outright)
+/// while keeping the walk's lock-held cost fixed and sub-second regardless of
+/// chain length. The full from-genesis walk is NOT bounded by this; it simply
+/// never runs on the hot block-apply path (see verify_chain_integrity).
+pub const INTEGRITY_FRONTIER_WINDOW: u32 = 256;
 const ORPHAN_BLOCKS_TREE: &str = "orphan_blocks";
 const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const CHAIN_META_TREE: &str = "chain_meta";
@@ -2807,7 +2814,14 @@ impl Blockchain {
             return Err(BlockchainError::InvalidTransaction);
         }
 
-        // Run expensive full-chain integrity checks periodically.
+        // Run the BOUNDED frontier integrity check periodically. This used to be
+        // the full from-genesis walk — O(chain) disk reads under the state lock
+        // and the caller's write guard, every ~60s of steady ingest. Once the
+        // chain outgrew the walk (5s blocks, ~17k/day), nodes wedged for minutes
+        // per walk (lock-watchdog chain_ok=false, 2026-07-10). The frontier
+        // window covers everything that can still change (reorgs at/below the
+        // trusted checkpoint are rejected outright; deeper blocks all passed full
+        // admission validation on arrival), at a fixed ~sub-second cost.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2820,7 +2834,11 @@ impl Blockchain {
             block.index.is_multiple_of(128) || now.saturating_sub(last_integrity) >= 60;
 
         if should_verify_integrity {
-            if !self.chain_sentinel.verify_chain_integrity(self).await {
+            if !self
+                .chain_sentinel
+                .verify_recent_chain_integrity(self, INTEGRITY_FRONTIER_WINDOW)
+                .await
+            {
                 return Err(BlockchainError::InvalidBlockHeader);
             }
             self.chain_sentinel
@@ -5503,7 +5521,41 @@ impl ChainSentinel {
         }
     }
 
+    /// Full from-genesis integrity walk. UNBOUNDED — cost grows with the chain
+    /// (~17k blocks/day at 5s blocks), so this must never run on the block-apply
+    /// path under the chain locks: it did until v7.7.6, firing every ~60s of
+    /// ingest, and once the walk outgrew the lock-watchdog probe window it wedged
+    /// nodes for minutes at a time (chain_ok=false strikes, 2026-07-10). Hot-path
+    /// callers use verify_recent_chain_integrity below; this stays for callers
+    /// that can afford unbounded time (audits, tests).
     pub async fn verify_chain_integrity(&self, blockchain: &Blockchain) -> bool {
+        self.verify_chain_integrity_from(blockchain, 0).await
+    }
+
+    /// Bounded frontier variant for the hot persist path: the SAME three per-pair
+    /// invariants (hash linkage, timestamp order, parent-linked difficulty) over
+    /// only the last `window` blocks — the only region that can still change.
+    /// Reorgs at/below the trusted checkpoint are rejected outright, and every
+    /// stored block already passed full admission validation when it landed, so
+    /// re-walking deep immutable history under the write lock bought nothing but
+    /// the wedge. Each pair's verdict depends ONLY on that pair (the difficulty
+    /// oracle records metrics; consensus_next_difficulty is parent-linked pure
+    /// math), so starting mid-chain cannot flip any checked pair's outcome — a
+    /// false failure here would reject a valid block, which is why this must stay
+    /// semantically identical to the full walk over its window.
+    pub async fn verify_recent_chain_integrity(
+        &self,
+        blockchain: &Blockchain,
+        window: u32,
+    ) -> bool {
+        let Some(tip) = blockchain.highest_block_index() else {
+            return true;
+        };
+        self.verify_chain_integrity_from(blockchain, tip.saturating_sub(window))
+            .await
+    }
+
+    async fn verify_chain_integrity_from(&self, blockchain: &Blockchain, start: u32) -> bool {
         let Some(tip) = blockchain.highest_block_index() else {
             return true;
         };
@@ -5512,10 +5564,12 @@ impl ChainSentinel {
         // the ascending order still feeds the difficulty oracle the same sequence.
         // Missing heights are skipped as scan_prefix would omit them, so a gap still
         // surfaces as a previous_hash mismatch against the last present block.
+        // The first present block at/after `start` only seeds `prev`; pair checks
+        // begin with its successor — identical shape at any starting height.
         let mut difficulty_oracle = DifficultyOracle::new();
         let mut prev: Option<([u8; 32], u64, u64)> = None; // (hash, timestamp, difficulty)
 
-        for h in 0..=tip {
+        for h in start..=tip {
             let Ok(block) = blockchain.get_block(h) else {
                 continue;
             };
@@ -6541,6 +6595,108 @@ mod tests {
                 .verify_chain_integrity(&blockchain)
                 .await
         );
+    }
+
+    /// Valid chain builder for sentinel tests: same spacing/difficulty recipe as
+    /// the passing two-block test above (constant target-time spacing pins the
+    /// consensus difficulty at NETWORK_MIN_DIFFICULTY after genesis), extended to
+    /// arbitrary length.
+    fn build_valid_sentinel_chain(blockchain: &Blockchain, len: u32) -> Vec<Block> {
+        let genesis = Blockchain::genesis_launch_block().expect("genesis should build");
+        insert_raw_block(blockchain, &genesis);
+        let mut blocks = vec![genesis];
+        for i in 1..len {
+            let prev = blocks.last().unwrap();
+            let mut b = metadata_test_block(i, prev.hash, &format!("m{i}"), 1.0);
+            b.timestamp = prev.timestamp + TARGET_BLOCK_TIME * 1_000;
+            b.difficulty = NETWORK_MIN_DIFFICULTY;
+            b.hash = b.calculate_hash_for_block();
+            insert_raw_block(blockchain, &b);
+            blocks.push(b);
+        }
+        blockchain.rebuild_chain_tip_metadata().unwrap();
+        blocks
+    }
+
+    /// The frontier check must catch corruption INSIDE its window exactly like
+    /// the full walk does.
+    #[tokio::test]
+    async fn frontier_integrity_detects_recent_corruption() {
+        let bc = test_blockchain();
+        let blocks = build_valid_sentinel_chain(&bc, 300);
+        let sentinel = ChainSentinel::new();
+        assert!(
+            sentinel
+                .verify_recent_chain_integrity(&bc, INTEGRITY_FRONTIER_WINDOW)
+                .await
+        );
+
+        // Tamper a block near the tip: break its parent linkage.
+        let mut bad = blocks[297].clone();
+        bad.previous_hash = [0xEEu8; 32];
+        bad.hash = bad.calculate_hash_for_block();
+        insert_raw_block(&bc, &bad);
+
+        assert!(
+            !sentinel
+                .verify_recent_chain_integrity(&bc, INTEGRITY_FRONTIER_WINDOW)
+                .await,
+            "frontier check must catch corruption inside its window"
+        );
+        assert!(!sentinel.verify_chain_integrity(&bc).await);
+    }
+
+    /// The frontier check is genuinely BOUNDED: corruption below the window is
+    /// deliberately out of its scope (deep history is checkpoint-final and was
+    /// admission-validated on arrival) — the full walk still catches it. This
+    /// documents the coverage trade the hot path makes for a fixed lock-held cost.
+    #[tokio::test]
+    async fn frontier_integrity_is_bounded_full_walk_still_catches_deep() {
+        let bc = test_blockchain();
+        let blocks = build_valid_sentinel_chain(&bc, 300);
+        let sentinel = ChainSentinel::new();
+
+        // Corrupt DEEP history (height 10, far below tip-256).
+        let mut bad = blocks[10].clone();
+        bad.previous_hash = [0xEEu8; 32];
+        bad.hash = bad.calculate_hash_for_block();
+        insert_raw_block(&bc, &bad);
+
+        assert!(
+            sentinel
+                .verify_recent_chain_integrity(&bc, INTEGRITY_FRONTIER_WINDOW)
+                .await,
+            "frontier check is windowed by design; deep corruption is the full walk's job"
+        );
+        assert!(
+            !sentinel.verify_chain_integrity(&bc).await,
+            "full walk must still catch deep corruption"
+        );
+    }
+
+    /// A mid-chain start must NEVER flip a valid pair to invalid — a false
+    /// integrity failure on the persist path would reject a valid block. Verify
+    /// the windowed walk passes from every kind of starting offset on a chain
+    /// the full walk accepts.
+    #[tokio::test]
+    async fn frontier_integrity_no_false_failures_at_any_start() {
+        let bc = test_blockchain();
+        let _ = build_valid_sentinel_chain(&bc, 300);
+        let sentinel = ChainSentinel::new();
+        assert!(sentinel.verify_chain_integrity(&bc).await);
+        for start in [0u32, 1, 7, 100, 250, 298, 299] {
+            assert!(
+                sentinel.verify_chain_integrity_from(&bc, start).await,
+                "false integrity failure starting at height {start}"
+            );
+        }
+        // And through the public windowed API at several window sizes.
+        for window in [0u32, 1, 5, 256, 1000] {
+            assert!(
+                sentinel.verify_recent_chain_integrity(&bc, window).await,
+                "false integrity failure with window {window}"
+            );
+        }
     }
 
     #[test]
