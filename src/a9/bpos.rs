@@ -1364,11 +1364,15 @@ impl BPoSSentinel {
     }
 
     async fn verify_chain_state(&self) -> Result<(), String> {
-        let blockchain = self.blockchain.read().await;
-        let mut stats = self.stats.write().await;
+        // Snapshot the tip height under a SHORT read lock and release it BEFORE the
+        // join_all below. verify_block_at_height re-acquires blockchain.read() per child;
+        // holding a parent read across that reentrant re-acquire can stall block-writes
+        // up to the startup timeout under tokio's write-preferring RwLock (audit M5).
+        let current_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
 
-        // Get current chain state
-        let current_height = blockchain.get_latest_block_index() as u32;
         let mut verified_blocks = HashSet::new();
         let mut anomalies = Vec::new();
 
@@ -1402,14 +1406,19 @@ impl BPoSSentinel {
             }
         }
 
-        // Update sentinel stats
-        stats.last_chain_verification = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Update sentinel stats under a short write lock (not held across the work above).
+        {
+            let mut stats = self.stats.write().await;
+            stats.last_chain_verification = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if !anomalies.is_empty() {
+                stats.anomalies_detected += anomalies.len() as u64;
+            }
+        }
 
         if !anomalies.is_empty() {
-            stats.anomalies_detected += anomalies.len() as u64;
             self.handle_chain_anomalies(anomalies).await?;
         }
 
