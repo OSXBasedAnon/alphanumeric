@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This is the user guide for Alphanumeric client version 7.7.3.
+This is the user guide for Alphanumeric client version 7.7.6.
 
 The prebuilt download is for **macOS (Apple Silicon)**. On **Windows** and
 **Linux** you build from source — it takes a few minutes and one `cargo`
