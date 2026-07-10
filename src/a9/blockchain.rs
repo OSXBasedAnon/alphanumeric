@@ -1,6 +1,5 @@
 use blake3;
 use dashmap::DashMap;
-use futures::executor::block_on;
 use lazy_static::lazy_static;
 use log::{debug, error, warn};
 use lru::LruCache;
@@ -297,7 +296,9 @@ impl Transaction {
     }
 
     pub fn total_debit_units(&self) -> i128 {
-        self.amount_units + self.fee_units
+        // saturating (defense-in-depth): callers already gate on checked_add via
+        // has_valid_regular_amounts, but never silently wrap if that guard is bypassed.
+        self.amount_units.saturating_add(self.fee_units)
     }
 
     pub fn has_valid_regular_amounts(&self) -> bool {
@@ -332,64 +333,6 @@ impl Transaction {
             pub_key: None,
             sig_hash: None,
         }
-    }
-
-    pub fn create_and_sign(
-        sender: String,
-        recipient: String,
-        amount: f64,
-        sender_wallet: &Wallet,
-    ) -> Result<Self, String> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let fee = amount * FEE_PERCENTAGE;
-
-        let transaction = Self {
-            sender,
-            recipient,
-            amount_units: Self::to_units(amount),
-            fee_units: Self::to_units(fee),
-            timestamp,
-            signature: None,
-            pub_key: None,
-            sig_hash: None,
-        };
-
-        let transaction_data = serde_json::to_vec(&transaction)
-            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-
-        // Sign and decode into bytes for signature hash + verification.
-        let full_signature_hex = block_on(sender_wallet.sign_transaction(&transaction_data))
-            .ok_or("Failed to sign transaction")?;
-        let full_signature = hex::decode(&full_signature_hex)
-            .map_err(|e| format!("Invalid signature hex: {}", e))?;
-
-        // Create new transaction with full signature for verification
-        let mut tx_with_full_sig = Self::new(
-            transaction.sender.clone(),
-            transaction.recipient.clone(),
-            transaction.amount(),
-            transaction.fee(),
-            transaction.timestamp,
-            Some(full_signature_hex),
-        );
-        tx_with_full_sig.sig_hash = Some(Self::signature_hash_hex(&full_signature));
-        tx_with_full_sig.pub_key =
-            Some(block_on(sender_wallet.get_public_key_hex()).ok_or("Failed to get public key")?);
-
-        // Verify the full signature
-        if let Some(pub_key) = &tx_with_full_sig.pub_key {
-            if !tx_with_full_sig.is_valid(pub_key) {
-                return Err("Signature verification failed".to_string());
-            }
-        } else {
-            return Err("Failed to get public key".to_string());
-        }
-
-        Ok(tx_with_full_sig)
     }
 
     pub fn create_hash(&self) -> String {
