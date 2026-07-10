@@ -4746,9 +4746,14 @@ impl Node {
                 );
             }
         }
-        // Validate + admit through the canonical path.
+        // Validate + admit through the canonical path. M2: a READ lock suffices --
+        // add_transaction is &self and serializes its balance-check + mempool mutation on
+        // state_mutation_lock (the same lock save_block/finalize_block take, same order),
+        // so a write lock added no exclusion, it only held the exclusive blockchain lock
+        // across the CPU-heavy ML-DSA verify. Read lets admissions verify concurrently and
+        // stops starving readers/mining during a tx burst.
         let submit = {
-            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.write()).await else {
+            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
                 return Self::explorer_busy();
             };
             chain.add_transaction(tx.clone()).await
@@ -8100,9 +8105,11 @@ impl Node {
 
                 // Validate transaction before adding
                 if self.validate_transaction(&tx, None).await? {
-                    // Add to blockchain
+                    // Add to blockchain. M2: read lock suffices -- add_transaction
+                    // self-serializes on state_mutation_lock, so the write lock only held
+                    // the exclusive lock across the ML-DSA verify (see submit-tx handler).
                     {
-                        let blockchain = self.blockchain.write().await;
+                        let blockchain = self.blockchain.read().await;
                         blockchain.add_transaction(tx.clone()).await?;
                     }
 
@@ -8424,9 +8431,10 @@ impl Node {
                     );
                     self.maybe_prune_validation_cache();
 
-                    // Add to blockchain
+                    // Add to blockchain. M2: read lock suffices (add_transaction
+                    // self-serializes on state_mutation_lock; write held it across verify).
                     let tx_added = {
-                        let blockchain = self.blockchain.write().await;
+                        let blockchain = self.blockchain.read().await;
                         blockchain.add_transaction((*tx_ref).clone()).await.is_ok()
                     };
                     if tx_added {
