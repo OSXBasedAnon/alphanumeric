@@ -976,12 +976,17 @@ struct StatsResponse {
     uptime_secs: u64,
 }
 
-/// State for the opt-in read-only explorer API (see start_explorer_server).
+/// State for the opt-in explorer API (see start_explorer_server).
 #[derive(Clone)]
 struct ExplorerState {
     blockchain: Arc<RwLock<Blockchain>>,
+    node: Node,
     start_time: u64,
     network_id: [u8; 32],
+    // Coarse per-process token bucket for the write endpoint (submit-tx). The
+    // per-sender mempool rate limit is the real guard; this only blunts a flood
+    // of junk that would fail validation, keeping it off the mempool lock.
+    submit_bucket: Arc<PLMutex<(Instant, f64)>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2575,10 +2580,17 @@ impl Node {
                         by_hash.entry(b.hash).or_insert(b);
                     }
                 }
-                // Empty-but-200 in a below-tip window, or an outright error: a gap. If it
-                // is within reorg reach retry (Transient); if deeper, the history is gone
-                // and only a snapshot recovers it (NeedsBootstrap).
-                Ok(_) | Err(_) => return gap_verdict(expected_height),
+                // Empty-but-200 in a below-tip window IS a genuine gap: depth decides —
+                // within reorg reach retry (Transient), deeper the history is gone and only
+                // a snapshot recovers it (NeedsBootstrap).
+                Ok(_) => return gap_verdict(expected_height),
+                // A network ERROR (429 rate-limit, timeout, 5xx) tells us NOTHING about
+                // whether the history exists — it's a transient relay hiccup. Treat it as
+                // Transient and retry; never self-bootstrap or freeze the applied tip on it.
+                // (audit finding #6: a pool's own /api/blocks GETs getting rate-limited
+                // under sustained load was misclassified as a chain gap → BeaconStale freeze
+                // / needless NeedsBootstrap restart.)
+                Err(_) => return Ancestor::Transient,
             }
 
             // Walk the prev-hash chain down through the bodies we now hold.
@@ -4512,6 +4524,7 @@ impl Node {
                 "/explorer/tx/{height}/{position}",
                 "/explorer/address/{address}?limit=&before_height=&before_pos=",
                 "/explorer/supply",
+                "POST /explorer/submit-tx  (body: signed transaction JSON)",
             ],
         }))
     }
@@ -4682,6 +4695,96 @@ impl Node {
         (StatusCode::OK, Json(payload))
     }
 
+    /// Submit a signed transaction to the network (opt-in explorer API write path).
+    /// This is the endpoint web wallets / exchanges POST a signed tx to. It changes
+    /// NO consensus surface: the tx goes through the SAME add_transaction validation
+    /// the CLI `create` uses (signature, balance, replay guard, already-confirmed
+    /// gate), and on acceptance is announced via the SAME gossip path. A node only
+    /// serves this when its operator sets ALPHANUMERIC_EXPLORER_API — the publisher
+    /// and ordinary clients never do, so existing infra is untouched.
+    async fn explorer_submit_tx_handler(
+        State(state): State<ExplorerState>,
+        Json(tx): Json<Transaction>,
+    ) -> (StatusCode, Json<Value>) {
+        // Coarse token bucket (refill 5/s, cap 20): a cheap flood guard so junk
+        // that would fail validation can't hammer the mempool write lock. The real
+        // rule is the per-sender rate limit inside add_transaction.
+        {
+            let mut b = state.submit_bucket.lock();
+            let now = Instant::now();
+            b.1 = (b.1 + now.duration_since(b.0).as_secs_f64() * 5.0).min(20.0);
+            b.0 = now;
+            if b.1 < 1.0 {
+                return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+            }
+            b.1 -= 1.0;
+        }
+        if tx.sender.is_empty() || tx.recipient.is_empty() {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "missing sender or recipient");
+        }
+        // M1: report duplicates EXPLICITLY instead of the bare 200 the mempool's
+        // Ok-on-collision would otherwise yield. An identical (sender, recipient,
+        // amount, fee, timestamp) tuple produces a byte-identical signed tx, so a
+        // caller's intended *second* same-second payment is indistinguishable from a
+        // resend and would otherwise vanish silently. Read-only pre-check on the opt-in
+        // explorer endpoint; the admission / propagation / consensus path below is
+        // unchanged. (audit M1 — residual of the now-fixed C02 replay finding)
+        let tx_id = tx.get_tx_id();
+        {
+            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+                return Self::explorer_busy();
+            };
+            if let Some(height) = chain.confirmed_tx_height(&tx_id) {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_confirmed",
+                        "tx_id": tx_id.clone(), "height": height
+                    })),
+                );
+            }
+            if chain.get_mempool_transaction_by_id(&tx_id).await.is_some() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_pending", "tx_id": tx_id.clone(),
+                        "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
+                    })),
+                );
+            }
+        }
+        // Validate + admit through the canonical path. M2: a READ lock suffices --
+        // add_transaction is &self and serializes its balance-check + mempool mutation on
+        // state_mutation_lock (the same lock save_block/finalize_block take, same order),
+        // so a write lock added no exclusion, it only held the exclusive blockchain lock
+        // across the CPU-heavy ML-DSA verify. Read lets admissions verify concurrently and
+        // stops starving readers/mining during a tx burst.
+        let submit = {
+            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+                return Self::explorer_busy();
+            };
+            chain.add_transaction(tx.clone()).await
+        };
+        match submit {
+            Ok(()) => {
+                // Announce now (mesh + peers) instead of waiting for the periodic
+                // re-gossip, so a withdrawal propagates immediately. Detached: the
+                // HTTP response never blocks on network I/O.
+                let node = state.node.clone();
+                let announce = tx.clone();
+                tokio::spawn(async move { node.gossip_transaction(&announce).await });
+                (
+                    StatusCode::OK,
+                    Json(json!({ "ok": true, "status": "accepted", "tx_id": tx.get_tx_id() })),
+                )
+            }
+            Err(e) => Self::explorer_err(
+                StatusCode::BAD_REQUEST,
+                &format!("transaction rejected: {}", e),
+            ),
+        }
+    }
+
     /// Start the explorer API iff ALPHANUMERIC_EXPLORER_API is set. Accepts
     /// `host:port` or a bare port (bound to 127.0.0.1). Loopback is the intended
     /// deployment; binding wider is allowed but warned — the operator's reverse
@@ -4710,8 +4813,10 @@ impl Node {
 
         let state = ExplorerState {
             blockchain: Arc::clone(&self.blockchain),
+            node: self.clone(),
             start_time: self.start_time,
             network_id: self.network_id,
+            submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
         };
 
         let app = Router::new()
@@ -4729,6 +4834,10 @@ impl Node {
                 get(Self::explorer_address_handler),
             )
             .route("/explorer/supply", get(Self::explorer_supply_handler))
+            .route(
+                "/explorer/submit-tx",
+                axum::routing::post(Self::explorer_submit_tx_handler),
+            )
             .with_state(state);
 
         let listener = std::net::TcpListener::bind(addr).map_err(|e| {
@@ -8003,9 +8112,11 @@ impl Node {
 
                 // Validate transaction before adding
                 if self.validate_transaction(&tx, None).await? {
-                    // Add to blockchain
+                    // Add to blockchain. M2: read lock suffices -- add_transaction
+                    // self-serializes on state_mutation_lock, so the write lock only held
+                    // the exclusive lock across the ML-DSA verify (see submit-tx handler).
                     {
-                        let blockchain = self.blockchain.write().await;
+                        let blockchain = self.blockchain.read().await;
                         blockchain.add_transaction(tx.clone()).await?;
                     }
 
@@ -8327,9 +8438,10 @@ impl Node {
                     );
                     self.maybe_prune_validation_cache();
 
-                    // Add to blockchain
+                    // Add to blockchain. M2: read lock suffices (add_transaction
+                    // self-serializes on state_mutation_lock; write held it across verify).
                     let tx_added = {
-                        let blockchain = self.blockchain.write().await;
+                        let blockchain = self.blockchain.read().await;
                         blockchain.add_transaction((*tx_ref).clone()).await.is_ok()
                     };
                     if tx_added {

@@ -118,9 +118,10 @@ impl Wallet {
         let address = hex::encode(&hasher.finalize()[..20]);
         let wallet_name = format!("Wallet_{}", &address[0..6]);
 
-        // Create combined key bytes with both secret and public
-        let mut combined_key_bytes = secret_key_bytes.clone();
-        combined_key_bytes.extend(&public_key_bytes);
+        // Create combined key bytes with both secret and public. Zeroizing so the
+        // transient plaintext seed is wiped on drop (defense-in-depth; audit M4/L07).
+        let mut combined_key_bytes = Zeroizing::new(secret_key_bytes.clone());
+        combined_key_bytes.extend_from_slice(&public_key_bytes);
 
         // Store the keypair
         let keys = WalletKeys {
@@ -133,10 +134,10 @@ impl Wallet {
             if !pass.is_empty() {
                 Self::encrypt_private_key(&combined_key_bytes, pass)?
             } else {
-                combined_key_bytes
+                combined_key_bytes.to_vec()
             }
         } else {
-            combined_key_bytes
+            combined_key_bytes.to_vec()
         };
 
         Ok(Self {
@@ -155,12 +156,13 @@ impl Wallet {
         passphrase: Option<&[u8]>,
         is_encrypted: bool,
     ) -> Result<Self, String> {
-        let combined_bytes = if is_encrypted {
+        // Zeroizing so the decrypted plaintext seed is wiped on drop (audit M4/L07).
+        let combined_bytes = Zeroizing::new(if is_encrypted {
             let pass = passphrase.ok_or("Passphrase required for encrypted wallet")?;
             Self::decrypt_private_key(encrypted_private_key.clone(), pass)?
         } else {
             encrypted_private_key.clone()
-        };
+        });
 
         let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
