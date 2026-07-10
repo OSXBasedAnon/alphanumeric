@@ -2580,10 +2580,17 @@ impl Node {
                         by_hash.entry(b.hash).or_insert(b);
                     }
                 }
-                // Empty-but-200 in a below-tip window, or an outright error: a gap. If it
-                // is within reorg reach retry (Transient); if deeper, the history is gone
-                // and only a snapshot recovers it (NeedsBootstrap).
-                Ok(_) | Err(_) => return gap_verdict(expected_height),
+                // Empty-but-200 in a below-tip window IS a genuine gap: depth decides —
+                // within reorg reach retry (Transient), deeper the history is gone and only
+                // a snapshot recovers it (NeedsBootstrap).
+                Ok(_) => return gap_verdict(expected_height),
+                // A network ERROR (429 rate-limit, timeout, 5xx) tells us NOTHING about
+                // whether the history exists — it's a transient relay hiccup. Treat it as
+                // Transient and retry; never self-bootstrap or freeze the applied tip on it.
+                // (audit finding #6: a pool's own /api/blocks GETs getting rate-limited
+                // under sustained load was misclassified as a chain gap → BeaconStale freeze
+                // / needless NeedsBootstrap restart.)
+                Err(_) => return Ancestor::Transient,
             }
 
             // Walk the prev-hash chain down through the bodies we now hold.
