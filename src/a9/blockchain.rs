@@ -3094,8 +3094,20 @@ impl Blockchain {
         let mut recent: std::collections::VecDeque<(u32, String, i128)> =
             std::collections::VecDeque::new();
         if let Some(tip) = self.highest_block_index() {
+            let mut missing = 0u32;
+            let mut first_missing = 0u32;
             for h in 0..=tip {
                 let Ok(block) = self.get_block(h) else {
+                    // M23: blocks are never pruned, so a gap in [0, tip] is genuine on-disk
+                    // corruption. Skipping it silently (as before) rebuilds WRONG balances
+                    // that still look authoritative because `tip` is unchanged. Count and
+                    // alarm loudly so the corruption is visible. Deliberately NOT a hard
+                    // fail: one bad old block must not strand a node whose recent state is
+                    // fine, and there is no pruning path that makes a gap legitimate.
+                    if missing == 0 {
+                        first_missing = h;
+                    }
+                    missing += 1;
                     continue;
                 };
                 Self::replay_apply_block_checked(
@@ -3104,6 +3116,18 @@ impl Blockchain {
                     &mut balances,
                     &mut recent,
                 )?;
+            }
+            if missing > 0 {
+                log::error!(
+                    "rebuild_balances_index: {} of {} blocks in [0, {}] failed to load \
+                     (first at height {}) and were SKIPPED -- rebuilt balances are \
+                     INCOMPLETE and almost certainly WRONG. The block DB is corrupt; \
+                     restore from a good snapshot or re-sync from the network.",
+                    missing,
+                    tip + 1,
+                    tip,
+                    first_missing,
+                );
             }
         }
 
