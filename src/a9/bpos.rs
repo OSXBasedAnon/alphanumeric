@@ -2640,28 +2640,36 @@ impl HeaderSentinel {
     }
 
     async fn manage_header_cache(&self) -> Result<(), String> {
-        let mut headers = self.headers.write().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Remove old headers (older than 24 hours)
-        headers.retain(|state| now - state.timestamp < 24 * 3600);
-
-        // If still too many headers, keep only the most recent ones
-        if headers.len() > self.max_headers {
-            let excess = headers.len() - self.max_headers;
-            for _ in 0..excess {
-                headers.pop_front();
+        // Header-cache cleanup under the `headers` lock ONLY, in its own scope so the
+        // guard is RELEASED before we touch `sync_state` below. Holding `headers`
+        // across `sync_state.write()` (as this used to) is the inverse of the order
+        // `add_verified_header` uses (sync_state -> headers): an ABBA deadlock that,
+        // once the cache filled (max_headers), could permanently wedge the header
+        // subsystem when two per-block tasks interleaved (2026-07-09 audit H2). These
+        // two cleanups are independent, so releasing early is behavior-preserving.
+        {
+            let mut headers = self.headers.write().await;
+            // Remove old headers (older than 24 hours)
+            headers.retain(|state| now - state.timestamp < 24 * 3600);
+            // If still too many headers, keep only the most recent ones
+            if headers.len() > self.max_headers {
+                let excess = headers.len() - self.max_headers;
+                for _ in 0..excess {
+                    headers.pop_front();
+                }
             }
         }
 
-        // Clean up verifications (DashMap doesn't need write lock)
+        // Clean up verifications (DashMap — no lock needed)
         self.verifications
             .retain(|_, v| now - v.timestamp < 24 * 3600);
 
-        // Update sync state
+        // Update sync state — acquired AFTER the `headers` guard above is dropped.
         let mut sync_state = self.sync_state.write().await;
         sync_state.participating_nodes.retain(|node| {
             self.verifications
@@ -2748,6 +2756,12 @@ impl HeaderSentinel {
                 .verifiers
                 .insert(node_id.clone());
         }
+        // Release the sync_state read guard BEFORE acquiring headers.write() below.
+        // Holding a sync_state guard across headers.write() is the second half of the
+        // ABBA with manage_header_cache (headers -> sync_state); sync_state is not read
+        // past this point, so dropping it here keeps the two locks strictly ordered
+        // (2026-07-09 audit H2).
+        drop(sync_state);
 
         let (verification_count, verified_by) = self
             .verifications
