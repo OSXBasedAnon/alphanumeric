@@ -1497,6 +1497,14 @@ impl Blockchain {
         self.confirmed_tx_index(tx_id).is_some()
     }
 
+    /// The canonical height at which `tx_id` was confirmed, or None if not yet
+    /// confirmed. Read-only public wrapper over the replay registry, for explorer /
+    /// mempool-hygiene callers that want to report *where* a tx already landed
+    /// (e.g. the submit-tx duplicate response). Consensus paths use the index directly.
+    pub fn confirmed_tx_height(&self, tx_id: &str) -> Option<u32> {
+        self.confirmed_tx_index(tx_id)
+    }
+
     /// Remove every mempool transaction that is already confirmed on the canonical
     /// chain. Confirmed txs can re-enter the mempool through gossip echoes or reorg
     /// reconciliation; any block template built while one is present fails

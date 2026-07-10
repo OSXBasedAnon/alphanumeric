@@ -4715,6 +4715,37 @@ impl Node {
         if tx.sender.is_empty() || tx.recipient.is_empty() {
             return Self::explorer_err(StatusCode::BAD_REQUEST, "missing sender or recipient");
         }
+        // M1: report duplicates EXPLICITLY instead of the bare 200 the mempool's
+        // Ok-on-collision would otherwise yield. An identical (sender, recipient,
+        // amount, fee, timestamp) tuple produces a byte-identical signed tx, so a
+        // caller's intended *second* same-second payment is indistinguishable from a
+        // resend and would otherwise vanish silently. Read-only pre-check on the opt-in
+        // explorer endpoint; the admission / propagation / consensus path below is
+        // unchanged. (audit M1 — residual of the now-fixed C02 replay finding)
+        let tx_id = tx.get_tx_id();
+        {
+            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+                return Self::explorer_busy();
+            };
+            if let Some(height) = chain.confirmed_tx_height(&tx_id) {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_confirmed",
+                        "tx_id": tx_id.clone(), "height": height
+                    })),
+                );
+            }
+            if chain.get_mempool_transaction_by_id(&tx_id).await.is_some() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_pending", "tx_id": tx_id.clone(),
+                        "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
+                    })),
+                );
+            }
+        }
         // Validate + admit through the canonical path.
         let submit = {
             let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.write()).await else {
@@ -4732,7 +4763,7 @@ impl Node {
                 tokio::spawn(async move { node.gossip_transaction(&announce).await });
                 (
                     StatusCode::OK,
-                    Json(json!({ "ok": true, "tx_id": tx.get_tx_id() })),
+                    Json(json!({ "ok": true, "status": "accepted", "tx_id": tx.get_tx_id() })),
                 )
             }
             Err(e) => Self::explorer_err(
