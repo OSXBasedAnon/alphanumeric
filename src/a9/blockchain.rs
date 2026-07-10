@@ -4331,6 +4331,17 @@ impl Blockchain {
             return Err(BlockchainError::SelfTransferNotAllowed);
         }
 
+        // Reject reserved-key collisions at mempool admission (L53): a real address is
+        // 40 lowercase hex chars, so it can never begin with the "__" prefix used for
+        // internal balances-tree markers (e.g. BALANCES_HEIGHT_KEY = "__height"). A tx
+        // crediting such a string would clobber that marker when the balances index is
+        // rebuilt. Admission-only, like the self-transfer guard above, so block validity
+        // is unchanged (a block-validation reject could fork on any such tx already in
+        // chain history).
+        if transaction.sender.starts_with("__") || transaction.recipient.starts_with("__") {
+            return Err(BlockchainError::InvalidTransaction);
+        }
+
         // Signature verification with public key binding
         let pub_key = match transaction.pub_key.as_ref() {
             Some(pk) => pk,
