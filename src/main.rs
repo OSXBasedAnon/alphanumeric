@@ -775,6 +775,9 @@ async fn async_main() -> Result<()> {
                 max_peers: config.network.max_peers,
                 max_connections: config.network.max_connections,
                 seed_nodes: config.network.seed_nodes.clone(),
+                // Peer cache lives next to the chain DB so it survives reboots
+                // (the temp-dir default gets wiped exactly when it matters).
+                data_dir: Some(db_path.clone()),
             },
         )
         .await {
@@ -1410,6 +1413,7 @@ async fn async_main() -> Result<()> {
 
     // Get total wallets and balance first
     let mut total_balance = 0.0;
+    let mut total_maturing = 0.0;
     let mut processed_wallets = 0;
 
     // Calculate total balance under a SHORT-LIVED guard, dropped before anything
@@ -1420,8 +1424,12 @@ async fn async_main() -> Result<()> {
     {
         let blockchain_guard = blockchain.read().await;
         for wallet in wallets.values() {
-            if let Ok(balance) = blockchain_guard.get_wallet_balance(&wallet.address).await {
-                total_balance += balance;
+            if let Ok(breakdown) = blockchain_guard
+                .get_wallet_balance_breakdown(&wallet.address)
+                .await
+            {
+                total_balance += breakdown.spendable;
+                total_maturing += breakdown.maturing.iter().map(|(_, amount)| amount).sum::<f64>();
                 processed_wallets += 1;
             }
         }
@@ -1451,6 +1459,13 @@ async fn async_main() -> Result<()> {
     color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
     stdout.set_color(&color_spec)?;
     writeln!(stdout, "Total Balance:   {:.8} ♦", total_balance)?;
+    // M06: freshly mined coinbases are credited but not yet spendable; without this
+    // line a miner's info screen under-reads their holdings for ~8 minutes per reward.
+    if total_maturing > 0.0 {
+        color_spec.set_fg(Some(Color::Rgb(128, 128, 128)));
+        stdout.set_color(&color_spec)?;
+        writeln!(stdout, "Maturing:        {:.8} ♦ (mining rewards, not yet spendable)", total_maturing)?;
+    }
     stdout.reset()?;
 
     // Node Status
@@ -1505,7 +1520,8 @@ async fn async_main() -> Result<()> {
     let network_snapshot = tokio::time::timeout(Duration::from_secs(3), async {
         let health = sentinel.get_network_metrics().await.ok()?;
         let active_peers = node.peers.read().await.len();
-        Some((health, active_peers))
+        let mesh_links = node.mesh_link_count().await;
+        Some((health, active_peers, mesh_links))
     })
     .await
     .ok()
@@ -1516,7 +1532,7 @@ async fn async_main() -> Result<()> {
         writeln!(stdout, "Unavailable while the node syncs — try again shortly.")?;
         stdout.reset()?;
     }
-    if let Some((health, active_peers)) = network_snapshot {
+    if let Some((health, active_peers, mesh_links)) = network_snapshot {
         let gateway_peers = gateway_overview
             .as_ref()
             .and_then(|overview| overview.peers)
@@ -1534,9 +1550,20 @@ async fn async_main() -> Result<()> {
         }
         color_spec.set_fg(Some(Color::Rgb(167, 165, 198)));
         stdout.set_color(&color_spec)?;
-        // Direct p2p is expected to be 0 for NAT'd nodes — the network runs over the
-        // gateway relay, not a p2p mesh, so this being 0 is normal, not a fault.
-        writeln!(stdout, "Direct P2P:      {} (relay mode)", active_peers)?;
+        // LOCAL connectivity, distinct from the gateway roster above: during a
+        // gateway outage the roster reads 0 while these links keep gossiping
+        // (2026-07-10 incident: "every node lost its peer list" was the roster
+        // display, not real connections). 0 TCP is normal for NAT'd nodes — the
+        // mesh is their direct-link layer.
+        if active_peers == 0 && mesh_links == 0 {
+            writeln!(stdout, "Direct P2P:      0 (relay mode)")?;
+        } else {
+            writeln!(
+                stdout,
+                "Direct P2P:      {} TCP + {} mesh link(s)",
+                active_peers, mesh_links
+            )?;
+        }
         color_spec.set_fg(Some(Color::Rgb(247, 111, 142)));
         stdout.set_color(&color_spec)?;
         writeln!(stdout, "Network Load:    {:.1}%", health.network_load * 100.0)?; 
@@ -1969,7 +1996,7 @@ println!("Wallet renamed successfully");
                                 if lost_race && continuous {
                                     consecutive_mine_errors = 0;
                                     println!(
-                                        "Lost the race for this block (another miner's was adopted) — retargeting the new tip…"
+                                        "Lost the race for this block (another miner's was adopted, no reward for this solve) — retargeting the new tip…"
                                     );
                                     let jitter_ms = 1_000
                                         + (SystemTime::now()
@@ -1983,6 +2010,16 @@ println!("Wallet renamed successfully");
                                     )
                                     .await;
                                     continue 'mining;
+                                }
+                                if lost_race {
+                                    // Single-shot mine: same lost race, but the loop exits.
+                                    // Say what actually happened — "Mining error: Block
+                                    // header is invalid" reads as a fault when it's a
+                                    // photo-finish loss to another miner.
+                                    println!(
+                                        "Lost the race for this block (another miner's was adopted) — no reward for this solve. Run `mine` again to compete for the next one."
+                                    );
+                                    break 'mining;
                                 }
                                 println!("Mining error: {}", e);
                                 if !continuous {
