@@ -2198,6 +2198,16 @@ impl Blockchain {
     }
 
     fn store_orphan_block(&self, block: &Block) -> Result<(), BlockchainError> {
+        // Same finality invariant as prune_orphans: a block at/below the trusted
+        // checkpoint can never appear in an adoptable branch, so storing it only
+        // buys per-ingest branch-reassembly work. Dropping it here (instead of
+        // store-then-prune) also skips two tree flushes per dead block while a
+        // partitioned miner floods the relay with a finalized-depth fork.
+        let checkpoint = self.trusted_checkpoint_height();
+        if checkpoint > 0 && block.index <= checkpoint {
+            return Ok(());
+        }
+
         let orphan_blocks = self.open_orphan_blocks_tree()?;
         let orphan_index = self.open_orphan_index_tree()?;
         let hash_key = Self::orphan_hash_key(&block.hash);
@@ -2631,6 +2641,19 @@ impl Blockchain {
                 };
                 // Branch may be same-height competitor or longer. Adoption decision is based on work.
 
+                // Checkpoint finality, applied at SELECTION time: a branch forking
+                // at/below the trusted checkpoint can never be adopted (the same
+                // gate below rejects it after selection), so skip it before it can
+                // win the work comparison. Without this, a heavy dead branch — the
+                // live 2026-07-11 case: an incompatible client's ~770-block fork —
+                // out-works every honest candidate, gets fully validated under the
+                // write lock on EVERY ingest, and only then hits the post-selection
+                // checkpoint reject; honest same-height competitors lose the scan
+                // to a corpse and the node pays the validation tax forever.
+                if branch[0].index <= self.trusted_checkpoint_height() {
+                    continue;
+                }
+
                 let fork_height = branch[0].index;
                 // O(1) memoised lookup; the suffix covers every fork height in range.
                 let canonical_work = canonical_suffix
@@ -2952,6 +2975,7 @@ impl Blockchain {
         let mut remove_hashes: Vec<[u8; 32]> = Vec::new();
 
         let mut retained: Vec<OrphanStoredBlock> = Vec::new();
+        let checkpoint = self.trusted_checkpoint_height();
         for item in orphan_blocks.iter() {
             let (_, raw) = item?;
             if let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) {
@@ -2959,7 +2983,17 @@ impl Blockchain {
                 let stale_height = tip
                     .map(|t| entry.block.index.saturating_add(ORPHAN_REORG_DEPTH) < t)
                     .unwrap_or(false);
-                if expired || stale_height {
+                // Finality invariant applied to the pool: no adoptable branch may
+                // fork at/below the trusted checkpoint (branch[0].index must be
+                // above it), so an orphan AT or BELOW the checkpoint can never be
+                // part of an adopted branch — it is dead weight that only feeds
+                // branch re-assembly on every ingest. Pruning it also severs the
+                // ancestry of any long dead fork (the 2026-07-11 ~770-block
+                // incompatible-client branch) so it stops re-assembling at all.
+                // The checkpoint never regresses, so this can never discard a
+                // block a future reorg could want.
+                let finalized_below = checkpoint > 0 && entry.block.index <= checkpoint;
+                if expired || stale_height || finalized_below {
                     remove_hashes.push(entry.block.hash);
                 } else {
                     retained.push(entry);
