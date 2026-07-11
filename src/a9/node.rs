@@ -253,8 +253,16 @@ const EVENT_BROADCAST_CAPACITY: usize = 1000;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
 const OUTBOUND_POOL_IDLE_SECS: u64 = 90;
 const OUTBOUND_POOL_MAX_FACTOR: usize = 2;
-const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
-const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 30;
+// Per-peer outbound circuit breaker. Loosened 2026-07-11 (was 3 / 30s): under a
+// fork-storm send burst, 3 consecutive timeouts tripped the breaker on many peers
+// at once for a full 30s, and a node whose peers were all open could not broadcast
+// its own freshly-mined block — so it orphaned (rplant's report). 6 consecutive
+// failures before declaring a peer dead tolerates transient bursts; a 15s (not 30s)
+// open window retries a momentarily-congested peer sooner. Still bounds hammering a
+// genuinely dead peer. Per-peer and success-resetting, so this only widens the
+// transient-tolerance, it does not remove the protection.
+const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 6;
+const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 15;
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
@@ -1829,10 +1837,20 @@ impl Node {
     }
 
     fn relay_sync_backfill_depth() -> u32 {
+        // Default 64 (= CHECKPOINT_REORG_MARGIN, 2026-07-11): the forward relay
+        // drain re-examines the finality-margin window below its tip, so a fork
+        // within the reorgable range self-heals on the forward path too, not only
+        // via converge's backward ancestor walk. Was 0 (pure forward-from-tip+1),
+        // which left a behind-but-on-canonical node unable to reconcile any shallow
+        // divergence — rplant's report, 2026-07-11. Only runs on behind-node
+        // catch-up paths, and one extra 64-block batch per call, so relay-GET load
+        // is bounded. (The witness-truncated case is handled by relay rehydration,
+        // not by re-pulling — see the S-01 path; this default only helps the
+        // on-canonical-but-behind case.)
         std::env::var("ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN)
             .min(256)
     }
 
