@@ -593,7 +593,7 @@ impl MiningManager {
                                                 pb.reset();
                                                 pb.set_prefix(format!("Block #{}", header.number));
                                                 pb.set_message(
-                                                    "Solved stale block; mining next network tip...",
+                                                    "Solved a stale height (another miner's block was adopted — no reward); mining the new tip...",
                                                 );
                                             }
                                             continue 'mining;

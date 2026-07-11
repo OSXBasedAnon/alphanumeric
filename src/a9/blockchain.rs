@@ -1053,6 +1053,28 @@ struct ChainStateDirty {
     marked_at: u64,
 }
 
+/// Display breakdown of get_wallet_balance: the same numbers it nets together, returned
+/// separately so UIs can show Total / Spendable / Maturing instead of a bare spendable
+/// figure that silently hides fresh coinbases for MINING_REWARD_MATURITY blocks (which
+/// users read as "mined a block but got no reward"). Display-only — spendability is
+/// still enforced by the consensus gates; `spendable` here is exactly what
+/// get_wallet_balance returns (it delegates to this).
+#[derive(Clone, Debug)]
+pub struct WalletBalanceBreakdown {
+    /// RAW confirmed ledger total, including still-immature coinbases.
+    pub confirmed: f64,
+    /// In-flight mempool debits against this address.
+    pub pending_debit: f64,
+    /// confirmed − pending_debit − immature: what the address can spend right now.
+    pub spendable: f64,
+    /// Still-immature MINING_REWARDS credits as (reward_height, amount), ascending by
+    /// height. A reward at height rh leaves this set once the tip reaches
+    /// rh + MINING_REWARD_MATURITY − 1.
+    pub maturing: Vec<(u32, f64)>,
+    /// The tip height this breakdown was computed against (for countdown math).
+    pub as_of_height: u64,
+}
+
 impl Blockchain {
     fn block_index_from_key(key: &[u8]) -> Option<u32> {
         let key_str = std::str::from_utf8(key).ok()?;
@@ -3398,33 +3420,53 @@ impl Blockchain {
     /// `in_flight` — the block being validated, whose own coinbase is not in storage yet).
     /// Returns 0 below the activation height. Implements the SAME predicate rh+MATURITY>h as
     /// replay_apply_block_checked, so the scan path and the replay path agree for a given chain.
+    /// Delegates to immature_coinbase_details so the enforced total and the displayed
+    /// per-reward breakdown can never drift.
     fn immature_reward_units_scan(
         &self,
         address: &str,
         spend_height: u64,
         in_flight: &[Transaction],
     ) -> i128 {
+        self.immature_coinbase_details(address, spend_height, in_flight)
+            .iter()
+            .map(|(_, amount_units)| *amount_units)
+            .sum()
+    }
+
+    /// The M06 overlay's per-reward view: every still-immature MINING_REWARDS credit to
+    /// `address` at `spend_height`, as (reward_height, amount_units) in ascending height
+    /// order (in-flight coinbases, at `spend_height` itself, last). This is the single
+    /// implementation of the maturity predicate — immature_reward_units_scan is its sum —
+    /// so any UI built on it shows exactly the set the affordability gates enforce.
+    /// Empty below the activation height.
+    fn immature_coinbase_details(
+        &self,
+        address: &str,
+        spend_height: u64,
+        in_flight: &[Transaction],
+    ) -> Vec<(u32, i128)> {
         if (spend_height as u32) < MATURITY_ACTIVATION_HEIGHT {
-            return 0;
+            return Vec::new();
         }
         let mat = MINING_REWARD_MATURITY as u64;
-        let mut imm: i128 = 0;
-        for tx in in_flight {
-            if tx.sender == "MINING_REWARDS" && tx.recipient == address {
-                imm += tx.amount_units;
-            }
-        }
+        let mut details: Vec<(u32, i128)> = Vec::new();
         let low = spend_height.saturating_sub(mat).saturating_add(1);
         for rh in low..spend_height {
             if let Ok(b) = self.get_block(rh as u32) {
                 for tx in &b.transactions {
                     if tx.sender == "MINING_REWARDS" && tx.recipient == address {
-                        imm += tx.amount_units;
+                        details.push((rh as u32, tx.amount_units));
                     }
                 }
             }
         }
-        imm
+        for tx in in_flight {
+            if tx.sender == "MINING_REWARDS" && tx.recipient == address {
+                details.push((spend_height as u32, tx.amount_units));
+            }
+        }
+        details
     }
 
     /// Dry-run: would the chain formed by canonical blocks below `fork_start`
@@ -5327,16 +5369,36 @@ impl Blockchain {
 
     // Public method that shows spendable balance to users
     pub async fn get_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
+        Ok(self.get_wallet_balance_breakdown(address).await?.spendable)
+    }
+
+    /// get_wallet_balance with its components kept separate (see WalletBalanceBreakdown).
+    /// Same cost as get_wallet_balance — one confirmed read, one pending read, one
+    /// maturity-window scan — so display callers can switch to this for free.
+    pub async fn get_wallet_balance_breakdown(
+        &self,
+        address: &str,
+    ) -> Result<WalletBalanceBreakdown, BlockchainError> {
         let confirmed = self.get_confirmed_balance(address).await?;
         let pending_debit = self.get_pending_debit_for(address).await?;
         // M06 (display): exclude still-immature rewards from the spendable balance the UI/send
         // flow offers — they'd be rejected at consensus. Prospective next height, no in-flight.
-        let immature =
-            self.immature_reward_units_scan(address, self.get_latest_block_index() as u64 + 1, &[]);
+        let as_of_height = self.get_latest_block_index() as u64;
+        let maturing_units = self.immature_coinbase_details(address, as_of_height + 1, &[]);
+        let immature: i128 = maturing_units.iter().map(|(_, amt)| *amt).sum();
         let net_units = Transaction::to_units(confirmed)
             .saturating_sub(Transaction::to_units(pending_debit))
             .saturating_sub(immature);
-        Ok(Transaction::from_units(net_units))
+        Ok(WalletBalanceBreakdown {
+            confirmed,
+            pending_debit,
+            spendable: Transaction::from_units(net_units),
+            maturing: maturing_units
+                .into_iter()
+                .map(|(height, amt)| (height, Transaction::from_units(amt)))
+                .collect(),
+            as_of_height,
+        })
     }
 
     pub async fn update_wallet_balance(
@@ -6219,6 +6281,91 @@ mod tests {
             .map(|(_, _, amt)| *amt)
             .sum();
         assert_eq!(replay_immature, scanned, "scan and replay must agree on the immature total");
+    }
+
+    /// Display breakdown (WalletBalanceBreakdown): the maturing list must be exactly the
+    /// M06 overlay set — same 100-block window, same boundaries — and `spendable` must
+    /// equal get_wallet_balance (which delegates to the breakdown). Pins the "credited
+    /// but not yet spendable" display contract, both window edges, and the oldest reward
+    /// crossing the maturity boundary exactly one block later.
+    #[tokio::test]
+    async fn wallet_balance_breakdown_surfaces_maturing_coinbases() {
+        let bc = test_blockchain();
+        let act = MATURITY_ACTIVATION_HEIGHT;
+        let m = MINING_REWARD_MATURITY; // 100
+        let tip = act + 10; // 1510
+        // Contiguous chain 0..=tip; "M" mines four blocks around the maturity window:
+        // two already mature at the tip (outside the window), one at the window's lower
+        // edge, one at the tip itself.
+        let m_blocks: HashMap<u32, f64> = [
+            (act - 200, 2.0),   // 1300: long mature
+            (tip - m + 1, 3.0), // 1411: exactly below the window (low edge is 1412)
+            (tip - m + 2, 5.0), // 1412: oldest still-immature -> matures next block
+            (tip, 7.0),         // 1510: fresh at the tip
+        ]
+        .into_iter()
+        .collect();
+        let mut prev = [0u8; 32];
+        for h in 0..=tip {
+            let (miner, amount) = match m_blocks.get(&h) {
+                Some(amount) => ("M", *amount),
+                None => ("other", 1.0),
+            };
+            let b = metadata_test_block(h, prev, miner, amount);
+            prev = b.hash;
+            insert_raw_block(&bc, &b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        let breakdown = bc.get_wallet_balance_breakdown("M").await.unwrap();
+        assert_eq!(breakdown.as_of_height, tip as u64);
+        assert_eq!(
+            breakdown.maturing,
+            vec![(tip - m + 2, 5.0), (tip, 7.0)],
+            "exactly the coinbases inside the maturity window, ascending by height"
+        );
+        assert_eq!(breakdown.confirmed, 17.0, "confirmed includes immature coinbases");
+        assert_eq!(breakdown.spendable, 5.0, "spendable excludes the maturing portion");
+        assert_eq!(
+            breakdown.spendable,
+            bc.get_wallet_balance("M").await.unwrap(),
+            "get_wallet_balance must be exactly the breakdown's spendable"
+        );
+
+        // One more block and the 1412 reward crosses the boundary (tip reaches rh+m-1).
+        let next = metadata_test_block(tip + 1, prev, "other", 1.0);
+        insert_raw_block(&bc, &next);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        let after = bc.get_wallet_balance_breakdown("M").await.unwrap();
+        assert_eq!(
+            after.maturing,
+            vec![(tip, 7.0)],
+            "oldest maturing reward must leave the set exactly one block later"
+        );
+        assert_eq!(after.spendable, 10.0, "the just-matured reward becomes spendable");
+    }
+
+    /// Below the M06 activation height the overlay is off: a fresh coinbase is spendable
+    /// immediately and the breakdown reports nothing maturing.
+    #[tokio::test]
+    async fn wallet_balance_breakdown_empty_below_activation() {
+        let bc = test_blockchain();
+        let mut prev = [0u8; 32];
+        for h in 0..=10u32 {
+            let b = metadata_test_block(h, prev, if h == 10 { "M" } else { "other" }, 4.0);
+            prev = b.hash;
+            insert_raw_block(&bc, &b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        let breakdown = bc.get_wallet_balance_breakdown("M").await.unwrap();
+        assert!(breakdown.maturing.is_empty(), "overlay is a no-op below activation");
+        assert_eq!(breakdown.confirmed, 4.0);
+        assert_eq!(
+            breakdown.spendable, 4.0,
+            "fresh coinbase is spendable at once below activation"
+        );
     }
 
     // Regression for the mining-loop reentrant deadlock (the permanent freeze when a

@@ -17,13 +17,43 @@ use tokio::sync::RwLock;
 
 use crate::a9::blockchain::FEE_PERCENTAGE;
 use crate::a9::{
-    blockchain::{Block, Blockchain, BlockchainError, Transaction},
+    blockchain::{
+        Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
+        TARGET_BLOCK_TIME,
+    },
     miner::{BlockHeader as ProgPowHeader, Miner, ProgPowTransaction},
     wallet::Wallet,
 };
 
 const KEY_FILE_PATH: &str = "private.key";
 const MINING_NONCE_WINDOW: u64 = 67_108_864;
+
+/// Blocks until the coinbase mined at `reward_height` leaves the M06 immature set — i.e.
+/// until the wallet's spendable balance includes it. It drops out once the tip reaches
+/// reward_height + MINING_REWARD_MATURITY − 1 (the display's spend height is tip+1).
+/// Display-only; the enforced set comes from the breakdown itself.
+fn blocks_until_mature(reward_height: u32, as_of_height: u64) -> u64 {
+    (reward_height as u64)
+        .saturating_add(MINING_REWARD_MATURITY as u64 - 1)
+        .saturating_sub(as_of_height)
+}
+
+/// "47 blocks (≈3m55s)" — human ETA for a coinbase that becomes spendable `blocks_left`
+/// blocks from now, at the TARGET_BLOCK_TIME cadence. Display-only.
+fn format_maturity_eta(blocks_left: u64) -> String {
+    let secs = blocks_left.saturating_mul(TARGET_BLOCK_TIME);
+    let eta = if secs >= 60 {
+        format!("≈{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("≈{}s", secs)
+    };
+    format!(
+        "{} block{} ({})",
+        blocks_left,
+        if blocks_left == 1 { "" } else { "s" },
+        eta
+    )
+}
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -727,15 +757,44 @@ impl Mgmt {
                 writeln!(stdout, "───────────────────")?;
                 stdout.reset()?;
 
-                let final_balance = {
+                let breakdown = {
                     let blockchain_guard = blockchain.read().await;
                     blockchain_guard
-                        .get_wallet_balance(&miner_wallet.address)
+                        .get_wallet_balance_breakdown(&miner_wallet.address)
                         .await?
                 };
 
-                writeln!(stdout, "Mining reward: {} ♦", mining_reward)?;
-                writeln!(stdout, "New balance: {}", final_balance)?;
+                if breakdown.maturing.is_empty() {
+                    // Below the M06 activation height the reward is spendable at once.
+                    writeln!(stdout, "Mining reward: {} ♦", mining_reward)?;
+                    writeln!(stdout, "New balance: {}", breakdown.spendable)?;
+                } else {
+                    // M06: the coinbase is credited on-chain immediately but withheld from
+                    // the spendable balance until buried MINING_REWARD_MATURITY deep.
+                    // Say so explicitly — an unchanged "New balance" right after "Mining
+                    // successful" reads as a lost reward, not a maturing one.
+                    let eta = format_maturity_eta(blocks_until_mature(
+                        mined_block.index,
+                        breakdown.as_of_height,
+                    ));
+                    let maturing_total: f64 =
+                        breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                    writeln!(
+                        stdout,
+                        "Mining reward: {} ♦ — credited, spendable in {}",
+                        mining_reward, eta
+                    )?;
+                    writeln!(stdout, "Spendable balance: {}", breakdown.spendable)?;
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))?;
+                    writeln!(
+                        stdout,
+                        "Maturing: {:.8} ♦ ({} reward{} on the way)",
+                        maturing_total,
+                        breakdown.maturing.len(),
+                        if breakdown.maturing.len() == 1 { "" } else { "s" }
+                    )?;
+                    stdout.reset()?;
+                }
                 writeln!(stdout)?;
 
                 Ok(mined_block)
@@ -1001,8 +1060,8 @@ impl Mgmt {
                 let blockchain_guard = blockchain.read().await;
 
                 // Get balance atomically
-                let balance = match blockchain_guard.get_wallet_balance(addr).await {
-                    Ok(bal) => bal,
+                let breakdown = match blockchain_guard.get_wallet_balance_breakdown(addr).await {
+                    Ok(breakdown) => breakdown,
                     Err(e) => {
                         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
                         writeln!(stdout, "Error getting balance: {}", e)?;
@@ -1010,6 +1069,7 @@ impl Mgmt {
                         return Ok(());
                     }
                 };
+                let balance = breakdown.spendable;
 
                 // Get pending transactions
                 let mut pending_stats = (0, 0, 0.0, 0.0); // (out_count, in_count, out_amount, in_amount)
@@ -1068,6 +1128,32 @@ impl Mgmt {
                 writeln!(stdout, " ♦")?;
                 stdout.reset()?;
 
+                // M06: coinbases still inside the maturity window are credited on-chain
+                // but excluded from the spendable figure above — show them or a freshly
+                // mined reward reads as missing.
+                if !breakdown.maturing.is_empty() {
+                    let maturing_total: f64 =
+                        breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                    let next_left = breakdown
+                        .maturing
+                        .iter()
+                        .map(|(height, _)| blocks_until_mature(*height, breakdown.as_of_height))
+                        .min()
+                        .unwrap_or(0);
+                    stdout
+                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))
+                        .ok();
+                    writeln!(
+                        stdout,
+                        "  + {:.8} ♦ maturing ({} reward{}; next spendable in {})",
+                        maturing_total,
+                        breakdown.maturing.len(),
+                        if breakdown.maturing.len() == 1 { "" } else { "s" },
+                        format_maturity_eta(next_left)
+                    )?;
+                    stdout.reset()?;
+                }
+
                 // Pending Transactions Section
                 if pending_stats.0 > 0 || pending_stats.1 > 0 {
                     stdout
@@ -1124,7 +1210,10 @@ impl Mgmt {
                 if let Ok(total_supply_units) = blockchain_guard.total_confirmed_supply_units() {
                     let total_supply = Transaction::from_units(total_supply_units);
                     if total_supply > 0.0 {
-                        let network_share = (balance / total_supply) * 100.0;
+                        // Confirmed (not spendable) over confirmed supply — same units on
+                        // both sides; the old spendable numerator under-read the share of
+                        // any address holding maturing coinbases or pending debits.
+                        let network_share = (breakdown.confirmed / total_supply) * 100.0;
                         stdout
                             .set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                         writeln!(stdout, "\n Network Statistics")?;
@@ -1166,8 +1255,11 @@ impl Mgmt {
         };
 
         for (name, wallet) in wallets {
-            match blockchain_guard.get_wallet_balance(&wallet.address).await {
-                Ok(balance) => {
+            match blockchain_guard
+                .get_wallet_balance_breakdown(&wallet.address)
+                .await
+            {
+                Ok(breakdown) => {
                     stdout
                         .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))
                         .ok();
@@ -1191,38 +1283,39 @@ impl Mgmt {
                     stdout
                         .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))
                         .ok();
-                    let _ = write!(stdout, "{}", balance);
+                    let _ = write!(stdout, "{}", breakdown.spendable);
                     stdout
                         .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181))))
                         .ok();
                     let _ = writeln!(stdout, " ♦");
 
-                    // Coinbase-maturity style hint: rewards mined into the last few
-                    // blocks can still be reorged away in a same-height race, which
-                    // users experience as "my balance goes up and down". Label that
-                    // portion instead of letting it read as corruption. Display-only;
-                    // spendability/consensus are unchanged.
-                    const IMMATURE_DEPTH: u32 = 12;
-                    let tip = blockchain_guard.get_latest_block_index() as u32;
-                    let mut immature = 0.0f64;
-                    for i in tip.saturating_sub(IMMATURE_DEPTH.saturating_sub(1))..=tip {
-                        if let Ok(block) = blockchain_guard.get_block(i) {
-                            for tx in &block.transactions {
-                                if tx.sender == "MINING_REWARDS" && tx.recipient == wallet.address
-                                {
-                                    immature += tx.amount();
-                                }
-                            }
-                        }
-                    }
-                    if immature > 0.0 {
+                    // M06: the spendable figure above excludes coinbases still inside the
+                    // MINING_REWARD_MATURITY window. Show that portion — sourced from the
+                    // SAME overlay the affordability gates enforce (the old 12-block hint
+                    // under-scanned the 100-block window and claimed the balance
+                    // "includes" rewards the spendable figure actually excludes).
+                    // Display-only; spendability/consensus are unchanged.
+                    if !breakdown.maturing.is_empty() {
+                        let maturing_total: f64 =
+                            breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                        let next_left = breakdown
+                            .maturing
+                            .iter()
+                            .map(|(height, _)| {
+                                blocks_until_mature(*height, breakdown.as_of_height)
+                            })
+                            .min()
+                            .unwrap_or(0);
                         stdout
                             .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))
                             .ok();
                         let _ = writeln!(
                             stdout,
-                            "  (includes {:.8} ♦ fresh mining rewards from the last {} blocks — may fluctuate briefly during chain races)",
-                            immature, IMMATURE_DEPTH
+                            "  + {:.8} ♦ maturing ({} reward{}; next spendable in {})",
+                            maturing_total,
+                            breakdown.maturing.len(),
+                            if breakdown.maturing.len() == 1 { "" } else { "s" },
+                            format_maturity_eta(next_left)
                         );
                     }
 
