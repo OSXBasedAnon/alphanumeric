@@ -330,16 +330,27 @@ impl MiningManager {
             // The CPU rayon search below then no-ops (its threads see `found`).
             #[cfg(feature = "gpu_miner")]
             if use_gpu {
-                if let Some((n, ts, diff, hash)) = crate::a9::gpu_miner::gpu_mine_attempt(
-                    header.number,
-                    &previous_block_hash,
-                    &merkle_root,
-                    previous_difficulty,
-                    previous_block_timestamp,
-                    std::time::Duration::from_secs(5),
-                    &tip_change_counter,
-                    template_tip_version,
-                ) {
+                // block_in_place: gpu_mine_attempt blocks synchronously on GPU
+                // readbacks for up to the whole budget. Running it inline on a
+                // tokio worker starved the very tasks that advance the tip
+                // (beacon-watch, converge) on low-core boxes — the miner was
+                // slowing down its own view of the network. The 20s budget (was
+                // 5s) is safe now that the adaptive ~250ms dispatches end the
+                // attempt within a fraction of a block of any tip change: the
+                // budget's only remaining job is refreshing the tx selection.
+                let gpu_hit = tokio::task::block_in_place(|| {
+                    crate::a9::gpu_miner::gpu_mine_attempt(
+                        header.number,
+                        &previous_block_hash,
+                        &merkle_root,
+                        previous_difficulty,
+                        previous_block_timestamp,
+                        std::time::Duration::from_secs(20),
+                        &tip_change_counter,
+                        template_tip_version,
+                    )
+                });
+                if let Some((n, ts, diff, hash)) = gpu_hit {
                     if !found.swap(true, Ordering::Release) {
                         result_nonce.store(n, Ordering::Release);
                         result_timestamp.store(ts, Ordering::Release);

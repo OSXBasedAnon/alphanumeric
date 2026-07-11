@@ -364,18 +364,29 @@ pub fn gpu_mine_attempt(
 ) -> Option<(u64, u64, u64, [u8; 32])> {
     let gpu = shared_gpu()?;
     let deadline = Instant::now() + budget;
-    // Big per-dispatch batch amortizes the readback: THREADS threads each testing
-    // ITERS nonces = ~1.07B nonces per GPU->CPU sync (THREADS*ITERS < 2^32 keeps the
-    // kernel's per-thread u32 offset exact). Threads stay under wgpu's 65535
-    // workgroups-per-dimension limit (65535 * 256 = 16.7M).
+    // Per-dispatch batch amortizes the readback (THREADS threads each testing
+    // `iters` nonces per GPU->CPU sync; THREADS*iters < 2^32 keeps the kernel's
+    // per-thread u32 offset exact; THREADS stays under wgpu's 65535
+    // workgroups-per-dimension limit at 65535*256 = 16.7M).
+    //
+    // `iters` is ADAPTIVE, targeting ~250ms of wall-clock per dispatch: the tip
+    // check below only runs BETWEEN dispatches (a submitted wgpu dispatch cannot
+    // be aborted), so the dispatch size IS the preemption granularity. The old
+    // fixed 64 iters (~2^30 nonces) took multiple SECONDS per dispatch on slower
+    // adapters — an entire block interval mining a template that was stale the
+    // moment the readback returned, which read as "the GPU miner is always a few
+    // blocks behind the tip". 250ms keeps any adapter within a fraction of a
+    // block of the live tip while still amortizing the readback ~40x per second.
     const THREADS: u32 = 65535 * 256;
-    const ITERS: u32 = 64;
+    const MAX_ITERS: u32 = 64;
+    const TARGET_DISPATCH_MS: f64 = 250.0;
 
-    const PER_DISPATCH: u64 = THREADS as u64 * ITERS as u64;
     let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
     let start = Instant::now();
     let mut base: u64 = 0;
+    let mut iters: u32 = 4;
     let mut dispatches: u64 = 0;
+    let mut hashed: u64 = 0;
     let mut last_report = start;
     while Instant::now() < deadline && !tip_moved() {
         let timestamp = SystemTime::now()
@@ -391,13 +402,25 @@ pub fn gpu_mine_attempt(
         // Header with a placeholder nonce; the kernel substitutes each thread's.
         let header = build_header(number, previous_hash, timestamp, 0, difficulty, merkle_root);
 
-        if let Some(nonce) = gpu.search_batch_iters(&header, zero_bits, base, THREADS, ITERS) {
+        let per_dispatch = THREADS as u64 * iters as u64;
+        let dispatch_start = Instant::now();
+        if let Some(nonce) = gpu.search_batch_iters(&header, zero_bits, base, THREADS, iters) {
+            // A tip that moved while this dispatch was in flight dooms the nonce
+            // (the finalize guard rejects a parent mismatch anyway) — drop it here
+            // and let the caller rebuild against the new tip instead of spending a
+            // validate/finalize round on a dead block.
+            if tip_moved() {
+                return None;
+            }
             let full = build_header(number, previous_hash, timestamp, nonce, difficulty, merkle_root);
             let hash = *blake3::hash(&full).as_bytes();
             return Some((nonce, timestamp, difficulty, hash));
         }
-        base = base.wrapping_add(PER_DISPATCH);
+        let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+        base = base.wrapping_add(per_dispatch);
         dispatches += 1;
+        hashed = hashed.saturating_add(per_dispatch);
+        iters = next_dispatch_iters(iters, dispatch_ms, TARGET_DISPATCH_MS, MAX_ITERS);
 
         // Progress heartbeat (~every 2s): without it, GPU mode shows nothing between
         // "rebuilding block template" lines and looks stalled. Also the duty-cycle
@@ -406,7 +429,7 @@ pub fn gpu_mine_attempt(
         let now = Instant::now();
         if now.duration_since(last_report).as_secs_f64() >= 2.0 {
             let elapsed = now.duration_since(start).as_secs_f64().max(1e-6);
-            let ghs = (dispatches * PER_DISPATCH) as f64 / elapsed / 1e9;
+            let ghs = hashed as f64 / elapsed / 1e9;
             print!(
                 "\r  GPU mining block #{}: {:.2} GH/s  ({} batches, diff {})   ",
                 number, ghs, dispatches, difficulty
@@ -419,9 +442,45 @@ pub fn gpu_mine_attempt(
     None
 }
 
+/// Next dispatch size (iterations per thread) so one dispatch takes ~target_ms:
+/// the between-dispatch tip check is the ONLY preemption point (a submitted
+/// dispatch cannot be aborted), so dispatch wall-clock bounds how stale a
+/// template can get. Pure so the scaling/clamping is testable. A measured time
+/// of ~0 (timer glitch) leaves the size unchanged.
+fn next_dispatch_iters(current: u32, measured_ms: f64, target_ms: f64, max_iters: u32) -> u32 {
+    if !measured_ms.is_finite() || measured_ms < 1.0 {
+        return current;
+    }
+    let scaled = (current as f64 * (target_ms / measured_ms)).round();
+    if !scaled.is_finite() {
+        return current;
+    }
+    (scaled as i64).clamp(1, max_iters as i64) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The adaptive sizing must converge toward the wall-clock target and stay
+    /// inside [1, max] — dispatch size is the tip-check preemption granularity,
+    /// so a slow adapter MUST shrink to ~250ms batches (the "GPU always a few
+    /// blocks behind" fix) and a fast one must grow toward the readback-
+    /// amortizing cap.
+    #[test]
+    fn dispatch_iters_adapt_toward_target() {
+        // Slow adapter: 4 iters took 2s -> shrink to the floor.
+        assert_eq!(next_dispatch_iters(4, 2000.0, 250.0, 64), 1);
+        // Fast adapter: 4 iters in 20ms -> grow proportionally (4 * 250/20).
+        assert_eq!(next_dispatch_iters(4, 20.0, 250.0, 64), 50);
+        // Above the cap: clamp.
+        assert_eq!(next_dispatch_iters(64, 100.0, 250.0, 64), 64);
+        // On target: stable.
+        assert_eq!(next_dispatch_iters(16, 250.0, 250.0, 64), 16);
+        // Timer glitch (sub-ms measurement): unchanged.
+        assert_eq!(next_dispatch_iters(8, 0.0, 250.0, 64), 8);
+        assert_eq!(next_dispatch_iters(8, f64::NAN, 250.0, 64), 8);
+    }
 
     fn miner() -> Option<GpuMiner> {
         match GpuMiner::new() {
