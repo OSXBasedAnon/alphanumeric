@@ -330,26 +330,39 @@ impl MiningManager {
             // The CPU rayon search below then no-ops (its threads see `found`).
             #[cfg(feature = "gpu_miner")]
             if use_gpu {
-                // block_in_place: gpu_mine_attempt blocks synchronously on GPU
+                // spawn_blocking: gpu_mine_attempt blocks synchronously on GPU
                 // readbacks for up to the whole budget. Running it inline on a
                 // tokio worker starved the very tasks that advance the tip
                 // (beacon-watch, converge) on low-core boxes — the miner was
-                // slowing down its own view of the network. The 20s budget (was
-                // 5s) is safe now that the adaptive ~250ms dispatches end the
-                // attempt within a fraction of a block of any tip change: the
-                // budget's only remaining job is refreshing the tx selection.
-                let gpu_hit = tokio::task::block_in_place(|| {
+                // slowing down its own view of the network. NOT block_in_place:
+                // the interactive client polls its command loop inside
+                // LocalSet::run_until (main.rs), whose poll forbids
+                // block_in_place — it panics with "can call blocking only when
+                // running on the multi-threaded runtime" and kills the whole
+                // client on the first `mine --gpu` (2026-07-11 audit finding,
+                // verified against tokio 1.52.3). spawn_blocking runs on the
+                // blocking pool from any context. The 20s budget (was 5s) is
+                // safe now that the adaptive ~250ms dispatches end the attempt
+                // within a fraction of a block of any tip change: the budget's
+                // only remaining job is refreshing the tx selection.
+                let gpu_number = header.number;
+                let gpu_prev = previous_block_hash;
+                let gpu_merkle = merkle_root;
+                let gpu_counter = Arc::clone(&tip_change_counter);
+                let gpu_hit = tokio::task::spawn_blocking(move || {
                     crate::a9::gpu_miner::gpu_mine_attempt(
-                        header.number,
-                        &previous_block_hash,
-                        &merkle_root,
+                        gpu_number,
+                        &gpu_prev,
+                        &gpu_merkle,
                         previous_difficulty,
                         previous_block_timestamp,
                         std::time::Duration::from_secs(20),
-                        &tip_change_counter,
+                        &gpu_counter,
                         template_tip_version,
                     )
-                });
+                })
+                .await
+                .unwrap_or(None);
                 if let Some((n, ts, diff, hash)) = gpu_hit {
                     if !found.swap(true, Ordering::Release) {
                         result_nonce.store(n, Ordering::Release);
