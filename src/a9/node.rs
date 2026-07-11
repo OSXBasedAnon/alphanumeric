@@ -198,6 +198,45 @@ const PEX_MAX_ADDRS_PER_RESPONSE: usize = 32;
 /// legitimately take 30s x 2 attempts; the cache-saver tick must never serialize
 /// behind half-dead peers for minutes (its period is 120s).
 const PEX_REQUEST_TIMEOUT_SECS: u64 = 5;
+/// Consecutive zero-progress converge calls (while > CHECKPOINT_REORG_MARGIN
+/// behind a fresh beacon) before escalating to NeedsBootstrap. Converge callers
+/// run at 3-20s cadences, so this trips in roughly 0.5-3.5 minutes of proven
+/// non-convergence — fast enough to unstick a wedged client, slow enough that a
+/// transient relay hiccup (which heals within a call or two) never trips it.
+const CONVERGE_STALL_ESCALATE_CALLS: u32 = 10;
+
+// ===== Chain re-bootstrap coordination (single source; main.rs boot logic and
+// the runtime paths in this module both use these) =====
+
+/// Floor between marker-forced re-bootstraps. On a shattered network the
+/// diverge->exit->restore cycle would otherwise loop a 13MB snapshot download
+/// every ~minute; within the cooldown the node stays up and keeps retrying
+/// converge instead. Stamped into the FRESH db dir right after a marker-forced
+/// restore, so (like the marker) it travels with the chain it describes.
+pub const REBOOTSTRAP_COOLDOWN_SECS: u64 = 1800;
+
+/// Marker meaning "the runtime PROVED this chain cannot converge — re-bootstrap
+/// at next boot regardless of what the (possibly stale) manifest comparison
+/// says." Lives INSIDE the sled directory so removing the chain removes it, and
+/// proven convergence deletes it.
+pub fn force_rebootstrap_marker_path(db_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_dir).join("force_rebootstrap")
+}
+
+/// Cooldown stamp file (mtime is the clock) — see REBOOTSTRAP_COOLDOWN_SECS.
+pub fn rebootstrap_cooldown_path(db_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_dir).join("rebootstrap_cooldown")
+}
+
+/// True while a marker-forced re-bootstrap happened less than the cooldown ago.
+pub fn rebootstrap_cooldown_active(db_dir: &str) -> bool {
+    std::fs::metadata(rebootstrap_cooldown_path(db_dir))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs() < REBOOTSTRAP_COOLDOWN_SECS)
+        .unwrap_or(false)
+}
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 const INBOUND_ATTEMPT_MAX_KEYS: usize = 10_000;
@@ -214,8 +253,16 @@ const EVENT_BROADCAST_CAPACITY: usize = 1000;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
 const OUTBOUND_POOL_IDLE_SECS: u64 = 90;
 const OUTBOUND_POOL_MAX_FACTOR: usize = 2;
-const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
-const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 30;
+// Per-peer outbound circuit breaker. Loosened 2026-07-11 (was 3 / 30s): under a
+// fork-storm send burst, 3 consecutive timeouts tripped the breaker on many peers
+// at once for a full 30s, and a node whose peers were all open could not broadcast
+// its own freshly-mined block — so it orphaned (rplant's report). 6 consecutive
+// failures before declaring a peer dead tolerates transient bursts; a 15s (not 30s)
+// open window retries a momentarily-congested peer sooner. Still bounds hammering a
+// genuinely dead peer. Per-peer and success-resetting, so this only widens the
+// transient-tolerance, it does not remove the protection.
+const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 6;
+const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 15;
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
@@ -916,6 +963,17 @@ pub struct Node {
     /// STUN-discovered external IP + unix time discovered (TTL-cached so outage
     /// retries don't re-query third-party STUN servers every 30s).
     cached_external_ip: Arc<RwLock<Option<(IpAddr, u64)>>>,
+    /// Tip observed at the previous converge_to_canonical call (stall watchdog).
+    converge_stall_tip: Arc<AtomicU64>,
+    /// Consecutive zero-progress converge calls while > reorg-margin behind a
+    /// fresh beacon; escalates to NeedsBootstrap at CONVERGE_STALL_ESCALATE_CALLS.
+    converge_stall_cycles: Arc<AtomicU64>,
+    /// Freshest beacon height ever fetched — known staleness for the mine-prep
+    /// fail-open bound even when the beacon is momentarily unreachable.
+    last_seen_beacon_height: Arc<AtomicU64>,
+    /// Resolved chain-DB directory (same value main.rs boots with) — lets runtime
+    /// paths schedule a force-re-bootstrap marker. None in tests/embedded uses.
+    chain_data_dir: Option<Arc<str>>,
     /// PEX-learned dialable addresses -> unix time last learned (bounded by
     /// PEX_ADDR_BOOK_CAP, aged out after PEX_ADDR_TTL_SECS), merged into the
     /// persisted peer cache so the address book outgrows our own connections.
@@ -1119,6 +1177,10 @@ impl Node {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| NodeError::Network(format!("HTTP client error: {}", e)))?;
+        let chain_data_dir: Option<Arc<str>> = data_dir
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(Arc::from);
         let peer_cache_path = Self::resolve_peer_cache_path(data_dir.as_deref());
 
         // Initialize socket and listener
@@ -1218,6 +1280,10 @@ impl Node {
             last_public_announce_attempt_at: Arc::new(AtomicU64::new(0)),
             announce_reject_streak: Arc::new(AtomicU64::new(0)),
             cached_external_ip: Arc::new(RwLock::new(None)),
+            converge_stall_tip: Arc::new(AtomicU64::new(0)),
+            converge_stall_cycles: Arc::new(AtomicU64::new(0)),
+            last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
+            chain_data_dir,
             pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
@@ -1771,10 +1837,20 @@ impl Node {
     }
 
     fn relay_sync_backfill_depth() -> u32 {
+        // Default 64 (= CHECKPOINT_REORG_MARGIN, 2026-07-11): the forward relay
+        // drain re-examines the finality-margin window below its tip, so a fork
+        // within the reorgable range self-heals on the forward path too, not only
+        // via converge's backward ancestor walk. Was 0 (pure forward-from-tip+1),
+        // which left a behind-but-on-canonical node unable to reconcile any shallow
+        // divergence — rplant's report, 2026-07-11. Only runs on behind-node
+        // catch-up paths, and one extra 64-block batch per call, so relay-GET load
+        // is bounded. (The witness-truncated case is handled by relay rehydration,
+        // not by re-pulling — see the S-01 path; this default only helps the
+        // on-canonical-but-behind case.)
         std::env::var("ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN)
             .min(256)
     }
 
@@ -2387,6 +2463,45 @@ impl Node {
         Ok(())
     }
 
+    /// Schedule an unconditional re-bootstrap at the next boot by dropping the
+    /// force-rebootstrap marker (the same file the runtime divergence exit and
+    /// the boot-time reconcile use). Respects the bootstrap-cycle cooldown.
+    /// Returns whether the marker was actually written — callers use this to
+    /// give the operator honest advice ("restart to re-sync" is only true when
+    /// the marker exists).
+    pub fn schedule_force_rebootstrap(&self, reason: &str) -> bool {
+        let Some(dir) = self.chain_data_dir.as_deref() else {
+            return false;
+        };
+        if rebootstrap_cooldown_active(dir) {
+            return false;
+        }
+        let marker = force_rebootstrap_marker_path(dir);
+        match std::fs::write(&marker, format!("{}\n", reason)) {
+            Ok(()) => {
+                warn!("Force re-bootstrap scheduled ({}): {}", reason, marker.display());
+                true
+            }
+            Err(e) => {
+                warn!("Could not write re-bootstrap marker {}: {}", marker.display(), e);
+                false
+            }
+        }
+    }
+
+    /// Pure verdict for the converge stall watchdog: (new_cycle_count, escalate).
+    /// A call counts toward the stall only when the node is beyond the reorg
+    /// margin behind a fresh beacon AND its tip did not move since the previous
+    /// call; any progress (or a small gap) resets. Kept pure so the escalation
+    /// semantics are testable.
+    fn converge_stall_verdict(last_tip: u32, tip: u32, gap: u32, cycles: u64) -> (u64, bool) {
+        if gap <= crate::a9::blockchain::CHECKPOINT_REORG_MARGIN || tip != last_tip {
+            return (0, false);
+        }
+        let cycles = cycles.saturating_add(1);
+        (cycles, cycles >= CONVERGE_STALL_ESCALATE_CALLS as u64)
+    }
+
     /// Pure gate for announce_to_discovery: allow when the last SUCCESS is older
     /// than `interval` AND the last ATTEMPT is older than `retry`. Zero means
     /// "never". Kept as a pure function so the two-marker semantics are testable.
@@ -2665,6 +2780,11 @@ impl Node {
             let Some(hash) = parse_hash("hash") else {
                 continue;
             };
+            // Remember the freshest beacon we ever saw: the mine-prep fail-open
+            // consults this when the beacon is momentarily unreachable, so known
+            // staleness can't be laundered into "mine the local tip anyway".
+            self.last_seen_beacon_height
+                .fetch_max(height, Ordering::AcqRel);
             return Some(TipBeaconInfo {
                 height: height as u32,
                 hash,
@@ -2821,6 +2941,39 @@ impl Node {
         // adoption comment below.
         const CONVERGE_CHUNK: u32 = 128;
         let entry_tip = self.blockchain.read().await.get_latest_block_index() as u32;
+        // PROGRESS-BASED stall escalation (2026-07-11). Classification-based
+        // escalation missed a real stuck state observed live within the hour of
+        // widening the boot stream window: a fork-storm relay develops per-height
+        // slot holes, the exact ancestor walk keeps failing (Ancestor::Transient
+        // -> BeaconStale — which never strikes the divergence watchdog), and the
+        // node sits far behind a FRESH beacon making zero progress: not diverged,
+        // not streamable, never escalated. The verdict here is purely about
+        // progress: CONVERGE_STALL_ESCALATE_CALLS consecutive converge calls with
+        // the gap beyond the reorg margin and a non-advancing tip = cannot
+        // converge, whatever each call's classification was. NeedsBootstrap then
+        // rides the existing 2-strike -> marker -> re-bootstrap machinery.
+        {
+            let gap = beacon.height.saturating_sub(entry_tip);
+            let last_tip = self
+                .converge_stall_tip
+                .swap(entry_tip as u64, Ordering::AcqRel) as u32;
+            let prev_cycles = self.converge_stall_cycles.load(Ordering::Acquire);
+            let (cycles, escalate) =
+                Self::converge_stall_verdict(last_tip, entry_tip, gap, prev_cycles);
+            self.converge_stall_cycles.store(cycles, Ordering::Release);
+            if escalate {
+                // Deliberately DO NOT reset the counter: escalation must PERSIST
+                // across calls while the stall lasts, or the caller's 2-consecutive-
+                // strike marker machinery never fires (an interleaved BeaconStale
+                // between two escalations 10 calls apart resets its strikes — the
+                // review's alternation starvation). Progress resets the counter.
+                warn!(
+                    "Converge made no progress for {} consecutive calls at tip {} with beacon {} ({} behind); escalating to re-bootstrap",
+                    prev_cycles.saturating_add(1), entry_tip, beacon.height, gap
+                );
+                return Converge::NeedsBootstrap;
+            }
+        }
         for _ in 0..MAX_ROUNDS {
             let (tip, at_beacon) = {
                 let bc = self.blockchain.read().await;
@@ -4238,9 +4391,25 @@ impl Node {
         loop {
             debug!("mine-prep: fetching beacon");
             let Some(beacon) = self.fetch_tip_beacon().await else {
-                // Beacon genuinely unreachable => FAIL OPEN and mine on the local tip.
-                // Producing on our best-known chain beats conceding; the reorg engine
-                // still resolves any fork when connectivity returns.
+                // Beacon genuinely unreachable => FAIL OPEN and mine on the local tip —
+                // but ONLY within racing distance of the last beacon we DID see.
+                // Staleness we already know about doesn't stop being true because the
+                // beacon blinked: a far-behind node failing open here mined
+                // guaranteed-orphan blocks hundreds below the network (2026-07-11).
+                // Near the tip, producing on our best-known chain still beats conceding;
+                // the reorg engine resolves any fork when connectivity returns.
+                let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
+                let last_seen = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
+                if last_seen
+                    > local_tip.saturating_add(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN)
+                {
+                    return Err(NodeError::Retryable(format!(
+                        "tip beacon unreachable and the last known network tip {} is {} blocks ahead of local {}; refusing to mine a stale chain",
+                        last_seen,
+                        last_seen.saturating_sub(local_tip),
+                        local_tip
+                    )));
+                }
                 warn!("Tip beacon unreachable; mining on local tip (fail-open)");
                 return Ok(());
             };
@@ -4267,11 +4436,17 @@ impl Node {
                 // At the canonical tip, or holding an equal/heavier chain: go COMPETE.
                 Converge::Converged | Converge::AtTipAhead => return Ok(()),
                 // Diverged below the finality window — incremental convergence cannot
-                // fix this (rare); surface so the reconcile loop can escalate.
+                // fix this; SCHEDULE the re-bootstrap here so the "restart" advice is
+                // true (2026-07-11: prep told a wedged operator to restart while the
+                // boot check kept streaming-skipping — a perfect advice loop).
                 Converge::NeedsBootstrap => {
-                    return Err(NodeError::ConsensusFailure(
-                        "chain diverged below the finality window; re-bootstrap required".into(),
-                    ));
+                    let scheduled =
+                        self.schedule_force_rebootstrap("mine-prep: diverged below finality");
+                    return Err(NodeError::ConsensusFailure(if scheduled {
+                        "chain diverged below the finality window; a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain".into()
+                    } else {
+                        "chain diverged below the finality window; a re-bootstrap ran recently — the node keeps retrying in the background".into()
+                    }));
                 }
                 // Made forward progress but not fully caught up: keep trying with backoff;
                 // after the deadline hand back Retryable so the caller re-invokes (the
@@ -4306,9 +4481,21 @@ impl Node {
                             bc.get_latest_block_index() as u32
                         };
                         if beacon.height > local_tip.saturating_add(64) {
+                            // Same advice-loop fix as the NeedsBootstrap arm: schedule
+                            // the re-bootstrap so restarting actually performs it.
+                            let scheduled = self.schedule_force_rebootstrap(
+                                "mine-prep: behind the beacon and not converging",
+                            );
                             return Err(NodeError::ConsensusFailure(format!(
-                                "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; restart this node to re-sync onto the canonical chain",
-                                beacon.height.saturating_sub(local_tip), local_tip, beacon.height
+                                "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; {}",
+                                beacon.height.saturating_sub(local_tip),
+                                local_tip,
+                                beacon.height,
+                                if scheduled {
+                                    "a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain"
+                                } else {
+                                    "a re-bootstrap ran recently — the node keeps retrying in the background"
+                                }
                             )));
                         }
                         // Fail-open is only competitive when we are within RACING
@@ -10897,6 +11084,40 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Stall watchdog: only zero-progress calls beyond the reorg margin count;
+    // escalation PERSISTS while the stall lasts (a single escalation followed by
+    // a counter reset would let interleaved BeaconStale results starve the
+    // caller's 2-consecutive-strike marker machinery — review, 2026-07-11).
+    #[test]
+    fn converge_stall_escalates_persistently_only_on_real_stalls() {
+        let margin = crate::a9::blockchain::CHECKPOINT_REORG_MARGIN;
+        let n = CONVERGE_STALL_ESCALATE_CALLS as u64;
+        // Small gap: never counts, always resets.
+        assert_eq!(Node::converge_stall_verdict(500, 500, margin, 99), (0, false));
+        // Progress: resets even when far behind.
+        assert_eq!(Node::converge_stall_verdict(500, 501, margin + 300, 99), (0, false));
+        // No progress, far behind: accumulates without escalating below the bar…
+        assert_eq!(
+            Node::converge_stall_verdict(500, 500, margin + 300, n - 2),
+            (n - 1, false)
+        );
+        // …escalates at the bar…
+        assert_eq!(
+            Node::converge_stall_verdict(500, 500, margin + 300, n - 1),
+            (n, true)
+        );
+        // …and KEEPS escalating while the stall persists.
+        assert_eq!(
+            Node::converge_stall_verdict(500, 500, margin + 300, n),
+            (n + 1, true)
+        );
+        // Recovery after escalation: any progress clears it.
+        assert_eq!(
+            Node::converge_stall_verdict(500, 620, margin + 300, n + 5),
+            (0, false)
+        );
+    }
 
     // The announce gate must re-arm on SUCCESS (full interval) but only throttle
     // failures for the short retry window — one failed announce during a gateway

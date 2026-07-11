@@ -134,6 +134,16 @@ const ORPHAN_BRANCH_SEARCH_LIMIT: usize = 4_096;
 /// branch is reached well within this budget. Never bites normal operation,
 /// where a reorg sees only a handful of branches.
 const MAX_REORG_BRANCHES_EVALUATED: usize = 8_192;
+/// (G) How long a witness-deferred reorg branch is skipped by try_adopt before it
+/// is re-evaluated. Long enough to collapse the per-ingest-tick re-verify/re-log
+/// storm (ingest fires every few seconds in a fork storm), short enough that once
+/// R rehydrates — which clears the memo immediately — nothing waits on it, and a
+/// branch R could not rehydrate is retried on a calm cadence.
+const WITNESS_BLOCKED_BACKOFF_SECS: u64 = 45;
+/// (G) TTL after which a memo entry is pruned even if never cleared — covers a
+/// branch that became canonical by another path or aged out of the orphan pool,
+/// so the memo cannot leak unbounded.
+const WITNESS_BLOCKED_TTL_SECS: u64 = ORPHAN_TTL_SECS;
 const GENESIS_LAUNCH_TIMESTAMP: u64 = 1_783_191_900;
 const GENESIS_LAUNCH_AMOUNT: f64 = 17.76;
 const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
@@ -1019,6 +1029,32 @@ pub struct Blockchain {
     balances_index_gate: Arc<Mutex<()>>,
     tip_change_counter: Arc<AtomicU64>,
     tip_watch_tx: watch::Sender<ChainTipSignal>,
+    /// (G) In-memory memo of reorg branches deferred by the S-01 frontier
+    /// signature gate: a branch that is genuinely heavier but whose above-floor
+    /// blocks arrived witness-truncated (the common case in a fork storm once the
+    /// checkpoint has fallen behind). Keyed by branch-tip hash. Two jobs:
+    /// (1) BACKOFF — try_adopt skips re-verifying + re-logging the same dead
+    /// branch every ingest tick (the 187k-reject CPU/log storm, 2026-07-11);
+    /// (2) WORK QUEUE for R — `needed` is the exact (height, hash) list the
+    /// Node layer must rehydrate from the relay so the gate can pass honestly.
+    /// In-memory by design: it is live-operation state, rebuilt from the orphan
+    /// pool after a restart; no persistence, no new tree, no consensus surface.
+    witness_blocked: Arc<PLMutex<HashMap<[u8; 32], WitnessBlockedBranch>>>,
+}
+
+/// Memo entry for a reorg branch the S-01 gate deferred (see `witness_blocked`).
+#[derive(Clone, Debug)]
+pub struct WitnessBlockedBranch {
+    /// Unix secs; the branch is not re-evaluated by try_adopt before this.
+    pub retry_after: u64,
+    /// Consecutive times this branch has been deferred (drives R's give-up → B).
+    pub attempts: u32,
+    /// Above-floor blocks in the branch that lack full witnesses — exactly what
+    /// R fetches from the relay by (height, hash).
+    pub needed: Vec<(u32, [u8; 32])>,
+    /// Wall-clock of the last time we recorded this branch, for TTL pruning of a
+    /// memo entry whose branch has since become canonical or aged out.
+    pub recorded_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2432,6 +2468,65 @@ impl Blockchain {
         self.try_adopt_orphan_branch().await
     }
 
+    // ===== (G) witness-blocked reorg memo =====
+    // These maintain `witness_blocked` — the backoff/queue for reorg branches the
+    // S-01 gate deferred because their above-floor blocks arrived witness-short.
+    // All are cheap in-memory ops under a parking_lot mutex (no await, no I/O).
+
+    /// True while `tip_hash`'s branch is inside its post-defer backoff window — the
+    /// signal to try_adopt to skip re-verifying/re-logging it this tick.
+    fn witness_branch_backoff_active(&self, tip_hash: &[u8; 32]) -> bool {
+        let now = Self::now_unix_secs();
+        let map = self.witness_blocked.lock();
+        map.get(tip_hash).map(|e| now < e.retry_after).unwrap_or(false)
+    }
+
+    /// Record (or refresh) a witness-deferred branch: arm the backoff, bump the
+    /// attempt counter, and store the exact blocks R must rehydrate. Also prunes
+    /// entries past their TTL so the memo cannot grow unbounded.
+    fn record_witness_blocked(&self, tip_hash: [u8; 32], needed: Vec<(u32, [u8; 32])>) {
+        let now = Self::now_unix_secs();
+        let mut map = self.witness_blocked.lock();
+        map.retain(|_, e| now.saturating_sub(e.recorded_at) <= WITNESS_BLOCKED_TTL_SECS);
+        let entry = map.entry(tip_hash).or_insert(WitnessBlockedBranch {
+            retry_after: 0,
+            attempts: 0,
+            needed: Vec::new(),
+            recorded_at: now,
+        });
+        entry.retry_after = now.saturating_add(WITNESS_BLOCKED_BACKOFF_SECS);
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.needed = needed;
+        entry.recorded_at = now;
+    }
+
+    /// Drop a memo entry — called by R the instant it rehydrates a branch, so the
+    /// next ingest re-evaluates it immediately (no backoff wait) with the now-full
+    /// witnesses present in the orphan pool.
+    pub fn clear_witness_blocked(&self, tip_hash: &[u8; 32]) {
+        self.witness_blocked.lock().remove(tip_hash);
+    }
+
+    /// Snapshot of the current witness-blocked branches for the Node-layer
+    /// rehydrator (R): (branch_tip_hash, attempts, needed blocks). Prunes expired
+    /// entries as a side effect.
+    pub fn witness_blocked_snapshot(&self) -> Vec<([u8; 32], u32, Vec<(u32, [u8; 32])>)> {
+        let now = Self::now_unix_secs();
+        let mut map = self.witness_blocked.lock();
+        map.retain(|_, e| now.saturating_sub(e.recorded_at) <= WITNESS_BLOCKED_TTL_SECS);
+        map.iter()
+            .map(|(tip, e)| (*tip, e.attempts, e.needed.clone()))
+            .collect()
+    }
+
+    // NOTE (v7.7.8): the relay witness-REHYDRATION path (try_install_rehydrated_orphan,
+    // reattempt_orphan_adoption, orphan_is_full_witnessed) and the checkpoint-relative
+    // reorg bound live on branch `v779-witness-full`, deferred to v7.7.9 pending the
+    // #2 x coinbase-maturity design + a complete adversarial review + soak proof. v7.7.8
+    // ships only G (the witness_blocked defer/backoff below, which stops the S-01
+    // re-verify/log storm with zero consensus surface); a witness-wedged node still
+    // recovers via the escape-hatch re-bootstrap path (converge NeedsBootstrap -> marker).
+
     async fn try_adopt_orphan_branch(&self) -> Result<bool, BlockchainError> {
         let Some(tip) = self.get_last_block() else {
             return Ok(false);
@@ -2614,15 +2709,38 @@ impl Blockchain {
         // forged competitor carrying a truncated/invalid user-tx signature could
         // otherwise be adopted via reorg. Any branch block above the verification
         // floor must therefore carry full, valid ML-DSA witnesses.
+        //
+        // (G) This gate is UNCHANGED as a validity check — a branch that lacks full
+        // witnesses is still not adopted. What changed is the failure handling: a
+        // genuinely-heavier branch whose above-floor blocks merely arrived
+        // witness-TRUNCATED (the fork-storm common case once the checkpoint lags)
+        // used to be re-selected, re-verified (expensive ML-DSA), and re-logged on
+        // every ingest tick — the 187k-reject CPU/log storm (2026-07-11). Now it is
+        // DEFERRED: recorded with a backoff and the exact blocks R must rehydrate
+        // from the relay, then skipped until R makes the real witnesses available
+        // (which clears the memo) or the backoff elapses. No block is accepted that
+        // was not accepted before; block_signatures_fully_verified still gates the
+        // eventual adoption on real, verified full witnesses.
+        let branch_tip_hash = branch.last().map(|b| b.hash).unwrap_or([0u8; 32]);
+        if self.witness_branch_backoff_active(&branch_tip_hash) {
+            return Ok(false);
+        }
         let floor = self.verification_floor();
+        let mut needed: Vec<(u32, [u8; 32])> = Vec::new();
         for b in &branch {
             if b.index > floor && !self.block_signatures_fully_verified(b) {
-                debug!(
-                    "Reorg rejected: branch block {} above floor {} lacks full witnesses",
-                    b.index, floor
-                );
-                return Ok(false);
+                needed.push((b.index, b.hash));
             }
+        }
+        if !needed.is_empty() {
+            debug!(
+                "Reorg deferred: branch tip {} has {} above-floor block(s) (floor {}) lacking full witnesses; queued for relay rehydration",
+                hex::encode(branch_tip_hash),
+                needed.len(),
+                floor
+            );
+            self.record_witness_blocked(branch_tip_hash, needed);
+            return Ok(false);
         }
 
         // Enforce transaction semantics on the reorg path exactly like tip
@@ -3544,6 +3662,7 @@ impl Blockchain {
             balances_index_gate: Arc::new(Mutex::new(())),
             tip_change_counter,
             tip_watch_tx,
+            witness_blocked: Arc::new(PLMutex::new(HashMap::new())),
         };
 
         // Ensure pending tx trees exist (do not clear at startup).
@@ -6134,6 +6253,40 @@ mod tests {
     fn pow_target_saturates_to_zero_for_large_difficulty() {
         // 4096 / 16 == 256 -> shifted past full 256-bit target width.
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
+    }
+
+    // (G) The witness-blocked memo: record arms the backoff + stores R's fetch
+    // list, backoff suppresses re-evaluation, snapshot exposes the queue, and
+    // clear (R's success signal) removes it so the next ingest re-evaluates now.
+    #[test]
+    fn witness_blocked_memo_backoff_snapshot_and_clear() {
+        let bc = test_blockchain();
+        let tip_a = [0xAAu8; 32];
+        let tip_b = [0xBBu8; 32];
+        let needed = vec![(36373u32, [0x11u8; 32]), (36374u32, [0x22u8; 32])];
+
+        // Not blocked initially.
+        assert!(!bc.witness_branch_backoff_active(&tip_a));
+        assert!(bc.witness_blocked_snapshot().is_empty());
+
+        // Record -> backoff active, queued for R with the exact needed blocks.
+        bc.record_witness_blocked(tip_a, needed.clone());
+        assert!(bc.witness_branch_backoff_active(&tip_a));
+        assert!(!bc.witness_branch_backoff_active(&tip_b), "unrelated branch unaffected");
+        let snap = bc.witness_blocked_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, tip_a);
+        assert_eq!(snap[0].1, 1, "first defer => attempts == 1");
+        assert_eq!(snap[0].2, needed);
+
+        // Re-record bumps the attempt counter (drives R's give-up -> B).
+        bc.record_witness_blocked(tip_a, needed.clone());
+        assert_eq!(bc.witness_blocked_snapshot()[0].1, 2);
+
+        // Clear (R rehydrated) -> gone, next ingest re-evaluates immediately.
+        bc.clear_witness_blocked(&tip_a);
+        assert!(!bc.witness_branch_backoff_active(&tip_a));
+        assert!(bc.witness_blocked_snapshot().is_empty());
     }
 
     // M06: the shared replay gate (used by both branch_is_balance_valid and
