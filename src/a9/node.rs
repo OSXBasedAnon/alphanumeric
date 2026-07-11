@@ -3754,21 +3754,41 @@ impl Node {
             blocks
         };
 
+        let mut consecutive_failures: u32 = 0;
         for block in blocks {
-            if let Err(e) = self.post_block_relay(&block).await {
-                // A rate-limited POST means the per-IP window is CLOSED: every further
-                // post in this run is guaranteed fuel on the fire (this loop runs after
-                // EVERY mined block at backfill=32, and at startup with deep-heal depths
-                // of 512-1024 — the 2,409-failure storms of 2026-07-08). Abort the run;
-                // the next mined block / heal tick retries against a fresh window.
-                if e.to_string().contains(RELAY_POST_RATE_LIMITED) {
-                    warn!(
-                        "Relay backfill rate-limited at #{}; aborting this backfill run",
-                        block.index
-                    );
-                    return;
+            match self.post_block_relay(&block).await {
+                Ok(()) => consecutive_failures = 0,
+                Err(e) => {
+                    // A rate-limited POST means the per-IP window is CLOSED: every further
+                    // post in this run is guaranteed fuel on the fire (this loop runs after
+                    // EVERY mined block at backfill=32, and at startup with deep-heal depths
+                    // of 512-1024 — the 2,409-failure storms of 2026-07-08). Abort the run;
+                    // the next mined block / heal tick retries against a fresh window.
+                    if e.to_string().contains(RELAY_POST_RATE_LIMITED) {
+                        warn!(
+                            "Relay backfill rate-limited at #{}; aborting this backfill run",
+                            block.index
+                        );
+                        return;
+                    }
+                    debug!("Recent block relay failed for #{}: {}", block.index, e);
+                    // Other failures used to only 429-abort, so a relay rejecting for
+                    // any OTHER reason (403 edge/WAF misconfig, 5xx outage) let the run
+                    // walk every remaining block — observed live 2026-07-10: a 403ing
+                    // edge turned the 512-block boot heal into 514 rejected POSTs.
+                    // Three consecutive failures is a state, not a blip; abort and let
+                    // the next tick retry against (hopefully) a healed relay. A single
+                    // bad block or transient hiccup doesn't trip this (counter resets
+                    // on success), so deep heals still make progress past stragglers.
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        warn!(
+                            "Relay backfill failing repeatedly (last: #{}); aborting this backfill run",
+                            block.index
+                        );
+                        return;
+                    }
                 }
-                debug!("Recent block relay failed for #{}: {}", block.index, e);
             }
             // Pace the burst: ~10 posts/s keeps even a 1024-deep heal well under the
             // gateway's per-IP POST budget, leaving headroom for the fresh mined-block
