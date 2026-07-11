@@ -204,6 +204,39 @@ const PEX_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// non-convergence — fast enough to unstick a wedged client, slow enough that a
 /// transient relay hiccup (which heals within a call or two) never trips it.
 const CONVERGE_STALL_ESCALATE_CALLS: u32 = 10;
+
+// ===== Chain re-bootstrap coordination (single source; main.rs boot logic and
+// the runtime paths in this module both use these) =====
+
+/// Floor between marker-forced re-bootstraps. On a shattered network the
+/// diverge->exit->restore cycle would otherwise loop a 13MB snapshot download
+/// every ~minute; within the cooldown the node stays up and keeps retrying
+/// converge instead. Stamped into the FRESH db dir right after a marker-forced
+/// restore, so (like the marker) it travels with the chain it describes.
+pub const REBOOTSTRAP_COOLDOWN_SECS: u64 = 1800;
+
+/// Marker meaning "the runtime PROVED this chain cannot converge — re-bootstrap
+/// at next boot regardless of what the (possibly stale) manifest comparison
+/// says." Lives INSIDE the sled directory so removing the chain removes it, and
+/// proven convergence deletes it.
+pub fn force_rebootstrap_marker_path(db_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_dir).join("force_rebootstrap")
+}
+
+/// Cooldown stamp file (mtime is the clock) — see REBOOTSTRAP_COOLDOWN_SECS.
+pub fn rebootstrap_cooldown_path(db_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_dir).join("rebootstrap_cooldown")
+}
+
+/// True while a marker-forced re-bootstrap happened less than the cooldown ago.
+pub fn rebootstrap_cooldown_active(db_dir: &str) -> bool {
+    std::fs::metadata(rebootstrap_cooldown_path(db_dir))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs() < REBOOTSTRAP_COOLDOWN_SECS)
+        .unwrap_or(false)
+}
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 const INBOUND_ATTEMPT_MAX_KEYS: usize = 10_000;
@@ -930,6 +963,9 @@ pub struct Node {
     /// Freshest beacon height ever fetched — known staleness for the mine-prep
     /// fail-open bound even when the beacon is momentarily unreachable.
     last_seen_beacon_height: Arc<AtomicU64>,
+    /// Resolved chain-DB directory (same value main.rs boots with) — lets runtime
+    /// paths schedule a force-re-bootstrap marker. None in tests/embedded uses.
+    chain_data_dir: Option<Arc<str>>,
     /// PEX-learned dialable addresses -> unix time last learned (bounded by
     /// PEX_ADDR_BOOK_CAP, aged out after PEX_ADDR_TTL_SECS), merged into the
     /// persisted peer cache so the address book outgrows our own connections.
@@ -1133,6 +1169,10 @@ impl Node {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| NodeError::Network(format!("HTTP client error: {}", e)))?;
+        let chain_data_dir: Option<Arc<str>> = data_dir
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(Arc::from);
         let peer_cache_path = Self::resolve_peer_cache_path(data_dir.as_deref());
 
         // Initialize socket and listener
@@ -1235,6 +1275,7 @@ impl Node {
             converge_stall_tip: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
+            chain_data_dir,
             pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
@@ -2402,6 +2443,32 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    /// Schedule an unconditional re-bootstrap at the next boot by dropping the
+    /// force-rebootstrap marker (the same file the runtime divergence exit and
+    /// the boot-time reconcile use). Respects the bootstrap-cycle cooldown.
+    /// Returns whether the marker was actually written — callers use this to
+    /// give the operator honest advice ("restart to re-sync" is only true when
+    /// the marker exists).
+    pub fn schedule_force_rebootstrap(&self, reason: &str) -> bool {
+        let Some(dir) = self.chain_data_dir.as_deref() else {
+            return false;
+        };
+        if rebootstrap_cooldown_active(dir) {
+            return false;
+        }
+        let marker = force_rebootstrap_marker_path(dir);
+        match std::fs::write(&marker, format!("{}\n", reason)) {
+            Ok(()) => {
+                warn!("Force re-bootstrap scheduled ({}): {}", reason, marker.display());
+                true
+            }
+            Err(e) => {
+                warn!("Could not write re-bootstrap marker {}: {}", marker.display(), e);
+                false
+            }
+        }
     }
 
     /// Pure verdict for the converge stall watchdog: (new_cycle_count, escalate).
@@ -4351,11 +4418,17 @@ impl Node {
                 // At the canonical tip, or holding an equal/heavier chain: go COMPETE.
                 Converge::Converged | Converge::AtTipAhead => return Ok(()),
                 // Diverged below the finality window — incremental convergence cannot
-                // fix this (rare); surface so the reconcile loop can escalate.
+                // fix this; SCHEDULE the re-bootstrap here so the "restart" advice is
+                // true (2026-07-11: prep told a wedged operator to restart while the
+                // boot check kept streaming-skipping — a perfect advice loop).
                 Converge::NeedsBootstrap => {
-                    return Err(NodeError::ConsensusFailure(
-                        "chain diverged below the finality window; re-bootstrap required".into(),
-                    ));
+                    let scheduled =
+                        self.schedule_force_rebootstrap("mine-prep: diverged below finality");
+                    return Err(NodeError::ConsensusFailure(if scheduled {
+                        "chain diverged below the finality window; a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain".into()
+                    } else {
+                        "chain diverged below the finality window; a re-bootstrap ran recently — the node keeps retrying in the background".into()
+                    }));
                 }
                 // Made forward progress but not fully caught up: keep trying with backoff;
                 // after the deadline hand back Retryable so the caller re-invokes (the
@@ -4390,9 +4463,21 @@ impl Node {
                             bc.get_latest_block_index() as u32
                         };
                         if beacon.height > local_tip.saturating_add(64) {
+                            // Same advice-loop fix as the NeedsBootstrap arm: schedule
+                            // the re-bootstrap so restarting actually performs it.
+                            let scheduled = self.schedule_force_rebootstrap(
+                                "mine-prep: behind the beacon and not converging",
+                            );
                             return Err(NodeError::ConsensusFailure(format!(
-                                "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; restart this node to re-sync onto the canonical chain",
-                                beacon.height.saturating_sub(local_tip), local_tip, beacon.height
+                                "local chain is {} blocks behind the network tip ({} vs {}) and cannot converge incrementally; {}",
+                                beacon.height.saturating_sub(local_tip),
+                                local_tip,
+                                beacon.height,
+                                if scheduled {
+                                    "a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain"
+                                } else {
+                                    "a re-bootstrap ran recently — the node keeps retrying in the background"
+                                }
                             )));
                         }
                         // Fail-open is only competitive when we are within RACING

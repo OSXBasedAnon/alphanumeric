@@ -30,7 +30,10 @@ use alphanumeric::a9::{
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
-    node::{Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT},
+    node::{
+        force_rebootstrap_marker_path, rebootstrap_cooldown_active, rebootstrap_cooldown_path,
+        Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT,
+    },
     oracle::DifficultyOracle,
     miner::{Miner, MiningManager},
     whisper::WhisperModule,
@@ -4088,36 +4091,10 @@ fn canonical_reconcile_decision(
 /// still re-bootstrap immediately.
 const STREAM_WINDOW: u32 = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
 
-/// Marker dropped by the runtime divergence exit: "this chain has PROVEN it
-/// cannot converge — re-bootstrap it at next boot regardless of what the
-/// (possibly stale) manifest comparison says." Lives INSIDE the sled directory
-/// so remove_local_db clears it atomically with the chain it condemned. A stale
-/// marker is also cleared by the runtime once convergence is PROVEN again.
-fn force_rebootstrap_marker_path(db_path: &str) -> std::path::PathBuf {
-    std::path::Path::new(db_path).join("force_rebootstrap")
-}
-
-/// Floor between marker-forced re-bootstraps. On a shattered network the
-/// diverge->exit->restore cycle would otherwise loop a 13MB snapshot download
-/// every ~minute; within the cooldown the node stays up and keeps retrying
-/// converge instead. Stamped into the FRESH db dir right after a marker-forced
-/// restore, so (like the marker) it travels with the chain it describes.
-const REBOOTSTRAP_COOLDOWN_SECS: u64 = 1800;
-
-fn rebootstrap_cooldown_path(db_path: &str) -> std::path::PathBuf {
-    std::path::Path::new(db_path).join("rebootstrap_cooldown")
-}
-
-/// True while a marker-forced re-bootstrap happened less than the cooldown ago
-/// (judged by the stamp file's mtime; missing/unreadable = not active).
-fn rebootstrap_cooldown_active(db_path: &str) -> bool {
-    std::fs::metadata(rebootstrap_cooldown_path(db_path))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|elapsed| elapsed.as_secs() < REBOOTSTRAP_COOLDOWN_SECS)
-        .unwrap_or(false)
-}
+// Marker + cooldown live in a9::node (single source, shared by the runtime
+// divergence exit, mine-prep scheduling, and this boot-time reconcile):
+// force_rebootstrap_marker_path / rebootstrap_cooldown_path /
+// rebootstrap_cooldown_active — imported above.
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
