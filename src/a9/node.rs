@@ -215,6 +215,17 @@ const CONVERGE_STALL_ESCALATE_CALLS: u32 = 10;
 /// restore, so (like the marker) it travels with the chain it describes.
 pub const REBOOTSTRAP_COOLDOWN_SECS: u64 = 1800;
 
+/// Shorter cooldown for HARD divergence verdicts (diverged below the finality
+/// window, hash-verified against the signed beacon/manifest). The 1800s generic
+/// cooldown exists to stop heuristic stall detectors from thrashing snapshot
+/// downloads — but suppressing a PROVEN below-finality divergence leaves a node
+/// that KNOWS it is stranded sitting stale for half an hour doing nothing
+/// (observed live 2026-07-11: "--sync: re-bootstrap is required" + no marker
+/// written + boot false-passing = fully stale until a human forced it). Bounded
+/// worst case with 300s: one snapshot download per 5 minutes on a genuinely
+/// shattered network — the price of never being silently stale.
+pub const REBOOTSTRAP_HARD_COOLDOWN_SECS: u64 = 300;
+
 /// Marker meaning "the runtime PROVED this chain cannot converge — re-bootstrap
 /// at next boot regardless of what the (possibly stale) manifest comparison
 /// says." Lives INSIDE the sled directory so removing the chain removes it, and
@@ -230,11 +241,22 @@ pub fn rebootstrap_cooldown_path(db_dir: &str) -> std::path::PathBuf {
 
 /// True while a marker-forced re-bootstrap happened less than the cooldown ago.
 pub fn rebootstrap_cooldown_active(db_dir: &str) -> bool {
+    rebootstrap_cooldown_within(db_dir, REBOOTSTRAP_COOLDOWN_SECS)
+}
+
+/// Hard-verdict variant: same stamp file, the shorter window. Used when the
+/// divergence is PROVEN (below-finality hash mismatch vs the signed canonical),
+/// where waiting out the generic cooldown means being knowingly stale.
+pub fn rebootstrap_hard_cooldown_active(db_dir: &str) -> bool {
+    rebootstrap_cooldown_within(db_dir, REBOOTSTRAP_HARD_COOLDOWN_SECS)
+}
+
+fn rebootstrap_cooldown_within(db_dir: &str, window_secs: u64) -> bool {
     std::fs::metadata(rebootstrap_cooldown_path(db_dir))
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map(|elapsed| elapsed.as_secs() < REBOOTSTRAP_COOLDOWN_SECS)
+        .map(|elapsed| elapsed.as_secs() < window_secs)
         .unwrap_or(false)
 }
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
@@ -2470,10 +2492,26 @@ impl Node {
     /// give the operator honest advice ("restart to re-sync" is only true when
     /// the marker exists).
     pub fn schedule_force_rebootstrap(&self, reason: &str) -> bool {
+        self.schedule_force_rebootstrap_bounded(reason, false)
+    }
+
+    /// Hard-verdict variant: a PROVEN below-finality divergence uses the short
+    /// cooldown so a node that knows it is stranded is never suppressed into
+    /// staying stale for the full generic window.
+    pub fn schedule_force_rebootstrap_hard(&self, reason: &str) -> bool {
+        self.schedule_force_rebootstrap_bounded(reason, true)
+    }
+
+    fn schedule_force_rebootstrap_bounded(&self, reason: &str, hard: bool) -> bool {
         let Some(dir) = self.chain_data_dir.as_deref() else {
             return false;
         };
-        if rebootstrap_cooldown_active(dir) {
+        let suppressed = if hard {
+            rebootstrap_hard_cooldown_active(dir)
+        } else {
+            rebootstrap_cooldown_active(dir)
+        };
+        if suppressed {
             return false;
         }
         let marker = force_rebootstrap_marker_path(dir);
@@ -4486,7 +4524,7 @@ impl Node {
                 // boot check kept streaming-skipping — a perfect advice loop).
                 Converge::NeedsBootstrap => {
                     let scheduled =
-                        self.schedule_force_rebootstrap("mine-prep: diverged below finality");
+                        self.schedule_force_rebootstrap_hard("mine-prep: diverged below finality");
                     return Err(NodeError::ConsensusFailure(if scheduled {
                         "chain diverged below the finality window; a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain".into()
                     } else {

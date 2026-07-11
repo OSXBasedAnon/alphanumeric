@@ -32,6 +32,7 @@ use alphanumeric::a9::{
     mgmt::{Mgmt, WalletKeyData},
     node::{
         force_rebootstrap_marker_path, rebootstrap_cooldown_active, rebootstrap_cooldown_path,
+        rebootstrap_hard_cooldown_active,
         Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT,
     },
     oracle::DifficultyOracle,
@@ -53,6 +54,9 @@ const MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024 * 102
 const BOOTSTRAP_MIN_DISK_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const TIP_URL: &str = "https://alphanumeric.blue/api/tip";
+// Verified header-snapshot history: dense canonical (height, hash) anchors over
+// the last ~24h, used by the boot reconcile to tell FORKED from merely BEHIND.
+const SNAPSHOT_HISTORY_URL: &str = "https://alphanumeric.blue/api/snapshot-history";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
@@ -1283,10 +1287,15 @@ async fn async_main() -> Result<()> {
                             if strikes >= 2 {
                                 // Bootstrap-cycle cooldown: on a genuinely shattered
                                 // network this exit repeats; without a floor the old
-                                // cheap ~21s crash-loop becomes a 13MB-snapshot download
-                                // loop. Within the cooldown, stay up and keep retrying
-                                // converge — same eventual recovery, bounded cost.
-                                if rebootstrap_cooldown_active(&db_path_recon) {
+                                // cheap ~21s crash-loop becomes a snapshot-download
+                                // loop. This verdict is a PROVEN below-finality
+                                // divergence against the signed beacon, so it uses the
+                                // HARD (short) window: suppressing it for the generic
+                                // 30 minutes left a node that knew it was stranded
+                                // sitting stale doing nothing (2026-07-11). Within the
+                                // short window, stay up and keep retrying converge —
+                                // same eventual recovery, bounded cost.
+                                if rebootstrap_hard_cooldown_active(&db_path_recon) {
                                     if !cooldown_logged {
                                         println!(
                                             "Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes"
@@ -3582,7 +3591,19 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                         .and_then(|h| u32::try_from(h).ok())
                 }
                 .await;
-                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height) {
+                // Canonical anchor at-or-below our tip: only needed (and only
+                // fetched) when we are behind the manifest height, i.e. when the
+                // manifest-height hash comparison inside the decision can't run.
+                let canonical_anchor: Option<(u32, String)> = match (
+                    &manifest_result,
+                    local_tip_height(db_path),
+                ) {
+                    (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
+                        fetch_canonical_anchor_at_or_below(tip).await
+                    }
+                    _ => None,
+                };
+                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor) {
                     CanonicalReconcile::InSyncOrUnknown => {
                         println!(
                             "Bootstrap skipped: launch network DB is on the canonical chain at {}",
@@ -4004,10 +4025,17 @@ enum CanonicalReconcile {
 /// also covers being ahead of it on the same chain). A fork below the tip yields a
 /// different hash there, and being behind yields no block there — both re-bootstrap.
 /// Fail-open: if the manifest didn't verify or lacks a tip, we keep the local DB.
+///
+/// `canonical_anchor` is a best-effort canonical (height, hash) at-or-below the
+/// LOCAL tip (see fetch_canonical_anchor_at_or_below). Without it, a node that is
+/// behind the manifest height has nothing to hash-compare, so a node BOTH behind
+/// AND forked at its own tip reads as merely behind → "streamable" → in sync —
+/// the stale-client trap (2026-07-11). With it, behind-and-forked re-bootstraps.
 fn canonical_reconcile_decision(
     db_path: &str,
     manifest: &Result<BootstrapManifestPointer>,
     live_beacon_height: Option<u32>,
+    canonical_anchor: Option<(u32, String)>,
 ) -> CanonicalReconcile {
     let Ok(m) = manifest else {
         return CanonicalReconcile::InSyncOrUnknown;
@@ -4073,12 +4101,40 @@ fn canonical_reconcile_decision(
         };
     }
 
-    // Behind (no block at the canonical height). If it is within the streamable
-    // window OF THE LIVE TIP, the beacon-watch loop catches up once the node is
-    // running (exact-walked branch adoption, v7.6.5) — we must NOT re-download the
-    // whole chain for a streamable gap; that is what "syncing" means. Only a gap
-    // deeper than the window (or a near-empty DB) is worth a full bootstrap.
+    // Behind (no block at the canonical height). BEFORE trusting "behind means
+    // streamable": verify our own tip region is actually ON the canonical chain.
+    // A node can be behind AND forked at its tip (it followed a side branch that
+    // died); streaming can never help it — canonical blocks won't attach to its
+    // fork tip and the reorg back is below finality. Without this check such a
+    // node booted "in sync" and stayed stale until a human forced a bootstrap
+    // (2026-07-11, observed live). The anchor is a canonical header at-or-below
+    // our tip; hash mismatch there = forked, re-bootstrap now. No anchor or no
+    // local block at the anchor height = fail-open to the existing behavior.
     let local_tip = local_tip_height(db_path).unwrap_or(0);
+    if let Some((anchor_height, anchor_hash)) = canonical_anchor {
+        if anchor_height <= local_tip {
+            if let Some(local_hash) = local_block_hash_at(db_path, anchor_height) {
+                if !local_hash.eq_ignore_ascii_case(&anchor_hash) {
+                    return CanonicalReconcile::Diverged {
+                        local: format!(
+                            "behind and forked: local block at {} is {}… but canonical is {}…",
+                            anchor_height,
+                            &local_hash[..local_hash.len().min(12)],
+                            &anchor_hash[..anchor_hash.len().min(12)]
+                        ),
+                        canonical_height: height,
+                        canonical_hash,
+                    };
+                }
+            }
+        }
+    }
+
+    // Within the streamable window OF THE LIVE TIP, the beacon-watch loop catches
+    // up once the node is running (exact-walked branch adoption, v7.6.5) — we must
+    // NOT re-download the whole chain for a streamable gap; that is what "syncing"
+    // means. Only a gap deeper than the window (or a near-empty DB) is worth a
+    // full bootstrap.
     if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
@@ -4132,6 +4188,71 @@ fn local_tip_height(db_path: &str) -> Option<u32> {
     db.scan_prefix(b"block_")
         .filter_map(|entry| entry.ok().and_then(|(k, _)| bootstrap_block_index_from_key(&k)))
         .max()
+}
+
+/// Best-effort canonical anchor at-or-below `local_tip`: the highest header from
+/// the gateway's verified snapshot history whose height we also hold locally.
+/// This is what lets the boot reconcile distinguish FORKED from merely BEHIND —
+/// a node whose tip is below the manifest height has NO hash to compare against
+/// the manifest, and treating "behind by less than the stream window" as in-sync
+/// left a node forked at its own tip claiming "on the canonical chain" forever
+/// (observed live 2026-07-11: tip 42025 on a dead side branch, canonical 42239+,
+/// boot skipped bootstrap, runtime detector cooldown-suppressed — fully stale).
+/// Trust level matches the boot beacon precedent (main.rs freshness note): a
+/// wrong anchor can at worst trigger one unnecessary re-bootstrap whose snapshot
+/// manifest is still independently signature-verified. Sanity: headers must be
+/// prev_hash-linked within their window before use.
+async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(2500))
+        .build()
+        .ok()?;
+    let body = client
+        .get(SNAPSHOT_HISTORY_URL)
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let mut best: Option<(u32, String)> = None;
+    for entry in body.get("history")?.as_array()? {
+        let Some(headers) = entry.get("headers").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        // Reject a window whose headers do not chain — a malformed or tampered
+        // entry must not become the fork verdict.
+        let mut linked = true;
+        for pair in headers.windows(2) {
+            let child_prev = pair[1].get("prev_hash").and_then(|v| v.as_str());
+            let parent_hash = pair[0].get("hash").and_then(|v| v.as_str());
+            if child_prev.is_none() || parent_hash.is_none() || child_prev != parent_hash {
+                linked = false;
+                break;
+            }
+        }
+        if !linked {
+            continue;
+        }
+        for h in headers {
+            let (Some(height), Some(hash)) = (
+                h.get("height").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()),
+                h.get("hash").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            if height > local_tip || hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            if best.as_ref().map(|(bh, _)| height > *bh).unwrap_or(true) {
+                best = Some((height, hash.to_ascii_lowercase()));
+            }
+        }
+    }
+    best
 }
 
 /// Fetch and verify the signed bootstrap manifest, returning the canonical tip as
@@ -4948,7 +5069,7 @@ mod tests {
         let db = reconcile_test_db("insync", &[(100, 7)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100)),
+            canonical_reconcile_decision(&db, &m, Some(100), None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -4960,7 +5081,7 @@ mod tests {
         let db = reconcile_test_db("fork", &[(100, 8)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100)),
+            canonical_reconcile_decision(&db, &m, Some(100), None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -4973,12 +5094,53 @@ mod tests {
         let db = reconcile_test_db("behind_small", &[(100, 7)]);
         let m = manifest_at(150, 9); // no local block at 150
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150)),
+            canonical_reconcile_decision(&db, &m, Some(150), None),
             CanonicalReconcile::InSyncOrUnknown
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW)),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // Behind AND forked at the tip: the canonical anchor at-or-below our tip
+    // disagrees with what we hold there — streaming can never fix this (canonical
+    // blocks won't attach, the reorg back is below finality), so it must
+    // re-bootstrap even though the gap is "streamable". This is the stale-client
+    // trap (2026-07-11): without the anchor this node booted "in sync" forever.
+    #[test]
+    fn reconcile_behind_and_forked_at_anchor_rebootstraps() {
+        let db = reconcile_test_db("behind_forked", &[(90, 7), (100, 8)]);
+        let m = manifest_at(150, 9); // behind: no local block at 150
+        let anchor = Some((100u32, hex::encode([5u8; 32]))); // canonical differs at 100
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Behind with a MATCHING anchor: genuinely just behind on canonical — stream.
+    #[test]
+    fn reconcile_behind_with_matching_anchor_streams() {
+        let db = reconcile_test_db("behind_anchored", &[(90, 7), (100, 8)]);
+        let m = manifest_at(150, 9);
+        let anchor = Some((100u32, hex::encode([8u8; 32]))); // matches local tip
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // An anchor above our tip carries no information about our chain — ignored
+    // (fail-open to the streamable-gap behavior).
+    #[test]
+    fn reconcile_anchor_above_local_tip_is_ignored() {
+        let db = reconcile_test_db("anchor_above", &[(100, 8)]);
+        let m = manifest_at(150, 9);
+        let anchor = Some((120u32, hex::encode([5u8; 32])));
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150), anchor),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -4990,7 +5152,7 @@ mod tests {
         let db = reconcile_test_db("behind_big", &[(100, 7)]);
         let m = manifest_at(150, 9);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1)),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5005,7 +5167,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100)),
+            canonical_reconcile_decision(&db, &m, Some(100), None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5018,7 +5180,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m: Result<BootstrapManifestPointer> = Err("gateway unreachable".into());
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, None),
+            canonical_reconcile_decision(&db, &m, None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
