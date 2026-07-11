@@ -2489,6 +2489,17 @@ impl Node {
         }
     }
 
+    /// Ghost-block guard: refuse to mine the local tip when the freshest network
+    /// height we have EVER seen (`known_tip`, the monotonic beacon high-water) is
+    /// more than a same/next-height race ahead of our local tip — even if the
+    /// latest single beacon read came back stale (== local) and converge reported
+    /// "at the tip". Fires only when genuinely behind (known_tip > local); a node
+    /// legitimately at or ahead of the beacon (known_tip <= local) always mines.
+    /// The +2 tolerance matches the BeaconStale fail-open racing distance.
+    fn stale_tip_mine_refused(local_tip: u32, known_tip: u32) -> bool {
+        known_tip > local_tip.saturating_add(2)
+    }
+
     /// Pure verdict for the converge stall watchdog: (new_cycle_count, escalate).
     /// A call counts toward the stall only when the node is beyond the reorg
     /// margin behind a fresh beacon AND its tip did not move since the previous
@@ -4434,7 +4445,35 @@ impl Node {
             };
             match round {
                 // At the canonical tip, or holding an equal/heavier chain: go COMPETE.
-                Converge::Converged | Converge::AtTipAhead => return Ok(()),
+                Converge::Converged | Converge::AtTipAhead => {
+                    // GHOST-BLOCK GUARD (2026-07-11): converge reports Converged when the
+                    // local chain holds the block at the beacon height it fetched — but a
+                    // single beacon read can come back STALE (equal to our own tip) while
+                    // the network has already moved on, and when the relay can't serve the
+                    // gap the node then mines its stale tip + 1: a guaranteed orphan, with
+                    // the operator watching "Block #N" tick up on a chain that's already
+                    // behind (observed live: node at 41370 mining #41371 while the network
+                    // was at 41395). Cross-check the freshest network height we have EVER
+                    // seen (monotonic high-water of every beacon read, node.rs fetch_max):
+                    // if we KNOW the network reached a height meaningfully above ours, we
+                    // are behind no matter what this one fetch said — refuse and retry
+                    // rather than mint a ghost block. Same +2 racing tolerance the
+                    // BeaconStale arm uses (a genuine same/next-height race still mines).
+                    // Retryable (not a hard error): the caller re-invokes and we mine the
+                    // instant we legitimately reach the tip. Refusing is the safe failure —
+                    // worse case a miner idles briefly; the alternative is orphan spam.
+                    let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
+                    let known_tip = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
+                    if Self::stale_tip_mine_refused(local_tip, known_tip) {
+                        return Err(NodeError::Retryable(format!(
+                            "network has reached {} but we are at {} ({} behind) and cannot fetch the gap yet; not mining a stale tip",
+                            known_tip,
+                            local_tip,
+                            known_tip.saturating_sub(local_tip)
+                        )));
+                    }
+                    return Ok(());
+                }
                 // Diverged below the finality window — incremental convergence cannot
                 // fix this; SCHEDULE the re-bootstrap here so the "restart" advice is
                 // true (2026-07-11: prep told a wedged operator to restart while the
@@ -11084,6 +11123,26 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ghost-block guard: a node mines only when at/ahead of the best-known network
+    // tip or within a same/next-height race; a node that KNOWS it is meaningfully
+    // behind (a higher beacon was seen) refuses, even if a momentarily-stale beacon
+    // read made converge report "at the tip" (the 41370-mining-#41371-while-network-
+    // at-41395 ghost-block, 2026-07-11).
+    #[test]
+    fn stale_tip_mine_guard_refuses_when_known_behind_but_mines_at_or_ahead() {
+        // Genuinely behind by more than a race -> refuse.
+        assert!(Node::stale_tip_mine_refused(41370, 41395));
+        assert!(Node::stale_tip_mine_refused(41370, 41373)); // exactly 3 behind
+        // Same/next-height race (<=2) -> mine.
+        assert!(!Node::stale_tip_mine_refused(41395, 41395)); // at tip
+        assert!(!Node::stale_tip_mine_refused(41395, 41396)); // 1-block race
+        assert!(!Node::stale_tip_mine_refused(41395, 41397)); // 2-block race (edge)
+        // Legitimately AHEAD of the last-seen beacon (we mined faster) -> mine.
+        assert!(!Node::stale_tip_mine_refused(41397, 41395));
+        // No beacon ever seen (known_tip 0) -> never refuses.
+        assert!(!Node::stale_tip_mine_refused(41395, 0));
+    }
 
     // Stall watchdog: only zero-progress calls beyond the reorg margin count;
     // escalation PERSISTS while the stall lasts (a single escalation followed by
