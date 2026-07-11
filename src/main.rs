@@ -1257,7 +1257,6 @@ async fn async_main() -> Result<()> {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(20));
                 let mut strikes = 0u32;
-                let mut marker_maybe_present = true;
                 let mut cooldown_logged = false;
                 loop {
                     ticker.tick().await;
@@ -1270,13 +1269,15 @@ async fn async_main() -> Result<()> {
                             // PROVEN convergence invalidates any stale marker: a node
                             // that recovered in place during a fail-open (gateway-down)
                             // boot must not get its now-healthy chain wiped at the next
-                            // gateway-up restart (review finding, 2026-07-11).
-                            if marker_maybe_present {
-                                let _ = std::fs::remove_file(force_rebootstrap_marker_path(
-                                    &db_path_recon,
-                                ));
-                                marker_maybe_present = false;
-                            }
+                            // gateway-up restart (review finding, 2026-07-11). Every
+                            // Converged tick, not once: mine-prep can write a marker at
+                            // any later moment (transient fork-storm NeedsBootstrap),
+                            // and a one-shot cleanup left that marker to wipe a chain
+                            // that then converged healthily for hours (audit finding).
+                            // Cost: one unlink of a usually-absent path per 20s tick.
+                            let _ = std::fs::remove_file(force_rebootstrap_marker_path(
+                                &db_path_recon,
+                            ));
                         }
                         Converge::AtTipAhead
                         | Converge::Progressed
@@ -4192,6 +4193,20 @@ async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, Stri
         .await
         .ok()?;
     if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    // Anchors are only meaningful for OUR network. A gateway serving a
+    // different network (config drift, future testnet) would hand back
+    // guaranteed-mismatching anchors, turning every boot into a spurious
+    // Diverged -> delete-DB -> re-bootstrap cycle (audit finding, 2026-07-11).
+    // Absent network_id (older gateway): fail-open to NO anchor rather than
+    // risk a wrong one.
+    let expected_network = launch_network_id_hex().ok()?;
+    let same_network = body
+        .get("network_id")
+        .and_then(|v| v.as_str())
+        .map(|n| n.eq_ignore_ascii_case(&expected_network));
+    if same_network != Some(true) {
         return None;
     }
     let mut best: Option<(u32, String)> = None;
