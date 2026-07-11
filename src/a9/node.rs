@@ -170,11 +170,34 @@ const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
 const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
 const DEFAULT_DISCOVERY_BASE: &str = "https://alphanumeric.blue";
 // DNS seeds are optional fallback only. Primary discovery should come from alphanumeric.blue.
-const DEFAULT_DNS_SEEDS: &[&str] = &[
-    "seed.alphanumeric.network:7177",
-    "seed2.alphanumeric.network:7177",
-    "a9seed.mynode.network:7177",
-];
+// NOTE: this must be a hostname the project actually controls. The old defaults
+// (seed*.alphanumeric.network, a9seed.mynode.network) were NXDOMAIN/domain-parked —
+// i.e. zero functional seeds — verified 2026-07-10. alphanumeric.blue's DNS outlives
+// the gateway app, so a plain A record here keeps first-contact working through a
+// gateway outage once the operator points it at a public node.
+const DEFAULT_DNS_SEEDS: &[&str] = &["seed.alphanumeric.blue:7177"];
+/// Retry cadence for a FAILED discovery announce. A successful announce still
+/// re-arms on the full announce interval; this only bounds how long a node stays
+/// invisible after the gateway comes back from an outage (2026-07-10 incident:
+/// the roster read as empty for minutes because failed announces silenced the
+/// loop for the whole 300s interval). Network errors (gateway unreachable) retry
+/// at this flat cadence — the gateway isn't serving anything, so recovery speed
+/// wins. HTTP rejections (gateway UP and saying 429/4xx) back off exponentially
+/// toward the full interval instead: those responses are real gateway work, and
+/// a fleet retrying rejections at 10x forever is the 2026-07-08 storm shape.
+const ANNOUNCE_RETRY_SECS: u64 = 30;
+/// Cap on PEX-learned addresses kept in memory for the persisted peer cache.
+const PEX_ADDR_BOOK_CAP: usize = 256;
+/// PEX book entries older than this are dropped (dead/rotated addresses must not
+/// haunt the persisted cache forever); re-learning an address refreshes it.
+const PEX_ADDR_TTL_SECS: u64 = 86_400;
+/// Max addresses accepted from a single GetPeers response per tick — bounds how
+/// much of the book one (possibly malicious) peer can claim at a time.
+const PEX_MAX_ADDRS_PER_RESPONSE: usize = 32;
+/// Outer bound on a single PEX GetPeers exchange. send_message_with_response can
+/// legitimately take 30s x 2 attempts; the cache-saver tick must never serialize
+/// behind half-dead peers for minutes (its period is 120s).
+const PEX_REQUEST_TIMEOUT_SECS: u64 = 5;
 const MAX_INBOUND_ATTEMPTS_PER_IP: u32 = 5;
 const INBOUND_ATTEMPT_WINDOW: u64 = 60; // seconds
 const INBOUND_ATTEMPT_MAX_KEYS: usize = 10_000;
@@ -835,6 +858,10 @@ pub struct NodeRuntimeConfig {
     pub max_peers: usize,
     pub max_connections: usize,
     pub seed_nodes: Vec<String>,
+    /// Resolved chain-DB path; the peer cache lives NEXT TO it (same parent dir)
+    /// so the address book survives reboots. None falls back to the OS temp dir
+    /// (the old default, which OS cleaners wipe — exactly when it matters).
+    pub data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -879,6 +906,20 @@ pub struct Node {
     // a momentary relay gap must not poison the live chain's fresh tips.
     relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), (Instant, bool)>>>,
     last_public_announce_at: Arc<AtomicU64>,
+    /// Last announce ATTEMPT (success or failure) — throttles failure retries to
+    /// ANNOUNCE_RETRY_SECS without silencing the loop for the full interval.
+    last_public_announce_attempt_at: Arc<AtomicU64>,
+    /// Consecutive HTTP-REJECTED announces (gateway up, non-2xx). Drives the
+    /// exponential retry backoff; reset on success. Pure network errors don't
+    /// count — see ANNOUNCE_RETRY_SECS.
+    announce_reject_streak: Arc<AtomicU64>,
+    /// STUN-discovered external IP + unix time discovered (TTL-cached so outage
+    /// retries don't re-query third-party STUN servers every 30s).
+    cached_external_ip: Arc<RwLock<Option<(IpAddr, u64)>>>,
+    /// PEX-learned dialable addresses -> unix time last learned (bounded by
+    /// PEX_ADDR_BOOK_CAP, aged out after PEX_ADDR_TTL_SECS), merged into the
+    /// persisted peer cache so the address book outgrows our own connections.
+    pex_addr_book: Arc<RwLock<HashMap<SocketAddr, u64>>>,
     last_header_snapshot_at: Arc<AtomicU64>,
     last_header_snapshot_height: Arc<AtomicU64>,
     last_stats_snapshot_at: Arc<AtomicU64>,
@@ -1058,6 +1099,7 @@ impl Node {
             max_peers,
             max_connections,
             seed_nodes: configured_seed_nodes,
+            data_dir,
         } = runtime_config;
         let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
@@ -1077,10 +1119,7 @@ impl Node {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| NodeError::Network(format!("HTTP client error: {}", e)))?;
-        let peer_cache_path = std::env::var("ALPHANUMERIC_PEER_CACHE_PATH").unwrap_or_else(|_| {
-            let path = std::env::temp_dir().join("alphanumeric_peers.json");
-            path.to_string_lossy().into_owned()
-        });
+        let peer_cache_path = Self::resolve_peer_cache_path(data_dir.as_deref());
 
         // Initialize socket and listener
         let (bind_addr, listener) = Self::initialize_listener(bind_addr)?;
@@ -1176,6 +1215,10 @@ impl Node {
             discovery_in_progress: Arc::new(AtomicBool::new(false)),
             public_relay_tip: Arc::new(RwLock::new(None)),
             last_public_announce_at: Arc::new(AtomicU64::new(0)),
+            last_public_announce_attempt_at: Arc::new(AtomicU64::new(0)),
+            announce_reject_streak: Arc::new(AtomicU64::new(0)),
+            cached_external_ip: Arc::new(RwLock::new(None)),
+            pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
             last_stats_snapshot_at: Arc::new(AtomicU64::new(0)),
@@ -1874,7 +1917,25 @@ impl Node {
             return Some(ip);
         }
 
+        // TTL cache: the announce retry path can call this every 30s during a
+        // gateway outage — don't re-walk third-party STUN servers each time. The
+        // TTL matches the healthy announce interval, so steady-state freshness is
+        // unchanged (one STUN exchange per announce interval at most).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let cached = self.cached_external_ip.read().await;
+            if let Some((ip, at)) = *cached {
+                if now.saturating_sub(at) < Self::announce_interval_secs() {
+                    return Some(ip);
+                }
+            }
+        }
+
         if let Ok((Some(ip), _v6)) = self.discover_external_addresses(STUN_SERVERS).await {
+            *self.cached_external_ip.write().await = Some((ip, now));
             return Some(ip);
         }
 
@@ -2073,9 +2134,42 @@ impl Node {
         Ok(())
     }
 
+    /// Peer-cache location: env override first, else INSIDE the chain-DB directory
+    /// so the address book survives reboots, else the legacy OS temp-dir default.
+    /// Inside the DB dir (not its parent) because that directory is guaranteed
+    /// writable — sled writes there continuously — while the parent can be
+    /// read-only (system-wide installs); sled ignores foreign files in its dir.
+    /// The temp dir was the original home and is wiped by OS cleaners on reboot —
+    /// i.e. the cache vanished exactly in the scenario it exists for (restarting
+    /// during a gateway outage).
+    fn resolve_peer_cache_path(data_dir: Option<&str>) -> String {
+        if let Ok(path) = std::env::var("ALPHANUMERIC_PEER_CACHE_PATH") {
+            if !path.trim().is_empty() {
+                return path;
+            }
+        }
+        if let Some(dir) = data_dir {
+            if !dir.trim().is_empty() {
+                return std::path::Path::new(dir)
+                    .join("alphanumeric_peers.json")
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+        std::env::temp_dir()
+            .join("alphanumeric_peers.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn load_peer_cache(&self) -> Vec<SocketAddr> {
         let path = &*self.peer_cache_path;
-        let data = std::fs::read_to_string(path);
+        // Legacy fallback: pre-v7.7.7 the cache lived in the OS temp dir. Read it
+        // once when the new location is empty so upgrades keep their address book;
+        // saves only ever go to the new path.
+        let data = std::fs::read_to_string(path).or_else(|_| {
+            std::fs::read_to_string(std::env::temp_dir().join("alphanumeric_peers.json"))
+        });
         if data.is_err() {
             return Vec::new();
         }
@@ -2135,13 +2229,47 @@ impl Node {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !Self::should_publish_now(
-            &self.last_public_announce_at,
-            Self::announce_interval_secs(),
+        // Success-then-attempt gate. The old should_publish_now marked the interval
+        // on ATTEMPT, so one failed announce during a gateway outage silenced this
+        // node for the whole interval — after recovery the roster read as empty for
+        // minutes (2026-07-10 incident). Now: a SUCCESS re-arms the full interval;
+        // a network failure only re-arms ANNOUNCE_RETRY_SECS (fast recovery), and
+        // HTTP rejections back off exponentially toward the interval (a rejecting
+        // gateway is doing real work per retry — don't 10x it forever).
+        let interval = Self::announce_interval_secs();
+        let retry = Self::announce_retry_secs_for_streak(
+            self.announce_reject_streak.load(Ordering::Acquire),
+            interval,
+        );
+        let last_attempt = self.last_public_announce_attempt_at.load(Ordering::Acquire);
+        if !Self::announce_gate(
             now,
+            self.last_public_announce_at.load(Ordering::Acquire),
+            last_attempt,
+            interval,
+            retry,
         ) {
             return Ok(());
         }
+        // CAS against the SAME value the gate evaluated: a concurrent caller then
+        // fails either the gate (fresh marker is recent) or this exchange (stale
+        // expected value), so exactly one attempt claims the window. Re-loading
+        // the marker here would let two callers interleave past both checks.
+        if self
+            .last_public_announce_attempt_at
+            .compare_exchange(last_attempt, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        // Tip check FIRST: a syncing/tip-less node exits here without burning a
+        // STUN exchange per retry (get_external_ip walks up to 4 third-party
+        // servers at 3s each when STUN is degraded).
+        let Some(public_tip) = self.public_advertisable_tip().await else {
+            return Ok(());
+        };
+        let height = public_tip.index;
 
         let ip = if let Ok(public_ip) = std::env::var("ALPHANUMERIC_PUBLIC_IP") {
             if !public_ip.trim().is_empty() {
@@ -2155,11 +2283,6 @@ impl Node {
                 .filter(|addr| !Self::is_private_ip(addr))
                 .map(|addr| addr.to_string())
         };
-
-        let Some(public_tip) = self.public_advertisable_tip().await else {
-            return Ok(());
-        };
-        let height = public_tip.index;
         let network_id = hex::encode(self.network_id);
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
@@ -2227,11 +2350,15 @@ impl Node {
         let payload = serde_json::Value::Object(payload);
 
         let mut any_ok = false;
+        let mut any_rejection = false;
         for url in Self::discovery_announce_urls() {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
                 Ok(res) if res.status().is_success() => any_ok = true,
                 Ok(res) => {
+                    // The gateway is UP and rejecting (429/4xx/5xx) — this drives
+                    // the exponential backoff, unlike a pure network error.
+                    any_rejection = true;
                     let status = res.status();
                     let body = res.text().await.unwrap_or_default();
                     debug!(
@@ -2244,11 +2371,44 @@ impl Node {
             }
         }
 
-        if !any_ok {
+        if any_ok {
+            // Only a SUCCESS re-arms the full announce interval (see gate above).
+            self.last_public_announce_at.store(now, Ordering::Release);
+            self.announce_reject_streak.store(0, Ordering::Release);
+        } else if any_rejection {
+            self.announce_reject_streak.fetch_add(1, Ordering::AcqRel);
+            debug!("Discovery announce rejected on all endpoints");
+        } else {
+            // Gateway unreachable: keep the flat fast retry (streak untouched) so
+            // the node re-registers within ~ANNOUNCE_RETRY_SECS of recovery.
             debug!("Discovery announce failed on all endpoints");
         }
 
         Ok(())
+    }
+
+    /// Pure gate for announce_to_discovery: allow when the last SUCCESS is older
+    /// than `interval` AND the last ATTEMPT is older than `retry`. Zero means
+    /// "never". Kept as a pure function so the two-marker semantics are testable.
+    fn announce_gate(now: u64, last_success: u64, last_attempt: u64, interval: u64, retry: u64) -> bool {
+        if last_success > 0 && now.saturating_sub(last_success) < interval {
+            return false;
+        }
+        if last_attempt > 0 && now.saturating_sub(last_attempt) < retry {
+            return false;
+        }
+        true
+    }
+
+    /// Retry cadence as a function of the consecutive-rejection streak: flat
+    /// ANNOUNCE_RETRY_SECS while the gateway is merely unreachable (streak 0),
+    /// doubling per consecutive HTTP rejection, capped at the full interval —
+    /// i.e. a persistently-rejecting gateway sees at most the pre-existing
+    /// 1-per-interval announce volume, while outage recovery stays fast.
+    fn announce_retry_secs_for_streak(streak: u64, interval: u64) -> u64 {
+        ANNOUNCE_RETRY_SECS
+            .saturating_mul(1u64 << streak.min(4))
+            .min(interval.max(ANNOUNCE_RETRY_SECS))
     }
 
     async fn post_header_snapshot(&self) -> Result<(), NodeError> {
@@ -6034,16 +6194,28 @@ impl Node {
             }
         });
 
-        // Periodic announce to discovery service
+        // Periodic announce to discovery service. The loop ticks FAST
+        // (ANNOUNCE_RETRY_SECS) and lets announce_to_discovery's internal gate own
+        // the cadence — full interval after a success, retry cadence after a
+        // failure — same pattern as the header-snapshot loop. Ticking at the slow
+        // interval meant one failed announce (gateway blip) left this node off the
+        // roster until the NEXT 300s tick. The relay tip refresh is NOT retried
+        // fast: it keeps its original interval via the tick counter (post storms
+        // are the known failure mode there, 2026-07-08).
         let node_clone = node.clone();
         tokio::spawn(async move {
-            let mut announce_interval =
-                interval(Duration::from_secs(Self::announce_interval_secs()));
+            let relay_every =
+                (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
+            let mut tick: u64 = 0;
+            let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_RETRY_SECS));
             loop {
                 announce_interval.tick().await;
-                if let Err(e) = node_clone.ensure_public_tip_relayed().await {
-                    debug!("Public relay tip refresh failed: {}", e);
+                if tick % relay_every == 0 {
+                    if let Err(e) = node_clone.ensure_public_tip_relayed().await {
+                        debug!("Public relay tip refresh failed: {}", e);
+                    }
                 }
+                tick = tick.wrapping_add(1);
                 if let Err(e) = node_clone.announce_to_discovery().await {
                     debug!("Announce error: {}", e);
                 }
@@ -6130,17 +6302,77 @@ impl Node {
             });
         }
 
-        // Periodic peer cache persistence
+        // Periodic peer cache persistence + PEX address-book refresh. PEX runs in
+        // normal operation (not just the gateway-down fallback): GetPeers is a
+        // read-only request to ≤2 live peers per 120s tick — no dialing, no
+        // topology change — and it fattens the persisted address book beyond our
+        // own connections, which is what a node restarts on during a gateway
+        // outage. Live peers keep priority in the 200-slot file; PEX entries fill
+        // the remainder.
         let node_clone = node.clone();
         tokio::spawn(async move {
             let mut cache_interval = interval(Duration::from_secs(120));
+            let mut save_failure_logged = false;
             loop {
                 cache_interval.tick().await;
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let peers: Vec<SocketAddr> = {
+                // Age out stale PEX entries FIRST so the book can never freeze at
+                // the cap holding dead/rotated addresses forever.
+                {
+                    let mut book = node_clone.pex_addr_book.write().await;
+                    book.retain(|_, learned| {
+                        now.saturating_sub(*learned) < PEX_ADDR_TTL_SECS
+                    });
+                }
+                let pex_targets: Vec<SocketAddr> = {
+                    let peers = node_clone.peers.read().await;
+                    peers.keys().copied().take(2).collect()
+                };
+                if !pex_targets.is_empty() {
+                    let allow_private = Self::private_discovery_peers_allowed();
+                    for target in pex_targets {
+                        // Outer timeout: send_message_with_response can take 30s x 2
+                        // attempts; this tick runs every 120s and must not serialize
+                        // behind half-dead peers.
+                        let Ok(Ok(list)) = tokio::time::timeout(
+                            Duration::from_secs(PEX_REQUEST_TIMEOUT_SECS),
+                            node_clone.request_peer_list(target),
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
+                        let mut book = node_clone.pex_addr_book.write().await;
+                        let mut inserted = 0usize;
+                        for addr in list {
+                            if inserted >= PEX_MAX_ADDRS_PER_RESPONSE {
+                                break;
+                            }
+                            if addr == node_clone.bind_addr
+                                || !Self::is_dialable_discovery_addr(&addr, allow_private)
+                            {
+                                continue;
+                            }
+                            // At cap, evict the oldest entry — the book rolls
+                            // instead of freezing.
+                            if !book.contains_key(&addr) && book.len() >= PEX_ADDR_BOOK_CAP {
+                                if let Some(oldest) = book
+                                    .iter()
+                                    .min_by_key(|(_, learned)| **learned)
+                                    .map(|(a, _)| *a)
+                                {
+                                    book.remove(&oldest);
+                                }
+                            }
+                            book.insert(addr, now);
+                            inserted += 1;
+                        }
+                    }
+                }
+                let mut peers: Vec<SocketAddr> = {
                     let peers = node_clone.peers.read().await;
                     let mut scored: Vec<(SocketAddr, f64)> = peers
                         .iter()
@@ -6151,8 +6383,30 @@ impl Node {
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     scored.into_iter().take(200).map(|(addr, _)| addr).collect()
                 };
-                if let Err(e) = node_clone.save_peer_cache(&peers) {
-                    debug!("Peer cache save error: {}", e);
+                {
+                    let book = node_clone.pex_addr_book.read().await;
+                    for addr in book.keys() {
+                        if peers.len() >= 200 {
+                            break;
+                        }
+                        if !peers.contains(addr) {
+                            peers.push(*addr);
+                        }
+                    }
+                }
+                match node_clone.save_peer_cache(&peers) {
+                    Ok(()) => save_failure_logged = false,
+                    Err(e) => {
+                        // warn ONCE per failure streak — a broken cache silently
+                        // no-ops the reboot-resilience fix, but a warn every 120s
+                        // would be log spam.
+                        if !save_failure_logged {
+                            warn!("Peer cache save failing (address book will not survive restarts): {}", e);
+                            save_failure_logged = true;
+                        } else {
+                            debug!("Peer cache save error: {}", e);
+                        }
+                    }
                 }
             }
         });
@@ -8835,13 +9089,21 @@ impl Node {
 
     /// Peer node_ids from the gateway directory — who to dial into the mesh (signaling is keyed by
     /// node_id). Reuses the same /api/peers the TCP discovery already reads.
+    /// Some(ids) when at least one discovery endpoint answered with an ok body
+    /// (even an empty roster); None when every endpoint failed. The distinction
+    /// matters: a gateway outage must NOT read as "zero peers" — the dialer loop
+    /// keeps its last-good directory on None (2026-07-10 incident: blanking the
+    /// directory dropped every dial target and disarmed the inbound-offer gate,
+    /// which fails OPEN on an empty set).
     #[cfg(feature = "webrtc_mesh")]
-    async fn fetch_mesh_peer_ids(&self) -> Vec<String> {
+    async fn fetch_mesh_peer_ids(&self) -> Option<Vec<String>> {
         let mut ids: Vec<String> = Vec::new();
+        let mut any_ok = false;
         for url in Self::discovery_peers_urls() {
             if let Ok(res) = self.http_client.get(&url).send().await {
                 if let Ok(body) = res.json::<DiscoveryResponse>().await {
                     if body.ok {
+                        any_ok = true;
                         for p in body.peers {
                             if let Some(id) = p.node_id {
                                 if id != self.node_id && id.len() == 64 {
@@ -8856,9 +9118,27 @@ impl Node {
                 break;
             }
         }
+        if !any_ok {
+            return None;
+        }
         ids.sort();
         ids.dedup();
-        ids
+        Some(ids)
+    }
+
+    /// Live WebRTC mesh DataChannel count, for status displays. 0 when the mesh is
+    /// disabled, not yet spawned, or compiled out.
+    #[cfg(feature = "webrtc_mesh")]
+    pub async fn mesh_link_count(&self) -> usize {
+        match self.webrtc_mesh.read().await.as_ref() {
+            Some(mesh) => mesh.connected_peers().await.len(),
+            None => 0,
+        }
+    }
+
+    #[cfg(not(feature = "webrtc_mesh"))]
+    pub async fn mesh_link_count(&self) -> usize {
+        0
     }
 
     /// Build + spawn the WebRTC mesh (opt-in via ALPHANUMERIC_WEBRTC_MESH): signaling poll, topology
@@ -8973,7 +9253,12 @@ impl Node {
                     if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
                         return;
                     }
-                    let ids = node.fetch_mesh_peer_ids().await;
+                    // Keep-last-good: a failed fetch (gateway outage) keeps the previous
+                    // directory instead of blanking it — see fetch_mesh_peer_ids.
+                    let ids = node
+                        .fetch_mesh_peer_ids()
+                        .await
+                        .unwrap_or_else(|| prev_ids.clone());
                     // A directory change (fetched from the ~free edge-cached /api/peers) may mean a new
                     // peer will dial us — wake the signaling poll so it drains promptly instead of
                     // waiting out the slow safety cadence. This is what makes draining event-driven.
@@ -10592,6 +10877,73 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The announce gate must re-arm on SUCCESS (full interval) but only throttle
+    // failures for the short retry window — one failed announce during a gateway
+    // blip must not silence the node for the whole interval (2026-07-10 incident:
+    // roster read empty for minutes after a short outage).
+    #[test]
+    fn announce_gate_retries_failures_fast_but_respects_success_interval() {
+        let (interval, retry) = (300u64, 30u64);
+        // Never announced, never attempted -> allowed.
+        assert!(Node::announce_gate(1000, 0, 0, interval, retry));
+        // Recent success -> blocked, regardless of attempt age.
+        assert!(!Node::announce_gate(1000, 900, 900, interval, retry));
+        assert!(!Node::announce_gate(1000, 900, 0, interval, retry));
+        // Old success, recent (failed) attempt -> blocked by the retry throttle.
+        assert!(!Node::announce_gate(1000, 500, 990, interval, retry));
+        // Old success, old attempt -> allowed (this is the fast post-outage retry:
+        // 30s after the failed attempt, NOT 300s after it).
+        assert!(Node::announce_gate(1000, 500, 960, interval, retry));
+        // No success ever (all attempts failed), attempt just now -> blocked...
+        assert!(!Node::announce_gate(1000, 0, 995, interval, retry));
+        // ...but allowed once the retry window passes.
+        assert!(Node::announce_gate(1030, 0, 995, interval, retry));
+        // Success exactly interval ago -> allowed again.
+        assert!(Node::announce_gate(1000, 700, 700, interval, retry));
+    }
+
+    // The peer cache must live INSIDE the chain-DB directory (reboot-safe AND
+    // guaranteed writable — sled writes there continuously; the parent dir can be
+    // read-only in system-wide installs), not in the OS temp dir (wiped exactly
+    // when the address book matters: restarting during a gateway outage). Env
+    // override is tested implicitly by these branches running with the var unset.
+    #[test]
+    fn peer_cache_path_lives_inside_the_chain_db_dir() {
+        let with_dir = Node::resolve_peer_cache_path(Some("/data/alphanumeric/blockchain.db"));
+        assert_eq!(
+            std::path::Path::new(&with_dir),
+            std::path::Path::new("/data/alphanumeric/blockchain.db/alphanumeric_peers.json")
+        );
+        // No (or blank) data dir -> legacy temp-dir fallback.
+        for missing in [None, Some("  ")] {
+            let fallback = Node::resolve_peer_cache_path(missing);
+            assert_eq!(
+                std::path::Path::new(&fallback),
+                std::env::temp_dir().join("alphanumeric_peers.json")
+            );
+        }
+    }
+
+    // Retry backoff: flat-and-fast while the gateway is unreachable (streak 0),
+    // doubling per consecutive HTTP rejection, capped at the announce interval —
+    // a persistently-rejecting gateway must see at most the pre-existing
+    // 1-per-interval volume (the 2026-07-08 storm class), while outage recovery
+    // stays at ANNOUNCE_RETRY_SECS.
+    #[test]
+    fn announce_retry_backs_off_on_rejections_and_caps_at_interval() {
+        let interval = 300;
+        assert_eq!(Node::announce_retry_secs_for_streak(0, interval), 30);
+        assert_eq!(Node::announce_retry_secs_for_streak(1, interval), 60);
+        assert_eq!(Node::announce_retry_secs_for_streak(2, interval), 120);
+        assert_eq!(Node::announce_retry_secs_for_streak(3, interval), 240);
+        assert_eq!(Node::announce_retry_secs_for_streak(4, interval), 300);
+        // Streak beyond the shift cap must neither overflow nor exceed the interval.
+        assert_eq!(Node::announce_retry_secs_for_streak(50, interval), 300);
+        assert_eq!(Node::announce_retry_secs_for_streak(u64::MAX, interval), 300);
+        // A pathologically small interval can't push retry below the floor.
+        assert_eq!(Node::announce_retry_secs_for_streak(4, 10), 30);
+    }
 
     #[test]
     fn network_bloom_uses_nonzero_hash_count() {
