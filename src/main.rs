@@ -56,7 +56,9 @@ const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const TIP_URL: &str = "https://alphanumeric.blue/api/tip";
 // Verified header-snapshot history: dense canonical (height, hash) anchors over
 // the last ~24h, used by the boot reconcile to tell FORKED from merely BEHIND.
-const SNAPSHOT_HISTORY_URL: &str = "https://alphanumeric.blue/api/snapshot-history";
+// limit=240 requests the gateway's full retention (the default response is a
+// shallow display-sized page).
+const SNAPSHOT_HISTORY_URL: &str = "https://alphanumeric.blue/api/snapshot-history?limit=240";
 const BOOTSTRAP_PUBLISHER_PUBKEY: &str =
     "dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3";
 const INSTANCE_LOCK_PATH: &str = ".alphanumeric.instance.lock";
