@@ -1244,17 +1244,32 @@ async fn async_main() -> Result<()> {
         {
             let node_recon = node.clone();
             let shutdown_recon = shutdown_requested.clone();
+            let db_path_recon = db_path.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(20));
                 let mut strikes = 0u32;
+                let mut marker_maybe_present = true;
+                let mut cooldown_logged = false;
                 loop {
                     ticker.tick().await;
                     if shutdown_recon.load(Ordering::Acquire) {
                         return;
                     }
                     match node_recon.sync_to_beacon().await {
-                        Converge::Converged
-                        | Converge::AtTipAhead
+                        Converge::Converged => {
+                            strikes = 0;
+                            // PROVEN convergence invalidates any stale marker: a node
+                            // that recovered in place during a fail-open (gateway-down)
+                            // boot must not get its now-healthy chain wiped at the next
+                            // gateway-up restart (review finding, 2026-07-11).
+                            if marker_maybe_present {
+                                let _ = std::fs::remove_file(force_rebootstrap_marker_path(
+                                    &db_path_recon,
+                                ));
+                                marker_maybe_present = false;
+                            }
+                        }
+                        Converge::AtTipAhead
                         | Converge::Progressed
                         | Converge::BeaconStale
                         | Converge::BranchInvalid => {
@@ -1263,6 +1278,37 @@ async fn async_main() -> Result<()> {
                         Converge::NeedsBootstrap => {
                             strikes += 1;
                             if strikes >= 2 {
+                                // Bootstrap-cycle cooldown: on a genuinely shattered
+                                // network this exit repeats; without a floor the old
+                                // cheap ~21s crash-loop becomes a 13MB-snapshot download
+                                // loop. Within the cooldown, stay up and keep retrying
+                                // converge — same eventual recovery, bounded cost.
+                                if rebootstrap_cooldown_active(&db_path_recon) {
+                                    if !cooldown_logged {
+                                        println!(
+                                            "Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes"
+                                        );
+                                        cooldown_logged = true;
+                                    }
+                                    strikes = 0;
+                                    continue;
+                                }
+                                // Drop the force-rebootstrap marker BEFORE exiting: the
+                                // boot-time manifest comparison lags its publish cadence,
+                                // so a fork AT tip height read as "in sync" at boot and
+                                // this exit crash-looped ~21s at a time until the manifest
+                                // caught up (observed 7x back-to-back, 2026-07-10). The
+                                // marker makes the next boot re-bootstrap unconditionally
+                                // — the live loop has PROVEN convergence is impossible,
+                                // which outranks any boot-time guess.
+                                let marker = force_rebootstrap_marker_path(&db_path_recon);
+                                if let Err(e) = std::fs::write(&marker, b"runtime divergence exit\n") {
+                                    eprintln!(
+                                        "Warning: could not write re-bootstrap marker {}: {}",
+                                        marker.display(),
+                                        e
+                                    );
+                                }
                                 println!(
                                     "Node chain diverged below the finality window on two checks; restarting to re-bootstrap onto the canonical chain"
                                 );
@@ -3448,6 +3494,10 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
 
 async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
+    // Whether this run was demanded by the runtime divergence marker — captured
+    // before the decision (remove_local_db deletes the marker with the dir), so
+    // a successful restore can stamp the bootstrap-cycle cooldown.
+    let was_marker_forced = force_rebootstrap_marker_path(db_path).exists();
 
     // Fetch and verify the signed bootstrap manifest up front. It carries the
     // canonical tip (height + hash) we reconcile a genesis-valid local DB against,
@@ -3825,6 +3875,12 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         )
         .into());
     }
+    if was_marker_forced {
+        // Stamp the cooldown into the FRESH db dir: if this chain diverges again
+        // immediately (shattered network), the divergence exit stays up and keeps
+        // retrying converge instead of looping snapshot downloads.
+        let _ = std::fs::write(rebootstrap_cooldown_path(db_path), b"");
+    }
     Ok(())
 }
 
@@ -3932,6 +3988,23 @@ fn canonical_reconcile_decision(
     };
     let canonical_hash = tip_hash.trim().to_ascii_lowercase();
     let canonical_height = height as u32;
+    // Runtime divergence exits drop a marker (see the beacon-watch NeedsBootstrap
+    // path): the live loop PROVED this chain cannot converge, which outranks any
+    // boot-time comparison — the manifest lags its publish cadence, so a fork AT
+    // tip height reads as "in sync" against a stale manifest (the 2026-07-10
+    // restart crash-loop). Honoring the marker is also what makes the wide
+    // STREAM_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
+    // Checked only once the manifest verified (above): with the gateway down a
+    // re-bootstrap is impossible anyway, so offline starts stay fail-open and the
+    // marker simply persists for the next boot. remove_local_db clears it together
+    // with the chain it condemned.
+    if force_rebootstrap_marker_path(db_path).exists() {
+        return CanonicalReconcile::Diverged {
+            local: "forced re-bootstrap (runtime divergence exit)".to_string(),
+            canonical_height: height,
+            canonical_hash,
+        };
+    }
     // FRESHNESS (v7.6.5, 2026-07-08 night): the manifest height lags by its publish
     // cadence — and when snapshot publishing broke (413s), it lagged by HOURS, so a
     // node 150+ blocks behind read as "in sync with the manifest" at boot, skipped
@@ -3988,14 +4061,63 @@ fn canonical_reconcile_decision(
     }
 }
 
-/// How far behind/forked a genesis-valid chain may be and still be caught up by
-/// the live beacon-watch loop instead of a full re-download. The live loop's
-/// chunked branch adoption (v7.6.5) converges deficits far larger than this, but
-/// the boot decision must stay CONSERVATIVE: if live convergence is broken for
-/// any reason, "restart the node" has to reliably trigger a re-bootstrap — a
-/// wide window here once told a 181-behind node it was in sync at boot while its
-/// live loop couldn't converge either, trapping it with no way out (2026-07-08).
-const STREAM_WINDOW: u32 = 96;
+/// How far behind a genesis-valid chain may be and still be caught up by the
+/// live beacon-watch loop instead of a full re-download. History of this value:
+/// it was 96 (≈8 min at 5s blocks) because the boot decision had to stay
+/// conservative — if live convergence was broken, "restart the node" had to
+/// reliably trigger a re-bootstrap; a wide window once told a 181-behind node it
+/// was in sync at boot while its live loop couldn't converge either, trapping it
+/// with no way out (2026-07-08). That escape now comes from the
+/// force-rebootstrap marker instead (the runtime divergence exit drops it and
+/// the next boot honors it unconditionally), so the window no longer carries the
+/// recovery burden and can reflect what streaming is actually good at: any
+/// casual close-and-reopen used to trigger a FULL re-download past 8 minutes
+/// ("every time I open the client it's behind", 2026-07-10).
+///
+/// The value is TIED to the converge engine's hard per-append bound
+/// (ORPHAN_REORG_DEPTH): a boot window wider than what the live loop will
+/// actually stream boots "in sync" and then marker-exits ~40s later — strictly
+/// worse than re-bootstrapping at boot (review finding, 2026-07-11; an initial
+/// 2000 overshot the 1024 engine bound and the 1025..=2000 band deterministically
+/// took the exit path). 1024 blocks ≈ 85 min at target cadence, ~16 relay
+/// windows — streams in seconds-to-a-minute in the background while the client
+/// is already usable. Gaps the relay can't actually serve (24h TIME-based
+/// retention vs slow-cadence eras, fork-storm slot holes) are caught by the
+/// converge stall watchdog, which escalates to the marker path within minutes.
+/// Forked-at-checkpoint chains (hash mismatch above) never reach this window and
+/// still re-bootstrap immediately.
+const STREAM_WINDOW: u32 = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
+
+/// Marker dropped by the runtime divergence exit: "this chain has PROVEN it
+/// cannot converge — re-bootstrap it at next boot regardless of what the
+/// (possibly stale) manifest comparison says." Lives INSIDE the sled directory
+/// so remove_local_db clears it atomically with the chain it condemned. A stale
+/// marker is also cleared by the runtime once convergence is PROVEN again.
+fn force_rebootstrap_marker_path(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path).join("force_rebootstrap")
+}
+
+/// Floor between marker-forced re-bootstraps. On a shattered network the
+/// diverge->exit->restore cycle would otherwise loop a 13MB snapshot download
+/// every ~minute; within the cooldown the node stays up and keeps retrying
+/// converge instead. Stamped into the FRESH db dir right after a marker-forced
+/// restore, so (like the marker) it travels with the chain it describes.
+const REBOOTSTRAP_COOLDOWN_SECS: u64 = 1800;
+
+fn rebootstrap_cooldown_path(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path).join("rebootstrap_cooldown")
+}
+
+/// True while a marker-forced re-bootstrap happened less than the cooldown ago
+/// (judged by the stamp file's mtime; missing/unreadable = not active).
+fn rebootstrap_cooldown_active(db_path: &str) -> bool {
+    std::fs::metadata(rebootstrap_cooldown_path(db_path))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs() < REBOOTSTRAP_COOLDOWN_SECS)
+        .unwrap_or(false)
+}
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
@@ -4764,6 +4886,139 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reconcile_test_block(index: u32, tag: u8) -> Block {
+        Block {
+            index,
+            previous_hash: [tag; 32],
+            timestamp: 1_000 + index as u64,
+            transactions: Vec::new(),
+            nonce: 0,
+            difficulty: 0,
+            hash: [tag; 32],
+            merkle_root: [0u8; 32],
+        }
+    }
+
+    /// Fresh sled DB at a unique temp path holding the given (height, hash-tag)
+    /// blocks; handle dropped so canonical_reconcile_decision can re-open by path.
+    fn reconcile_test_db(name: &str, heights: &[(u32, u8)]) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "a9_reconcile_{}_{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = sled::Config::new().path(&path).open().unwrap();
+        for (h, tag) in heights {
+            let b = reconcile_test_block(*h, *tag);
+            db.insert(
+                format!("block_{}", h).as_bytes(),
+                alphanumeric::a9::codec::serialize(&b).unwrap(),
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+        path.to_string_lossy().into_owned()
+    }
+
+    fn manifest_at(height: u64, tag: u8) -> Result<BootstrapManifestPointer> {
+        Ok(BootstrapManifestPointer {
+            url: String::new(),
+            network_id: None,
+            height: Some(height),
+            tip_hash: Some(hex::encode([tag; 32])),
+            sha256: None,
+            compressed_bytes: None,
+            extracted_bytes: None,
+            file_count: None,
+            publisher_pubkey: String::new(),
+            manifest_sig: String::new(),
+            updated_at: 0,
+        })
+    }
+
+    // In sync: we hold the canonical block at the manifest height -> keep the DB.
+    #[test]
+    fn reconcile_in_sync_when_local_holds_canonical_tip_hash() {
+        let db = reconcile_test_db("insync", &[(100, 7)]);
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100)),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // Fork at the signed checkpoint: hash mismatch at the manifest height must
+    // re-bootstrap immediately (2026-07-08 stranded-fork recovery), never stream.
+    #[test]
+    fn reconcile_fork_at_checkpoint_diverges_immediately() {
+        let db = reconcile_test_db("fork", &[(100, 8)]);
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100)),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Merely behind, within the stream window: the live loop catches up — the
+    // "every open re-downloads the chain" fix (2026-07-10: a client 100 behind
+    // at 5s blocks = closed for ~8 minutes = full re-bootstrap, under the old 96).
+    #[test]
+    fn reconcile_behind_within_stream_window_streams() {
+        let db = reconcile_test_db("behind_small", &[(100, 7)]);
+        let m = manifest_at(150, 9); // no local block at 150
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(150)),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+        // Gap right at the window edge still streams…
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW)),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
+
+    // …and one past it re-bootstraps. The LIVE beacon height governs the gap
+    // (v7.6.5 freshness rule), not the lagging manifest height.
+    #[test]
+    fn reconcile_behind_beyond_stream_window_rebootstraps() {
+        let db = reconcile_test_db("behind_big", &[(100, 7)]);
+        let m = manifest_at(150, 9);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1)),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // The runtime divergence exit's marker outranks an otherwise-in-sync verdict:
+    // the live loop PROVED the chain can't converge while the manifest was stale
+    // (the 2026-07-10 restart crash-loop). remove_local_db clears the marker with
+    // the condemned chain.
+    #[test]
+    fn reconcile_marker_forces_rebootstrap_even_when_in_sync() {
+        let db = reconcile_test_db("marker", &[(100, 7)]);
+        std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(100)),
+            CanonicalReconcile::Diverged { .. }
+        ));
+    }
+
+    // Fail-open is preserved: with no verified manifest a re-bootstrap is
+    // impossible anyway, so the marker persists silently and offline starts work.
+    #[test]
+    fn reconcile_marker_ignored_when_manifest_unreachable() {
+        let db = reconcile_test_db("marker_offline", &[(100, 7)]);
+        std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
+        let m: Result<BootstrapManifestPointer> = Err("gateway unreachable".into());
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, None),
+            CanonicalReconcile::InSyncOrUnknown
+        ));
+    }
 
     fn signed_bootstrap_manifest() -> BootstrapManifestPointer {
         use ed25519_dalek::{Signer, SigningKey};
