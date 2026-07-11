@@ -2770,12 +2770,12 @@ impl Node {
             // convergence/bootstrap decisions on this chain. (Consensus safety still
             // comes from independent block validation on apply; this is a cheap guard
             // so a cross-network beacon can't even trigger a fetch or an exit path.)
-            let same_network = body
+            let network_id_match = body
                 .get("network_id")
                 .and_then(|v| v.as_str())
-                .map(|nid| nid.eq_ignore_ascii_case(&hex::encode(self.network_id)))
-                .unwrap_or(true); // absent network_id: don't hard-fail (older gateway)
-            if !same_network {
+                .map(|nid| nid.eq_ignore_ascii_case(&hex::encode(self.network_id)));
+            // Absent network_id: don't hard-fail (older gateway).
+            if network_id_match == Some(false) {
                 continue;
             }
             let Some(height) = body.get("height").and_then(|v| v.as_u64()) else {
@@ -2794,8 +2794,14 @@ impl Node {
             // Remember the freshest beacon we ever saw: the mine-prep fail-open
             // consults this when the beacon is momentarily unreachable, so known
             // staleness can't be laundered into "mine the local tip anyway".
-            self.last_seen_beacon_height
-                .fetch_max(height, Ordering::AcqRel);
+            // Only a beacon that POSITIVELY identified our network may raise the
+            // high-water: it is monotonic forever, so one cross-network or
+            // malformed read without a network_id would permanently refuse
+            // mining with "network has reached X" on every prep.
+            if network_id_match == Some(true) {
+                self.last_seen_beacon_height
+                    .fetch_max(height, Ordering::AcqRel);
+            }
             return Some(TipBeaconInfo {
                 height: height as u32,
                 hash,
@@ -4563,7 +4569,24 @@ impl Node {
                 // Terminal for that branch, not for us: mine on our local tip and let
                 // PoW settle it (same fail-open posture as a relay gap, immediately —
                 // retrying the same invalid branch cannot succeed).
+                //
+                // EXCEPT when we know the network is meaningfully above us — the same
+                // stale-tip guard as the Converged/AtTipAhead arm (the ea030a1 ghost
+                // guard missed this arm). "That candidate is invalid" says nothing
+                // about OUR height; a wedged node that kept failing candidates here
+                // fail-opened and mined its own branch ~900 blocks past canonical on
+                // the live network (2026-07-11), poisoning the relay head for everyone.
                 Converge::BranchInvalid => {
+                    let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
+                    let known_tip = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
+                    if Self::stale_tip_mine_refused(local_tip, known_tip) {
+                        return Err(NodeError::Retryable(format!(
+                            "canonical candidate failed validation while the network is at {} and we are at {} ({} behind); not mining a stale tip",
+                            known_tip,
+                            local_tip,
+                            known_tip.saturating_sub(local_tip)
+                        )));
+                    }
                     warn!("Canonical candidate branch failed validation; mining on local tip (fail-open)");
                     return Ok(());
                 }
