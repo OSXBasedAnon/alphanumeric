@@ -2747,10 +2747,46 @@ impl Blockchain {
         // extension: a competing branch that double-spends or overspends must be
         // rejected even though it arrived as a same-height competitor. Checked
         // before any slot is rewritten so there is nothing to roll back.
-        if !self.branch_is_balance_valid(branch[0].index, &branch).await? {
+        //
+        // O(reorg span) fast path: derive the fork-boundary state from the
+        // balances index (marker must vouch for the exact current tip) and
+        // dry-run ONLY the branch, instead of replaying the whole chain from
+        // genesis. Same replay function, same inputs at the boundary, same
+        // verdict — the from-genesis walk at ~42k blocks held the write lock
+        // past the 10s lock-watchdog on every fork-storm race reorg
+        // (2026-07-11: nodes struck chain_ok=false, fell behind, never
+        // recovered). The index gate is taken HERE (not at the mutation window
+        // below) so no concurrent catch-up moves the tree between the marker
+        // check, the dry-run read, and the post-rewrite write-back. Lock order
+        // state_mutation_lock -> balances_index_gate, same as the writers'
+        // in-lock balance reads; dropped before the mempool reconcile.
+        let fork_start = branch[0].index;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let index_guard = self.balances_index_gate.lock().await;
+        let fork_state =
+            self.balances_at_fork_state(&balances_tree, fork_start, tip.index, &branch)?;
+        let balance_valid = match &fork_state {
+            Some((fork_balances, fork_recent)) => {
+                let mut balances = fork_balances.clone();
+                let mut recent = fork_recent.clone();
+                branch.iter().all(|block| {
+                    Self::replay_apply_block_checked(
+                        block.index,
+                        &block.transactions,
+                        &mut balances,
+                        &mut recent,
+                    )
+                    .is_ok()
+                })
+            }
+            // Index can't vouch for the tip (lagging marker, unloadable block):
+            // the authoritative from-genesis dry-run, as before.
+            None => self.branch_is_balance_valid(fork_start, &branch).await?,
+        };
+        if !balance_valid {
             debug!(
                 "Reorg rejected: branch at height {} fails balance validation (overspend/double-spend)",
-                branch[0].index
+                fork_start
             );
             return Ok(false);
         }
@@ -2759,7 +2795,6 @@ impl Blockchain {
         // transaction from the range it replaces, but it must not replay one that is
         // confirmed BELOW the fork point (in the history the branch keeps). Reject a
         // branch that does — this closes replay via a crafted reorg.
-        let fork_start = branch[0].index;
         for b in &branch {
             for tx in &b.transactions {
                 if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
@@ -2812,13 +2847,12 @@ impl Blockchain {
             .ok_or(BlockchainError::InvalidBlockHeader)?
             .clone();
 
-        // Hold the balances-index gate across the whole mutation window: a lazy
-        // catch-up (ensure_balances_index) must never read canonical slots
-        // mid-rewrite. The dirty marker (set above) makes a gate-waiter skip once
-        // it gets in; this closes the window where one could already be running.
-        // Lock order state_mutation_lock -> balances_index_gate, same as the
-        // writers' in-lock balance reads; dropped before the mempool reconcile.
-        let index_guard = self.balances_index_gate.lock().await;
+        // The balances-index gate is already held (acquired at the dry-run above)
+        // across the whole mutation window: a lazy catch-up
+        // (ensure_balances_index) must never read canonical slots mid-rewrite,
+        // and the fork-boundary state computed above must stay valid until it is
+        // written back below. The dirty marker (set above) makes a gate-waiter
+        // skip once it gets in.
 
         // Apply the reorg ATOMICALLY: rewrite the branch's canonical slots and drop
         // any now-stale higher slots in a single batch, so a crash can never leave a
@@ -2849,10 +2883,34 @@ impl Blockchain {
         }
         let _ = self.prune_confirmed_txs(branch_tip.timestamp);
 
-        // Rebuild balances index after reorg (the marker commits atomically inside
-        // the rebuild's own batch, set to the post-rewrite tip it replayed).
-        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        self.rebuild_balances_index(&balances_tree).await?;
+        // Balances after the reorg, in O(reorg span): the fork-boundary values
+        // (already reverted to fork_start-1 for every touched address) commit
+        // atomically WITH the marker, then the tested O(gap) catch-up replays
+        // the new canonical branch from the freshly-rewritten slots. Falls back
+        // to the authoritative from-genesis rebuild when the index could not
+        // vouch for the old tip (fork_state None). catch_up itself falls back
+        // to the full rebuild on any unloadable/non-replaying block, so every
+        // failure path still converges on authoritative values.
+        match fork_state {
+            Some((reverted, _recent)) => {
+                let mut batch = sled::Batch::default();
+                for (addr, bal) in &reverted {
+                    batch.insert(addr.as_bytes(), codec::serialize(bal)?);
+                }
+                let fork_base = (fork_start as u64).saturating_sub(1);
+                batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&fork_base)?);
+                balances_tree.apply_batch(batch)?;
+                self.catch_up_balances_index(
+                    &balances_tree,
+                    fork_base,
+                    branch_tip.index as u64,
+                )
+                .await?;
+            }
+            None => {
+                self.rebuild_balances_index(&balances_tree).await?;
+            }
+        }
         self.write_chain_tip_metadata(&branch_tip)?;
         let _ = self.get_network_difficulty().await?;
         self.db.flush()?;
@@ -3530,6 +3588,121 @@ impl Blockchain {
             *balances.entry(tx.recipient.clone()).or_insert(0) += tx.amount_units;
         }
         Ok(())
+    }
+
+    /// Exact arithmetic inverse of replay_apply_block_checked over RAW confirmed
+    /// totals: coinbase -> recipient loses the reward; anything else -> sender
+    /// regains the full debit (amount + fee), recipient loses the amount. The
+    /// special case mirrors the apply's predicate byte-for-byte (`sender ==
+    /// "MINING_REWARDS"`, NOT the wider SYSTEM_ADDRESSES set). No solvency or
+    /// maturity logic on purpose: maturity is a comparison-time overlay that
+    /// never changes stored values (see replay_apply_block_checked), and a
+    /// revert of already-applied blocks cannot fail — the sums are additive and
+    /// order-independent, so intermediate negatives in the in-memory map are
+    /// fine and never reach disk (callers write one final batch).
+    fn replay_revert_block(txs: &[Transaction], balances: &mut HashMap<String, i128>) {
+        for tx in txs {
+            if tx.sender == "MINING_REWARDS" {
+                *balances.entry(tx.recipient.clone()).or_insert(0) -= tx.amount_units;
+                continue;
+            }
+            *balances.entry(tx.sender.clone()).or_insert(0) += tx.total_debit_units();
+            *balances.entry(tx.recipient.clone()).or_insert(0) -= tx.amount_units;
+        }
+    }
+
+    /// The state a reorg needs at the fork boundary, derived in O(reorg span)
+    /// from the balances index instead of an O(chain) from-genesis replay: RAW
+    /// confirmed balances exactly as of `fork_start - 1` for every address the
+    /// reverted blocks or the candidate branch touch, plus the rolling
+    /// immature-coinbase window seeded exactly as a from-genesis replay would
+    /// hold it entering `fork_start` (same conservative seed as
+    /// catch_up_balances_index — over-seeding is self-correcting).
+    ///
+    /// Returns None — callers MUST fall back to the O(chain) full replay /
+    /// rebuild — whenever the index cannot vouch for the exact current tip:
+    /// marker != old_tip (index lagging or mid-recovery), any reverted or seed
+    /// block fails to load, or fork_start is 0. When Some is returned the
+    /// values are byte-equivalent to a from-genesis replay for the touched set:
+    /// the marker proves the index applied exactly blocks [0, old_tip], and
+    /// replay_revert_block is the exact inverse of the apply over the reverted
+    /// span. Caller must hold balances_index_gate across this call AND the
+    /// subsequent write-back so no concurrent catch-up moves the tree.
+    fn balances_at_fork_state(
+        &self,
+        balances_tree: &sled::Tree,
+        fork_start: u32,
+        old_tip: u32,
+        branch: &[Block],
+    ) -> Result<
+        Option<(
+            HashMap<String, i128>,
+            std::collections::VecDeque<(u32, String, i128)>,
+        )>,
+        BlockchainError,
+    > {
+        if fork_start == 0 || fork_start > old_tip {
+            return Ok(None);
+        }
+        if Self::get_balances_height(balances_tree)? != Some(old_tip as u64) {
+            return Ok(None);
+        }
+
+        // Touch set mirrors replay_apply_block_checked: a coinbase touches its
+        // recipient only; anything else touches sender and recipient. Branch
+        // addresses are included so the dry-run reads every value it needs.
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut collect = |txs: &[Transaction]| {
+            for tx in txs {
+                if tx.sender != "MINING_REWARDS" {
+                    touched.insert(tx.sender.clone());
+                }
+                touched.insert(tx.recipient.clone());
+            }
+        };
+        let mut reverted_blocks: Vec<Block> = Vec::with_capacity((old_tip - fork_start + 1) as usize);
+        for h in fork_start..=old_tip {
+            let Ok(block) = self.get_block(h) else {
+                return Ok(None);
+            };
+            collect(&block.transactions);
+            reverted_blocks.push(block);
+        }
+        for b in branch {
+            collect(&b.transactions);
+        }
+
+        let mut balances: HashMap<String, i128> = HashMap::new();
+        for addr in &touched {
+            let value = match balances_tree.get(addr.as_bytes())? {
+                Some(raw) => Self::deserialize_units_compatible(&raw)?,
+                None => 0,
+            };
+            balances.insert(addr.clone(), value);
+        }
+        for block in &reverted_blocks {
+            Self::replay_revert_block(&block.transactions, &mut balances);
+        }
+
+        // Maturity window entering fork_start — blocks below the fork are
+        // canonical and untouched by the reorg, so this seed is identical for
+        // the old and new histories. Ascending order matches the replay's push
+        // order (the pop loop only inspects the front).
+        let mut recent: std::collections::VecDeque<(u32, String, i128)> =
+            std::collections::VecDeque::new();
+        let seed_low = fork_start.saturating_sub(MINING_REWARD_MATURITY);
+        for rh in seed_low..fork_start {
+            let Ok(block) = self.get_block(rh) else {
+                return Ok(None);
+            };
+            for tx in &block.transactions {
+                if tx.sender == "MINING_REWARDS" {
+                    recent.push_back((block.index, tx.recipient.clone(), tx.amount_units));
+                }
+            }
+        }
+
+        Ok(Some((balances, recent)))
     }
 
     /// Coinbase-maturity overlay (M06) for the tip-extension and advisory gates: the total
@@ -7384,6 +7557,209 @@ mod tests {
                 "address {k} diverged between catch-up and full rebuild"
             );
         }
+    }
+
+    /// replay_revert_block must be the exact arithmetic inverse of
+    /// replay_apply_block_checked over raw totals: applying a set of blocks and
+    /// then reverting them (in any order) returns every touched address to its
+    /// starting value.
+    #[test]
+    fn replay_revert_is_exact_inverse_of_apply() {
+        let mut prev = [0u8; 32];
+        let mut blocks = Vec::new();
+        for (i, miner) in [(0u32, "alice"), (1, "bob")] {
+            let b = metadata_test_block(i, prev, miner, 10.0);
+            prev = b.hash;
+            blocks.push(b);
+        }
+        let b2 = test_block_with_txs(2, prev, "carol", 10.0, &[("alice", "dave", 3.0)]);
+        prev = b2.hash;
+        blocks.push(b2);
+        let b3 = test_block_with_txs(
+            3,
+            prev,
+            "alice",
+            10.0,
+            &[("dave", "erin", 1.0), ("bob", "alice", 2.5)],
+        );
+        blocks.push(b3);
+
+        let mut balances: HashMap<String, i128> = HashMap::new();
+        let mut recent: std::collections::VecDeque<(u32, String, i128)> =
+            std::collections::VecDeque::new();
+        for b in &blocks {
+            Blockchain::replay_apply_block_checked(
+                b.index,
+                &b.transactions,
+                &mut balances,
+                &mut recent,
+            )
+            .unwrap();
+        }
+        // Revert in forward order on purpose: the inverse must be
+        // order-independent (additive sums), not just LIFO-correct.
+        for b in &blocks {
+            Blockchain::replay_revert_block(&b.transactions, &mut balances);
+        }
+        for (addr, v) in &balances {
+            assert_eq!(*v, 0, "address {addr} did not return to its pre-apply value");
+        }
+    }
+
+    /// The O(reorg span) fast path (balances_at_fork_state -> revert write-back
+    /// -> catch_up over the new branch) must land the SAME values as a fresh
+    /// from-genesis build of the post-reorg chain. Mirrors
+    /// try_adopt_orphan_branch's exact sequence at the storage level. The
+    /// sentinel proves no full rebuild ran (a rebuild removes unknown keys;
+    /// the incremental path never removes).
+    #[tokio::test]
+    async fn reorg_incremental_balances_match_full_rebuild() {
+        // Old canonical chain 0..=6; fork at 4. dave/erin exist ONLY on the
+        // reverted span (their values must return to zero), alice is funded
+        // pre-fork and spends on both sides.
+        let mut prev = [0u8; 32];
+        let mut base = Vec::new();
+        for (i, miner) in [(0u32, "alice"), (1, "bob"), (2, "alice"), (3, "carol")] {
+            let b = metadata_test_block(i, prev, miner, 10.0);
+            prev = b.hash;
+            base.push(b);
+        }
+        let fork_prev = prev;
+        let old4 = test_block_with_txs(4, prev, "miner4", 10.0, &[("alice", "dave", 3.0)]);
+        prev = old4.hash;
+        let old5 = test_block_with_txs(5, prev, "miner5", 10.0, &[("dave", "erin", 1.0)]);
+        prev = old5.hash;
+        let old6 = metadata_test_block(6, prev, "bob", 10.0);
+        let old_branch = vec![old4, old5, old6];
+
+        let mut prev = fork_prev;
+        let new4 = test_block_with_txs(4, prev, "nb4", 10.0, &[("alice", "bob", 2.0)]);
+        prev = new4.hash;
+        let new5 = metadata_test_block(5, prev, "nb5", 10.0);
+        prev = new5.hash;
+        let new6 = test_block_with_txs(6, prev, "nb6", 10.0, &[("bob", "grace", 5.0)]);
+        prev = new6.hash;
+        let new7 = metadata_test_block(7, prev, "nb7", 10.0);
+        let new_branch = vec![new4, new5, new6, new7];
+
+        // Instance A: old chain indexed at its tip, then the try_adopt sequence.
+        let a = test_blockchain();
+        for b in base.iter().chain(old_branch.iter()) {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        a.ensure_balances_index().await.unwrap();
+        let a_tree = a.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(6));
+        a_tree
+            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .unwrap();
+
+        let fork_state = a
+            .balances_at_fork_state(&a_tree, 4, 6, &new_branch)
+            .unwrap()
+            .expect("marker vouches for the tip — fast path must engage");
+        // Dry-run the branch from the fork state (the balance_valid check).
+        {
+            let (mut balances, mut recent) = fork_state.clone();
+            for b in &new_branch {
+                Blockchain::replay_apply_block_checked(
+                    b.index,
+                    &b.transactions,
+                    &mut balances,
+                    &mut recent,
+                )
+                .expect("valid branch must dry-run cleanly from the fork state");
+            }
+        }
+        // Slot rewrite, then the atomic revert write-back + marker, then catch-up
+        // over the new branch — exactly try_adopt_orphan_branch's update.
+        for b in &new_branch {
+            insert_raw_block(&a, b);
+        }
+        a.rebuild_chain_tip_metadata().unwrap();
+        let (reverted, _) = fork_state;
+        let mut batch = sled::Batch::default();
+        for (addr, bal) in &reverted {
+            batch.insert(addr.as_bytes(), codec::serialize(bal).unwrap());
+        }
+        batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&3u64).unwrap());
+        a_tree.apply_batch(batch).unwrap();
+        a.catch_up_balances_index(&a_tree, 3, 7).await.unwrap();
+        assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(7));
+        assert!(
+            a_tree.get("zz_sentinel".as_bytes()).unwrap().is_some(),
+            "incremental path must have run (a full rebuild removes the sentinel)"
+        );
+
+        // Instance B: the post-reorg chain built fresh from genesis.
+        let b_chain = test_blockchain();
+        for b in base.iter().chain(new_branch.iter()) {
+            insert_raw_block(&b_chain, b);
+        }
+        b_chain.rebuild_chain_tip_metadata().unwrap();
+        b_chain.ensure_balances_index().await.unwrap();
+
+        // Value identity over the union of addresses (absent == 0): reverted-
+        // span-only addresses (dave, erin, miner4, miner5) may remain as
+        // explicit zeros on the incremental side, matching catch-up semantics.
+        let mut a_vals = dump_balances(&a);
+        a_vals.remove("zz_sentinel");
+        let b_vals = dump_balances(&b_chain);
+        let keys: std::collections::BTreeSet<String> =
+            a_vals.keys().chain(b_vals.keys()).cloned().collect();
+        for k in keys {
+            assert_eq!(
+                a_vals.get(&k).copied().unwrap_or(0),
+                b_vals.get(&k).copied().unwrap_or(0),
+                "address {k} diverged between incremental reorg and full rebuild"
+            );
+        }
+        for gone in ["dave", "erin", "miner4", "miner5"] {
+            assert_eq!(
+                a_vals.get(gone).copied().unwrap_or(0),
+                0,
+                "reverted-branch-only address {gone} must return to zero"
+            );
+        }
+    }
+
+    /// A lagging marker must disable the fast path (balances_at_fork_state ->
+    /// None) so the reorg falls back to the authoritative full rebuild instead
+    /// of reverting blocks the index never applied.
+    #[tokio::test]
+    async fn reorg_fast_path_requires_marker_at_tip() {
+        let mut prev = [0u8; 32];
+        let mut chain = Vec::new();
+        for i in 0..=5u32 {
+            let b = metadata_test_block(i, prev, &format!("m{i}"), 10.0);
+            prev = b.hash;
+            chain.push(b);
+        }
+        let bc = test_blockchain();
+        for b in &chain {
+            insert_raw_block(&bc, b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&tree).unwrap(), Some(5));
+
+        // Marker at tip: fast path engages.
+        assert!(bc
+            .balances_at_fork_state(&tree, 4, 5, &[])
+            .unwrap()
+            .is_some());
+        // Lagging marker: fast path must refuse.
+        Blockchain::set_balances_height(&tree, 4).unwrap();
+        assert!(bc
+            .balances_at_fork_state(&tree, 4, 5, &[])
+            .unwrap()
+            .is_none());
+        // Genesis fork or inverted span: refuse.
+        Blockchain::set_balances_height(&tree, 5).unwrap();
+        assert!(bc.balances_at_fork_state(&tree, 0, 5, &[]).unwrap().is_none());
+        assert!(bc.balances_at_fork_state(&tree, 6, 5, &[]).unwrap().is_none());
     }
 
     /// Catch-up starting MID-WAY through the coinbase-maturity window must seed
