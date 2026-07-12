@@ -10,7 +10,7 @@ https://www.alphanumeric.blue/
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.6.1`.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.7.8`.
 
 ## Quick Nav
 
@@ -129,6 +129,14 @@ Transaction witnesses use a compact-finality model:
 - live mempool and new block admission require the full ML-DSA signature and sender public key
 - confirmed block storage keeps a compact signature receipt plus `sig_hash = SHA256(full_signature)`
 - historical P2P sync validates block hash, merkle root, PoW, balances, reward rules, public-key/address binding, and receipt commitments without requiring archived full witnesses
+
+Difficulty maps to PoW work in discrete power-of-two bands (the target is
+`MAX_TARGET >> (difficulty / 16)`), so the retarget adjusts real work in factor-of-two
+steps rather than continuously. At hashrates that fall between two bands, observed block
+time can sawtooth around the `TARGET_BLOCK_TIME` (faster in the lower band, slower in the
+higher one) until difficulty or hashrate settles. This is expected and self-correcting —
+it does not affect finality (reorgs remain bounded by the checkpoint margin) — and finer
+target granularity is a candidate for a future coordinated protocol upgrade.
 
 If you are integrating against this repository, pin a commit hash and validate behavior at that exact revision.
 
