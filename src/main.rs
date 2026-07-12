@@ -31,7 +31,7 @@ use alphanumeric::a9::{
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
     node::{
-        force_rebootstrap_marker_path, rebootstrap_cooldown_active, rebootstrap_cooldown_path,
+        force_rebootstrap_marker_path, rebootstrap_cooldown_path,
         rebootstrap_hard_cooldown_active,
         Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT,
     },
