@@ -460,13 +460,14 @@ impl Transaction {
     }
 
     async fn verify_balance(&self, blockchain: &Blockchain) -> Result<(), BlockchainError> {
-        let sender_balance = blockchain.get_confirmed_balance(&self.sender).await?; // Changed this line!
+        // Exact i128 (hygiene: this path is currently unreachable, but keep it off the
+        // lossy f64 round-trip like every other affordability check — 2026-07-12 audit).
+        let sender_units = blockchain.get_confirmed_balance_units(&self.sender).await?;
 
         if !self.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        let sender_units = Transaction::to_units(sender_balance);
         let total_required = self.total_debit_units();
 
         if sender_units < total_required {
@@ -4172,8 +4173,11 @@ impl Blockchain {
         // First pass: Get all confirmed balances
         for tx in &block.transactions {
             if tx.sender != "MINING_REWARDS" && !confirmed_balances.contains_key(&tx.sender) {
-                let balance = self.get_confirmed_balance(&tx.sender).await?;
-                confirmed_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
+                // Exact i128 to match the consensus writer process_transactions_batch;
+                // a gate-vs-writer round-trip mismatch above ~33.55M coins would burn
+                // valid mined blocks (2026-07-12 audit).
+                let balance_units = self.get_confirmed_balance_units(&tx.sender).await?;
+                confirmed_balances.insert(tx.sender.clone(), balance_units);
             }
         }
         set_finalize_stage(2);
@@ -4510,13 +4514,16 @@ impl Blockchain {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        // For regular transactions, validate balance with proper pending tracking
-        let confirmed_balance = self.get_confirmed_balance(&tx.sender).await?;
-        let pending_amount = if block.is_none() {
+        // For regular transactions, validate balance with proper pending tracking.
+        // Exact i128 on BOTH operands (confirmed and pending): f64 subtraction is lossy
+        // above ~18M coins even below the round-trip onset, so keep the whole compare in
+        // integer units (2026-07-12 audit).
+        let confirmed_units = self.get_confirmed_balance_units(&tx.sender).await?;
+        let pending_units = if block.is_none() {
             // Only check pending for new transactions, not during block validation
-            self.get_pending_amount(&tx.sender).await?
+            self.get_pending_debit_units(&tx.sender).await?
         } else {
-            0.0
+            0
         };
 
         // M06 (advisory): for mempool admission (block=None) don't offer to spend an immature
@@ -4529,7 +4536,7 @@ impl Blockchain {
             }
             Some(_) => 0,
         };
-        let available_balance = Transaction::to_units(confirmed_balance - pending_amount) - immature;
+        let available_balance = confirmed_units - pending_units - immature;
         let required_amount = tx.total_debit_units();
 
         if available_balance < required_amount {
@@ -4827,10 +4834,11 @@ impl Blockchain {
         let unique_senders: HashSet<&String> =
             regular_transactions.iter().map(|tx| &tx.sender).collect();
 
-        // Fetch all confirmed balances in one pass
+        // Fetch all confirmed balances in one pass. Exact i128 to match the consensus
+        // writer (round-trip drifts above ~33.55M coins — 2026-07-12 audit).
         for sender in unique_senders {
-            let balance = self.get_confirmed_balance(sender).await?;
-            confirmed_balances.insert(sender.clone(), Transaction::to_units(balance));
+            let balance_units = self.get_confirmed_balance_units(sender).await?;
+            confirmed_balances.insert(sender.clone(), balance_units);
         }
 
         // Validate each regular transaction
@@ -4990,8 +4998,10 @@ impl Blockchain {
             return Ok(());
         }
 
-        let confirmed_balance = self.get_confirmed_balance(&transaction.sender).await?;
-        let pending_amount = self.get_pending_debit_for(&transaction.sender).await?;
+        // Exact i128 on both operands, same reasoning as validate_transaction:
+        // f64 confirmed/pending subtraction is lossy at large balances (2026-07-12 audit).
+        let confirmed_units = self.get_confirmed_balance_units(&transaction.sender).await?;
+        let pending_units = self.get_pending_debit_units(&transaction.sender).await?;
 
         // M06 (advisory): don't admit a tx that spends an immature reward at the next height.
         let immature = self.immature_reward_units_scan(
@@ -4999,8 +5009,7 @@ impl Blockchain {
             self.get_latest_block_index() as u64 + 1,
             &[],
         );
-        let available_balance =
-            Transaction::to_units(confirmed_balance - pending_amount) - immature;
+        let available_balance = confirmed_units - pending_units - immature;
         let total_required = transaction.total_debit_units();
         if available_balance < total_required {
             return Err(BlockchainError::InsufficientFunds);
@@ -5424,15 +5433,20 @@ impl Blockchain {
         let mut balance_changes: HashMap<String, i128> = HashMap::new();
         let mut current_balances: HashMap<String, i128> = HashMap::new();
 
-        // First pass: Get all current balances for any address touched by this batch
+        // First pass: Get all current balances for any address touched by this batch.
+        // EXACT i128 (get_confirmed_balance_units), NOT to_units(get_confirmed_balance):
+        // this is the consensus ledger writer (new_balance = current + change is written
+        // back below), and the f64 round-trip drifts the stored ledger away from the
+        // exact rebuild/catch-up paths above ~33.55M coins — a latent chain split
+        // (2026-07-12 audit). Value-identical below that in the reachable range.
         for tx in &transactions {
             if tx.sender != "MINING_REWARDS" && !current_balances.contains_key(&tx.sender) {
-                let balance = self.get_confirmed_balance(&tx.sender).await?;
-                current_balances.insert(tx.sender.clone(), Transaction::to_units(balance));
+                let balance_units = self.get_confirmed_balance_units(&tx.sender).await?;
+                current_balances.insert(tx.sender.clone(), balance_units);
             }
             if !current_balances.contains_key(&tx.recipient) {
-                let balance = self.get_confirmed_balance(&tx.recipient).await?;
-                current_balances.insert(tx.recipient.clone(), Transaction::to_units(balance));
+                let balance_units = self.get_confirmed_balance_units(&tx.recipient).await?;
+                current_balances.insert(tx.recipient.clone(), balance_units);
             }
         }
 
@@ -5653,7 +5667,14 @@ impl Blockchain {
         true
     }
 
-    pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
+    /// Exact confirmed balance in i128 units — the SINGLE source of truth for any
+    /// affordability or consensus decision. Preserves the lazy ensure_balances_index
+    /// rebuild, the 0-insert, and the slow-path scan. Consensus/affordability callers
+    /// MUST use this, never `Transaction::to_units(get_confirmed_balance(...))`: that
+    /// f64 round-trip is not the identity above ~33.55M coins (2^25 coins) and drifts
+    /// the incrementally-maintained ledger away from the exact rebuild/catch-up path,
+    /// a latent chain split on a large-balance payment (2026-07-12 audit).
+    pub async fn get_confirmed_balance_units(&self, address: &str) -> Result<i128, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let auto_rebuild = std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -5669,12 +5690,12 @@ impl Blockchain {
         }
         if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
             let balance_units = Self::deserialize_units_compatible(&balance_bytes)?;
-            return Ok(Transaction::from_units(balance_units));
+            return Ok(balance_units);
         }
         if auto_rebuild && index_height >= self.get_latest_block_index() {
             let balance_units: i128 = 0;
             balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
-            return Ok(0.0);
+            return Ok(0);
         }
         // Slow path: calculate from blocks, then cache in balances tree.
         let mut balance_units: i128 = 0;
@@ -5715,7 +5736,16 @@ impl Blockchain {
         }
 
         balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
-        Ok(Transaction::from_units(balance_units))
+        Ok(balance_units)
+    }
+
+    /// Confirmed balance as f64 — DISPLAY ONLY. A thin wrapper over the exact
+    /// get_confirmed_balance_units for UI/reporting; never route an affordability
+    /// or consensus check through this (the f64 is lossy above ~33.55M coins).
+    pub async fn get_confirmed_balance(&self, address: &str) -> Result<f64, BlockchainError> {
+        Ok(Transaction::from_units(
+            self.get_confirmed_balance_units(address).await?,
+        ))
     }
 
     // Public method that shows spendable balance to users
@@ -5752,30 +5782,11 @@ impl Blockchain {
         })
     }
 
-    pub async fn update_wallet_balance(
-        &self,
-        address: &str,
-        amount: f64,
-    ) -> Result<(), BlockchainError> {
-        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-
-        // Get current balance
-        let current_balance_units = match balances_tree.get(address.as_bytes())? {
-            Some(balance_bytes) => Self::deserialize_units_compatible(&balance_bytes)?,
-            None => 0,
-        };
-
-        let new_balance_units = current_balance_units + Transaction::to_units(amount);
-
-        // Store new balance
-        balances_tree.insert(
-            address.as_bytes(),
-            codec::serialize(&new_balance_units)
-                .map_err(|_| BlockchainError::InvalidTransaction)?,
-        )?;
-
-        Ok(())
-    }
+    // (removed 2026-07-12) update_wallet_balance: a dead pub f64 ledger writer with
+    // zero callers that bypassed the BALANCES_HEIGHT_KEY marker and seeded from
+    // to_units(f64) — exactly the round-trip drift this audit is eliminating. Deleted
+    // so it can't reintroduce the bug class. Ledger writes go through
+    // process_transactions_batch / rebuild / catch-up only.
 
     pub fn calculate_merkle_root(
         transactions: &[Transaction],
@@ -6409,6 +6420,74 @@ mod tests {
             .db
             .insert(key.as_bytes(), codec::serialize(block).unwrap())
             .expect("raw block insert should succeed");
+    }
+
+    /// Balance round-trip identity: to_units(from_units(u)) == u for every u the chain
+    /// can reach (through 2^51 units). This is WHY routing the consensus writer + gates
+    /// from to_units(get_confirmed_balance(..)) to the exact get_confirmed_balance_units
+    /// is value-identical in the reachable range — no fork. The first value where the
+    /// round-trip drifts is 3_355_443_200_000_019 units (2^25 coins + 19, ~33.55M coins),
+    /// far above any balance the current chain could hold; the exact path is what keeps
+    /// an incrementally-maintained ledger equal to a from-genesis rebuild past that point.
+    #[test]
+    fn balance_roundtrip_is_identity_through_the_reachable_range() {
+        // ~2^51 units = 2_251_799_813_685_248 (~22.5M coins) is the top of the verified
+        // identity range and already well beyond any reachable single-address balance.
+        for u in [
+            0i128,
+            1,
+            100_000_000,               // 1 coin
+            2_250_000_000_000_000,     // ~22.5M coins
+            1i128 << 50,
+            1i128 << 51,
+        ] {
+            assert_eq!(
+                Transaction::to_units(Transaction::from_units(u)),
+                u,
+                "round-trip must be the identity at {u} units (reachable range)"
+            );
+        }
+        // Documented onset: the first unit value where the old f64 round-trip drifts.
+        const ROUNDTRIP_ONSET: i128 = 3_355_443_200_000_019;
+        assert_ne!(
+            Transaction::to_units(Transaction::from_units(ROUNDTRIP_ONSET)),
+            ROUNDTRIP_ONSET,
+            "onset: to_units(from_units) is expected to drift at {ROUNDTRIP_ONSET} units"
+        );
+    }
+
+    /// get_confirmed_balance_units returns the stored i128 EXACTLY at a balance where the
+    /// f64 get_confirmed_balance drifts — proving the consensus writer/gates (now routed
+    /// to the units getter) stay equal to the exact rebuild/catch-up ledger past the
+    /// round-trip onset, while the old to_units(get_confirmed_balance(..)) would not.
+    #[tokio::test]
+    async fn confirmed_balance_units_is_exact_where_f64_drifts() {
+        let bc = test_blockchain();
+        // Empty chain: tip 0, index height 0, so no lazy rebuild fires and the seeded
+        // value is read straight back.
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+        const DRIFTY: i128 = 3_355_443_200_000_019; // first value the f64 round-trip drifts
+        tree.insert("whale".as_bytes(), codec::serialize(&DRIFTY).unwrap())
+            .unwrap();
+
+        // Exact getter: byte-for-byte the stored value.
+        assert_eq!(bc.get_confirmed_balance_units("whale").await.unwrap(), DRIFTY);
+
+        // The f64 path round-trips and drifts — exactly why consensus reads the units getter.
+        let via_f64 = Transaction::to_units(bc.get_confirmed_balance("whale").await.unwrap());
+        assert_ne!(
+            via_f64, DRIFTY,
+            "the f64 round-trip drifts at this balance; consensus must use the units getter"
+        );
+
+        // A reachable-range balance is identical either way (value-identical, no fork).
+        tree.insert("small".as_bytes(), codec::serialize(&2_250_000_000_000_000i128).unwrap())
+            .unwrap();
+        assert_eq!(
+            bc.get_confirmed_balance_units("small").await.unwrap(),
+            Transaction::to_units(bc.get_confirmed_balance("small").await.unwrap()),
+            "below the onset the exact getter and the f64 round-trip must agree"
+        );
     }
 
     /// The mining affordability gates (validate_new_block / finalize_block) must pass
