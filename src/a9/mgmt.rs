@@ -759,6 +759,18 @@ impl Mgmt {
                 writeln!(stdout, "───────────────────")?;
                 stdout.reset()?;
 
+                // The reward actually minted, from the mined block's coinbase:
+                // mine_block rebuilds the template from the LIVE mempool, so the
+                // command-time `mining_reward` figure can be stale by solve time
+                // (fees arrived/left mid-grind, or the height crossed a reward
+                // step during a long grind).
+                let mining_reward = mined_block
+                    .transactions
+                    .first()
+                    .filter(|tx| tx.sender == "MINING_REWARDS")
+                    .map(|tx| tx.amount())
+                    .unwrap_or(mining_reward);
+
                 let breakdown = {
                     let blockchain_guard = blockchain.read().await;
                     blockchain_guard

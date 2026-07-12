@@ -49,6 +49,9 @@ pub struct GpuMiner {
     params_buf: wgpu::Buffer,
     result_buf: wgpu::Buffer,
     readback_buf: wgpu::Buffer,
+    // Buffer identities never change, so one bind group serves every dispatch
+    // (rebuilding it per dispatch was pure per-dispatch churn).
+    bind: wgpu::BindGroup,
     pub adapter_name: String,
 }
 
@@ -60,7 +63,15 @@ impl GpuMiner {
     }
 
     async fn new_async() -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        // Identical to Instance::default() (all backends; Vulkan wins adapter
+        // selection on NVIDIA) EXCEPT it honors WGPU_BACKEND — wgpu 22.1.0's
+        // Instance::default() ignores the env var, which left no way to steer
+        // a box with a broken driver stack (e.g. WGPU_BACKEND=dx12) without a
+        // rebuild.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
+            ..Default::default()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -117,6 +128,22 @@ impl GpuMiner {
             mapped_at_creation: false,
         });
 
+        let bind_layout = pipeline.get_bind_group_layout(0);
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blake3-pow"),
+            layout: &bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: result_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         Ok(Self {
             device,
             queue,
@@ -124,6 +151,7 @@ impl GpuMiner {
             params_buf,
             result_buf,
             readback_buf,
+            bind,
             adapter_name: format!("{} ({:?})", info.name, info.backend),
         })
     }
@@ -146,21 +174,6 @@ impl GpuMiner {
             0,
             bytemuck::bytes_of(&ResultBuf::zeroed()),
         );
-        let bind_layout = self.pipeline.get_bind_group_layout(0);
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.result_buf.as_entire_binding(),
-                },
-            ],
-        });
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -170,7 +183,7 @@ impl GpuMiner {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, &self.bind, &[]);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         enc.copy_buffer_to_buffer(
@@ -296,33 +309,66 @@ impl GpuMiner {
     }
 }
 
+use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use indicatif::ProgressBar;
 
 use crate::a9::blockchain::Block;
 
 /// Process-wide cached GPU miner (init is ~100-200ms; reuse it across blocks).
-/// None once init has failed, so we don't retry a broken/absent GPU every block.
-static GPU: OnceLock<Option<GpuMiner>> = OnceLock::new();
+/// The Err side keeps the init/self-check failure so the mine command can SHOW
+/// the user why the GPU is unusable — the default log filter is Error-only, so
+/// a log::warn here was invisible and `mine --gpu` on a broken adapter looked
+/// like mining while doing nothing.
+static GPU: OnceLock<Result<GpuMiner, String>> = OnceLock::new();
 
-fn shared_gpu() -> Option<&'static GpuMiner> {
+/// Converged dispatch size, carried ACROSS attempts. Attempts end on every
+/// network tip change (~5s), and restarting the adaptive sizing from 4 each
+/// time meant the first dispatches of EVERY attempt ran far under the wall-
+/// clock target — with the rate display re-ramping alongside.
+static LAST_ITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
+
+/// Displayed-rate EWMA (f64 bits), carried across attempts. Instantaneous
+/// per-dispatch rate keeps template-rebuild gaps out of the denominator, and
+/// the cross-attempt EWMA keeps the number steady through ~5s tip churn —
+/// an attempt-local average sagged ~40% at every tip change and read as
+/// thermal throttling on a perfectly healthy card.
+static RATE_EWMA_BITS: AtomicU64 = AtomicU64::new(0);
+
+fn shared_gpu_status() -> &'static Result<GpuMiner, String> {
     GPU.get_or_init(|| match GpuMiner::new() {
         Ok(m) => match m.self_check() {
-            Ok(()) => {
-                log::info!("GPU miner ready: {} (BLAKE3 self-check passed)", m.adapter_name);
-                Some(m)
-            }
-            Err(e) => {
-                log::warn!("GPU miner disabled: {e}");
-                None
-            }
+            Ok(()) => Ok(m),
+            Err(e) => Err(format!("self-check failed on {}: {e}", m.adapter_name)),
         },
-        Err(e) => {
-            log::warn!("GPU miner unavailable ({e}); mining on CPU");
-            None
-        }
+        Err(e) => Err(e),
     })
-    .as_ref()
+}
+
+/// Adapter name + backend if the GPU is usable, or the reason it is not.
+/// The mine command prints this ONCE on stdout so `--gpu` is never silent
+/// about which adapter it picked (or that it picked none).
+pub fn gpu_status() -> Result<&'static str, String> {
+    match shared_gpu_status() {
+        Ok(m) => {
+            // Re-verify per mine command: the OnceLock caches Ok forever, but a
+            // mid-session device loss (driver reset/TDR) survives into the NEXT
+            // command — without this the status line would claim a healthy GPU
+            // on a dead device. One 92-byte hash (~ms); if the dead device makes
+            // this panic instead of erroring, the caller's spawn_blocking
+            // JoinError arm already demotes to CPU.
+            m.self_check()
+                .map_err(|e| format!("{} failed re-check: {e}", m.adapter_name))?;
+            Ok(m.adapter_name.as_str())
+        }
+        Err(e) => Err(e.clone()),
+    }
+}
+
+fn shared_gpu() -> Option<&'static GpuMiner> {
+    shared_gpu_status().as_ref().ok()
 }
 
 /// Build the 92-byte mining header (matches the CPU miner's layout exactly).
@@ -344,6 +390,28 @@ fn build_header(
     h
 }
 
+/// Expected hashes to solve one block at `difficulty` (target = MAX >> (d/16)).
+fn expected_hashes(difficulty: u64) -> f64 {
+    2f64.powi((difficulty / 16).min(255) as i32)
+}
+
+/// Human "about how long" at a measured rate — the honest solo-mining ETA the
+/// display owes the user (a Poisson mean, not a countdown).
+fn format_eta(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "…".into();
+    }
+    if seconds < 90.0 {
+        format!("~{:.0}s", seconds)
+    } else if seconds < 5400.0 {
+        format!("~{:.0}m", seconds / 60.0)
+    } else if seconds < 172_800.0 {
+        format!("~{:.1}h", seconds / 3600.0)
+    } else {
+        format!("~{:.1}d", seconds / 86_400.0)
+    }
+}
+
 /// GPU nonce search for one block attempt. Refreshes the timestamp/difficulty
 /// per sub-batch (like the CPU miner), searching until it finds a winning nonce,
 /// hits the wall-clock `budget`, or the network tip moves (tip_counter no longer
@@ -351,6 +419,16 @@ fn build_header(
 /// dispatch instead of wasting the rest of the budget on a stale template). On
 /// success returns `(nonce, timestamp, difficulty, hash)` for the existing CPU
 /// finalizer to build+verify — the GPU only proposes a nonce; consensus unchanged.
+///
+/// Display: all output goes through `progress` (the mine command's indicatif
+/// bar) — never raw print!, which fought the bar's steady tick for the terminal
+/// line and garbled both. The bar is PERCENT of ONE EXPECTED BLOCK of work at
+/// the live difficulty; `session_hashed` carries the running total across
+/// attempts AND heights (attempts end every tip change / budget, and the tip
+/// advances every ~5s network-wide — a per-height bar would restart before it
+/// visibly moved). The search is memoryless, so cumulative-work-vs-expected is
+/// the one progress number that is both monotonic and true; the message adds
+/// the measured GH/s and the honest Poisson ETA at that rate.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_mine_attempt(
     number: u32,
@@ -361,13 +439,16 @@ pub fn gpu_mine_attempt(
     budget: std::time::Duration,
     tip_counter: &std::sync::atomic::AtomicU64,
     tip_version: u64,
+    session_hashed: &AtomicU64,
+    progress: Option<&ProgressBar>,
 ) -> Option<(u64, u64, u64, [u8; 32])> {
     let gpu = shared_gpu()?;
     let deadline = Instant::now() + budget;
     // Per-dispatch batch amortizes the readback (THREADS threads each testing
-    // `iters` nonces per GPU->CPU sync; THREADS*iters < 2^32 keeps the kernel's
-    // per-thread u32 offset exact; THREADS stays under wgpu's 65535
-    // workgroups-per-dimension limit at 65535*256 = 16.7M).
+    // `iters` nonces per GPU->CPU sync; THREADS*iters <= 65535*256*256 =
+    // 4,294,901,760 < 2^32 keeps the kernel's per-thread u32 offset exact;
+    // THREADS stays under wgpu's 65535 workgroups-per-dimension limit at
+    // 65535*256 = 16.7M).
     //
     // `iters` is ADAPTIVE, targeting ~250ms of wall-clock per dispatch: the tip
     // check below only runs BETWEEN dispatches (a submitted wgpu dispatch cannot
@@ -377,22 +458,42 @@ pub fn gpu_mine_attempt(
     // moment the readback returned, which read as "the GPU miner is always a few
     // blocks behind the tip". 250ms keeps any adapter within a fraction of a
     // block of the live tip while still amortizing the readback ~40x per second.
+    // MAX_ITERS 256 (was 64): 64 capped a dispatch at 1.07G nonces, so any card
+    // past ~4.3 GH/s ran sub-250ms dispatches and paid the readback/submit
+    // overhead up to 3x more often than designed (~1-3% on a 5090-class card).
+    // 65535*256*256 = 4,294,901,760 < 2^32, so the kernel's per-thread u32
+    // offset stays exact; the ~250ms adaptive target still bounds preemption.
     const THREADS: u32 = 65535 * 256;
-    const MAX_ITERS: u32 = 64;
-    const TARGET_DISPATCH_MS: f64 = 250.0;
+    const MAX_ITERS: u32 = 256;
+    // 140ms (was 250): dispatch length trades fixed per-dispatch overhead
+    // (measured ~1-2ms: fence round-trip + map + submit) against STALENESS —
+    // a dispatch in flight when the tip moves is all dead work, costing D/2 on
+    // average per ~5s tip change. Total waste is minimized at
+    // D* = sqrt(2·T_o·T_tip) ≈ 100-160ms; 140ms cuts combined waste from
+    // ~3.1% to ~2.4%. If this miner ever dominates network hashrate (rarer
+    // external tip changes), larger dispatches win again — retune by the
+    // formula, not by feel.
+    const TARGET_DISPATCH_MS: f64 = 140.0;
 
     let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
-    let start = Instant::now();
-    let mut base: u64 = 0;
-    let mut iters: u32 = 4;
-    let mut dispatches: u64 = 0;
-    let mut hashed: u64 = 0;
-    let mut last_report = start;
+    // Random window base (see attempt_nonce_base): same-wallet rigs build
+    // identical merkle roots within the same second, and anchored-at-0 bases
+    // made them scan near-identical (timestamp, nonce) space — one rig's whole
+    // hashrate wasted. Also what makes one-process-per-card multi-GPU sound.
+    let mut base: u64 = crate::a9::miner::attempt_nonce_base();
+    let mut iters: u32 = LAST_ITERS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(1, MAX_ITERS);
+    let mut last_report = Instant::now();
     while Instant::now() < deadline && !tip_moved() {
+        // Clamped to the parent's timestamp (same as the CPU loop): a local
+        // clock behind the parent stamps headers that fail parent-timestamp
+        // validation only after the grind — every solve burned.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs()
+            .max(previous_block_timestamp);
         let difficulty = Block::consensus_next_difficulty(
             previous_difficulty,
             timestamp.saturating_sub(previous_block_timestamp),
@@ -418,25 +519,55 @@ pub fn gpu_mine_attempt(
         }
         let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
         base = base.wrapping_add(per_dispatch);
-        dispatches += 1;
-        hashed = hashed.saturating_add(per_dispatch);
+        let total_hashed = session_hashed
+            .fetch_add(per_dispatch, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(per_dispatch);
         iters = next_dispatch_iters(iters, dispatch_ms, TARGET_DISPATCH_MS, MAX_ITERS);
+        LAST_ITERS.store(iters, std::sync::atomic::Ordering::Relaxed);
 
-        // Progress heartbeat (~every 2s): without it, GPU mode shows nothing between
-        // "rebuilding block template" lines and looks stalled. Also the duty-cycle
-        // meter — hashed/elapsed is the REAL rate the node mines at (vs the raw
-        // kernel rate) once template-rebuild time is counted.
-        let now = Instant::now();
-        if now.duration_since(last_report).as_secs_f64() >= 2.0 {
-            let elapsed = now.duration_since(start).as_secs_f64().max(1e-6);
-            let ghs = hashed as f64 / elapsed / 1e9;
-            print!(
-                "\r  GPU mining block #{}: {:.2} GH/s  ({} batches, diff {})   ",
-                number, ghs, dispatches, difficulty
-            );
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
-            last_report = now;
+        // Rate = EWMA over per-dispatch instantaneous rates (see RATE_EWMA_BITS).
+        let inst_ghs = per_dispatch as f64 / (dispatch_ms.max(1.0) / 1000.0) / 1e9;
+        let prev = f64::from_bits(RATE_EWMA_BITS.load(std::sync::atomic::Ordering::Relaxed));
+        let ghs = if prev.is_finite() && prev > 0.0 {
+            prev * 0.8 + inst_ghs * 0.2
+        } else {
+            inst_ghs
+        };
+        RATE_EWMA_BITS.store(ghs.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+        // Drive the mine command's progress bar (~2 updates/s). The bar is
+        // PERCENT of one expected block of work at the live difficulty —
+        // unit-free, so it moves at any difficulty (GH units truncated to zero
+        // ticks at the 464 floor, where expected work is 0.54 GH) — and it
+        // WRAPS past one expectation instead of pegging full: finding a block
+        // is Poisson, so "expected" is a mean, not a finish line, and a pegged
+        // bar reads as stalled during an (ordinary) unlucky stretch. Past the
+        // first sweep the message carries the multiplier. The message adds the
+        // measured rate and the honest ETA it implies.
+        if let Some(pb) = progress {
+            let now = Instant::now();
+            if now.duration_since(last_report).as_secs_f64() >= 0.5 {
+                let expected = expected_hashes(difficulty);
+                let eta = format_eta(expected / (ghs * 1e9).max(1.0));
+                if pb.length() != Some(100) {
+                    pb.set_length(100);
+                }
+                let sweeps = total_hashed as f64 / expected.max(1.0);
+                pb.set_position(((sweeps.fract() * 100.0) as u64).min(99));
+                // Most-important-first: at 80 columns {wide_msg} clips the tail,
+                // so rate and ETA must survive; the multiplier is the "how
+                // unlucky is this block" meter once past one expectation.
+                let due = if sweeps >= 1.0 {
+                    format!(" · {:.1}x expected work", sweeps)
+                } else {
+                    String::new()
+                };
+                pb.set_message(format!(
+                    "{:.2} GH/s · block in {} · diff {}{}",
+                    ghs, eta, difficulty, due
+                ));
+                last_report = now;
+            }
         }
     }
     None
@@ -475,6 +606,9 @@ mod tests {
         assert_eq!(next_dispatch_iters(4, 20.0, 250.0, 64), 50);
         // Above the cap: clamp.
         assert_eq!(next_dispatch_iters(64, 100.0, 250.0, 64), 64);
+        // The live cap (256) keeps THREADS*iters = 65535*256*256 < 2^32.
+        assert!(65_535u64 * 256 * 256 < 1u64 << 32);
+        assert_eq!(next_dispatch_iters(128, 50.0, 250.0, 256), 256);
         // On target: stable.
         assert_eq!(next_dispatch_iters(16, 250.0, 250.0, 64), 16);
         // Timer glitch (sub-ms measurement): unchanged.

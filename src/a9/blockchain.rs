@@ -7056,10 +7056,10 @@ mod tests {
 
         // The reported bug was a PERMANENT hang; both miners returning within the
         // timeout above is the anti-freeze guarantee. At least the race winner must
-        // have mined a block. The loser may legitimately fail to re-mine the same
-        // now-confirmed tx here because this test passes a FIXED template to
-        // mine_block — the real node re-reads the mempool per block, so it would
-        // simply build the next template without the evicted tx.
+        // have mined a block. (mine_block now selects from the LIVE mempool on
+        // every template rebuild — the tx snapshot argument is ignored — so the
+        // tx reaches the template via add_transaction above, and the loser drops
+        // the now-confirmed tx on its next rebuild instead of re-mining it.)
         assert!(
             ra.is_ok() || rb.is_ok(),
             "at least one miner must mine a block; both failed: {:?} / {:?}",

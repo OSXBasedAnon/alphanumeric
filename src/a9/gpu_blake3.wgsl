@@ -69,44 +69,100 @@ fn g(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> vec4<u32> {
 }
 
 // One BLAKE3 compression; returns the 8 output words (chaining value / root words).
-// `block` is indexed only by CONSTANT literals (the message schedule permutation
-// is unrolled), satisfying naga's constant-index rule.
+// FULLY UNROLLED: all 7 rounds are written out with the message-schedule
+// permutation COMPOSED into constant indices (Alephium-miner style register
+// renaming) instead of a runtime loop that physically shuffles m0..m15 through
+// 16 lets per round. naga lowers every WGSL for-loop to a while(true)+bool-gate
+// pattern in which no backend compiler can recover the trip count, so the
+// rolled loop's ~96 moves/compression + loop overhead were REAL on every
+// backend — measured +48% kernel throughput on Metal from this change alone
+// (2026-07-12 variant bench; byte-exact vs the blake3 crate throughout).
+// `block` is indexed only by CONSTANT literals, satisfying naga's rule.
 fn compress(cv: array<u32, 8>, block: array<u32, 16>, block_len: u32, flags: u32) -> array<u32, 8> {
     var s0 = cv[0]; var s1 = cv[1]; var s2 = cv[2]; var s3 = cv[3];
     var s4 = cv[4]; var s5 = cv[5]; var s6 = cv[6]; var s7 = cv[7];
     var s8 = IV[0]; var s9 = IV[1]; var s10 = IV[2]; var s11 = IV[3];
     var s12 = 0u; var s13 = 0u; var s14 = block_len; var s15 = flags;
-
-    // Message words permuted per round. Round 0 uses the block as-is; each later
-    // round applies the fixed BLAKE3 permutation, unrolled into constant indices.
-    var m0 = block[0]; var m1 = block[1]; var m2 = block[2]; var m3 = block[3];
-    var m4 = block[4]; var m5 = block[5]; var m6 = block[6]; var m7 = block[7];
-    var m8 = block[8]; var m9 = block[9]; var m10 = block[10]; var m11 = block[11];
-    var m12 = block[12]; var m13 = block[13]; var m14 = block[14]; var m15 = block[15];
-
+    let m0 = block[0];
+    let m1 = block[1];
+    let m2 = block[2];
+    let m3 = block[3];
+    let m4 = block[4];
+    let m5 = block[5];
+    let m6 = block[6];
+    let m7 = block[7];
+    let m8 = block[8];
+    let m9 = block[9];
+    let m10 = block[10];
+    let m11 = block[11];
+    let m12 = block[12];
+    let m13 = block[13];
+    let m14 = block[14];
+    let m15 = block[15];
     var r: vec4<u32>;
-    for (var round = 0u; round < 7u; round = round + 1u) {
-        // Column step.
-        r = g(s0, s4, s8, s12, m0, m1);   s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
-        r = g(s1, s5, s9, s13, m2, m3);   s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
-        r = g(s2, s6, s10, s14, m4, m5);  s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
-        r = g(s3, s7, s11, s15, m6, m7);  s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
-        // Diagonal step.
-        r = g(s0, s5, s10, s15, m8, m9);   s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
-        r = g(s1, s6, s11, s12, m10, m11); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
-        r = g(s2, s7, s8, s13, m12, m13);  s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
-        r = g(s3, s4, s9, s14, m14, m15);  s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
-
-        if (round < 6u) {
-            // permutation: new[i] = old[SIGMA[i]]
-            let n0 = m2;  let n1 = m6;  let n2 = m3;  let n3 = m10;
-            let n4 = m7;  let n5 = m0;  let n6 = m4;  let n7 = m13;
-            let n8 = m1;  let n9 = m11; let n10 = m12; let n11 = m5;
-            let n12 = m9; let n13 = m14; let n14 = m15; let n15 = m8;
-            m0 = n0; m1 = n1; m2 = n2; m3 = n3; m4 = n4; m5 = n5; m6 = n6; m7 = n7;
-            m8 = n8; m9 = n9; m10 = n10; m11 = n11; m12 = n12; m13 = n13; m14 = n14; m15 = n15;
-        }
-    }
+    // round 0
+    r = g(s0, s4, s8, s12, m0, m1); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m2, m3); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m4, m5); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m6, m7); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m8, m9); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m10, m11); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m12, m13); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m14, m15); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 1
+    r = g(s0, s4, s8, s12, m2, m6); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m3, m10); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m7, m0); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m4, m13); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m1, m11); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m12, m5); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m9, m14); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m15, m8); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 2
+    r = g(s0, s4, s8, s12, m3, m4); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m10, m12); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m13, m2); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m7, m14); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m6, m5); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m9, m0); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m11, m15); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m8, m1); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 3
+    r = g(s0, s4, s8, s12, m10, m7); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m12, m9); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m14, m3); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m13, m15); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m4, m0); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m11, m2); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m5, m8); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m1, m6); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 4
+    r = g(s0, s4, s8, s12, m12, m13); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m9, m11); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m15, m10); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m14, m8); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m7, m2); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m5, m3); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m0, m1); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m6, m4); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 5
+    r = g(s0, s4, s8, s12, m9, m14); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m11, m5); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m8, m12); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m15, m1); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m13, m3); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m0, m10); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m2, m6); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m4, m7); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
+    // round 6
+    r = g(s0, s4, s8, s12, m11, m15); s0 = r.x; s4 = r.y; s8 = r.z; s12 = r.w;
+    r = g(s1, s5, s9, s13, m5, m0); s1 = r.x; s5 = r.y; s9 = r.z; s13 = r.w;
+    r = g(s2, s6, s10, s14, m1, m9); s2 = r.x; s6 = r.y; s10 = r.z; s14 = r.w;
+    r = g(s3, s7, s11, s15, m8, m6); s3 = r.x; s7 = r.y; s11 = r.z; s15 = r.w;
+    r = g(s0, s5, s10, s15, m14, m10); s0 = r.x; s5 = r.y; s10 = r.z; s15 = r.w;
+    r = g(s1, s6, s11, s12, m2, m12); s1 = r.x; s6 = r.y; s11 = r.z; s12 = r.w;
+    r = g(s2, s7, s8, s13, m3, m4); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
+    r = g(s3, s4, s9, s14, m7, m13); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
 
     var out: array<u32, 8>;
     out[0] = s0 ^ s8;  out[1] = s1 ^ s9;  out[2] = s2 ^ s10; out[3] = s3 ^ s11;

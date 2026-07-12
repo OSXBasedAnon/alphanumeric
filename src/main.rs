@@ -2021,6 +2021,15 @@ println!("Wallet renamed successfully");
                                 //    continuous miners so their prep/poll cycles never
                                 //    line up into synchronized bursts against the
                                 //    free-tier gateway.
+                                // Say so first: this wait + jitter is up to ~25s
+                                // of otherwise-silent pause right after the
+                                // reward summary — the one spot a healthy miner
+                                // looked hung. No bar is alive here, so a plain
+                                // println is safe.
+                                println!(
+                                    "Waiting for the network to absorb block #{} before the next round…",
+                                    mined_height
+                                );
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)

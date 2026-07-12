@@ -14,15 +14,32 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, NETWORK_FEE,
+    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
-const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {msg}";
-const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {msg}";
+// {wide_msg}: indicatif never truncates a plain {msg}, so a long status line
+// WRAPS and the single moving bar becomes a flickering two-row block on an
+// 80-col terminal; wide_msg clips the message to the remaining row instead.
+const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {wide_msg}";
+const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {wide_msg}";
+/// GPU mode drives the same ===== bar, but as PERCENT of one expected block of
+/// work at the live difficulty (len 100; gpu_miner.rs drives the position) —
+/// unit-free, so it moves at any difficulty (a GH-scaled length collapsed to
+/// zero usable ticks at the 464 floor). The spinner keeps visible motion
+/// between the bar's coarse increments. The message is ordered
+/// most-important-first (rate, ETA) so an 80-col clip still shows what matters.
+#[cfg(feature = "gpu_miner")]
+const GPU_MINING_PROGRESS_TEMPLATE: &str =
+    "{prefix} {spinner:.cyan} {bar:37.cyan/blue} {pos:>3}% {wide_msg}";
+/// Success frame in GPU scale — keeps the percent grammar on the final frame
+/// instead of flipping to the CPU template's pos/len columns.
+#[cfg(feature = "gpu_miner")]
+const GPU_MINING_SUCCESS_TEMPLATE: &str =
+    "{prefix} {bar:37.cyan/blue}> {pos:>3}% {wide_msg}";
 /// How often (in nonces, per thread) the hot loop polls the ATOMIC tip-change
 /// counter. One Acquire load — cheap enough to keep tight so a solved block
 /// elsewhere aborts wasted work within microseconds.
@@ -87,6 +104,28 @@ impl From<Box<dyn std::error::Error>> for MiningError {
     fn from(error: Box<dyn std::error::Error>) -> Self {
         MiningError::MiningFailed(error.to_string())
     }
+}
+
+/// Random nonce-window base for one mining attempt (splitmix64 of the clock +
+/// pid). NOT crypto — it only de-correlates the search windows of same-wallet
+/// rigs: the reward tx is deterministic with a whole-second timestamp, so two
+/// rigs on one wallet routinely build IDENTICAL merkle roots in the same
+/// second, and with every searcher anchored at nonce 0 they then scan
+/// near-100% overlapping (timestamp, nonce) space — half their combined
+/// hashrate thrown away. Random ~2^34-nonce windows in a 2^64 space collide
+/// with probability ~6e-9 per attempt. Masked to 2^62 so the CPU path's
+/// saturating/checked range math never nears the u64 ceiling.
+pub(crate) fn attempt_nonce_base() -> u64 {
+    let mut x = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ ((std::process::id() as u64) << 32);
+    // splitmix64 finalizer
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (x ^ (x >> 31)) & ((1u64 << 62) - 1)
 }
 
 #[derive(Debug, Clone)]
@@ -160,23 +199,10 @@ impl MiningManager {
         _reward_amount: f64,
         #[cfg_attr(not(feature = "gpu_miner"), allow(unused_variables))] use_gpu: bool,
     ) -> Result<(u64, String, Block), MiningError> {
-        let transactions: Vec<Transaction> = transactions
-            .iter()
-            .map(|ptx| {
-                let mut tx = Transaction::new(
-                    ptx.sender.clone(),
-                    ptx.recipient.clone(),
-                    ptx.amount,
-                    ptx.fee,
-                    ptx.timestamp,
-                    ptx.signature.clone(),
-                );
-                tx.pub_key = ptx.pub_key.clone();
-                tx.sig_hash = ptx.sig_hash.clone();
-                tx
-            })
-            .collect();
-        let mining_transactions = transactions;
+        // The command-time snapshot is no longer mined from — the template
+        // rebuild below selects from the LIVE mempool every pass, so txs that
+        // confirm mid-grind leave the template and new arrivals enter it.
+        let _ = transactions;
 
         let found = Arc::new(AtomicBool::new(false));
         let abort_for_tip_change = Arc::new(AtomicBool::new(false));
@@ -201,6 +227,45 @@ impl MiningManager {
             .max(1);
         let nonces_per_thread = max_nonce.div_ceil(num_threads as u64);
 
+        // Resolve the GPU ONCE per mine command, out loud, BEFORE the progress
+        // bar exists (its 100ms steady tick would garble any plain println
+        // racing it — the exact bug this rework removes). The default log
+        // filter is Error-only, so the old log-only init path left `--gpu`
+        // totally silent about WHICH adapter it picked — or that init/self-check
+        // failed and it was about to pick none. Worse, a failed GPU used to make
+        // the loop below `continue` forever: rebuilding templates at full speed,
+        // hashing nothing, telling nobody. Now a dead GPU says so and falls back
+        // to the CPU scan, which is what the fallback always claimed to do.
+        // `mut`: a GPU that dies MID-session (driver reset/TDR) demotes too.
+        #[cfg(feature = "gpu_miner")]
+        let mut gpu_active = if use_gpu {
+            // First call initializes wgpu — ~100-200ms of pollster::block_on —
+            // so it runs on the blocking pool, not the async thread (mine_block
+            // can be polled inside the client's LocalSet; see the spawn_blocking
+            // note on the dispatch below).
+            let status = tokio::task::spawn_blocking(crate::a9::gpu_miner::gpu_status)
+                .await
+                .unwrap_or_else(|_| Err("GPU init/re-check thread failed".to_string()));
+            match status {
+                Ok(adapter) => {
+                    println!("  GPU: {adapter} — BLAKE3 kernel self-check passed");
+                    true
+                }
+                Err(reason) => {
+                    println!("  GPU unavailable: {reason}");
+                    println!("  Falling back to CPU mining so this command still mines.");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        // Cumulative hashes this mine command (across attempts and heights) —
+        // feeds the expected-work progress bar. The tip advances every ~5s
+        // network-wide, so any per-height meter would reset before it moved.
+        #[cfg(feature = "gpu_miner")]
+        let gpu_session_hashed = Arc::new(AtomicU64::new(0));
+
         let progress_bar = Arc::new(Mutex::new(ProgressBar::new(max_nonce)));
         {
             if let Ok(pb) = progress_bar.lock() {
@@ -210,6 +275,18 @@ impl MiningManager {
                 pb.set_style(style);
                 pb.set_prefix(format!("Block #{}", header.number));
                 pb.enable_steady_tick(Duration::from_millis(100));
+                #[cfg(feature = "gpu_miner")]
+                if gpu_active {
+                    // GPU scale: the bar is percent-of-one-expected-block (len
+                    // 100, position set by gpu_mine_attempt), difficulty-
+                    // independent — a GH-unit length truncated to 0 usable
+                    // ticks at the 464-difficulty floor (2^29 ≈ 0.54 GH).
+                    if let Ok(style) = ProgressStyle::with_template(GPU_MINING_PROGRESS_TEMPLATE) {
+                        pb.set_style(style.progress_chars("=  "));
+                    }
+                    pb.set_length(100);
+                    pb.set_message("warming up GPU search...");
+                }
             } else {
                 return Err(MiningError::MiningFailed(
                     "Progress bar lock poisoned".to_string(),
@@ -217,7 +294,7 @@ impl MiningManager {
             }
         }
 
-        let mut current_nonce: u64 = 0;
+        let mut current_nonce: u64 = attempt_nonce_base();
         // Progress-bar refresh cadence per thread. try_lock keeps losers from
         // blocking, but with hundreds of threads even the attempts are traffic —
         // 8192 still repaints many times a second while staying off the hot path.
@@ -248,13 +325,18 @@ impl MiningManager {
                 )
             };
 
-            if current_height > header.number {
+            // `!=`, not `>`: a reorg can LOWER the tip, and this check is the
+            // only retarget point in GPU mode — with `>` the header kept its
+            // stale-high index while previous_hash tracked the real (lower)
+            // tip, so every subsequent solve was doomed at finalize until the
+            // chain grew back past the stale number.
+            if current_height != header.number {
                 header.number = current_height;
                 if let Ok(pb) = progress_bar.lock() {
                     pb.set_prefix(format!("Block #{}", header.number));
                     pb.set_message("New network tip detected; rebuilding block template...");
                 }
-                current_nonce = 0;
+                current_nonce = attempt_nonce_base();
                 continue;
             }
 
@@ -267,10 +349,60 @@ impl MiningManager {
                 // freezing the miner whenever the mempool held a pending tx. A shared read
                 // guard lets ingest proceed and never blocks it for the whole rebuild.
                 let blockchain_lock = self.blockchain.read().await;
-                let mut selected_regular = Vec::with_capacity(mining_transactions.len());
+                // LIVE mempool, not the command-time snapshot: mine_block runs
+                // for hours, and against a static snapshot (a) a tx another
+                // miner confirmed mid-grind stays in our template and burns the
+                // whole solve at finalize's replay guard, and (b) txs that
+                // arrived after the command never enter the template at all —
+                // no fees, and their confirmation waits on other miners.
+                // Source = get_transactions_for_block (prunes expired, applies
+                // the MAX_TX_AGE_SECS freshness gate) + the handle_mine_command
+                // gates + the consensus bounds the block itself will be checked
+                // against: age with a margin (the block is stamped up to an
+                // attempt later than this filter runs — a tx within seconds of
+                // expiry would pass here and burn the solve at finalize) and
+                // the future-dating bound (a sender's skewed clock would
+                // otherwise poison every rebuilt template).
+                let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
+                let live_transactions: Vec<Transaction> = blockchain_lock
+                    .get_transactions_for_block()
+                    .await
+                    .into_iter()
+                    .filter(|tx| {
+                        if tx.sender == "MINING_REWARDS" {
+                            return false;
+                        }
+                        if blockchain_lock.is_tx_confirmed(&tx.get_tx_id()) {
+                            return false;
+                        }
+                        if !tx.has_valid_regular_amounts() {
+                            return false;
+                        }
+                        if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
+                            < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
+                        {
+                            return false;
+                        }
+                        if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
+                            return false;
+                        }
+                        if let Some(sig_hex) = &tx.signature {
+                            if let Ok(bytes) = hex::decode(sig_hex) {
+                                return bytes.len() > 64;
+                            }
+                        }
+                        false
+                    })
+                    .collect();
+                let mut selected_regular = Vec::with_capacity(live_transactions.len());
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
 
-                for transaction in &mining_transactions {
+                for transaction in &live_transactions {
                     // Exact i128: tx selection must agree with the consensus writer's
                     // affordability so it doesn't select a tx that finalize then rejects
                     // (the f64 round-trip drifts above ~33.55M coins — 2026-07-12 audit).
@@ -331,7 +463,7 @@ impl MiningManager {
             // nonce — a wrong hash is caught by the normal block verify (fail-closed).
             // The CPU rayon search below then no-ops (its threads see `found`).
             #[cfg(feature = "gpu_miner")]
-            if use_gpu {
+            if gpu_active {
                 // spawn_blocking: gpu_mine_attempt blocks synchronously on GPU
                 // readbacks for up to the whole budget. Running it inline on a
                 // tokio worker starved the very tasks that advance the tip
@@ -351,7 +483,13 @@ impl MiningManager {
                 let gpu_prev = previous_block_hash;
                 let gpu_merkle = merkle_root;
                 let gpu_counter = Arc::clone(&tip_change_counter);
-                let gpu_hit = tokio::task::spawn_blocking(move || {
+                let gpu_hashed = Arc::clone(&gpu_session_hashed);
+                // indicatif's ProgressBar clone shares the underlying bar, so the
+                // GPU thread paints the SAME line the command owns — replacing the
+                // old raw print!("\r…") heartbeat that raced the bar's steady tick
+                // and garbled the display.
+                let gpu_pb = progress_bar.lock().ok().map(|pb| pb.clone());
+                let gpu_hit = match tokio::task::spawn_blocking(move || {
                     crate::a9::gpu_miner::gpu_mine_attempt(
                         gpu_number,
                         &gpu_prev,
@@ -361,10 +499,36 @@ impl MiningManager {
                         std::time::Duration::from_secs(20),
                         &gpu_counter,
                         template_tip_version,
+                        &gpu_hashed,
+                        gpu_pb.as_ref(),
                     )
                 })
                 .await
-                .unwrap_or(None);
+                {
+                    Ok(hit) => hit,
+                    Err(join_err) => {
+                        // The GPU thread PANICKED — a mid-session device loss
+                        // (driver reset/TDR, eGPU unplug). Without demotion this
+                        // would re-panic every attempt forever, mining nothing:
+                        // the same wedge the startup check closes, one step
+                        // later. Demote to the CPU scan for the rest of the
+                        // command; a restart re-probes the GPU.
+                        if let Ok(pb) = progress_bar.lock() {
+                            pb.println(format!(
+                                "  GPU search failed mid-session ({join_err}); falling back to CPU mining."
+                            ));
+                            if let Ok(style) =
+                                ProgressStyle::with_template(MINING_PROGRESS_TEMPLATE)
+                            {
+                                pb.set_style(style.progress_chars("=  "));
+                            }
+                            pb.set_length(max_nonce);
+                            pb.set_position(0);
+                        }
+                        gpu_active = false;
+                        None
+                    }
+                };
                 if let Some((n, ts, diff, hash)) = gpu_hit {
                     if !found.swap(true, Ordering::Release) {
                         result_nonce.store(n, Ordering::Release);
@@ -380,8 +544,9 @@ impl MiningManager {
                 // if not (budget hit / tip moved), skip the pointless CPU scan and
                 // loop to a fresh GPU attempt against the current tip. Running the
                 // CPU window here was ~half the wasted duty cycle that stopped the
-                // GPU from winning blocks.
-                if !found.load(Ordering::Acquire) {
+                // GPU from winning blocks. If the GPU just DIED (gpu_active
+                // demoted above), fall through to the CPU scan instead.
+                if !found.load(Ordering::Acquire) && gpu_active {
                     continue;
                 }
             }
@@ -417,10 +582,15 @@ impl MiningManager {
 
                         // Don't create full Block - just calculate hash directly
                         // We only need the full block when we find a valid nonce
+                        // Clamped to the parent's timestamp: a local clock behind
+                        // the parent would stamp a block that fails parent-
+                        // timestamp validation — discovered only AFTER the grind,
+                        // burning the whole solve.
                         let timestamp = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
-                            .as_secs();
+                            .as_secs()
+                            .max(previous_block_timestamp);
                         if timestamp != cached_timestamp {
                             cached_timestamp = timestamp;
                             cached_difficulty = Block::consensus_next_difficulty(
@@ -529,7 +699,7 @@ impl MiningManager {
                 if let Some(height) = latest_height {
                     header.number = height;
                 }
-                current_nonce = 0;
+                current_nonce = attempt_nonce_base();
                 if let Ok(pb) = progress_bar.lock() {
                     pb.reset();
                     pb.set_prefix(format!("Block #{}", header.number));
@@ -622,12 +792,27 @@ impl MiningManager {
                             match res {
                                 Ok(()) => {
                                     if let Ok(pb) = progress_bar.lock() {
+                                        // Keep the bar's own unit grammar on the
+                                        // final frame: percent for the GPU scale
+                                        // (len 100), pos/len nonces for the CPU.
+                                        #[cfg(feature = "gpu_miner")]
+                                        let success_template = if gpu_active {
+                                            GPU_MINING_SUCCESS_TEMPLATE
+                                        } else {
+                                            MINING_SUCCESS_TEMPLATE
+                                        };
+                                        #[cfg(not(feature = "gpu_miner"))]
+                                        let success_template = MINING_SUCCESS_TEMPLATE;
                                         if let Ok(style) =
-                                            ProgressStyle::with_template(MINING_SUCCESS_TEMPLATE)
+                                            ProgressStyle::with_template(success_template)
                                         {
                                             pb.set_style(style.progress_chars("=  "));
                                         }
-                                        pb.set_position(max_nonce);
+                                        // length-relative: the GPU bar is
+                                        // percent-scaled (len 100), the CPU bar
+                                        // nonce-scaled (len max_nonce) — either
+                                        // way "full" is the bar's own length.
+                                        pb.set_position(pb.length().unwrap_or(max_nonce));
                                         pb.finish_with_message("Block mined successfully!");
                                     }
                                     return Ok((nonce, hash_string, mined_block));
@@ -653,12 +838,20 @@ impl MiningManager {
                                             });
                                         if let Some((height, true)) = stale_template {
                                             header.number = height;
-                                            current_nonce = 0;
+                                            current_nonce = attempt_nonce_base();
                                             if let Ok(pb) = progress_bar.lock() {
-                                                pb.reset();
+                                                // GPU percent bar (len 100) is
+                                                // session-cumulative — a reset
+                                                // here would flash it to 0% and
+                                                // snap back on the next report,
+                                                // a backward glitch right as the
+                                                // user is told they lost a race.
+                                                if pb.length() != Some(100) {
+                                                    pb.reset();
+                                                }
                                                 pb.set_prefix(format!("Block #{}", header.number));
                                                 pb.set_message(
-                                                    "Solved a stale height (another miner's block was adopted — no reward); mining the new tip...",
+                                                    "Lost the race for this height — retargeting the new tip...",
                                                 );
                                             }
                                             continue 'mining;
