@@ -1724,7 +1724,13 @@ async fn async_main() -> Result<()> {
         color_spec.set_fg(Some(Color::Rgb(237, 124, 51)));
         stdout.set_color(&color_spec)?;
         let age = now.saturating_sub(last_block.timestamp);
-        writeln!(stdout, "Last Block Time:   {}s", age)?;
+        // Past a minute the raw-seconds age is the "am I stalled?" signal but reads
+        // as an unparseable wall of digits (11506s); annotate it human-readably.
+        if age >= 60 {
+            writeln!(stdout, "Last Block Time:   {}s ({} ago)", age, human_duration_secs(age))?;
+        } else {
+            writeln!(stdout, "Last Block Time:   {}s", age)?;
+        }
     }
     stdout.reset()?;
 
@@ -3980,6 +3986,25 @@ fn local_block_hash_at(db_path: &str, height: u32) -> Option<String> {
     let raw = db.get(format!("block_{}", height).as_bytes()).ok()??;
     let block = Block::from_bytes(raw.as_ref()).ok()?;
     Some(hex::encode(block.hash))
+}
+
+/// Compact human-readable duration for status display, e.g. 11506 -> "3h 11m".
+/// Display-only helper: `info` keeps the raw seconds and appends this so a
+/// stalled node's block age reads at a glance instead of as a wall of seconds.
+fn human_duration_secs(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m {s}s")
+    }
 }
 
 /// Decision for whether a genesis-valid local DB is actually on the canonical
