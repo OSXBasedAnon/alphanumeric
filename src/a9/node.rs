@@ -105,6 +105,13 @@ const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 // gateway by a third (43k -> 29k requests/day per node) — the fleet is the dominant
 // consumer of the Vercel edge budget.
 const BEACON_POLL_INTERVAL_SECS: u64 = 3;
+/// Window over which beacon-height observations count toward the mine-prep stale-tip
+/// high-water. Must comfortably exceed the worst observed CDN staleness of the beacon
+/// (~29s) so a transient stale-low read can never become the window max (ghost-block
+/// safety), while still letting a genuine canonical regression age the old stuck-high
+/// value out. 10 min gives >20x margin; post-regression recovery is bounded by this
+/// window plus the gateway's beacon TTL (~5 min), i.e. ~15 min, versus FOREVER before.
+const BEACON_HIGH_WATER_WINDOW_SECS: u64 = 600;
 
 /// The canonical tip as advertised by the signed beacon (height, hash, version).
 #[derive(Clone, Copy)]
@@ -1004,8 +1011,26 @@ pub struct Node {
     /// Consecutive zero-progress converge calls while > reorg-margin behind a
     /// fresh beacon; escalates to NeedsBootstrap at CONVERGE_STALL_ESCALATE_CALLS.
     converge_stall_cycles: Arc<AtomicU64>,
-    /// Freshest beacon height ever fetched — known staleness for the mine-prep
-    /// fail-open bound even when the beacon is momentarily unreachable.
+    /// Rolling window of recent (observed-at, height) beacon reads that positively
+    /// matched our network. The mine-prep stale-tip guard consults the MAX height in
+    /// the window as "the freshest network height we can trust." A ROLLING max (not a
+    /// forever-monotonic one) is deliberate: a forever high-water pinned every miner
+    /// into refusing to mine after a genuine canonical REGRESSION (publisher
+    /// re-bootstrap onto a lower true chain, or a heavier-but-shorter reorg) with no
+    /// exit but a process restart (2026-07-12 audit). A rolling max still catches a
+    /// momentary stale CDN read (fresh reads every ~5s keep re-raising it, so one
+    /// stale-low copy can never be the window max), but lets a stuck-high value age
+    /// out after a real regression. Uses NO timestamp from the beacon body (miner-set
+    /// block_time is forgeable +300s) — only the local observation time.
+    beacon_high_water: Arc<PLMutex<std::collections::VecDeque<(Instant, u32)>>>,
+    /// Forever-monotonic max of every network_id-matched beacon height ever seen.
+    /// Used ONLY by the beacon-UNREACHABLE fail-open bound: during a total beacon
+    /// outage there are no fresh reads, so the rolling window would age out to 0 and
+    /// let a genuinely far-behind node fail-open into mining orphans hundreds below
+    /// the network (the 2026-07-11 far-behind incident). Aging out is only safe when
+    /// fresh LOW reads confirm a regression — which the reachable +2 ghost arms have
+    /// (they use the rolling window) but the unreachable arm does not. So this monotonic
+    /// value stays for the outage case; the rolling window handles reachable recovery.
     last_seen_beacon_height: Arc<AtomicU64>,
     /// Resolved chain-DB directory (same value main.rs boots with) — lets runtime
     /// paths schedule a force-re-bootstrap marker. None in tests/embedded uses.
@@ -1318,6 +1343,7 @@ impl Node {
             cached_external_ip: Arc::new(RwLock::new(None)),
             converge_stall_tip: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
+            beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
             pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
@@ -2541,15 +2567,72 @@ impl Node {
         }
     }
 
-    /// Ghost-block guard: refuse to mine the local tip when the freshest network
-    /// height we have EVER seen (`known_tip`, the monotonic beacon high-water) is
-    /// more than a same/next-height race ahead of our local tip — even if the
-    /// latest single beacon read came back stale (== local) and converge reported
-    /// "at the tip". Fires only when genuinely behind (known_tip > local); a node
-    /// legitimately at or ahead of the beacon (known_tip <= local) always mines.
-    /// The +2 tolerance matches the BeaconStale fail-open racing distance.
+    /// Ghost-block guard: refuse to mine the local tip when the freshest trusted
+    /// network height (`known_tip`) is more than a same/next-height race ahead of our
+    /// local tip — even if the latest single beacon read came back stale (== local)
+    /// and converge reported "at the tip". The reachable-beacon arms pass the ROLLING
+    /// high-water here (max over the last window of reads) so a genuine regression
+    /// clears the guard once the old height ages out; the beacon-unreachable fail-open
+    /// arm passes the forever-monotonic high-water instead (no fresh read to confirm a
+    /// regression). Fires only when behind (known_tip > local); a node at or ahead of
+    /// the tip always mines. The +2 tolerance matches the BeaconStale racing distance.
     fn stale_tip_mine_refused(local_tip: u32, known_tip: u32) -> bool {
         known_tip > local_tip.saturating_add(2)
+    }
+
+    /// Record a network_id-matched beacon height observation into the rolling
+    /// high-water window (prunes entries older than BEACON_HIGH_WATER_WINDOW_SECS).
+    fn record_beacon_observation(&self, height: u32) {
+        let now = Instant::now();
+        let mut obs = self.beacon_high_water.lock();
+        obs.push_back((now, height));
+        while let Some(&(t, _)) = obs.front() {
+            if now.duration_since(t).as_secs() > BEACON_HIGH_WATER_WINDOW_SECS {
+                obs.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Length backstop (reads are ~1 per 3s, so ~200 fit the window; cap far above
+        // that so a burst can't grow it unboundedly).
+        while obs.len() > 4096 {
+            obs.pop_front();
+        }
+    }
+
+    /// The freshest network height we can currently trust: the MAX beacon height
+    /// observed within the rolling window. A single stale-low read can never be the
+    /// max while fresh reads are present; a genuinely regressed chain ages the old
+    /// stuck-high value out. 0 if nothing observed yet (fail-open — same as the old
+    /// AtomicU64::new(0) start, so a fresh node isn't pinned).
+    fn beacon_high_water_height(&self) -> u32 {
+        let now = Instant::now();
+        let mut obs = self.beacon_high_water.lock();
+        while let Some(&(t, _)) = obs.front() {
+            if now.duration_since(t).as_secs() > BEACON_HIGH_WATER_WINDOW_SECS {
+                obs.pop_front();
+            } else {
+                break;
+            }
+        }
+        Self::window_high_water(&obs, now, BEACON_HIGH_WATER_WINDOW_SECS)
+    }
+
+    /// Pure max-height-in-window (does not depend on prior pruning): the highest
+    /// beacon height observed no more than `window_secs` ago. This is what makes the
+    /// guard ghost-safe AND regression-recoverable: a stale-low read is never the max
+    /// while any fresher-higher read is still inside the window, yet a stuck-high value
+    /// drops out once it ages past the window.
+    fn window_high_water(
+        obs: &std::collections::VecDeque<(Instant, u32)>,
+        now: Instant,
+        window_secs: u64,
+    ) -> u32 {
+        obs.iter()
+            .filter(|(t, _)| now.duration_since(*t).as_secs() <= window_secs)
+            .map(|(_, h)| *h)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Pure verdict for the converge stall watchdog: (new_cycle_count, escalate).
@@ -2846,13 +2929,18 @@ impl Node {
             // Remember the freshest beacon we ever saw: the mine-prep fail-open
             // consults this when the beacon is momentarily unreachable, so known
             // staleness can't be laundered into "mine the local tip anyway".
-            // Only a beacon that POSITIVELY identified our network may raise the
-            // high-water: it is monotonic forever, so one cross-network or
-            // malformed read without a network_id would permanently refuse
-            // mining with "network has reached X" on every prep.
+            // Only a beacon that POSITIVELY identified our network is recorded: a
+            // cross-network or malformed read (no network_id) must not move the
+            // high-water. Recorded into the ROLLING window (not a forever-monotonic
+            // max) so a genuine canonical regression can eventually clear the guard
+            // (2026-07-12 audit) instead of pinning every miner into a permanent
+            // refuse-to-mine until restart.
             if network_id_match == Some(true) {
-                self.last_seen_beacon_height
-                    .fetch_max(height, Ordering::AcqRel);
+                self.record_beacon_observation(height as u32);
+                // Also feed the forever-monotonic high-water used by the unreachable
+                // fail-open bound (see field doc): it must NOT age out, or a total
+                // beacon outage would drop a far-behind node into orphan mining.
+                self.last_seen_beacon_height.fetch_max(height, Ordering::AcqRel);
             }
             return Some(TipBeaconInfo {
                 height: height as u32,
@@ -4491,6 +4579,10 @@ impl Node {
                 // Near the tip, producing on our best-known chain still beats conceding;
                 // the reorg engine resolves any fork when connectivity returns.
                 let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
+                // Beacon UNREACHABLE: use the FOREVER-MONOTONIC high-water, not the
+                // rolling window. With no fresh read to confirm a regression, the
+                // rolling window would age out to 0 during a >10min outage and let a
+                // far-behind node fail-open into mining orphans (2026-07-12 review).
                 let last_seen = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
                 if last_seen
                     > local_tip.saturating_add(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN)
@@ -4544,7 +4636,7 @@ impl Node {
                     // instant we legitimately reach the tip. Refusing is the safe failure —
                     // worse case a miner idles briefly; the alternative is orphan spam.
                     let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
-                    let known_tip = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
+                    let known_tip = self.beacon_high_water_height();
                     if Self::stale_tip_mine_refused(local_tip, known_tip) {
                         return Err(NodeError::Retryable(format!(
                             "network has reached {} but we are at {} ({} behind) and cannot fetch the gap yet; not mining a stale tip",
@@ -4653,7 +4745,7 @@ impl Node {
                 // the live network (2026-07-11), poisoning the relay head for everyone.
                 Converge::BranchInvalid => {
                     let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
-                    let known_tip = self.last_seen_beacon_height.load(Ordering::Acquire) as u32;
+                    let known_tip = self.beacon_high_water_height();
                     if Self::stale_tip_mine_refused(local_tip, known_tip) {
                         return Err(NodeError::Retryable(format!(
                             "canonical candidate failed validation while the network is at {} and we are at {} ({} behind); not mining a stale tip",
@@ -8718,7 +8810,17 @@ impl Node {
                         blockchain.add_transaction(tx.clone()).await?;
                     }
 
-                    self.gossip_transaction(&tx).await;
+                    // SPAWN the gossip off the single-consumer event pump: gossip_transaction
+                    // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
+                    // costs a full 5s TCP connect — awaiting it inline stalled the pump (the
+                    // ONLY server of GetBlocks/ChainRequest) for up to ~40s per inbound tx,
+                    // timing out syncing peers' block fetches (2026-07-12 audit). Same spawn
+                    // pattern as the re-announce and create paths.
+                    let node = self.clone();
+                    let gossip_tx = tx.clone();
+                    tokio::spawn(async move {
+                        node.gossip_transaction(&gossip_tx).await;
+                    });
                 }
             }
 
@@ -11240,6 +11342,42 @@ mod tests {
         assert!(!Node::stale_tip_mine_refused(41397, 41395));
         // No beacon ever seen (known_tip 0) -> never refuses.
         assert!(!Node::stale_tip_mine_refused(41395, 0));
+    }
+
+    // The rolling beacon high-water must (a) keep a stale-LOW read from ever becoming
+    // the guard's known_tip while a fresher-HIGHER read is still in-window (ghost-block
+    // safety — the exact protection the old monotonic high-water gave), yet (b) let a
+    // genuinely regressed height take over once the old stuck-high value ages out of
+    // the window (the exit-after-regression the monotonic version never had).
+    #[test]
+    fn beacon_rolling_high_water_ghost_safe_yet_regression_recoverable() {
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        const W: u64 = 600;
+        let now = Instant::now();
+
+        // (a) GHOST-SAFETY: fresh reads at 41395 plus one stale-low 41370 -> max stays
+        // 41395, so the guard still refuses a node at 41370. A stale-low read cannot
+        // launder the node into ghost-mining.
+        let mut obs: VecDeque<(Instant, u32)> = VecDeque::new();
+        obs.push_back((now - Duration::from_secs(10), 41395));
+        obs.push_back((now - Duration::from_secs(5), 41370)); // stale CDN copy
+        obs.push_back((now - Duration::from_secs(1), 41395));
+        assert_eq!(Node::window_high_water(&obs, now, W), 41395);
+        assert!(Node::stale_tip_mine_refused(41370, Node::window_high_water(&obs, now, W)));
+
+        // (b) REGRESSION RECOVERY: the old high 41395 is now OUTSIDE the window; only a
+        // fresh regressed height 41380 remains in-window -> max drops to 41380, so a node
+        // at 41380 is no longer pinned (guard clears) — the exit the monotonic max lacked.
+        let mut regressed: VecDeque<(Instant, u32)> = VecDeque::new();
+        regressed.push_back((now - Duration::from_secs(W + 60), 41395)); // aged out
+        regressed.push_back((now - Duration::from_secs(30), 41380)); // fresh, regressed
+        regressed.push_back((now - Duration::from_secs(2), 41380));
+        assert_eq!(Node::window_high_water(&regressed, now, W), 41380);
+        assert!(!Node::stale_tip_mine_refused(41380, Node::window_high_water(&regressed, now, W)));
+
+        // Empty / nothing in-window -> 0 (fail-open, never pins).
+        assert_eq!(Node::window_high_water(&VecDeque::new(), now, W), 0);
     }
 
     // Stall watchdog: only zero-progress calls beyond the reorg margin count;
