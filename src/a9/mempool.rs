@@ -346,6 +346,13 @@ impl Mempool {
         None
     }
 
+    /// Zero-cost emptiness probe (atomic counter read — no locks, no scan).
+    /// The miner's template rebuild runs every tip change (~5s); when the pool
+    /// is empty it must not pay the full selection/prune path just to learn so.
+    pub fn is_empty(&self) -> bool {
+        self.total_count.load(AtomicOrdering::Relaxed) == 0
+    }
+
     pub fn get_all_transactions(&self) -> Vec<Transaction> {
         let mut out = Vec::with_capacity(self.total_count.load(AtomicOrdering::Relaxed));
         for entry in self.transactions.iter() {

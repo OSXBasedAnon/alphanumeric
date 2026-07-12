@@ -5050,6 +5050,11 @@ impl Blockchain {
         self.get_pending_debit_for(address).await
     }
 
+    /// Zero-cost mempool emptiness probe (read guard + atomic counter).
+    pub async fn mempool_is_empty(&self) -> bool {
+        self.mempool.read().await.is_empty()
+    }
+
     pub async fn get_transactions_for_block(&self) -> Vec<Transaction> {
         let mut mempool = self.mempool.write().await;
         mempool.prune_expired();
@@ -7037,13 +7042,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0, false)
+                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0, false)
+                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
 
@@ -7104,13 +7109,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0, false)
+                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0, false)
+                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
 

@@ -313,8 +313,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use indicatif::ProgressBar;
-
 use crate::a9::blockchain::Block;
 
 /// Process-wide cached GPU miner (init is ~100-200ms; reuse it across blocks).
@@ -336,6 +334,9 @@ static LAST_ITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// an attempt-local average sagged ~40% at every tip change and read as
 /// thermal throttling on a perfectly healthy card.
 static RATE_EWMA_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Difficulty of the most recent dispatch — read by the display task.
+static LAST_DIFFICULTY: AtomicU64 = AtomicU64::new(0);
 
 fn shared_gpu_status() -> &'static Result<GpuMiner, String> {
     GPU.get_or_init(|| match GpuMiner::new() {
@@ -395,9 +396,31 @@ fn expected_hashes(difficulty: u64) -> f64 {
     2f64.powi((difficulty / 16).min(255) as i32)
 }
 
+/// Clear the display statics at the start of a mine command so a second
+/// `mine --gpu` in the same process doesn't flash the previous command's
+/// GH/s and difficulty for ~1s before the first new dispatch lands.
+pub fn reset_display_state() {
+    RATE_EWMA_BITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAST_DIFFICULTY.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live display readings for the mine command's bar task: (EWMA GH/s, last
+/// difficulty mined against). The GPU thread only ever writes atomics — it
+/// must NEVER touch the console (see gpu_mine_attempt's display note).
+pub fn gpu_display_snapshot() -> (f64, u64) {
+    let ghs = f64::from_bits(RATE_EWMA_BITS.load(std::sync::atomic::Ordering::Relaxed));
+    let difficulty = LAST_DIFFICULTY.load(std::sync::atomic::Ordering::Relaxed);
+    (if ghs.is_finite() { ghs } else { 0.0 }, difficulty)
+}
+
+/// Poisson mean seconds to one block at `difficulty` for a rate in GH/s.
+pub fn expected_block_seconds(difficulty: u64, ghs: f64) -> f64 {
+    expected_hashes(difficulty) / (ghs * 1e9).max(1.0)
+}
+
 /// Human "about how long" at a measured rate — the honest solo-mining ETA the
 /// display owes the user (a Poisson mean, not a countdown).
-fn format_eta(seconds: f64) -> String {
+pub fn format_eta(seconds: f64) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
         return "…".into();
     }
@@ -420,15 +443,18 @@ fn format_eta(seconds: f64) -> String {
 /// success returns `(nonce, timestamp, difficulty, hash)` for the existing CPU
 /// finalizer to build+verify — the GPU only proposes a nonce; consensus unchanged.
 ///
-/// Display: all output goes through `progress` (the mine command's indicatif
-/// bar) — never raw print!, which fought the bar's steady tick for the terminal
-/// line and garbled both. The bar is PERCENT of ONE EXPECTED BLOCK of work at
-/// the live difficulty; `session_hashed` carries the running total across
-/// attempts AND heights (attempts end every tip change / budget, and the tip
-/// advances every ~5s network-wide — a per-height bar would restart before it
-/// visibly moved). The search is memoryless, so cumulative-work-vs-expected is
-/// the one progress number that is both monotonic and true; the message adds
-/// the measured GH/s and the honest Poisson ETA at that rate.
+/// Display: this thread NEVER touches the console. It only writes atomics —
+/// `session_progress_micro` (cumulative expected-blocks of work, micro-units)
+/// plus the rate/difficulty statics — and the mine command's display task
+/// paints the bar from them at its own cadence. The first version called
+/// indicatif setters from this loop between dispatches; indicatif draws on the
+/// CALLING thread, and Windows console writes stall for 100ms+ — the GPU sat
+/// idle behind console I/O, oscillating 40-70% utilization in Task Manager on
+/// a 5s-block network where every ms between dispatches is paid at the tip
+/// cadence. Progress accumulates PER-DISPATCH against the difficulty that work
+/// was actually done at (the Poisson intensity integral): monotonic even while
+/// live difficulty flaps across a /16 band boundary, where an
+/// instant-difficulty denominator would halve/double the shown percent.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_mine_attempt(
     number: u32,
@@ -439,8 +465,8 @@ pub fn gpu_mine_attempt(
     budget: std::time::Duration,
     tip_counter: &std::sync::atomic::AtomicU64,
     tip_version: u64,
-    session_hashed: &AtomicU64,
-    progress: Option<&ProgressBar>,
+    session_progress_micro: &AtomicU64,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Option<(u64, u64, u64, [u8; 32])> {
     let gpu = shared_gpu()?;
     let deadline = Instant::now() + budget;
@@ -484,8 +510,13 @@ pub fn gpu_mine_attempt(
     let mut iters: u32 = LAST_ITERS
         .load(std::sync::atomic::Ordering::Relaxed)
         .clamp(1, MAX_ITERS);
-    let mut last_report = Instant::now();
-    while Instant::now() < deadline && !tip_moved() {
+    // A dispatch can't be aborted once submitted, so `stop` is checked here
+    // between dispatches (every ~140ms) — the finest-grained the GPU allows.
+    // The caller ends the whole command on the next line when this returns.
+    while Instant::now() < deadline
+        && !tip_moved()
+        && !stop.load(std::sync::atomic::Ordering::Relaxed)
+    {
         // Clamped to the parent's timestamp (same as the CPU loop): a local
         // clock behind the parent stamps headers that fail parent-timestamp
         // validation only after the grind — every solve burned.
@@ -519,13 +550,13 @@ pub fn gpu_mine_attempt(
         }
         let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
         base = base.wrapping_add(per_dispatch);
-        let total_hashed = session_hashed
-            .fetch_add(per_dispatch, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(per_dispatch);
         iters = next_dispatch_iters(iters, dispatch_ms, TARGET_DISPATCH_MS, MAX_ITERS);
         LAST_ITERS.store(iters, std::sync::atomic::Ordering::Relaxed);
 
-        // Rate = EWMA over per-dispatch instantaneous rates (see RATE_EWMA_BITS).
+        // Telemetry only — a handful of atomic stores, nothing that can stall
+        // this thread between dispatches. Rate = EWMA over per-dispatch
+        // instantaneous rates; progress accumulates per_dispatch/expected AT
+        // THIS DISPATCH'S DIFFICULTY in micro-expected-blocks.
         let inst_ghs = per_dispatch as f64 / (dispatch_ms.max(1.0) / 1000.0) / 1e9;
         let prev = f64::from_bits(RATE_EWMA_BITS.load(std::sync::atomic::Ordering::Relaxed));
         let ghs = if prev.is_finite() && prev > 0.0 {
@@ -534,41 +565,10 @@ pub fn gpu_mine_attempt(
             inst_ghs
         };
         RATE_EWMA_BITS.store(ghs.to_bits(), std::sync::atomic::Ordering::Relaxed);
-
-        // Drive the mine command's progress bar (~2 updates/s). The bar is
-        // PERCENT of one expected block of work at the live difficulty —
-        // unit-free, so it moves at any difficulty (GH units truncated to zero
-        // ticks at the 464 floor, where expected work is 0.54 GH) — and it
-        // WRAPS past one expectation instead of pegging full: finding a block
-        // is Poisson, so "expected" is a mean, not a finish line, and a pegged
-        // bar reads as stalled during an (ordinary) unlucky stretch. Past the
-        // first sweep the message carries the multiplier. The message adds the
-        // measured rate and the honest ETA it implies.
-        if let Some(pb) = progress {
-            let now = Instant::now();
-            if now.duration_since(last_report).as_secs_f64() >= 0.5 {
-                let expected = expected_hashes(difficulty);
-                let eta = format_eta(expected / (ghs * 1e9).max(1.0));
-                if pb.length() != Some(100) {
-                    pb.set_length(100);
-                }
-                let sweeps = total_hashed as f64 / expected.max(1.0);
-                pb.set_position(((sweeps.fract() * 100.0) as u64).min(99));
-                // Most-important-first: at 80 columns {wide_msg} clips the tail,
-                // so rate and ETA must survive; the multiplier is the "how
-                // unlucky is this block" meter once past one expectation.
-                let due = if sweeps >= 1.0 {
-                    format!(" · {:.1}x expected work", sweeps)
-                } else {
-                    String::new()
-                };
-                pb.set_message(format!(
-                    "{:.2} GH/s · block in {} · diff {}{}",
-                    ghs, eta, difficulty, due
-                ));
-                last_report = now;
-            }
-        }
+        LAST_DIFFICULTY.store(difficulty, std::sync::atomic::Ordering::Relaxed);
+        let progress_inc =
+            ((per_dispatch as f64 / expected_hashes(difficulty)) * 1e6).max(0.0) as u64;
+        session_progress_micro.fetch_add(progress_inc, std::sync::atomic::Ordering::Relaxed);
     }
     None
 }

@@ -621,6 +621,7 @@ impl Mgmt {
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Db>>,
         use_gpu: bool,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Block> {
         if command.len() < 2 {
             return Err("Usage: mine <wallet_name_or_address>".into());
@@ -748,6 +749,7 @@ impl Mgmt {
                 miner_wallet.address.clone(),
                 mining_reward,
                 use_gpu,
+                stop,
             )
             .await
         {
@@ -812,6 +814,11 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 Ok(mined_block)
+            }
+            Err(crate::a9::miner::MiningError::Stopped) => {
+                // Clean user stop (Enter), not a fault — no red "error" line.
+                writeln!(stdout, "Mining stopped.")?;
+                Err(Box::new(crate::a9::miner::MiningError::Stopped))
             }
             Err(e) => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;

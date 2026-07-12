@@ -1864,6 +1864,16 @@ println!("Wallet renamed successfully");
                             let _ = std::io::stdin().read_line(&mut buf);
                             stop.store(true, Ordering::SeqCst);
                         });
+                    } else {
+                        // Single-shot grinds one block, which solo can take a
+                        // while. Enter-to-stop needs the continuous reader (a
+                        // stray stdin reader here would corrupt the rustyline
+                        // prompt after the block lands), so point at the two
+                        // real ways out.
+                        println!(
+                            "Mining one block (solo can take a while). Press Ctrl-C to abort, \
+                             or use `--continuous` to keep mining with Enter-to-stop."
+                        );
                     }
 
                     // Sleep in short slices so Enter stops continuous mode promptly.
@@ -1967,7 +1977,7 @@ println!("Wallet renamed successfully");
                         let mining_manager = MiningManager::new(Arc::clone(&blockchain));
                         let miner = Miner::new(blockchain.clone(), mining_manager);
                         match mgmt
-                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc, use_gpu)
+                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc, use_gpu, Arc::clone(&stop_flag))
                             .await
                         {
                             Ok(mined_block) => {
@@ -2059,6 +2069,15 @@ println!("Wallet renamed successfully");
                                 .await;
                             }
                             Err(e) => {
+                                // USER STOP (Enter): a clean exit, not a fault.
+                                // handle_mine_command already printed "Mining
+                                // stopped."; just leave the loop without the
+                                // error path or backoff.
+                                if stop_flag.load(Ordering::SeqCst)
+                                    || e.to_string().contains("stopped by user")
+                                {
+                                    break 'mining;
+                                }
                                 // LOST RACE, not a fault: we solved a height, but the
                                 // network's block for it arrived first and the background
                                 // sync adopted it, so finalization correctly rejects our
