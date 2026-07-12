@@ -5110,9 +5110,22 @@ impl Blockchain {
             MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
         };
 
-        // Add transaction fees to the base reward
+        // Add transaction fees to the base reward.
+        //
+        // Floor by min(MIN_BLOCK_REWARD, current_max) — NOT MIN_BLOCK_REWARD alone.
+        // current_max decays as MAX_BLOCK_REWARD * 0.83^periods (one period = 6
+        // months), and once it drops below MIN_BLOCK_REWARD (~10.5 years past
+        // genesis) a fixed 1.0 floor makes this `clamp(1.0, current_max<1.0)` — a
+        // clamp with min > max, which f64::clamp PANICS on. calculate_block_reward
+        // runs on both the validation and mining reward paths, so that panic would
+        // halt every node at once. Bounding the floor by the ceiling is exactly
+        // value-identical while current_max >= MIN_BLOCK_REWARD (every block for the
+        // ~10.5 years the chain will actually see) and, past the crossover, lets the
+        // reward follow the diminished current_max down instead of panicking. Do not
+        // revert to a fixed floor.
+        let reward_floor = MIN_BLOCK_REWARD.min(current_max);
         let final_reward = Transaction::round_amount(
-            (base_reward + effective_fees).clamp(MIN_BLOCK_REWARD, current_max),
+            (base_reward + effective_fees).clamp(reward_floor, current_max),
         );
 
         Ok(final_reward)
@@ -6384,6 +6397,61 @@ mod tests {
             .db
             .insert(key.as_bytes(), codec::serialize(block).unwrap())
             .expect("raw block insert should succeed");
+    }
+
+    /// The block reward is well-formed across the ENTIRE emission timeline,
+    /// including the long-horizon regime where the decaying current_max
+    /// (MAX_BLOCK_REWARD * 0.83^periods) falls below MIN_BLOCK_REWARD. The reward
+    /// floor is bounded by the ceiling, so no period produces a `clamp(min > max)`
+    /// (which f64::clamp would panic on, on both the validation and mining reward
+    /// paths). This pins two things at once: (a) VALUE IDENTITY in the reachable
+    /// range — for every period where current_max >= MIN_BLOCK_REWARD the reward is
+    /// exactly what a fixed-1.0 floor produced, so the bound is not a consensus
+    /// change for any block the chain will see for ~10.5 years; (b) past the
+    /// crossover the reward tracks current_max and never panics.
+    #[test]
+    fn block_reward_well_formed_across_full_emission_timeline() {
+        const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000;
+        let bc = test_blockchain();
+        let genesis = metadata_test_block(0, [0u8; 32], "genesis", 50.0);
+        let g_ts = genesis.timestamp;
+        insert_raw_block(&bc, &genesis);
+
+        // metadata_test_block carries only the MINING_REWARDS coinbase, which the
+        // reward fold filters out -> tx_count 0 -> empty-block base = current_max*0.2.
+        for periods in [0u32, 1, 5, 12, 13, 20, 21, 22, 30, 60] {
+            let current_max = MAX_BLOCK_REWARD * 0.83f64.powi(periods as i32);
+            let mut b = metadata_test_block(1, genesis.hash, "miner", 1.0);
+            b.timestamp = g_ts + periods as u64 * SECONDS_IN_SIX_MONTHS;
+            let got = bc
+                .calculate_block_reward(&b)
+                .expect("reward must compute (no panic) at every period");
+            assert!(
+                got.is_finite() && got >= 0.0,
+                "period {periods}: reward {got} not finite/non-negative"
+            );
+
+            // Independent expected value using the ORIGINAL fixed-1.0 floor in the
+            // reachable range: proves the ceiling-bounded floor changed nothing while
+            // current_max >= 1.0. Past the crossover the original panicked, so there
+            // the only requirement is "== current_max, no panic".
+            let base = current_max * 0.2; // empty-block base
+            if current_max >= MIN_BLOCK_REWARD {
+                let expected =
+                    Transaction::round_amount(base.clamp(MIN_BLOCK_REWARD, current_max));
+                assert!(
+                    (got - expected).abs() < 1e-9,
+                    "period {periods}: reward {got} != fixed-floor expected {expected} \
+                     (current_max={current_max}) — the bound must be value-identical in range"
+                );
+            } else {
+                let expected = Transaction::round_amount(current_max);
+                assert!(
+                    (got - expected).abs() < 1e-9,
+                    "period {periods}: reward {got} != current_max {expected} past crossover"
+                );
+            }
+        }
     }
 
     #[test]
