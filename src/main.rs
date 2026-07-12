@@ -4180,18 +4180,27 @@ fn local_tip_height(db_path: &str) -> Option<u32> {
 /// manifest is still independently signature-verified. Sanity: headers must be
 /// prev_hash-linked within their window before use.
 async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, String)> {
+    // Size discipline: this is the one boot-path fetch whose response we parse
+    // wholesale, and at limit=240 a legitimate reply is single-digit MB. Cap it
+    // so a misbehaving/hostile gateway can't balloon boot memory — fail-open to
+    // "no anchor", same as any other fetch trouble.
+    const MAX_ANCHOR_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(2500))
         .build()
         .ok()?;
-    let body = client
+    let raw = client
         .get(SNAPSHOT_HISTORY_URL)
         .send()
         .await
         .ok()?
-        .json::<serde_json::Value>()
+        .bytes()
         .await
         .ok()?;
+    if raw.len() > MAX_ANCHOR_RESPONSE_BYTES {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
@@ -4209,13 +4218,27 @@ async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, Stri
     if same_network != Some(true) {
         return None;
     }
-    let mut best: Option<(u32, String)> = None;
+    best_anchor_from_history(&body, local_tip)
+}
+
+/// Pure anchor selection from a (network-gated) snapshot-history response: the
+/// highest header height <= local_tip, and among entries that disagree about
+/// that height — which legitimately happens when a short reorg rewrote it
+/// between two snapshots — the hash from the NEWEST snapshot (highest snapshot
+/// tip height) wins, because it reflects the settled chain. Selection is
+/// deliberately independent of the response's array order: the old code kept
+/// whichever entry the gateway sent first, which was only correct because the
+/// route happens to sort newest-first — an ordering nobody promised. Windows
+/// whose headers do not prev_hash-chain are rejected wholesale (a malformed or
+/// tampered entry must not become the fork verdict), as are non-64-hex hashes.
+fn best_anchor_from_history(body: &serde_json::Value, local_tip: u32) -> Option<(u32, String)> {
+    // (anchor height, snapshot tip height it came from, hash)
+    let mut best: Option<(u32, u64, String)> = None;
     for entry in body.get("history")?.as_array()? {
         let Some(headers) = entry.get("headers").and_then(|v| v.as_array()) else {
             continue;
         };
-        // Reject a window whose headers do not chain — a malformed or tampered
-        // entry must not become the fork verdict.
+        let snapshot_height = entry.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
         let mut linked = true;
         for pair in headers.windows(2) {
             let child_prev = pair[1].get("prev_hash").and_then(|v| v.as_str());
@@ -4238,12 +4261,18 @@ async fn fetch_canonical_anchor_at_or_below(local_tip: u32) -> Option<(u32, Stri
             if height > local_tip || hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
-            if best.as_ref().map(|(bh, _)| height > *bh).unwrap_or(true) {
-                best = Some((height, hash.to_ascii_lowercase()));
+            let better = match &best {
+                None => true,
+                Some((bh, bsnap, _)) => {
+                    height > *bh || (height == *bh && snapshot_height > *bsnap)
+                }
+            };
+            if better {
+                best = Some((height, snapshot_height, hash.to_ascii_lowercase()));
             }
         }
     }
-    best
+    best.map(|(height, _, hash)| (height, hash))
 }
 
 /// Fetch and verify the signed bootstrap manifest, returning the canonical tip as
@@ -5121,6 +5150,79 @@ mod tests {
             canonical_reconcile_decision(&db, &m, Some(150), anchor),
             CanonicalReconcile::InSyncOrUnknown
         ));
+    }
+
+    fn history_body(entries: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "history": entries })
+    }
+
+    fn history_entry(snapshot_height: u64, headers: Vec<(u32, &str, &str)>) -> serde_json::Value {
+        serde_json::json!({
+            "height": snapshot_height,
+            "headers": headers
+                .into_iter()
+                .map(|(h, hash, prev)| serde_json::json!({
+                    "height": h, "hash": hash, "prev_hash": prev, "timestamp": 0
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    // When two snapshots disagree about the same height (a short reorg rewrote
+    // it between them), the NEWEST snapshot's hash must win — independent of
+    // the order the gateway serialized the entries. The old positional logic
+    // kept whichever came first and was only correct by an unpromised sort.
+    #[test]
+    fn anchor_same_height_conflict_newest_snapshot_wins_any_order() {
+        let old_hash = "a".repeat(64);
+        let new_hash = "b".repeat(64);
+        let older = history_entry(100, vec![(90, old_hash.as_str(), &"0".repeat(64))]);
+        let newer = history_entry(150, vec![(90, new_hash.as_str(), &"0".repeat(64))]);
+        for entries in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            let got = best_anchor_from_history(&history_body(entries), 95);
+            assert_eq!(got, Some((90, new_hash.clone())));
+        }
+    }
+
+    // Highest height at-or-below the local tip wins over a newer-but-lower one.
+    #[test]
+    fn anchor_prefers_highest_usable_height() {
+        let low = history_entry(200, vec![(80, &"c".repeat(64), &"0".repeat(64))]);
+        let high = history_entry(120, vec![(92, &"d".repeat(64), &"0".repeat(64))]);
+        let got = best_anchor_from_history(&history_body(vec![low, high]), 95);
+        assert_eq!(got, Some((92, "d".repeat(64))));
+    }
+
+    // A window whose headers don't chain is rejected wholesale; malformed
+    // hashes and above-tip heights are skipped.
+    #[test]
+    fn anchor_rejects_unlinked_windows_and_junk() {
+        let good_parent = "e".repeat(64);
+        let linked = history_entry(
+            100,
+            vec![
+                (90, good_parent.as_str(), &"0".repeat(64)),
+                (91, &"f".repeat(64), good_parent.as_str()),
+            ],
+        );
+        let unlinked = history_entry(
+            300,
+            vec![
+                (93, &"1".repeat(64), &"0".repeat(64)),
+                (94, &"2".repeat(64), &"9".repeat(64)), // prev doesn't match
+            ],
+        );
+        let junk = history_entry(400, vec![(92, "not-hex", &"0".repeat(64)), (99, &"3".repeat(64), &"0".repeat(64))]);
+        let got = best_anchor_from_history(
+            &history_body(vec![linked, unlinked, junk]),
+            95,
+        );
+        // unlinked window's 93/94 rejected; junk's 92 non-hex skipped and its
+        // window is unlinked anyway; linked window's 91 is the best survivor.
+        assert_eq!(got, Some((91, "f".repeat(64))));
     }
 
     // An anchor above our tip carries no information about our chain — ignored
