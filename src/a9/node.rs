@@ -163,6 +163,20 @@ enum Ancestor {
     /// near the tip) -> transient, retry (never bootstrap).
     Transient,
 }
+
+/// Outcome of an exact (height,hash) relay fetch. Distinguishing a TRANSIENT
+/// failure (unreachable base / 429 / 5xx / 404-not-posted-yet / decode error)
+/// from a DEFINITIVE miss (a reachable base cleanly served a response that lacks
+/// or mismatches the asked block) is load-bearing: the ancestor walk must RETRY a
+/// transient blip on the soft tier rather than escalate it to NeedsBootstrap and
+/// sideline the live lineage for 300s. The windowed fetch path already makes this
+/// split (Err -> Ancestor::Transient, 2ff72d8); the exact-fetch path bypassed it
+/// by collapsing every failure to None (2026-07-12 audit).
+enum ExactFetch {
+    Found(Block),
+    Missing,
+    Transient,
+}
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 60;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
@@ -2943,11 +2957,15 @@ impl Node {
                             .fetch_relay_block_exact(expected_height, expected_hash)
                             .await
                         {
-                            Some(b) => {
+                            ExactFetch::Found(b) => {
                                 by_hash.entry(b.hash).or_insert(b.clone());
                                 b
                             }
-                            None => return gap_verdict(expected_height),
+                            // A transient blip (429/timeout/unreachable) on the exact
+                            // fetch must retry on the soft tier, NOT sideline the live
+                            // lineage for 300s via NeedsBootstrap (2026-07-12 audit).
+                            ExactFetch::Transient => return Ancestor::Transient,
+                            ExactFetch::Missing => return gap_verdict(expected_height),
                         }
                     }
                 };
@@ -3655,10 +3673,17 @@ impl Node {
 
     /// Fetch ONE relay block by exact (height, hash) via GET /api/block. Used by the
     /// ancestor/reorg walk when the fork-capped windowed list omits the specific
-    /// parent it needs. None if unreachable, not found, or malformed (walk then
-    /// treats it as a genuine gap). Blocks are immutable so this is edge-cached.
-    async fn fetch_relay_block_exact(&self, height: u32, hash: [u8; 32]) -> Option<Block> {
+    /// parent it needs. Returns Transient on any unreachable/rate-limited/decode
+    /// failure (walk retries on the soft tier); Missing only when a reachable base
+    /// cleanly answers WITHOUT the asked block (walk treats that as a real gap).
+    /// Blocks are immutable so this is edge-cached.
+    async fn fetch_relay_block_exact(&self, height: u32, hash: [u8; 32]) -> ExactFetch {
         let network_id = hex::encode(self.network_id);
+        // A definitive negative requires at least one base to answer cleanly (2xx,
+        // decodable) yet without the block. Send errors, non-2xx (429/5xx, and 404
+        // = "not posted yet", which the gateway itself never caches, e51c878) and
+        // decode errors are transient and must never be laundered into a gap.
+        let mut definitive_miss = false;
         for base in Self::discovery_bases() {
             let url = format!(
                 "{}/api/block?network_id={}&height={}&hash={}",
@@ -3667,19 +3692,24 @@ impl Node {
                 height,
                 hex::encode(hash)
             );
-            let Ok(res) = self.http_client.get(&url).send().await else {
-                continue;
+            let res = match self.http_client.get(&url).send().await {
+                Ok(r) => r,
+                Err(_) => continue, // transient: base unreachable
             };
             if !res.status().is_success() {
-                continue;
+                continue; // transient: 429 / 5xx / 404-not-posted-yet
             }
-            let Ok(body) = res.json::<serde_json::Value>().await else {
-                continue;
+            let body = match res.json::<serde_json::Value>().await {
+                Ok(b) => b,
+                Err(_) => continue, // transient: body decode failure
             };
+            // From here the base is reachable and answered cleanly; any negative is definitive.
             if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                definitive_miss = true;
                 continue;
             }
             let Some(record) = body.get("block") else {
+                definitive_miss = true;
                 continue;
             };
             // The relay wraps the node Block in an ENVELOPE record ({height, hash,
@@ -3694,6 +3724,7 @@ impl Node {
                     "exact-block fetch #{}: response record missing inner block field",
                     height
                 );
+                definitive_miss = true;
                 continue;
             };
             if let Ok(block) = serde_json::from_value::<Block>(block_val.clone()) {
@@ -3704,17 +3735,23 @@ impl Node {
                     && block.calculate_hash_for_block() == hash
                     && block.verify_pow_meets_floor()
                 {
-                    return Some(block);
+                    return ExactFetch::Found(block);
                 }
                 debug!(
                     "exact-block fetch #{}: parsed block failed (height/hash/pow) check",
                     height
                 );
+                definitive_miss = true;
             } else {
                 debug!("exact-block fetch #{}: inner block failed to deserialize", height);
+                definitive_miss = true;
             }
         }
-        None
+        if definitive_miss {
+            ExactFetch::Missing
+        } else {
+            ExactFetch::Transient
+        }
     }
 
     /// Fetch the gateway's relay-head hint: the {height, hash} of the newest block
