@@ -270,10 +270,12 @@ impl MiningManager {
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
 
                 for transaction in &mining_transactions {
-                    let confirmed_balance = blockchain_lock
-                        .get_confirmed_balance(&transaction.sender)
+                    // Exact i128: tx selection must agree with the consensus writer's
+                    // affordability so it doesn't select a tx that finalize then rejects
+                    // (the f64 round-trip drifts above ~33.55M coins — 2026-07-12 audit).
+                    let confirmed_units = blockchain_lock
+                        .get_confirmed_balance_units(&transaction.sender)
                         .await?;
-                    let confirmed_units = Transaction::to_units(confirmed_balance);
                     let already_selected = sender_debits
                         .get(&transaction.sender)
                         .copied()
