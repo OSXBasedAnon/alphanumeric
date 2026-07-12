@@ -4189,8 +4189,16 @@ impl Blockchain {
             let pending = pending_effects.get(&tx.sender).copied().unwrap_or(0);
             // M06 (defense-in-depth): don't let the local miner commit a block that spends an
             // immature reward — process_transactions_batch would reject it anyway.
+            // in_flight = &[] (NOT &block.transactions): `confirmed`/`pending` here are the
+            // PRE-block balance (the block's own coinbase, MINING_REWARDS, is skipped above and
+            // never credited), so the coinbase must NOT be subtracted via immature either. The
+            // authoritative apply (process_transactions_batch) credits the coinbase AND counts it
+            // immature so it CANCELS; passing &block.transactions here subtracted it without the
+            // credit, making this gate exactly one reward R stricter than consensus and rejecting a
+            // valid full-spendable self-spend — the "Insufficient funds while mining" burn
+            // (2026-07-12 audit). &[] matches add_transaction and the authority exactly.
             let immature =
-                self.immature_reward_units_scan(&tx.sender, block.index as u64, &block.transactions);
+                self.immature_reward_units_scan(&tx.sender, block.index as u64, &[]);
             let available = confirmed - pending - immature;
             let required = tx.total_debit_units();
 
@@ -4851,8 +4859,12 @@ impl Blockchain {
             let pending_deducted = pending_deductions.get(&tx.sender).copied().unwrap_or(0);
 
             // M06 (defense-in-depth): reject a candidate block that spends an immature reward.
+            // in_flight = &[] (NOT &block.transactions), same reasoning as finalize_block: the
+            // block's own coinbase is not credited into current_confirmed/pending_deducted, so
+            // subtracting it via immature made this gate one reward stricter than the authoritative
+            // apply (where the coinbase cancels) and burned valid self-spend solves (2026-07-12).
             let immature =
-                self.immature_reward_units_scan(&tx.sender, block.index as u64, &block.transactions);
+                self.immature_reward_units_scan(&tx.sender, block.index as u64, &[]);
             let available_balance = current_confirmed - pending_deducted - immature;
             let required_amount = tx.total_debit_units();
 
@@ -6397,6 +6409,49 @@ mod tests {
             .db
             .insert(key.as_bytes(), codec::serialize(block).unwrap())
             .expect("raw block insert should succeed");
+    }
+
+    /// The mining affordability gates (validate_new_block / finalize_block) must pass
+    /// in_flight = &[] to the maturity scan, NOT &block.transactions. The block's own
+    /// coinbase is never credited into the pre-block `confirmed`, so counting it in
+    /// `immature` subtracts an uncredited reward and makes the gate exactly one block
+    /// reward stricter than the authoritative apply (process_transactions_batch, where
+    /// the coinbase cancels: +R in balance, +R in immature) — the "Insufficient funds
+    /// while mining" self-spend burn (2026-07-12 audit). This pins the crux: the
+    /// in-flight coinbase inflates the immature total by exactly its amount, which is
+    /// what the gates must NOT subtract (matching add_transaction and the authority).
+    #[test]
+    fn mining_gate_maturity_scan_must_exclude_the_blocks_own_coinbase() {
+        let bc = test_blockchain();
+        // Past the activation height, so the maturity overlay is enforced.
+        let spend_height = MATURITY_ACTIVATION_HEIGHT as u64 + 200;
+        let reward = Transaction::to_units(10.0);
+        let own_coinbase = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "W".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: reward,
+            timestamp: 1_000,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        // Fresh chain: no stored coinbase in the maturity window, so stored immature = 0.
+        let without_inflight = bc.immature_reward_units_scan("W", spend_height, &[]);
+        let with_inflight =
+            bc.immature_reward_units_scan("W", spend_height, std::slice::from_ref(&own_coinbase));
+        assert_eq!(without_inflight, 0, "no stored immature coinbase for W on a fresh chain");
+        assert_eq!(
+            with_inflight - without_inflight,
+            reward,
+            "the block's own coinbase inflates immature by exactly R; the gates now pass &[] so \
+             they never subtract that uncredited R (matching add_transaction + the authority)"
+        );
+        // Below the activation height the overlay is inert regardless of in_flight.
+        assert_eq!(
+            bc.immature_reward_units_scan("W", 100, std::slice::from_ref(&own_coinbase)),
+            0
+        );
     }
 
     /// The block reward is well-formed across the ENTIRE emission timeline,
