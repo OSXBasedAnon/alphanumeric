@@ -2970,6 +2970,18 @@ impl Node {
             .map(|b| (b.height, hex::encode(b.hash)))
     }
 
+    /// Highest network beacon height OBSERVED by the background reconcile loops
+    /// (a free read of the last-seen high-water — NO network fetch), or None if
+    /// none seen yet. Powers the explorer `/status` freshness signal so a
+    /// consumer (exchange deposit-crediting, a wallet) can gate on how far
+    /// behind the serving node is without doing its own beacon fetch.
+    pub fn observed_beacon_height(&self) -> Option<u32> {
+        match self.last_seen_beacon_height.load(Ordering::Acquire) {
+            0 => None,
+            h => Some(h as u32),
+        }
+    }
+
     /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
     /// work is the single always-converge op below.
     async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {
@@ -5146,12 +5158,27 @@ impl Node {
         let payload = {
             let tip = chain.get_last_block();
             let index_meta = chain.address_index_meta();
+            let local_height = tip.as_ref().map(|b| b.index);
+            // FRESHNESS SIGNAL: a resilient service node stays UP and serves while
+            // it is a bit behind (rather than self-terminating), so a consumer
+            // must be able to tell HOW far behind before trusting a read for e.g.
+            // deposit crediting. network_height is the highest signed beacon the
+            // node has observed (free cached read); blocks_behind is the delta.
+            // Both null until the first beacon is seen. Data served is always a
+            // valid canonical prefix — this only says how fresh it is.
+            let network_height = state.node.observed_beacon_height();
+            let blocks_behind = match (local_height, network_height) {
+                (Some(l), Some(n)) => Some(n.saturating_sub(l)),
+                _ => None,
+            };
             json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
                 "network_id": hex::encode(state.network_id),
-                "height": tip.as_ref().map(|b| b.index),
+                "height": local_height,
                 "tip_hash": tip.as_ref().map(|b| hex::encode(b.hash)),
+                "network_height": network_height,
+                "blocks_behind": blocks_behind,
                 "index_height": index_meta.map(|(height, _)| height),
                 "index_ready": index_meta.is_some(),
                 "uptime_secs": SystemTime::now()
