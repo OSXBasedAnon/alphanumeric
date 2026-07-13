@@ -1156,6 +1156,14 @@ struct ExplorerAddressQuery {
     before_pos: Option<u32>,
 }
 
+/// Query for `GET /explorer/tx?id=<tx_id>`. The tx id is a composite
+/// colon-delimited string (`get_tx_id`), not URL-path-friendly, so it is passed
+/// as a query parameter rather than a path segment.
+#[derive(Debug, Deserialize)]
+struct ExplorerTxIdQuery {
+    id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscoveryResponse {
     ok: bool,
@@ -2956,6 +2964,30 @@ impl Node {
     /// mined block before starting the next). Read-only; one edge-cached HTTP GET.
     pub async fn network_beacon_height(&self) -> Option<u32> {
         self.fetch_tip_beacon().await.map(|b| b.height)
+    }
+
+    /// Current signed beacon tip as `(height, hex hash)`, or None if the beacon
+    /// is unreachable. Read-only sibling of `network_beacon_height` for callers
+    /// that also need the tip HASH — e.g. the idle reconcile loop's fork check,
+    /// which compares the local block at the beacon height against this hash to
+    /// catch an out-extended (taller-but-losing) fork. Mining never calls this;
+    /// it is behaviour-neutral for the mining path.
+    pub async fn network_beacon_tip(&self) -> Option<(u32, String)> {
+        self.fetch_tip_beacon()
+            .await
+            .map(|b| (b.height, hex::encode(b.hash)))
+    }
+
+    /// Highest network beacon height OBSERVED by the background reconcile loops
+    /// (a free read of the last-seen high-water — NO network fetch), or None if
+    /// none seen yet. Powers the explorer `/status` freshness signal so a
+    /// consumer (exchange deposit-crediting, a wallet) can gate on how far
+    /// behind the serving node is without doing its own beacon fetch.
+    pub fn observed_beacon_height(&self) -> Option<u32> {
+        match self.last_seen_beacon_height.load(Ordering::Acquire) {
+            0 => None,
+            h => Some(h as u32),
+        }
     }
 
     /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
@@ -5118,6 +5150,7 @@ impl Node {
                 "/explorer/tip",
                 "/explorer/block/{height}",
                 "/explorer/tx/{height}/{position}",
+                "/explorer/tx?id={tx_id}  (status of a tx by id: confirmed/pending/not_found)",
                 "/explorer/address/{address}?limit=&before_height=&before_pos=",
                 "/explorer/supply",
                 "POST /explorer/submit-tx  (body: signed transaction JSON)",
@@ -5134,12 +5167,27 @@ impl Node {
         let payload = {
             let tip = chain.get_last_block();
             let index_meta = chain.address_index_meta();
+            let local_height = tip.as_ref().map(|b| b.index);
+            // FRESHNESS SIGNAL: a resilient service node stays UP and serves while
+            // it is a bit behind (rather than self-terminating), so a consumer
+            // must be able to tell HOW far behind before trusting a read for e.g.
+            // deposit crediting. network_height is the highest signed beacon the
+            // node has observed (free cached read); blocks_behind is the delta.
+            // Both null until the first beacon is seen. Data served is always a
+            // valid canonical prefix — this only says how fresh it is.
+            let network_height = state.node.observed_beacon_height();
+            let blocks_behind = match (local_height, network_height) {
+                (Some(l), Some(n)) => Some(n.saturating_sub(l)),
+                _ => None,
+            };
             json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
                 "network_id": hex::encode(state.network_id),
-                "height": tip.as_ref().map(|b| b.index),
+                "height": local_height,
                 "tip_hash": tip.as_ref().map(|b| hex::encode(b.hash)),
+                "network_height": network_height,
+                "blocks_behind": blocks_behind,
                 "index_height": index_meta.map(|(height, _)| height),
                 "index_ready": index_meta.is_some(),
                 "uptime_secs": SystemTime::now()
@@ -5211,6 +5259,102 @@ impl Node {
             );
         }
         (StatusCode::OK, Json(payload))
+    }
+
+    /// `GET /explorer/tx?id=<tx_id>` — look up a transaction by its id (the value
+    /// `submit-tx` returns) and report its status. This is the endpoint a web3
+    /// site polls to follow a transaction it just broadcast to confirmation,
+    /// without having to know the (height, position) locator up front.
+    ///
+    /// Returns 200 with `status: "confirmed"` (plus height, position, block_hash,
+    /// confirmations, and the tx body) once it is in a block; 200 with
+    /// `status: "pending"` while it sits in the mempool; and 404 `not_found` if it
+    /// is unknown, was dropped, or is older than the confirmed-tx retention
+    /// window (for deep history, look it up by (height, position) or via
+    /// `/explorer/address`). This tracks USER-submitted transactions; coinbase /
+    /// system rewards are not in the tx-id registry and read as not_found here.
+    /// Read-only (confirmed-tx registry + block reads + mempool lookup) — no
+    /// consensus, mining, or write surface. `status` is present on every
+    /// response; `ok` is true on 200 and false on the 404.
+    async fn explorer_tx_by_id_handler(
+        State(state): State<ExplorerState>,
+        Query(query): Query<ExplorerTxIdQuery>,
+    ) -> (StatusCode, Json<Value>) {
+        // Bound the id: a real get_tx_id is well under 512 chars
+        // (two 40-hex addresses + amounts + a timestamp). Reject empty/oversized
+        // before any tree scan.
+        let tx_id = match query.id {
+            Some(id) if !id.is_empty() && id.len() <= 512 => id,
+            _ => {
+                return Self::explorer_err(
+                    StatusCode::BAD_REQUEST,
+                    "missing or invalid `id` query parameter",
+                )
+            }
+        };
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+
+        // Confirmed: the recent-confirmed registry maps tx_id -> height. Locate
+        // the body + position by scanning that block's transactions (unique tx_id
+        // within a block is guaranteed by the replay guard).
+        if let Some(height) = chain.confirmed_tx_height(&tx_id) {
+            let tip_height = chain.get_latest_block_index() as u32;
+            if let Ok(block) = chain.get_block(height) {
+                if let Some(position) = block
+                    .transactions
+                    .iter()
+                    .position(|t| t.get_tx_id() == tx_id)
+                {
+                    let mut payload =
+                        Self::explorer_tx_json(&block.transactions[position], position);
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert("ok".into(), json!(true));
+                        object.insert("tx_id".into(), json!(tx_id));
+                        object.insert("status".into(), json!("confirmed"));
+                        object.insert("height".into(), json!(height));
+                        object.insert("block_hash".into(), json!(hex::encode(block.hash)));
+                        object.insert(
+                            "confirmations".into(),
+                            json!(tip_height.saturating_sub(height) as u64 + 1),
+                        );
+                    }
+                    return (StatusCode::OK, Json(payload));
+                }
+            }
+            // Registry says confirmed but the body could not be located (a rare
+            // index/block skew): still report confirmed with the height we hold.
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true, "status": "confirmed", "tx_id": tx_id, "height": height,
+                })),
+            );
+        }
+
+        // Pending: still in the mempool, not yet in a block.
+        if let Some(tx) = chain.get_mempool_transaction_by_id(&tx_id).await {
+            let mut payload = Self::explorer_tx_json(&tx, 0);
+            if let Some(object) = payload.as_object_mut() {
+                // position is meaningless before the tx is placed in a block.
+                object.remove("position");
+                object.insert("ok".into(), json!(true));
+                object.insert("tx_id".into(), json!(tx_id));
+                object.insert("status".into(), json!("pending"));
+            }
+            return (StatusCode::OK, Json(payload));
+        }
+
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "status": "not_found",
+                "tx_id": tx_id,
+                "hint": "unknown, dropped, or older than the recent-confirmed window; for deep history look it up by (height, position) or via /explorer/address",
+            })),
+        )
     }
 
     async fn explorer_address_handler(
@@ -5421,6 +5565,7 @@ impl Node {
             .route("/explorer/status", get(Self::explorer_status_handler))
             .route("/explorer/tip", get(Self::explorer_tip_handler))
             .route("/explorer/block/:height", get(Self::explorer_block_handler))
+            .route("/explorer/tx", get(Self::explorer_tx_by_id_handler))
             .route(
                 "/explorer/tx/:height/:position",
                 get(Self::explorer_tx_handler),

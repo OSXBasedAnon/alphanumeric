@@ -1348,5 +1348,6 @@ impl Mgmt {
                 }
             }
         }
+        println!();
     }
 }
