@@ -26,6 +26,7 @@ and a per-sender mempool rate limit, but a public deployment should add its own.
 | `/explorer/tip` | latest block header |
 | `/explorer/block/{height}` | full block at height (canonical) |
 | `/explorer/tx/{height}/{position}` | one transaction by block height + position |
+| `/explorer/tx?id={tx_id}` | track one transaction by id: `confirmed` (with height, position, block_hash, confirmations, body), `pending` (in mempool), or 404 |
 | `/explorer/address/{address}` | confirmed **balance** + paginated tx **history** |
 | `/explorer/supply` | circulating supply |
 
@@ -63,8 +64,9 @@ Responses:
 On `200` the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and announced it to the network —
 any miner can now include it. There is no separate confirmation step; poll
-`/explorer/tx` or `/explorer/address` for the sender/recipient to see it land in
-a block.
+`/explorer/tx?id=` with the returned `tx_id` (it reports `pending` then
+`confirmed` with a rising `confirmations` count), or watch `/explorer/address`
+for the sender/recipient, to see it land in a block.
 
 ### Signing (client side — you build this)
 
