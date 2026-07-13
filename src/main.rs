@@ -4125,11 +4125,22 @@ enum CanonicalReconcile {
 /// different hash there, and being behind yields no block there — both re-bootstrap.
 /// Fail-open: if the manifest didn't verify or lacks a tip, we keep the local DB.
 ///
-/// `canonical_anchor` is a best-effort canonical (height, hash) at-or-below the
-/// LOCAL tip (see fetch_canonical_anchor_at_or_below). Without it, a node that is
-/// behind the manifest height has nothing to hash-compare, so a node BOTH behind
-/// AND forked at its own tip reads as merely behind → "streamable" → in sync —
-/// the stale-client trap (2026-07-11). With it, behind-and-forked re-bootstraps.
+/// `canonical_anchor` is a known-good canonical `(height, hash)` at or below our
+/// LOCAL tip (see fetch_canonical_anchor_at_or_below). Its job is to tell apart
+/// two states that look identical from height alone:
+///   - BEHIND: our chain is a valid prefix of canonical and just needs the newer
+///     blocks fetched forward ("streaming"; cheap, done by the live sync loop).
+///   - FORKED: at some height we hold a DIFFERENT block than canonical, so we
+///     followed a branch that lost. Streaming can never recover this — the live
+///     catch-up is forward-only (it adopts canonical children onto the tip), but
+///     canonical blocks won't link onto our diverged tip and it never rewinds to
+///     the fork point to rebuild the canonical branch. (A fork older than the
+///     finality window is additionally blocked from reorging by the checkpoint,
+///     but that is not the general reason.) The only cure is a fresh re-bootstrap.
+/// A behind node and a forked node can BOTH lack a block at the manifest tip
+/// height, so without the anchor a forked node reads as merely behind, tries to
+/// stream forever, and never recovers (the stale-client trap seen live
+/// 2026-07-11). The anchor hash-compare catches the fork and re-bootstraps.
 fn canonical_reconcile_decision(
     db_path: &str,
     manifest: &Result<BootstrapManifestPointer>,
@@ -4200,15 +4211,17 @@ fn canonical_reconcile_decision(
         };
     }
 
-    // Behind (no block at the canonical height). BEFORE trusting "behind means
-    // streamable": verify our own tip region is actually ON the canonical chain.
-    // A node can be behind AND forked at its tip (it followed a side branch that
-    // died); streaming can never help it — canonical blocks won't attach to its
-    // fork tip and the reorg back is below finality. Without this check such a
-    // node booted "in sync" and stayed stale until a human forced a bootstrap
-    // (2026-07-11, observed live). The anchor is a canonical header at-or-below
-    // our tip; hash mismatch there = forked, re-bootstrap now. No anchor or no
-    // local block at the anchor height = fail-open to the existing behavior.
+    // FORK CHECK (see the behind-vs-forked note on this fn). Having no block at
+    // the manifest tip height, on its own, only means "behind". Before treating
+    // that as a cheap forward catch-up, confirm our tip region is actually ON
+    // canonical: compare the local block we hold at the anchor height to the
+    // known-good canonical hash there. A mismatch means we are on a lost fork
+    // that the forward-only catch-up can never fix (canonical blocks won't link
+    // onto our diverged tip, and it never rewinds to rebuild the branch), so
+    // re-bootstrap now. Without this check a forked node booted "in sync" and
+    // stayed stale until a human forced a bootstrap (2026-07-11, live). No
+    // anchor, or no local block at the anchor height, falls through to the plain
+    // behind path below.
     let local_tip = local_tip_height(db_path).unwrap_or(0);
     if let Some((anchor_height, anchor_hash)) = canonical_anchor {
         if anchor_height <= local_tip {
@@ -4229,11 +4242,12 @@ fn canonical_reconcile_decision(
         }
     }
 
-    // Within the streamable window OF THE LIVE TIP, the beacon-watch loop catches
-    // up once the node is running (exact-walked branch adoption, v7.6.5) — we must
-    // NOT re-download the whole chain for a streamable gap; that is what "syncing"
-    // means. Only a gap deeper than the window (or a near-empty DB) is worth a
-    // full bootstrap.
+    // Plain BEHIND (anchor region on canonical, or no anchor to check). If the
+    // gap to the live tip is within STREAM_WINDOW, the running node catches up by fetching
+    // those blocks forward (the beacon-watch loop's exact-walked adoption) — do
+    // NOT re-download the whole chain for a gap the node will close on its own;
+    // that is what normal syncing is. Only a gap deeper than the window (or a
+    // near-empty DB) is worth a full re-bootstrap.
     if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
@@ -5318,11 +5332,14 @@ mod tests {
         ));
     }
 
-    // Behind AND forked at the tip: the canonical anchor at-or-below our tip
-    // disagrees with what we hold there — streaming can never fix this (canonical
-    // blocks won't attach, the reorg back is below finality), so it must
-    // re-bootstrap even though the gap is "streamable". This is the stale-client
-    // trap (2026-07-11): without the anchor this node booted "in sync" forever.
+    // A node that is behind AND on a lost fork must re-bootstrap, not stream.
+    // Here the canonical block at height 100 (the anchor) has a different hash
+    // than the block we hold at 100, proving we are on a diverged branch, not a
+    // clean prefix. The running node's forward-only catch-up could never recover
+    // us (canonical blocks won't link onto our forked tip, and it never rewinds
+    // to the fork point), so the verdict must be Diverged even though the height
+    // gap alone looks small enough to just sync. Without the anchor this node
+    // booted "in sync" and stayed stale forever (the 2026-07-11 stale-client trap).
     #[test]
     fn reconcile_behind_and_forked_at_anchor_rebootstraps() {
         let db = reconcile_test_db("behind_forked", &[(90, 7), (100, 8)]);
@@ -5419,8 +5436,9 @@ mod tests {
         assert_eq!(got, Some((91, "f".repeat(64))));
     }
 
-    // An anchor above our tip carries no information about our chain — ignored
-    // (fail-open to the streamable-gap behavior).
+    // An anchor ABOVE our tip tells us nothing about our chain (we hold no block
+    // there to compare), so it is ignored: we fall through to the plain behind
+    // path and, since the gap is within the window, just stream to catch up.
     #[test]
     fn reconcile_anchor_above_local_tip_is_ignored() {
         let db = reconcile_test_db("anchor_above", &[(100, 8)]);
