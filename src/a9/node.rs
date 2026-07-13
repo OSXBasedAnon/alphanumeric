@@ -2958,6 +2958,18 @@ impl Node {
         self.fetch_tip_beacon().await.map(|b| b.height)
     }
 
+    /// Current signed beacon tip as `(height, hex hash)`, or None if the beacon
+    /// is unreachable. Read-only sibling of `network_beacon_height` for callers
+    /// that also need the tip HASH — e.g. the idle reconcile loop's fork check,
+    /// which compares the local block at the beacon height against this hash to
+    /// catch an out-extended (taller-but-losing) fork. Mining never calls this;
+    /// it is behaviour-neutral for the mining path.
+    pub async fn network_beacon_tip(&self) -> Option<(u32, String)> {
+        self.fetch_tip_beacon()
+            .await
+            .map(|b| (b.height, hex::encode(b.hash)))
+    }
+
     /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
     /// work is the single always-converge op below.
     async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {

@@ -1258,6 +1258,7 @@ async fn async_main() -> Result<()> {
                 let mut ticker = tokio::time::interval(Duration::from_secs(20));
                 let mut strikes = 0u32;
                 let mut cooldown_logged = false;
+                let mut behind_logged = false;
                 loop {
                     ticker.tick().await;
                     if shutdown_recon.load(Ordering::Acquire) {
@@ -1278,14 +1279,109 @@ async fn async_main() -> Result<()> {
                             let _ = std::fs::remove_file(force_rebootstrap_marker_path(
                                 &db_path_recon,
                             ));
+                            behind_logged = false;
                         }
                         Converge::AtTipAhead
                         | Converge::Progressed
                         | Converge::BeaconStale
                         | Converge::BranchInvalid => {
                             strikes = 0;
+                            behind_logged = false;
                         }
                         Converge::NeedsBootstrap => {
+                            // RESILIENT SERVICE CLIENTS (exchange / explorer /
+                            // web-wallet API): a NeedsBootstrap from an idle node
+                            // is almost always a FALSE POSITIVE — the node mints
+                            // nothing, so it is a canonical PREFIX (not a fork),
+                            // just behind and momentarily unable to fetch the
+                            // intervening bodies (relay holes / thin mesh /
+                            // partition). The old code escalated that to a process
+                            // exit every ~minute, taking the SERVICE down and
+                            // thinning the mesh. Only a genuine "fallen more than
+                            // ORPHAN_REORG_DEPTH behind" (bodies aged out, snapshot
+                            // is the only cure) warrants the disruptive exit +
+                            // re-bootstrap. Below that, STAY UP and keep serving —
+                            // the in-place converge / Tier-2 peer-sync / gossip
+                            // loops recover the node, and if it never catches up it
+                            // crosses the threshold on its own and re-bootstraps
+                            // then. Read-only + mining-neutral: mine-prep still
+                            // re-checks convergence and writes its own marker
+                            // (schedule_force_rebootstrap_hard) untouched.
+                            let genuinely_too_far = {
+                                let local_tip = node_recon
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .get_latest_block_index()
+                                    as u32;
+                                // FORK vs BEHIND: NeedsBootstrap is overloaded. A
+                                // genuine FORK (our tip is not on canonical) can
+                                // have a small — or even negative — height gap, so
+                                // gap alone would leave a forked service node
+                                // serving wrong-chain data. Re-derive the two fork
+                                // checks the boot reconcile uses, read through the
+                                // OPEN handle (no DB re-open), touching nothing on
+                                // the mine path:
+                                let beacon = node_recon.network_beacon_tip().await;
+                                //  (B) anchor at-or-below our tip: fetch a signed
+                                //      canonical header <= local_tip and compare its
+                                //      hash to the block we hold there. Catches a
+                                //      fork whose divergence point is at/below our
+                                //      tip and below the beacon.
+                                let mut forked = match fetch_canonical_anchor_at_or_below(
+                                    local_tip,
+                                )
+                                .await
+                                {
+                                    Some((anchor_h, anchor_hash)) if anchor_h <= local_tip => {
+                                        match node_recon
+                                            .blockchain
+                                            .read()
+                                            .await
+                                            .get_block(anchor_h)
+                                        {
+                                            Ok(b) => !hex::encode(b.hash)
+                                                .eq_ignore_ascii_case(&anchor_hash),
+                                            Err(_) => false,
+                                        }
+                                    }
+                                    _ => false,
+                                };
+                                //  (A) at the beacon tip: when we are AT/ABOVE the
+                                //      beacon height, compare our block at the beacon
+                                //      height to the signed beacon hash. Catches an
+                                //      out-extended taller-but-losing fork (gap<=0),
+                                //      which check (B)'s anchor — landing on the
+                                //      shared fork point — would miss.
+                                if !forked {
+                                    if let Some((bh, bhash)) = &beacon {
+                                        if local_tip >= *bh {
+                                            if let Ok(b) = node_recon
+                                                .blockchain
+                                                .read()
+                                                .await
+                                                .get_block(*bh)
+                                            {
+                                                forked = !hex::encode(b.hash)
+                                                    .eq_ignore_ascii_case(bhash);
+                                            }
+                                        }
+                                    }
+                                }
+                                let beacon_height = beacon.as_ref().map(|(h, _)| *h);
+                                idle_reconcile_needs_snapshot(local_tip, beacon_height, forked)
+                            };
+                            if !genuinely_too_far {
+                                strikes = 0;
+                                if !behind_logged {
+                                    println!(
+                                        "Behind the network tip; catching up in the background. The node stays up and keeps serving."
+                                    );
+                                    behind_logged = true;
+                                }
+                                continue;
+                            }
+                            behind_logged = false;
                             strikes += 1;
                             if strikes >= 2 {
                                 // Bootstrap-cycle cooldown: on a genuinely shattered
@@ -1317,7 +1413,7 @@ async fn async_main() -> Result<()> {
                                 // — the live loop has PROVEN convergence is impossible,
                                 // which outranks any boot-time guess.
                                 let marker = force_rebootstrap_marker_path(&db_path_recon);
-                                if let Err(e) = std::fs::write(&marker, b"runtime divergence exit\n") {
+                                if let Err(e) = std::fs::write(&marker, b"runtime too-far-behind exit\n") {
                                     eprintln!(
                                         "Warning: could not write re-bootstrap marker {}: {}",
                                         marker.display(),
@@ -1325,7 +1421,8 @@ async fn async_main() -> Result<()> {
                                     );
                                 }
                                 println!(
-                                    "Node chain diverged below the finality window on two checks; restarting to re-bootstrap onto the canonical chain"
+                                    "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
+                                    alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                 );
                                 std::process::exit(0);
                             }
@@ -4180,6 +4277,47 @@ const STREAM_WINDOW: u32 = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
 // force_rebootstrap_marker_path / rebootstrap_cooldown_path /
 // rebootstrap_cooldown_active — imported above.
 
+/// Whether an idle-reconcile `NeedsBootstrap` warrants the DISRUPTIVE snapshot
+/// re-bootstrap (process exit + boot-time re-bootstrap) instead of staying up
+/// and catching up in place.
+///
+/// Returns TRUE when EITHER:
+///  - `forked` — the local chain is a genuine FORK of canonical (a proven hash
+///    mismatch against a canonical anchor we also hold). This re-bootstraps
+///    PROMPTLY regardless of height gap: a forked service node (exchange / wallet
+///    API) is serving WRONG-chain data, and incremental convergence cannot cross
+///    a below-finality fork. `Converge::NeedsBootstrap` is overloaded — it covers
+///    both "diverged fork" and "behind prefix" — and a genuine fork can sit at a
+///    SMALL height gap, so the caller re-derives the fork/behind distinction the
+///    boot reconcile already uses (a gap check alone would miss the small-gap
+///    fork and leave the service on the wrong chain).
+///  - the node has fallen MORE than `ORPHAN_REORG_DEPTH` blocks behind — too far
+///    to close incrementally (bodies aged out of the relay window), so a fresh
+///    snapshot is the only cure.
+///
+/// Returns FALSE for everything else: a canonical PREFIX that is merely behind
+/// and momentarily body-starved (relay holes / thin mesh). This is the whole
+/// point of the fix — such a SERVICE node must NOT self-terminate. Staying up
+/// lets the in-place converge / Tier-2 peer-sync / gossip paths recover it while
+/// it keeps serving. Recovery is never LOST, only deferred: a stuck prefix keeps
+/// falling behind and crosses the depth threshold on its own, rather than being
+/// nuked every ~minute on a transient stall (which took services offline).
+///
+/// `beacon_height == None` (beacon unreachable) with `forked == false` returns
+/// FALSE: never nuke a node on a gap we cannot confirm against a live tip.
+///
+/// Read-only and mining-neutral: mine-prep re-checks convergence and writes its
+/// own re-bootstrap marker independently of this decision.
+fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, forked: bool) -> bool {
+    if forked {
+        return true;
+    }
+    match beacon_height {
+        Some(bh) => bh.saturating_sub(local_tip) > alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH,
+        None => false,
+    }
+}
+
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
     let db = sled::Config::new()
@@ -5117,6 +5255,37 @@ mod tests {
             canonical_reconcile_decision(&db, &m, Some(100), None),
             CanonicalReconcile::InSyncOrUnknown
         ));
+    }
+
+    // The idle-reconcile snapshot gate: a SERVICE node (exchange/explorer/
+    // web-wallet) must self-terminate ONLY when it is genuinely too far behind
+    // to catch up incrementally (> ORPHAN_REORG_DEPTH), never on a transient
+    // "behind but catchable" body-starvation stall — that false positive used
+    // to take services offline every ~minute.
+    #[test]
+    fn idle_snapshot_gate_stays_up_on_behind_prefix_but_exits_on_fork_or_too_far() {
+        let depth = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
+        // NOT forked, within incremental range: STAY UP (false).
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000), false)); // caught up
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1001), false)); // 1 behind
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + 64), false)); // finality window
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + depth), false)); // exactly at bound = not > bound
+        // NOT forked, beyond the bound: genuinely aged out -> re-bootstrap (true).
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1000 + depth + 1), false));
+        assert!(idle_reconcile_needs_snapshot(0, Some(50_000), false));
+        // NOT forked, beacon behind local (we are AHEAD): never re-bootstrap.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(500), false));
+        // NOT forked, beacon unreachable: never nuke on an unconfirmable gap.
+        assert!(!idle_reconcile_needs_snapshot(1000, None, false));
+        // FORKED overrides EVERYTHING — re-bootstrap even at a tiny gap, even
+        // "caught up", even with no beacon: a forked service serves wrong data.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1001), true)); // 1 behind but forked
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1000), true)); // "caught up" on a fork
+        assert!(idle_reconcile_needs_snapshot(1000, None, true)); // forked, beacon unknown
+        assert!(idle_reconcile_needs_snapshot(1000, Some(500), true)); // forked, ahead-by-height
+        // Saturation safety: no underflow/overflow at the u32 extremes.
+        assert!(!idle_reconcile_needs_snapshot(u32::MAX, Some(0), false));
+        assert!(idle_reconcile_needs_snapshot(0, Some(u32::MAX), false));
     }
 
     // Fork at the signed checkpoint: hash mismatch at the manifest height must
