@@ -1327,5 +1327,6 @@ impl Mgmt {
                 }
             }
         }
+        println!();
     }
 }
