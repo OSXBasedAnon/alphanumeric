@@ -6646,6 +6646,40 @@ mod tests {
         tx
     }
 
+    // Invariant behind verified-only witness caching: get_tx_id() covers sender:recipient:amount:
+    // fee:timestamp and excludes the signature/pub_key, so two transactions can share a tx_id while
+    // only one carries the sender's real signature. Verification keys on the signature/address
+    // binding, not on the id — so a witness that matches an id but not that binding fails to verify,
+    // and is therefore never cached. This pins that: matching id, non-matching binding -> rejected.
+    #[tokio::test]
+    async fn witness_matching_id_but_wrong_binding_fails_verification() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("wallet builds");
+        let other = Wallet::new(None).expect("second wallet builds");
+        let ts = 1_700_000_000u64;
+
+        let genuine = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        assert!(
+            bc.verify_transaction_signature(&genuine).is_ok(),
+            "a correctly-signed witness must verify — honest blocks are unaffected"
+        );
+
+        // Same id-defining fields, but the key/signature binding is not the sender's.
+        let mut mismatched = genuine.clone();
+        mismatched.pub_key = other.get_public_key_hex().await;
+        mismatched.sig_hash = None;
+
+        assert_eq!(
+            mismatched.get_tx_id(),
+            genuine.get_tx_id(),
+            "same tx_id — it excludes the signature/pub_key"
+        );
+        assert!(
+            bc.verify_transaction_signature(&mismatched).is_err(),
+            "matching id but not the sender's binding must fail verification, so it is never cached"
+        );
+    }
+
     #[test]
     fn pow_target_zero_difficulty_is_max_target() {
         assert_eq!(pow_target_from_difficulty(0), *MAX_TARGET);

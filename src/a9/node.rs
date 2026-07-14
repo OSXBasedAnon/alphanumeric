@@ -55,7 +55,8 @@ use tokio::{
 };
 
 use crate::a9::blockchain::{
-    Block, Blockchain, BlockchainError, RateLimiter, Transaction, SYSTEM_ADDRESSES,
+    Block, Blockchain, BlockchainError, MAX_BLOCK_TX_COUNT, RateLimiter, Transaction,
+    SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
@@ -97,6 +98,12 @@ const MAINTENANCE_INTERVAL: u64 = 60; // 1 minute
 const VERSION_CHECK_INTERVAL_SECS: u64 = 1800; // 30 min: notice-only client-version check
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 300;
 const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
+// Upper bound on wall-clock time spent resolving a single block's transaction witnesses.
+// Honest blocks resolve theirs locally — near-tip gossip leaves them in the mempool and relay
+// sync ships them inline — so this is only approached when witnesses have to be fetched one by
+// one from a slow-responding peer. Reaching it defers the block (re-verified later, never
+// negative-cached) rather than letting resolution run for an unbounded stretch.
+const WITNESS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
 /// origin/Redis nothing, so this stays O(1) in client count; a version change is
 /// the ONLY thing that triggers a block fetch, so there is no redundant pulling.
@@ -290,6 +297,9 @@ const NETWORK_VERSION: u32 = 3;
 
 // Resource limits
 const MAX_PARALLEL_VALIDATIONS: usize = 200;
+// Concurrent outbound witness fetches, pooled separately from validation permits so a slow-
+// responding peer can only ever contend with other fetches — never with block validation itself.
+const MAX_PARALLEL_WITNESS_FETCHES: usize = 200;
 const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
@@ -821,6 +831,10 @@ impl Clone for NetworkBloom {
 #[derive(Debug, Clone)]
 pub struct ValidationPool {
     available: Arc<Semaphore>,
+    // Network-bound witness fetches draw from this SEPARATE pool, so a peer that answers slowly can
+    // never occupy a validation permit. Only blocks that must fetch a missing witness contend here;
+    // locally-resolvable blocks never touch it.
+    fetch: Arc<Semaphore>,
     pub active_validations: Arc<AtomicU64>,
     timeout: Duration,
 }
@@ -829,9 +843,17 @@ impl ValidationPool {
     pub fn new() -> Self {
         Self {
             available: Arc::new(Semaphore::new(MAX_PARALLEL_VALIDATIONS)),
+            fetch: Arc::new(Semaphore::new(MAX_PARALLEL_WITNESS_FETCHES)),
             active_validations: Arc::new(AtomicU64::new(0)),
             timeout: Duration::from_secs(30),
         }
+    }
+
+    // One slot for a single outbound witness fetch. Non-blocking: if the fetch pool is saturated the
+    // caller treats the witness as unresolved and defers the block (it re-verifies later) rather than
+    // queueing behind slow peers.
+    fn acquire_fetch_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.fetch.clone().try_acquire_owned().ok()
     }
 
     async fn acquire_validation_permit(&self) -> Result<ValidationPermit<'_>, NodeError> {
@@ -8451,18 +8473,9 @@ impl Node {
             self.validation_cache.remove(&block_hash);
         }
 
-        let _permit = match tokio::time::timeout(
-            Duration::from_millis(500),
-            self.validation_pool.acquire_validation_permit(),
-        )
-        .await
-        {
-            Ok(permit) => permit?,
-            Err(_) => {
-                return Ok(false);
-            }
-        };
-
+        // Cheap structural checks run before any validation permit or fetch, so a garbage block
+        // (bad hash / sub-floor PoW / over the tx-count limit) costs nothing scarce to reject.
+        //
         // A block's CLAIMED hash (block.hash, attacker-controlled off the wire) must equal its COMPUTED
         // hash. If it lies, reject it WITHOUT negative-caching — the cache is keyed by the claimed hash,
         // so caching a false verdict under an attacker-chosen hash would let a garbage block suppress the
@@ -8483,14 +8496,34 @@ impl Node {
             return Ok(false);
         }
 
+        // A block exceeding the ledger's transaction-count limit is already invalid; rejecting it
+        // here, before any witness resolution runs, uses the same bound validate_block enforces.
+        if !Self::witness_count_within_limit(block.transactions.len()) {
+            return Ok(false);
+        }
+        // ---- Phase 1: resolve every transaction's witness. This is the network-bound phase and it
+        // holds NO validation permit, so a peer that answers witness fetches slowly can never occupy
+        // the scarce validation pool. Fetches draw from their own bounded pool inside
+        // resolve_full_tx_for_block; locally-resolvable blocks never contend at all. The deadline
+        // caps how long a single block may spend here.
+        let witness_deadline = Instant::now() + WITNESS_RESOLVE_DEADLINE;
+        let mut resolved: Vec<Transaction> = Vec::with_capacity(block.transactions.len());
+
         for tx in &block.transactions {
+            if Instant::now() >= witness_deadline {
+                return Ok(false);
+            }
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
             }
 
-            let mut full_tx = match self.resolve_full_tx_for_block(tx, peer).await? {
-                Some(tx) => tx,
-                None => return Ok(false),
+            // A witness we cannot resolve — missing, the fetch pool was saturated, or a transport
+            // error while fetching — means this block cannot be verified right now. Defer it
+            // (Ok(false), not negative-cached, re-verified later) rather than surfacing an error, so
+            // a transient hiccup on an honest block self-corrects and Phase 1 never returns Err.
+            let mut full_tx = match self.resolve_full_tx_for_block(tx, peer).await {
+                Ok(Some(tx)) => tx,
+                Ok(None) | Err(_) => return Ok(false),
             };
 
             if full_tx.get_tx_id() != tx.get_tx_id() {
@@ -8507,9 +8540,12 @@ impl Node {
 
             if full_tx.sig_hash.is_none() {
                 if let Some(sig_hex) = &full_tx.signature {
-                    let sig_bytes = hex::decode(sig_hex).map_err(|_| {
-                        NodeError::InvalidTransaction("Invalid signature bytes".into())
-                    })?;
+                    // A resolved witness whose signature is not valid hex cannot verify this block;
+                    // defer (Ok(false)) rather than propagate an error, keeping Phase 1 Err-free.
+                    let sig_bytes = match hex::decode(sig_hex) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(false),
+                    };
                     full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
                 }
             }
@@ -8520,14 +8556,40 @@ impl Node {
                 }
             }
 
+            resolved.push(full_tx);
+        }
+
+        // ---- Phase 2: hold a validation permit only for the CPU/lock-bound work — signature
+        // verification and validate_block. Because the permit is never held across a network fetch,
+        // an honest block acquires one promptly even while slow-fetch blocks are in flight.
+        let _permit = match tokio::time::timeout(
+            Duration::from_millis(500),
+            self.validation_pool.acquire_validation_permit(),
+        )
+        .await
+        {
+            Ok(permit) => permit?,
+            Err(_) => {
+                return Ok(false);
+            }
+        };
+
+        for full_tx in &resolved {
             let signature_ok = {
                 let blockchain = self.blockchain.read().await;
-                blockchain.verify_transaction_signature(&full_tx).is_ok()
+                blockchain.verify_transaction_signature(full_tx).is_ok()
             };
 
             if !signature_ok {
                 return Ok(false);
             }
+
+            // Signature verified — safe to memoize so a sibling or later block carrying the same
+            // transaction resolves it without another fetch. This is the only path that writes the
+            // witness cache, which is precisely what lets the read side trust a cached entry.
+            self.tx_witness_cache
+                .lock()
+                .put(full_tx.get_tx_id(), full_tx.clone());
         }
 
         let mut validation_result = {
@@ -8630,9 +8692,9 @@ impl Node {
         peer: Option<SocketAddr>,
     ) -> Result<Option<Transaction>, NodeError> {
         let tx_id = tx.get_tx_id();
-        // Defense-in-depth: only trust a cached witness whose id matches its key. An entry that doesn't
-        // (a bogus TxResponse poison) is dropped so resolution falls through to the block's own
-        // signature / mempool / peer fetch instead of censoring a valid block. Done under one lock.
+        // The cache holds only witnesses that already passed signature verification during block
+        // validation; as a belt-and-suspenders check a returned entry must still match its key, and a
+        // stray one is dropped so resolution falls through to the signature / mempool / peer path.
         let cached = {
             let mut cache = self.tx_witness_cache.lock();
             match cache.get(&tx_id).cloned() {
@@ -8650,7 +8712,6 @@ impl Node {
 
         if let Some(sig_hex) = &tx.signature {
             if !Self::is_signature_truncated(sig_hex) {
-                self.tx_witness_cache.lock().put(tx_id.clone(), tx.clone());
                 return Ok(Some(tx.clone()));
             }
         }
@@ -8664,22 +8725,19 @@ impl Node {
         {
             if let Some(sig_hex) = &mempool_tx.signature {
                 if !Self::is_signature_truncated(sig_hex) {
-                    self.tx_witness_cache
-                        .lock()
-                        .put(tx_id.clone(), mempool_tx.clone());
                     return Ok(Some(mempool_tx));
                 }
             }
         }
 
         if let Some(peer_addr) = peer {
-            let fetched = self.request_tx_witness(peer_addr, &tx_id).await?;
-            if let Some(ref full_tx) = fetched {
-                self.tx_witness_cache
-                    .lock()
-                    .put(tx_id.clone(), full_tx.clone());
-            }
-            return Ok(fetched);
+            // Bound concurrent outbound fetches on their own pool; if it is saturated, report the
+            // witness as unresolved so the block defers instead of piling up behind slow peers.
+            let _fetch_slot = match self.validation_pool.acquire_fetch_slot() {
+                Some(slot) => slot,
+                None => return Ok(None),
+            };
+            return self.request_tx_witness(peer_addr, &tx_id).await;
         }
 
         Ok(None)
@@ -8690,6 +8748,13 @@ impl Node {
             Ok(bytes) => bytes.len() <= 64,
             Err(_) => true,
         }
+    }
+
+    // Witness resolution is bounded to the same transaction count validate_block permits, so it
+    // never runs over a list larger than a valid block could carry. Because both sites use the
+    // identical limit, a node with this check accepts/rejects by count exactly as one without it.
+    fn witness_count_within_limit(tx_count: usize) -> bool {
+        tx_count <= MAX_BLOCK_TX_COUNT
     }
 
     async fn request_tx_witness(
@@ -9221,17 +9286,9 @@ impl Node {
             }
 
             NetworkMessage::TxResponse { tx_id, tx } => {
-                if let Some(ref full_tx) = tx {
-                    // Only cache a witness whose id actually matches its key. An unsolicited/bogus
-                    // TxResponse{tx_id:T, tx:<mismatched>} must NOT poison the witness cache — otherwise
-                    // it would censor every valid block carrying tx T (resolve_full_tx_for_block reads
-                    // this cache first). Downstream still verifies the signature, so this is liveness-only
-                    // defense, but it closes a low-cost targeted valid-block censorship on all paths.
-                    if full_tx.get_tx_id() == tx_id {
-                        self.tx_witness_cache.lock().put(tx_id.clone(), full_tx.clone());
-                    }
-                }
-
+                // A response is only handed to the request waiting for it (below). The witness cache
+                // is written solely after a signature verifies during block validation, so an
+                // unsolicited or mismatched response is neither trusted nor cached here.
                 let sender = {
                     let mut channels = self.tx_response_channels.write().await;
                     channels.remove(&tx_id)
@@ -11468,6 +11525,62 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
+    // a block over the limit is invalid on every node, and a block at/under it is resolved
+    // normally. Sharing MAX_BLOCK_TX_COUNT is what guarantees a node carrying this pre-check
+    // reaches the same accept/reject-by-count verdict as one without it — no rollout divergence.
+    #[test]
+    fn witness_count_within_limit_matches_ledger_boundary() {
+        assert!(Node::witness_count_within_limit(0));
+        assert!(Node::witness_count_within_limit(1));
+        assert!(Node::witness_count_within_limit(MAX_BLOCK_TX_COUNT)); // full valid block: ok
+        assert!(!Node::witness_count_within_limit(MAX_BLOCK_TX_COUNT + 1)); // over the limit: rejected
+        // The pre-check bound is the ledger bound, not an independent number.
+        assert_eq!(MAX_BLOCK_TX_COUNT, crate::a9::blockchain::MAX_BLOCK_TX_COUNT);
+    }
+
+    // The per-block witness-resolve deadline has to clear a comfortable multiple of a single
+    // fetch's timeout so an honest block (which needs at most a few fetches, each capped at that
+    // timeout) never trips it and gets deferred, while staying finite so resolution over a block
+    // whose witnesses only a slow peer can supply cannot run unbounded.
+    #[test]
+    fn witness_resolve_deadline_leaves_honest_headroom_yet_stays_bounded() {
+        let per_fetch = Duration::from_secs(3); // request_tx_witness per-request timeout
+        assert!(
+            WITNESS_RESOLVE_DEADLINE >= per_fetch * 8,
+            "deadline too tight — an honest block with a few slow fetches could be deferred"
+        );
+        assert!(
+            WITNESS_RESOLVE_DEADLINE <= Duration::from_secs(120),
+            "deadline too loose to bound resolution work"
+        );
+    }
+
+    // Outbound witness fetches draw from a bounded pool kept separate from validation permits, so a
+    // slow-responding peer can only ever contend with other fetches. The pool must cap concurrency
+    // and refuse (so a fetch-needing block defers) when saturated, then recover as slots release.
+    #[test]
+    fn witness_fetch_slots_are_bounded_and_recover() {
+        let pool = ValidationPool::new();
+        let mut held = Vec::new();
+        for _ in 0..MAX_PARALLEL_WITNESS_FETCHES {
+            let slot = pool.acquire_fetch_slot();
+            assert!(slot.is_some(), "a fetch slot must be available up to the pool size");
+            held.push(slot.unwrap());
+        }
+        // Saturated: refuse rather than queue behind slow peers (the caller defers the block).
+        assert!(
+            pool.acquire_fetch_slot().is_none(),
+            "a saturated fetch pool must refuse so a fetch-needing block defers"
+        );
+        // Releasing one slot frees capacity again.
+        held.pop();
+        assert!(
+            pool.acquire_fetch_slot().is_some(),
+            "releasing a fetch slot must free capacity"
+        );
+    }
 
     // Ghost-block guard: a node mines only when at/ahead of the best-known network
     // tip or within a same/next-height race; a node that KNOWS it is meaningfully
