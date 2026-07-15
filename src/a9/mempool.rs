@@ -429,6 +429,16 @@ impl Mempool {
     /// Try to free `required_space` bytes and/or `required_count` slots by evicting the
     /// lowest fee-per-byte transactions that are STRICTLY CHEAPER than `incoming_fee`.
     ///
+    /// This scans the pool (O(N)) to build the candidate heap. That is DELIBERATE — a
+    /// persistent fee-ordered index (O(log N) eviction) was considered and rejected: this only
+    /// runs when the pool is already pegged at the FIXED 50k / 50MB cap, so N is a bounded
+    /// constant (one O(50k) scan, sub-millisecond on any modern CPU) that does NOT grow as the
+    /// chain grows. And it only fires under sustained congestion (inflow above the ~400 tx/s
+    /// block-drain rate), where block throughput — not this eviction — is the actual bottleneck.
+    /// So the incremental index would save a negligible amount of CPU exactly when CPU isn't the
+    /// limit, in exchange for maintaining another structure in lockstep with `transactions` on
+    /// every add/evict/prune/clear (a real correctness hazard). Not worth it; leave the scan.
+    ///
     /// All-or-nothing: if the strictly-cheaper transactions cannot free enough, nothing is
     /// evicted and this returns `false` (the caller then rejects the incoming transaction).
     /// Two invariants this preserves:
