@@ -1428,20 +1428,23 @@ impl BPoSSentinel {
     async fn verify_block_at_height(&self, height: u32) -> Result<bool, String> {
         const BATCH_SIZE: usize = 50;
 
-        let blockchain = self.blockchain.read().await;
-        let mut blocks_to_verify = Vec::with_capacity(BATCH_SIZE);
+        // Collect the target + context blocks (owned) and drop the read guard BEFORE the batch
+        // await, so no blockchain lock is held across verification.
+        let blocks_to_verify = {
+            let blockchain = self.blockchain.read().await;
+            let mut blocks_to_verify = Vec::with_capacity(BATCH_SIZE);
 
-        // Get the target block and context blocks
-        let target_block = blockchain.get_block(height)?;
-        blocks_to_verify.push(target_block.clone());
+            let target_block = blockchain.get_block(height)?;
+            blocks_to_verify.push(target_block.clone());
 
-        // Get some context blocks if available
-        let context_start = height.saturating_sub((BATCH_SIZE - 1) as u32);
-        for h in context_start..height {
-            if let Ok(block) = blockchain.get_block(h) {
-                blocks_to_verify.push(block);
+            let context_start = height.saturating_sub((BATCH_SIZE - 1) as u32);
+            for h in context_start..height {
+                if let Ok(block) = blockchain.get_block(h) {
+                    blocks_to_verify.push(block);
+                }
             }
-        }
+            blocks_to_verify
+        };
 
         // Run batch verification
         let results = self.verify_block_batch(&blocks_to_verify).await?;
@@ -1453,8 +1456,9 @@ impl BPoSSentinel {
     async fn verify_block_batch(&self, blocks: &[Block]) -> Result<Vec<bool>, String> {
         use rayon::prelude::*;
 
-        // Prepare validation context
-        let _blockchain = self.blockchain.read().await;
+        // No blockchain guard here: the parallel closure below reads only the passed `blocks` slice.
+        // Acquiring a read guard while a caller already holds one risks a reentrant self-deadlock on
+        // the write-preferring RwLock (a writer queued between the two reads parks the second read).
 
         // Convert blocks to validation tasks
         let validation_tasks: Vec<_> = blocks

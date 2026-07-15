@@ -336,14 +336,16 @@ impl Mempool {
     }
 
     pub fn find_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
-        for entry in self.transactions.iter() {
-            for tx in entry.value().iter() {
-                if tx.tx_id == tx_id {
-                    return Some(tx.transaction.clone());
-                }
-            }
-        }
-        None
+        // Resolve the sender via the O(1) tx_id -> sender locator, then scan only that sender's
+        // bounded bucket (<= MEMPOOL_MAX_PER_ADDRESS) instead of the entire pool. The sender is
+        // cloned so the locator guard is dropped before touching `transactions` (distinct maps).
+        let sender = self.tx_locator.get(tx_id)?.value().clone();
+        self.transactions
+            .get(&sender)?
+            .value()
+            .iter()
+            .find(|entry| entry.tx_id == tx_id)
+            .map(|entry| entry.transaction.clone())
     }
 
     /// Zero-cost emptiness probe (atomic counter read — no locks, no scan).
