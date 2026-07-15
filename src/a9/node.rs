@@ -232,6 +232,12 @@ const PEX_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// non-convergence — fast enough to unstick a wedged client, slow enough that a
 /// transient relay hiccup (which heals within a call or two) never trips it.
 const CONVERGE_STALL_ESCALATE_CALLS: u32 = 10;
+/// Minimum wall-clock spacing between converge-stall increments. converge_to_relay_tip evaluates up
+/// to MAX_TIP_CANDIDATES candidates within a single ~3-20s pass with an unchanged tip; without this
+/// gate every candidate would bump the counter, tripping escalation in ~2 passes instead of the
+/// intended ~0.5-3.5 minutes. Set just under the fastest caller cadence so distinct passes each
+/// count once while a within-pass candidate burst counts once.
+const CONVERGE_STALL_MIN_INTERVAL_MS: u64 = 2_500;
 
 // ===== Chain re-bootstrap coordination (single source; main.rs boot logic and
 // the runtime paths in this module both use these) =====
@@ -1030,6 +1036,9 @@ pub struct Node {
     cached_external_ip: Arc<RwLock<Option<(IpAddr, u64)>>>,
     /// Tip observed at the previous converge_to_canonical call (stall watchdog).
     converge_stall_tip: Arc<AtomicU64>,
+    /// Unix-millis of the last counted converge-stall increment; gates increments to at most one per
+    /// CONVERGE_STALL_MIN_INTERVAL_MS so a per-pass candidate burst counts once (see that const).
+    converge_stall_last_ms: Arc<AtomicU64>,
     /// Consecutive zero-progress converge calls while > reorg-margin behind a
     /// fresh beacon; escalates to NeedsBootstrap at CONVERGE_STALL_ESCALATE_CALLS.
     converge_stall_cycles: Arc<AtomicU64>,
@@ -1169,6 +1178,9 @@ struct ExplorerState {
     // per-sender mempool rate limit is the real guard; this only blunts a flood
     // of junk that would fail validation, keeping it off the mempool lock.
     submit_bucket: Arc<PLMutex<(Instant, f64)>>,
+    // Coarse per-process token bucket for the O(chain) explorer READ endpoints (address summary,
+    // supply): a node-side flood guard for the opt-in explorer, independent of any upstream proxy.
+    read_bucket: Arc<PLMutex<(Instant, f64)>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1372,6 +1384,7 @@ impl Node {
             announce_reject_streak: Arc::new(AtomicU64::new(0)),
             cached_external_ip: Arc::new(RwLock::new(None)),
             converge_stall_tip: Arc::new(AtomicU64::new(0)),
+            converge_stall_last_ms: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
@@ -3173,20 +3186,43 @@ impl Node {
                 .converge_stall_tip
                 .swap(entry_tip as u64, Ordering::AcqRel) as u32;
             let prev_cycles = self.converge_stall_cycles.load(Ordering::Acquire);
-            let (cycles, escalate) =
-                Self::converge_stall_verdict(last_tip, entry_tip, gap, prev_cycles);
-            self.converge_stall_cycles.store(cycles, Ordering::Release);
-            if escalate {
-                // Deliberately DO NOT reset the counter: escalation must PERSIST
-                // across calls while the stall lasts, or the caller's 2-consecutive-
-                // strike marker machinery never fires (an interleaved BeaconStale
-                // between two escalations 10 calls apart resets its strikes — the
-                // review's alternation starvation). Progress resets the counter.
-                warn!(
-                    "Converge made no progress for {} consecutive calls at tip {} with beacon {} ({} behind); escalating to re-bootstrap",
-                    prev_cycles.saturating_add(1), entry_tip, beacon.height, gap
-                );
-                return Converge::NeedsBootstrap;
+            let cycles = Self::converge_stall_verdict(last_tip, entry_tip, gap, prev_cycles).0;
+
+            if cycles == 0 {
+                // Progress (tip advanced) or a within-margin gap: reset immediately, always.
+                self.converge_stall_cycles.store(0, Ordering::Release);
+            } else {
+                // Zero-progress stall. Throttle COUNTING to at most once per
+                // CONVERGE_STALL_MIN_INTERVAL_MS so a candidate burst within one converge_to_relay_tip
+                // pass counts once (not once per candidate), restoring the intended ~0.5-3.5 minute
+                // horizon. Escalation itself is NEVER throttled: once the persisted counter reaches
+                // the threshold, every stalled call must return NeedsBootstrap, or a gated candidate
+                // in an aggregating pass would starve the caller's 2-strike re-bootstrap machinery.
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let last_ms = self.converge_stall_last_ms.load(Ordering::Acquire);
+                // saturating_sub reads a backward wall-clock step as 0 elapsed; treat now < last as
+                // "interval elapsed" so a clock regression can never stall this watchdog.
+                let interval_elapsed =
+                    now_ms < last_ms || now_ms - last_ms >= CONVERGE_STALL_MIN_INTERVAL_MS;
+                let effective = if interval_elapsed {
+                    self.converge_stall_last_ms.store(now_ms, Ordering::Release);
+                    self.converge_stall_cycles.store(cycles, Ordering::Release);
+                    cycles
+                } else {
+                    // Within the cadence window: do not count this candidate, but read the persisted
+                    // counter so an already-reached threshold still escalates.
+                    self.converge_stall_cycles.load(Ordering::Acquire)
+                };
+                if effective >= CONVERGE_STALL_ESCALATE_CALLS as u64 {
+                    warn!(
+                        "Converge made no progress for {} consecutive ticks at tip {} with beacon {} ({} behind); escalating to re-bootstrap",
+                        effective, entry_tip, beacon.height, gap
+                    );
+                    return Converge::NeedsBootstrap;
+                }
             }
         }
         for _ in 0..MAX_ROUNDS {
@@ -5379,11 +5415,28 @@ impl Node {
         )
     }
 
+    // Consume one token from the coarse explorer read bucket (refill 10/s, cap 30). Returns false
+    // when exhausted, so an unauthenticated flood is answered 429 before any O(chain) scan runs.
+    fn allow_explorer_read(state: &ExplorerState) -> bool {
+        let mut b = state.read_bucket.lock();
+        let now = Instant::now();
+        b.1 = (b.1 + now.duration_since(b.0).as_secs_f64() * 10.0).min(30.0);
+        b.0 = now;
+        if b.1 < 1.0 {
+            return false;
+        }
+        b.1 -= 1.0;
+        true
+    }
+
     async fn explorer_address_handler(
         State(state): State<ExplorerState>,
         AxumPath(address): AxumPath<String>,
         Query(query): Query<ExplorerAddressQuery>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         if !Self::explorer_valid_address(&address) {
             return Self::explorer_err(StatusCode::BAD_REQUEST, "invalid address");
         }
@@ -5443,6 +5496,9 @@ impl Node {
     async fn explorer_supply_handler(
         State(state): State<ExplorerState>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -5579,6 +5635,7 @@ impl Node {
             start_time: self.start_time,
             network_id: self.network_id,
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
+            read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
         };
 
         let app = Router::new()
@@ -9229,28 +9286,27 @@ impl Node {
 
     async fn handle_peer_message(
         &self,
-        data: &[u8],
+        message: NetworkMessage,
+        raw: &[u8],
         addr: SocketAddr,
         tx: &mpsc::Sender<NetworkEvent>,
     ) -> Result<Option<NetworkMessage>, NodeError> {
-        if data.len() > MAX_MESSAGE_SIZE {
+        // `raw` is the codec-framed plaintext the message was decoded from (equal to
+        // codec::serialize(&message)); the caller already decoded it, so there is no re-deserialize.
+        if raw.len() > MAX_MESSAGE_SIZE {
             self.record_peer_failure(addr).await;
             return Err(NodeError::Network("Message too large".into()));
         }
 
-        // Deserialize message
-        let message: NetworkMessage = match codec::deserialize(data) {
-            Ok(msg) => msg,
-            Err(_) => {
-                self.record_peer_failure(addr).await;
-                return Err(NodeError::Network("Invalid message format".into()));
-            }
-        };
-
         // Deduplicate gossip only. Requests/responses must always be processed, otherwise one
-        // peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request.
+        // peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request. Hash the
+        // CANONICAL re-serialization rather than the wire bytes: MessagePack decoding is not
+        // injective, so a hostile peer could otherwise re-encode the same message many ways to slip
+        // every copy past the bloom. Only gossip messages pay this (requests/responses skip it).
         if Self::should_dedup_message(&message) {
-            let message_hash = blake3::hash(data);
+            let canonical = codec::serialize(&message)
+                .map_err(|_| NodeError::Network("Failed to serialize message".into()))?;
+            let message_hash = blake3::hash(&canonical);
             if !self.network_bloom.insert(message_hash.as_bytes()) {
                 return Ok(None);
             }
@@ -10422,9 +10478,9 @@ impl Node {
 
                     // Enforce authenticated transport after a successful handshake.
                     // Any decrypt failure or missing secret is treated as a protocol violation.
-                    let message: NetworkMessage =
-                        match self.decrypt_message(data_to_process, &shared_secret) {
-                            Ok(data) => data,
+                    let (message, plaintext) =
+                        match self.decrypt_message_with_plaintext(data_to_process, &shared_secret) {
+                            Ok(pair) => pair,
                             Err(e) => {
                                 warn!("Decryption failed from {}: {}", peer_addr, e);
                                 self.record_peer_failure(peer_addr).await;
@@ -10432,12 +10488,10 @@ impl Node {
                             }
                         };
 
-                    // Serialize the message for handle_peer_message dedup/rate tracking.
-                    let serialized_message = codec::serialize(&message)?;
-
-                    // Process message
+                    // Process message; the plaintext bytes carry the dedup/length checks (no
+                    // re-serialize, no second deserialize).
                     let response = match self
-                        .handle_peer_message(&serialized_message, peer_addr, &tx)
+                        .handle_peer_message(message, &plaintext, peer_addr, &tx)
                         .await
                     {
                         Ok(response) => response,
@@ -11458,6 +11512,20 @@ impl Node {
         encrypted: &[u8],
         shared_secret: &[u8],
     ) -> Result<NetworkMessage, NodeError> {
+        Ok(self
+            .decrypt_message_with_plaintext(encrypted, shared_secret)?
+            .0)
+    }
+
+    // Decrypt AND return the codec-framed plaintext alongside the decoded message, so the caller can
+    // length-check and dedup-hash the plaintext instead of re-serializing the message. rmp_serde is
+    // canonical and deserialize rejects trailing bytes, so the plaintext equals
+    // codec::serialize(&message) byte-for-byte — the checks are unchanged.
+    fn decrypt_message_with_plaintext(
+        &self,
+        encrypted: &[u8],
+        shared_secret: &[u8],
+    ) -> Result<(NetworkMessage, Vec<u8>), NodeError> {
         if encrypted.len() < 12 + 16 {
             // Nonce + min ciphertext + auth tag
             return Err(NodeError::Network("Invalid encrypted message".into()));
@@ -11481,8 +11549,9 @@ impl Node {
             .open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out)
             .map_err(|_| NodeError::Network("Decryption failed".into()))?;
 
-        // Deserialize message
-        Ok(codec::deserialize(decrypted)?)
+        // Deserialize message, then hand back the plaintext bytes too.
+        let message = codec::deserialize(decrypted)?;
+        Ok((message, decrypted.to_vec()))
     }
 
     // Method to derive shared secret for secure communication

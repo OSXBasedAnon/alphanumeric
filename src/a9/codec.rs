@@ -19,11 +19,13 @@ pub enum CodecError {
 }
 
 pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CodecError> {
-    let payload = rmp_serde::to_vec(value)?;
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+    // Serialize directly into the output buffer after the envelope header, avoiding a separate
+    // payload Vec plus a full-payload memcpy. rmp_serde::encode::write drives the same default
+    // Serializer that to_vec uses, so the encoded bytes are byte-for-byte identical.
+    let mut out = Vec::with_capacity(HEADER_LEN + 64);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&payload);
+    rmp_serde::encode::write(&mut out, value)?;
     Ok(out)
 }
 

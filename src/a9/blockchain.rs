@@ -939,20 +939,32 @@ impl RateLimiter {
                 .retain(|_, v| v.last().is_some_and(|&t| t >= cutoff));
         }
 
+        // Fast path: an existing key admits/rejects with no owned-String allocation.
+        if let Some(mut times) = self.windows.get_mut(address) {
+            return Self::admit_in_window(times.value_mut(), now, cutoff, self.max_requests);
+        }
+        // First in-window request for this key: allocate the key once. (entry may observe a value
+        // another thread just inserted, so run the same window logic rather than assuming empty.)
         let mut times = self.windows.entry(address.to_string()).or_default();
+        Self::admit_in_window(times.value_mut(), now, cutoff, self.max_requests)
+    }
 
-        // Fast path: check if we need to cleanup at all
+    fn admit_in_window(
+        times: &mut Vec<tokio::time::Instant>,
+        now: tokio::time::Instant,
+        cutoff: tokio::time::Instant,
+        max_requests: usize,
+    ) -> bool {
+        // Drop entries that have aged out of the window (the first valid index onward is kept).
         if !times.is_empty() && times[0] < cutoff {
-            // Binary search to find first valid entry
             let first_valid = times
                 .iter()
                 .position(|&t| t >= cutoff)
                 .unwrap_or(times.len());
-            // Efficiently remove old entries by draining
             times.drain(0..first_valid);
         }
 
-        if times.len() >= self.max_requests {
+        if times.len() >= max_requests {
             return false;
         }
 
@@ -1029,6 +1041,17 @@ pub struct Blockchain {
     /// never held while acquiring the state lock.
     balances_index_gate: Arc<Mutex<()>>,
     tip_change_counter: Arc<AtomicU64>,
+    /// In-memory memo of the validated chain tip, keyed by `tip_change_counter`. Every tip change
+    /// bumps that counter (persist pairs write_chain_tip_metadata with notify_tip_changed; finalize
+    /// and reorg notify too), so a cached entry is valid exactly while the counter is unchanged.
+    /// This lets the very hot get_latest_block_index / get_last_block path skip re-reading and fully
+    /// deserializing the tip block on every call; a version mismatch falls back to the validated
+    /// current_chain_tip_metadata, so results are identical to the uncached path.
+    chain_tip_cache: Arc<PLMutex<Option<(u64, ChainTipMetadata)>>>,
+    /// In-memory memo of total confirmed supply, keyed by `tip_change_counter`. Supply changes only
+    /// when a block is applied (which bumps the counter), so the opt-in /explorer/supply endpoint can
+    /// reuse the last full balances-tree scan within a tip while it stays unchanged.
+    supply_cache: Arc<PLMutex<Option<(u64, i128)>>>,
     tip_watch_tx: watch::Sender<ChainTipSignal>,
     /// (G) In-memory memo of reorg branches deferred by the S-01 frontier
     /// signature gate: a branch that is genuinely heavier but whose above-floor
@@ -1127,11 +1150,27 @@ impl Blockchain {
     }
 
     fn highest_block_index(&self) -> Option<u32> {
-        self.current_chain_tip_metadata()
-            .ok()
-            .flatten()
-            .map(|tip| tip.height)
-            .or_else(|| self.highest_block_index_scan())
+        let version = self.tip_change_counter.load(Ordering::Acquire);
+        // Fast path: the memoized tip is valid while the tip-change counter is unchanged. The Option
+        // is Copy, so this copies out and drops the guard immediately (no lock across the slow path).
+        let cached = *self.chain_tip_cache.lock();
+        if let Some((cached_version, tip)) = cached {
+            if cached_version == version {
+                return Some(tip.height);
+            }
+        }
+        // Slow path: validate against storage exactly as the uncached code did, then memoize under
+        // this version so the ~2K same-version reads per applied block skip the full tip-block parse.
+        match self.current_chain_tip_metadata() {
+            Ok(Some(tip)) => {
+                *self.chain_tip_cache.lock() = Some((version, tip));
+                Some(tip.height)
+            }
+            _ => {
+                *self.chain_tip_cache.lock() = None;
+                self.highest_block_index_scan()
+            }
+        }
     }
 
     fn now_unix_secs() -> u64 {
@@ -1371,16 +1410,26 @@ impl Blockchain {
             hash: block.hash,
         };
         meta_tree.insert(CHAIN_TIP_KEY, codec::serialize(&tip)?)?;
+        // Invalidate the in-memory memos the moment the persisted tip changes — before the caller's
+        // fallible flushes / notify_tip_changed — so a flush error between here and the counter bump
+        // can never leave a reader serving a tip staler than storage.
+        *self.chain_tip_cache.lock() = None;
+        *self.supply_cache.lock() = None;
         Ok(())
     }
 
     fn clear_chain_tip_metadata(&self) -> Result<(), BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
         meta_tree.remove(CHAIN_TIP_KEY)?;
+        *self.chain_tip_cache.lock() = None;
+        *self.supply_cache.lock() = None;
         Ok(())
     }
 
     fn rebuild_chain_tip_metadata(&self) -> Result<Option<ChainTipMetadata>, BlockchainError> {
+        // A rebuild replaces the persisted tip; drop the in-memory memo so the next read re-validates
+        // (defensive — rebuild is normally reached only through the validating read path or startup).
+        *self.chain_tip_cache.lock() = None;
         let Some(height) = self.highest_block_index_scan() else {
             self.clear_chain_tip_metadata()?;
             return Ok(None);
@@ -2137,6 +2186,15 @@ impl Blockchain {
     /// which double-counted transfers (a mined 50 sent onward counted as 100) and
     /// decoded the entire chain to do it. One cheap tree scan, no block loads.
     pub fn total_confirmed_supply_units(&self) -> Result<i128, BlockchainError> {
+        // Supply changes only when a block is applied (which bumps tip_change_counter); reuse the
+        // last full scan while the tip is unchanged instead of walking the whole balances tree per
+        // request. Falls through to a fresh scan on any tip change.
+        let version = self.tip_change_counter.load(Ordering::Acquire);
+        if let Some((cached_version, supply)) = *self.supply_cache.lock() {
+            if cached_version == version {
+                return Ok(supply);
+            }
+        }
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         let mut total: i128 = 0;
         for item in balances_tree.iter() {
@@ -2155,6 +2213,7 @@ impl Blockchain {
                 }
             }
         }
+        *self.supply_cache.lock() = Some((version, total));
         Ok(total)
     }
 
@@ -2433,8 +2492,11 @@ impl Blockchain {
     }
 
     fn to_storage_block(block: &Block) -> Block {
-        let mut storage_block = block.clone();
-        storage_block.transactions = block
+        // Build the storage tx vector directly (no whole-block clone whose tx vector is discarded).
+        // When a sig_hash is present the truncated tx is produced straight off the borrow (one
+        // allocation); only the derive-from-signature branch needs to compute the hash first.
+        // Byte-identical to the prior clone-then-truncate path.
+        let transactions = block
             .transactions
             .iter()
             .map(|tx| {
@@ -2442,22 +2504,32 @@ impl Blockchain {
                     return tx.clone();
                 }
 
-                let mut full_tx = tx.clone();
-                if full_tx.sig_hash.is_none() {
-                    if let Some(sig_hex) = &full_tx.signature {
-                        if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                            full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
-                        }
-                    }
-                }
+                let sig_hash = match &tx.sig_hash {
+                    Some(h) => Some(h.clone()),
+                    None => tx.signature.as_ref().and_then(|sig_hex| {
+                        hex::decode(sig_hex)
+                            .ok()
+                            .map(|sig_bytes| Transaction::signature_hash_hex(&sig_bytes))
+                    }),
+                };
 
-                match &full_tx.sig_hash {
-                    Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
-                    None => full_tx,
+                match sig_hash {
+                    Some(sig_hash) => tx.with_truncated_signature(sig_hash),
+                    None => tx.clone(),
                 }
             })
             .collect();
-        storage_block
+
+        Block {
+            index: block.index,
+            previous_hash: block.previous_hash,
+            timestamp: block.timestamp,
+            transactions,
+            nonce: block.nonce,
+            difficulty: block.difficulty,
+            hash: block.hash,
+            merkle_root: block.merkle_root,
+        }
     }
 
     /// Adopt an externally-fetched competing branch (pulled from the gateway
@@ -3130,7 +3202,7 @@ impl Blockchain {
             SignatureValidationMode::AllowTruncatedStored => TransactionContext::ReceiptValidation,
         };
         if let Err(err) = self
-            .process_transactions_batch(block.transactions.clone(), tx_context, block.index as u64)
+            .process_transactions_batch(&block.transactions, tx_context, block.index as u64)
             .await
         {
             warn!(
@@ -3479,6 +3551,9 @@ impl Blockchain {
             balances_tree.apply_batch(batch)?;
         }
         balances_tree.flush()?;
+        // The index just advanced at the current tip; drop the supply memo (keyed by tip version)
+        // so /explorer/supply doesn't serve a pre-catch-up partial sum until the next block.
+        *self.supply_cache.lock() = None;
         Ok(())
     }
 
@@ -3568,6 +3643,9 @@ impl Blockchain {
         batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&covered_height)?);
         balances_tree.apply_batch(batch)?;
 
+        // The index was rebuilt fully current; drop the supply memo so /explorer/supply cannot keep
+        // serving a pre-rebuild partial sum. Covers every catch-up fallback and the direct rebuild.
+        *self.supply_cache.lock() = None;
         Ok(())
     }
 
@@ -3869,6 +3947,8 @@ impl Blockchain {
             state_mutation_lock: Arc::new(Mutex::new(())),
             balances_index_gate: Arc::new(Mutex::new(())),
             tip_change_counter,
+            chain_tip_cache: Arc::new(PLMutex::new(None)),
+            supply_cache: Arc::new(PLMutex::new(None)),
             tip_watch_tx,
             witness_blocked: Arc::new(PLMutex::new(HashMap::new())),
         };
@@ -4222,7 +4302,7 @@ impl Blockchain {
         // Process transactions atomically
         if let Err(err) = self
             .process_transactions_batch(
-                block.transactions.clone(),
+                &block.transactions,
                 TransactionContext::BlockValidation,
                 block.index as u64,
             )
@@ -5419,7 +5499,7 @@ impl Blockchain {
     // Add to handle distributions
     pub async fn process_transactions_batch(
         &self,
-        transactions: Vec<Transaction>,
+        transactions: &[Transaction],
         context: TransactionContext,
         confirm_height: u64,
     ) -> Result<(), BlockchainError> {
@@ -5439,7 +5519,7 @@ impl Blockchain {
         // back below), and the f64 round-trip drifts the stored ledger away from the
         // exact rebuild/catch-up paths above ~33.55M coins — a latent chain split
         // (2026-07-12 audit). Value-identical below that in the reachable range.
-        for tx in &transactions {
+        for tx in transactions {
             if tx.sender != "MINING_REWARDS" && !current_balances.contains_key(&tx.sender) {
                 let balance_units = self.get_confirmed_balance_units(&tx.sender).await?;
                 current_balances.insert(tx.sender.clone(), balance_units);
@@ -5459,8 +5539,13 @@ impl Blockchain {
         // so it nets out of spendable — a same-block spend of the fresh reward is blocked.
         // No-op below the activation height, so all pre-activation history applies unchanged.
         let mut immature_by_addr: HashMap<String, i128> = HashMap::new();
-        if (confirm_height as u32) >= MATURITY_ACTIVATION_HEIGHT {
-            for tx in &transactions {
+        // The overlay is consulted ONLY in the regular-sender branch below (the affordability check
+        // reads immature_by_addr.get(&tx.sender)). A block whose senders are all MINING_REWARDS never
+        // reads it, so skip its ~MINING_REWARD_MATURITY stored-block deserializes entirely. This is
+        // consensus-identical: the map that would be built is never queried for such a block.
+        let has_regular_sender = transactions.iter().any(|tx| tx.sender != "MINING_REWARDS");
+        if has_regular_sender && (confirm_height as u32) >= MATURITY_ACTIVATION_HEIGHT {
+            for tx in transactions {
                 if tx.sender == "MINING_REWARDS" {
                     *immature_by_addr.entry(tx.recipient.clone()).or_default() += tx.amount_units;
                 }
@@ -5481,7 +5566,7 @@ impl Blockchain {
         }
 
         // Second pass: Validate and calculate changes
-        for tx in &transactions {
+        for tx in transactions {
             match tx.sender.as_str() {
                 "MINING_REWARDS" => {
                     *balance_changes.entry(tx.recipient.clone()).or_default() += tx.amount_units;
@@ -5538,7 +5623,7 @@ impl Blockchain {
         ) {
             let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
             let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
-            for tx in &transactions {
+            for tx in transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
                     // Retain the full witness for a bounded window (before purging the
@@ -5676,9 +5761,17 @@ impl Blockchain {
     /// a latent chain split on a large-balance payment (2026-07-12 audit).
     pub async fn get_confirmed_balance_units(&self, address: &str) -> Result<i128, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        let auto_rebuild = std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
+        // The auto-rebuild flag is fixed for the process lifetime; read the env once and cache it
+        // instead of taking the process-wide env lock + allocating a String on every balance read.
+        fn balances_auto_rebuild_enabled() -> bool {
+            static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *FLAG.get_or_init(|| {
+                std::env::var("ALPHANUMERIC_BALANCES_AUTO_REBUILD")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true)
+            })
+        }
+        let auto_rebuild = balances_auto_rebuild_enabled();
 
         let mut index_height = Self::get_balances_height(&balances_tree)?.unwrap_or(0);
         if auto_rebuild {
@@ -5806,24 +5899,29 @@ impl Blockchain {
         let mut current_level: Vec<[u8; 32]> = transactions
             .iter()
             .map(|tx| {
+                // Normalize to the stored (truncated-signature, sig_hash-bound) form. Derive the
+                // sig_hash only when absent and the signature decodes to non-empty bytes; when a
+                // sig_hash is available, truncate directly off the borrow. Byte-identical to the
+                // prior clone-then-truncate path (consensus merkle input must not change).
                 let tx_for_merkle = if tx.sender == "MINING_REWARDS" {
                     tx.clone()
                 } else {
-                    let mut full_tx = tx.clone();
-                    if full_tx.sig_hash.is_none() {
-                        if let Some(sig_hex) = &full_tx.signature {
-                            if let Ok(sig_bytes) = hex::decode(sig_hex) {
-                                if !sig_bytes.is_empty() {
-                                    full_tx.sig_hash =
-                                        Some(Transaction::signature_hash_hex(&sig_bytes));
+                    let sig_hash = match &tx.sig_hash {
+                        Some(h) => Some(h.clone()),
+                        None => tx.signature.as_ref().and_then(|sig_hex| {
+                            hex::decode(sig_hex).ok().and_then(|sig_bytes| {
+                                if sig_bytes.is_empty() {
+                                    None
+                                } else {
+                                    Some(Transaction::signature_hash_hex(&sig_bytes))
                                 }
-                            }
-                        }
-                    }
+                            })
+                        }),
+                    };
 
-                    match &full_tx.sig_hash {
-                        Some(sig_hash) => full_tx.with_truncated_signature(sig_hash.clone()),
-                        None => full_tx,
+                    match sig_hash {
+                        Some(sig_hash) => tx.with_truncated_signature(sig_hash),
+                        None => tx.clone(),
                     }
                 };
 
