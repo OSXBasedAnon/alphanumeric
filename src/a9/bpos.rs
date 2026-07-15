@@ -1,12 +1,11 @@
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
-use rand::{thread_rng, Rng};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
@@ -31,8 +30,6 @@ pub enum ActionType {
 const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
 const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
-#[allow(dead_code)]
-const SENTINEL_VERIFY_INTERVAL: u64 = 300; // 5 minute verification cycle
 const MLDSA_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_MLDSA87_BIND_V2";
 
 pub fn build_mldsa_binding_payload(node_id: &str, mldsa_public_key: &[u8]) -> Vec<u8> {
@@ -99,21 +96,6 @@ impl ValidatorTier {
 }
 
 #[derive(Debug)]
-struct NodeSentinel {
-    secret_key: Vec<u8>,
-    last_challenge: u64,
-    verified_peers: HashSet<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SentinelChallenge {
-    timestamp: u64,
-    nonce: [u8; 32],
-    header_hash: [u8; 32],
-    signature: Vec<u8>,
-}
-
-#[derive(Debug)]
 pub struct BPoSSentinel {
     blockchain: Arc<RwLock<Blockchain>>,
     node: Arc<Node>,
@@ -125,8 +107,6 @@ pub struct BPoSSentinel {
     anomaly_detector: Arc<RwLock<AnomalyDetector>>,
     sync_manager: Arc<RwLock<SyncManager>>,
     last_anomaly_broadcast: Arc<RwLock<u64>>, // Rate limiting for anomaly broadcasts
-    node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
-    peer_sentinels: Arc<RwLock<DashMap<String, Vec<u8>>>>,
     verified_headers: VerifiedHeaderQueue,
     initialized: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -157,8 +137,6 @@ impl BPoSSentinel {
             })),
             sync_manager: Arc::new(RwLock::new(SyncManager {})),
             last_anomaly_broadcast: Arc::new(RwLock::new(0)),
-            node_sentinel: None,
-            peer_sentinels: Arc::new(RwLock::new(DashMap::new())),
             verified_headers: Arc::new(RwLock::new(VecDeque::new())),
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -332,20 +310,6 @@ impl BPoSSentinel {
         {
             let mut detector = self.anomaly_detector.write().await;
             detector.recent_anomalies.truncate(Self::MAX_ANOMALIES);
-        }
-
-        // Cleanup peer sentinels
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Handle sentinel and peer sentinel cleanup
-        if let Some(sentinel_lock) = &self.node_sentinel {
-            if let Ok(sentinel) = sentinel_lock.try_read() {
-                let peers = self.peer_sentinels.write().await;
-                peers.retain(|_, _| now - sentinel.last_challenge < 3600);
-            }
         }
 
         Ok(())
@@ -1232,33 +1196,6 @@ impl BPoSSentinel {
             .map_err(|e| e.to_string())
     }
 
-    async fn get_latest_verified_header(&self) -> Result<[u8; 32], String> {
-        let headers = self.verified_headers.read().await;
-        headers
-            .back()
-            .map(|(_, hash)| *hash)
-            .ok_or_else(|| "No verified headers".to_string())
-    }
-
-    async fn await_challenge_response(&self, addr: SocketAddr) -> Result<Vec<u8>, String> {
-        let timeout = Duration::from_secs(5);
-        let start = Instant::now();
-
-        while start.elapsed() < timeout {
-            if let Ok(response) = self.node.receive_message(addr).await {
-                match response {
-                    NetworkMessage::ChallengeResponse { signature, .. } => {
-                        return Ok(signature);
-                    }
-                    _ => continue,
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        Err("Challenge response timeout".to_string())
-    }
-
     async fn find_consensus_chain(
         &self,
         peer_blocks: Vec<Vec<Block>>,
@@ -1659,209 +1596,6 @@ impl BPoSSentinel {
             .ok_or_else(|| "No consensus block found".to_string())
     }
 
-    async fn initialize_sentinel(&mut self) -> Result<(), String> {
-        // Generate fresh mldsa keypair for this node instance
-        let (_public_key, secret_key) = mldsa::generate_keypair();
-
-        let sentinel = NodeSentinel {
-            secret_key,
-            last_challenge: 0,
-            verified_peers: HashSet::new(),
-        };
-
-        self.node_sentinel = Some(Arc::new(RwLock::new(sentinel)));
-
-        // Start sentinel monitoring tasks
-        self.start_sentinel_tasks();
-
-        info!("Quantum-resistant sentinel initialized");
-        Ok(())
-    }
-
-    fn start_sentinel_tasks(&self) {
-        let sentinel = self.clone();
-
-        // Spawn sentinel verification cycle
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(SENTINEL_VERIFY_INTERVAL));
-            loop {
-                interval.tick().await;
-                if let Err(e) = sentinel.verify_network_integrity().await {
-                    error!("Sentinel verification error: {}", e);
-                }
-            }
-        });
-
-        // Spawn header verification task
-        let sentinel = self.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(SENTINEL_VERIFY_INTERVAL / 2));
-            loop {
-                interval.tick().await;
-                if let Err(e) = sentinel.verify_network_integrity().await {
-                    error!("Header verification error: {}", e);
-                }
-            }
-        });
-    }
-
-    // Verify network integrity
-    pub async fn verify_network_integrity(&self) -> Result<(), String> {
-        // Snapshot-then-drop: this ran periodically holding the peers guard across
-        // challenge generation AND the whole network verification fan-out — a prime
-        // wedge/livelock source (2026-07-08 class: guard-across-network-io).
-        let peer_addrs: Vec<SocketAddr> = {
-            let peers = self.node.peers.read().await;
-            peers.keys().copied().collect()
-        };
-        let mut verifications = Vec::new();
-
-        // Generate and send challenges in parallel
-        for addr in peer_addrs {
-            let challenge = self
-                .generate_challenge()
-                .await
-                .map_err(|e| format!("Failed to generate challenge: {}", e))?;
-
-            verifications.push((addr, challenge));
-        }
-
-        // Clone the necessary data for each verification task
-        // Process verifications in parallel
-        let verification_results = futures::future::join_all(verifications.into_iter().map(
-            |(addr, challenge)| async move {
-                let sentinel = self.clone();
-                match sentinel.verify_peer_sentinel(addr, &challenge).await {
-                    Ok(_) => Ok(addr),
-                    Err(e) => {
-                        warn!("Peer sentinel verification failed {}: {}", addr, e);
-                        Err((addr, e))
-                    }
-                }
-            },
-        ))
-        .await;
-
-        // Handle failed verifications
-        let failed_peers: Vec<_> = verification_results
-            .into_iter()
-            .filter_map(|r| match r {
-                Err((addr, _)) => Some(addr),
-                _ => None,
-            })
-            .collect();
-
-        for addr in failed_peers {
-            self.handle_failed_verification(addr).await?;
-        }
-
-        // Update network health metrics
-        let mut health = self.network_health.write().await;
-        health.last_update = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        Ok(())
-    }
-
-    async fn generate_challenge(&self) -> Result<SentinelChallenge, String> {
-        if let Some(sentinel) = &self.node_sentinel {
-            let sentinel = sentinel.write().await;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            // Generate random nonce
-            let mut nonce = [0u8; 32];
-            thread_rng().fill(&mut nonce);
-
-            // Get latest header hash
-            let header_hash = self.get_latest_verified_header().await?;
-
-            // Create challenge data
-            let mut challenge_data = Vec::with_capacity(48);
-            challenge_data.extend_from_slice(&now.to_le_bytes());
-            challenge_data.extend_from_slice(&nonce);
-            challenge_data.extend_from_slice(&header_hash);
-
-            // Sign with sentinel's mldsa key
-            let signature = mldsa::sign(&challenge_data, &sentinel.secret_key)?;
-
-            Ok(SentinelChallenge {
-                timestamp: now,
-                nonce,
-                header_hash,
-                signature,
-            })
-        } else {
-            Err("Sentinel not initialized".to_string())
-        }
-    }
-
-    async fn verify_peer_sentinel(
-        &self,
-        addr: SocketAddr,
-        challenge: &SentinelChallenge,
-    ) -> Result<(), String> {
-        let message = NetworkMessage::Challenge(
-            codec::serialize(challenge).map_err(|e| format!("Serialization error: {}", e))?,
-        );
-
-        self.node.send_message(addr, &message).await?;
-
-        if let Ok(response) = self.await_challenge_response(addr).await {
-            let peer_sentinels = self.peer_sentinels.read().await;
-            let peer_sentinel = peer_sentinels
-                .get(&addr.to_string())
-                .ok_or("Peer sentinel not registered")?;
-
-            let response_data = [
-                &challenge.timestamp.to_le_bytes(),
-                &challenge.nonce[..],
-                &response,
-            ]
-            .concat();
-
-            let verification_result =
-                mldsa::verify(&response_data, &response, peer_sentinel.as_slice());
-            if verification_result.is_ok() {
-                // ... rest of verification logic
-                Ok(())
-            } else {
-                Err("Invalid sentinel response".to_string())
-            }
-        } else {
-            Err("Peer challenge timeout".to_string())
-        }
-    }
-
-    async fn handle_failed_verification(&self, addr: SocketAddr) -> Result<(), String> {
-        if let Some(sentinel) = &self.node_sentinel {
-            let mut sentinel = sentinel.write().await;
-            sentinel.verified_peers.remove(&addr.to_string());
-        }
-
-        // Snapshot-then-drop: never hold the peers guard across sends.
-        let peer_addrs: Vec<SocketAddr> = {
-            let peers = self.node.peers.read().await;
-            peers.keys().copied().collect()
-        };
-        for peer_addr in peer_addrs {
-            if peer_addr != addr {
-                let alert = NetworkMessage::AlertMessage(format!(
-                    "SENTINEL_ALERT:{}:VERIFICATION_FAILED",
-                    addr
-                ));
-                if let Err(e) = self.node.send_message(peer_addr, &alert).await {
-                    warn!("Failed to send sentinel alert to {}: {}", peer_addr, e);
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2162,8 +1896,6 @@ impl Clone for BPoSSentinel {
             anomaly_detector: Arc::clone(&self.anomaly_detector),
             sync_manager: Arc::clone(&self.sync_manager),
             last_anomaly_broadcast: Arc::clone(&self.last_anomaly_broadcast),
-            node_sentinel: self.node_sentinel.clone(),
-            peer_sentinels: Arc::clone(&self.peer_sentinels),
             verified_headers: Arc::clone(&self.verified_headers),
             initialized: Arc::clone(&self.initialized),
         }
@@ -2227,12 +1959,8 @@ pub struct HeaderSentinel {
     sync_state: Arc<RwLock<NetworkSyncState>>,
     consensus_threshold: f64,
     max_headers: usize,
-    #[allow(dead_code)]
-    sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     public_key: Vec<u8>,
     secret_key: Vec<u8>,
-    #[allow(dead_code)]
-    node_sentinel: Option<Arc<RwLock<NodeSentinel>>>,
     header_rules_version: u32,
 }
 
@@ -2399,19 +2127,9 @@ impl HeaderSentinel {
             })),
             consensus_threshold: 0.67,
             max_headers: 10000,
-            sentinel: None,
             public_key,
             secret_key,
-            node_sentinel: None,
             header_rules_version: HEADER_RULES_VERSION,
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn get_sentinel(&self) -> Result<tokio::sync::RwLockReadGuard<'_, NodeSentinel>, String> {
-        match &self.sentinel {
-            Some(sentinel) => Ok(sentinel.read().await),
-            None => Err("Sentinel not initialized".to_string()),
         }
     }
 
@@ -2557,16 +2275,6 @@ impl HeaderSentinel {
         }
 
         Ok(valid_count)
-    }
-
-    #[allow(dead_code)]
-    async fn get_node_sentinel(
-        &self,
-    ) -> Result<tokio::sync::RwLockReadGuard<'_, NodeSentinel>, String> {
-        match &self.node_sentinel {
-            Some(sentinel) => Ok(sentinel.read().await),
-            None => Err("Node sentinel not initialized".to_string()),
-        }
     }
 
     pub async fn is_header_verified(&self, hash: &[u8; 32]) -> bool {
