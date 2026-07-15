@@ -139,7 +139,26 @@ impl Mempool {
             return Err(BlockchainError::InvalidTransaction);
         }
 
-        // Quick checks first
+        // Per-address rate limit FIRST — a transaction that will be rejected must never trigger
+        // eviction of another sender's transaction. Read the count in its own statement so
+        // the DashMap guard is dropped before any eviction below.
+        let at_address_cap = self
+            .address_counts
+            .get(&tx.sender)
+            .map(|c| *c >= MEMPOOL_MAX_PER_ADDRESS)
+            .unwrap_or(false);
+        if at_address_cap {
+            return Err(BlockchainError::RateLimitExceeded(
+                "Too many transactions from this address".into(),
+            ));
+        }
+
+        // Incoming fee-per-byte governs eviction: only strictly-cheaper residents are evictable,
+        // so a low-fee tx can never displace a higher-fee one.
+        let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
+
+        // If the pool is at capacity, try to make room by evicting only strictly-cheaper
+        // transactions — all-or-nothing. If that cannot free enough, reject WITHOUT evicting.
         let current_total_size = self.total_size.load(AtomicOrdering::SeqCst);
         let current_total_count = self.total_count.load(AtomicOrdering::SeqCst);
         let required_bytes = current_total_size
@@ -148,21 +167,13 @@ impl Mempool {
         let required_count = current_total_count
             .saturating_add(1)
             .saturating_sub(MEMPOOL_MAX_TRANSACTIONS);
-        if required_bytes > 0 || required_count > 0 {
-            self.evict_lowest_fee_transactions(required_bytes, required_count);
+        if (required_bytes > 0 || required_count > 0)
+            && !self.try_evict_below(required_bytes, required_count, fee_per_byte)
+        {
+            return Err(BlockchainError::RateLimitExceeded("Mempool is full".into()));
         }
 
-        // Rate limit check (cheap)
-        match self.address_counts.get(&tx.sender) {
-            Some(count) if *count >= MEMPOOL_MAX_PER_ADDRESS => {
-                return Err(BlockchainError::RateLimitExceeded(
-                    "Too many transactions from this address".into(),
-                ))
-            }
-            _ => {}
-        }
-
-        // Final size check after eviction
+        // Belt-and-suspenders: after a successful eviction plan there is room for the incoming tx.
         let final_size = self.total_size.load(AtomicOrdering::SeqCst) + tx_size;
         let final_count = self.total_count.load(AtomicOrdering::SeqCst) + 1;
         if final_size > MEMPOOL_MAX_BYTES || final_count > MEMPOOL_MAX_TRANSACTIONS {
@@ -171,7 +182,6 @@ impl Mempool {
 
         // Create entry
         let sender = tx.sender.clone();
-        let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
         let entry = MempoolEntry {
             transaction: tx,
             tx_id: tx_id.clone(),
@@ -423,44 +433,60 @@ impl Mempool {
         removed
     }
 
-    fn evict_lowest_fee_transactions(&mut self, required_space: usize, required_count: usize) {
+    /// Try to free `required_space` bytes and/or `required_count` slots by evicting the
+    /// lowest fee-per-byte transactions that are STRICTLY CHEAPER than `incoming_fee`.
+    ///
+    /// All-or-nothing: if the strictly-cheaper transactions cannot free enough, nothing is
+    /// evicted and this returns `false` (the caller then rejects the incoming transaction).
+    /// Two invariants this preserves:
+    ///  * eviction is a no-op for a transaction that is about to be rejected — the caller only
+    ///    invokes this after the incoming tx has passed the per-address cap, and here we
+    ///    plan-then-commit so a doomed incoming tx never destroys a resident.
+    ///  * a lower- or equal-fee incoming tx can never displace a higher-fee resident, because
+    ///    only entries with `fee_per_byte < incoming_fee` are eviction candidates.
+    fn try_evict_below(
+        &mut self,
+        required_space: usize,
+        required_count: usize,
+        incoming_fee: FeePerByte,
+    ) -> bool {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
-        let mut space_freed = 0;
-        let mut count_freed = 0;
-
-        // Use a min-heap to efficiently find lowest fee transactions across all senders
-        // Store (fee, timestamp, sender, size) - removed idx as it's not used
+        // Only transactions strictly cheaper than the incoming one are eviction candidates.
         let mut candidates = BinaryHeap::new();
-
         for entry in self.transactions.iter() {
             let sender = entry.key();
             for tx in entry.value().iter() {
-                candidates.push(Reverse((
-                    tx.fee_per_byte,
-                    tx.timestamp,
-                    sender.clone(),
-                    tx.tx_id.clone(),
-                    tx.size,
-                )));
+                if tx.fee_per_byte < incoming_fee {
+                    candidates.push(Reverse((
+                        tx.fee_per_byte,
+                        tx.timestamp,
+                        sender.clone(),
+                        tx.tx_id.clone(),
+                        tx.size,
+                    )));
+                }
             }
         }
 
-        // Evict lowest fee transactions until we have enough space
+        // Plan removals cheapest-first WITHOUT mutating anything; bail out (evicting nothing)
+        // the moment the strictly-cheaper set is exhausted before the requirement is met.
         let mut to_remove: HashMap<String, HashSet<String>> = HashMap::new();
-
+        let mut space_freed = 0usize;
+        let mut count_freed = 0usize;
         while space_freed < required_space || count_freed < required_count {
-            if let Some(Reverse((_, _timestamp, sender, tx_id, size))) = candidates.pop() {
-                to_remove.entry(sender).or_default().insert(tx_id);
-                space_freed += size;
-                count_freed += 1;
-            } else {
-                break;
+            match candidates.pop() {
+                Some(Reverse((_, _timestamp, sender, tx_id, size))) => {
+                    to_remove.entry(sender).or_default().insert(tx_id);
+                    space_freed += size;
+                    count_freed += 1;
+                }
+                None => return false,
             }
         }
 
-        // Batch removals
+        // Requirement is satisfiable — commit the planned removals.
         for (addr, tx_ids) in to_remove {
             // Compute removals under the transactions guard, then DROP it before
             // touching address_counts (never hold two DashMap guards; never remove a
@@ -494,6 +520,7 @@ impl Mempool {
                 self.tx_locator.remove(id);
             }
         }
+        true
     }
 }
 
@@ -689,5 +716,100 @@ mod tests {
         assert_eq!(heap.pop(), Some(mid));
         assert_eq!(heap.pop(), Some(low));
         assert_eq!(heap.pop(), None);
+    }
+
+    // Mempool admission does not verify signatures (that is the blockchain layer's job), so a
+    // bare unsigned tx is a faithful mempool input. Distinct timestamps => distinct tx_ids.
+    fn tx_with(sender: &str, ts: u64, amount: f64, fee: f64) -> Transaction {
+        Transaction::new(sender.to_string(), "recipient".to_string(), amount, fee, ts, None)
+    }
+
+    // M1: a transaction that is about to be rejected (sender at the per-address cap) must NOT
+    // evict another sender's resident. The cap check now precedes eviction.
+    #[test]
+    fn capped_sender_rejected_without_evicting_others() {
+        let mut mp = Mempool::new();
+        let victim = tx_with("senderB", 1, 1.0, 0.001); // low fee: the old code's eviction target
+        let victim_id = victim.get_tx_id();
+        mp.add_transaction(victim).expect("victim admitted");
+        for i in 0..MEMPOOL_MAX_PER_ADDRESS {
+            mp.add_transaction(tx_with("senderA", 1000 + i as u64, 1.0, 0.001))
+                .expect("filling sender A to its per-address cap");
+        }
+        // Simulate a globally-full pool so eviction WOULD run in the old order.
+        mp.total_count
+            .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
+        // Sender A is at its cap; this high-fee tx could have evicted the victim in the old order.
+        let res = mp.add_transaction(tx_with("senderA", 9999, 1.0, 100.0));
+        assert!(
+            matches!(res, Err(BlockchainError::RateLimitExceeded(_))),
+            "capped sender must be rejected, got {:?}",
+            res
+        );
+        assert!(
+            mp.find_transaction_by_id(&victim_id).is_some(),
+            "M1 regression: a doomed (cap-exceeded) tx evicted a resident"
+        );
+    }
+
+    // M2: a low-fee incoming tx cannot displace a higher-fee resident when the pool is full.
+    #[test]
+    fn low_fee_incoming_cannot_evict_higher_fee_resident() {
+        let mut mp = Mempool::new();
+        let high = tx_with("rich", 1, 1.0, 100.0);
+        let high_id = high.get_tx_id();
+        mp.add_transaction(high).expect("high-fee resident admitted");
+        mp.total_count
+            .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
+        let low = tx_with("poor", 2, 1.0, 0.001);
+        let low_id = low.get_tx_id();
+        let res = mp.add_transaction(low);
+        assert!(
+            matches!(res, Err(BlockchainError::RateLimitExceeded(_))),
+            "low-fee tx that cannot displace must be rejected, got {:?}",
+            res
+        );
+        assert!(
+            mp.find_transaction_by_id(&high_id).is_some(),
+            "M2 regression: higher-fee resident evicted by a cheaper tx"
+        );
+        assert!(mp.find_transaction_by_id(&low_id).is_none());
+    }
+
+    // M2 (positive): a high-fee incoming tx DOES displace a strictly-cheaper resident.
+    #[test]
+    fn high_fee_incoming_evicts_lower_fee_resident() {
+        let mut mp = Mempool::new();
+        let low = tx_with("poor", 1, 1.0, 0.001);
+        let low_id = low.get_tx_id();
+        mp.add_transaction(low).expect("low-fee resident admitted");
+        mp.total_count
+            .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
+        let high = tx_with("rich", 2, 1.0, 100.0);
+        let high_id = high.get_tx_id();
+        let res = mp.add_transaction(high);
+        assert!(res.is_ok(), "high-fee tx should displace a cheaper resident: {:?}", res);
+        assert!(mp.find_transaction_by_id(&high_id).is_some());
+        assert!(
+            mp.find_transaction_by_id(&low_id).is_none(),
+            "the strictly-cheaper resident should have been evicted"
+        );
+    }
+
+    // The eviction planner is all-or-nothing: if the strictly-cheaper set cannot satisfy the
+    // requirement, it evicts nothing and reports failure.
+    #[test]
+    fn try_evict_below_is_all_or_nothing() {
+        let mut mp = Mempool::new();
+        let only = tx_with("a", 1, 1.0, 0.001);
+        let only_id = only.get_tx_id();
+        mp.add_transaction(only).expect("resident admitted");
+        // Ask to free TWO slots with an incoming fee above everything; only one cheaper tx exists.
+        let freed = mp.try_evict_below(0, 2, FeePerByte(1_000_000.0));
+        assert!(!freed, "cannot free 2 slots from a single candidate");
+        assert!(
+            mp.find_transaction_by_id(&only_id).is_some(),
+            "all-or-nothing: nothing must be evicted on a failed plan"
+        );
     }
 }
