@@ -4637,56 +4637,6 @@ impl Blockchain {
         self.get_block(0)
     }
 
-    pub async fn calculate_wallet_balance(&self, address: &str) -> Result<f64, BlockchainError> {
-        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-
-        if let Some(balance_bytes) = balances_tree.get(address.as_bytes())? {
-            let units = Self::deserialize_units_compatible(&balance_bytes)?;
-            Ok(Transaction::from_units(units))
-        } else {
-            Ok(0.0)
-        }
-    }
-    // Validation
-    pub async fn validate_chain(&self) -> Result<bool, BlockchainError> {
-        let Some(tip) = self.highest_block_index() else {
-            return Ok(true);
-        };
-
-        // Stream one block at a time by height instead of materialising the whole
-        // chain into a Vec — peak RAM is O(1) regardless of chain length. Missing
-        // heights are skipped just as scan_prefix omits them, so a gap still surfaces
-        // as a previous_hash mismatch against the last block that did load.
-        let mut previous_block: Option<Block> = None;
-        for h in 0..=tip {
-            let Ok(current_block) = self.get_block(h) else {
-                continue;
-            };
-
-            if let Err(e) = self.validate_block(&current_block).await {
-                error!("Block validation failed: {:?}", e);
-                return Ok(false);
-            }
-
-            // Check if the current block's previous_hash matches the previous block's hash
-            if let Some(prev) = previous_block {
-                if current_block.previous_hash != prev.hash {
-                    error!(
-                        "Block hash mismatch: expected {:?}, got {:?}",
-                        prev.hash, current_block.previous_hash
-                    );
-                    return Ok(false);
-                }
-            }
-
-            // Set the current block as the previous block for the next iteration
-            previous_block = Some(current_block);
-        }
-
-        // If all blocks are validated successfully, return true
-        Ok(true)
-    }
-
     pub async fn validate_transaction(
         &self,
         tx: &Transaction,
@@ -4838,17 +4788,6 @@ impl Blockchain {
         }
 
         Ok(())
-    }
-
-    pub fn get_block_by_timestamp(&self, timestamp: u64) -> Result<Block, BlockchainError> {
-        for (_, block_data) in self.db.scan_prefix(b"block_").flatten() {
-            if let Ok(block) = Block::from_bytes(&block_data) {
-                if block.timestamp == timestamp {
-                    return Ok(block);
-                }
-            }
-        }
-        Err(BlockchainError::InvalidTransaction)
     }
 
     fn is_valid_hash_with_difficulty(&self, hash: &[u8; 32], difficulty: u64) -> bool {
@@ -5313,19 +5252,6 @@ impl Blockchain {
         self.mempool.write().await.add_transaction(tx)
     }
 
-    pub fn get_transaction_by_hash(&self, hash: &str) -> Option<Transaction> {
-        for (_, value) in self.db.scan_prefix(b"block_").flatten() {
-            if let Ok(block) = Block::from_bytes(&value) {
-                for tx in block.transactions {
-                    if tx.create_hash() == hash {
-                        return Some(tx);
-                    }
-                }
-            }
-        }
-        None
-    }
-
     pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
         const REDUCTION_RATE: f64 = 0.83; // 17% reduction = multiply by 0.83
@@ -5588,66 +5514,6 @@ impl Blockchain {
     }
 
     // Temporal Provenance with Causal Linking
-    pub async fn get_temporally_verified_balance(
-        &self,
-        address: &str,
-    ) -> Result<f64, BlockchainError> {
-        // ... (address decoding as before)
-
-        let blocks = self.get_blocks();
-        let mut balance_units: i128 = 0;
-        let mut causal_chain = Vec::new();
-
-        // Process blocks and build causal chain (as before)
-        for block in &blocks {
-            let hash = block.calculate_hash_for_block();
-            for tx in block.transactions.iter() {
-                if tx.sender == address || tx.recipient == address {
-                    causal_chain.push((tx.clone(), hash, block.index, block.timestamp));
-                }
-            }
-        }
-
-        causal_chain.sort_by_key(|entry| (entry.2, entry.3));
-
-        for entry in &causal_chain {
-            let tx = &entry.0;
-            if tx.sender == "MINING_REWARDS" && tx.recipient == address {
-                balance_units += tx.amount_units;
-            } else if tx.sender == address {
-                // Transactions in confirmed blocks are assumed validated at acceptance time.
-                // Do not re-check signatures here with sender address input.
-                balance_units -= tx.total_debit_units();
-            } else if tx.recipient == address {
-                balance_units += tx.amount_units;
-            }
-        }
-
-        // Handle pending transactions CORRECTLY
-        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        let mut pending_balances: HashMap<String, i128> = HashMap::new(); // Track pending balances
-
-        for (_, tx_bytes) in pending_tree.iter().flatten() {
-            if let Ok(tx) = deserialize_transaction(&tx_bytes) {
-                if tx.sender == address {
-                    let pending_spent = pending_balances.get(address).unwrap_or(&0);
-                    // Get current balance from confirmed transactions
-                    let current_balance = balance_units;
-                    let tx_debit = tx.total_debit_units();
-                    if current_balance + pending_spent < tx_debit {
-                        continue; // Skip double-spending transaction
-                    }
-                    balance_units -= tx_debit;
-                    *pending_balances.entry(address.to_string()).or_insert(0) -= tx_debit;
-                } else if tx.recipient == address {
-                    balance_units += tx.amount_units;
-                }
-            }
-        }
-
-        Ok(Transaction::from_units(balance_units))
-    }
-
     // Add to handle distributions
     pub async fn process_transactions_batch(
         &self,
@@ -7581,13 +7447,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
 
@@ -7648,13 +7514,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), 0.0, false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
                 .await
         });
 

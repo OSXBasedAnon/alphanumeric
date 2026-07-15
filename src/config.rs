@@ -70,8 +70,14 @@ impl NetworkConfig {
         let mut config = Self::default();
 
         if let Ok(port) = env::var("ALPHANUMERIC_PORT") {
-            if let Ok(port) = port.parse::<u16>() {
-                config.port = port;
+            match port.parse::<u16>() {
+                Ok(p) => config.port = p,
+                // Mirror BIND_IP below: warn loudly instead of silently swallowing a bad value,
+                // so an operator whose override was ignored actually finds out.
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_PORT='{}' is not a valid port; ignoring it and using {}.",
+                    port, config.port
+                ),
             }
         }
 
@@ -90,9 +96,15 @@ impl NetworkConfig {
         }
 
         if let Ok(max_peers) = env::var("ALPHANUMERIC_MAX_PEERS") {
-            if let Ok(max_peers) = max_peers.parse::<usize>() {
-                config.max_peers =
-                    Self::clamp_usize(max_peers, MIN_CONFIGURED_PEERS, MAX_CONFIGURED_PEERS);
+            match max_peers.parse::<usize>() {
+                Ok(n) => {
+                    config.max_peers =
+                        Self::clamp_usize(n, MIN_CONFIGURED_PEERS, MAX_CONFIGURED_PEERS)
+                }
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_MAX_PEERS='{}' is not a valid number; ignoring it and using {}.",
+                    max_peers, config.max_peers
+                ),
             }
         }
 

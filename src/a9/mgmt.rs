@@ -741,7 +741,6 @@ impl Mgmt {
                 &progpow_transactions,
                 MINING_NONCE_WINDOW,
                 miner_wallet.address.clone(),
-                mining_reward,
                 use_gpu,
                 stop,
             )
