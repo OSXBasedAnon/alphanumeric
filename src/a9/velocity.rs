@@ -209,11 +209,21 @@ impl ShredCache {
             }
         };
 
-        if shred.index as usize >= shreds.len() {
+        let slot = shred.index as usize;
+        if slot >= shreds.len() {
             return false;
         }
 
-        shreds[shred.index as usize] = Some(shred.clone());
+        // First-write-wins: create_shred_key mixes a nonce, so a peer resending the same
+        // (block_hash, index) with a different nonce clears the bloom check and would otherwise
+        // OVERWRITE an already-reconstructable slot with attacker-chosen bytes — a reconstruction
+        // poison. Honest re-sends of a given (block_hash, index) carry identical erasure-coded
+        // data, so refusing the overwrite is a no-op for them.
+        if shreds[slot].is_some() {
+            return false;
+        }
+
+        shreds[slot] = Some(shred.clone());
         self.bloom.add(&key);
         true
     }
@@ -548,7 +558,10 @@ impl VelocityManager {
                 .collect::<Vec<_>>();
 
             if !selected_peers.is_empty() {
-                let min_confirmations = (selected_peers.len() * 3) / 4;
+                // Require at least ONE real confirmation: for 1-3 peers integer (len*3)/4 == 0,
+                // so `successes >= 0` reported the fast path as successful even when zero sends
+                // landed — a silent propagation black hole. For len>=4 the value is unchanged.
+                let min_confirmations = ((selected_peers.len() * 3) / 4).max(1);
 
                 let futures: Vec<_> = selected_peers
                     .iter()
@@ -709,12 +722,20 @@ impl VelocityManager {
             indices,
             from,
         } = request;
+        // Dedup + cap the attacker-supplied indices before scanning the cache: there are only
+        // ERASURE_TOTAL_SHARD_COUNT slots per block, so 20 distinct indices is the most any
+        // legitimate request can need. This blocks a peer inflating the response by repeating one
+        // index many times (each repeat clones and ships a whole shred). Mirrors the
+        // anti-amplification cap already shipped on the sibling Range branch.
+        let mut idx: Vec<u32> = indices;
+        idx.sort_unstable();
+        idx.dedup();
+        idx.truncate(ERASURE_TOTAL_SHARD_COUNT);
         let available_shreds = {
             let cache = self.shred_cache.cache.lock();
             if let Some(shreds) = cache.peek(&block_hash) {
-                indices
-                    .iter()
-                    .filter_map(|&idx| shreds.get(idx as usize).and_then(|s| s.clone()))
+                idx.iter()
+                    .filter_map(|&i| shreds.get(i as usize).and_then(|s| s.clone()))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -1188,6 +1209,27 @@ mod tests {
 
         assert!(!cache.add_shred(shred));
         assert_eq!(cache.cache.lock().len(), 0);
+    }
+
+    // First-write-wins: a resend of the same (block_hash, index) with a different nonce clears
+    // the bloom (nonce is in the key) but must NOT overwrite an already-filled slot, or an
+    // attacker could poison reconstruction with chosen bytes.
+    #[test]
+    fn add_shred_is_first_write_wins_per_slot() {
+        let cache = ShredCache::new();
+        let bh = [9u8; 32];
+        let first = test_shred(bh, 0); // data = [1], nonce = 0
+        assert!(cache.add_shred(first.clone()));
+
+        let mut poison = test_shred(bh, 0);
+        poison.nonce = 999; // different key, passes the bloom
+        poison.data = vec![0xEE];
+        assert!(!cache.add_shred(poison), "a second shred for a filled slot is refused");
+
+        // The slot still holds the first shred's data, not the poison.
+        let guard = cache.cache.lock();
+        let slot = guard.peek(&bh).and_then(|s| s[0].clone()).expect("slot 0 present");
+        assert_eq!(slot.data, first.data, "the original shred must be retained");
     }
 
     #[test]
