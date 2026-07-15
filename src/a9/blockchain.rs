@@ -2615,6 +2615,24 @@ impl Blockchain {
     // re-verify/log storm with zero consensus surface); a witness-wedged node still
     // recovers via the escape-hatch re-bootstrap path (converge NeedsBootstrap -> marker).
 
+    /// Rehydrate a reverted transaction to its full-signature form from the retained
+    /// witness store. Returns None when this node never held (or has since pruned) the
+    /// full signature. Transactions read back from a stored block carry only a truncated
+    /// (<=64-byte) signature, which can never pass the full-signature gate, so a reverted
+    /// tx that cannot be rehydrated must be dropped rather than re-queued: re-added as-is
+    /// it would be re-selected into every block template the miner builds and rejected at
+    /// finalize, wasting a full proof-of-work grind per attempt until it ages out.
+    fn rehydrate_reverted_tx(&self, tx: &Transaction) -> Option<Transaction> {
+        let full = self.get_confirmed_witness_tx(&tx.get_tx_id())?;
+        let has_full_sig = full
+            .signature
+            .as_deref()
+            .and_then(|s| hex::decode(s).ok())
+            .map(|b| b.len() > 64)
+            .unwrap_or(false);
+        has_full_sig.then_some(full)
+    }
+
     async fn try_adopt_orphan_branch(&self) -> Result<bool, BlockchainError> {
         let Some(tip) = self.get_last_block() else {
             return Ok(false);
@@ -3025,9 +3043,14 @@ impl Blockchain {
         // re-selected into the next block template (mirrors the finalize/persist paths;
         // clear_transaction is a no-op for txs that were never in the local mempool).
         // Then return the reverted transactions the new branch did NOT re-confirm so
-        // they can be re-mined instead of being silently lost — add_transaction
-        // re-validates each against the new canonical state and drops any now invalid
-        // (e.g. spent by the winning branch).
+        // they can be re-mined instead of being silently lost. Stored blocks keep only
+        // truncated (<=64-byte) signatures, so the copies read from get_block above can
+        // never pass the full-signature gate — re-queued as-is they would poison every
+        // template the miner builds until they age out. Rehydrate each to its full
+        // signature from the retained witness store; drop (with a log) any whose full
+        // witness this node never held or the retention window has pruned. Re-queued via
+        // the Mempool method directly, never self.add_transaction — that re-takes the
+        // mutation lock (held across this whole reorg) and would deadlock.
         {
             let mut mempool = self.mempool.write().await;
             for b in &branch {
@@ -3036,7 +3059,17 @@ impl Blockchain {
                 }
             }
             for tx in reverted_txs {
-                let _ = mempool.add_transaction(tx);
+                match self.rehydrate_reverted_tx(&tx) {
+                    Some(full) => {
+                        let _ = mempool.add_transaction(full);
+                    }
+                    None => {
+                        debug!(
+                            "Reorg: dropping reverted tx {} — full signature unavailable (never held locally or pruned)",
+                            tx.get_tx_id()
+                        );
+                    }
+                }
             }
         }
 
@@ -6268,6 +6301,59 @@ mod tests {
         insert_at(5, "tiny_chain_tx");
         bc.prune_confirmed_witnesses(100).unwrap();
         assert!(bc.get_confirmed_witness_tx("tiny_chain_tx").is_some());
+    }
+
+    // A transaction reverted by a reorg must be re-queued with its FULL signature
+    // (pulled from the witness store, keyed on the signature-independent tx id), and
+    // dropped entirely when no full witness is available — a truncated copy could
+    // never be mined and would only poison the block template until it ages out.
+    #[test]
+    fn rehydrate_reverted_tx_restores_full_signature_or_drops() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+
+        // A reverted tx as read back from a stored block: identifying fields intact,
+        // but only a truncated signature survived storage.
+        let reverted = Transaction {
+            sender: "alice".to_string(),
+            recipient: "bob".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(2.0),
+            timestamp: 1_234,
+            signature: Some(hex::encode(vec![0u8; 32])),
+            pub_key: None,
+            sig_hash: None,
+        };
+
+        // No witness retained: nothing to rehydrate, so it is dropped.
+        assert!(bc.rehydrate_reverted_tx(&reverted).is_none());
+
+        // Retain the full-signature witness under the same (signature-independent) id.
+        let mut full = reverted.clone();
+        full.signature = Some(hex::encode(vec![7u8; 128]));
+        cw_tree
+            .insert(
+                reverted.get_tx_id().as_bytes(),
+                codec::serialize(&full).unwrap(),
+            )
+            .unwrap();
+        let got = bc
+            .rehydrate_reverted_tx(&reverted)
+            .expect("full witness present");
+        let sig = hex::decode(got.signature.unwrap()).unwrap();
+        assert!(sig.len() > 64, "rehydrated tx must carry the full signature");
+
+        // A witness whose own signature is truncated is treated as absent (it could
+        // not pass the full-signature gate either).
+        let mut truncated_witness = reverted.clone();
+        truncated_witness.signature = Some(hex::encode(vec![9u8; 40]));
+        cw_tree
+            .insert(
+                reverted.get_tx_id().as_bytes(),
+                codec::serialize(&truncated_witness).unwrap(),
+            )
+            .unwrap();
+        assert!(bc.rehydrate_reverted_tx(&reverted).is_none());
     }
 
     fn metadata_test_block(
