@@ -483,6 +483,15 @@ fn main() -> Result<()> {
     }
 }
 
+/// True only for a bare arrow-up escape typed as the ENTIRE line in the raw-stdin
+/// fallback. rustyline consumes arrow-up itself, so recall must never fire when an
+/// editor is present; and matching a substring (an ESC byte or "[A" anywhere) would
+/// let an arbitrary payment message/address silently re-fire the previous command,
+/// which can be a funded create/whisper.
+fn is_recall_line(command: &str, editor_present: bool) -> bool {
+    !editor_present && matches!(command, "\u{1b}[A" | "\u{1b}OA")
+}
+
 async fn async_main() -> Result<()> {
     // Initialize logging with ERROR level during startup to avoid UI interference.
     // RUST_LOG still wins when set so field diagnostics stay possible.
@@ -553,8 +562,14 @@ async fn async_main() -> Result<()> {
         pb.set_message("Checking bootstrap snapshot...");
         let create_launch_genesis = env_flag_enabled("ALPHANUMERIC_CREATE_LAUNCH_GENESIS")
             || env_flag_enabled("ALPHANUMERIC_RESET_TO_LAUNCH_GENESIS");
+        // Mirror config.rs seed-node precedence exactly: ALPHANUMERIC_SEED_NODES wins if set,
+        // else the ALPHANUMERIC_BOOTSTRAP_PEERS alias. Reading only SEED_NODES here meant a node
+        // configured via the alias had seed_peer_configured=false, so a snapshot outage failed
+        // CLOSED instead of entering the P2P peer-bootstrap fallback. True iff config.seed_nodes
+        // would be non-empty (any non-blank comma entry).
         let seed_peer_configured = std::env::var("ALPHANUMERIC_SEED_NODES")
-            .map(|s| !s.trim().is_empty())
+            .or_else(|_| std::env::var("ALPHANUMERIC_BOOTSTRAP_PEERS"))
+            .map(|s| s.split(',').any(|p| !p.trim().is_empty()))
             .unwrap_or(false);
         let mut peer_bootstrap_mode = false;
         if create_launch_genesis && !has_local_block_data(&db_path) {
@@ -826,9 +841,18 @@ async fn async_main() -> Result<()> {
             .unwrap_or_default()
             .as_secs()));
 
-        // Initialize core services
+        // Initialize core services. On failure the task returns here — before sync and before
+        // the monitor is spawned — so the node has no networking, yet the REPL still opens its
+        // normal menu and looks healthy. error! alone can be suppressed by RUST_LOG, so also
+        // print a stderr WARNING. Kept non-fatal so local wallet/balance inspection off the
+        // on-disk DB still works; the operator must restart to get networking back.
         if let Err(e) = node_clone.start().await {
             error!("Critical error during startup: {}", e);
+            eprintln!(
+                "WARNING: node networking failed to start ({}). Running OFFLINE — sync, mining \
+                 and sends will not work until you restart.",
+                e
+            );
             return;
         }
 
@@ -861,9 +885,13 @@ async fn async_main() -> Result<()> {
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            // Sleep detection with state reset
+                            // Sleep detection with state reset. saturating_sub: `now`/`last` are
+                            // wall-clock seconds, so a backward clock step (NTP, host time sync)
+                            // makes now < last — a bare subtraction panics in debug and wraps to a
+                            // huge value in release, firing false "sleep detected" resets every
+                            // tick. Matches the sibling checks elsewhere in this monitor.
                             let last = activity_time.load(Ordering::Acquire);
-                            if now - last > SLEEP_THRESHOLD {
+                            if now.saturating_sub(last) > SLEEP_THRESHOLD {
                                 debug!("Sleep detected, resetting network state");
                                 // Reset all counters
                                 sync_attempts = 0;
@@ -1439,7 +1467,11 @@ async fn async_main() -> Result<()> {
                                     "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
                                     alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                 );
-                                std::process::exit(0);
+                                // Nonzero: this exit exists to BE re-launched (the marker written
+                                // above makes the next boot re-bootstrap). exit(0) reads as success,
+                                // so systemd Restart=on-failure / docker restart:on-failure would
+                                // leave the stranded node dead instead of restarting it.
+                                std::process::exit(3);
                             }
                         }
                     }
@@ -1450,8 +1482,11 @@ async fn async_main() -> Result<()> {
         if headless {
             println!("Headless mode enabled. Node services are running.");
             // (Runtime canonical reconciliation runs for every node — spawned above.)
+            // Poll the shutdown flag every 1s (not 60s) so Ctrl-C / SIGTERM is noticed
+            // promptly and systemd doesn't have to SIGKILL after TimeoutStopSec. The tight
+            // poll is negligible cost since the actual work runs in the spawned tasks.
             while !shutdown_requested.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             return Ok(());
         }
@@ -1485,10 +1520,31 @@ async fn async_main() -> Result<()> {
                 return Ok(());
             }
             let mut command = if line_editor.is_some() {
-                let read_result = line_editor
-                    .as_mut()
-                    .expect("line editor checked")
-                    .readline(&console_prompt);
+                // Run the blocking readline on the blocking pool so this LocalSet thread keeps
+                // driving the spawn_local node monitor (health/discovery/wake-recovery) while the
+                // user sits at the prompt — a synchronous readline on this thread froze it. The
+                // owned editor is moved in and handed back; console_prompt is Copy (&'static str
+                // pair). The main reconciliation loop runs on other workers and is unaffected.
+                let editor_owned = line_editor.take().expect("line editor checked");
+                let prompt = console_prompt;
+                let read_result = match tokio::task::spawn_blocking(move || {
+                    let mut ed = editor_owned;
+                    let res = ed.readline(&prompt);
+                    (ed, res)
+                })
+                .await
+                {
+                    Ok((ed_back, res)) => {
+                        line_editor = Some(ed_back);
+                        res
+                    }
+                    Err(_) => {
+                        // The blocking read task panicked; clean up and exit gracefully.
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                };
                 match read_result {
                     Ok(line) => line.trim().to_string(),
                     Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -1511,8 +1567,24 @@ async fn async_main() -> Result<()> {
                 let _ = stdout.reset();
                 let _ = stdout.flush();
 
-                let mut command = String::new();
-                match std::io::stdin().read_line(&mut command) {
+                // Same rationale as the rustyline branch: read on the blocking pool so this
+                // LocalSet thread keeps driving the spawn_local monitor instead of freezing on a
+                // synchronous stdin read.
+                let (command, read_res) = match tokio::task::spawn_blocking(|| {
+                    let mut command = String::new();
+                    let res = std::io::stdin().read_line(&mut command);
+                    (command, res)
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = remove_db_lock(&format!("{}.lock", db_path));
+                        let _ = remove_instance_lock();
+                        return Ok(());
+                    }
+                };
+                match read_res {
                     Ok(0) => {
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -1532,11 +1604,7 @@ async fn async_main() -> Result<()> {
                 .trim()
                 .to_string();
 
-            let recalled_previous = matches!(command.as_str(), "\u{1b}[A" | "\u{1b}OA" | "^[[A")
-                || (command.starts_with('\u{1b}') && command.ends_with("[A"))
-                || (command.ends_with("[A") && command.len() <= 8)
-                || command.contains('\u{1b}')
-                || command.contains("[A");
+            let recalled_previous = is_recall_line(&command, line_editor.is_some());
             if recalled_previous {
                 if let Some(previous) = last_console_command.clone() {
                     println!("{}", previous);
@@ -2259,9 +2327,15 @@ if parts.len() == 1 {
     writeln!(stdout, "───────────────────")?;
 
 let mut all_messages = Vec::new();
-let blockchain_guard = blockchain.read().await;
 
 for wallet in wallets.values() {
+    // Short-lived per-wallet read guard (mirrors the whisper sync loop and the `info`
+    // handler). scan_blockchain_for_messages walks tip->cutoff with a get_block per height
+    // (~tens of thousands of reads over the 48h window), repeated for every wallet. Holding
+    // ONE guard across the whole batch would park a queued block-save writer — and then every
+    // reader behind it — on tokio's write-preferring RwLock for the entire scan.
+    let blockchain_guard = blockchain.read().await;
+
     // Get confirmed messages from blockchain
     let blockchain_messages = whisper.scan_blockchain_for_messages(&blockchain_guard, &wallet.address).await;
     all_messages.extend(blockchain_messages);
@@ -2346,11 +2420,11 @@ writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
         let (recipient, amount, message) = match parts.len() {
             3 => {
                 let msg = parts[2].trim_matches('"');
-                if msg.len() > alphanumeric::a9::whisper::MAX_MESSAGE_BYTES {
+                if msg.chars().count() > alphanumeric::a9::whisper::MAX_WHISPER_CHARS {
                     let mut error_style = ColorSpec::new();
                     error_style.set_fg(Some(Color::Red)).set_bold(true);
                     stdout.set_color(&error_style)?;
-                    println!("Message must be 4 characters/bytes");
+                    println!("Whisper carries a 4-letter (a-z) code only; shorten the message.");
                     stdout.reset()?;
                     continue;
                 }
@@ -2371,11 +2445,11 @@ writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
                 };
 
                 let msg = parts[3].trim_matches('"');
-                if msg.len() > alphanumeric::a9::whisper::MAX_MESSAGE_BYTES {
+                if msg.chars().count() > alphanumeric::a9::whisper::MAX_WHISPER_CHARS {
                     let mut error_style = ColorSpec::new();
                     error_style.set_fg(Some(Color::Red)).set_bold(true);
                     stdout.set_color(&error_style)?;
-                    println!("Message must be 32 bytes or less");
+                    println!("Whisper carries a 4-letter (a-z) code only; shorten the message.");
                     stdout.reset()?;
                     continue;
                 }
@@ -2416,8 +2490,10 @@ continue;
 }
         };
 
-        // Rest of the whisper sending code remains the same...
-        let sender_wallet = match wallets.values().next() {
+        // Deterministic payer: `wallets` is a HashMap, so .values().next() funded the whisper
+        // from an ARBITRARY wallet each run (a mild fund-safety surprise). Pick the
+        // lowest-address wallet so the same one signs every time; the receipt prints it below.
+        let sender_wallet = match wallets.values().min_by(|a, b| a.address.cmp(&b.address)) {
             Some(w) => w,
             None => {
                 let mut error_style = ColorSpec::new();
@@ -2500,6 +2576,7 @@ writeln!(stdout, "\n  Receipt:")?;
 stdout.reset()?;
 style.set_fg(Some(Color::Rgb(180, 219, 210)));
 stdout.set_color(&style)?;
+writeln!(stdout, "  From: {}", sender_wallet.address)?;
 writeln!(stdout, "  Amount: {:.8}", whisper_tx.amount())?;
 writeln!(stdout, "  Fee: {:.8}", whisper_tx.fee())?;
 writeln!(stdout, "  Message: {}\n", message)?;
@@ -2881,9 +2958,18 @@ async fn handle_network_commands(
 
                             // First try TCP connection
                             println!("Step 1: Testing TCP connection...");
-                            match TcpStream::connect(socket_addr).await {
-                                Ok(_) => println!("✓ TCP connection successful"),
-                                Err(e) => {
+                            // Bound the raw connect: verify_peer below has its own 10s timeout,
+                            // but an untimed TcpStream::connect against a black-holing firewall
+                            // can hang for the OS SYN-retry default (tens of seconds), freezing
+                            // this diagnostic far longer than the retry logic assumes.
+                            match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                TcpStream::connect(socket_addr),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => println!("✓ TCP connection successful"),
+                                Ok(Err(e)) => {
                                     println!("✗ TCP connection failed: {}", e);
                                     println!(
                                         "  - Check if port {} is open on target",
@@ -2891,6 +2977,12 @@ async fn handle_network_commands(
                                     );
                                     println!("  - Verify no firewall blocking connection");
                                     println!("  - Ensure target node is running");
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                                Err(_) => {
+                                    println!("✗ TCP connection timed out after 10s");
+                                    println!("  - Target unreachable or packets filtered/dropped");
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                     continue;
                                 }
@@ -5248,6 +5340,26 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Arrow-up recall must fire ONLY for a bare arrow-up escape typed as the whole line in the
+    // raw-stdin fallback — never for a payload that merely contains an ESC byte or "[A", which
+    // the old substring heuristic matched and could use to silently re-fire a funded command.
+    #[test]
+    fn is_recall_line_matches_only_bare_arrow_up_in_fallback() {
+        // Fallback (no editor): the two bare arrow-up escapes recall; nothing else does.
+        assert!(is_recall_line("\u{1b}[A", false));
+        assert!(is_recall_line("\u{1b}OA", false));
+        assert!(!is_recall_line("whisper addr 5 [A]", false));
+        assert!(!is_recall_line("create a b 5", false));
+        assert!(!is_recall_line("a message with an \u{1b} esc byte", false));
+        assert!(!is_recall_line("[A", false));
+        assert!(!is_recall_line("", false));
+
+        // With an editor present, rustyline consumes arrow-up itself, so recall never fires —
+        // not even for the raw escape (it cannot reach `command` in that path).
+        assert!(!is_recall_line("\u{1b}[A", true));
+        assert!(!is_recall_line("\u{1b}OA", true));
+    }
 
     fn reconcile_test_block(index: u32, tag: u8) -> Block {
         Block {
