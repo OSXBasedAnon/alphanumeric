@@ -169,6 +169,15 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Classify a `private.key` read error. ONLY `NotFound` is a genuine first run (safe to create a
+/// default wallet). Any other error — permissions (EACCES), a Windows AV share-lock, non-UTF-8
+/// corruption (`InvalidData`), or a transient I/O error — means the key file EXISTS but is
+/// currently unreadable; treating that as first-run would overwrite it with a fresh wallet and
+/// permanently destroy funds. Those must fail loudly instead.
+fn load_error_is_first_run(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
 impl Mgmt {
     pub fn new(
         _db: sled::Db,
@@ -531,53 +540,32 @@ impl Mgmt {
                 println!("Loaded {} wallets successfully\n", wallets.len());
                 Ok(wallets)
             }
-            Err(_) => self.create_default_wallet(passphrase).await,
-        }
-    }
-
-    pub async fn save_wallets(
-        &self,
-        db_arc: &Arc<RwLock<Db>>,
-        wallets: &HashMap<String, Wallet>,
-        _passphrase: Option<&[u8]>,
-    ) -> std::result::Result<(), Box<dyn Error>> {
-        let wallet_key_data: Vec<WalletKeyData> = wallets
-            .iter()
-            .map(|(name, wallet)| {
-                WalletKeyData::new(
-                    name.clone(),
-                    wallet.address.clone(),
-                    wallet.encrypted_private_key.clone(),
-                    wallet.is_encrypted,
+            Err(e) if load_error_is_first_run(&e) => {
+                // No key file yet: genuine first run.
+                self.create_default_wallet(passphrase).await
+            }
+            Err(e) => {
+                // The key file exists but could not be read. Do NOT fall through to
+                // create_default_wallet — that would overwrite the existing key with a fresh
+                // wallet and destroy funds. Fail loudly so the operator can fix perms / restore.
+                Err(format!(
+                    "{} exists but could not be read ({:?}: {}). Refusing to start so the \
+                     existing wallet is not overwritten — fix permissions or restore from backup.",
+                    KEY_FILE_PATH,
+                    e.kind(),
+                    e
                 )
-            })
-            .collect();
-
-        let serialized_key_data = serde_json::to_string(&wallet_key_data)?;
-        write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
-
-        let db_guard = db_arc.write().await;
-        let wallets_tree = db_guard
-            .open_tree("wallets")
-            .map_err(|e| format!("Failed to open wallets tree: {}", e))?;
-
-        for wallet in wallets.values() {
-            let encrypted_private_key = wallet
-                .encrypted_private_key
-                .as_ref()
-                .ok_or("Missing encrypted private key")?
-                .to_vec();
-            wallets_tree
-                .insert(wallet.address.as_bytes(), encrypted_private_key)
-                .map_err(|e| format!("Failed to save wallet: {}", e))?;
+                .into())
+            }
         }
-
-        wallets_tree
-            .flush()
-            .map_err(|e| format!("Failed to flush database: {}", e))?;
-
-        Ok(())
     }
+
+    // NOTE: `save_wallets` was removed. It rewrote private.key from the
+    // in-memory wallet map, which erased wallets that had failed to load (e.g. wrong passphrase),
+    // and additionally persisted plaintext keys into the shared chain DB's `wallets` tree (never
+    // read on load). Every wallet-mutation path (create_new_wallet / create_default_wallet /
+    // rename_wallet) already persists private.key by merging with the on-disk contents, so the
+    // function was both redundant and destructive.
 
     pub async fn rename_wallet(&self, old_name: &str, new_name: &str) -> Result<()> {
         let mut wallet_key_data = match fs::read_to_string(KEY_FILE_PATH).await {
@@ -1349,5 +1337,29 @@ impl Mgmt {
             }
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    // H4: only a NotFound read error is a genuine first run. Every other read error must NOT be
+    // treated as first-run — doing so would overwrite an existing private.key and destroy funds.
+    #[test]
+    fn only_notfound_read_error_is_first_run() {
+        assert!(load_error_is_first_run(&Error::from(ErrorKind::NotFound)));
+
+        assert!(!load_error_is_first_run(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!load_error_is_first_run(&Error::new(
+            ErrorKind::InvalidData,
+            "non-utf8 key file"
+        )));
+        assert!(!load_error_is_first_run(&Error::from(ErrorKind::Other)));
+        assert!(!load_error_is_first_run(&Error::new(
+            ErrorKind::WouldBlock,
+            "AV share-lock"
+        )));
     }
 }

@@ -1096,9 +1096,24 @@ async fn async_main() -> Result<()> {
             }
         }
 
-        let mut wallets = if headless && key_data_result.is_err() {
+        let mut wallets = if headless
+            && matches!(&key_data_result, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
             println!("Headless mode: no private.key found; continuing without a local wallet.");
             HashMap::new()
+        } else if headless && key_data_result.is_err() {
+            // Existing-but-unreadable key file (EACCES / non-UTF-8 / AV lock): do NOT silently run
+            // walletless on a key-holding node — that masks the condition. Abort loudly, mirroring
+            // the H4 guard in load_wallets.
+            let e = key_data_result.as_ref().err().unwrap();
+            return Err(format!(
+                "{} exists but could not be read ({:?}: {}). Refusing to start walletless so the \
+                 condition is not masked — fix permissions or restore from backup.",
+                KEY_FILE_PATH,
+                e.kind(),
+                e
+            )
+            .into());
         } else if wallet_encryption_state.is_some() {
             mgmt.load_wallets(&db_arc, wallet_encryption_state.as_deref()).await?
         } else {
@@ -1869,9 +1884,10 @@ if let Err(e) = mgmt
 {
 println!("Error creating wallet: {}", e);
 } else {
-if let Err(e) = mgmt.save_wallets(&db_arc, &wallets, wallet_encryption_state.as_deref()).await {
-error!("Failed to save wallets after creation: {}", e);
-}
+// create_new_wallet has already persisted the merged key file (including any wallets that
+// failed to load, e.g. wrong passphrase — they are read from disk and re-written). A follow-up
+// save_wallets here would rewrite the file from the IN-MEMORY map only and erase those skipped
+// wallets, permanently destroying their keys — so it is deliberately omitted.
 {
     let mut addresses = wallet_addresses.write().await;
     *addresses = wallets.values().map(|w| w.address.clone()).collect();
