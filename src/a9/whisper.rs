@@ -17,6 +17,11 @@ pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
 pub const MAX_FEE: f64 = 0.01;
 pub const MESSAGE_HISTORY_HOURS: i64 = 48;
 pub const MAX_MESSAGE_BYTES: usize = 128;
+/// The whisper payload is a <=4-letter code: encode_message_as_fee takes only the first 4
+/// chars and decode reads exactly 4, so anything longer is silently dropped. Gate sends on
+/// this so the contract matches the encoder instead of accepting a 128-byte message and
+/// truncating it without warning.
+pub const MAX_WHISPER_CHARS: usize = 4;
 
 const PRIME_TABLE: &[u64] = &[
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
@@ -349,6 +354,12 @@ impl WhisperModule {
         hex::encode(hasher.finalize())
     }
 
+    /// NOTE: `timestamp` is intentionally unused. The whisper component of the fee is a
+    /// deterministic arithmetic coding of the (<=4-char) code alone — no per-message salt.
+    /// Consequences: (1) ZERO confidentiality — anyone can decode any whisper straight from the
+    /// public ledger; (2) the same code always maps to the same fee. Do NOT treat the code as
+    /// private or unique, and do NOT add timestamp-dependent coding (it would break the decode
+    /// of every historical whisper). The param is kept only to preserve the call sites.
     pub fn encode_message_as_fee(&self, message: &str, _timestamp: u64, base_amount: f64) -> f64 {
         let mut low = 0.0;
         let mut high = 1.0;
@@ -378,6 +389,8 @@ impl WhisperModule {
         (total_fee * 100_000_000.0).round() / 100_000_000.0
     }
 
+    /// NOTE: `timestamp` is intentionally unused — the code is recovered from the fee alone
+    /// (see encode_message_as_fee's note on the deterministic, zero-confidentiality design).
     pub fn decode_message_from_fee(
         &self,
         total_fee: f64,
@@ -440,7 +453,8 @@ impl WhisperModule {
         wallet: &Wallet,
         sender_balance: f64,
     ) -> Result<Transaction, BlockchainError> {
-        if message.len() > MAX_MESSAGE_BYTES {
+        // Reject rather than silently truncate: only the first MAX_WHISPER_CHARS are encoded.
+        if message.chars().count() > MAX_WHISPER_CHARS {
             return Err(BlockchainError::InvalidTransaction);
         }
 
