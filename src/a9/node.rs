@@ -1151,18 +1151,9 @@ struct StatsState {
     peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
     start_time: u64,
     network_id: [u8; 32],
-}
-
-#[derive(Serialize)]
-struct StatsResponse {
-    network_id: String,
-    height: u32,
-    difficulty: u64,
-    hashrate_ths: f64,
-    last_block_time: u64,
-    peers: usize,
-    version: String,
-    uptime_secs: u64,
+    // Coarse per-process token bucket so an unauthenticated flood of /stats (when
+    // ALPHANUMERIC_STATS_BIND is a public interface) can't hammer the blockchain read lock.
+    read_bucket: Arc<PLMutex<(Instant, f64)>>,
 }
 
 /// State for the opt-in explorer API (see start_explorer_server).
@@ -1415,7 +1406,15 @@ impl Node {
         match bind_addr {
             Some(addr) => {
                 info!("Using provided bind address: {}", addr);
-                let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+                // Match the socket domain to the bind address family. An IPv4-domain socket
+                // cannot bind an explicit IPv6 SocketAddr (address-family error), so the node
+                // failed to start on an IPv6 bind. IPv4 behavior is unchanged.
+                let domain = if addr.is_ipv6() {
+                    Domain::IPV6
+                } else {
+                    Domain::IPV4
+                };
+                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
                 socket.set_reuse_address(true)?;
                 socket.set_nodelay(true)?;
 
@@ -2739,7 +2738,17 @@ impl Node {
         let delta_due =
             tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 7;
         if delta_due {
-            self.last_header_snapshot_at.store(now, Ordering::Release);
+            // Claim the burst window atomically. A bare store let two concurrent callers
+            // (the 5s periodic loop and the post-mine path) both observe delta_due and both
+            // POST, defeating the 7s floor. compare_exchange lets only the caller that swaps
+            // last_at from the value it observed proceed; the loser bails.
+            if self
+                .last_header_snapshot_at
+                .compare_exchange(last_at, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(());
+            }
         } else if !Self::should_publish_now(
             &self.last_header_snapshot_at,
             Self::header_snapshot_interval_secs(),
@@ -3305,15 +3314,24 @@ impl Node {
                         }
                         let saved = {
                             let bc = self.blockchain.write().await;
+                            let before = bc.get_latest_block_index() as u32;
                             // String-ify immediately: BlockchainError is !Send and this
                             // value is held across the checkpoint await below.
-                            bc.save_receipt_verified_block(&block)
+                            let result = bc
+                                .save_receipt_verified_block(&block)
                                 .await
-                                .map_err(|e| e.to_string())
+                                .map_err(|e| e.to_string());
+                            let after = bc.get_latest_block_index() as u32;
+                            (result, before, after)
                         };
                         match saved {
-                            Ok(()) => {
-                                if block.index > floor {
+                            (Ok(()), before, after) => {
+                                // Only trail the finality checkpoint when the save actually
+                                // extended the canonical tip, matching the relay-tip sibling.
+                                // save_receipt_verified_block also returns Ok(()) for an
+                                // idempotent duplicate or a parked side block, and advancing
+                                // finality behind a block that did not move the tip is unsafe.
+                                if after > before && block.index > floor {
                                     let _ = self
                                         .blockchain
                                         .read()
@@ -3321,7 +3339,7 @@ impl Node {
                                         .advance_checkpoint_behind(block.index);
                                 }
                             }
-                            Err(e) => {
+                            (Err(e), _, _) => {
                                 debug!(
                                     "Rejected forward block {} toward {}@{}: {}",
                                     block.index,
@@ -4905,9 +4923,18 @@ impl Node {
             // already posted; the recent-window re-post can trail behind.
             let node = self.clone();
             tokio::spawn(async move {
+                // Reset the single-flight flag via a destructor so a panic (or cancellation)
+                // inside post_recent_blocks_to_relay cannot wedge it `true` forever and
+                // permanently disable all future relay backfill for the process.
+                struct BackfillGuard;
+                impl Drop for BackfillGuard {
+                    fn drop(&mut self) {
+                        RELAY_BACKFILL_INFLIGHT.store(false, Ordering::SeqCst);
+                    }
+                }
+                let _guard = BackfillGuard;
                 node.post_recent_blocks_to_relay(Node::relay_backfill_limit())
                     .await;
-                RELAY_BACKFILL_INFLIGHT.store(false, Ordering::SeqCst);
             });
         }
 
@@ -4985,29 +5012,30 @@ impl Node {
         Ok(())
     }
 
-    async fn stats_handler(State(state): State<StatsState>) -> Json<StatsResponse> {
-        let height = {
-            let blockchain = state.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
-        };
+    async fn stats_handler(State(state): State<StatsState>) -> (StatusCode, Json<Value>) {
+        if !Self::allow_read_bucket(&state.read_bucket) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "rate_limited" })),
+            );
+        }
 
-        let last_block_time = {
-            let blockchain = state.blockchain.read().await;
-            blockchain
-                .get_last_block()
-                .map(|b| b.timestamp)
-                .unwrap_or(0)
+        // ONE timed read guard: a consistent snapshot (the four fields used to be read under
+        // four separate acquisitions, so under a heavy writer they could be torn across
+        // instants), and fail-fast with 503 instead of hanging. get_tip_difficulty and
+        // calculate_network_hashrate are &self on the guard and never re-lock the outer
+        // RwLock, so holding one read across all fields is deadlock-free.
+        let Ok(blockchain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
         };
-
-        let difficulty = {
-            let blockchain = state.blockchain.read().await;
-            blockchain.get_tip_difficulty().await
-        };
-
-        let hashrate_ths = {
-            let blockchain = state.blockchain.read().await;
-            blockchain.calculate_network_hashrate().await
-        };
+        let height = blockchain.get_latest_block_index() as u32;
+        let last_block_time = blockchain
+            .get_last_block()
+            .map(|b| b.timestamp)
+            .unwrap_or(0);
+        let difficulty = blockchain.get_tip_difficulty().await;
+        let hashrate_ths = blockchain.calculate_network_hashrate().await;
+        drop(blockchain);
 
         let peers = state.peers.read().await.len();
         let uptime_secs = SystemTime::now()
@@ -5016,16 +5044,19 @@ impl Node {
             .as_secs()
             .saturating_sub(state.start_time);
 
-        Json(StatsResponse {
-            network_id: hex::encode(state.network_id),
-            height,
-            difficulty,
-            hashrate_ths,
-            last_block_time,
-            peers,
-            version: format!("rust-{}", NETWORK_VERSION),
-            uptime_secs,
-        })
+        (
+            StatusCode::OK,
+            Json(json!({
+                "network_id": hex::encode(state.network_id),
+                "height": height,
+                "difficulty": difficulty,
+                "hashrate_ths": hashrate_ths,
+                "last_block_time": last_block_time,
+                "peers": peers,
+                "version": format!("rust-{}", NETWORK_VERSION),
+                "uptime_secs": uptime_secs,
+            })),
+        )
     }
 
     async fn health_handler() -> Json<Value> {
@@ -5055,6 +5086,7 @@ impl Node {
             peers: Arc::clone(&self.peers),
             start_time: self.start_time,
             network_id: self.network_id,
+            read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
         };
 
         let app = Router::new()
@@ -5413,8 +5445,10 @@ impl Node {
 
     // Consume one token from the coarse explorer read bucket (refill 10/s, cap 30). Returns false
     // when exhausted, so an unauthenticated flood is answered 429 before any O(chain) scan runs.
-    fn allow_explorer_read(state: &ExplorerState) -> bool {
-        let mut b = state.read_bucket.lock();
+    /// Coarse per-process token bucket (refill 10/s, cap 30) shared by the opt-in explorer
+    /// READ endpoints and the /stats endpoint.
+    fn allow_read_bucket(bucket: &Arc<PLMutex<(Instant, f64)>>) -> bool {
+        let mut b = bucket.lock();
         let now = Instant::now();
         b.1 = (b.1 + now.duration_since(b.0).as_secs_f64() * 10.0).min(30.0);
         b.0 = now;
@@ -5423,6 +5457,10 @@ impl Node {
         }
         b.1 -= 1.0;
         true
+    }
+
+    fn allow_explorer_read(state: &ExplorerState) -> bool {
+        Self::allow_read_bucket(&state.read_bucket)
     }
 
     async fn explorer_address_handler(
@@ -6401,8 +6439,15 @@ impl Node {
                             }
                             Err(e) => {
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    // This might be a valid peer - check with a full TCP connection
-                                    if TcpStream::connect(addr).await.is_ok() {
+                                    // This might be a valid peer - check with a full TCP connection.
+                                    // Bound the probe: an untimed connect to a filtered/black-hole
+                                    // host hangs for the OS SYN-retry default (tens of seconds), and
+                                    // this scan walks hundreds of addresses sequentially.
+                                    if timeout(Duration::from_millis(300), TcpStream::connect(addr))
+                                        .await
+                                        .map(|r| r.is_ok())
+                                        .unwrap_or(false)
+                                    {
                                         discovered.insert(addr);
                                     }
                                 }
@@ -9133,17 +9178,25 @@ impl Node {
                             self.mesh_gossip_block(&block).await;
                         }
                     } else {
-                        // Traditional broadcast method
+                        // Traditional broadcast method. SPAWN it off the single-consumer event
+                        // pump (which processes NetworkEvents strictly serially): broadcast_block
+                        // fans out to up to 16 peers with per-peer connect/write, and awaited
+                        // inline it stalls every following event (txs, peer joins, chain requests,
+                        // further blocks). Gossip is best-effort and peers dedup, so detaching it
+                        // is safe. Same spawn pattern as the transaction-gossip path above.
                         let peers = self.peers.read().await;
                         let selected_peers =
                             self.select_broadcast_peers(&peers, peers.len().min(16));
                         drop(peers);
-                        if let Err(e) = self
-                            .broadcast_block(Arc::new(block.clone()), None, selected_peers)
-                            .await
-                        {
-                            warn!("Failed to broadcast block to selected peers: {}", e);
-                        }
+                        let node = self.clone();
+                        let block_arc = Arc::new(block.clone());
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                node.broadcast_block(block_arc, None, selected_peers).await
+                            {
+                                warn!("Failed to broadcast block to selected peers: {}", e);
+                            }
+                        });
                     }
                 }
             }
@@ -9427,7 +9480,15 @@ impl Node {
                     return Err(NodeError::Network("Invalid block proof of work".into()));
                 }
                 let block_hash = block_ref.calculate_hash_for_block();
-                if !self.network_bloom.insert(&block_hash) {
+                // Dedup with a READ-ONLY check, and only COMMIT the hash to the shared bloom
+                // after a definitive accept. verify_block_with_witness returns Ok(false)
+                // (not an error, not negative-cached) when a transaction witness can't be
+                // resolved right now — a recoverable case. Inserting before verify would leave
+                // that hash in the bloom, so a later re-delivery from a peer that CAN supply the
+                // witness would be dropped here, permanently suppressing a recoverable block.
+                // Truly-invalid blocks are still cheap to reject (the PoW-floor gate above and
+                // verify's internal negative-cache). Same rationale as the mesh ingest path.
+                if self.network_bloom.check(&block_hash) {
                     return Ok(None);
                 }
 
@@ -9436,7 +9497,10 @@ impl Node {
                     .verify_block_with_witness(&block_ref, Some(addr))
                     .await?
                 {
-                    // Save block to blockchain
+                    self.network_bloom.insert(&block_hash);
+                    // Save block to blockchain. Idempotent for an already-present block (the
+                    // brief check-then-insert race is closed by save_block's state lock +
+                    // same-hash short-circuit), so a duplicate delivery is a safe no-op.
                     self.blockchain.write().await.save_block(&block_ref).await?;
                     self.publish_discovery_state("Accepted block").await;
 
@@ -10429,6 +10493,12 @@ impl Node {
         // Message handling loop
         let (mut reader, mut writer) = tokio::io::split(stream);
 
+        // Cumulative handler-failure ceiling for a single connection. Higher than the
+        // health-check MAX_FAILURES (3) so a couple of transient malformed frames don't drop
+        // an otherwise-honest peer, but bounded so a peer streaming invalid frames can't hold
+        // the connection open forever.
+        const MAX_HANDLER_FAILURES: u32 = 10;
+
         'connection: loop {
             // Read message length prefix with timeout
             let mut len_bytes = [0u8; 4];
@@ -10495,6 +10565,7 @@ impl Node {
                             warn!("Message handling error from {}: {}", peer_addr, e);
 
                             // Check if error suggests malicious behavior
+                            let mut recorded = false;
                             match &e {
                                 NodeError::Network(msg)
                                     if msg.contains("Rate limit")
@@ -10502,16 +10573,36 @@ impl Node {
                                         || msg.contains("Invalid") =>
                                 {
                                     self.record_peer_failure(peer_addr).await;
+                                    recorded = true;
                                 }
                                 _ => {}
                             }
 
-                            // Continue for transient errors
-                            if !matches!(e, NodeError::Network(msg) if msg.contains("Rate limit")) {
-                                continue;
+                            // A 'Rate limit' error drops the connection immediately.
+                            if matches!(&e, NodeError::Network(msg) if msg.contains("Rate limit")) {
+                                break 'connection;
                             }
 
-                            break 'connection;
+                            // Other malicious-looking errors are tolerated transiently — but a peer
+                            // that keeps streaming malformed/invalid frames must not be served
+                            // forever. Once its cumulative failure count (the same signal the
+                            // health-check loop evicts on) crosses the handler ceiling, drop it.
+                            if recorded {
+                                let n = self
+                                    .peer_failures
+                                    .read()
+                                    .await
+                                    .get(&peer_addr)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if n >= MAX_HANDLER_FAILURES {
+                                    warn!("Dropping {} after {} handler failures", peer_addr, n);
+                                    break 'connection;
+                                }
+                            }
+
+                            // Continue for transient errors
+                            continue;
                         }
                     };
 
@@ -11603,6 +11694,29 @@ mod tests {
         assert!(!Node::witness_count_within_limit(MAX_BLOCK_TX_COUNT + 1)); // over the limit: rejected
         // The pre-check bound is the ledger bound, not an independent number.
         assert_eq!(MAX_BLOCK_TX_COUNT, crate::a9::blockchain::MAX_BLOCK_TX_COUNT);
+    }
+
+    // The read-endpoint token bucket shared by /stats and the explorer reads admits a burst up
+    // to its cap and then rate-limits, so an unauthenticated flood cannot hammer the chain lock.
+    #[test]
+    fn read_bucket_admits_burst_up_to_cap_then_limits() {
+        // Drained bucket: the first call has no tokens and is refused.
+        let empty = Arc::new(PLMutex::new((Instant::now(), 0.0)));
+        assert!(!Node::allow_read_bucket(&empty));
+
+        // Full bucket (cap 30): 30 back-to-back calls are admitted, the next is limited. The
+        // refill over the microseconds these calls take is far below a single token.
+        let full = Arc::new(PLMutex::new((Instant::now(), 30.0)));
+        for i in 0..30 {
+            assert!(
+                Node::allow_read_bucket(&full),
+                "call {i} within the burst cap must be admitted"
+            );
+        }
+        assert!(
+            !Node::allow_read_bucket(&full),
+            "a call past the burst cap must be rate-limited"
+        );
     }
 
     // The per-block witness-resolve deadline has to clear a comfortable multiple of a single
