@@ -874,7 +874,6 @@ async fn async_main() -> Result<()> {
                 let mut block_times = VecDeque::with_capacity(50);
                 let mut sync_attempts: u32 = 0;
                 let mut discovery_failures: u32 = 0;
-                let mut consecutive_timeouts: u32 = 0;
 
                 loop {
                     tokio::select! {
@@ -896,11 +895,7 @@ async fn async_main() -> Result<()> {
                                 // Reset all counters
                                 sync_attempts = 0;
                                 discovery_failures = 0;
-                                consecutive_timeouts = 0;
                                 block_times.clear();
-
-                                // Reset validation state
-                                node.validation_pool.active_validations.store(0, Ordering::SeqCst);
 
                                 // Attempt immediate network recovery
                                 if let Err(e) = node.discover_network_nodes().await {
@@ -971,8 +966,6 @@ async fn async_main() -> Result<()> {
                                             }
                                         })
                                     ).await;
-                                    let batch_timeouts = heights.iter().filter(|h| h.is_none()).count() as u32;
-                                    consecutive_timeouts = consecutive_timeouts.saturating_add(batch_timeouts);
 
                                     // Process height differences with backoff
                                     if let Some(&max_height) = heights.iter().flatten().max() {
@@ -985,7 +978,6 @@ async fn async_main() -> Result<()> {
                                                             warn!("Post-sync publish failed: {}", e);
                                                         }
                                                         sync_attempts = 0;
-                                                        consecutive_timeouts = 0;
                                                     }
                                                     Err(e) => {
                                                         error!("Chain sync failed (attempt {}/{}): {}", 
@@ -1018,7 +1010,6 @@ async fn async_main() -> Result<()> {
                                 match node.discover_network_nodes().await {
                                     Ok(_) => {
                                         discovery_failures = 0;
-                                        consecutive_timeouts = 0;
                                     }
                                     Err(e) => {
                                         error!("Emergency peer discovery failed: {}", e);
@@ -1081,10 +1072,6 @@ async fn async_main() -> Result<()> {
                                     }
                                 }
 
-                                // Reset timeout counter on successful block
-                                if block_time <= MAX_BLOCK_AGE {
-                                    consecutive_timeouts = 0;
-                                }
                             }
                         }
                     }
@@ -1160,40 +1147,10 @@ async fn async_main() -> Result<()> {
         )));
 
         // Whisper
-        let whisper_module = Arc::new(RwLock::new(WhisperModule::new_with_db(Arc::new(db.clone()))));
+        let whisper_module = Arc::new(RwLock::new(WhisperModule::new()));
         let wallet_addresses: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(
             wallets.values().map(|w| w.address.clone()).collect(),
         ));
-
-        {
-            let whisper_module = whisper_module.clone();
-            let wallet_addresses = wallet_addresses.clone();
-            let blockchain = blockchain.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(15));
-                loop {
-                    interval.tick().await;
-                    // Snapshot the address list so the wallet_addresses lock is not held
-                    // across the scan loop (a new-wallet writer would otherwise block).
-                    let addresses = {
-                        let guard = wallet_addresses.read().await;
-                        if guard.is_empty() {
-                            continue;
-                        }
-                        guard.clone()
-                    };
-                    let whisper = whisper_module.read().await;
-                    for addr in addresses.iter() {
-                        // Short-lived per-address blockchain read guard, dropped before the
-                        // next iteration. Holding ONE read guard across the whole per-wallet
-                        // scan loop starves a queued block-save writer (tokio's write-
-                        // preferring RwLock) for the entire batch, delaying block ingest.
-                        let blockchain_guard = blockchain.read().await;
-                        let _ = whisper.sync_index_for_wallet(addr, &blockchain_guard).await;
-                    }
-                }
-            });
-        }
 
         // Instant received-funds notification. Subscribes to the in-process tip
         // signal (fired by the live beacon-watch sync on every applied block) and
@@ -4558,27 +4515,6 @@ fn best_anchor_from_history(body: &serde_json::Value, local_tip: u32) -> Option<
         }
     }
     best.map(|(height, _, hash)| (height, hash))
-}
-
-/// Fetch and verify the signed bootstrap manifest, returning the canonical tip as
-/// (height, lowercased hex hash). None if unreachable or unverifiable — callers
-/// treat that as "canonical unknown" and take no action. Used for runtime drift
-/// detection against the same signed source the startup reconciliation uses.
-async fn fetch_verified_canonical_tip() -> Option<(u64, String)> {
-    let client = bootstrap_manifest_http_client().ok()?;
-    let resp = client.get(BOOTSTRAP_MANIFEST_URL).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.bytes().await.ok()?;
-    let parsed: BootstrapManifestResponse = serde_json::from_slice(&body).ok()?;
-    if !parsed.ok {
-        return None;
-    }
-    verify_bootstrap_manifest(&parsed.manifest).ok()?;
-    let height = parsed.manifest.height?;
-    let tip_hash = parsed.manifest.tip_hash.as_ref()?.trim().to_ascii_lowercase();
-    Some((height, tip_hash))
 }
 
 fn local_db_matches_launch_genesis(db_path: &str) -> bool {

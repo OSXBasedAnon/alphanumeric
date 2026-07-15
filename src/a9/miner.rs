@@ -35,52 +35,16 @@ const TIP_CHANGE_CHECK_INTERVAL: u64 = 256;
 /// many-core miner, throttling the very machines the thread pool freed up.
 const DB_TIP_CONFIRM_INTERVAL: u64 = 262_144;
 
-#[derive(Debug, Clone, Error)]
-pub enum CryptoError {
-    #[error("Encryption failed")]
-    Encryption,
-    #[error("Decryption failed")]
-    Decryption,
-    #[error("Key generation failed")]
-    KeyGeneration,
-}
-
 #[derive(Error, Debug)]
 pub enum MiningError {
-    #[error("Mining timeout exceeded")]
-    Timeout,
-    #[error("Invalid difficulty target: {0}")]
-    InvalidDifficulty(String),
-    #[error("Invalid transaction fee")]
-    InvalidFee,
-    #[error("Insufficient mining reward")]
-    InsufficientReward,
-    #[error("Crypto operation failed")]
-    CryptoError(#[from] CryptoError),
-    #[error("Block not found")]
-    BlockNotFound,
-    #[error("Invalid data: {0}")]
-    InvalidData(&'static str),
-    #[error("Out of bounds error")]
-    OutOfBounds,
-    #[error("Transaction Error")]
-    TransactionError,
     #[error("Mining failed: {0}")]
     MiningFailed(String),
     #[error("Blockchain error: {0}")]
     BlockchainError(String),
-    #[error("Invalid target format")]
-    InvalidTargetFormat,
     #[error("Invalid hash format")]
     InvalidHashFormat,
     #[error("Exceeded max nonce limit")]
     MaxNonceExceeded,
-    #[error("Serialization error")]
-    SerializationError,
-    #[error("Validation error")]
-    ValidationError,
-    #[error("Wallet error")]
-    WalletError,
 }
 
 impl From<Box<dyn std::error::Error>> for MiningError {
@@ -157,7 +121,6 @@ impl MiningManager {
         transactions: &[ProgPowTransaction],
         max_nonce: u64,
         miner_address: String,
-        _reward_amount: f64,
     ) -> Result<(u64, String, Block), MiningError> {
         let transactions: Vec<Transaction> = transactions
             .iter()
@@ -663,7 +626,6 @@ impl Miner {
         transactions: &[ProgPowTransaction],
         max_nonce: u64,
         miner_address: String,
-        reward_amount: f64,
     ) -> Result<(u64, String, Block), MiningError> {
         self.manager
             .mine_block(
@@ -671,7 +633,6 @@ impl Miner {
                 transactions,
                 max_nonce,
                 miner_address,
-                reward_amount,
             )
             .await
             .map_err(|e| MiningError::MiningFailed(e.to_string()))

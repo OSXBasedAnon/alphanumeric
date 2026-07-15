@@ -1,16 +1,12 @@
 use chrono::{DateTime, Duration, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sled::Db;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
-use crate::a9::codec;
 use crate::a9::wallet::Wallet;
 
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
@@ -36,12 +32,6 @@ pub struct FeeInfo {
     pub timestamp: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct WalletIndex {
-    last_scanned_block: u32,
-    fee_cache: Vec<FeeInfo>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhisperMessage {
     pub from: String,
@@ -55,13 +45,9 @@ pub struct WhisperMessage {
 
 pub struct WhisperModule {
     frequency_map: HashMap<char, (f64, f64, u64)>,
-    wallet_indices: DashMap<String, WalletIndex>,
-    db: Option<Arc<Db>>,
 }
 
 impl WhisperModule {
-    const INDEX_TREE: &'static str = "whisper_index";
-    const MAX_INDEX_MESSAGES: usize = 2000;
     /// Hard fuse on the number of blocks any single whisper/history scan may hold
     /// in memory at once. The scans are time-windowed (48h whisper view, 7d
     /// history), so this cap is never reached in practice (~29 days at 5s blocks);
@@ -101,15 +87,6 @@ impl WhisperModule {
     pub fn new() -> Self {
         Self {
             frequency_map: Self::build_frequency_map(),
-            wallet_indices: DashMap::new(),
-            db: None,
-        }
-    }
-
-    pub fn new_with_db(db: Arc<Db>) -> Self {
-        Self {
-            db: Some(db),
-            ..Self::new()
         }
     }
 
@@ -163,175 +140,6 @@ impl WhisperModule {
         }
 
         frequency_map
-    }
-
-    // Initialize or update wallet index
-    async fn ensure_wallet_indexed(
-        &self,
-        address: &str,
-        blockchain: &Blockchain,
-    ) -> Result<(), BlockchainError> {
-        let current_height = blockchain.get_latest_block_index() as u32;
-        let mut should_update = false;
-
-        // Fast check if we need to update
-        if let Some(index) = self.wallet_indices.get(address) {
-            if index.last_scanned_block < current_height {
-                should_update = true;
-            }
-        } else {
-            // Try to load from persisted index first
-            if let Some(index) = self.load_index_from_db(address) {
-                self.wallet_indices.insert(address.to_string(), index);
-            } else {
-                // Initialize new wallet index with empty fee_cache
-                self.wallet_indices.insert(
-                    address.to_string(),
-                    WalletIndex {
-                        last_scanned_block: 0,
-                        fee_cache: Vec::new(),
-                    },
-                );
-            }
-            should_update = true;
-        }
-
-        if should_update {
-            self.update_wallet_index(address, blockchain, false).await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn sync_index_for_wallet(
-        &self,
-        address: &str,
-        blockchain: &Blockchain,
-    ) -> Result<(), BlockchainError> {
-        self.ensure_wallet_indexed(address, blockchain).await
-    }
-
-    async fn update_wallet_index(
-        &self,
-        address: &str,
-        blockchain: &Blockchain,
-        force_full_scan: bool,
-    ) -> Result<(), BlockchainError> {
-        let current_height = blockchain.get_latest_block_index() as u32;
-        let mut start_height = 0;
-
-        // Get or create index
-        if !force_full_scan {
-            if let Some(index) = self.wallet_indices.get(address) {
-                start_height = index.last_scanned_block.saturating_add(1);
-                if start_height >= current_height {
-                    return Ok(());
-                }
-            }
-        }
-
-        let mut fee_cache = Vec::new();
-
-        // Bound the scan to the fee-cache retention window instead of the whole
-        // range. The cache is pruned to MESSAGE_HISTORY_HOURS (prune_fee_cache), so
-        // scanning older blocks is pure waste — and on a fresh wallet (start_height
-        // == 0) a par-materialization of `(0..=current)` would pull the entire
-        // decoded chain into RAM (unbounded-allocation DoS that worsens as the chain
-        // grows). Walk backward from the tip, stopping at whichever comes first:
-        // start_height (keeps the incremental path cheap) or a block older than the
-        // window (timestamps are consensus-monotonic in height).
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let cutoff_secs = now_secs.saturating_sub((MESSAGE_HISTORY_HOURS as u64) * 3600);
-        let mut blocks: Vec<Block> = Vec::new();
-        let mut idx = current_height as i64;
-        while idx >= start_height as i64 && blocks.len() < Self::MAX_WINDOW_BLOCKS {
-            match blockchain.get_block(idx as u32) {
-                Ok(block) => {
-                    if block.timestamp < cutoff_secs {
-                        break;
-                    }
-                    blocks.push(block);
-                }
-                Err(_) => {}
-            }
-            idx -= 1;
-        }
-        blocks.sort_unstable_by_key(|b| b.index);
-
-        // Process transactions
-        for block in blocks {
-            for tx in &block.transactions {
-                if (tx.sender == address || tx.recipient == address)
-                    && (tx.fee() - FEE_PERCENTAGE * tx.amount()).abs() > 1e-8
-                {
-                    fee_cache.push(FeeInfo {
-                        fee: tx.fee(),
-                        amount: tx.amount(),
-                        from: tx.sender.clone(),
-                        to: tx.recipient.clone(),
-                        timestamp: tx.timestamp,
-                    });
-                }
-            }
-        }
-
-        // Update index
-        self.wallet_indices.insert(
-            address.to_string(),
-            WalletIndex {
-                last_scanned_block: current_height,
-                fee_cache: Self::prune_fee_cache(fee_cache),
-            },
-        );
-
-        self.save_index_to_db(address);
-
-        Ok(())
-    }
-
-    fn prune_fee_cache(mut fee_cache: Vec<FeeInfo>) -> Vec<FeeInfo> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let cutoff = now.saturating_sub((MESSAGE_HISTORY_HOURS as u64) * 3600);
-
-        fee_cache.retain(|entry| entry.timestamp >= cutoff);
-        fee_cache.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
-        if fee_cache.len() > Self::MAX_INDEX_MESSAGES {
-            fee_cache.drain(0..fee_cache.len() - Self::MAX_INDEX_MESSAGES);
-        }
-
-        fee_cache
-    }
-
-    fn load_index_from_db(&self, address: &str) -> Option<WalletIndex> {
-        let db = self.db.as_ref()?;
-        let tree = db.open_tree(Self::INDEX_TREE).ok()?;
-        let key = format!("idx:{}", address);
-        let bytes = tree.get(key.as_bytes()).ok()??;
-        codec::deserialize(&bytes).ok()
-    }
-
-    fn save_index_to_db(&self, address: &str) {
-        let db = match self.db.as_ref() {
-            Some(db) => db,
-            None => return,
-        };
-        let tree = match db.open_tree(Self::INDEX_TREE) {
-            Ok(tree) => tree,
-            Err(_) => return,
-        };
-        if let Some(index) = self.wallet_indices.get(address) {
-            if let Ok(bytes) = codec::serialize(&*index) {
-                let key = format!("idx:{}", address);
-                let _ = tree.insert(key.as_bytes(), bytes);
-            }
-        }
     }
 
     fn calculate_transaction_hash(&self, tx: &Transaction) -> String {

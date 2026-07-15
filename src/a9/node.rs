@@ -191,7 +191,6 @@ enum ExactFetch {
     Transient,
 }
 const DEFAULT_STATS_SNAPSHOT_INTERVAL_SECS: u64 = 300;
-const DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS: u64 = 60;
 const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 3000;
 const DISCOVERY_BACKOFF_BASE_SECS: u64 = 60;
 const DISCOVERY_BACKOFF_MAX_SECS: u64 = 900;
@@ -840,7 +839,6 @@ pub struct ValidationPool {
     // never occupy a validation permit. Only blocks that must fetch a missing witness contend here;
     // locally-resolvable blocks never touch it.
     fetch: Arc<Semaphore>,
-    pub active_validations: Arc<AtomicU64>,
     timeout: Duration,
 }
 
@@ -849,7 +847,6 @@ impl ValidationPool {
         Self {
             available: Arc::new(Semaphore::new(MAX_PARALLEL_VALIDATIONS)),
             fetch: Arc::new(Semaphore::new(MAX_PARALLEL_WITNESS_FETCHES)),
-            active_validations: Arc::new(AtomicU64::new(0)),
             timeout: Duration::from_secs(30),
         }
     }
@@ -863,13 +860,7 @@ impl ValidationPool {
 
     async fn acquire_validation_permit(&self) -> Result<ValidationPermit<'_>, NodeError> {
         match timeout(self.timeout, self.available.acquire()).await {
-            Ok(Ok(permit)) => {
-                self.active_validations.fetch_add(1, Ordering::SeqCst);
-                Ok(ValidationPermit {
-                    _permit: permit,
-                    pool: self.clone(),
-                })
-            }
+            Ok(Ok(permit)) => Ok(ValidationPermit { _permit: permit }),
             Ok(Err(e)) => Err(NodeError::Network(format!(
                 "Failed to acquire permit: {}",
                 e
@@ -885,16 +876,10 @@ impl Default for ValidationPool {
     }
 }
 
-// RAII guard for validation permits
+// RAII holder for a validation permit: keeps the semaphore permit alive until dropped
+// (the permit releases itself on drop).
 struct ValidationPermit<'a> {
     _permit: tokio::sync::SemaphorePermit<'a>,
-    pool: ValidationPool,
-}
-
-impl<'a> Drop for ValidationPermit<'a> {
-    fn drop(&mut self) {
-        self.pool.active_validations.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 //----------------------------------------------------------------------
@@ -1079,7 +1064,6 @@ pub struct Node {
     configured_seed_nodes: Arc<Vec<String>>,
 
     // Consensus state
-    tx_response_channels: Arc<RwLock<HashMap<String, oneshot::Sender<Option<Transaction>>>>>,
     tx_witness_cache: Arc<PLMutex<LruCache<String, Transaction>>>,
     pub validation_pool: Arc<ValidationPool>,
     validation_cache: Arc<DashMap<String, ValidationCacheEntry>>,
@@ -1350,7 +1334,6 @@ impl Node {
             validation_pool: Arc::new(ValidationPool::new()),
             validation_cache: Arc::new(DashMap::with_capacity(10000)),
             solicited_block_peers: Arc::new(DashMap::new()),
-            tx_response_channels: Arc::new(RwLock::new(HashMap::with_capacity(2000))),
             tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
             relay_dead_targets: Arc::new(PLMutex::new(LruCache::new(
                 // Must comfortably exceed the number of distinct dead tips a post-storm
@@ -1841,13 +1824,6 @@ impl Node {
             .collect()
     }
 
-    fn discovery_snapshot_urls() -> Vec<String> {
-        Self::discovery_bases()
-            .into_iter()
-            .map(|base| format!("{}/api/chain-snapshot", base))
-            .collect()
-    }
-
     fn discovery_blocks_urls() -> Vec<String> {
         if let Ok(url) = std::env::var("ALPHANUMERIC_BLOCKS_URL") {
             return vec![url];
@@ -1921,21 +1897,6 @@ impl Node {
             .is_ok()
     }
 
-    fn periodic_relay_sync_interval_secs() -> Option<u64> {
-        // Always on and LIVE: every node stays current with the network tip by
-        // pulling the relay on a short timer (block-time cadence), so new blocks —
-        // and any payments they carry — land within a few seconds with no restart
-        // and no configuration. The env var only tunes the cadence.
-        if let Ok(value) = std::env::var("ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                if parsed > 0 {
-                    return Some(parsed.clamp(1, 3600));
-                }
-            }
-        }
-        Some(DEFAULT_PERIODIC_RELAY_SYNC_INTERVAL_SECS)
-    }
-
     fn relay_sync_backfill_depth() -> u32 {
         // Default 64 (= CHECKPOINT_REORG_MARGIN, 2026-07-11): the forward relay
         // drain re-examines the finality-margin window below its tip, so a fork
@@ -1960,64 +1921,6 @@ impl Node {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 24)
-    }
-
-    fn json_height(value: Option<&Value>) -> Option<u32> {
-        value
-            .and_then(|value| value.get("height"))
-            .and_then(Value::as_u64)
-            .and_then(|height| u32::try_from(height).ok())
-    }
-
-    fn public_tip_height_from_snapshot(body: &Value) -> Option<u32> {
-        let mut best = 0u32;
-
-        if body
-            .get("canonical_verified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            if let Some(height) = Self::json_height(body.get("canonical_stats")) {
-                best = best.max(height);
-            }
-        }
-
-        if body
-            .get("observed_verified")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            if let Some(height) = Self::json_height(body.get("observed_stats")) {
-                best = best.max(height);
-            }
-        }
-
-        let source = body.get("source").and_then(Value::as_str).unwrap_or("");
-        let observed_source = body
-            .get("observed_source")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if matches!(source, "pending" | "push" | "snapshot" | "indexer")
-            || matches!(observed_source, "pending" | "push" | "snapshot" | "indexer")
-        {
-            if let Some(height) = Self::json_height(body.get("stats")) {
-                best = best.max(height);
-            }
-            if let Some(height) = Self::json_height(body.get("observed_stats")) {
-                best = best.max(height);
-            }
-        }
-
-        if let Some(height) = body
-            .get("diagnostics")
-            .and_then(|diagnostics| diagnostics.get("relay_backed_height"))
-            .and_then(Value::as_u64)
-            .and_then(|height| u32::try_from(height).ok())
-        {
-            best = best.max(height);
-        }
-
-        (best > 0).then_some(best)
     }
 
     async fn mark_block_relayed(&self, block: &Block) {
@@ -3028,12 +2931,6 @@ impl Node {
             0 => None,
             h => Some(h as u32),
         }
-    }
-
-    /// Reconcile to the beacon (thin wrapper kept for existing call sites). The real
-    /// work is the single always-converge op below.
-    async fn reconcile_to_beacon(&self, beacon: &TipBeaconInfo) {
-        let _ = self.converge_to_canonical(beacon).await;
     }
 
     /// Find the highest height at which the LOCAL chain agrees with the CANONICAL
@@ -4506,119 +4403,6 @@ impl Node {
         }
     }
 
-    async fn fetch_public_tip_height(&self) -> Result<Option<u32>, NodeError> {
-        let expected_network_id = hex::encode(self.network_id);
-        let mut best_height: Option<u32> = None;
-
-        for url in Self::discovery_snapshot_urls() {
-            let res = match self.http_client.get(url).send().await {
-                Ok(res) => res,
-                Err(e) => {
-                    debug!("Public tip check failed: {}", e);
-                    continue;
-                }
-            };
-
-            if !res.status().is_success() {
-                debug!("Public tip check returned {}", res.status());
-                continue;
-            }
-
-            let body = match res.json::<Value>().await {
-                Ok(body) => body,
-                Err(e) => {
-                    debug!("Public tip response parse failed: {}", e);
-                    continue;
-                }
-            };
-
-            let same_network = body
-                .get("network_id")
-                .and_then(Value::as_str)
-                .map(|network_id| network_id.eq_ignore_ascii_case(&expected_network_id))
-                .unwrap_or(false);
-            if !same_network {
-                continue;
-            }
-
-            if let Some(height) = Self::public_tip_height_from_snapshot(&body) {
-                best_height = Some(best_height.map_or(height, |best| best.max(height)));
-            }
-        }
-
-        Ok(best_height)
-    }
-
-    async fn best_connected_peer_height_for_mining(
-        &self,
-        max_wait: Duration,
-    ) -> Result<u32, NodeError> {
-        let peer_addrs = {
-            let peers = self.peers.read().await;
-            peers.keys().copied().collect::<Vec<_>>()
-        };
-
-        if peer_addrs.is_empty() {
-            return Err(NodeError::ConsensusFailure(
-                "no connected peers available for pre-mine sync".to_string(),
-            ));
-        }
-
-        let timeout_ms = u64::try_from(max_wait.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let peer_heights = timeout(max_wait, self.query_peer_heights(peer_addrs, timeout_ms))
-            .await
-            .map_err(|_| {
-                NodeError::ConsensusFailure(
-                    "connected peers did not report height before timeout".to_string(),
-                )
-            })?;
-
-        peer_heights
-            .first()
-            .map(|(_, height)| *height)
-            .ok_or_else(|| {
-                NodeError::ConsensusFailure("no connected peer reported chain height".to_string())
-            })
-    }
-
-    async fn guard_public_tip_before_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
-        // Prefer the FRESH signed beacon as the canonical network tip (the header
-        // snapshot lags by its publish interval). Fall back to the snapshot only if
-        // the beacon is unavailable, and fail open if neither is reachable.
-        let public_height = if let Some(beacon) = self.fetch_tip_beacon().await {
-            beacon.height
-        } else {
-            match timeout(max_wait, self.fetch_public_tip_height()).await {
-                Ok(Ok(Some(height))) => height,
-                Ok(Ok(None)) => return Ok(()),
-                Ok(Err(e)) => {
-                    debug!("Public tip check unavailable before mining: {}", e);
-                    return Ok(());
-                }
-                Err(_) => {
-                    debug!("Public tip check timed out before mining");
-                    return Ok(());
-                }
-            }
-        };
-
-        let local_height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
-        };
-
-        if local_height < public_height {
-            return Err(NodeError::ConsensusFailure(format!(
-                "verified network tip {} is ahead of local tip {}; mining paused until the node syncs",
-                public_height, local_height
-            )));
-        }
-
-        Ok(())
-    }
-
     async fn publish_discovery_state(&self, context: &str) {
         if let Err(e) = self.announce_to_discovery().await {
             debug!("{} discovery announce failed: {}", context, e);
@@ -6046,210 +5830,6 @@ impl Node {
         }
 
         Ok(result)
-    }
-
-    #[allow(dead_code)]
-    async fn scan_range_with_limit(
-        &self,
-        range: &ScanRange,
-        semaphore: Arc<Semaphore>,
-        limit: usize,
-    ) -> Result<HashSet<SocketAddr>, NodeError> {
-        let mut discovered = HashSet::new();
-
-        // Get addresses to scan based on network type
-        let mut addrs = match &range.network {
-            ScanNetwork::V4(net) => {
-                let mut addrs = Vec::new();
-                // Generate addresses from the subnet, but limit to reasonable number
-                for host in net.hosts().take(limit) {
-                    addrs.push(SocketAddr::new(IpAddr::V4(host), DEFAULT_PORT));
-                }
-                addrs
-            }
-            ScanNetwork::V6(net) => {
-                let mut addrs = Vec::new();
-                let mut rng = thread_rng();
-
-                // For IPv6, generate limited random addresses in the subnet
-                for _ in 0..limit.min(25) {
-                    let mut segments = [0u16; 8];
-
-                    // Copy prefix
-                    let prefix_len = (net.prefix_len() / 16) as usize;
-                    let prefix = net.addr().segments();
-                    segments[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
-
-                    // Randomize host part
-                    for segment in segments.iter_mut().skip(prefix_len) {
-                        *segment = rng.gen();
-                    }
-
-                    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(segments)), DEFAULT_PORT);
-                    addrs.push(addr);
-                }
-                addrs
-            }
-        };
-
-        // Randomize order for better distribution
-        addrs.shuffle(&mut thread_rng());
-
-        // Take only the first 'limit' addresses
-        addrs.truncate(limit);
-
-        // Concurrently scan addresses with improved error handling
-        let scan_tasks: Vec<_> = addrs
-            .into_iter()
-            .map(|addr| {
-                let permit = semaphore.clone().acquire_owned();
-                let node = self.clone();
-
-                tokio::spawn(async move {
-                    let _permit = permit.await.ok()?;
-
-                    if addr == node.bind_addr {
-                        return None;
-                    }
-
-                    // Quick TCP check with better timeout
-                    match tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
-                        .await
-                    {
-                        Ok(Ok(_)) => Some(addr),
-                        _ => None,
-                    }
-                })
-            })
-            .collect();
-
-        // Gather results
-        for result in futures::future::join_all(scan_tasks).await {
-            if let Ok(Some(addr)) = result {
-                discovered.insert(addr);
-            }
-        }
-
-        Ok(discovered)
-    }
-
-    #[allow(dead_code)]
-    async fn build_optimized_scan_ranges(
-        &self,
-        v4_addr: IpAddr,
-        v6_addr: Option<IpAddr>,
-    ) -> Result<Vec<ScanRange>, NodeError> {
-        let mut ranges = Vec::new();
-
-        // Add current peer subnet ranges first (most likely to find peers)
-        {
-            let peers = self.peers.read().await;
-            for (_, info) in peers.iter() {
-                // Direct access to subnet_group - it's not an Option
-                // Convert subnet group to scan range
-                match info.address.ip() {
-                    IpAddr::V4(ip) => {
-                        let octets = ip.octets();
-                        let subnet_str = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-
-                        if let Ok(net) = subnet_str.parse::<Ipv4Net>() {
-                            // Add with high priority
-                            ranges.push(ScanRange {
-                                network: ScanNetwork::V4(net),
-                                priority: 1, // Highest priority
-                            });
-                        }
-                    }
-                    IpAddr::V6(_) => {} // Skip IPv6 for now
-                }
-            }
-        }
-
-        // Add IPv4 subnet from current address (your likely subnet)
-        if let IpAddr::V4(ipv4) = v4_addr {
-            let octets = ipv4.octets();
-
-            // Current /24 subnet
-            let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
-            if let Ok(net) = subnet.parse::<Ipv4Net>() {
-                ranges.push(ScanRange {
-                    network: ScanNetwork::V4(net),
-                    priority: 1, // Highest priority
-                });
-            }
-
-            // Add adjacent subnets
-            for i in -2i32..=2i32 {
-                if i == 0 {
-                    continue;
-                }
-
-                // Try to handle wraparound properly
-                let third_octet = ((octets[2] as i32) + i) & 0xFF;
-                let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], third_octet);
-
-                if let Ok(net) = subnet.parse::<Ipv4Net>() {
-                    ranges.push(ScanRange {
-                        network: ScanNetwork::V4(net),
-                        priority: 2,
-                    });
-                }
-            }
-
-            // Add broader subnet (faster search across larger network)
-            let broader_subnet = format!("{}.{}.0.0/16", octets[0], octets[1]);
-            if let Ok(net) = broader_subnet.parse::<Ipv4Net>() {
-                ranges.push(ScanRange {
-                    network: ScanNetwork::V4(net),
-                    priority: 3,
-                });
-            }
-        }
-
-        // Add common cloud provider and ISP ranges
-        for &(range, priority) in &[
-            // Major cloud providers (likely to host nodes)
-            ("3.0.0.0/8", 3),   // AWS
-            ("35.0.0.0/8", 3),  // GCP
-            ("52.0.0.0/8", 3),  // AWS
-            ("104.0.0.0/8", 3), // Cloud
-            // ISP ranges
-            ("24.0.0.0/8", 4), // Comcast
-            ("71.0.0.0/8", 4), // AT&T
-            ("73.0.0.0/8", 4), // Verizon
-            // Private networks (for local testing)
-            ("192.168.0.0/16", 2), // Local
-            ("10.0.0.0/8", 3),     // Private
-        ] {
-            if let Ok(net) = range.parse::<Ipv4Net>() {
-                ranges.push(ScanRange {
-                    network: ScanNetwork::V4(net),
-                    priority,
-                });
-            }
-        }
-
-        // Add IPv6 ranges if available
-        if let Some(IpAddr::V6(ipv6)) = v6_addr {
-            let segments = ipv6.segments();
-            // Try to get a reasonable IPv6 subnet
-            let subnet = format!(
-                "{:x}:{:x}:{:x}:{:x}::/64",
-                segments[0], segments[1], segments[2], segments[3]
-            );
-
-            if let Ok(net) = subnet.parse::<Ipv6Net>() {
-                ranges.push(ScanRange {
-                    network: ScanNetwork::V6(net),
-                    priority: 5, // Lower priority since IPv6 is less common
-                });
-            }
-        }
-
-        // Sort ranges by priority (lower number = higher priority)
-        ranges.sort_by_key(|range| range.priority);
-
-        Ok(ranges)
     }
 
     async fn build_scan_ranges(
@@ -9390,18 +8970,10 @@ impl Node {
                 return Ok(Some(NetworkMessage::TxResponse { tx_id, tx: tx_opt }));
             }
 
-            NetworkMessage::TxResponse { tx_id, tx } => {
-                // A response is only handed to the request waiting for it (below). The witness cache
-                // is written solely after a signature verifies during block validation, so an
-                // unsolicited or mismatched response is neither trusted nor cached here.
-                let sender = {
-                    let mut channels = self.tx_response_channels.write().await;
-                    channels.remove(&tx_id)
-                };
-
-                if let Some(sender) = sender {
-                    let _ = sender.send(tx);
-                }
+            NetworkMessage::TxResponse { .. } => {
+                // Ignored here: the correlated request/response path is request_tx_witness,
+                // which matches its reply synchronously via send_message_with_response and does
+                // not route through this dispatch. A TxResponse arriving here is unsolicited.
             }
 
             NetworkMessage::Transaction(tx_data) => {
