@@ -56,6 +56,37 @@ fn is_lan_or_local(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// True if an SDP candidate's connection-address (whitespace token 4) is a LAN/private/
+/// link-local IP. Works for both full `a=candidate:` SDP lines and bare `candidate:` trickle
+/// strings — the connection-address is token 4 in both layouts (see the leak test).
+fn candidate_line_is_local(cand: &str) -> bool {
+    cand.split_whitespace()
+        .nth(4)
+        .and_then(|tok| tok.parse::<std::net::IpAddr>().ok())
+        .map(is_lan_or_local)
+        .unwrap_or(false)
+}
+
+/// Rebuild an SDP dropping any `a=candidate:` line whose connection-address is LAN/private.
+/// build_api's ip_filter only vets LOCALLY gathered candidates; a remote peer's candidates
+/// arrive un-vetted inside its bundled SDP, so a malicious-but-authenticated peer could list
+/// private/link-local addresses that our ICE agent would then send STUN connectivity checks to
+/// (an internal-probe / SSRF reflection primitive). Filtering to the SAME is_lan_or_local
+/// predicate proven on the outbound side removes it. Public server-reflexive candidates keep a
+/// public connection-address and are preserved, so real connectivity is unaffected; mDNS
+/// `.local` hostnames don't parse as an IpAddr and pass through harmlessly (mDNS is disabled).
+fn strip_local_candidates_from_sdp(sdp: &str) -> String {
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.lines() {
+        if line.trim_start().starts_with("a=candidate:") && candidate_line_is_local(line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
+}
+
 /// Build a webrtc API handle (data-channel only; no media codecs). Reused for all peer connections.
 ///
 /// Configured for an INTERNET-only mesh: miners are across the internet, not a LAN. We disable mDNS
@@ -133,7 +164,10 @@ pub async fn set_local_and_gather(
 ) -> Result<RTCSessionDescription, Box<dyn std::error::Error + Send + Sync>> {
     let mut gather_complete = pc.gathering_complete_promise().await;
     pc.set_local_description(desc).await?;
-    let _ = gather_complete.recv().await;
+    // Bound the wait so a peer whose STUN gathering never completes can't hang the handshake
+    // indefinitely. On elapse proceed best-effort: local_description() still returns whatever
+    // candidates were gathered so far, preserving the non-trickle single-exchange model.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), gather_complete.recv()).await;
     pc.local_description()
         .await
         .ok_or_else(|| "no local description after gathering".into())
@@ -680,6 +714,16 @@ impl WebRtcMesh {
                 let _ = pc.close().await;
                 return Err("mesh shut down".to_string());
             }
+            // Enforce the connection cap under the SAME lock as the insert. dial()/handle_offer()
+            // check len < MESH_MAX_CONNS and then drop the lock before we re-take it here, so
+            // concurrent dials/offers could each pass that outer check and all insert, blowing the
+            // bound (unbounded RTCPeerConnections/UDP sockets). The !contains_key guard keeps a
+            // re-insert for an existing peer (which doesn't grow len) from being spuriously rejected.
+            if !conns.contains_key(peer_id) && conns.len() >= MESH_MAX_CONNS {
+                drop(conns);
+                let _ = pc.close().await;
+                return Err("mesh at capacity".to_string());
+            }
             conns.insert(peer_id.to_string(), PeerConn { pc: pc.clone(), created: Instant::now() });
         }
         Ok(pc)
@@ -757,11 +801,19 @@ impl WebRtcMesh {
         if self.conns.lock().await.len() >= MESH_MAX_CONNS {
             return Ok(false);
         }
+        // Throttle a peer whose negotiations keep failing: each accepted offer spins up a full
+        // RTCPeerConnection + STUN gather, so unbounded retries are a resource drain. Reuse the
+        // exponential dial backoff — we are the polite (higher-id) side here and by construction
+        // never dial `from`, so a backoff entry on `from` gates only this offer path.
+        if !self.dial_allowed(from).await {
+            return Ok(false);
+        }
         let pc = self.new_pc(from).await?;
         match self.negotiate_answer(&pc, from, sdp).await {
             Ok(()) => Ok(true),
             Err(e) => {
                 self.remove_if_current_and_close(from, &pc).await;
+                self.note_dial_failure(from).await;
                 Err(e)
             }
         }
@@ -773,7 +825,8 @@ impl WebRtcMesh {
         from: &str,
         sdp: &str,
     ) -> Result<(), String> {
-        let remote = RTCSessionDescription::offer(sdp.to_string()).map_err(|e| e.to_string())?;
+        let remote = RTCSessionDescription::offer(strip_local_candidates_from_sdp(sdp))
+            .map_err(|e| e.to_string())?;
         pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
         let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
         let answer = set_local_and_gather(pc, answer).await.map_err(|e| e.to_string())?;
@@ -789,7 +842,8 @@ impl WebRtcMesh {
             if matches!(pc.connection_state(), St::Connected) {
                 return Ok(false);
             }
-            let remote = RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?;
+            let remote = RTCSessionDescription::answer(strip_local_candidates_from_sdp(sdp))
+                .map_err(|e| e.to_string())?;
             pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
             return Ok(true);
         }
@@ -805,6 +859,11 @@ impl WebRtcMesh {
         let pc = self.conns.lock().await.get(from).map(|c| c.pc.clone());
         if let Some(pc) = pc {
             if matches!(pc.connection_state(), St::Connected) {
+                return Ok(false);
+            }
+            // Drop a trickle candidate pointing at a LAN/private address (same reason as the
+            // remote-SDP filter): never feed it to the ICE agent to probe.
+            if candidate_line_is_local(cand) {
                 return Ok(false);
             }
             let init = RTCIceCandidateInit {
@@ -922,6 +981,31 @@ mod tests {
         use ring::rand::SystemRandom;
         use ring::signature::Ed25519KeyPair;
         Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref().to_vec()
+    }
+
+    // A remote peer's candidates arrive un-vetted inside its SDP. The strip filter must drop
+    // private/LAN connection-addresses (an internal-probe primitive) while preserving public
+    // server-reflexive candidates so real connectivity survives.
+    #[test]
+    fn strip_local_candidates_keeps_public_srflx_drops_private_host() {
+        let public = "a=candidate:1 1 udp 1677729535 8.8.8.8 3478 typ srflx raddr 0.0.0.0 rport 0";
+        let private = "a=candidate:2 1 udp 2122260223 192.168.1.5 54321 typ host";
+        let linklocal = "a=candidate:3 1 udp 2122260223 169.254.1.1 54321 typ host";
+        let sdp = format!("v=0\r\n{public}\r\n{private}\r\n{linklocal}\r\nm=application 9 UDP/DTLS/SCTP\r\n");
+
+        let out = strip_local_candidates_from_sdp(&sdp);
+        assert!(out.contains("8.8.8.8"), "public srflx candidate must be preserved");
+        assert!(!out.contains("192.168.1.5"), "private host candidate must be stripped");
+        assert!(!out.contains("169.254.1.1"), "link-local candidate must be stripped");
+        assert!(out.contains("v=0") && out.contains("m=application"), "non-candidate lines survive");
+
+        // The per-line predicate: public passes, private/link-local are flagged local.
+        assert!(!candidate_line_is_local(public));
+        assert!(candidate_line_is_local(private));
+        assert!(candidate_line_is_local(linklocal));
+        // A trickle candidate string (no "a=" prefix) uses the same token-4 layout.
+        assert!(candidate_line_is_local("candidate:2 1 udp 2122260223 10.0.0.9 54321 typ host"));
+        assert!(!candidate_line_is_local("candidate:1 1 udp 1677729535 8.8.8.8 3478 typ srflx"));
     }
 
     // The topology guarantee that was broken before: with the OLD "dial the 12 globally-smallest ids"
