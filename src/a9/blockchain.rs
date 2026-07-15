@@ -771,6 +771,8 @@ pub enum BlockchainError {
     InvalidTransactionSignature,
     InvalidBlockKeys(String),
     InvalidSystemTransaction,
+    /// A block repeats a non-coinbase transaction id.
+    DuplicateTransaction,
     BatchValidationFailed(Vec<usize>),
 }
 
@@ -804,6 +806,9 @@ impl fmt::Display for BlockchainError {
             }
             BlockchainError::InvalidBlockKeys(e) => write!(f, "Invalid block keys: {}", e),
             BlockchainError::InvalidSystemTransaction => write!(f, "Invalid system transaction"),
+            BlockchainError::DuplicateTransaction => {
+                write!(f, "Block repeats a non-coinbase transaction id")
+            }
             BlockchainError::BatchValidationFailed(errors) => {
                 write!(f, "Batch validation failed with {} errors", errors.len())
             }
@@ -4741,6 +4746,22 @@ impl Blockchain {
         hash_int <= target
     }
 
+    /// True if `transactions` repeats a non-coinbase transaction id. Coinbase (`MINING_REWARDS`)
+    /// entries are exempt — single-coinbase positioning and reward correctness are enforced
+    /// separately.
+    fn has_duplicate_regular_tx(transactions: &[Transaction]) -> bool {
+        let mut seen = HashSet::with_capacity(transactions.len());
+        for tx in transactions {
+            if tx.sender == "MINING_REWARDS" {
+                continue;
+            }
+            if !seen.insert(tx.get_tx_id()) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn validate_block(&self, block: &Block) -> Result<(), BlockchainError> {
         self.validate_block_internal(block, SignatureValidationMode::AllowTruncatedStored)
             .await
@@ -4763,6 +4784,15 @@ impl Blockchain {
         // further per-transaction work. Finalized history is small and unaffected.
         if block.transactions.len() > MAX_BLOCK_TX_COUNT {
             return Err(BlockchainError::InvalidBlockHeader);
+        }
+
+        // Intra-block transaction-id uniqueness: a block must not contain the same non-coinbase
+        // transaction more than once. Honest block construction never produces this (the mempool
+        // is keyed by tx_id and block assembly emits each entry once), so it never affects a
+        // legitimately-built block. Deterministic, no lock/IO/state; enforced on every ingress
+        // path (tip-extension, reorg, receipt/full sync all route through here).
+        if Self::has_duplicate_regular_tx(&block.transactions) {
+            return Err(BlockchainError::DuplicateTransaction);
         }
 
         // Verify merkle root matches transactions
@@ -6742,6 +6772,96 @@ mod tests {
         );
         tx.pub_key = wallet.get_public_key_hex().await;
         tx
+    }
+
+    // ===== intra-block transaction-uniqueness rule =====
+
+    // The predicate flags a repeated non-coinbase tx_id and exempts coinbase entries.
+    #[test]
+    fn has_duplicate_regular_tx_detects_dups_and_exempts_coinbase() {
+        let a = user_tx("alice", "bob", 1.0, 100);
+        let b = user_tx("alice", "carol", 2.0, 200);
+
+        assert!(!Blockchain::has_duplicate_regular_tx(&[a.clone(), b.clone()]));
+        assert!(Blockchain::has_duplicate_regular_tx(&[a.clone(), a.clone()]));
+
+        // Two entries with the same id but different signature bytes are still a duplicate.
+        let mut a_resigned = a.clone();
+        a_resigned.signature = Some("bb".repeat(2400));
+        assert_eq!(a.get_tx_id(), a_resigned.get_tx_id());
+        assert!(Blockchain::has_duplicate_regular_tx(&[a.clone(), a_resigned]));
+
+        // Coinbase (MINING_REWARDS) entries are exempt even when identical.
+        let coinbase = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "miner".to_string(),
+            fee_units: 0,
+            amount_units: Transaction::to_units(50.0),
+            timestamp: 1,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        assert!(!Blockchain::has_duplicate_regular_tx(&[
+            coinbase.clone(),
+            coinbase.clone(),
+            a
+        ]));
+    }
+
+    // End-to-end: validate_block rejects a duplicate-tx block at any height (the rule is
+    // ALWAYS-ON). Asserting the specific DuplicateTransaction variant makes this isolating: the C1
+    // check runs before the merkle/difficulty/parent gates, so it is the FIRST to fire; if the
+    // enforcement call were removed the block would be rejected by a later gate with a DIFFERENT
+    // variant and this assertion would fail (confirmed separately via mutation testing).
+    #[tokio::test]
+    async fn validate_block_rejects_duplicate_tx() {
+        let bc = test_blockchain();
+        let tx = user_tx("alice", "bob", 1.0, 1234);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // A duplicate-tx block at an ordinary height is rejected as DuplicateTransaction.
+        let dup = vec![tx.clone(), tx.clone()];
+        assert!(Blockchain::has_duplicate_regular_tx(&dup));
+        let merkle_root = Blockchain::calculate_merkle_root(&dup).unwrap();
+        let mut block = Block {
+            index: 7,
+            previous_hash: [0u8; 32],
+            timestamp: now,
+            transactions: dup,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+        assert!(block.validate_header().is_ok(), "crafted block header should be valid");
+        assert!(
+            matches!(
+                bc.validate_block(&block).await,
+                Err(BlockchainError::DuplicateTransaction)
+            ),
+            "a duplicate-tx block must be rejected as DuplicateTransaction"
+        );
+
+        // Control: an honest (distinct-tx) block at the SAME height is NOT flagged as a duplicate —
+        // it fails later (parent linkage), never with DuplicateTransaction. Proves the rule fires
+        // only on duplicates, not as a blanket rejection.
+        let honest = vec![tx.clone(), user_tx("alice", "carol", 2.0, 5678)];
+        let mut honest_block = block.clone();
+        honest_block.merkle_root = Blockchain::calculate_merkle_root(&honest).unwrap();
+        honest_block.transactions = honest;
+        honest_block.hash = honest_block.calculate_hash_for_block();
+        assert!(
+            !matches!(
+                bc.validate_block(&honest_block).await,
+                Err(BlockchainError::DuplicateTransaction)
+            ),
+            "an honest (non-duplicate) block must NOT be rejected as DuplicateTransaction"
+        );
     }
 
     // Invariant behind verified-only witness caching: get_tx_id() covers sender:recipient:amount:
