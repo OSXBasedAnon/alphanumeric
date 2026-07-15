@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::a9::codec;
-use crate::a9::mempool::{Mempool, TemporalVerification};
+use crate::a9::mempool::Mempool;
 use crate::a9::mldsa;
 use crate::a9::oracle::DifficultyOracle;
 use crate::a9::wallet::Wallet;
@@ -1034,7 +1034,6 @@ pub struct Blockchain {
     pub rate_limiter: Arc<RateLimiter>,
     mempool: Arc<RwLock<Mempool>>,
     pub chain_sentinel: Arc<ChainSentinel>,
-    pub temporal_verification: TemporalVerification,
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
     state_mutation_lock: Arc<Mutex<()>>,
     /// Single-flight gate for balances-index maintenance (rebuild / catch-up).
@@ -3911,6 +3910,42 @@ impl Blockchain {
         details
     }
 
+    /// Batched form of the M06 overlay for the local-miner affordability gates: the total
+    /// still-immature MINING_REWARDS credited to each recipient at `spend_height`, computed in
+    /// ONE pass over the maturity window instead of one per transaction. For any address the
+    /// returned value equals `immature_reward_units_scan(address, spend_height, &[])` exactly —
+    /// same window [spend_height-MATURITY+1, spend_height), same MINING_REWARDS filter, same
+    /// below-activation cutoff, and the block's own (in-flight) coinbase excluded — so a
+    /// per-sender lookup is byte-identical to the per-tx scan while turning a full block's
+    /// O(tx x MATURITY) block reads into O(MATURITY), keeping the gates well under the miner's
+    /// solve-validation timeout as blocks fill.
+    fn immature_rewards_by_recipient(
+        &self,
+        transactions: &[Transaction],
+        spend_height: u32,
+    ) -> HashMap<String, i128> {
+        let mut immature_by_addr: HashMap<String, i128> = HashMap::new();
+        let has_regular_sender = transactions.iter().any(|tx| tx.sender != "MINING_REWARDS");
+        if !has_regular_sender || spend_height < MATURITY_ACTIVATION_HEIGHT {
+            return immature_by_addr;
+        }
+        let spend_height = spend_height as u64;
+        let low = spend_height
+            .saturating_sub(MINING_REWARD_MATURITY as u64)
+            .saturating_add(1);
+        for rh in low..spend_height {
+            if let Ok(b) = self.get_block(rh as u32) {
+                for tx in &b.transactions {
+                    if tx.sender == "MINING_REWARDS" {
+                        *immature_by_addr.entry(tx.recipient.clone()).or_default() +=
+                            tx.amount_units;
+                    }
+                }
+            }
+        }
+        immature_by_addr
+    }
+
     /// Dry-run: would the chain formed by canonical blocks below `fork_start`
     /// plus `branch` keep every sender solvent at each step? Reads only; used to
     /// reject a reorg to a competing branch that double-spends or overspends
@@ -3980,7 +4015,6 @@ impl Blockchain {
             rate_limiter,
             mempool: Arc::new(RwLock::new(Mempool::new())),
             chain_sentinel,
-            temporal_verification: TemporalVerification::new(),
             signature_cache,
             state_mutation_lock: Arc::new(Mutex::new(())),
             balances_index_gate: Arc::new(Mutex::new(())),
@@ -4301,6 +4335,13 @@ impl Blockchain {
         set_finalize_stage(2);
         trace_step("prefetch_balances");
 
+        // Precompute the M06 immature-reward overlay once for the whole block instead of
+        // re-scanning the maturity window per transaction (equal value-for-value; see
+        // immature_rewards_by_recipient). in_flight = &[] semantics preserved: the block's own
+        // coinbase is excluded, matching the per-tx scan and the authoritative apply below.
+        let immature_by_addr =
+            self.immature_rewards_by_recipient(&block.transactions, block.index);
+
         // Second pass: Validate transactions and track effects
         for tx in &block.transactions {
             if tx.sender == "MINING_REWARDS" {
@@ -4319,8 +4360,7 @@ impl Blockchain {
             // credit, making this gate exactly one reward R stricter than consensus and rejecting a
             // valid full-spendable self-spend — the "Insufficient funds while mining" burn
             // (2026-07-12 audit). &[] matches add_transaction and the authority exactly.
-            let immature =
-                self.immature_reward_units_scan(&tx.sender, block.index as u64, &[]);
+            let immature = immature_by_addr.get(&tx.sender).copied().unwrap_or(0);
             let available = confirmed - pending - immature;
             let required = tx.total_debit_units();
 
@@ -4984,6 +5024,12 @@ impl Blockchain {
             confirmed_balances.insert(sender.clone(), balance_units);
         }
 
+        // Precompute the M06 immature-reward overlay once for the whole block instead of
+        // re-scanning the maturity window per transaction (equal value-for-value; see
+        // immature_rewards_by_recipient). in_flight = &[] semantics preserved.
+        let immature_by_addr =
+            self.immature_rewards_by_recipient(&block.transactions, block.index);
+
         // Validate each regular transaction
         for tx in regular_transactions {
             if !tx.has_valid_regular_amounts() {
@@ -5014,8 +5060,7 @@ impl Blockchain {
             // block's own coinbase is not credited into current_confirmed/pending_deducted, so
             // subtracting it via immature made this gate one reward stricter than the authoritative
             // apply (where the coinbase cancels) and burned valid self-spend solves (2026-07-12).
-            let immature =
-                self.immature_reward_units_scan(&tx.sender, block.index as u64, &[]);
+            let immature = immature_by_addr.get(&tx.sender).copied().unwrap_or(0);
             let available_balance = current_confirmed - pending_deducted - immature;
             let required_amount = tx.total_debit_units();
 
@@ -6745,6 +6790,93 @@ mod tests {
             bc.immature_reward_units_scan("W", 100, std::slice::from_ref(&own_coinbase)),
             0
         );
+    }
+
+    /// The hoisted precompute the local-miner gates now use (immature_rewards_by_recipient)
+    /// must return, for EVERY address, the byte-identical i128 that the per-transaction
+    /// immature_reward_units_scan(addr, height, &[]) returned — the gates' accept/reject
+    /// verdict depends on that equivalence. Also pins the crux that the map excludes the
+    /// block's own (in-flight) coinbase, exactly matching the &[] the gates pass.
+    #[test]
+    fn immature_rewards_by_recipient_matches_per_tx_scan() {
+        let bc = test_blockchain();
+        let mat = MINING_REWARD_MATURITY as u64;
+        let spend_height = MATURITY_ACTIVATION_HEIGHT as u64 + 200; // past activation
+        let window_low = spend_height - mat + 1;
+
+        // Two stored coinbases to alice and one to bob INSIDE the window
+        // [spend_height-MAT+1, spend_height); one to carol BELOW it (must not count).
+        for (h, miner) in [
+            (window_low, "alice"),
+            (window_low + 30, "bob"),
+            (spend_height - 2, "alice"),
+            (window_low - 5, "carol"),
+        ] {
+            insert_raw_block(&bc, &metadata_test_block(h as u32, [0u8; 32], miner, 10.0));
+        }
+
+        // Block being validated at spend_height: its OWN coinbase to alice, then regular spends.
+        let mut txs = vec![Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "alice".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(10.0),
+            timestamp: 1_000,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }];
+        for s in ["alice", "bob", "carol", "dave"] {
+            txs.push(Transaction {
+                sender: s.to_string(),
+                recipient: "zzz".to_string(),
+                fee_units: Transaction::to_units(NETWORK_FEE),
+                amount_units: Transaction::to_units(1.0),
+                timestamp: 1_000,
+                signature: Some(hex::encode(vec![1u8; 128])),
+                pub_key: None,
+                sig_hash: None,
+            });
+        }
+
+        // Value-for-value equivalence with the per-tx &[] scan, for every address touched.
+        let map = bc.immature_rewards_by_recipient(&txs, spend_height as u32);
+        for s in ["alice", "bob", "carol", "dave", "MINING_REWARDS", "zzz"] {
+            assert_eq!(
+                map.get(s).copied().unwrap_or(0),
+                bc.immature_reward_units_scan(s, spend_height, &[]),
+                "map must equal the per-tx &[] scan for {s}"
+            );
+        }
+
+        // Crux: the map counts only in-window stored rewards and EXCLUDES the in-flight coinbase.
+        assert_eq!(
+            map.get("alice").copied().unwrap_or(0),
+            Transaction::to_units(20.0),
+            "alice has two in-window stored rewards; the block's own coinbase is not counted"
+        );
+        assert!(
+            bc.immature_reward_units_scan("alice", spend_height, &txs)
+                > map.get("alice").copied().unwrap_or(0),
+            "the in-flight coinbase inflates immature — the gates must use the &[] map"
+        );
+        assert_eq!(
+            map.get("carol").copied().unwrap_or(0),
+            0,
+            "carol's only reward is below the maturity window"
+        );
+
+        // Below the activation height the overlay is inert (empty map, scan 0), and at the
+        // exact boundary it engages — both must still agree with the scan.
+        let below = bc.immature_rewards_by_recipient(&txs, MATURITY_ACTIVATION_HEIGHT - 1);
+        assert!(below.is_empty(), "overlay is empty below the activation height");
+        for s in ["alice", "bob"] {
+            assert_eq!(
+                below.get(s).copied().unwrap_or(0),
+                bc.immature_reward_units_scan(s, (MATURITY_ACTIVATION_HEIGHT - 1) as u64, &[]),
+                "below activation both the map and the scan must be 0 for {s}"
+            );
+        }
     }
 
     /// The block reward is well-formed across the ENTIRE emission timeline,

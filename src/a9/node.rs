@@ -60,7 +60,6 @@ use crate::a9::blockchain::{
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
-use crate::a9::mempool::TemporalVerification;
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
 
 //----------------------------------------------------------------------
@@ -1091,7 +1090,6 @@ pub struct Node {
     tx: broadcast::Sender<NetworkEvent>,
 
     // Feature components
-    pub temporal_verification: Arc<TemporalVerification>,
     pub header_sentinel: Option<Arc<HeaderSentinel>>,
     pub velocity_manager: Option<Arc<VelocityManager>>,
 
@@ -1269,7 +1267,6 @@ impl Node {
 
         let witness_cache_capacity = Self::witness_cache_capacity();
         let peer_id = PeerId::from(p2p_key.public()).to_string();
-        let temporal_verification = Arc::new(TemporalVerification::new());
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -1395,7 +1392,6 @@ impl Node {
             last_stats_snapshot_at: Arc::new(AtomicU64::new(0)),
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
-            temporal_verification,
             header_sentinel: Some(Arc::new(HeaderSentinel::new())),
             lock_path: Arc::new(lock_path.to_string_lossy().into_owned()),
             velocity_manager,
