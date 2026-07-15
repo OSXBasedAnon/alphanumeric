@@ -27,6 +27,13 @@ pub fn validate_public_key(public_key: &[u8]) -> Result<(), String> {
     verifying_key_from_public(public_key).map(|_| ())
 }
 
+/// Derive the public (verifying) key from a secret seed, in the same encoding `generate_keypair`
+/// produces. Used to check that a loaded key file's stored public key really matches its secret.
+pub fn public_key_from_secret(secret_key: &[u8]) -> Result<Vec<u8>, String> {
+    let signing_key = signing_key_from_secret(secret_key)?;
+    Ok(signing_key.verifying_key().encode().to_vec())
+}
+
 pub fn sign(message: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, String> {
     let signing_key = signing_key_from_secret(secret_key)?;
     let signature: Signature<MlDsa87> = signing_key.sign(message);

@@ -98,6 +98,16 @@ impl Wallet {
             return Err("Invalid key data: malformed ML-DSA public key".to_string());
         }
 
+        // Bind the public key to the secret seed: reject a key file whose stored public key is not
+        // the one derived from the secret (bit-rot, a hand-edited/merged file, a bad restore).
+        // Without this the wallet would sign with the seed's real key but advertise a different
+        // address, silently making the transactions it produces unverifiable and any funds it
+        // received unspendable.
+        let derived_public = mldsa::public_key_from_secret(secret_bytes)?;
+        if derived_public.as_slice() != public_bytes {
+            return Err("Invalid key data: public key does not match the secret key".to_string());
+        }
+
         Ok((secret_bytes, public_bytes))
     }
 
@@ -271,5 +281,28 @@ impl Wallet {
         cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| "Decryption failed. Invalid passphrase or corrupted data".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A key file whose stored public key is not the one derived from the secret seed must be
+    // rejected, even though each half is individually well-formed.
+    #[test]
+    fn split_rejects_public_key_not_bound_to_secret() {
+        let (pub_a, sec_a) = mldsa::generate_keypair();
+        let (pub_b, _sec_b) = mldsa::generate_keypair();
+
+        // Matching secret+public: accepted.
+        let mut good = sec_a.clone();
+        good.extend_from_slice(&pub_a);
+        assert!(Wallet::split_combined_key_bytes(&good).is_ok());
+
+        // secret from A + public from B (each valid, but not bound to each other): rejected.
+        let mut mismatched = sec_a;
+        mismatched.extend_from_slice(&pub_b);
+        assert!(Wallet::split_combined_key_bytes(&mismatched).is_err());
     }
 }
