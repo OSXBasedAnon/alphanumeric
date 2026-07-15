@@ -927,7 +927,14 @@ impl RateLimiter {
     pub fn check_limit(&self, address: &str) -> bool {
         let now = tokio::time::Instant::now();
         let window_secs = self.window_size.num_seconds() as u64;
-        let cutoff = now - std::time::Duration::from_secs(window_secs);
+        // The monotonic clock is boot-relative, so `now - window` underflows in the first
+        // `window` seconds after boot; the std Instant subtraction panics on underflow (and
+        // panic=unwind would tear down the request task). Saturate to `now` instead — the
+        // window briefly collapses to the current instant (fail-open) until the clock passes
+        // the window. Value-identical for every non-underflow case.
+        let cutoff = now
+            .checked_sub(std::time::Duration::from_secs(window_secs))
+            .unwrap_or(now);
 
         // Evict idle keys periodically so `windows` can't grow without bound: a key whose newest
         // timestamp has aged past the window is never revisited otherwise. Swept BEFORE taking the
@@ -2948,7 +2955,11 @@ impl Blockchain {
         let mut reverted_txs: Vec<Transaction> = Vec::new();
         for h in fork_start..=tip.index {
             if let Ok(old) = self.get_block(h) {
-                let _ = self.remove_confirmed_txs(&old);
+                // Fatal, like every other write in this marker-protected window: a swallowed
+                // failure would leave a reverted, not-re-confirmed tx registered and later
+                // reject its legitimate re-mine as a false replay. Returning Err aborts the
+                // reorg with the dirty marker still set, so recovery rebuilds the registry.
+                self.remove_confirmed_txs(&old)?;
                 for tx in &old.transactions {
                     if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                         continue;
@@ -2995,9 +3006,11 @@ impl Blockchain {
         self.prune_orphans()?;
 
         // Register the newly-canonical branch's transactions in the replay registry,
-        // then prune anything now past the freshness window.
+        // then prune anything now past the freshness window. Fatal (like the revert above):
+        // a swallowed failure would leave the adopted branch's txs unregistered so a later
+        // block could replay one; returning Err keeps the dirty marker set for recovery.
         for b in &branch {
-            let _ = self.record_confirmed_txs(b);
+            self.record_confirmed_txs(b)?;
         }
         let _ = self.prune_confirmed_txs(branch_tip.timestamp);
 
@@ -3265,8 +3278,19 @@ impl Blockchain {
 
         // Register this block's transactions in the replay registry so any later
         // block that re-includes one is rejected as a replay, then prune entries
-        // now past the freshness window so the registry stays bounded.
-        let _ = self.record_confirmed_txs(block);
+        // now past the freshness window so the registry stays bounded. The register
+        // write must be fatal: swallowing a failure here would commit the block (below)
+        // with its transactions absent from the registry AND clear the dirty marker, so
+        // startup recovery would never rebuild it — and the replay guard would later miss
+        // a re-mine of one of these confirmed payments. Returning Err leaves the marker set
+        // (and the block unstored), so recovery heals the registry from the canonical chain.
+        if let Err(err) = self.record_confirmed_txs(block) {
+            warn!(
+                "Block {} replay-registry write failed; dirty marker remains for startup recovery: {}",
+                block.index, err
+            );
+            return Err(err);
+        }
         let _ = self.prune_confirmed_txs(block.timestamp);
 
         // Store block with truncated signatures to reduce chain size
@@ -4430,14 +4454,29 @@ impl Blockchain {
         // between the block commit and these derived-state writes must leave the
         // dirty marker set so startup recovery force-rebuilds the registry and the
         // address index instead of silently missing this block's entries.
-        let _ = self.record_confirmed_txs(&block);
-        let _ = self.prune_confirmed_txs(block.timestamp);
+        // Evict the now-confirmed txs from the in-memory mempool FIRST (closes the window
+        // where the miner re-selects them into the next template before a restart), then
+        // register them in the replay registry.
         {
             let mut mempool = self.mempool.write().await;
             for tx in &block.transactions {
                 mempool.clear_transaction(tx);
             }
         }
+        // The registry write is fatal: on failure, return Err here — skipping
+        // clear_chain_state_dirty below — so the dirty marker survives and startup recovery
+        // force-rebuilds the registry from the canonical chain. Swallowing it would commit the
+        // block with its txs unregistered AND clear the recovery signal, letting the replay
+        // guard later miss a re-mine of one of these payments. (Kept out of any await scope:
+        // BlockchainError is !Send.)
+        if let Err(err) = self.record_confirmed_txs(&block) {
+            warn!(
+                "Finalized block {} replay-registry write failed; leaving dirty marker for startup recovery: {}",
+                block.index, err
+            );
+            return Err(err);
+        }
+        let _ = self.prune_confirmed_txs(block.timestamp);
         self.clear_chain_state_dirty()?;
 
         self.notify_tip_changed(&block);
@@ -5894,8 +5933,12 @@ impl Blockchain {
             return Ok(balance_units);
         }
         if auto_rebuild && index_height >= self.get_latest_block_index() {
-            let balance_units: i128 = 0;
-            balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
+            // Index is current and the address has no entry, so its confirmed balance is 0.
+            // Do NOT persist a 0-entry here: this is the read path (explorer / RPC balance
+            // queries for arbitrary addresses), and writing on read grows the balances tree
+            // without bound (sled never reclaims freed keys). Every later read of this address
+            // hits this same branch and returns 0 without a slow-path recompute; the consensus
+            // writer persists real entries for every address a block actually touches.
             return Ok(0);
         }
         // Slow path: calculate from blocks, then cache in balances tree.
@@ -6747,6 +6790,32 @@ mod tests {
             Transaction::to_units(bc.get_confirmed_balance("small").await.unwrap()),
             "below the onset the exact getter and the f64 round-trip must agree"
         );
+    }
+
+    /// A confirmed-balance read for an absent address on a current-index chain returns 0
+    /// WITHOUT persisting a phantom 0-entry. The old read-path write grew the balances tree
+    /// without bound (one key per explorer/RPC query of an arbitrary address; sled never
+    /// reclaims), while the returned value — and total supply — are unchanged.
+    #[tokio::test]
+    async fn confirmed_balance_read_does_not_persist_phantom_zero_entries() {
+        let bc = test_blockchain();
+        let tree = bc.db.open_tree(BALANCES_TREE).unwrap();
+
+        // Empty chain: index height 0 >= tip 0, so absent addresses take the current-index
+        // no-entry branch. Each reads back 0 and must leave the tree untouched.
+        for addr in ["nobody_1", "nobody_2", "nobody_3"] {
+            assert_eq!(bc.get_confirmed_balance_units(addr).await.unwrap(), 0);
+            assert!(
+                tree.get(addr.as_bytes()).unwrap().is_none(),
+                "reading an absent balance must not persist a 0-entry for {addr}"
+            );
+        }
+        // Reading is idempotent (still 0, still no entry) and real entries read back exactly.
+        assert_eq!(bc.get_confirmed_balance_units("nobody_1").await.unwrap(), 0);
+        assert!(tree.get("nobody_1".as_bytes()).unwrap().is_none());
+        tree.insert("funded".as_bytes(), codec::serialize(&12_345i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.get_confirmed_balance_units("funded").await.unwrap(), 12_345);
     }
 
     /// The mining affordability gates (validate_new_block / finalize_block) must pass
