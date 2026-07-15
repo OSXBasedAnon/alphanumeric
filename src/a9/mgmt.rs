@@ -359,10 +359,23 @@ impl Mgmt {
         std::io::stdin().read_line(&mut input)?;
 
         let (wallet_pass, is_encrypted) = if input.trim().to_lowercase() == "y" {
-            let pass = Password::new("Enter passphrase (or press Enter for no encryption):")
+            let pass = match Password::new("Enter passphrase (or press Enter for no encryption):")
                 .with_display_mode(PasswordDisplayMode::Masked)
                 .prompt()
-                .unwrap_or_default();
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    // The user asked to encrypt (typed "y"); a prompt failure (non-TTY, EOF,
+                    // terminal error) must NOT silently fall through to an unencrypted,
+                    // plaintext-on-disk wallet. Abort so they can retry.
+                    return Err(format!(
+                        "passphrase prompt failed ({}); aborting so the wallet is not created \
+                         unencrypted by mistake",
+                        e
+                    )
+                    .into());
+                }
+            };
 
             if !pass.trim().is_empty() {
                 let pass_bytes = pass.trim().as_bytes().to_vec();
