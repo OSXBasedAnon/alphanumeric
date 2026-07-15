@@ -2599,11 +2599,16 @@ impl HeaderSentinel {
 
     pub async fn should_enforce_consensus_for_block(&self, height: u32) -> bool {
         let _ = height;
-        if self.is_header_rules_v2_active() {
-            true
-        } else {
-            self.should_enforce_consensus_for_headers().await
-        }
+        // The only block-level action this gates is the conflicting-verified-header REJECT
+        // (node.rs block-accept path). Require real verifier context (>=3 eligible) in EVERY
+        // rules version: below that the header quorum is trivially forgeable — a single
+        // self-registered peer can get a conflicting header "verified" — so enforcing it on a
+        // bootstrapping or eclipsed node only lets one attacker wedge it off the true block
+        // while protecting nothing (PoW fork-choice still selects the canonical chain). v2
+        // previously enforced unconditionally, which WAS that wedge. Strictly lenient — a node
+        // now rejects fewer blocks, so it cannot be forked off — and the gated check is
+        // reject-only, so relaxing it can never admit a PoW/ledger-invalid block.
+        self.should_enforce_consensus_for_headers().await
     }
 
     pub fn should_require_verified_header_record_for_block(&self, height: u32) -> bool {
@@ -3108,6 +3113,30 @@ mod tests {
         assert!(sentinel.is_header_rules_v2_active());
         assert!(sentinel.should_require_verified_header_record_for_block(1));
         assert!(sentinel.should_require_verified_header_record_for_block(1_000_000));
+    }
+
+    // The conflicting-verified-header REJECT (gated by should_enforce_consensus_for_block) must
+    // only fire with real verifier context (>=3 eligible), even under always-on v2 rules. On a
+    // bootstrapping/eclipsed node (eligible<3) the quorum is forgeable, so enforcing it let one
+    // self-registered peer wedge the node off the true block. Lenient + reject-only: cannot fork
+    // a node or admit an invalid block.
+    #[tokio::test]
+    async fn block_consensus_enforcement_requires_three_eligible_even_in_v2() {
+        let sentinel = HeaderSentinel::new();
+        assert!(sentinel.is_header_rules_v2_active());
+        // Fresh node: <3 eligible verifiers -> do NOT enforce (was unconditionally true in v2).
+        assert!(!sentinel.should_enforce_consensus_for_block(1).await);
+        // Three registered verifier IPs -> enforcement engages.
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3".to_string(), reg_key(3, 3));
+        assert!(sentinel.should_enforce_consensus_for_block(1).await);
     }
 
     #[test]
