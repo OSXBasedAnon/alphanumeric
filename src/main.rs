@@ -4727,6 +4727,25 @@ async fn publish_bootstrap_snapshot(
     ));
     let export_dir_string = export_dir.to_string_lossy().to_string();
 
+    // Remove the temp zip and the re-imported DB export dir on EVERY exit path. Most of the
+    // early returns below propagate with `?` and would otherwise leak them; during a gateway
+    // outage the loop rebuilds and leaks a full-DB-sized zip every cycle, filling the disk shared
+    // with the live chain DB. RAII Drop runs on success and on any error return.
+    struct TempCleanup {
+        zip: std::path::PathBuf,
+        export_dir: std::path::PathBuf,
+    }
+    impl Drop for TempCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.zip);
+            let _ = std::fs::remove_dir_all(&self.export_dir);
+        }
+    }
+    let _temp_cleanup = TempCleanup {
+        zip: zip_path.clone(),
+        export_dir: export_dir.clone(),
+    };
+
     // Clone DB handle for spawn_blocking.
     let db_clone = db.clone();
 
@@ -4811,8 +4830,14 @@ async fn publish_bootstrap_snapshot(
     let sha256 = hex::encode(hasher.finalize());
 
     // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
+    // Bound every request so a blackholed/half-open connection (e.g. a tunnel flap) cannot block
+    // the publish loop forever and freeze the manifest: a tight connect timeout catches the common
+    // "can't (re)establish the connection" case fast on all requests, and a generous total timeout
+    // is the backstop for a stalled transfer — sized to comfortably cover the worst-case blob PUT.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(40 * 60))
         .build()?;
 
     // Step 1: upload the snapshot zip DIRECTLY to Vercel Blob (v7.6.5). The zip
