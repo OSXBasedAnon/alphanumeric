@@ -1,23 +1,16 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 use dashmap::DashMap;
 
-use crate::a9::blockchain::{Blockchain, BlockchainError, Transaction};
-use crate::a9::bpos::BlockHeaderInfo;
+use crate::a9::blockchain::{BlockchainError, Transaction};
 use crate::a9::codec;
-
-type CheckpointQueue = Arc<RwLock<VecDeque<([u8; 32], u64)>>>;
 
 const MEMPOOL_MAX_BYTES: usize = 50_000_000;
 const MEMPOOL_MAX_TRANSACTIONS: usize = 50_000;
 const MEMPOOL_MAX_PER_ADDRESS: usize = 100;
-const MAX_CHECKPOINT_HEADERS: usize = 1_000;
-const CHECKPOINT_INTERVAL: u64 = 300; // 5 minutes
 
 pub const MAX_BLOCK_SIZE: usize = 1_000_000;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 2_000;
@@ -532,172 +525,6 @@ impl Mempool {
 }
 
 impl Default for Mempool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug)]
-pub struct TemporalVerification {
-    verified_headers: Arc<DashMap<[u8; 32], u64>>,
-    checkpoint_hashes: CheckpointQueue,
-    last_checkpoint: Arc<RwLock<u64>>,
-}
-
-impl TemporalVerification {
-    const MAX_VERIFICATIONS: usize = 10_000;
-    const VERIFICATION_TIMEOUT: u64 = 3600; // 1 hour in seconds
-                                            // Initialize a new TemporalVerification struct
-    pub fn new() -> Self {
-        Self {
-            verified_headers: Arc::new(DashMap::new()),
-            checkpoint_hashes: Arc::new(RwLock::new(VecDeque::with_capacity(
-                MAX_CHECKPOINT_HEADERS,
-            ))),
-            last_checkpoint: Arc::new(RwLock::new(0)),
-        }
-    }
-
-    pub async fn initialize_from_blockchain(
-        &self,
-        blockchain: &Blockchain,
-    ) -> Result<(), BlockchainError> {
-        // Get all existing blocks
-        let blocks = blockchain.get_blocks();
-
-        // Clear existing verifications
-        self.verified_headers.clear();
-
-        // Add all existing blocks to the verification cache
-        for block in blocks {
-            let header_info = BlockHeaderInfo {
-                height: block.index,
-                hash: block.hash,
-                prev_hash: block.previous_hash,
-                timestamp: block.timestamp,
-            };
-            self.verified_headers.insert(block.hash, block.timestamp);
-
-            // Also add to checkpoint hashes if appropriate
-            if self
-                .verified_headers
-                .len()
-                .is_multiple_of(MAX_CHECKPOINT_HEADERS / 10)
-            {
-                self.update_checkpoint_hashes(&header_info).await;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn add_verification(&self, header: &BlockHeaderInfo) {
-        let now = self.current_timestamp();
-
-        // Cleanup old verifications
-        self.verified_headers
-            .retain(|_, timestamp| now.saturating_sub(*timestamp) < Self::VERIFICATION_TIMEOUT);
-
-        // Manage capacity
-        if self.verified_headers.len() >= Self::MAX_VERIFICATIONS {
-            let mut entries: Vec<_> = self.verified_headers.iter().collect();
-            entries.sort_by_key(|entry| *entry.value());
-
-            let to_remove = Self::MAX_VERIFICATIONS / 10;
-            for entry in entries.iter().take(to_remove) {
-                self.verified_headers.remove(entry.key());
-            }
-        }
-
-        let should_checkpoint = self
-            .last_checkpoint
-            .try_read()
-            .map(|last| now.saturating_sub(*last) >= CHECKPOINT_INTERVAL)
-            .unwrap_or(false);
-
-        // Add new verification
-        self.verified_headers.insert(header.hash, now);
-
-        // Trigger checkpoint if needed
-        if should_checkpoint {
-            let hash = header.hash;
-            let checkpoint_hashes = self.checkpoint_hashes.clone();
-            let last_checkpoint = self.last_checkpoint.clone();
-
-            tokio::spawn(async move {
-                let mut checkpoint_guard = checkpoint_hashes.write().await;
-                checkpoint_guard.push_back((hash, now));
-
-                if checkpoint_guard.len() > MAX_CHECKPOINT_HEADERS {
-                    checkpoint_guard.pop_front();
-                }
-
-                let mut last_guard = last_checkpoint.write().await;
-                *last_guard = now;
-            });
-        }
-    }
-
-    // Verify a header based on temporal consistency
-    pub fn verify_header(&self, header: &BlockHeaderInfo) -> bool {
-        // Special case for genesis block or first block after genesis
-        if header.height <= 1 {
-            return true;
-        }
-
-        // Regular verification
-        if let Some(last_verified_timestamp) = self.verified_headers.get(&header.prev_hash) {
-            let now = self.current_timestamp();
-            header.timestamp > *last_verified_timestamp && header.timestamp <= now
-        } else {
-            // Only fail if we should have the previous hash
-            header.height <= 1
-        }
-    }
-
-    // Add a verified header to the map and update checkpoint hashes
-    pub async fn add_verified_header(&self, header: &BlockHeaderInfo) {
-        self.verified_headers.insert(header.hash, header.timestamp);
-        self.update_checkpoint_hashes(header).await;
-    }
-
-    // Update the list of checkpoint hashes
-    async fn update_checkpoint_hashes(&self, header: &BlockHeaderInfo) {
-        let mut checkpoint_hashes = self.checkpoint_hashes.write().await; // Use `.await` here
-        checkpoint_hashes.push_back((header.hash, header.timestamp));
-        // Maintain the fixed size for the checkpoint list
-        if checkpoint_hashes.len() > MAX_CHECKPOINT_HEADERS {
-            checkpoint_hashes.pop_front();
-        }
-    }
-
-    // Create a checkpoint based on the time interval
-    pub async fn create_checkpoint(&self) {
-        let now = self.current_timestamp();
-        let mut last_checkpoint = self.last_checkpoint.write().await;
-
-        if now.saturating_sub(*last_checkpoint) < CHECKPOINT_INTERVAL {
-            return;
-        }
-        *last_checkpoint = now;
-    }
-
-    // Retrieve the latest checkpoint hash and timestamp
-    pub async fn get_last_checkpoint(&self) -> Option<([u8; 32], u64)> {
-        let checkpoint_hashes = self.checkpoint_hashes.read().await; // Use `.await` here
-        checkpoint_hashes.back().cloned() // Return the most recent checkpoint (if any)
-    }
-
-    // Get the current timestamp (seconds since Unix epoch)
-    fn current_timestamp(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-}
-
-impl Default for TemporalVerification {
     fn default() -> Self {
         Self::new()
     }

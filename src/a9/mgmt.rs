@@ -655,13 +655,6 @@ impl Mgmt {
             prep_bar.set_message("Reading chain tip and mempool...");
             let blockchain_guard = blockchain.read().await;
 
-            // Initialize temporal verification
-            prep_bar.set_message("Preparing transaction verification...");
-            blockchain_guard
-                .temporal_verification
-                .initialize_from_blockchain(&blockchain_guard)
-                .await?;
-
             // Get mempool transactions (full signatures only)
             prep_bar.set_message("Selecting pending transactions...");
             // Drop already-confirmed txs FIRST: one poisoned mempool entry makes the
