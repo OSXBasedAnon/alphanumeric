@@ -679,7 +679,12 @@ async fn async_main() -> Result<()> {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    let _ = db_for_flush.flush();
+                    // Flush on the blocking pool, never a runtime worker: a synchronous sled
+                    // flush that stalls under storage contention must not pin a tokio worker.
+                    // All-4-worker pins on inline sled I/O are what froze the publisher runtime
+                    // (2026-07-16 park); off-worker => the runtime + watchdog stay alive.
+                    let dbf = db_for_flush.clone();
+                    let _ = tokio::task::spawn_blocking(move || dbf.flush()).await;
                 }
             });
         }
@@ -4705,6 +4710,7 @@ async fn bootstrap_publish_loop(
 
         if let Err(e) = publish_bootstrap_snapshot(
             &db,
+            &blockchain,
             &db_path,
             height,
             &tip_hash_hex,
@@ -4747,6 +4753,7 @@ async fn bootstrap_publish_loop(
 #[cfg(feature = "bootstrap_publisher")]
 async fn publish_bootstrap_snapshot(
     db: &sled::Db,
+    blockchain: &Arc<RwLock<Blockchain>>,
     _db_path: &str,
     height: u64,
     tip_hash_hex: &str,
@@ -4831,6 +4838,18 @@ async fn publish_bootstrap_snapshot(
     // Clone DB handle for spawn_blocking.
     let db_clone = db.clone();
 
+    // BOUNDED QUIESCE (2026-07-16 park fix): hold the chain write lock across the full-DB
+    // export/import so it CANNOT run concurrently with the workers' inline sled ops. The
+    // concurrent export used to bypass this lock (via a cloned Db handle); that true
+    // concurrency on sled 0.34 is what let all 4 tokio workers pin inside sled at once and
+    // freeze the whole runtime (so the in-runtime watchdog was never polled and never exited).
+    // Under the lock, other tasks async-wait (freed — the runtime + watchdog stay alive) and
+    // the export sees an exclusive, internally-consistent DB (also fixes the torn-snapshot
+    // risk). Bounded + cheap: publish cadence is 300s at mainnet height, so the ~seconds pause
+    // is <2% ingest downtime. Released explicitly below, BEFORE any network I/O.
+    let quiesce = blockchain.write().await;
+    let quiesce_started = Instant::now();
+
     // Build a zip of a re-imported sled database in a temp directory (not the live DB dir)
     // to avoid Windows file locks (os error 33) when reading active log files.
     let archive_stats = tokio::task::spawn_blocking(
@@ -4905,11 +4924,43 @@ async fn publish_bootstrap_snapshot(
     .await
     .map_err(|e| format!("zip task failed: {}", e))??;
 
+    // Live-DB work is done; release the quiesce lock BEFORE any file read / network I/O so
+    // ingest resumes and the lock never spans the (slow, possibly-blackholed) upload.
+    drop(quiesce);
+
+    // SCALING GUARD (v7.8.0): the write-lock hold == full-DB export wall-time, which grows with
+    // the chain. If it ever nears the in-process lock watchdog's 10s read-probe window an export
+    // could self-exit the headless publisher every publish (a crash-loop). Warn loudly well
+    // before that so the bounded flush+clone export (export off-lock — v7.8.1) ships with runway.
+    // ~3s today at ~266MB logical.
+    let quiesce_secs = quiesce_started.elapsed().as_secs();
+    if quiesce_secs >= 8 {
+        log::warn!(
+            "bootstrap export held the chain write lock {}s (>=8s; lock-watchdog probe=10s) — \
+             bound/chunk the export (flush+clone, export off-lock) before the DB grows into a \
+             publish-cycle crash-loop",
+            quiesce_secs
+        );
+    }
+
     let bytes = fs::read(&zip_path).await?;
     let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let sha256 = hex::encode(hasher.finalize());
+
+    // SOAK SAFETY (env-gated, OFF in production): the upload target is hardcoded to the real
+    // gateway, so an isolated soak node must never push to it. The park-triggering work
+    // (flush+export+import+zip) has already run above under the quiesce lock; this only skips
+    // shipping the result. With ALPHANUMERIC_SOAK_NO_UPLOAD unset, behavior is identical.
+    if std::env::var("ALPHANUMERIC_SOAK_NO_UPLOAD").is_ok() {
+        log::info!(
+            "soak: bootstrap snapshot built ({} bytes, sha {}…) — skipping upload",
+            compressed_bytes,
+            &sha256[..12.min(sha256.len())]
+        );
+        return Ok(());
+    }
 
     // Disable auto-redirects so we don't lose Authorization headers on cross-host redirects.
     // Bound every request so a blackholed/half-open connection (e.g. a tunnel flap) cannot block
@@ -5315,6 +5366,7 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 
     publish_bootstrap_snapshot(
         &db,
+        blockchain,
         db_path,
         height,
         &tip_hash_hex,
