@@ -714,6 +714,11 @@ pub struct NetworkBloom {
     size: usize,
     max_items_before_reset: usize,
     items_count: AtomicUsize,
+    // Per-process random seed mixed into every hash. Without it the ~1% false-positive
+    // pattern is identical on every node (DefaultHasher has fixed keys), so an item that
+    // false-positives at one node's dedup gate false-positives at all of them — silently
+    // dropping the same never-seen block or tx network-wide. A random seed decorrelates it.
+    seed: u64,
 }
 
 impl NetworkBloom {
@@ -729,6 +734,7 @@ impl NetworkBloom {
             size,
             max_items_before_reset,
             items_count: AtomicUsize::new(0),
+            seed: Self::random_seed(),
         }
     }
 
@@ -738,7 +744,7 @@ impl NetworkBloom {
         let mut was_new = false;
 
         for i in 0..self.num_hashes {
-            let hash = Self::hash(item, i);
+            let hash = self.hash(item, i);
             let idx = hash as usize % self.bits.len();
 
             let old = self.bits[idx].swap(true, Ordering::Relaxed);
@@ -754,7 +760,7 @@ impl NetworkBloom {
 
     pub fn check(&self, item: &[u8]) -> bool {
         (0..self.num_hashes).all(|i| {
-            let hash = Self::hash(item, i);
+            let hash = self.hash(item, i);
             let idx = hash as usize % self.bits.len();
             self.bits[idx].load(Ordering::Relaxed)
         })
@@ -788,11 +794,21 @@ impl NetworkBloom {
         (((size as f64 / expected_items as f64) * std::f64::consts::LN_2).round() as usize).max(1)
     }
 
-    fn hash(data: &[u8], seed: usize) -> u64 {
+    fn hash(&self, data: &[u8], round: usize) -> u64 {
         let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
+        self.seed.hash(&mut hasher);
+        round.hash(&mut hasher);
         data.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn random_seed() -> u64 {
+        // RandomState is seeded from the OS RNG on each construction; hashing nothing yields a
+        // per-process-random u64 with no extra dependency.
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
     }
 
     pub fn load_factor(&self) -> f64 {
@@ -824,6 +840,8 @@ impl Clone for NetworkBloom {
             size: self.size,
             max_items_before_reset: self.max_items_before_reset,
             items_count: AtomicUsize::new(self.items_count.load(Ordering::Relaxed)),
+            // Keep the same seed: the copied bits only mean anything under the seed that set them.
+            seed: self.seed,
         }
     }
 }
@@ -11253,6 +11271,32 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The dedup bloom seeds its hash per process, so the ~1% false-positive pattern is not
+    // identical on every node: the same item must hash to different positions in two instances.
+    #[test]
+    fn bloom_seed_decorrelates_across_instances() {
+        let a = NetworkBloom::new(4096, 0.01);
+        let b = NetworkBloom::new(4096, 0.01);
+        let item = b"block-hash-fingerprint";
+        let a_pos: Vec<u64> = (0..a.num_hashes).map(|i| a.hash(item, i)).collect();
+        let b_pos: Vec<u64> = (0..b.num_hashes).map(|i| b.hash(item, i)).collect();
+        assert_ne!(
+            a_pos, b_pos,
+            "two bloom instances must hash the same item differently"
+        );
+    }
+
+    // Cloning a bloom must carry its seed, or the copied bits stop matching the items that set
+    // them: a member of the original must still read as present in the clone.
+    #[test]
+    fn bloom_clone_preserves_membership() {
+        let a = NetworkBloom::new(4096, 0.01);
+        let item = b"a-seen-message";
+        a.insert(item);
+        let b = a.clone();
+        assert!(b.check(item), "clone must still recognize an inserted item");
+    }
 
     // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
     // a block over the limit is invalid on every node, and a block at/under it is resolved
