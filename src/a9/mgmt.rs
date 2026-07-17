@@ -1050,7 +1050,21 @@ impl Mgmt {
                 return Ok(());
             }
             Some(addr) => {
-                let blockchain_guard = blockchain.read().await;
+                // Time-boxed like `balance`: after a re-bootstrap/deep sync the chain write
+                // lock can be held by block application for a long stretch, and an unbounded
+                // read here made `account` sit silently until it was released.
+                let Ok(blockchain_guard) =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read())
+                        .await
+                else {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                    writeln!(
+                        stdout,
+                        "Chain busy (syncing/reorg in progress) — try `account` again shortly."
+                    )?;
+                    stdout.reset()?;
+                    return Ok(());
+                };
 
                 // Get balance atomically
                 let breakdown = match blockchain_guard.get_wallet_balance_breakdown(addr).await {
