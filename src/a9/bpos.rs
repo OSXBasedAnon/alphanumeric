@@ -2278,15 +2278,18 @@ impl HeaderSentinel {
     }
 
     pub async fn is_header_verified(&self, hash: &[u8; 32]) -> bool {
-        let verifications = self.verifications.get(hash);
-        let Some(v) = verifications else {
-            return false;
-        };
-
+        // Compute the required-verifier threshold (which reads `sync_state`) BEFORE taking
+        // the `verifications` entry guard, so we never hold a DashMap guard across an await.
+        // This keeps the cache's lock order consistent with the rest of the module
+        // (sync_state -> verifications) rather than the inverse.
         let participating = self.sync_state.read().await.participating_nodes.len();
         let registered = self.registered_verifier_ip_count();
         let eligible = participating.max(registered).max(1);
         let required = self.required_verifier_count(eligible);
+
+        let Some(v) = self.verifications.get(hash) else {
+            return false;
+        };
         let actual = Self::external_verifier_count(&v.verifiers);
 
         actual >= required
@@ -2553,23 +2556,35 @@ impl HeaderSentinel {
         // (random hashes, no prev-link check) can't OOM us.
         self.evict_oldest_verification_if_full(&header.hash);
 
-        // Quick lookup in recent verifications using DashMap
-        let mut verification =
-            self.verifications
-                .entry(header.hash)
-                .or_insert_with(|| VerificationState {
-                    timestamp: now,
-                    verifiers: HashSet::with_capacity(10),
-                    mldsa_signatures: HashMap::with_capacity(10),
-                });
+        // Record the verification and take the snapshot the header record needs, then
+        // RELEASE the DashMap entry guard BEFORE awaiting the `headers` lock. Holding a
+        // `verifications` entry guard across `self.headers.write().await` is the inverse of
+        // the order `verify_headers_batch` uses (headers -> verifications), so once the two
+        // paths touched the same shard they could interleave into a stall. Never hold a
+        // verification-cache guard across an await.
+        let (verification_count, verified_by) = {
+            let mut verification =
+                self.verifications
+                    .entry(header.hash)
+                    .or_insert_with(|| VerificationState {
+                        timestamp: now,
+                        verifiers: HashSet::with_capacity(10),
+                        mldsa_signatures: HashMap::with_capacity(10),
+                    });
 
-        // Add verification atomically
-        verification.verifiers.insert(node_id.to_string());
-        if signature_valid {
-            verification
-                .mldsa_signatures
-                .insert(node_id.to_string(), signature);
-        }
+            // Add verification atomically
+            verification.verifiers.insert(node_id.to_string());
+            if signature_valid {
+                verification
+                    .mldsa_signatures
+                    .insert(node_id.to_string(), signature);
+            }
+
+            (
+                verification.verifiers.len() as u32,
+                verification.verifiers.clone(),
+            )
+        };
 
         // Add to headers queue with fixed size
         let mut headers = self.headers.write().await;
@@ -2580,8 +2595,8 @@ impl HeaderSentinel {
         headers.push_back(HeaderState {
             header,
             timestamp: now,
-            verification_count: verification.verifiers.len() as u32,
-            verified_by: verification.verifiers.clone(),
+            verification_count,
+            verified_by,
         });
 
         Ok(true)
@@ -2853,6 +2868,124 @@ mod tests {
         assert_eq!(
             sentinel.max_future_skew_seconds(),
             HEADER_MAX_FUTURE_SECONDS
+        );
+    }
+
+    // A verifier key from a distinct source IP that can actually sign, so header paths pass
+    // the signature gate and reach the lock code.
+    fn signing_verifier(ip_octet: u8) -> (String, RegisteredKey, Vec<u8>) {
+        let (public_key, secret_key) = mldsa::generate_keypair();
+        let node_id = format!("verifier-{}", ip_octet);
+        let key = RegisteredKey {
+            mldsa_public_key: public_key,
+            source_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, ip_octet)),
+            last_seen: 0,
+        };
+        (node_id, key, secret_key)
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    // The verify_and_add_header refactor (release the verifications guard before taking the
+    // headers lock) must still record the verification and the header with the right snapshot.
+    #[tokio::test]
+    async fn verify_and_add_header_records_verification_and_header() {
+        let sentinel = HeaderSentinel::new();
+        let (node_id, key, secret_key) = signing_verifier(1);
+        sentinel.peer_mldsa_keys.insert(node_id.clone(), key);
+
+        let header = BlockHeaderInfo {
+            height: 0,
+            hash: [0x42; 32],
+            prev_hash: [0; 32],
+            timestamp: now_secs(),
+        };
+        let payload = codec::serialize(&header).unwrap();
+        let signature = mldsa::sign(&payload, &secret_key).unwrap();
+
+        let added = sentinel
+            .verify_and_add_header(header.clone(), &node_id, signature)
+            .await
+            .unwrap();
+        assert!(added);
+        assert!(sentinel.has_verification_record(&header.hash));
+
+        let headers = sentinel.headers.read().await;
+        let state = headers
+            .iter()
+            .find(|s| s.header.hash == header.hash)
+            .expect("header should be recorded");
+        assert_eq!(state.verification_count, 1);
+        assert!(state.verified_by.contains(&node_id));
+    }
+
+    // Regression guard for the verifications <-> headers lock order (ABBA). verify_and_add_header
+    // (verifications entry -> headers.write) and verify_headers_batch (headers.write ->
+    // verifications entry) must not hold a verifications entry guard across the headers await, or
+    // two concurrent header messages on the same shard can stall the worker. Hammer both paths
+    // concurrently on overlapping hashes and require the whole set to finish inside a timeout; a
+    // reintroduced guard-across-await would hang here. Runs on the same multi-worker runtime shape
+    // as production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn header_paths_stay_live_under_concurrent_interleaving() {
+        let sentinel = std::sync::Arc::new(HeaderSentinel::new());
+        let (node_id, key, secret_key) = signing_verifier(2);
+        sentinel.peer_mldsa_keys.insert(node_id.clone(), key);
+        let now = now_secs();
+
+        let mut tasks = Vec::new();
+        for i in 0..64u32 {
+            // Single-header path.
+            let s = std::sync::Arc::clone(&sentinel);
+            let id = node_id.clone();
+            let sk = secret_key.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut hash = [0u8; 32];
+                hash[0..4].copy_from_slice(&i.to_le_bytes());
+                let header = BlockHeaderInfo {
+                    height: 0,
+                    hash,
+                    prev_hash: [0; 32],
+                    timestamp: now,
+                };
+                let payload = codec::serialize(&header).unwrap();
+                let signature = mldsa::sign(&payload, &sk).unwrap();
+                let _ = s.verify_and_add_header(header, &id, signature).await;
+            }));
+
+            // Batch path on the SAME hash (same DashMap shard), so the two orders contend.
+            let s = std::sync::Arc::clone(&sentinel);
+            let id = node_id.clone();
+            let sk = secret_key.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut hash = [0u8; 32];
+                hash[0..4].copy_from_slice(&i.to_le_bytes());
+                let headers = vec![BlockHeaderInfo {
+                    height: 0,
+                    hash,
+                    prev_hash: [0; 32],
+                    timestamp: now,
+                }];
+                let payload = codec::serialize(&headers).unwrap();
+                let signature = mldsa::sign(&payload, &sk).unwrap();
+                let _ = s.verify_headers_batch(headers, &id, signature).await;
+            }));
+        }
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(20), async move {
+            for t in tasks {
+                let _ = t.await;
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "header verification paths deadlocked under concurrent interleaving"
         );
     }
 }

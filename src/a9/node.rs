@@ -714,6 +714,11 @@ pub struct NetworkBloom {
     size: usize,
     max_items_before_reset: usize,
     items_count: AtomicUsize,
+    // Per-process random seed mixed into every hash. Without it the ~1% false-positive
+    // pattern is identical on every node (DefaultHasher has fixed keys), so an item that
+    // false-positives at one node's dedup gate false-positives at all of them — silently
+    // dropping the same never-seen block or tx network-wide. A random seed decorrelates it.
+    seed: u64,
 }
 
 impl NetworkBloom {
@@ -729,6 +734,7 @@ impl NetworkBloom {
             size,
             max_items_before_reset,
             items_count: AtomicUsize::new(0),
+            seed: Self::random_seed(),
         }
     }
 
@@ -738,7 +744,7 @@ impl NetworkBloom {
         let mut was_new = false;
 
         for i in 0..self.num_hashes {
-            let hash = Self::hash(item, i);
+            let hash = self.hash(item, i);
             let idx = hash as usize % self.bits.len();
 
             let old = self.bits[idx].swap(true, Ordering::Relaxed);
@@ -754,7 +760,7 @@ impl NetworkBloom {
 
     pub fn check(&self, item: &[u8]) -> bool {
         (0..self.num_hashes).all(|i| {
-            let hash = Self::hash(item, i);
+            let hash = self.hash(item, i);
             let idx = hash as usize % self.bits.len();
             self.bits[idx].load(Ordering::Relaxed)
         })
@@ -788,11 +794,21 @@ impl NetworkBloom {
         (((size as f64 / expected_items as f64) * std::f64::consts::LN_2).round() as usize).max(1)
     }
 
-    fn hash(data: &[u8], seed: usize) -> u64 {
+    fn hash(&self, data: &[u8], round: usize) -> u64 {
         let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
+        self.seed.hash(&mut hasher);
+        round.hash(&mut hasher);
         data.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn random_seed() -> u64 {
+        // RandomState is seeded from the OS RNG on each construction; hashing nothing yields a
+        // per-process-random u64 with no extra dependency.
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
     }
 
     pub fn load_factor(&self) -> f64 {
@@ -824,6 +840,8 @@ impl Clone for NetworkBloom {
             size: self.size,
             max_items_before_reset: self.max_items_before_reset,
             items_count: AtomicUsize::new(self.items_count.load(Ordering::Relaxed)),
+            // Keep the same seed: the copied bits only mean anything under the seed that set them.
+            seed: self.seed,
         }
     }
 }
@@ -1007,6 +1025,11 @@ pub struct Node {
     // Soft entries (transient walk/gap failures) time out but never propagate —
     // a momentary relay gap must not poison the live chain's fresh tips.
     relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), (Instant, bool)>>>,
+    // Relay-once bookkeeping for the early (pre-full-validation) block relay. DISJOINT from
+    // network_bloom by construction, so early-relay accounting never touches the acceptance dedup
+    // path: a block forwarded early is recorded here, never in the shared bloom, so it can never
+    // suppress a later witness-bearing delivery that the node must still fully validate and accept.
+    early_relay_seen: Arc<PLMutex<LruCache<[u8; 32], ()>>>,
     last_public_announce_at: Arc<AtomicU64>,
     /// Last announce ATTEMPT (success or failure) — throttles failure retries to
     /// ANNOUNCE_RETRY_SECS without silencing the loop for the full interval.
@@ -1342,6 +1365,11 @@ impl Node {
                 std::num::NonZeroUsize::new(512).expect("nonzero"),
             ))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
+            // Bounded relay-once set for the early relay path (see field comment). Same 8192 cap
+            // as the mesh seen-set; a block hash is a fixed 32 bytes so this is ~small.
+            early_relay_seen: Arc::new(PLMutex::new(LruCache::new(
+                NonZeroUsize::new(8192).expect("nonzero"),
+            ))),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
             bind_addr,
             listener,
@@ -4672,6 +4700,14 @@ impl Node {
         let block_hash = block.calculate_hash_for_block();
         let _ = self.network_bloom.insert(&block_hash);
 
+        // Flood the mined block over the WebRTC mesh FIRST — before the gateway relay POST and the
+        // peer discovery below — so mesh-connected miners get it on the fastest direct path without
+        // waiting on the HTTP round-trip or discovery. mesh_gossip_block is fire-and-forget (it
+        // spawns the actual sends), so this does not delay the relay POST. The peered broadcast
+        // below passes gossip_mesh=false, so the block is mesh-gossiped exactly once.
+        #[cfg(feature = "webrtc_mesh")]
+        self.mesh_gossip_block(&block).await;
+
         // PROPAGATION-CRITICAL, FIRST: POST to the gateway relay immediately — it is the
         // authoritative propagation path across NAT, so it must NOT wait behind the
         // peerless p2p discovery (~6s timeout) below, which almost never yields a
@@ -4740,11 +4776,9 @@ impl Node {
         };
 
         if selected_peers.is_empty() {
-            // No TCP peers — but we may have DIRECT mesh peers. Gossip the mined block over the mesh
-            // so a peerless NAT miner (exactly the case the mesh targets) still propagates P2P, not
-            // only via the relay. The peered branch below already gossips inside broadcast_block.
-            #[cfg(feature = "webrtc_mesh")]
-            self.mesh_gossip_block(&block).await;
+            // No TCP peers. The mined block was already flooded over the mesh at the top of this
+            // function (the fastest path for a peerless NAT miner), so there is nothing to do here
+            // but note the missing TCP fan-out.
             if post_mine {
                 warn!("Mined block saved locally, but no peers were available for block broadcast");
             } else {
@@ -4755,7 +4789,7 @@ impl Node {
             }
         } else {
             match self
-                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                .broadcast_block(Arc::new(block.clone()), None, selected_peers, false)
                 .await
             {
                 Ok(0) => {
@@ -8553,10 +8587,16 @@ impl Node {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const MAX_ATTEMPTS: u32 = 2;
 
-        // Rate limit check
-        let rate_key = format!("send_to_{}", addr);
-        if !self.rate_limiter.check_limit(&rate_key) {
-            return Err(NodeError::Network("Rate limit exceeded".to_string()));
+        // Rate limit check. Blocks are exempt: a burst of tx/gossip traffic to a peer must
+        // never spend the budget that a block send needs, since dropping a block send stalls
+        // propagation and raises the orphan rate. Our own block sends are already bounded by
+        // the valid-PoW production rate and guarded by the outbound circuit breaker below, so
+        // exempting them adds no amplification. All other message types stay paced per peer.
+        if !matches!(message, NetworkMessage::Block(_)) {
+            let rate_key = format!("send_to_{}", addr);
+            if !self.rate_limiter.check_limit(&rate_key) {
+                return Err(NodeError::Network("Rate limit exceeded".to_string()));
+            }
         }
 
         let mut last_error = None;
@@ -8724,6 +8764,13 @@ impl Node {
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
 
+                    // Relay exactly once across ingress arms: if another arm (a concurrent TCP early
+                    // relay) already claimed this block's relay slot, skip re-flooding it here. The
+                    // block is already saved above; this gates only the outbound relay.
+                    if !self.claim_relay(&block_hash) {
+                        return Ok(());
+                    }
+
                     // Broadcast to peers using velocity protocol if available
                     if let Some(velocity) = &self.velocity_manager {
                         let (peer_map, selected_peers) = {
@@ -8746,7 +8793,7 @@ impl Node {
 
                             // Fallback to traditional broadcast (broadcast_block also floods the mesh)
                             if let Err(e) = self
-                                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                                .broadcast_block(Arc::new(block.clone()), None, selected_peers, true)
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
@@ -8772,7 +8819,7 @@ impl Node {
                         let block_arc = Arc::new(block.clone());
                         tokio::spawn(async move {
                             if let Err(e) =
-                                node.broadcast_block(block_arc, None, selected_peers).await
+                                node.broadcast_block(block_arc, None, selected_peers, true).await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
                             }
@@ -9064,6 +9111,63 @@ impl Node {
                     return Ok(None);
                 }
 
+                // EARLY RELAY (forward ahead of the peer-witness-fetch verify and the save_block
+                // write lock below): relay a block that already extends OUR tip AND passes a
+                // STANDALONE validation, before the accept pipeline runs. This is the poison-free
+                // contract the mesh ingest path uses — verify_block_parallel runs real ML-DSA on the
+                // block's own transactions with NO peer fetch, so a block that fails standalone
+                // validation is never relayed. A valid PoW alone cannot authorize a relay: the PoW
+                // commits only to a merkle root over truncated signatures + sig_hash receipts, so an
+                // attacker can preserve a block's hash while mangling a full signature
+                // (calculate_merkle_root, blockchain.rs) — only the standalone ML-DSA verify rejects
+                // that. Acceptance is unchanged: the block is still fully validated and saved by the
+                // pipeline below; only the relay hop moves earlier.
+                let mut early_relayed = false;
+                {
+                    // Cheap local pre-filter (claimed hash + strict tip-extension + merkle binding)
+                    // against a dropped chain snapshot, THEN the standalone poison-free verify. Only
+                    // tip-extenders early-relay; fork/orphan blocks take the post-accept relay.
+                    let cheap_ok = {
+                        let bc = self.blockchain.read().await;
+                        let tip_index = bc.get_latest_block_index();
+                        match bc.get_last_block_hash() {
+                            Ok(tip_hash) => {
+                                Self::early_relay_cheap_gate(&block_ref, tip_index, &tip_hash)
+                            }
+                            Err(_) => false,
+                        }
+                    };
+
+                    if cheap_ok && self.verify_block_parallel(&block_ref).await.unwrap_or(false) {
+                        // Standalone-VALID tip-extender. Source-filter the targets FIRST and only
+                        // claim the single relay slot when there is somewhere to forward it, so a node
+                        // whose only peer IS the source does not burn the claim and suppress the
+                        // post-accept relay. The claim (disjoint from network_bloom) fires at most once
+                        // per block hash across all ingress arms.
+                        let targets: Vec<SocketAddr> = {
+                            let peers = self.peers.read().await;
+                            self.select_broadcast_peers(&peers, peers.len().min(16))
+                        }
+                        .into_iter()
+                        .filter(|p| *p != addr)
+                        .collect();
+
+                        if !targets.is_empty() && self.claim_relay(&block_hash) {
+                            let node = self.clone();
+                            let relay_block = Arc::clone(&block_ref);
+                            tokio::spawn(async move {
+                                if let Err(e) = node
+                                    .broadcast_block(relay_block, Some(addr), targets, true)
+                                    .await
+                                {
+                                    warn!("Early block relay failed: {}", e);
+                                }
+                            });
+                            early_relayed = true;
+                        }
+                    }
+                }
+
                 // Verify and propagate block
                 if self
                     .verify_block_with_witness(&block_ref, Some(addr))
@@ -9083,16 +9187,22 @@ impl Node {
                             NodeError::Network(format!("Failed to send block event: {}", e))
                         })?;
 
-                    // Broadcast block to peers
-                    let peers = self.peers.read().await;
-                    let selected_peers = self.select_broadcast_peers(&peers, peers.len().min(16));
-                    drop(peers);
+                    // Post-accept relay, made exactly-once: fire only if the early path did NOT
+                    // already relay this block AND we win the relay claim. Covers blocks that did not
+                    // qualify for the early relay (non-tip-extenders, or standalone-deferred
+                    // truncated-signature blocks) but were accepted after full validation.
+                    if !early_relayed && self.claim_relay(&block_hash) {
+                        let peers = self.peers.read().await;
+                        let selected_peers =
+                            self.select_broadcast_peers(&peers, peers.len().min(16));
+                        drop(peers);
 
-                    if let Err(e) = self
-                        .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers)
-                        .await
-                    {
-                        warn!("Failed to propagate block to selected peers: {}", e);
+                        if let Err(e) = self
+                            .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers, true)
+                            .await
+                        {
+                            warn!("Failed to propagate block to selected peers: {}", e);
+                        }
                     }
                 }
             }
@@ -9796,16 +9906,48 @@ impl Node {
         }
     }
 
+    /// Claim the single relay slot for a block hash. Returns true exactly once per hash (the
+    /// caller that wins the claim), false on every subsequent call. Backed by a bounded LRU that
+    /// is DISJOINT from network_bloom, so relay-once accounting never touches acceptance dedup.
+    /// Used to move the relay hop ahead of full validation without ever relaying a block twice.
+    fn claim_relay(&self, block_hash: &[u8; 32]) -> bool {
+        self.early_relay_seen.lock().put(*block_hash, ()).is_none()
+    }
+
+    /// Cheap, local pre-filter deciding whether a received block is eligible to be RELAYED before
+    /// full validation: it must claim its own computed hash, strictly extend `tip` (height + 1, and
+    /// previous_hash == the tip hash), and its transaction set must hash to its committed merkle
+    /// root. This only decides whether to run the standalone poison-free verify (the real gate) and
+    /// which blocks skip straight to the post-accept relay — it is an optimization filter, not a
+    /// security boundary. Note: a matching merkle root does NOT prove signature validity (the root
+    /// binds truncated signatures + sig_hash receipts), which is exactly why the caller still runs
+    /// verify_block_parallel before relaying.
+    fn early_relay_cheap_gate(block: &Block, tip_index: u64, tip_hash: &[u8; 32]) -> bool {
+        block.hash == block.calculate_hash_for_block()
+            && block.index as u64 == tip_index.saturating_add(1)
+            && &block.previous_hash == tip_hash
+            && Blockchain::calculate_merkle_root(&block.transactions)
+                .map(|root| root == block.merkle_root)
+                .unwrap_or(false)
+    }
+
     async fn broadcast_block(
         &self,
         block: Arc<Block>,
         source: Option<SocketAddr>,
         peers: Vec<SocketAddr>,
+        gossip_mesh: bool,
     ) -> Result<usize, NodeError> {
-        // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks;
-        // all broadcast_block callers). No-op unless the mesh feature is on and up.
+        // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks).
+        // Callers that already flooded the mesh themselves pass gossip_mesh=false so a block is
+        // never mesh-gossiped twice — the mined-egress path floods the mesh FIRST and then does a
+        // TCP-only broadcast. No-op unless the mesh feature is on and up.
         #[cfg(feature = "webrtc_mesh")]
-        self.mesh_gossip_block(block.as_ref()).await;
+        if gossip_mesh {
+            self.mesh_gossip_block(block.as_ref()).await;
+        }
+        #[cfg(not(feature = "webrtc_mesh"))]
+        let _ = gossip_mesh;
         let targets: Vec<_> = peers
             .into_iter()
             .filter(|addr| Some(*addr) != source)
@@ -11253,6 +11395,129 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The dedup bloom seeds its hash per process, so the ~1% false-positive pattern is not
+    // identical on every node: the same item must hash to different positions in two instances.
+    #[test]
+    fn bloom_seed_decorrelates_across_instances() {
+        let a = NetworkBloom::new(4096, 0.01);
+        let b = NetworkBloom::new(4096, 0.01);
+        let item = b"block-hash-fingerprint";
+        let a_pos: Vec<u64> = (0..a.num_hashes).map(|i| a.hash(item, i)).collect();
+        let b_pos: Vec<u64> = (0..b.num_hashes).map(|i| b.hash(item, i)).collect();
+        assert_ne!(
+            a_pos, b_pos,
+            "two bloom instances must hash the same item differently"
+        );
+    }
+
+    // Cloning a bloom must carry its seed, or the copied bits stop matching the items that set
+    // them: a member of the original must still read as present in the clone.
+    #[test]
+    fn bloom_clone_preserves_membership() {
+        let a = NetworkBloom::new(4096, 0.01);
+        let item = b"a-seen-message";
+        a.insert(item);
+        let b = a.clone();
+        assert!(b.check(item), "clone must still recognize an inserted item");
+    }
+
+    // Guards the relay-once primitive: claim_relay's body is exactly
+    // `early_relay_seen.lock().put(h, ()).is_none()`. put must return None only on the first
+    // insert of a hash (the claimer) and Some(()) after — if an lru change altered that, the early
+    // relay would fire twice (double-flood) or never (silent no-relay). Distinct hashes are
+    // independent.
+    #[test]
+    fn early_relay_claim_is_single_winner() {
+        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> =
+            Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
+        let claim = |h: [u8; 32]| seen.lock().put(h, ()).is_none();
+        let h = [7u8; 32];
+        assert!(claim(h), "first claim wins");
+        assert!(!claim(h), "second claim loses");
+        assert!(!claim(h), "still loses");
+        assert!(claim([8u8; 32]), "a different hash claims independently");
+    }
+
+    // Under real thread contention on the same hash, exactly one caller may win the claim (the
+    // PLMutex serializes the put), so the early relay is fired by exactly one of N racing ingests.
+    #[test]
+    fn early_relay_claim_has_exactly_one_concurrent_winner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> =
+            Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
+        let wins = Arc::new(AtomicUsize::new(0));
+        let h = [42u8; 32];
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let seen = Arc::clone(&seen);
+            let wins = Arc::clone(&wins);
+            handles.push(std::thread::spawn(move || {
+                if seen.lock().put(h, ()).is_none() {
+                    wins.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for hd in handles {
+            hd.join().unwrap();
+        }
+        assert_eq!(
+            wins.load(Ordering::Relaxed),
+            1,
+            "exactly one thread may claim the hash"
+        );
+    }
+
+    // The early-relay cheap gate must accept a well-formed tip-extender and reject anything that is
+    // not one: wrong height, wrong parent, a lied-about hash, or a merkle root that does not match
+    // the transactions. It is only a pre-filter (the standalone verify is the real gate), but a bug
+    // here would silently over- or under-relay, so pin the exact predicate.
+    #[test]
+    fn early_relay_cheap_gate_accepts_only_well_formed_tip_extenders() {
+        let tip_index: u64 = 100;
+        let tip_hash = [9u8; 32];
+        let make = || {
+            let mut b = Block {
+                index: (tip_index + 1) as u32,
+                previous_hash: tip_hash,
+                timestamp: 0,
+                transactions: Vec::new(),
+                nonce: 0,
+                difficulty: 1,
+                hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+            };
+            b.merkle_root = Blockchain::calculate_merkle_root(&b.transactions).unwrap();
+            b.hash = b.calculate_hash_for_block();
+            b
+        };
+
+        // Well-formed tip-extender: accepted.
+        assert!(Node::early_relay_cheap_gate(&make(), tip_index, &tip_hash));
+
+        // Wrong height (not tip+1): rejected (recompute hash so only the height check fails).
+        let mut wrong_height = make();
+        wrong_height.index = (tip_index + 2) as u32;
+        wrong_height.hash = wrong_height.calculate_hash_for_block();
+        assert!(!Node::early_relay_cheap_gate(&wrong_height, tip_index, &tip_hash));
+
+        // Wrong parent: rejected.
+        let mut wrong_parent = make();
+        wrong_parent.previous_hash = [1u8; 32];
+        wrong_parent.hash = wrong_parent.calculate_hash_for_block();
+        assert!(!Node::early_relay_cheap_gate(&wrong_parent, tip_index, &tip_hash));
+
+        // Lied-about hash (claimed != computed): rejected.
+        let mut hash_liar = make();
+        hash_liar.hash = [7u8; 32];
+        assert!(!Node::early_relay_cheap_gate(&hash_liar, tip_index, &tip_hash));
+
+        // Merkle root not matching the tx set: rejected (recompute hash so only merkle fails).
+        let mut merkle_liar = make();
+        merkle_liar.merkle_root = [3u8; 32];
+        merkle_liar.hash = merkle_liar.calculate_hash_for_block();
+        assert!(!Node::early_relay_cheap_gate(&merkle_liar, tip_index, &tip_hash));
+    }
 
     // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
     // a block over the limit is invalid on every node, and a block at/under it is resolved
