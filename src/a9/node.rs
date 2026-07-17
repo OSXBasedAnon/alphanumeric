@@ -4690,6 +4690,14 @@ impl Node {
         let block_hash = block.calculate_hash_for_block();
         let _ = self.network_bloom.insert(&block_hash);
 
+        // Flood the mined block over the WebRTC mesh FIRST — before the gateway relay POST and the
+        // peer discovery below — so mesh-connected miners get it on the fastest direct path without
+        // waiting on the HTTP round-trip or discovery. mesh_gossip_block is fire-and-forget (it
+        // spawns the actual sends), so this does not delay the relay POST. The peered broadcast
+        // below passes gossip_mesh=false, so the block is mesh-gossiped exactly once.
+        #[cfg(feature = "webrtc_mesh")]
+        self.mesh_gossip_block(&block).await;
+
         // PROPAGATION-CRITICAL, FIRST: POST to the gateway relay immediately — it is the
         // authoritative propagation path across NAT, so it must NOT wait behind the
         // peerless p2p discovery (~6s timeout) below, which almost never yields a
@@ -4758,11 +4766,9 @@ impl Node {
         };
 
         if selected_peers.is_empty() {
-            // No TCP peers — but we may have DIRECT mesh peers. Gossip the mined block over the mesh
-            // so a peerless NAT miner (exactly the case the mesh targets) still propagates P2P, not
-            // only via the relay. The peered branch below already gossips inside broadcast_block.
-            #[cfg(feature = "webrtc_mesh")]
-            self.mesh_gossip_block(&block).await;
+            // No TCP peers. The mined block was already flooded over the mesh at the top of this
+            // function (the fastest path for a peerless NAT miner), so there is nothing to do here
+            // but note the missing TCP fan-out.
             if post_mine {
                 warn!("Mined block saved locally, but no peers were available for block broadcast");
             } else {
@@ -4773,7 +4779,7 @@ impl Node {
             }
         } else {
             match self
-                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                .broadcast_block(Arc::new(block.clone()), None, selected_peers, false)
                 .await
             {
                 Ok(0) => {
@@ -8770,7 +8776,7 @@ impl Node {
 
                             // Fallback to traditional broadcast (broadcast_block also floods the mesh)
                             if let Err(e) = self
-                                .broadcast_block(Arc::new(block.clone()), None, selected_peers)
+                                .broadcast_block(Arc::new(block.clone()), None, selected_peers, true)
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
@@ -8796,7 +8802,7 @@ impl Node {
                         let block_arc = Arc::new(block.clone());
                         tokio::spawn(async move {
                             if let Err(e) =
-                                node.broadcast_block(block_arc, None, selected_peers).await
+                                node.broadcast_block(block_arc, None, selected_peers, true).await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
                             }
@@ -9113,7 +9119,7 @@ impl Node {
                     drop(peers);
 
                     if let Err(e) = self
-                        .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers)
+                        .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers, true)
                         .await
                     {
                         warn!("Failed to propagate block to selected peers: {}", e);
@@ -9825,11 +9831,18 @@ impl Node {
         block: Arc<Block>,
         source: Option<SocketAddr>,
         peers: Vec<SocketAddr>,
+        gossip_mesh: bool,
     ) -> Result<usize, NodeError> {
-        // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks;
-        // all broadcast_block callers). No-op unless the mesh feature is on and up.
+        // Flood the block over the WebRTC mesh in parallel to TCP (covers mined + relayed blocks).
+        // Callers that already flooded the mesh themselves pass gossip_mesh=false so a block is
+        // never mesh-gossiped twice — the mined-egress path floods the mesh FIRST and then does a
+        // TCP-only broadcast. No-op unless the mesh feature is on and up.
         #[cfg(feature = "webrtc_mesh")]
-        self.mesh_gossip_block(block.as_ref()).await;
+        if gossip_mesh {
+            self.mesh_gossip_block(block.as_ref()).await;
+        }
+        #[cfg(not(feature = "webrtc_mesh"))]
+        let _ = gossip_mesh;
         let targets: Vec<_> = peers
             .into_iter()
             .filter(|addr| Some(*addr) != source)
