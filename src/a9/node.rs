@@ -8571,10 +8571,16 @@ impl Node {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const MAX_ATTEMPTS: u32 = 2;
 
-        // Rate limit check
-        let rate_key = format!("send_to_{}", addr);
-        if !self.rate_limiter.check_limit(&rate_key) {
-            return Err(NodeError::Network("Rate limit exceeded".to_string()));
+        // Rate limit check. Blocks are exempt: a burst of tx/gossip traffic to a peer must
+        // never spend the budget that a block send needs, since dropping a block send stalls
+        // propagation and raises the orphan rate. Our own block sends are already bounded by
+        // the valid-PoW production rate and guarded by the outbound circuit breaker below, so
+        // exempting them adds no amplification. All other message types stay paced per peer.
+        if !matches!(message, NetworkMessage::Block(_)) {
+            let rate_key = format!("send_to_{}", addr);
+            if !self.rate_limiter.check_limit(&rate_key) {
+                return Err(NodeError::Network("Rate limit exceeded".to_string()));
+            }
         }
 
         let mut last_error = None;
