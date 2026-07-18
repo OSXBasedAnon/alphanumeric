@@ -10808,6 +10808,15 @@ impl Node {
     }
 
     // Sync with network to keep blockchain updated
+    /// A relay-fallback failure is only a real sync failure when a peer is genuinely AHEAD of us.
+    /// With zero blocks synced from peers and no known peer above `current_height`, we are caught up
+    /// to the peer frontier, so a transient relay-backfill error is benign (the periodic beacon-driven
+    /// converge loop still tracks the relay head). This keeps "failed to sync" meaningful for a
+    /// genuinely-stuck node instead of crying wolf on every at-tip relay blip.
+    fn any_peer_ahead(peer_heights: &[(SocketAddr, u32)], current_height: u32) -> bool {
+        peer_heights.iter().any(|(_, h)| *h > current_height)
+    }
+
     pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_MS: u64 = 1000;
@@ -11096,15 +11105,29 @@ impl Node {
             self.publish_discovery_state("Post-sync").await;
             Ok(())
         } else {
-            self.sync_with_block_relay(current_height)
-                .await
-                .map(|_| ())
-                .map_err(|relay_err| {
-                    NodeError::Network(format!(
+            // Zero blocks from peers. Fall back to the relay for a best-effort backfill, but only
+            // treat a relay error as a REAL sync failure when a peer is genuinely ahead of us. If no
+            // known peer is ahead, zero-from-peers means we are caught up to the peer frontier, so a
+            // transient relay-backfill hiccup is not a failure: log it quietly and report success
+            // (the periodic beacon-driven converge loop still pulls us to the relay head if anything
+            // is actually behind). This stops an at-tip miner from repeatedly logging "failed to
+            // sync" on benign relay blips while keeping the error meaningful for a stuck node.
+            match self.sync_with_block_relay(current_height).await {
+                Ok(_) => Ok(()),
+                Err(relay_err) if Self::any_peer_ahead(&peer_heights, current_sync_height) => {
+                    Err(NodeError::Network(format!(
                         "Failed to sync any blocks from peers and relay sync failed: {}",
                         relay_err
-                    ))
-                })
+                    )))
+                }
+                Err(relay_err) => {
+                    debug!(
+                        "Caught up at height {} (no peer ahead); ignoring transient relay-backfill error: {}",
+                        current_sync_height, relay_err
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -11420,6 +11443,20 @@ mod tests {
         a.insert(item);
         let b = a.clone();
         assert!(b.check(item), "clone must still recognize an inserted item");
+    }
+
+    // sync_with_network must not cry wolf: with zero blocks synced from peers, a relay-fallback
+    // error is a real "failed to sync" ONLY when a peer is genuinely ahead. No peer ahead == caught
+    // up to the peer frontier == a transient relay blip is benign (report success, retry later).
+    #[test]
+    fn any_peer_ahead_flags_only_a_genuinely_higher_peer() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let peer = |p: u16, h: u32| (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), p), h);
+        // No peers, or every peer at/below us -> caught up, not behind.
+        assert!(!Node::any_peer_ahead(&[], 100));
+        assert!(!Node::any_peer_ahead(&[peer(1, 100), peer(2, 99), peer(3, 1)], 100));
+        // A peer strictly ahead -> genuinely behind.
+        assert!(Node::any_peer_ahead(&[peer(1, 100), peer(2, 101)], 100));
     }
 
     // Guards the relay-once primitive: claim_relay's body is exactly
