@@ -134,6 +134,12 @@ const ORPHAN_BRANCH_SEARCH_LIMIT: usize = 4_096;
 /// branch is reached well within this budget. Never bites normal operation,
 /// where a reorg sees only a handful of branches.
 const MAX_REORG_BRANCHES_EVALUATED: usize = 8_192;
+/// Cap on how many best-ranked branches the reorg engine fully validates and tries to adopt
+/// in one pass. The first branch to pass every gate wins; a gate-rejected best falls through
+/// to the next-best. Bounds the extra validation work when an attacker floods invalid
+/// high-ranked competitors — each of which still costs a real floor-difficulty grind, and a
+/// rejected best only prolongs a self-healing equal-work fork.
+const MAX_REORG_ADOPT_ATTEMPTS: usize = 16;
 /// (G) How long a witness-deferred reorg branch is skipped by try_adopt before it
 /// is re-evaluated. Long enough to collapse the per-ingest-tick re-verify/re-log
 /// storm (ingest fires every few seconds in a fork storm), short enough that once
@@ -2724,9 +2730,15 @@ impl Blockchain {
             }
         }
 
-        let mut best_branch: Option<Vec<Block>> = None;
-        let mut best_work_pair: Option<(BigUint, BigUint)> = None;
-        let mut best_tip_hash: [u8; 32] = [0u8; 32];
+        // Rank every work-eligible branch instead of committing to a single "best" before its
+        // validity is known. A structurally-valid but balance-invalid same-height competitor can
+        // be ground to the lowest tip hash and win the work/tie-break comparison; if that winner
+        // is the ONLY branch we ever validate, its post-selection rejection (overspend / replay /
+        // missing witnesses) makes us abandon the reorg and never consider the honest tie-winner,
+        // prolonging the fork. Keep all eligible branches so a rejected best falls through to the
+        // next-best VALID branch — the deterministic lowest-hash tie-break is then resolved over
+        // ADOPTABLE branches only.
+        let mut ranked: Vec<(Vec<Block>, BigUint, BigUint, [u8; 32])> = Vec::new();
         let mut branches_evaluated: usize = 0;
 
         'candidate: for candidate in candidates {
@@ -2738,7 +2750,7 @@ impl Blockchain {
             for branch in branches {
                 if branches_evaluated >= MAX_REORG_BRANCHES_EVALUATED {
                     debug!(
-                        "Reorg scan hit branch-eval budget ({} branches); adopting best found so far",
+                        "Reorg scan hit branch-eval budget ({} branches); ranking best found so far",
                         MAX_REORG_BRANCHES_EVALUATED
                     );
                     break 'candidate;
@@ -2748,17 +2760,12 @@ impl Blockchain {
                 let Some(branch_tip) = branch.last() else {
                     continue;
                 };
-                // Branch may be same-height competitor or longer. Adoption decision is based on work.
+                let branch_tip_hash = branch_tip.hash;
 
-                // Checkpoint finality, applied at SELECTION time: a branch forking
-                // at/below the trusted checkpoint can never be adopted (the same
-                // gate below rejects it after selection), so skip it before it can
-                // win the work comparison. Without this, a heavy dead branch — the
-                // live 2026-07-11 case: an incompatible client's ~770-block fork —
-                // out-works every honest candidate, gets fully validated under the
-                // write lock on EVERY ingest, and only then hits the post-selection
-                // checkpoint reject; honest same-height competitors lose the scan
-                // to a corpse and the node pays the validation tax forever.
+                // Checkpoint finality, applied at ranking time: a branch forking at/below the
+                // trusted checkpoint can never be adopted, so it never enters the ranking. This
+                // also keeps a heavy dead sub-checkpoint fork (the 2026-07-11 incompatible-client
+                // ~770-block case) from being re-validated under the write lock on every ingest.
                 if branch[0].index <= self.trusted_checkpoint_height() {
                     continue;
                 }
@@ -2771,51 +2778,53 @@ impl Blockchain {
                     .unwrap_or_else(|| BigUint::from(0u8));
                 let branch_work = Self::branch_work_to_height(&branch, branch_tip.index);
 
-                // Deterministic adoption rule:
-                // 1) positive overlap work advantage
-                // 2) tie-break by lexical tip hash
-                let should_replace = match &best_work_pair {
-                    None => true,
-                    Some((best_branch_work, best_canonical_work)) => {
-                        match Self::compare_work_delta(
-                            &branch_work,
-                            &canonical_work,
-                            best_branch_work,
-                            best_canonical_work,
-                        ) {
-                            std::cmp::Ordering::Greater => true,
-                            std::cmp::Ordering::Equal => branch_tip.hash < best_tip_hash,
-                            std::cmp::Ordering::Less => false,
-                        }
-                    }
-                };
-
-                if should_replace {
-                    best_tip_hash = branch_tip.hash;
-                    best_work_pair = Some((branch_work, canonical_work));
-                    best_branch = Some(branch);
+                // Only rank branches that could actually be adopted over the current tip:
+                // strictly more overlap work, or an equal-work SAME-HEIGHT tip whose hash is
+                // strictly lower than ours (the deterministic lowest-hash tie-break).
+                if branch_work < canonical_work {
+                    continue;
                 }
+                if branch_work == canonical_work
+                    && (branch_tip.index != tip.index || branch_tip.hash >= tip.hash)
+                {
+                    continue;
+                }
+
+                ranked.push((branch, branch_work, canonical_work, branch_tip_hash));
             }
         }
 
-        let Some(branch) = best_branch else {
-            return Ok(false);
-        };
-        let Some((branch_work, canonical_work)) = best_work_pair else {
-            return Ok(false);
-        };
-        if branch_work < canonical_work {
-            return Ok(false);
-        }
-        if branch_work == canonical_work {
-            let Some(branch_tip) = branch.last() else {
-                return Ok(false);
-            };
-            if branch_tip.index != tip.index || branch_tip.hash >= tip.hash {
-                return Ok(false);
+        // Best-first: greater overlap-work delta wins; an equal delta breaks to the lower tip
+        // hash (identical to the former single-best rule, now expressed as a total order).
+        ranked.sort_by(|a, b| match Self::compare_work_delta(&a.1, &a.2, &b.1, &b.2) {
+            std::cmp::Ordering::Greater => std::cmp::Ordering::Less,
+            std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
+            std::cmp::Ordering::Equal => a.3.cmp(&b.3),
+        });
+
+        // Try branches best-first and adopt the first that passes every validity gate. Bounded
+        // so a flood of invalid high-ranked competitors cannot force many dry-runs.
+        for (branch, _branch_work, _canonical_work, _branch_tip_hash) in
+            ranked.into_iter().take(MAX_REORG_ADOPT_ATTEMPTS)
+        {
+            if self.adopt_branch_if_valid(branch, &tip).await? {
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
+    /// Validate one candidate branch against every reorg gate and, if it passes, apply it
+    /// atomically. Returns Ok(true) when the branch is adopted and Ok(false) when a gate rejects
+    /// it (the caller then tries the next-best branch); an Err is a genuine fault, some inside
+    /// the mutation window where the dirty marker is left set for startup recovery. Split out of
+    /// try_adopt_orphan_branch so the deterministic tie-break is resolved over ADOPTABLE branches
+    /// rather than a single pre-validation pick.
+    async fn adopt_branch_if_valid(
+        &self,
+        branch: Vec<Block>,
+        tip: &Block,
+    ) -> Result<bool, BlockchainError> {
         // Validate the selected branch (including parent-linked difficulty adjustment) before applying.
         for b in &branch {
             self.validate_block_internal(b, SignatureValidationMode::AllowTruncatedStored)
