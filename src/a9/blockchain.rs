@@ -1509,6 +1509,61 @@ impl Blockchain {
         Ok(Some(codec::deserialize(&raw)?))
     }
 
+    /// Recover ALL derived state from the authoritative canonical block store after an interrupted
+    /// apply (a crash, OR a live mid-apply `Err` the caller caught and continued past). The order
+    /// is load-bearing:
+    ///   1. `rebuild_chain_tip_metadata` FIRST — it invalidates `chain_tip_cache` and re-anchors
+    ///      `CHAIN_TIP` by scanning `block_` keys. This MUST precede any `highest_block_index()`-
+    ///      driven rebuild: a reorg that failed before `write_chain_tip_metadata` left the cache
+    ///      holding the OLD tip with a still-valid version, so a balance/registry rebuild would
+    ///      otherwise cover the wrong height range and re-poison the ledger.
+    ///   2. force-rebuild the balances index from canonical `[0..=tip]`, discarding a marker that
+    ///      is ahead of the tip (H4) or on the wrong branch (M1) — neither is a trustworthy gap.
+    ///   3. re-derive the replay registry from the same canonical range (its remove/record loops
+    ///      run outside the atomic slot batch, so a failure can leave it half-written).
+    ///   4. address history index is display-only — fail open.
+    ///   5. clear the dirty marker LAST, so any earlier failure leaves it set and the next apply
+    ///      (or startup) retries recovery.
+    /// This is the SAME body `initialize()` runs at startup, factored out so live and startup
+    /// recovery cannot drift.
+    async fn recover_dirty_chain_state(
+        &self,
+        marker: &ChainStateDirty,
+    ) -> Result<(), BlockchainError> {
+        warn!(
+            "Recovering derived chain state after interrupted {} at block {}",
+            marker.reason, marker.block_index
+        );
+        let _ = self.rebuild_chain_tip_metadata()?; // (1) re-anchor tip; invalidate stale cache
+        self.ensure_balances_index_with_force(true).await?; // (2) full rebuild from canonical slots
+        self.rebuild_confirmed_tx_index()?; // (3) re-derive replay registry
+        if let Err(e) = self.rebuild_address_tx_index() {
+            // (4) display-only: a failure must not abort the apply/startup
+            warn!("Address history index rebuild failed during recovery: {}", e);
+        }
+        self.clear_chain_state_dirty()?; // (5) clear LAST
+        Ok(())
+    }
+
+    /// Cheap, idempotent, ~free when clean (one `CHAIN_META_TREE` get). Runs `recover_dirty_chain_state`
+    /// ONLY when a prior apply left the dirty marker stuck. It MUST be called under the same
+    /// serialization as the apply it precedes, and BEFORE that apply reads the tip or the balances
+    /// index — so a live mid-apply failure is healed to the authoritative canonical state instead
+    /// of the next apply re-applying against poisoned (marker-ahead / wrong-branch) derived state
+    /// (H4 double-coinbase self-fork; M1 reorg divergence). The joint serialization
+    /// (`state_mutation_lock` for tip extensions, the outer `RwLock` write guard for the external
+    /// reorg) guarantees a marker seen here reflects a PRIOR failed apply, never an in-flight one.
+    async fn reconcile_chain_state_if_dirty(&self) -> Result<(), BlockchainError> {
+        // Resolve the `?` (which threads a !Send ControlFlow<Result<_, BlockchainError>>) to a plain
+        // Option BEFORE the await, so no BlockchainError-carrying temporary is held across it — the
+        // project-wide !Send rule (BlockchainError is a boxed dyn Error). `marker` is all-Send.
+        let dirty = self.chain_state_dirty()?;
+        if let Some(marker) = dirty {
+            self.recover_dirty_chain_state(&marker).await?;
+        }
+        Ok(())
+    }
+
     /// Highest block height the node treats as final. Blocks at/below it are
     /// signature-trusted (vouched for by a verified signed snapshot, or fully
     /// verified locally then aged past the reorg margin) and cannot be reorged;
@@ -2653,6 +2708,12 @@ impl Blockchain {
     }
 
     async fn try_adopt_orphan_branch(&self) -> Result<bool, BlockchainError> {
+        // Heal any state a PRIOR interrupted apply left dirty (a failed reorg leaves storage on the
+        // new branch but balances on the old) BEFORE reading the tip or scoring branches, so
+        // selection never runs against a stale tip cache / wrong-branch balances (M1). No-op when
+        // clean. Runs under the outer RwLock write guard (adopt_external_branch), before
+        // adopt_branch_if_valid acquires balances_index_gate, so no re-entrant gate acquisition.
+        self.reconcile_chain_state_if_dirty().await?;
         let Some(tip) = self.get_last_block() else {
             return Ok(false);
         };
@@ -3174,6 +3235,13 @@ impl Blockchain {
         block: &Block,
         sig_mode: SignatureValidationMode,
     ) -> Result<(), BlockchainError> {
+        // Heal any state a PRIOR interrupted apply left dirty BEFORE this persist reads balances
+        // (process_transactions_batch below), so a marker left ahead of the tip by a failed apply
+        // cannot double-credit this block's coinbase on the retry (H4). No-op when clean. Also
+        // covers the promote_orphans_from_tip loop, where a mid-loop persist failure must be healed
+        // before the next iteration's balance read.
+        self.reconcile_chain_state_if_dirty().await?;
+
         // Canonical validation gate for all persistence paths.
         self.validate_block_internal(block, sig_mode).await?;
 
@@ -4082,12 +4150,6 @@ impl Blockchain {
 
     pub async fn initialize(&self) -> Result<(), BlockchainError> {
         let dirty_state = self.chain_state_dirty()?;
-        if let Some(marker) = dirty_state.as_ref() {
-            warn!(
-                "Recovering derived chain state after interrupted {} at block {}",
-                marker.reason, marker.block_index
-            );
-        }
         let _ = self.rebuild_chain_tip_metadata()?;
 
         // Get and set the network difficulty first
@@ -4098,24 +4160,14 @@ impl Blockchain {
         self.sync_mempool_with_sled().await?;
         self.rebuild_pending_debits_index().await?;
 
-        // Ensure balances index is valid (rebuild if needed)
-        self.ensure_balances_index_with_force(dirty_state.is_some())
-            .await?;
-        if dirty_state.is_some() {
-            // A crash mid-reorg can leave the replay registry half-written (its
-            // remove/record loops run outside the atomic canonical-slot batch), so
-            // rederive it from the now-consistent canonical chain before clearing the
-            // marker. Otherwise a stale registry would silently let a confirmed tx be
-            // replayed after recovery.
-            self.rebuild_confirmed_tx_index()?;
-            // The address history index has the same half-applied exposure as the
-            // registry (its remove/record run outside the atomic slot batch), but it
-            // is display-only: a failed rebuild must not abort startup. Fail-open —
-            // a failure leaves its meta invalidated, so ensure retries next start.
-            if let Err(e) = self.rebuild_address_tx_index() {
-                warn!("Address history index rebuild failed during recovery: {}", e);
-            }
-            self.clear_chain_state_dirty()?;
+        // Recover from an interrupted apply (a crash OR a live mid-apply Err) via the SAME path the
+        // live reconcile uses (recover_dirty_chain_state), so startup and live recovery cannot
+        // drift: it re-anchors the tip, force-rebuilds balances + the replay registry from the
+        // canonical chain, and clears the marker last. Non-dirty startup just ensures the balances
+        // index is current.
+        match dirty_state.as_ref() {
+            Some(marker) => self.recover_dirty_chain_state(marker).await?,
+            None => self.ensure_balances_index().await?,
         }
         // Build the address history index on first run under this feature, rebuild
         // it if the chain was rewritten while it was offline, or catch up if merely
@@ -4209,6 +4261,11 @@ impl Blockchain {
 
         let _state_guard = self.state_mutation_lock.lock().await;
 
+        // Heal any state a PRIOR interrupted apply left dirty before the tip-shape classification
+        // below reads highest_block_index(): a stale cached tip from a failed reorg would otherwise
+        // misclassify this block. No-op when clean.
+        self.reconcile_chain_state_if_dirty().await?;
+
         // Enforce linear tip extension and park out-of-order blocks as orphans.
         match self.highest_block_index() {
             None => {
@@ -4256,6 +4313,10 @@ impl Blockchain {
             .await?;
 
         let _state_guard = self.state_mutation_lock.lock().await;
+
+        // Heal any state a PRIOR interrupted apply left dirty before the tip-shape classification
+        // below reads highest_block_index() (same reasoning as save_block). No-op when clean.
+        self.reconcile_chain_state_if_dirty().await?;
 
         match self.highest_block_index() {
             None => {
@@ -4306,6 +4367,14 @@ impl Blockchain {
         _miner_address: String,
     ) -> Result<(), BlockchainError> {
         let _state_guard = self.state_mutation_lock.lock().await;
+
+        // THE mining self-fork fix (H4): heal any state a PRIOR interrupted apply left dirty BEFORE
+        // the tip check, the balance prefetch, and process_transactions_batch below. A finalize that
+        // failed after advancing the balances marker but before storing its block leaves the marker
+        // ahead of the tip; without healing here the retry re-mines against the inflated balance and
+        // credits the coinbase twice (base + 2*reward), self-forking the ledger. No-op when clean.
+        self.reconcile_chain_state_if_dirty().await?;
+
         let trace_finalize = std::env::var("ALPHANUMERIC_TRACE_FINALIZE")
             .map(|v| !v.trim().is_empty() && v.trim() != "0")
             .unwrap_or(false);
@@ -8132,6 +8201,223 @@ mod tests {
         assert_eq!(
             blockchain.get_confirmed_balance("miner1").await.unwrap(),
             2.0
+        );
+    }
+
+    // T1 (H4): live reconcile discards a marker-AHEAD poison — the state a finalize leaves when it
+    // advances the balances marker + credits the coinbase but then fails before storing its block —
+    // crediting the coinbase EXACTLY once. This is the core no-double-coinbase / no-self-fork check.
+    #[tokio::test]
+    async fn reconcile_heals_marker_ahead_poison_no_double_coinbase() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let block1 = metadata_test_block(1, block0.hash, "minerx", 5.0);
+        insert_raw_block(&bc, &block0);
+        insert_raw_block(&bc, &block1);
+        bc.write_chain_tip_metadata(&block1).unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        assert_eq!(bc.get_confirmed_balance("minerx").await.unwrap(), 5.0);
+
+        // Stage the poison of a half-committed finalize of a phantom block 2: advance the marker to
+        // 2 and credit minerx a SECOND coinbase (as process_transactions_batch would), but never
+        // store block 2 (tip stays 1). Mark dirty, exactly as the failed finalize would have.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("minerx".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 2).unwrap();
+        bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
+
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+
+        assert_eq!(bc.chain_state_dirty().unwrap(), None, "marker cleared");
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(
+            Blockchain::get_balances_height(&balances).unwrap(),
+            Some(1),
+            "marker re-anchored to the true tip"
+        );
+        assert_eq!(bc.get_latest_block_index(), 1, "tip unchanged");
+        assert_eq!(
+            bc.get_confirmed_balance("minerx").await.unwrap(),
+            5.0,
+            "phantom second coinbase erased; credited exactly once"
+        );
+    }
+
+    // T2 (M1, DECISIVE): recovery must re-anchor the tip (rebuild_chain_tip_metadata FIRST) before
+    // rebuilding balances. A reorg that failed after rewriting canonical slots to a TALLER branch B
+    // (but before write_chain_tip_metadata) leaves chain_tip_cache holding the OLD height; without
+    // the tip re-anchor the balance rebuild would cover [0..=old_tip] and miss B's top block. This
+    // test fails if rebuild_chain_tip_metadata is ever dropped from recover_dirty_chain_state.
+    #[tokio::test]
+    async fn reconcile_reanchors_tip_before_rebuilding_balances_after_failed_reorg() {
+        let bc = test_blockchain();
+        // Chain A: 0..=3.
+        let a0 = metadata_test_block(0, [0u8; 32], "m0", 5.0);
+        let a1 = metadata_test_block(1, a0.hash, "m1", 5.0);
+        let a2 = metadata_test_block(2, a1.hash, "m2a", 5.0);
+        let a3 = metadata_test_block(3, a2.hash, "m3a", 5.0);
+        for b in [&a0, &a1, &a2, &a3] {
+            insert_raw_block(&bc, b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        // Populate chain_tip_cache at height 3 — the stale value recovery must invalidate.
+        assert_eq!(bc.highest_block_index(), Some(3));
+
+        // Simulate a reorg to a TALLER branch B forking at 2 that FAILED after the slot rewrite:
+        // overwrite block_2/block_3 and add block_4 on B (insert_raw_block does NOT invalidate the
+        // cache); balances + marker still reflect A (marker=3). Mark dirty as the failed reorg would.
+        let b2 = metadata_test_block(2, a1.hash, "m2b", 5.0);
+        let b3 = metadata_test_block(3, b2.hash, "m3b", 5.0);
+        let b4 = metadata_test_block(4, b3.hash, "m4b", 5.0);
+        for b in [&b2, &b3, &b4] {
+            insert_raw_block(&bc, b);
+        }
+        bc.mark_chain_state_dirty(2, "orphan_branch_reorg").unwrap();
+
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+        assert_eq!(bc.get_latest_block_index(), 4, "tip re-anchored to the taller branch B");
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert_eq!(Blockchain::get_balances_height(&balances).unwrap(), Some(4));
+        assert_eq!(
+            bc.get_confirmed_balance("m4b").await.unwrap(),
+            5.0,
+            "B4's coinbase is credited (tip was re-anchored past the stale height 3)"
+        );
+        assert_eq!(
+            bc.get_confirmed_balance("m3a").await.unwrap(),
+            0.0,
+            "A3's reverted coinbase is gone (block_3 was overwritten by B3)"
+        );
+    }
+
+    // T5: live reconcile produces the SAME state as a full initialize() over the same staged-dirty
+    // DB — the property that lets startup and live recovery share one code path.
+    #[tokio::test]
+    async fn live_reconcile_matches_initialize_recovery() {
+        let stage = |bc: &Blockchain| {
+            let b0 = metadata_test_block(0, [0u8; 32], "m0", 5.0);
+            let b1 = metadata_test_block(1, b0.hash, "m1", 5.0);
+            insert_raw_block(bc, &b0);
+            insert_raw_block(bc, &b1);
+            bc.write_chain_tip_metadata(&b1).unwrap();
+            let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+            // marker-ahead poison identical to T1.
+            balances
+                .insert("m1".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+                .unwrap();
+            Blockchain::set_balances_height(&balances, 2).unwrap();
+            bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
+        };
+
+        let live = test_blockchain();
+        stage(&live);
+        live.reconcile_chain_state_if_dirty().await.unwrap();
+
+        let boot = test_blockchain();
+        stage(&boot);
+        boot.initialize().await.unwrap();
+
+        assert_eq!(dump_balances(&live), dump_balances(&boot), "same balances");
+        assert_eq!(live.get_latest_block_index(), boot.get_latest_block_index());
+        assert_eq!(live.chain_state_dirty().unwrap(), None);
+        assert_eq!(boot.chain_state_dirty().unwrap(), None);
+    }
+
+    // T6: reconcile on an already-consistent DB is a no-op — no marker, balances unchanged, and
+    // running it twice back-to-back changes nothing (idempotent).
+    #[tokio::test]
+    async fn reconcile_is_noop_when_clean() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "m0", 5.0);
+        let b1 = metadata_test_block(1, b0.hash, "m1", 5.0);
+        insert_raw_block(&bc, &b0);
+        insert_raw_block(&bc, &b1);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        assert_eq!(bc.chain_state_dirty().unwrap(), None, "clean to start");
+        let before = dump_balances(&bc);
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+        assert_eq!(dump_balances(&bc), before, "clean reconcile changes nothing");
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+        // The healthy invariant: marker never ahead of the tip once clean.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        assert!(
+            Blockchain::get_balances_height(&balances).unwrap().unwrap_or(0)
+                <= bc.get_latest_block_index()
+        );
+    }
+
+    // WIRING (H4): finalize_block must run its reconcile BEFORE the tip check / balance prefetch /
+    // apply. Unlike the isolated T1/T5 tests, this drives the REAL entry point, so it FAILS if
+    // finalize's reconcile insert is ever deleted (the marker would stay Some(2)). finalize may
+    // reject the diff-0 retry block AFTER reconciling — that failure is intentionally ignored; the
+    // assertion is on the reconcile's effect.
+    #[tokio::test]
+    async fn finalize_reconciles_marker_ahead_poison_before_apply() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let block1 = metadata_test_block(1, block0.hash, "minerx", 5.0);
+        insert_raw_block(&bc, &block0);
+        insert_raw_block(&bc, &block1);
+        bc.write_chain_tip_metadata(&block1).unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        // The H4 poison a failed finalize leaves: marker ahead + coinbase double-credited, unstored.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("minerx".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 2).unwrap();
+        bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
+
+        // Drive the real entry point; its reconcile must heal before it touches balances.
+        let retry = metadata_test_block(2, block1.hash, "minery", 5.0);
+        let _ = bc.finalize_block(retry, "minery".to_string()).await;
+
+        assert_eq!(bc.chain_state_dirty().unwrap(), None, "finalize healed the marker");
+        assert_eq!(
+            bc.get_confirmed_balance("minerx").await.unwrap(),
+            5.0,
+            "phantom second coinbase erased by finalize's reconcile — credited once"
+        );
+    }
+
+    // WIRING (M1): try_adopt_orphan_branch must run its reconcile BEFORE it reads the tip / scores
+    // branches. Drives the real reorg entry point, so it FAILS if try_adopt's reconcile insert is
+    // deleted (the tip would stay at the stale cached height 1). The orphan pool is empty, so the
+    // adoption itself is a no-op; the assertion is on the reconcile re-anchoring the tip.
+    #[tokio::test]
+    async fn try_adopt_reconciles_before_branch_selection() {
+        let bc = test_blockchain();
+        let a0 = metadata_test_block(0, [0u8; 32], "m0", 5.0);
+        let a1 = metadata_test_block(1, a0.hash, "m1", 5.0);
+        insert_raw_block(&bc, &a0);
+        insert_raw_block(&bc, &a1);
+        bc.rebuild_chain_tip_metadata().unwrap();
+        bc.ensure_balances_index().await.unwrap();
+        assert_eq!(bc.highest_block_index(), Some(1)); // populate the stale cache
+
+        // A failed reorg left a TALLER branch B's slots written but balances/marker on old chain A.
+        let b1 = metadata_test_block(1, a0.hash, "m1b", 5.0);
+        let b2 = metadata_test_block(2, b1.hash, "m2b", 5.0);
+        insert_raw_block(&bc, &b1);
+        insert_raw_block(&bc, &b2);
+        bc.mark_chain_state_dirty(1, "orphan_branch_reorg").unwrap();
+
+        let _ = bc.try_adopt_orphan_branch().await;
+
+        assert_eq!(bc.chain_state_dirty().unwrap(), None, "try_adopt healed the marker");
+        assert_eq!(
+            bc.get_latest_block_index(),
+            2,
+            "try_adopt's reconcile re-anchored the tip to the taller branch before selection"
         );
     }
 
