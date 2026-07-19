@@ -14,7 +14,7 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS, NETWORK_FEE,
+    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT, MAX_TX_AGE_SECS, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 
@@ -456,10 +456,36 @@ impl MiningManager {
                     })
                     .collect()
                 };
-                let mut selected_regular = Vec::with_capacity(live_transactions.len());
+
+                // Reserve one slot for the coinbase so the finalized block never exceeds
+                // the consensus per-block transaction cap. Without this bound, a mempool
+                // larger than the cap made every template over-full: the nonce grind
+                // completed, finalize rejected the block, and — the rejection being
+                // indistinguishable from a lost race — the continuous loop reset its error
+                // counter and re-ground the same doomed template forever, stalling block
+                // production across the whole network until the backlog drained.
+                let regular_cap = MAX_BLOCK_TX_COUNT.saturating_sub(1);
+
+                // Order candidates highest-fee first, then oldest first, so that when the
+                // live mempool exceeds the cap we keep the most valuable / longest-waiting
+                // transactions rather than an arbitrary subset. Regular transactions are
+                // near-constant size (the ML-DSA signature dominates), so exact fee order
+                // tracks fee-per-byte.
+                let mut ordered: Vec<&Transaction> = live_transactions.iter().collect();
+                ordered.sort_by(|a, b| {
+                    b.fee_units
+                        .cmp(&a.fee_units)
+                        .then_with(|| a.timestamp.cmp(&b.timestamp))
+                });
+
+                let mut selected_regular =
+                    Vec::with_capacity(regular_cap.min(live_transactions.len()));
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
 
-                for transaction in &live_transactions {
+                for transaction in ordered {
+                    if selected_regular.len() >= regular_cap {
+                        break;
+                    }
                     // Exact i128: tx selection must agree with the consensus writer's
                     // affordability so it doesn't select a tx that finalize then rejects
                     // (the f64 round-trip drifts above ~33.55M coins — 2026-07-12 audit).
