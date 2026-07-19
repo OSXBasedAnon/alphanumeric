@@ -589,14 +589,15 @@ impl WebRtcMesh {
                 .map(|(id, c)| (id.clone(), c.pc.clone()))
                 .collect()
         };
-        let local = self.local_id().to_string();
         for (id, pc) in stale {
             // Identity-checked: never evict a fresh pc a concurrent re-dial bound to this id.
             self.remove_if_current_and_close(&id, &pc).await;
-            // A reaped never-connected pc means the dial to a peer we initiate to failed — back off.
-            if id > local {
-                self.note_dial_failure(&id).await;
-            }
+            // A reaped never-connected pc means a connection attempt with this peer failed — back
+            // off regardless of which side offered. Previously only our OUTBOUND dials (id > local)
+            // recorded backoff, so a low-id peer that repeatedly offers but never completes hole-
+            // punch recorded none: dial_allowed(from) never throttled it, pinning the signaling poll
+            // loop at its fast cadence and churning a fresh RTCPeerConnection every reap window.
+            self.note_dial_failure(&id).await;
         }
     }
 
@@ -1112,6 +1113,43 @@ mod tests {
         let b = mesh.dial_backoff.lock().await;
         assert!(b.contains_key("stays"), "still-advertised peer keeps its backoff");
         assert!(!b.contains_key("gone"), "departed peer's backoff is pruned");
+    }
+
+    // M4: a reaped never-connected pc must record dial backoff regardless of which side offered.
+    // The former `id > local` guard recorded backoff only for our OUTBOUND dials, so a low-id peer
+    // that keeps offering but never completes hole-punch was never throttled — pinning the
+    // signaling poll loop at its fast cadence and churning a fresh pc every reap window.
+    #[tokio::test]
+    async fn reap_stale_backs_off_responder_side_peers_too() {
+        use std::time::{Duration, Instant};
+        let t: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
+        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        // A responder-side id: strictly LESS than our local id, so the old guard skipped it.
+        let peer = "!".to_string();
+        assert!(
+            peer.as_str() < mesh.local_id(),
+            "test peer id must sort below the local id to exercise the responder path"
+        );
+
+        mesh.new_pc(&peer).await.unwrap();
+        // Age the connection past the stale window, leaving it New (never connected).
+        {
+            let mut conns = mesh.conns.lock().await;
+            let entry = conns.get_mut(&peer).expect("pc is tracked");
+            entry.created = Instant::now() - Duration::from_secs(MESH_STALE_SECS + 5);
+        }
+
+        assert!(mesh.dial_allowed(&peer).await, "no backoff before the reap");
+        mesh.reap_stale().await;
+        assert!(
+            !mesh.dial_allowed(&peer).await,
+            "a reaped never-connected responder-side pc must record dial backoff"
+        );
+        assert!(
+            !mesh.conns.lock().await.contains_key(&peer),
+            "the reaped pc is removed"
+        );
     }
 
     // In-memory signal transport for multi-node tests: a shared map of per-recipient mailboxes —
