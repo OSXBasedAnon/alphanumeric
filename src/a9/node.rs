@@ -8330,6 +8330,9 @@ impl Node {
             }
         };
 
+        // Tracks whether validation_result was flipped to false purely by the (time-varying)
+        // conflicting-verified-header check, so that verdict is NOT negative-cached below.
+        let mut conflict_derived_reject = false;
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
                 // Header consensus is versioned by activation height:
@@ -8348,6 +8351,7 @@ impl Node {
                             block.index
                         );
                         validation_result = false;
+                        conflict_derived_reject = true;
                     } else {
                         let has_record = sentinel.has_verification_record(&block.hash);
                         if sentinel.should_require_verified_header_record_for_block(block.index)
@@ -8368,13 +8372,20 @@ impl Node {
             }
         }
 
-        self.validation_cache.insert(
-            block_hash,
-            ValidationCacheEntry {
-                valid: validation_result,
-                timestamp: SystemTime::now(),
-            },
-        );
+        // Do NOT negative-cache a conflict-derived rejection: has_conflicting_verified_header is
+        // time-varying (the attacker's verified header ages out / its backoff elapses), so caching
+        // false under this block's own hash would suppress the honest tip for up to the cache TTL
+        // even after the conflict clears. Re-evaluate it fresh next time — same reasoning as the
+        // bad-claimed-hash path above, which also declines to negative-cache.
+        if !conflict_derived_reject {
+            self.validation_cache.insert(
+                block_hash,
+                ValidationCacheEntry {
+                    valid: validation_result,
+                    timestamp: SystemTime::now(),
+                },
+            );
+        }
         self.maybe_prune_validation_cache();
 
         if validation_result {

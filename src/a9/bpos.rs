@@ -452,11 +452,12 @@ impl BPoSSentinel {
                     .map(|info| (info.address.to_string(), info.blocks))
                     .collect()
             };
-            let headers = self.header_sentinel.headers.read().await;
-
+            // Max height any peer reports. The former filter compared peer SocketAddr strings to
+            // header verified_by node_ids, which never match, so this trigger was dead (max was
+            // always 0). sync_with_network re-validates peer heights anyway, so computing the max
+            // directly from reported heights is both correct and sufficient.
             peer_infos
                 .iter()
-                .filter(|(address, _)| headers.iter().any(|h| h.verified_by.contains(address)))
                 .map(|(_, blocks)| *blocks)
                 .max()
                 .unwrap_or(0)
@@ -1962,6 +1963,10 @@ pub struct HeaderSentinel {
     public_key: Vec<u8>,
     secret_key: Vec<u8>,
     header_rules_version: u32,
+    /// Serialises register_peer_mldsa_key's per-IP count + insert so concurrent registrations
+    /// from the same IP cannot each observe per_ip < cap and all insert (TOCTOU). Registration
+    /// is infrequent and holds no await, so a plain mutex is cheap and deadlock-free.
+    registration_gate: std::sync::Mutex<()>,
 }
 
 impl HeaderSentinel {
@@ -1992,6 +1997,21 @@ impl HeaderSentinel {
             .iter()
             .filter(|id| id.as_str() != Self::LOCAL_VERIFIER_ID)
             .count()
+    }
+
+    /// Number of DISTINCT source IPs among a header's external verifiers (LOCAL excluded). This
+    /// is the anti-Sybil NUMERATOR and must be counted on the same basis (distinct IP) as the
+    /// eligibility denominator (registered_verifier_ip_count): MAX_MLDSA_KEYS_PER_IP permits two
+    /// keys behind one IP, so counting raw node_ids would let a single host contribute more to a
+    /// header's tally than to the eligible set and self-satisfy the quorum. A verifier whose key
+    /// is no longer registered (evicted) does not count.
+    fn distinct_verifier_ip_count(&self, verifiers: &HashSet<String>) -> usize {
+        let ips: std::collections::HashSet<IpAddr> = verifiers
+            .iter()
+            .filter(|id| id.as_str() != Self::LOCAL_VERIFIER_ID)
+            .filter_map(|id| self.peer_mldsa_keys.get(id).map(|e| e.value().source_ip))
+            .collect();
+        ips.len()
     }
 
     fn verify_signature_with_registered_node_key(
@@ -2055,6 +2075,13 @@ impl HeaderSentinel {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // Serialise the rest (existing-key update OR per-IP count + insert) so concurrent
+        // same-IP registrations cannot each pass the per-IP cap check and all insert (TOCTOU).
+        let _reg_guard = self
+            .registration_gate
+            .lock()
+            .map_err(|_| "registration gate poisoned".to_string())?;
 
         // Existing node_id: accept a key rotation, always refresh last_seen + source_ip.
         if let Some(mut existing) = self.peer_mldsa_keys.get_mut(node_id) {
@@ -2130,6 +2157,7 @@ impl HeaderSentinel {
             public_key,
             secret_key,
             header_rules_version: HEADER_RULES_VERSION,
+            registration_gate: std::sync::Mutex::new(()),
         }
     }
 
@@ -2198,8 +2226,14 @@ impl HeaderSentinel {
             // Verify headers in chunk
             for header in chunk {
                 let strict_v2 = self.is_header_rules_v2_active();
-                // Skip duplicates
+                // A header already in the verification cache was validated when first seen. Still
+                // record THIS reporter as one of its verifiers — distinct reporters must accumulate
+                // toward the quorum. The former early `continue` dropped every reporter after the
+                // first, so an honestly-reported conflicting header could never reach quorum and the
+                // reject gate was inert. Push it through to the accumulation block below (which adds
+                // node_id), but skip re-running the temporal/link validation it already passed.
                 if self.verifications.contains_key(&header.hash) {
+                    verified_headers.push(header.clone());
                     continue;
                 }
 
@@ -2290,7 +2324,9 @@ impl HeaderSentinel {
         let Some(v) = self.verifications.get(hash) else {
             return false;
         };
-        let actual = Self::external_verifier_count(&v.verifiers);
+        // Count by distinct source IP, matching the IP-based eligibility denominator, so two
+        // keys behind one IP cannot inflate the tally past the quorum threshold.
+        let actual = self.distinct_verifier_ip_count(&v.verifiers);
 
         actual >= required
     }
@@ -2827,6 +2863,56 @@ mod tests {
             sentinel
                 .has_conflicting_verified_header(10, &expected_hash)
                 .await
+        );
+    }
+
+    // L3 regression: a header's verifier quorum is counted by DISTINCT source IP, not by raw
+    // node_id, so the two keys MAX_MLDSA_KEYS_PER_IP permits behind one IP cannot forge quorum.
+    #[tokio::test]
+    async fn header_quorum_counts_distinct_ips_not_keys() {
+        let sentinel = HeaderSentinel::new();
+        // Three eligible source IPs -> the required threshold is 3 (ceil(3 * 0.67)).
+        sentinel.peer_mldsa_keys.insert("n1".to_string(), reg_key(1, 1));
+        sentinel.peer_mldsa_keys.insert("n2".to_string(), reg_key(2, 2));
+        // Two distinct keys, SAME source IP (10.0.0.3): allowed, but one Sybil identity.
+        sentinel.peer_mldsa_keys.insert("n3a".to_string(), reg_key(3, 3));
+        sentinel.peer_mldsa_keys.insert("n3b".to_string(), reg_key(4, 3));
+        assert_eq!(sentinel.registered_verifier_ip_count(), 3);
+        assert_eq!(sentinel.required_verifier_count(3), 3);
+
+        let hash = [0xCD; 32];
+
+        // Verified by n1 + BOTH keys behind ip3: 3 node_ids but only 2 distinct IPs. Counting keys
+        // would forge quorum (3 >= 3); counting IPs correctly does not (2 < 3).
+        sentinel.verifications.insert(
+            hash,
+            VerificationState {
+                timestamp: 0,
+                verifiers: ["n1".to_string(), "n3a".to_string(), "n3b".to_string()]
+                    .into_iter()
+                    .collect(),
+                mldsa_signatures: HashMap::new(),
+            },
+        );
+        assert!(
+            !sentinel.is_header_verified(&hash).await,
+            "two keys behind one IP must not reach quorum"
+        );
+
+        // Three genuinely distinct verifier IPs DO reach quorum.
+        sentinel.verifications.insert(
+            hash,
+            VerificationState {
+                timestamp: 0,
+                verifiers: ["n1".to_string(), "n2".to_string(), "n3a".to_string()]
+                    .into_iter()
+                    .collect(),
+                mldsa_signatures: HashMap::new(),
+            },
+        );
+        assert!(
+            sentinel.is_header_verified(&hash).await,
+            "three distinct verifier IPs must reach quorum"
         );
     }
 
