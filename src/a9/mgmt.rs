@@ -169,6 +169,26 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Persist the serialized wallet key set to `key_file_path`, returning Err on either an I/O
+/// failure or the 5s timeout. Persisting the key is a PRECONDITION for treating a wallet as
+/// created: the ML-DSA seed lives only in RAM until this write, and `save_wallets` was removed,
+/// so a swallowed write failure would lose the key on the next launch and permanently strand any
+/// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
+/// on this class; this closes the corresponding write side.
+async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
+    let serialized = serde_json::to_string(key_data_vec)?;
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        write_secret_file(key_file_path, serialized.as_ref()).await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("failed to persist wallet key to {}: {}", key_file_path, e).into()),
+        Err(_) => Err(format!("timed out persisting wallet key to {}", key_file_path).into()),
+    }
+}
+
 /// Classify a `private.key` read error. ONLY `NotFound` is a genuine first run (safe to create a
 /// default wallet). Any other error — permissions (EACCES), a Windows AV share-lock, non-UTF-8
 /// corruption (`InvalidData`), or a transient I/O error — means the key file EXISTS but is
@@ -305,26 +325,14 @@ impl Mgmt {
         let mut key_data_vec = existing_keys;
         key_data_vec.push(key_data);
 
-        let serialized_key_data = serde_json::to_string(&key_data_vec)?;
+        // Persist the key BEFORE registering the wallet: a write failure or timeout returns Err
+        // here rather than handing back a wallet whose ML-DSA seed exists only in RAM (which the
+        // next launch would not find, permanently stranding any funds sent to the address).
+        persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
 
-        // Save wallet to key file with timeout
-        match tokio::time::timeout(Duration::from_secs(5), async {
-            write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })
-        .await
-        {
-            Ok(Ok(())) => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
-                writeln!(stdout, "\n✓ Wallet created successfully!")?;
-                stdout.reset()?;
-            }
-            _ => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-                writeln!(stdout, "\n⚠ Wallet created with warnings")?;
-                stdout.reset()?;
-            }
-        };
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
+        writeln!(stdout, "\n✓ Wallet created successfully!")?;
+        stdout.reset()?;
 
         // Display wallet information
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)))?;
@@ -336,7 +344,7 @@ impl Mgmt {
         }
         stdout.reset()?;
 
-        // Add to active wallets map
+        // Register the wallet only after its key is durably persisted.
         wallets.insert(name, wallet.clone());
 
         Ok(wallet)
@@ -468,33 +476,22 @@ impl Mgmt {
 
         let key_data_vec = vec![key_data];
 
-        let serialized_key_data = serde_json::to_string(&key_data_vec)?;
+        // Persist the key BEFORE registering the wallet (see persist_wallet_keys). On first run no
+        // key file exists yet, so a swallowed write failure here would make the NEXT launch treat
+        // it as a fresh first run and generate a DIFFERENT default wallet — orphaning this one's
+        // address and any funds it received. Fail loudly instead.
+        persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
 
-        // Save wallet to key file with timeout
-        match tokio::time::timeout(Duration::from_secs(5), async {
-            write_secret_file(KEY_FILE_PATH, serialized_key_data.as_ref()).await?;
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })
-        .await
-        {
-            Ok(Ok(())) => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
-                writeln!(stdout, "\n✓ Wallet created successfully!")?;
-                stdout.reset()?;
-            }
-            _ => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-                writeln!(stdout, "\n⚠ Wallet created with warnings")?;
-                stdout.reset()?;
-            }
-        };
+        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
+        writeln!(stdout, "\n✓ Wallet created successfully!")?;
+        stdout.reset()?;
 
         // Display wallet information
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)))?;
         writeln!(stdout, "\nWallet Address: {}", wallet.address)?;
         stdout.reset()?;
 
-        // Add wallet to local map
+        // Register the wallet only after its key is durably persisted.
         wallets.insert(default_wallet_name, wallet);
 
         // Avoid self-relaunch: spawning a second copy of the executable is a common heuristic trigger
@@ -1359,5 +1356,30 @@ mod tests {
             ErrorKind::WouldBlock,
             "AV share-lock"
         )));
+    }
+
+    // H2: persisting the wallet key is a PRECONDITION for creating the wallet. A write failure or
+    // timeout must surface as Err (never be swallowed), so the caller never registers/returns a
+    // wallet whose ML-DSA seed exists only in RAM and would be lost on the next launch.
+    #[tokio::test]
+    async fn persist_wallet_keys_surfaces_write_failure_and_persists_on_success() {
+        // FAILURE (fault injection): a path whose parent directory does not exist makes
+        // write_secret_file's temp-file create fail, so persist_wallet_keys must return Err.
+        let bad_path = "/nonexistent-a9-wallet-test-dir-zzq/private.key";
+        assert!(
+            persist_wallet_keys(bad_path, &[]).await.is_err(),
+            "a wallet-key write failure must surface as Err, never be swallowed"
+        );
+        assert!(!std::path::Path::new(bad_path).exists());
+
+        // SUCCESS: a writable path persists the key set and returns Ok.
+        let ok_path = std::env::temp_dir().join(format!("a9-persist-ok-{}.key", std::process::id()));
+        let ok_path_str = ok_path.to_str().expect("temp path is valid utf-8");
+        assert!(
+            persist_wallet_keys(ok_path_str, &[]).await.is_ok(),
+            "a writable path must persist the key set successfully"
+        );
+        assert!(ok_path.exists());
+        let _ = std::fs::remove_file(&ok_path);
     }
 }
