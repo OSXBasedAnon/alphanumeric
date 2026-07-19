@@ -773,6 +773,10 @@ pub enum BlockchainError {
     InvalidSystemTransaction,
     /// A block repeats a non-coinbase transaction id.
     DuplicateTransaction,
+    /// A block carries more than MAX_BLOCK_TX_COUNT transactions. Distinct from
+    /// InvalidBlockHeader so the continuous miner never mistakes an over-full
+    /// template for a lost race and re-grinds the same doomed block forever.
+    BlockTransactionCountExceeded,
     BatchValidationFailed(Vec<usize>),
 }
 
@@ -808,6 +812,9 @@ impl fmt::Display for BlockchainError {
             BlockchainError::InvalidSystemTransaction => write!(f, "Invalid system transaction"),
             BlockchainError::DuplicateTransaction => {
                 write!(f, "Block repeats a non-coinbase transaction id")
+            }
+            BlockchainError::BlockTransactionCountExceeded => {
+                write!(f, "Block exceeds the maximum transaction count")
             }
             BlockchainError::BatchValidationFailed(errors) => {
                 write!(f, "Batch validation failed with {} errors", errors.len())
@@ -4833,8 +4840,10 @@ impl Blockchain {
 
         // Bound transactions per block (DoS): reject an over-full block before any
         // further per-transaction work. Finalized history is small and unaffected.
+        // Distinct error (not InvalidBlockHeader) so a continuous miner never mistakes
+        // this for a lost race and re-grinds the same over-full template forever.
         if block.transactions.len() > MAX_BLOCK_TX_COUNT {
-            return Err(BlockchainError::InvalidBlockHeader);
+            return Err(BlockchainError::BlockTransactionCountExceeded);
         }
 
         // Intra-block transaction-id uniqueness: a block must not contain the same non-coinbase
@@ -4979,6 +4988,15 @@ impl Blockchain {
     pub async fn validate_new_block(&self, block: &Block) -> Result<(), BlockchainError> {
         // Basic Header Validation
         block.validate_header()?;
+
+        // Bound transactions per block (DoS + liveness): reject an over-full template
+        // BEFORE finalize, with an error distinct from a lost race, so the continuous
+        // miner treats it as a real fault instead of re-grinding it forever. The template
+        // selector already caps at MAX_BLOCK_TX_COUNT-1, so this only fires on a block
+        // built by some other path.
+        if block.transactions.len() > MAX_BLOCK_TX_COUNT {
+            return Err(BlockchainError::BlockTransactionCountExceeded);
+        }
 
         // Get current confirmed balances before validation
         let mut confirmed_balances: HashMap<String, i128> = HashMap::new();
@@ -8596,6 +8614,63 @@ mod tests {
             .await
             .expect_err("child block with backwards timestamp should be rejected");
         assert!(matches!(err, BlockchainError::InvalidBlockHeader));
+    }
+
+    // H3 regression: an over-full block (more than MAX_BLOCK_TX_COUNT transactions) must be
+    // rejected with a DISTINCT error, never one that stringifies like a lost race. Otherwise
+    // the continuous miner mistakes the finalize rejection for "another miner's block won",
+    // resets its error counter, and re-grinds the same doomed over-full template forever —
+    // halting block production network-wide whenever the mempool exceeds the cap.
+    #[tokio::test]
+    async fn validate_new_block_rejects_over_full_template_with_distinct_error() {
+        let bc = test_blockchain();
+        let coinbase = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "miner0".to_string(),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 1_000,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        // 1 coinbase + MAX_BLOCK_TX_COUNT regular = MAX_BLOCK_TX_COUNT + 1 (over the cap).
+        let mut transactions = vec![coinbase];
+        for i in 0..MAX_BLOCK_TX_COUNT {
+            transactions.push(Transaction {
+                sender: format!("s{}", i),
+                recipient: "r".to_string(),
+                fee_units: Transaction::to_units(NETWORK_FEE),
+                amount_units: Transaction::to_units(1.0),
+                timestamp: 1_000,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            });
+        }
+        assert!(transactions.len() > MAX_BLOCK_TX_COUNT);
+
+        let merkle_root =
+            Blockchain::calculate_merkle_root(&transactions).expect("merkle root should build");
+        let mut block = Block {
+            index: 1,
+            previous_hash: [1u8; 32],
+            timestamp: 1_000,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+
+        let err = bc
+            .validate_new_block(&block)
+            .await
+            .expect_err("over-full block must be rejected");
+        assert!(matches!(err, BlockchainError::BlockTransactionCountExceeded));
+        // The classification guard: this must never read as a lost race.
+        assert!(!err.to_string().contains("Block header is invalid"));
     }
 
     #[tokio::test]
