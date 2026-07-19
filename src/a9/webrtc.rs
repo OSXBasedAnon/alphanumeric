@@ -40,6 +40,17 @@ fn ensure_crypto_provider() {
 /// on an internet-only mesh. Loopback is intentionally excluded here (kept via the filter below) so
 /// same-machine tests still work.
 fn is_lan_or_local(ip: std::net::IpAddr) -> bool {
+    // Fold an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to IPv4 so the IPv4 arm classifies it; std
+    // does not auto-fold, so ::ffff:<internal-ipv4> would otherwise slip past the V6 arm as
+    // "public" and NOT be stripped from a remote peer's SDP (the internal-probe/SSRF primitive this
+    // guards). Mirrors node.rs::canonical_ip / PeerInfo::new.
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_private()
@@ -565,6 +576,27 @@ impl WebRtcMesh {
         entry.1 = Instant::now() + Duration::from_secs(secs);
     }
 
+    /// Handle a pc reaching a TERMINAL state (Failed or Closed). Always drops it from `conns` if it
+    /// is still the current pc for `peer`; on `failed` (ICE gave up / a live link was lost) it also
+    /// records dial backoff and closes the pc off-task. Recording backoff HERE — not only in
+    /// `reap_stale` — is what actually throttles a low-id peer that keeps offering: the Failed
+    /// state-change is the COMMON teardown, and `forget_if_current` removes the pc before the 45s
+    /// reaper ever sees it, so without this the Failed path would escape the backoff entirely and
+    /// keep the signaling poll loop hot. A previously-connected peer that drops to Failed takes a
+    /// first-tier backoff before its next dial; `on_open` clears it on the next success.
+    async fn on_terminal_pc_state(&self, peer: &str, pc: &Arc<RTCPeerConnection>, failed: bool) {
+        let was_current = self.forget_if_current(peer, pc).await;
+        if failed && was_current {
+            self.note_dial_failure(peer).await;
+            // Close off-task: close() drives more state changes, so awaiting it inside the
+            // state-change handler would re-enter synchronously.
+            let pc = pc.clone();
+            tokio::spawn(async move {
+                let _ = pc.close().await;
+            });
+        }
+    }
+
     /// Close + remove any connection that has not reached Connected within MESH_STALE_SECS. Half-open
     /// pcs (offer sent, no answer arrived) never transition to Failed on their own, so this is the
     /// only thing that frees them and unblocks a re-dial of that peer.
@@ -695,14 +727,7 @@ impl WebRtcMesh {
                     return;
                 }
                 if let (Some(mesh), Some(pc)) = (mesh_weak.upgrade(), pc_weak.upgrade()) {
-                    let was_current = mesh.forget_if_current(&peer2, &pc).await;
-                    if matches!(s, St::Failed) && was_current {
-                        // Close off-task: close() drives more state changes, so awaiting it inside
-                        // this handler would re-enter synchronously.
-                        tokio::spawn(async move {
-                            let _ = pc.close().await;
-                        });
-                    }
+                    mesh.on_terminal_pc_state(&peer2, &pc, matches!(s, St::Failed)).await;
                 }
             })
         }));
@@ -1150,6 +1175,47 @@ mod tests {
             !mesh.conns.lock().await.contains_key(&peer),
             "the reaped pc is removed"
         );
+    }
+
+    // M3 companion: is_lan_or_local must fold an IPv4-mapped IPv6 address before classifying, so a
+    // remote peer cannot smuggle ::ffff:<internal-ipv4> past the SDP candidate strip (an SSRF probe
+    // toward internal/metadata hosts).
+    #[test]
+    fn is_lan_or_local_folds_ipv4_mapped_ipv6() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mapped =
+            |a: u8, b: u8, c: u8, d: u8| IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
+        // Internal mapped addresses classify as LAN/local (stripped from a remote SDP).
+        assert!(is_lan_or_local(mapped(169, 254, 169, 254))); // link-local cloud metadata
+        assert!(is_lan_or_local(mapped(10, 0, 0, 1))); // RFC1918
+        // A mapped PUBLIC address is preserved (real connectivity unaffected).
+        assert!(!is_lan_or_local(mapped(8, 8, 8, 8)));
+    }
+
+    // M4 (completion): the Failed state-change is the common pc teardown; forget_if_current removes
+    // the pc before the reaper sees it, so backoff must be recorded there too. failed=true drops the
+    // pc AND records backoff; failed=false (a normal Close) drops it WITHOUT backoff.
+    #[tokio::test]
+    async fn failed_pc_teardown_records_backoff() {
+        let t: Arc<dyn SignalTransport> =
+            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
+        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+
+        // Failed teardown -> pc dropped AND backoff recorded.
+        let peer = "peer-failed";
+        let pc = mesh.new_pc(peer).await.unwrap();
+        assert!(mesh.dial_allowed(peer).await, "no backoff before failure");
+        mesh.on_terminal_pc_state(peer, &pc, true).await;
+        assert!(!mesh.conns.lock().await.contains_key(peer), "failed pc is dropped");
+        assert!(!mesh.dial_allowed(peer).await, "a Failed teardown records dial backoff");
+
+        // Closed teardown (normal shutdown) -> pc dropped WITHOUT backoff.
+        let peer2 = "peer-closed";
+        let pc2 = mesh.new_pc(peer2).await.unwrap();
+        mesh.on_terminal_pc_state(peer2, &pc2, false).await;
+        assert!(!mesh.conns.lock().await.contains_key(peer2), "closed pc is dropped");
+        assert!(mesh.dial_allowed(peer2).await, "a normal Close does not back off");
+        let _ = pc2.close().await;
     }
 
     // In-memory signal transport for multi-node tests: a shared map of per-recipient mailboxes —
