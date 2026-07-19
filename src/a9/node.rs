@@ -2049,8 +2049,19 @@ impl Node {
         None
     }
 
+    /// Fold an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to its real IPv4 form so the IPv4
+    /// filters apply to it; Rust std does not auto-fold these. Mirrors PeerInfo::new. Without it
+    /// an attacker-supplied ::ffff:<internal-ipv4> slips past the IPv6 arm of the address filters
+    /// as "public/dialable" (SSRF / internal-host dialing). Non-mapped addresses pass through.
+    fn canonical_ip(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            v4 => v4,
+        }
+    }
+
     fn is_private_ip(addr: &IpAddr) -> bool {
-        match addr {
+        match Self::canonical_ip(*addr) {
             IpAddr::V4(ip) => {
                 ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
             }
@@ -2063,11 +2074,15 @@ impl Node {
             return false;
         }
 
+        // Fold an IPv4-mapped IPv6 address to IPv4 so the IPv4 filters below apply to it (std does
+        // not auto-fold); otherwise ::ffff:<internal-ipv4> would slip past the IPv6 arm as dialable.
+        let ip = Self::canonical_ip(addr.ip());
+
         if allow_private {
-            return !addr.ip().is_unspecified();
+            return !ip.is_unspecified();
         }
 
-        match addr.ip() {
+        match ip {
             IpAddr::V4(ip) => {
                 let octets = ip.octets();
                 let is_shared_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
@@ -11454,6 +11469,32 @@ mod tests {
         a.insert(item);
         let b = a.clone();
         assert!(b.check(item), "clone must still recognize an inserted item");
+    }
+
+    // M3: IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) must be folded to IPv4 before the address
+    // filters run, or an attacker-supplied ::ffff:<internal-ipv4> slips past the IPv6 arm as a
+    // public, dialable peer (SSRF / internal-host dialing). A mapped PUBLIC address stays dialable.
+    #[test]
+    fn ipv4_mapped_ipv6_is_canonicalized_before_filtering() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let mapped = |a: u8, b: u8, c: u8, d: u8| IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
+        let metadata = mapped(169, 254, 169, 254); // link-local cloud metadata endpoint
+        let private = mapped(10, 0, 0, 1);
+        let loopback = mapped(127, 0, 0, 1);
+        let public = mapped(8, 8, 8, 8);
+
+        // Folded internal mapped addresses classify as private; a mapped public one does not.
+        assert!(Node::is_private_ip(&metadata));
+        assert!(Node::is_private_ip(&private));
+        assert!(Node::is_private_ip(&loopback));
+        assert!(!Node::is_private_ip(&public));
+
+        // And they are NOT dialable in public discovery mode, while the mapped public one is.
+        let dial = |ip| Node::is_dialable_discovery_addr(&SocketAddr::new(ip, 8333), false);
+        assert!(!dial(metadata));
+        assert!(!dial(private));
+        assert!(!dial(loopback));
+        assert!(dial(public));
     }
 
     // sync_with_network must not cry wolf: with zero blocks synced from peers, a relay-fallback
