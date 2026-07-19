@@ -2347,6 +2347,20 @@ impl Blockchain {
             return Ok(());
         }
 
+        // Unreachable-height guard (bound 4, H1): collect_orphan_branches_from caps branch depth at
+        // ORPHAN_REORG_DEPTH and seeds only from candidates <= tip, so the highest block any
+        // adoptable branch can contain is tip + ORPHAN_REORG_DEPTH - 1. A block above
+        // tip + ORPHAN_REORG_DEPTH can never enter an adopted branch — the SAME bound holds on
+        // un-upgraded peers, so this cannot diverge the canonical chain — and retaining it only
+        // feeds an above-tip flood. Skipped pre-genesis (tip None); a far-behind node catches up
+        // via height-indexed sync, not via retained far-ahead orphans. Threshold MUST track
+        // collect's max_depth (both ORPHAN_REORG_DEPTH).
+        if let Some(tip) = self.highest_block_index() {
+            if block.index > tip.saturating_add(ORPHAN_REORG_DEPTH) {
+                return Ok(());
+            }
+        }
+
         let orphan_blocks = self.open_orphan_blocks_tree()?;
         let orphan_index = self.open_orphan_index_tree()?;
         let hash_key = Self::orphan_hash_key(&block.hash);
@@ -2423,14 +2437,21 @@ impl Blockchain {
         Ok(children)
     }
 
+    /// Enumerate all orphan branches rooted at `start`, bounded by `max_depth` and `max_branches`.
+    /// Branches are `Vec<Arc<Block>>`: at a fork the branch-so-far is cloned per child, but with
+    /// `Arc` that copies 8-byte pointers, not whole `Block` bodies (bound 2). Without this, a
+    /// spine+fanout orphan DAG (`max_depth * max_branches` ~ 4.19M) deep-copied ~1.3-1.6 GB of block
+    /// bodies under the lock (H1). The returned branch set/order/contents are byte-identical to the
+    /// former body-clone version — every fork-choice input (`branch[0].index`,
+    /// `branch_work_to_height`, tie-break hash) reads the same bytes, so adoption is unchanged.
     fn collect_orphan_branches_from(
         &self,
-        start: Block,
+        start: Arc<Block>,
         max_depth: usize,
         max_branches: usize,
-    ) -> Result<Vec<Vec<Block>>, BlockchainError> {
-        let mut complete = Vec::new();
-        let mut stack = vec![vec![start]];
+    ) -> Result<Vec<Vec<Arc<Block>>>, BlockchainError> {
+        let mut complete: Vec<Vec<Arc<Block>>> = Vec::new();
+        let mut stack: Vec<Vec<Arc<Block>>> = vec![vec![start]];
 
         while let Some(branch) = stack.pop() {
             let Some(current) = branch.last() else {
@@ -2460,8 +2481,8 @@ impl Blockchain {
 
             let selected: Vec<Block> = children.into_iter().take(remaining_slots).collect();
             for child in selected.into_iter().rev() {
-                let mut next_branch = branch.clone();
-                next_branch.push(child);
+                let mut next_branch = branch.clone(); // Vec<Arc<Block>> clone = pointer copies only
+                next_branch.push(Arc::new(child));
                 stack.push(next_branch);
             }
         }
@@ -2486,12 +2507,17 @@ impl Blockchain {
         BigUint::from(1u8) << exponent
     }
 
-    fn branch_work_to_height(branch: &[Block], max_height: u32) -> BigUint {
+    // Generic over Borrow<Block> so it serves BOTH the external-branch fork-choice callers (which
+    // hold owned `Block`s) and the orphan-reorg ranking (which now holds `Arc<Block>` for bound 2).
+    fn branch_work_to_height<B: std::borrow::Borrow<Block>>(
+        branch: &[B],
+        max_height: u32,
+    ) -> BigUint {
         branch
             .iter()
-            .filter(|b| b.index <= max_height)
+            .filter(|b| b.borrow().index <= max_height)
             .fold(BigUint::from(0u8), |acc, b| {
-                acc + Self::work_units_for_difficulty(b.difficulty)
+                acc + Self::work_units_for_difficulty(b.borrow().difficulty)
             })
     }
 
@@ -2763,6 +2789,13 @@ impl Blockchain {
         // deterministic tie-break. Combined with the per-attempt eval budget below,
         // this stops a flood of low-value orphan competitors from starving
         // evaluation of the genuinely heaviest branch.
+        //
+        // INVARIANT (bound-3 neutrality): the PRIMARY key MUST stay index-descending. It forces
+        // every sub-checkpoint candidate strictly after all above-checkpoint ones, which is the
+        // only reason skipping sub-checkpoint candidates BEFORE collect() (H1 bound 3) leaves the
+        // MAX_REORG_BRANCHES_EVALUATED-budgeted ranked set identical to the old per-branch filter.
+        // Re-keying this by work/difficulty first could let a sub-checkpoint candidate consume the
+        // eval budget ahead of an adoptable one and diverge an upgraded node from an un-upgraded peer.
         candidates.sort_by(|a, b| {
             b.index
                 .cmp(&a.index)
@@ -2799,12 +2832,20 @@ impl Blockchain {
         // prolonging the fork. Keep all eligible branches so a rejected best falls through to the
         // next-best VALID branch — the deterministic lowest-hash tie-break is then resolved over
         // ADOPTABLE branches only.
-        let mut ranked: Vec<(Vec<Block>, BigUint, BigUint, [u8; 32])> = Vec::new();
+        let mut ranked: Vec<(Vec<Arc<Block>>, BigUint, BigUint, [u8; 32])> = Vec::new();
         let mut branches_evaluated: usize = 0;
+        // Read the finality checkpoint once (monotonic within a pass). Every branch from a candidate
+        // shares branch[0] = candidate, so a sub-checkpoint candidate yields only unadoptable
+        // branches — skip the whole enumeration for it rather than filtering each branch afterward
+        // (bound 3). Value-identical to the former per-branch check, applied one step earlier.
+        let checkpoint = self.trusted_checkpoint_height();
 
         'candidate: for candidate in candidates {
+            if candidate.index <= checkpoint {
+                continue;
+            }
             let branches = self.collect_orphan_branches_from(
-                candidate,
+                Arc::new(candidate),
                 ORPHAN_REORG_DEPTH as usize,
                 ORPHAN_BRANCH_SEARCH_LIMIT,
             )?;
@@ -2822,15 +2863,8 @@ impl Blockchain {
                     continue;
                 };
                 let branch_tip_hash = branch_tip.hash;
-
-                // Checkpoint finality, applied at ranking time: a branch forking at/below the
-                // trusted checkpoint can never be adopted, so it never enters the ranking. This
-                // also keeps a heavy dead sub-checkpoint fork (the 2026-07-11 incompatible-client
-                // ~770-block case) from being re-validated under the write lock on every ingest.
-                if branch[0].index <= self.trusted_checkpoint_height() {
-                    continue;
-                }
-
+                // Checkpoint finality is now enforced one step earlier, on the candidate seed
+                // (branch[0] == candidate for every branch), so no per-branch re-check is needed.
                 let fork_height = branch[0].index;
                 // O(1) memoised lookup; the suffix covers every fork height in range.
                 let canonical_work = canonical_suffix
@@ -2868,6 +2902,10 @@ impl Blockchain {
         for (branch, _branch_work, _canonical_work, _branch_tip_hash) in
             ranked.into_iter().take(MAX_REORG_ADOPT_ATTEMPTS)
         {
+            // Rehydrate the <=MAX_REORG_ADOPT_ATTEMPTS branches actually dry-run back to owned Block
+            // bodies (a value copy of the same bytes) for adopt_branch_if_valid, which mutates and
+            // persists them. Only these few branches ever pay the body copy — never all ~4M.
+            let branch: Vec<Block> = branch.iter().map(|a| (**a).clone()).collect();
             if self.adopt_branch_if_valid(branch, &tip).await? {
                 return Ok(true);
             }
@@ -7786,11 +7824,99 @@ mod tests {
         blockchain.store_orphan_block(&lower_grandchild).unwrap();
 
         let branches = blockchain
-            .collect_orphan_branches_from(start, 8, ORPHAN_BRANCH_SEARCH_LIMIT)
+            .collect_orphan_branches_from(
+                std::sync::Arc::new(start),
+                8,
+                ORPHAN_BRANCH_SEARCH_LIMIT,
+            )
             .unwrap();
 
         assert!(branches.iter().any(|branch| branch.len() == 2));
         assert!(branches.iter().any(|branch| branch.len() == 3));
+    }
+
+    // Bound 4 (H1): store_orphan_block admits an orphan up to tip + ORPHAN_REORG_DEPTH (the highest
+    // index any adoptable branch can reach) but rejects one above it — a provably-unreachable
+    // height that un-upgraded peers bound identically, so this cannot diverge the canonical chain.
+    #[tokio::test]
+    async fn above_tip_orphan_admission_boundary() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "m0", 1.0);
+        let b1 = metadata_test_block(1, b0.hash, "m1", 1.0);
+        let b2 = metadata_test_block(2, b1.hash, "m2", 1.0);
+        for b in [&b0, &b1, &b2] {
+            insert_raw_block(&bc, b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap();
+        assert_eq!(bc.highest_block_index(), Some(2));
+        let tip = 2u32;
+
+        let at_bound = metadata_test_block(tip + ORPHAN_REORG_DEPTH, [7u8; 32], "at", 1.0);
+        let above = metadata_test_block(tip + ORPHAN_REORG_DEPTH + 1, [8u8; 32], "above", 1.0);
+        bc.store_orphan_block(&at_bound).unwrap();
+        bc.store_orphan_block(&above).unwrap();
+
+        let orphans = bc.open_orphan_blocks_tree().unwrap();
+        assert!(
+            orphans
+                .get(Blockchain::orphan_hash_key(&at_bound.hash).as_bytes())
+                .unwrap()
+                .is_some(),
+            "orphan at exactly tip + ORPHAN_REORG_DEPTH is admitted (still reachable)"
+        );
+        assert!(
+            orphans
+                .get(Blockchain::orphan_hash_key(&above.hash).as_bytes())
+                .unwrap()
+                .is_none(),
+            "orphan above tip + ORPHAN_REORG_DEPTH is rejected (provably unreachable)"
+        );
+
+        // A below-tip orphan is a legitimate reorg competitor and must still be admitted — the
+        // guard only rejects FAR-above-tip blocks, never same-height/below forks.
+        let below = metadata_test_block(1, [9u8; 32], "below", 1.0);
+        bc.store_orphan_block(&below).unwrap();
+        assert!(
+            orphans
+                .get(Blockchain::orphan_hash_key(&below.hash).as_bytes())
+                .unwrap()
+                .is_some(),
+            "a below-tip orphan (a valid reorg competitor) is still admitted"
+        );
+    }
+
+    // Bound 2 (H1): the Arc<Block> enumeration must return the SAME branch set as the former
+    // body-clone version — no branch dropped by the memory-representation change. A fanout of N
+    // children yields exactly N branches; a grandchild extends one of them.
+    #[tokio::test]
+    async fn orphan_enumeration_preserves_all_branches_under_fanout() {
+        let bc = test_blockchain();
+        let root = metadata_test_block(1, [0u8; 32], "root", 1.0);
+        let mut kids = Vec::new();
+        for i in 0..5u32 {
+            let k = metadata_test_block(2, root.hash, &format!("k{}", i), 1.0);
+            bc.store_orphan_block(&k).unwrap();
+            kids.push(k);
+        }
+        // One child also has a grandchild — a length-3 branch.
+        let gc = metadata_test_block(3, kids[0].hash, "gc", 1.0);
+        bc.store_orphan_block(&gc).unwrap();
+
+        let branches = bc
+            .collect_orphan_branches_from(
+                std::sync::Arc::new(root),
+                ORPHAN_REORG_DEPTH as usize,
+                ORPHAN_BRANCH_SEARCH_LIMIT,
+            )
+            .unwrap();
+
+        assert_eq!(branches.len(), 5, "every fanout child yields a branch (none dropped)");
+        assert_eq!(
+            branches.iter().filter(|b| b.len() == 3).count(),
+            1,
+            "exactly the grandchild branch reaches length 3"
+        );
+        assert_eq!(branches.iter().filter(|b| b.len() == 2).count(), 4);
     }
 
     #[tokio::test]
