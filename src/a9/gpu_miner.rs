@@ -335,6 +335,41 @@ static LAST_ITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// thermal throttling on a perfectly healthy card.
 static RATE_EWMA_BITS: AtomicU64 = AtomicU64::new(0);
 
+/// Observed network tip-change cadence, carried across attempts: epoch-ms of
+/// the last observed tip change + an EWMA of the intervals between changes.
+/// Feeds the adaptive dispatch target — the optimum dispatch length depends on
+/// how often the tip actually moves (D* = sqrt(2·T_o·T_tip)), and the live
+/// cadence swings between ~2s (difficulty climbing) and the 5s target
+/// (equilibrium). A hardcoded target tuned to either end is mistuned at the
+/// other; measuring T_tip keeps the sizing correct at both without retunes.
+static LAST_TIP_CHANGE_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+static TIP_INTERVAL_EWMA_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Record that a tip change was just observed by the dispatch loop. EWMA over
+/// the inter-change intervals, with a sanity window so counter bursts (<200ms)
+/// and idle gaps between mine commands (>60s) never poison the cadence.
+fn record_tip_change_observation() {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let prev = LAST_TIP_CHANGE_EPOCH_MS.swap(now_ms, std::sync::atomic::Ordering::AcqRel);
+    if prev == 0 {
+        return;
+    }
+    let interval = now_ms.saturating_sub(prev);
+    if !(200..=60_000).contains(&interval) {
+        return;
+    }
+    let prev_ewma = TIP_INTERVAL_EWMA_MS.load(std::sync::atomic::Ordering::Acquire);
+    let next = if prev_ewma == 0 {
+        interval
+    } else {
+        (prev_ewma * 7 + interval * 3) / 10
+    };
+    TIP_INTERVAL_EWMA_MS.store(next, std::sync::atomic::Ordering::Release);
+}
+
 /// Difficulty of the most recent dispatch — read by the display task.
 static LAST_DIFFICULTY: AtomicU64 = AtomicU64::new(0);
 
@@ -491,15 +526,21 @@ pub fn gpu_mine_attempt(
     // offset stays exact; the ~250ms adaptive target still bounds preemption.
     const THREADS: u32 = 65535 * 256;
     const MAX_ITERS: u32 = 256;
-    // 140ms (was 250): dispatch length trades fixed per-dispatch overhead
-    // (measured ~1-2ms: fence round-trip + map + submit) against STALENESS —
-    // a dispatch in flight when the tip moves is all dead work, costing D/2 on
-    // average per ~5s tip change. Total waste is minimized at
-    // D* = sqrt(2·T_o·T_tip) ≈ 100-160ms; 140ms cuts combined waste from
-    // ~3.1% to ~2.4%. If this miner ever dominates network hashrate (rarer
-    // external tip changes), larger dispatches win again — retune by the
-    // formula, not by feel.
-    const TARGET_DISPATCH_MS: f64 = 140.0;
+    // ADAPTIVE dispatch target (was a fixed 140ms tuned to the 5s cadence):
+    // dispatch length trades fixed per-dispatch overhead T_o (measured
+    // ~1-2ms: fence round-trip + map + submit) against STALENESS — a dispatch
+    // in flight when the tip moves is all dead work, costing D/2 on average
+    // per tip change. Combined waste = T_o/D + D/(2·T_tip), minimized at
+    // D* = sqrt(2·T_o·T_tip). T_tip is MEASURED (EWMA of observed tip-change
+    // intervals, see record_tip_change_observation) because the live cadence
+    // swings: ~2s while difficulty climbs → D* ≈ 77ms (waste ~4.6% → ~3.9%
+    // vs the old 140), 5s at equilibrium → D* ≈ 122ms (where a fixed 77
+    // would be WORSE than 140). Clamped [50, 250]ms so a cadence outlier can
+    // never push preemption granularity to extremes; before the first
+    // measured interval, falls back to 77ms (the deploy-time ~2s cadence).
+    let target_dispatch_ms = adaptive_dispatch_target_ms(
+        TIP_INTERVAL_EWMA_MS.load(std::sync::atomic::Ordering::Acquire),
+    );
 
     let tip_moved = || tip_counter.load(std::sync::atomic::Ordering::Acquire) != tip_version;
     // Random window base (see attempt_nonce_base): same-wallet rigs build
@@ -511,8 +552,8 @@ pub fn gpu_mine_attempt(
         .load(std::sync::atomic::Ordering::Relaxed)
         .clamp(1, MAX_ITERS);
     // A dispatch can't be aborted once submitted, so `stop` is checked here
-    // between dispatches (every ~140ms) — the finest-grained the GPU allows.
-    // The caller ends the whole command on the next line when this returns.
+    // between dispatches (every ~target_dispatch_ms) — the finest-grained the
+    // GPU allows. The caller ends the whole command when this returns.
     while Instant::now() < deadline
         && !tip_moved()
         && !stop.load(std::sync::atomic::Ordering::Relaxed)
@@ -542,6 +583,7 @@ pub fn gpu_mine_attempt(
             // and let the caller rebuild against the new tip instead of spending a
             // validate/finalize round on a dead block.
             if tip_moved() {
+                record_tip_change_observation();
                 return None;
             }
             let full = build_header(number, previous_hash, timestamp, nonce, difficulty, merkle_root);
@@ -550,7 +592,7 @@ pub fn gpu_mine_attempt(
         }
         let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
         base = base.wrapping_add(per_dispatch);
-        iters = next_dispatch_iters(iters, dispatch_ms, TARGET_DISPATCH_MS, MAX_ITERS);
+        iters = next_dispatch_iters(iters, dispatch_ms, target_dispatch_ms, MAX_ITERS);
         LAST_ITERS.store(iters, std::sync::atomic::Ordering::Relaxed);
 
         // Telemetry only — a handful of atomic stores, nothing that can stall
@@ -570,7 +612,29 @@ pub fn gpu_mine_attempt(
             ((per_dispatch as f64 / expected_hashes(difficulty)) * 1e6).max(0.0) as u64;
         session_progress_micro.fetch_add(progress_inc, std::sync::atomic::Ordering::Relaxed);
     }
+    // Loop exit on a moved tip is the common attempt end — feed the cadence
+    // EWMA here too (deadline/stop exits record nothing: no change observed).
+    if tip_moved() {
+        record_tip_change_observation();
+    }
     None
+}
+
+/// Optimal dispatch wall-clock target for the measured tip-change cadence:
+/// D* = sqrt(2·T_o·T_tip) with T_o ≈ 1.5ms, clamped to [50, 250]ms; 77ms
+/// (the ~2s-cadence optimum) until the first interval is measured. Pure so
+/// the operating points are testable.
+fn adaptive_dispatch_target_ms(tip_interval_ewma_ms: u64) -> f64 {
+    const DISPATCH_OVERHEAD_MS: f64 = 1.5;
+    const FALLBACK_TARGET_MS: f64 = 77.0;
+    const MIN_TARGET_MS: f64 = 50.0;
+    const MAX_TARGET_MS: f64 = 250.0;
+    if tip_interval_ewma_ms == 0 {
+        return FALLBACK_TARGET_MS;
+    }
+    (2.0 * DISPATCH_OVERHEAD_MS * tip_interval_ewma_ms as f64)
+        .sqrt()
+        .clamp(MIN_TARGET_MS, MAX_TARGET_MS)
 }
 
 /// Next dispatch size (iterations per thread) so one dispatch takes ~target_ms:
@@ -614,6 +678,22 @@ mod tests {
         // Timer glitch (sub-ms measurement): unchanged.
         assert_eq!(next_dispatch_iters(8, 0.0, 250.0, 64), 8);
         assert_eq!(next_dispatch_iters(8, f64::NAN, 250.0, 64), 8);
+    }
+
+    /// The adaptive target must hit the documented operating points of
+    /// D* = sqrt(2·T_o·T_tip) and stay inside its clamps at the extremes.
+    #[test]
+    fn adaptive_dispatch_target_tracks_cadence() {
+        // No measurement yet: deploy-time fallback.
+        assert_eq!(adaptive_dispatch_target_ms(0), 77.0);
+        // ~2s cadence (difficulty climbing): ≈77ms.
+        assert!((adaptive_dispatch_target_ms(2_000) - 77.46).abs() < 0.1);
+        // 5s equilibrium cadence: ≈122ms.
+        assert!((adaptive_dispatch_target_ms(5_000) - 122.47).abs() < 0.1);
+        // Sub-second churn clamps at the floor (preemption never coarser-bounded
+        // than 50ms), multi-minute cadence at the ceiling.
+        assert_eq!(adaptive_dispatch_target_ms(500), 50.0);
+        assert_eq!(adaptive_dispatch_target_ms(60_000), 250.0);
     }
 
     fn miner() -> Option<GpuMiner> {
