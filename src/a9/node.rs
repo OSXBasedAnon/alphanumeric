@@ -4576,12 +4576,15 @@ impl Node {
             // relay) — the rare "mine hangs for a minute with zero output" stall.
             // Cancelling here is state-safe: adoption is atomic (apply_batch) and any
             // partially staged sync work is re-derived on the next round.
-            let round = match timeout(
-                Duration::from_secs(20),
-                self.converge_to_canonical(&beacon),
-            )
-            .await
-            {
+            // The per-round cap also respects the CALLER's remaining budget (floored
+            // at 2s so a round can still do useful work): a flat 20s here let one
+            // last round overshoot max_wait by ~2x — the caller's declared budget
+            // was soft. Bounded worst case is now budget + ~5s, not budget + ~23s.
+            let round_cap = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(2))
+                .min(Duration::from_secs(20));
+            let round = match timeout(round_cap, self.converge_to_canonical(&beacon)).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     warn!("Converge round timed out; retrying against a fresh beacon");
@@ -4641,14 +4644,23 @@ impl Node {
                             "still converging to the canonical tip; retry".into(),
                         ));
                     }
-                    tokio::time::sleep(backoff).await;
-                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
-                    backoff = if tip_now > last_round_tip {
+                    // Attribute progress to the ROUND, not the sleep: read the
+                    // tip BEFORE sleeping (background/mesh ingest advancing the
+                    // tip DURING the sleep must not launder a failing round into
+                    // "productive" and pin the backoff at the floor against a
+                    // distressed relay), decide the next backoff, sleep it, then
+                    // re-baseline AFTER the sleep so sleep-time background
+                    // progress isn't credited to the next round either.
+                    let tip_after_round =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_after_round > last_round_tip {
                         Duration::from_millis(500)
                     } else {
                         (backoff * 2).min(Duration::from_secs(5))
                     };
-                    last_round_tip = tip_now;
+                    tokio::time::sleep(backoff).await;
+                    last_round_tip =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
                 }
                 // Transient relay gap. A DEEP gap (history aged out) already escalated to
                 // NeedsBootstrap above (M3), so this is a near-the-tip hiccup: after the
@@ -4707,14 +4719,19 @@ impl Node {
                         warn!("Relay gap while preparing to mine; mining on local tip (fail-open)");
                         return Ok(());
                     }
-                    tokio::time::sleep(backoff).await;
-                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
-                    backoff = if tip_now > last_round_tip {
+                    // Same round-attribution discipline as the Progressed arm
+                    // (see that comment): decide from a pre-sleep read, sleep,
+                    // re-baseline post-sleep.
+                    let tip_after_round =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_after_round > last_round_tip {
                         Duration::from_millis(500)
                     } else {
                         (backoff * 2).min(Duration::from_secs(5))
                     };
-                    last_round_tip = tip_now;
+                    tokio::time::sleep(backoff).await;
+                    last_round_tip =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
                 }
                 // The canonical branch we were pointed at failed validation locally.
                 // Terminal for that branch, not for us: mine on our local tip and let

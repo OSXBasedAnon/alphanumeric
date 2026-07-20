@@ -1067,6 +1067,20 @@ impl Mgmt {
                     .address_history_summary(addr)
                     .unwrap_or_default();
 
+                // Materialize EVERYTHING the display needs, then DROP the chain
+                // guard BEFORE the styled dump below (hundreds of sync console
+                // writes, incl. the 50-row recent list). A blocked console
+                // (Windows QuickEdit select / Ctrl-S) would otherwise park this
+                // read guard, and the write-preferring chain lock queue would
+                // halt block ingest and mining node-wide — the 2026-07-16
+                // publisher-park class. Every read below returns owned data.
+                const RECENT_TX_LIMIT: usize = 50;
+                let recent = blockchain_guard
+                    .address_recent_txs(addr, RECENT_TX_LIMIT, None)
+                    .unwrap_or_default();
+                let total_supply_units = blockchain_guard.total_confirmed_supply_units().ok();
+                drop(blockchain_guard);
+
                 // Print account information. All styled output goes THROUGH the termcolor
                 // `stdout` stream (writeln!/write!), never println!/print!: mixing the two puts
                 // the color/bold attribute on one handle and the text on another, so headers
@@ -1184,14 +1198,12 @@ impl Mgmt {
                         }
 
                         // Recent Transactions — a fixed last-N list off the same address
-                        // index (O(N), no block decodes). Rendered only inside this
-                        // Some(stats) arm so it appears only when the index is READY:
-                        // address_recent_txs returns an empty Vec both when the index is
-                        // unbuilt AND when the address is inactive, so gating on the
-                        // index-backed summary avoids a misleading empty "Recent Transactions".
-                        const RECENT_TX_LIMIT: usize = 50;
-                        if let Ok(recent) =
-                            blockchain_guard.address_recent_txs(addr, RECENT_TX_LIMIT, None)
+                        // index (O(N), no block decodes), materialized ABOVE before the
+                        // guard was dropped. Rendered only inside this Some(stats) arm so
+                        // it appears only when the index is READY: address_recent_txs
+                        // returns an empty Vec both when the index is unbuilt AND when the
+                        // address is inactive, so gating on the index-backed summary avoids
+                        // a misleading empty "Recent Transactions".
                         {
                             if !recent.is_empty() {
                                 stdout.set_color(
@@ -1252,7 +1264,8 @@ impl Mgmt {
                 // Network Statistics Section. Circulating supply = sum of positive
                 // confirmed balances; the old per-transaction sum double-counted
                 // every onward transfer and decoded the whole chain to do it.
-                if let Ok(total_supply_units) = blockchain_guard.total_confirmed_supply_units() {
+                // (Materialized above, before the guard was dropped.)
+                if let Some(total_supply_units) = total_supply_units {
                     let total_supply = Transaction::from_units(total_supply_units);
                     if total_supply > 0.0 {
                         // Confirmed (not spendable) over confirmed supply — same units on

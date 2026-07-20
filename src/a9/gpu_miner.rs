@@ -437,6 +437,14 @@ fn expected_hashes(difficulty: u64) -> f64 {
 pub fn reset_display_state() {
     RATE_EWMA_BITS.store(0, std::sync::atomic::Ordering::Relaxed);
     LAST_DIFFICULTY.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Re-arm the tip-cadence sampler (prev==0 discards the next interval):
+    // this runs at the start of every mining round, so the sampler never
+    // bridges a miner-idle gap — win finalize + absorption (≤20s) + jitter,
+    // or a ≤60s pause between commands — into a fake "tip interval" that
+    // inflates the EWMA and drags the adaptive dispatch target off cadence.
+    // The interval EWMA itself is kept: genuine samples stay valid across
+    // rounds; only the bridge sample is discarded.
+    LAST_TIP_CHANGE_EPOCH_MS.store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// Live display readings for the mine command's bar task: (EWMA GH/s, last
