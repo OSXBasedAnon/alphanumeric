@@ -1977,15 +1977,21 @@ println!("Wallet renamed successfully");
                     }
                     // --gpu only does something in a binary built with the gpu_miner
                     // feature. In a default build (publisher / VPS / exchange nodes),
-                    // say so clearly instead of silently mining on CPU.
+                    // REFUSE instead of demoting to CPU: the old one-line fallback
+                    // scrolled away and the operator mined at ~1/400th of the
+                    // expected rate for a whole session without noticing ("previous
+                    // version found blocks, this one hasn't"). An explicit --gpu on
+                    // a featureless build is a build mistake — say so and stop.
                     #[cfg(not(feature = "gpu_miner"))]
                     if use_gpu {
                         println!(
-                            "This binary was built without GPU support. Rebuild with \
-                             `cargo build --release --features gpu_miner`, or use the GPU \
-                             beta build, to mine with --gpu. Falling back to CPU mining."
+                            "This binary was built without GPU support, so `--gpu` cannot work. \
+                             Rebuild with `cargo build --release --features \
+                             bootstrap_publisher,webrtc_mesh,gpu_miner` (or use the GPU beta \
+                             build), or run `mine {}` without --gpu for CPU mining.",
+                            parts[1]
                         );
-                        use_gpu = false;
+                        continue;
                     }
                     // Normalized args for the handler regardless of flags.
                     let mine_parts: Vec<&str> = vec![parts[0], parts[1]];
@@ -2042,6 +2048,11 @@ println!("Wallet renamed successfully");
                     const MAX_CONSECUTIVE_MINE_ERRORS: u32 = 5;
                     let mut consecutive_mine_errors: u32 = 0;
 
+                    // Peer discovery, backgrounded once per command: prep used to burn
+                    // up to ~3s inline on NAT'd dials before convergence even started,
+                    // and convergence uses the relay, not p2p peers.
+                    node.clone().spawn_prep_discovery();
+
                     'mining: loop {
                         if continuous && stop_flag.load(Ordering::SeqCst) {
                             break 'mining;
@@ -2052,38 +2063,76 @@ println!("Wallet renamed successfully");
                                 "Preparing mining: syncing to the network tip so we can compete..."
                             );
                         }
-                        // Liveness heartbeat: every prep step is time-bounded, but the
-                        // bounds can stack to ~30s per attempt on a churning network,
-                        // which USERS read as "it's stuck, restart the client". Print
-                        // elapsed progress every 5s so silence never looks like a hang.
-                        let prep_heartbeat = tokio::spawn(async {
+                        // Liveness heartbeat: prep is time-bounded, but a churning
+                        // network can use the whole budget, which USERS read as "it's
+                        // stuck, restart the client". Print progress every 5s — with
+                        // actual heights when we know them — so silence never looks
+                        // like a hang.
+                        let hb_blockchain = Arc::clone(&blockchain);
+                        let hb_node = node.clone();
+                        let prep_heartbeat = tokio::spawn(async move {
                             let started = Instant::now();
                             loop {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
-                                println!(
-                                    "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
-                                    started.elapsed().as_secs()
-                                );
+                                // Copy the height out, then DROP the guard before
+                                // printing: stdout can block, and holding a read
+                                // guard across it starves the write-preferring
+                                // chain lock.
+                                let local_tip =
+                                    { hb_blockchain.read().await.get_latest_block_index() };
+                                let known_tip = hb_node.beacon_high_water_height() as u64;
+                                if known_tip > local_tip {
+                                    println!(
+                                        "  …syncing: local tip {}, network ~{} ({} behind; {}s elapsed — bounded, will report)",
+                                        local_tip,
+                                        known_tip,
+                                        known_tip - local_tip,
+                                        started.elapsed().as_secs()
+                                    );
+                                } else {
+                                    println!(
+                                        "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
+                                        started.elapsed().as_secs()
+                                    );
+                                }
                             }
                         });
-                        // Converge-then-compete with a bounded retry. Only a genuine
+                        // ONE continuous prep budget (was 3 fixed 8s attempts with 2s
+                        // sleeps between): deadline-gated converge paths get to work
+                        // the whole budget in a single call — no mid-progress
+                        // truncation, no per-attempt beacon/ancestor rework — while
+                        // the immediate-refusal guards (ghost-block, beacon
+                        // unreachable) still return fast and are re-invoked after a
+                        // short pause, preserving the caller re-invoke contract the
+                        // 2026-07-11 ghost-guard comment codifies. Only a genuine
                         // below-finality divergence (needs re-bootstrap) is a hard stop.
-                        const MINE_PREP_ATTEMPTS: u32 = 3;
+                        const MINE_PREP_BUDGET: Duration = Duration::from_secs(24);
+                        let prep_deadline = Instant::now() + MINE_PREP_BUDGET;
                         let mut prep_ok = false;
                         let mut prep_stop: Option<String> = None;
-                        for attempt in 1..=MINE_PREP_ATTEMPTS {
-                            match node.prepare_local_mining(Duration::from_secs(8)).await {
+                        loop {
+                            let remaining =
+                                prep_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match node.prepare_local_mining(remaining).await {
                                 Ok(()) => {
                                     prep_ok = true;
                                     break;
                                 }
-                                Err(NodeError::Retryable(_)) => {
-                                    if attempt < MINE_PREP_ATTEMPTS {
-                                        println!(
-                                            "Still catching up to the network tip (attempt {}/{})…",
-                                            attempt, MINE_PREP_ATTEMPTS
-                                        );
+                                Err(NodeError::Retryable(reason)) => {
+                                    let left =
+                                        prep_deadline.saturating_duration_since(Instant::now());
+                                    if left >= Duration::from_secs(2) {
+                                        // The Retryable reason carries the actual
+                                        // heights ("network has reached X but we are
+                                        // at Y…") — print it instead of a bare
+                                        // attempt counter.
+                                        println!("Still catching up: {}", reason);
                                         tokio::time::sleep(Duration::from_secs(2)).await;
+                                    } else {
+                                        break;
                                     }
                                 }
                                 Err(NodeError::ConsensusFailure(reason)) => {

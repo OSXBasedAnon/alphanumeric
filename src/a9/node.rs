@@ -2589,7 +2589,7 @@ impl Node {
     /// max while fresh reads are present; a genuinely regressed chain ages the old
     /// stuck-high value out. 0 if nothing observed yet (fail-open — same as the old
     /// AtomicU64::new(0) start, so a fresh node isn't pinned).
-    fn beacon_high_water_height(&self) -> u32 {
+    pub fn beacon_high_water_height(&self) -> u32 {
         let now = Instant::now();
         let mut obs = self.beacon_high_water.lock();
         while let Some(&(t, _)) = obs.front() {
@@ -4458,32 +4458,37 @@ impl Node {
         }
     }
 
+    /// Fire-and-forget peer discovery for a mine command. Runs the same
+    /// peers-empty probe + bounded discovery prepare_local_mining used to do
+    /// INLINE — where its NAT'd dials burned up to ~3s before convergence even
+    /// started. Convergence uses the relay, not p2p peers (and the post-mine
+    /// flood runs its own discovery when the table is empty), so nothing waits
+    /// on this. The peers-lock read stays time-boxed: a wedged peers lock
+    /// elsewhere must degrade this into "skip discovery", never into a hang.
+    pub fn spawn_prep_discovery(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let peers_empty = match timeout(Duration::from_secs(2), async {
+                self.peers.read().await.is_empty()
+            })
+            .await
+            {
+                Ok(empty) => empty,
+                Err(_) => {
+                    debug!("prep-discovery: peers lock busy; skipping");
+                    false
+                }
+            };
+            if peers_empty {
+                let _ = timeout(Duration::from_secs(3), self.connect_discovery_peers(8)).await;
+            }
+        });
+    }
+
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
         debug!("mine-prep: enter");
-        // Best-effort peer discovery (harmless no-op when NAT'd and empty). Capped
-        // WELL below max_wait: across NAT this almost never yields a peer, and at the
-        // old cap (= max_wait) it silently ate the entire mining-prep window before
-        // convergence even started — the "mine command hangs with no output" stall.
-        // Convergence uses the relay, not p2p peers, so a short cap loses nothing.
-        // The peers-lock read is itself time-boxed: a wedged peers lock elsewhere
-        // must degrade this into "skip discovery", never into a hang.
-        let peers_empty = match timeout(Duration::from_secs(2), async {
-            self.peers.read().await.is_empty()
-        })
-        .await
-        {
-            Ok(empty) => empty,
-            Err(_) => {
-                debug!("mine-prep: peers lock busy; skipping discovery");
-                false
-            }
-        };
-        debug!("mine-prep: peers checked (empty={})", peers_empty);
-        if peers_empty {
-            let cap = max_wait.min(Duration::from_secs(3));
-            let _ = timeout(cap, self.connect_discovery_peers(8)).await;
-        }
-        debug!("mine-prep: discovery done, entering converge loop");
+        // Peer discovery is NOT done inline here anymore — the mine command
+        // spawns spawn_prep_discovery once in the background instead, so the
+        // whole max_wait budget goes to convergence.
 
         // ALWAYS CONVERGE, THEN COMPETE — never pause-and-concede.
         //
@@ -4494,11 +4499,22 @@ impl Node {
         // ahead kept winning and nobody could catch up. Now "behind" means "actively
         // syncing then racing", from ANY state (behind, forked-at-tip, forked-and-
         // behind). The loop re-fetches the beacon each round so a block that lands
-        // mid-prep is adopted and we re-target onto it before mining. The backoff keeps
-        // the cadence >= a block time so a run of rounds can't self-rate-limit the relay
-        // into the very non-convergence it is meant to cure.
+        // mid-prep is adopted and we re-target onto it before mining.
+        //
+        // BACKOFF POLICY: the doubling backoff applies ONLY to rounds that made no
+        // forward progress (tip unchanged) — that is genuine relay distress, and
+        // backing off is what keeps a run of failing rounds from hammering the
+        // relay into the very non-convergence it is meant to cure. A round that
+        // ADVANCED the tip resets the backoff to the floor instead: adopted blocks
+        // are never re-POSTed and the window GETs are 64-aligned/CDN-coalesced, so
+        // productive rounds cost the relay nothing extra — while doubling on
+        // progress was punishing success with growing sleeps that let the live
+        // tip (one block ~2s) outrun the catch-up. Keyed off the ACTUAL tip delta,
+        // not the returned verdict: a mid-call transient can report BeaconStale
+        // even after earlier rounds applied blocks.
         let deadline = Instant::now() + max_wait;
         let mut backoff = Duration::from_millis(500);
+        let mut last_round_tip = self.blockchain.read().await.get_latest_block_index() as u32;
         loop {
             debug!("mine-prep: fetching beacon");
             let Some(beacon) = self.fetch_tip_beacon().await else {
@@ -4601,7 +4617,13 @@ impl Node {
                         ));
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_now > last_round_tip {
+                        Duration::from_millis(500)
+                    } else {
+                        (backoff * 2).min(Duration::from_secs(5))
+                    };
+                    last_round_tip = tip_now;
                 }
                 // Transient relay gap. A DEEP gap (history aged out) already escalated to
                 // NeedsBootstrap above (M3), so this is a near-the-tip hiccup: after the
@@ -4661,7 +4683,13 @@ impl Node {
                         return Ok(());
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_now > last_round_tip {
+                        Duration::from_millis(500)
+                    } else {
+                        (backoff * 2).min(Duration::from_secs(5))
+                    };
+                    last_round_tip = tip_now;
                 }
                 // The canonical branch we were pointed at failed validation locally.
                 // Terminal for that branch, not for us: mine on our local tip and let
