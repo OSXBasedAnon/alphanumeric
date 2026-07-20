@@ -2069,9 +2069,18 @@ println!("Wallet renamed successfully");
                         let mut prep_ok = false;
                         let mut prep_stop: Option<String> = None;
                         loop {
+                            // Enter-to-stop must work during prep too, not only
+                            // once mining starts.
+                            if continuous && stop_flag.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let remaining =
                                 prep_deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
+                            // Sub-2s remainders can't do useful converge work —
+                            // re-invoking just spun the beacon fetch and blew the
+                            // declared budget (the callee floors its round cap at
+                            // 2s, so give it at least that).
+                            if remaining < Duration::from_secs(2) {
                                 break;
                             }
                             match node.prepare_local_mining(remaining).await {
@@ -2169,8 +2178,8 @@ println!("Wallet renamed successfully");
                                 }
 
                                 // NETWORK-CITIZEN PACING between rounds:
-                                // 1) Absorption wait — poll the signed beacon (edge-
-                                //    cached, same cadence as the background watch)
+                                // 1) Absorption wait — poll the signed beacon
+                                //    (edge-cached)
                                 //    until the network reflects a block at our height
                                 //    (ours or a competitor's), so we never stack new
                                 //    blocks faster than the network can propagate
@@ -2190,6 +2199,13 @@ println!("Wallet renamed successfully");
                                 // safety property (anti-block-stacking) and stays;
                                 // the slice is only how fast we notice absorption.
                                 // Cost: a few extra edge-cached GETs per block.
+                                // Say so first: this wait can be up to ~20s of
+                                // otherwise-silent pause after the reward summary,
+                                // the one spot a healthy CPU miner looked hung.
+                                println!(
+                                    "Waiting for the network to absorb block #{} before the next round…",
+                                    mined_height
+                                );
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)
@@ -2622,7 +2638,15 @@ stdout.reset()?;
 Some("history") => {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let whisper = whisper_module.read().await;
-    let blockchain_guard = blockchain.read().await;
+    // Time-boxed like `balance`/`account`: an unbounded read here sat silently
+    // through converge write-holds (a 128-block adoption validates under the
+    // write lock) and read as "client hung".
+    let Ok(blockchain_guard) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
+    else {
+        println!("Chain busy (syncing/reorg in progress) — try `history` again shortly.");
+        continue;
+    };
 
     let mut title_style = ColorSpec::new();
     title_style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(true);
@@ -2636,14 +2660,21 @@ Some("history") => {
     // each call reads at most N index entries (no block decodes).
     const RECENT_TX_LIMIT: usize = 50;
     let mut all_transactions = Vec::new();
-    if blockchain_guard.address_index_ready() {
+    let index_ready = blockchain_guard.address_index_ready();
+    if index_ready {
         for wallet in wallets.values() {
             let wallet_transactions = whisper
                 .get_recent_transactions(&blockchain_guard, &wallet.address, RECENT_TX_LIMIT)
                 .await;
             all_transactions.extend(wallet_transactions);
         }
-    } else {
+    }
+    // Everything below renders from owned data: drop the chain guard (and the
+    // whisper guard) BEFORE the styled dump so a blocked console can never park
+    // a read guard under the write-preferring chain lock (2026-07-16 class).
+    drop(blockchain_guard);
+    drop(whisper);
+    if !index_ready {
         // Parity with the `account` command: while the address index is still
         // building, say so instead of rendering an empty list under the header.
         let mut note = ColorSpec::new();
