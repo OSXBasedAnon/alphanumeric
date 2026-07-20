@@ -481,6 +481,16 @@ impl MiningManager {
                 let mut selected_regular =
                     Vec::with_capacity(regular_cap.min(live_transactions.len()));
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
+                // One confirmed-balance read PER UNIQUE SENDER, not per candidate.
+                // The chain read lock is held across this loop, so a sender's
+                // confirmed balance cannot change mid-selection — the per-candidate
+                // re-await only serialized an O(candidates) chain of redundant index
+                // reads on the tip-change hot path, with the GPU idle for all of it.
+                // Worst case was exactly the dust-storm shape (thousands of txs from
+                // a handful of senders). Intra-template spending is still tracked
+                // exactly by `sender_debits`; selection order and outcomes are
+                // byte-identical to the per-candidate version.
+                let mut confirmed_cache: HashMap<String, i128> = HashMap::new();
 
                 for transaction in ordered {
                     if selected_regular.len() >= regular_cap {
@@ -489,9 +499,16 @@ impl MiningManager {
                     // Exact i128: tx selection must agree with the consensus writer's
                     // affordability so it doesn't select a tx that finalize then rejects
                     // (the f64 round-trip drifts above ~33.55M coins — 2026-07-12 audit).
-                    let confirmed_units = blockchain_lock
-                        .get_confirmed_balance_units(&transaction.sender)
-                        .await?;
+                    let confirmed_units = match confirmed_cache.get(&transaction.sender) {
+                        Some(units) => *units,
+                        None => {
+                            let units = blockchain_lock
+                                .get_confirmed_balance_units(&transaction.sender)
+                                .await?;
+                            confirmed_cache.insert(transaction.sender.clone(), units);
+                            units
+                        }
+                    };
                     let already_selected = sender_debits
                         .get(&transaction.sender)
                         .copied()
