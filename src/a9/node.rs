@@ -2589,7 +2589,7 @@ impl Node {
     /// max while fresh reads are present; a genuinely regressed chain ages the old
     /// stuck-high value out. 0 if nothing observed yet (fail-open — same as the old
     /// AtomicU64::new(0) start, so a fresh node isn't pinned).
-    fn beacon_high_water_height(&self) -> u32 {
+    pub fn beacon_high_water_height(&self) -> u32 {
         let now = Instant::now();
         let mut obs = self.beacon_high_water.lock();
         while let Some(&(t, _)) = obs.front() {
@@ -2994,12 +2994,21 @@ impl Node {
     /// CDN/gateway cache coalesces the reorg scan to one origin read per window.
     /// Bounded, floored at `verification_floor()`; any relay gap/empty/break returns
     /// `Transient` (retry) rather than a spurious deep-divergence verdict.
-    async fn find_common_ancestor(&self, beacon: &TipBeaconInfo, floor: u32) -> Ancestor {
+    /// `by_hash` is the caller-owned canonical-body cache, keyed by block hash.
+    /// converge_to_canonical passes ONE cache across all its rounds against the
+    /// same fixed beacon: without it, every round after a chunked adoption
+    /// re-fetched the identical windows from the beacon down (a quadratic
+    /// re-walk — ~72 GETs to converge a 1024 gap instead of ~17). Hash-keyed
+    /// entries cannot go stale (blocks are immutable and the walk follows
+    /// prev-hash links), and every adopted block still passes the sig gate +
+    /// engine validation — the cache only saves re-downloading bodies.
+    async fn find_common_ancestor(
+        &self,
+        beacon: &TipBeaconInfo,
+        floor: u32,
+        by_hash: &mut std::collections::HashMap<[u8; 32], Block>,
+    ) -> Ancestor {
         const WIN: u32 = 64;
-        // Canonical blocks indexed by their OWN hash so we can follow previous_hash
-        // links regardless of which fork shares a given height.
-        let mut by_hash: std::collections::HashMap<[u8; 32], Block> =
-            std::collections::HashMap::new();
         let mut canon_desc: Vec<Block> = Vec::new(); // canonical bodies, tip -> ancestor
         let mut expected_hash = beacon.hash;
         let mut expected_height = beacon.height;
@@ -3020,26 +3029,33 @@ impl Node {
         };
 
         for _ in 0..max_rounds {
-            // Fetch the 64-aligned window containing the height we need next.
+            // Fetch the 64-aligned window containing the height we need next —
+            // unless the caller's cross-round cache already holds the body the
+            // walk needs (warm after a prior round's fetches). On a cache hit
+            // the walk below consumes cached bodies directly and the exact-fetch
+            // fallback covers any individual miss, so skipping the window fetch
+            // can never manufacture a gap verdict.
             let win_base = expected_height - (expected_height % WIN);
-            let win_end = win_base + WIN - 1;
-            match self.fetch_relay_blocks(win_base, win_end).await {
-                Ok(v) if !v.is_empty() => {
-                    for b in v {
-                        by_hash.entry(b.hash).or_insert(b);
+            if !by_hash.contains_key(&expected_hash) {
+                let win_end = win_base + WIN - 1;
+                match self.fetch_relay_blocks(win_base, win_end).await {
+                    Ok(v) if !v.is_empty() => {
+                        for b in v {
+                            by_hash.entry(b.hash).or_insert(b);
+                        }
                     }
+                    // Empty-but-200 in a below-tip window IS a genuine gap: depth decides —
+                    // within reorg reach retry (Transient), deeper the history is gone and only
+                    // a snapshot recovers it (NeedsBootstrap).
+                    Ok(_) => return gap_verdict(expected_height),
+                    // A network ERROR (429 rate-limit, timeout, 5xx) tells us NOTHING about
+                    // whether the history exists — it's a transient relay hiccup. Treat it as
+                    // Transient and retry; never self-bootstrap or freeze the applied tip on it.
+                    // (audit finding #6: a pool's own /api/blocks GETs getting rate-limited
+                    // under sustained load was misclassified as a chain gap → BeaconStale freeze
+                    // / needless NeedsBootstrap restart.)
+                    Err(_) => return Ancestor::Transient,
                 }
-                // Empty-but-200 in a below-tip window IS a genuine gap: depth decides —
-                // within reorg reach retry (Transient), deeper the history is gone and only
-                // a snapshot recovers it (NeedsBootstrap).
-                Ok(_) => return gap_verdict(expected_height),
-                // A network ERROR (429 rate-limit, timeout, 5xx) tells us NOTHING about
-                // whether the history exists — it's a transient relay hiccup. Treat it as
-                // Transient and retry; never self-bootstrap or freeze the applied tip on it.
-                // (audit finding #6: a pool's own /api/blocks GETs getting rate-limited
-                // under sustained load was misclassified as a chain gap → BeaconStale freeze
-                // / needless NeedsBootstrap restart.)
-                Err(_) => return Ancestor::Transient,
             }
 
             // Walk the prev-hash chain down through the bodies we now hold.
@@ -3170,6 +3186,12 @@ impl Node {
                 }
             }
         }
+        // Canonical-body cache shared across THIS call's rounds (one fixed
+        // beacon): after a chunked adoption the next round's ancestor walk
+        // re-reads the same bodies from here instead of re-fetching the whole
+        // beacon-to-tip span from the relay (the quadratic re-walk).
+        let mut walk_cache: std::collections::HashMap<[u8; 32], Block> =
+            std::collections::HashMap::new();
         for _ in 0..MAX_ROUNDS {
             let (tip, at_beacon) = {
                 let bc = self.blockchain.read().await;
@@ -3182,7 +3204,10 @@ impl Node {
             }
 
             let floor = self.blockchain.read().await.verification_floor();
-            let (ancestor, canon) = match self.find_common_ancestor(beacon, floor).await {
+            let (ancestor, canon) = match self
+                .find_common_ancestor(beacon, floor, &mut walk_cache)
+                .await
+            {
                 Ancestor::Found(a, canon) => (a, canon),
                 Ancestor::NoneBelowFloor | Ancestor::NeedsBootstrap => {
                     return Converge::NeedsBootstrap
@@ -4458,32 +4483,37 @@ impl Node {
         }
     }
 
+    /// Fire-and-forget peer discovery for a mine command. Runs the same
+    /// peers-empty probe + bounded discovery prepare_local_mining used to do
+    /// INLINE — where its NAT'd dials burned up to ~3s before convergence even
+    /// started. Convergence uses the relay, not p2p peers (and the post-mine
+    /// flood runs its own discovery when the table is empty), so nothing waits
+    /// on this. The peers-lock read stays time-boxed: a wedged peers lock
+    /// elsewhere must degrade this into "skip discovery", never into a hang.
+    pub fn spawn_prep_discovery(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let peers_empty = match timeout(Duration::from_secs(2), async {
+                self.peers.read().await.is_empty()
+            })
+            .await
+            {
+                Ok(empty) => empty,
+                Err(_) => {
+                    debug!("prep-discovery: peers lock busy; skipping");
+                    false
+                }
+            };
+            if peers_empty {
+                let _ = timeout(Duration::from_secs(3), self.connect_discovery_peers(8)).await;
+            }
+        });
+    }
+
     pub async fn prepare_local_mining(&self, max_wait: Duration) -> Result<(), NodeError> {
         debug!("mine-prep: enter");
-        // Best-effort peer discovery (harmless no-op when NAT'd and empty). Capped
-        // WELL below max_wait: across NAT this almost never yields a peer, and at the
-        // old cap (= max_wait) it silently ate the entire mining-prep window before
-        // convergence even started — the "mine command hangs with no output" stall.
-        // Convergence uses the relay, not p2p peers, so a short cap loses nothing.
-        // The peers-lock read is itself time-boxed: a wedged peers lock elsewhere
-        // must degrade this into "skip discovery", never into a hang.
-        let peers_empty = match timeout(Duration::from_secs(2), async {
-            self.peers.read().await.is_empty()
-        })
-        .await
-        {
-            Ok(empty) => empty,
-            Err(_) => {
-                debug!("mine-prep: peers lock busy; skipping discovery");
-                false
-            }
-        };
-        debug!("mine-prep: peers checked (empty={})", peers_empty);
-        if peers_empty {
-            let cap = max_wait.min(Duration::from_secs(3));
-            let _ = timeout(cap, self.connect_discovery_peers(8)).await;
-        }
-        debug!("mine-prep: discovery done, entering converge loop");
+        // Peer discovery is NOT done inline here anymore — the mine command
+        // spawns spawn_prep_discovery once in the background instead, so the
+        // whole max_wait budget goes to convergence.
 
         // ALWAYS CONVERGE, THEN COMPETE — never pause-and-concede.
         //
@@ -4494,11 +4524,22 @@ impl Node {
         // ahead kept winning and nobody could catch up. Now "behind" means "actively
         // syncing then racing", from ANY state (behind, forked-at-tip, forked-and-
         // behind). The loop re-fetches the beacon each round so a block that lands
-        // mid-prep is adopted and we re-target onto it before mining. The backoff keeps
-        // the cadence >= a block time so a run of rounds can't self-rate-limit the relay
-        // into the very non-convergence it is meant to cure.
+        // mid-prep is adopted and we re-target onto it before mining.
+        //
+        // BACKOFF POLICY: the doubling backoff applies ONLY to rounds that made no
+        // forward progress (tip unchanged) — that is genuine relay distress, and
+        // backing off is what keeps a run of failing rounds from hammering the
+        // relay into the very non-convergence it is meant to cure. A round that
+        // ADVANCED the tip resets the backoff to the floor instead: adopted blocks
+        // are never re-POSTed and the window GETs are 64-aligned/CDN-coalesced, so
+        // productive rounds cost the relay nothing extra — while doubling on
+        // progress was punishing success with growing sleeps that let the live
+        // tip (one block ~2s) outrun the catch-up. Keyed off the ACTUAL tip delta,
+        // not the returned verdict: a mid-call transient can report BeaconStale
+        // even after earlier rounds applied blocks.
         let deadline = Instant::now() + max_wait;
         let mut backoff = Duration::from_millis(500);
+        let mut last_round_tip = self.blockchain.read().await.get_latest_block_index() as u32;
         loop {
             debug!("mine-prep: fetching beacon");
             let Some(beacon) = self.fetch_tip_beacon().await else {
@@ -4601,7 +4642,13 @@ impl Node {
                         ));
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_now > last_round_tip {
+                        Duration::from_millis(500)
+                    } else {
+                        (backoff * 2).min(Duration::from_secs(5))
+                    };
+                    last_round_tip = tip_now;
                 }
                 // Transient relay gap. A DEEP gap (history aged out) already escalated to
                 // NeedsBootstrap above (M3), so this is a near-the-tip hiccup: after the
@@ -4661,7 +4708,13 @@ impl Node {
                         return Ok(());
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
+                    backoff = if tip_now > last_round_tip {
+                        Duration::from_millis(500)
+                    } else {
+                        (backoff * 2).min(Duration::from_secs(5))
+                    };
+                    last_round_tip = tip_now;
                 }
                 // The canonical branch we were pointed at failed validation locally.
                 // Terminal for that branch, not for us: mine on our local tip and let

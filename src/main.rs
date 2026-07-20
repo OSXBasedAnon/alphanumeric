@@ -2006,6 +2006,11 @@ println!("Wallet renamed successfully");
                     const MAX_CONSECUTIVE_MINE_ERRORS: u32 = 5;
                     let mut consecutive_mine_errors: u32 = 0;
 
+                    // Peer discovery, backgrounded once per command: prep used to burn
+                    // up to ~3s inline on NAT'd dials before convergence even started,
+                    // and convergence uses the relay, not p2p peers.
+                    node.clone().spawn_prep_discovery();
+
                     'mining: loop {
                         if continuous && stop_flag.load(Ordering::SeqCst) {
                             break 'mining;
@@ -2016,38 +2021,76 @@ println!("Wallet renamed successfully");
                                 "Preparing mining: syncing to the network tip so we can compete..."
                             );
                         }
-                        // Liveness heartbeat: every prep step is time-bounded, but the
-                        // bounds can stack to ~30s per attempt on a churning network,
-                        // which USERS read as "it's stuck, restart the client". Print
-                        // elapsed progress every 5s so silence never looks like a hang.
-                        let prep_heartbeat = tokio::spawn(async {
+                        // Liveness heartbeat: prep is time-bounded, but a churning
+                        // network can use the whole budget, which USERS read as "it's
+                        // stuck, restart the client". Print progress every 5s — with
+                        // actual heights when we know them — so silence never looks
+                        // like a hang.
+                        let hb_blockchain = Arc::clone(&blockchain);
+                        let hb_node = node.clone();
+                        let prep_heartbeat = tokio::spawn(async move {
                             let started = Instant::now();
                             loop {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
-                                println!(
-                                    "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
-                                    started.elapsed().as_secs()
-                                );
+                                // Copy the height out, then DROP the guard before
+                                // printing: stdout can block, and holding a read
+                                // guard across it starves the write-preferring
+                                // chain lock.
+                                let local_tip =
+                                    { hb_blockchain.read().await.get_latest_block_index() };
+                                let known_tip = hb_node.beacon_high_water_height() as u64;
+                                if known_tip > local_tip {
+                                    println!(
+                                        "  …syncing: local tip {}, network ~{} ({} behind; {}s elapsed — bounded, will report)",
+                                        local_tip,
+                                        known_tip,
+                                        known_tip - local_tip,
+                                        started.elapsed().as_secs()
+                                    );
+                                } else {
+                                    println!(
+                                        "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
+                                        started.elapsed().as_secs()
+                                    );
+                                }
                             }
                         });
-                        // Converge-then-compete with a bounded retry. Only a genuine
+                        // ONE continuous prep budget (was 3 fixed 8s attempts with 2s
+                        // sleeps between): deadline-gated converge paths get to work
+                        // the whole budget in a single call — no mid-progress
+                        // truncation, no per-attempt beacon/ancestor rework — while
+                        // the immediate-refusal guards (ghost-block, beacon
+                        // unreachable) still return fast and are re-invoked after a
+                        // short pause, preserving the caller re-invoke contract the
+                        // 2026-07-11 ghost-guard comment codifies. Only a genuine
                         // below-finality divergence (needs re-bootstrap) is a hard stop.
-                        const MINE_PREP_ATTEMPTS: u32 = 3;
+                        const MINE_PREP_BUDGET: Duration = Duration::from_secs(24);
+                        let prep_deadline = Instant::now() + MINE_PREP_BUDGET;
                         let mut prep_ok = false;
                         let mut prep_stop: Option<String> = None;
-                        for attempt in 1..=MINE_PREP_ATTEMPTS {
-                            match node.prepare_local_mining(Duration::from_secs(8)).await {
+                        loop {
+                            let remaining =
+                                prep_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match node.prepare_local_mining(remaining).await {
                                 Ok(()) => {
                                     prep_ok = true;
                                     break;
                                 }
-                                Err(NodeError::Retryable(_)) => {
-                                    if attempt < MINE_PREP_ATTEMPTS {
-                                        println!(
-                                            "Still catching up to the network tip (attempt {}/{})…",
-                                            attempt, MINE_PREP_ATTEMPTS
-                                        );
+                                Err(NodeError::Retryable(reason)) => {
+                                    let left =
+                                        prep_deadline.saturating_duration_since(Instant::now());
+                                    if left >= Duration::from_secs(2) {
+                                        // The Retryable reason carries the actual
+                                        // heights ("network has reached X but we are
+                                        // at Y…") — print it instead of a bare
+                                        // attempt counter.
+                                        println!("Still catching up: {}", reason);
                                         tokio::time::sleep(Duration::from_secs(2)).await;
+                                    } else {
+                                        break;
                                     }
                                 }
                                 Err(NodeError::ConsensusFailure(reason)) => {
@@ -2138,6 +2181,15 @@ println!("Wallet renamed successfully");
                                 //    continuous miners so their prep/poll cycles never
                                 //    line up into synchronized bursts against the
                                 //    free-tier gateway.
+                                // 500ms poll slice (was 2s): the FIRST poll fires
+                                // milliseconds after local finalize — before our
+                                // publish can possibly have round-tripped — so the
+                                // old 2s slice was a near-guaranteed 2s floor on
+                                // every won block, and overshot the beacon's actual
+                                // refresh by up to 2s more. The 20s DEADLINE is the
+                                // safety property (anti-block-stacking) and stays;
+                                // the slice is only how fast we notice absorption.
+                                // Cost: a few extra edge-cached GETs per block.
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)
@@ -2148,7 +2200,7 @@ println!("Wallet renamed successfully");
                                     match node.network_beacon_height().await {
                                         Some(h) if h >= mined_height => break,
                                         _ => sleep_interruptible(
-                                            Duration::from_secs(2),
+                                            Duration::from_millis(500),
                                             &stop_flag,
                                         )
                                         .await,
@@ -3767,16 +3819,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 // Canonical anchor at-or-below our tip: only needed (and only
                 // fetched) when we are behind the manifest height, i.e. when the
                 // manifest-height hash comparison inside the decision can't run.
+                // One tip scan for both consumers: local_tip_height is a full
+                // block_-prefix scan plus a sled open/close (~0.5-5s on a
+                // multi-GB DB), and canonical_reconcile_decision used to
+                // recompute it internally — two identical scans per boot.
+                let boot_local_tip = local_tip_height(db_path);
                 let canonical_anchor: Option<(u32, String)> = match (
                     &manifest_result,
-                    local_tip_height(db_path),
+                    boot_local_tip,
                 ) {
                     (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
                         fetch_canonical_anchor_at_or_below(tip).await
                     }
                     _ => None,
                 };
-                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor) {
+                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor, boot_local_tip) {
                     CanonicalReconcile::InSyncOrUnknown => {
                         println!(
                             "Bootstrap skipped: launch network DB is on the canonical chain at {}",
@@ -4239,6 +4296,10 @@ fn canonical_reconcile_decision(
     manifest: &Result<BootstrapManifestPointer>,
     live_beacon_height: Option<u32>,
     canonical_anchor: Option<(u32, String)>,
+    // Caller-supplied tip from an already-performed scan (boot does one for the
+    // anchor fetch); None falls back to scanning here — tests rely on the
+    // re-open-by-path behavior, and a None from a degenerate DB rescans cheaply.
+    local_tip_hint: Option<u32>,
 ) -> CanonicalReconcile {
     let Ok(m) = manifest else {
         return CanonicalReconcile::InSyncOrUnknown;
@@ -4315,7 +4376,9 @@ fn canonical_reconcile_decision(
     // stayed stale until a human forced a bootstrap (2026-07-11, live). No
     // anchor, or no local block at the anchor height, falls through to the plain
     // behind path below.
-    let local_tip = local_tip_height(db_path).unwrap_or(0);
+    let local_tip = local_tip_hint
+        .or_else(|| local_tip_height(db_path))
+        .unwrap_or(0);
     if let Some((anchor_height, anchor_hash)) = canonical_anchor {
         if anchor_height <= local_tip {
             if let Some(local_hash) = local_block_hash_at(db_path, anchor_height) {
@@ -5430,7 +5493,7 @@ mod tests {
         let db = reconcile_test_db("insync", &[(100, 7)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5473,7 +5536,7 @@ mod tests {
         let db = reconcile_test_db("fork", &[(100, 8)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5486,12 +5549,12 @@ mod tests {
         let db = reconcile_test_db("behind_small", &[(100, 7)]);
         let m = manifest_at(150, 9); // no local block at 150
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), None),
+            canonical_reconcile_decision(&db, &m, Some(150), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5510,7 +5573,7 @@ mod tests {
         let m = manifest_at(150, 9); // behind: no local block at 150
         let anchor = Some((100u32, hex::encode([5u8; 32]))); // canonical differs at 100
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5522,7 +5585,7 @@ mod tests {
         let m = manifest_at(150, 9);
         let anchor = Some((100u32, hex::encode([8u8; 32]))); // matches local tip
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5609,7 +5672,7 @@ mod tests {
         let m = manifest_at(150, 9);
         let anchor = Some((120u32, hex::encode([5u8; 32])));
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5621,7 +5684,7 @@ mod tests {
         let db = reconcile_test_db("behind_big", &[(100, 7)]);
         let m = manifest_at(150, 9);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5636,7 +5699,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5649,7 +5712,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m: Result<BootstrapManifestPointer> = Err("gateway unreachable".into());
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, None, None),
+            canonical_reconcile_decision(&db, &m, None, None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
