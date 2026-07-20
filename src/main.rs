@@ -3879,16 +3879,21 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 // Canonical anchor at-or-below our tip: only needed (and only
                 // fetched) when we are behind the manifest height, i.e. when the
                 // manifest-height hash comparison inside the decision can't run.
+                // One tip scan for both consumers: local_tip_height is a full
+                // block_-prefix scan plus a sled open/close (~0.5-5s on a
+                // multi-GB DB), and canonical_reconcile_decision used to
+                // recompute it internally — two identical scans per boot.
+                let boot_local_tip = local_tip_height(db_path);
                 let canonical_anchor: Option<(u32, String)> = match (
                     &manifest_result,
-                    local_tip_height(db_path),
+                    boot_local_tip,
                 ) {
                     (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
                         fetch_canonical_anchor_at_or_below(tip).await
                     }
                     _ => None,
                 };
-                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor) {
+                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor, boot_local_tip) {
                     CanonicalReconcile::InSyncOrUnknown => {
                         println!(
                             "Bootstrap skipped: launch network DB is on the canonical chain at {}",
@@ -4351,6 +4356,10 @@ fn canonical_reconcile_decision(
     manifest: &Result<BootstrapManifestPointer>,
     live_beacon_height: Option<u32>,
     canonical_anchor: Option<(u32, String)>,
+    // Caller-supplied tip from an already-performed scan (boot does one for the
+    // anchor fetch); None falls back to scanning here — tests rely on the
+    // re-open-by-path behavior, and a None from a degenerate DB rescans cheaply.
+    local_tip_hint: Option<u32>,
 ) -> CanonicalReconcile {
     let Ok(m) = manifest else {
         return CanonicalReconcile::InSyncOrUnknown;
@@ -4427,7 +4436,9 @@ fn canonical_reconcile_decision(
     // stayed stale until a human forced a bootstrap (2026-07-11, live). No
     // anchor, or no local block at the anchor height, falls through to the plain
     // behind path below.
-    let local_tip = local_tip_height(db_path).unwrap_or(0);
+    let local_tip = local_tip_hint
+        .or_else(|| local_tip_height(db_path))
+        .unwrap_or(0);
     if let Some((anchor_height, anchor_hash)) = canonical_anchor {
         if anchor_height <= local_tip {
             if let Some(local_hash) = local_block_hash_at(db_path, anchor_height) {
@@ -5542,7 +5553,7 @@ mod tests {
         let db = reconcile_test_db("insync", &[(100, 7)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5585,7 +5596,7 @@ mod tests {
         let db = reconcile_test_db("fork", &[(100, 8)]);
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5598,12 +5609,12 @@ mod tests {
         let db = reconcile_test_db("behind_small", &[(100, 7)]);
         let m = manifest_at(150, 9); // no local block at 150
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), None),
+            canonical_reconcile_decision(&db, &m, Some(150), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5622,7 +5633,7 @@ mod tests {
         let m = manifest_at(150, 9); // behind: no local block at 150
         let anchor = Some((100u32, hex::encode([5u8; 32]))); // canonical differs at 100
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5634,7 +5645,7 @@ mod tests {
         let m = manifest_at(150, 9);
         let anchor = Some((100u32, hex::encode([8u8; 32]))); // matches local tip
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5721,7 +5732,7 @@ mod tests {
         let m = manifest_at(150, 9);
         let anchor = Some((120u32, hex::encode([5u8; 32])));
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), anchor),
+            canonical_reconcile_decision(&db, &m, Some(150), anchor, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -5733,7 +5744,7 @@ mod tests {
         let db = reconcile_test_db("behind_big", &[(100, 7)]);
         let m = manifest_at(150, 9);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5748,7 +5759,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m = manifest_at(100, 7);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100), None),
+            canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
@@ -5761,7 +5772,7 @@ mod tests {
         std::fs::write(force_rebootstrap_marker_path(&db), b"test\n").unwrap();
         let m: Result<BootstrapManifestPointer> = Err("gateway unreachable".into());
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, None, None),
+            canonical_reconcile_decision(&db, &m, None, None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
