@@ -1098,24 +1098,32 @@ impl Mgmt {
                     .address_history_summary(addr)
                     .unwrap_or_default();
 
-                // Print account information with proper formatting
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(40, 204, 217))))?;
+                // Print account information. All styled output goes THROUGH the termcolor
+                // `stdout` stream (writeln!/write!), never println!/print!: mixing the two puts
+                // the color/bold attribute on one handle and the text on another, so headers
+                // rendered bold only on Windows (Console API) and plain on Unix. Section headers
+                // are explicitly bold so they look identical on both platforms.
+                stdout.set_color(
+                    ColorSpec::new()
+                        .set_fg(Some(Color::Rgb(40, 204, 217)))
+                        .set_bold(true),
+                )?;
                 writeln!(stdout, "\n Account Information")?;
                 stdout.reset()?;
-                println!("───────────────────");
+                writeln!(stdout, "───────────────────")?;
 
                 // Address
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))?;
                 write!(stdout, "Address: ")?;
                 stdout.reset()?;
-                println!("{}", addr);
+                writeln!(stdout, "{}", addr)?;
 
                 // Wallet Status
                 if wallets.contains_key(addr) {
                     stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
                     write!(stdout, "Status: ")?;
                     stdout.reset()?;
-                    println!("Local Wallet");
+                    writeln!(stdout, "Local Wallet")?;
                 }
 
                 // Balance
@@ -1164,38 +1172,102 @@ impl Mgmt {
                         .set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
                     writeln!(stdout, "\n Pending Transactions")?;
                     stdout.reset()?;
-                    println!("───────────────────");
-                    println!(
+                    writeln!(stdout, "───────────────────")?;
+                    writeln!(
+                        stdout,
                         "Outgoing: {} (Total: {:.8})",
                         pending_stats.0, pending_stats.2
-                    );
-                    println!(
+                    )?;
+                    writeln!(
+                        stdout,
                         "Incoming: {} (Total: {:.8})",
                         pending_stats.1, pending_stats.3
-                    );
+                    )?;
                 }
 
                 // Transaction History Section
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                 writeln!(stdout, "\n Transaction History")?;
                 stdout.reset()?;
-                println!("───────────────────");
+                writeln!(stdout, "───────────────────")?;
                 match &history {
                     Some(stats) => {
-                        println!("Total Transactions: {}", stats.tx_count);
-                        println!("Volume Sent: {:.8}", Transaction::from_units(stats.sent_units));
-                        println!(
+                        writeln!(stdout, "Total Transactions: {}", stats.tx_count)?;
+                        writeln!(
+                            stdout,
+                            "Volume Sent: {:.8}",
+                            Transaction::from_units(stats.sent_units)
+                        )?;
+                        writeln!(
+                            stdout,
                             "Volume Received: {:.8}",
                             Transaction::from_units(stats.received_units)
-                        );
-                        println!(
+                        )?;
+                        writeln!(
+                            stdout,
                             "Total Fees Paid: {:.8}",
                             Transaction::from_units(stats.fees_units)
-                        );
+                        )?;
                         if let (Some(first), Some(last)) = (stats.first_height, stats.last_height)
                         {
-                            println!("First Activity: block {}", first);
-                            println!("Last Activity: block {}", last);
+                            writeln!(stdout, "First Activity: block {}", first)?;
+                            writeln!(stdout, "Last Activity: block {}", last)?;
+                        }
+
+                        // Recent Transactions — a fixed last-N list off the same address
+                        // index (O(N), no block decodes). Rendered only inside this
+                        // Some(stats) arm so it appears only when the index is READY:
+                        // address_recent_txs returns an empty Vec both when the index is
+                        // unbuilt AND when the address is inactive, so gating on the
+                        // index-backed summary avoids a misleading empty "Recent Transactions".
+                        const RECENT_TX_LIMIT: usize = 50;
+                        if let Ok(recent) =
+                            blockchain_guard.address_recent_txs(addr, RECENT_TX_LIMIT, None)
+                        {
+                            if !recent.is_empty() {
+                                stdout.set_color(
+                                    ColorSpec::new()
+                                        .set_fg(Some(Color::Blue))
+                                        .set_bold(true),
+                                )?;
+                                writeln!(
+                                    stdout,
+                                    "\n Recent Transactions (last {})",
+                                    RECENT_TX_LIMIT
+                                )?;
+                                stdout.reset()?;
+                                writeln!(stdout, "───────────────────")?;
+                                for entry in &recent {
+                                    if entry.is_sender() {
+                                        stdout.set_color(
+                                            ColorSpec::new()
+                                                .set_fg(Some(Color::Rgb(255, 84, 73)))
+                                                .set_bold(true),
+                                        )?;
+                                        write!(stdout, "SENT    ")?;
+                                    } else {
+                                        stdout.set_color(
+                                            ColorSpec::new()
+                                                .set_fg(Some(Color::Rgb(59, 242, 173)))
+                                                .set_bold(true),
+                                        )?;
+                                        write!(stdout, "RECEIVED")?;
+                                    }
+                                    stdout.reset()?;
+                                    write!(
+                                        stdout,
+                                        "  {:.8} ♦  {} {}",
+                                        Transaction::from_units(entry.amount_units),
+                                        if entry.is_sender() { "to  " } else { "from" },
+                                        entry.counterparty
+                                    )?;
+                                    stdout.set_color(
+                                        ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))),
+                                    )?;
+                                    writeln!(stdout, "  (block {})", entry.height)?;
+                                    stdout.reset()?;
+                                }
+                            }
                         }
                     }
                     None => {
@@ -1222,8 +1294,8 @@ impl Mgmt {
                             .set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                         writeln!(stdout, "\n Network Statistics")?;
                         stdout.reset()?;
-                        println!("───────────────────");
-                        println!("Network Share: {:.4}% \n", network_share);
+                        writeln!(stdout, "───────────────────")?;
+                        writeln!(stdout, "Network Share: {:.4}% \n", network_share)?;
                     }
                 }
             }
@@ -1234,18 +1306,26 @@ impl Mgmt {
     pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>) {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
-        // Set the color for the first line
+        // Header + divider are written THROUGH the termcolor stream (writeln!(stdout,…)),
+        // never println!. Mixing the two left the text on std stdout while the color/bold
+        // attribute lived on the termcolor handle — on Unix the ANSI escape leaked through
+        // and colored it (no bold), on Windows the Console-API attribute made it render
+        // intense/bold. Same code, different look per platform. Set the style explicitly and
+        // emit the text on the same stream so it renders identically everywhere.
         stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(242, 237, 161))))
+            .set_color(
+                ColorSpec::new()
+                    .set_fg(Some(Color::Rgb(242, 237, 161)))
+                    .set_bold(true),
+            )
             .ok();
-        println!("\n Wallet Balances and Addresses:");
-        let _ = stdout.reset(); // Reset the color to default
+        let _ = writeln!(stdout, "\n Wallet Balances and Addresses:");
+        let _ = stdout.reset();
 
-        // Optionally, add a divider with color
         stdout
             .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(51, 43, 23))))
             .ok();
-        println!("────────────────────");
+        let _ = writeln!(stdout, "────────────────────");
         let _ = stdout.reset();
 
         // Time-boxed: after a re-bootstrap/deep sync the chain lock can be held by
@@ -1254,7 +1334,7 @@ impl Mgmt {
         let Ok(blockchain_guard) =
             tokio::time::timeout(std::time::Duration::from_secs(3), self.blockchain.read()).await
         else {
-            println!("Chain busy (syncing/reorg in progress) — try `balance` again shortly.");
+            let _ = writeln!(stdout, "Chain busy (syncing/reorg in progress) — try `balance` again shortly.");
             return;
         };
 
@@ -1324,14 +1404,15 @@ impl Mgmt {
                     }
 
                     let _ = stdout.reset();
-                    println!("-------------------");
+                    let _ = writeln!(stdout, "-------------------");
                 }
                 Err(e) => {
-                    println!("Failed to get balance for wallet {}: {}", name, e);
+                    let _ = writeln!(stdout, "Failed to get balance for wallet {}: {}", name, e);
                 }
             }
         }
-        println!();
+        let _ = writeln!(stdout);
+        let _ = stdout.flush();
     }
 }
 

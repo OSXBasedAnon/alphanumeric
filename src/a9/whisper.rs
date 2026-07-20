@@ -48,9 +48,9 @@ pub struct WhisperModule {
 }
 
 impl WhisperModule {
-    /// Hard fuse on the number of blocks any single whisper/history scan may hold
-    /// in memory at once. The scans are time-windowed (48h whisper view, 7d
-    /// history), so this cap is never reached in practice (~29 days at 5s blocks);
+    /// Hard fuse on the number of blocks the whisper message scan may hold in
+    /// memory at once. The scan is time-windowed (the 48h whisper view), so this
+    /// cap is never reached in practice (~29 days at 5s blocks);
     /// it exists only so an adversarially-skewed timestamp stream cannot defeat the
     /// early-cutoff break and drag the whole chain into RAM.
     const MAX_WINDOW_BLOCKS: usize = 500_000;
@@ -62,7 +62,7 @@ impl WhisperModule {
     /// walk can stop. Peak memory is bounded to the in-window blocks (plus the
     /// MAX_WINDOW_BLOCKS fuse) instead of materializing the entire decoded chain the
     /// way `Blockchain::get_blocks()` does — the unbounded-allocation DoS this
-    /// replaces on `scan_blockchain_for_messages` / `get_transaction_history`.
+    /// replaces on `scan_blockchain_for_messages`.
     fn collect_blocks_since(blockchain: &Blockchain, cutoff_secs: u64) -> Vec<Block> {
         let tip = blockchain.get_latest_block_index();
         let mut out = Vec::new();
@@ -413,25 +413,20 @@ impl WhisperModule {
         messages
     }
 
-    pub async fn get_transaction_history(
+    /// Newest-first "last N" confirmed history for one address, plus its pending
+    /// txs. Unlike `get_transaction_history` this is a FIXED COUNT, not a time
+    /// window: it reads at most `limit` entries straight off the address index
+    /// (O(limit), no block decodes, no time cutoff), so a quiet-but-real address
+    /// still shows its most recent activity instead of an empty 7-day window.
+    pub async fn get_recent_transactions(
         &self,
         blockchain: &Blockchain,
         address: &str,
-        days: i64,
+        limit: usize,
     ) -> Vec<FeeInfo> {
         let mut transactions = Vec::new();
-        let now = Utc::now();
-        let cutoff = now - Duration::days(days);
-
-        let cutoff_secs = cutoff.timestamp().max(0) as u64;
         if blockchain.address_index_ready() {
-            // Read confirmed history straight off the address index: touches only
-            // this address's entries (no block decodes at all) and includes mining
-            // rewards. Capped to bound a pathological display; newest-first.
-            const HISTORY_SCAN_CAP: usize = 5_000;
-            if let Ok(confirmed) =
-                blockchain.address_recent_txs(address, HISTORY_SCAN_CAP, Some(cutoff_secs))
-            {
+            if let Ok(confirmed) = blockchain.address_recent_txs(address, limit, None) {
                 for entry in confirmed {
                     let (from, to) = if entry.is_sender() && entry.is_recipient() {
                         (address.to_string(), address.to_string())
@@ -449,29 +444,11 @@ impl WhisperModule {
                     });
                 }
             }
-        } else {
-            // Index not built (first-run build failed) — fall back to the bounded,
-            // time-windowed block walk rather than showing nothing.
-            let blocks = Self::collect_blocks_since(blockchain, cutoff_secs);
-            for block in blocks {
-                for tx in &block.transactions {
-                    if tx.sender == address || tx.recipient == address {
-                        transactions.push(FeeInfo {
-                            fee: tx.fee(),
-                            amount: tx.amount(),
-                            from: tx.sender.clone(),
-                            to: tx.recipient.clone(),
-                            timestamp: tx.timestamp,
-                        });
-                    }
-                }
-            }
         }
-
-        // Add pending transactions (excluding system transactions)
+        // Pending txs for this address are the very newest; include them (skipping
+        // system senders), then keep only the newest `limit` overall.
         if let Ok(pending) = blockchain.get_pending_transactions().await {
             for tx in &pending {
-                // Skip any pending system transactions
                 if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                     continue;
                 }
@@ -486,21 +463,8 @@ impl WhisperModule {
                 }
             }
         }
-
-        // Filter by time and sort
-        transactions.retain(|tx| {
-            DateTime::<Utc>::from_timestamp(tx.timestamp as i64, 0)
-                .map(|dt| dt >= cutoff)
-                .unwrap_or(false)
-        });
-
-        // Sort transactions by date and timestamp
-        transactions.sort_by(|a, b| {
-            let a_datetime = DateTime::<Utc>::from_timestamp(a.timestamp as i64, 0);
-            let b_datetime = DateTime::<Utc>::from_timestamp(b.timestamp as i64, 0);
-            b_datetime.cmp(&a_datetime)
-        });
-
+        transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        transactions.truncate(limit);
         transactions
     }
 

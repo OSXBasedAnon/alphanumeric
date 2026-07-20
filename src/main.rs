@@ -2575,17 +2575,33 @@ Some("history") => {
     let mut title_style = ColorSpec::new();
     title_style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(true);
     stdout.set_color(&title_style)?;
-    writeln!(&mut stdout, "\n Transaction History (Last 7 Days)")?;
+    writeln!(&mut stdout, "\n Transaction History (Last 50)")?;
     stdout.reset()?;
         writeln!(&mut stdout, "───────────────────")?;
 
-    // Collect all transactions across all wallets
+    // Collect the most recent transactions across all wallets. Fixed last-N (not a
+    // 7-day window) so a wallet quiet for a week still shows its latest activity;
+    // each call reads at most N index entries (no block decodes).
+    const RECENT_TX_LIMIT: usize = 50;
     let mut all_transactions = Vec::new();
-    for wallet in wallets.values() {
-        let wallet_transactions = whisper
-            .get_transaction_history(&blockchain_guard, &wallet.address, 7)
-            .await;
-        all_transactions.extend(wallet_transactions);
+    if blockchain_guard.address_index_ready() {
+        for wallet in wallets.values() {
+            let wallet_transactions = whisper
+                .get_recent_transactions(&blockchain_guard, &wallet.address, RECENT_TX_LIMIT)
+                .await;
+            all_transactions.extend(wallet_transactions);
+        }
+    } else {
+        // Parity with the `account` command: while the address index is still
+        // building, say so instead of rendering an empty list under the header.
+        let mut note = ColorSpec::new();
+        note.set_fg(Some(Color::Yellow));
+        stdout.set_color(&note)?;
+        writeln!(
+            &mut stdout,
+            "History index unavailable — it builds at startup; restart the node if this persists."
+        )?;
+        stdout.reset()?;
     }
 
     // Sort all transactions by timestamp (oldest first)
@@ -2612,6 +2628,13 @@ Some("history") => {
         a.to == b.to &&
         (a.amount - b.amount).abs() < f64::EPSILON
     });
+
+    // Keep only the newest N across all wallets (sorted oldest-first above, so the
+    // most recent are at the tail).
+    if all_transactions.len() > RECENT_TX_LIMIT {
+        let drop = all_transactions.len() - RECENT_TX_LIMIT;
+        all_transactions.drain(0..drop);
+    }
 
     for tx in all_transactions {
         let wallet_is_sender = wallets.values().any(|w| w.address == tx.from);
@@ -3191,9 +3214,9 @@ fn print_ascii_intro() {
                 -####++++#####++++#####+                              Algorithm: SHA-256
                     -++++-   --+++.                                              BLAKE3
              .++++++++++++++++++++++++-                               Database: sled
-             +#####+++######++++######+                               Encryption: Argon2
-                 -+++++----++++-                                      Quantum DSS: ML-DSA-87
-                .+++++.  .-+++-
+             +#####+++######++++######+                               Encryption: AES-256-GCM
+                 -+++++----++++-                                      Key derivation: Argon2id
+                .+++++.  .-+++-                                       Quantum DSS: ML-DSA-87
                 ++++     ++++.
 
 "#
