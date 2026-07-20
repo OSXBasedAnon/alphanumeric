@@ -1,4 +1,3 @@
-use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
 use log::info;
@@ -21,7 +20,7 @@ use crate::a9::{
         Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
         TARGET_BLOCK_TIME,
     },
-    miner::{BlockHeader as ProgPowHeader, Miner, ProgPowTransaction},
+    miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
 };
 
@@ -648,94 +647,44 @@ impl Mgmt {
                 .ok_or_else(|| format!("No wallet found with name or address: {}", wallet_input))?
         };
 
-        let (transactions, last_hash, next_block_index, difficulty, mining_reward) = {
-            prep_bar.set_message("Reading chain tip and mempool...");
+        // Tip snapshot ONLY — no mempool selection here. mine_block rebuilds its
+        // template from the LIVE mempool on every pass (with its own
+        // drop_confirmed sweep, confirmed/amount/age/signature filters, fee
+        // ordering, and per-sender affordability), and discards the command-time
+        // transaction list outright. The old code still swept and filtered the
+        // mempool, computed the reward, and built the merkle root TWICE right
+        // here — pure dead work that also queued behind block-ingest writers on
+        // the chain read lock before the first hash could be ground.
+        let (last_hash, next_block_index, difficulty) = {
+            prep_bar.set_message("Reading chain tip...");
             let blockchain_guard = blockchain.read().await;
-
-            // Get mempool transactions (full signatures only)
-            prep_bar.set_message("Selecting pending transactions...");
-            // Drop already-confirmed txs FIRST: one poisoned mempool entry makes the
-            // finalize replay guard reject the block AFTER the full nonce grind —
-            // a wasted solve per attempt until the mempool is cleaned (the
-            // 2026-07-09 "Transaction is invalid" mining loop that also tripped the
-            // 5-error stop). The per-tx filter below is the belt to this suspender.
-            let _ = blockchain_guard.drop_confirmed_mempool_txs().await;
-            let mempool_transactions = blockchain_guard.get_mempool_transactions().await?;
-            let regular_transactions: Vec<Transaction> = mempool_transactions
-                .into_iter()
-                .filter(|tx| {
-                    if tx.sender == "MINING_REWARDS" {
-                        return false;
-                    }
-                    if blockchain_guard.is_tx_confirmed(&tx.get_tx_id()) {
-                        return false;
-                    }
-                    if !tx.has_valid_regular_amounts() {
-                        return false;
-                    }
-                    if let Some(sig_hex) = &tx.signature {
-                        if let Ok(bytes) = hex::decode(sig_hex) {
-                            return bytes.len() > 64;
-                        }
-                    }
-                    false
-                })
-                .collect();
-
-            // Calculate mining reward
-            prep_bar.set_message("Calculating reward and difficulty...");
-            let mining_reward = blockchain_guard.get_block_reward(&regular_transactions);
-
-            // Pass as slice to calculate_merkle_root
-            let _merkle_root = Blockchain::calculate_merkle_root(&regular_transactions)?;
-
             let tip = blockchain_guard
                 .get_last_block()
                 .ok_or_else(|| "No tip block found".to_string())?;
             let last_hash = tip.hash;
             let next_block_index = tip.index.saturating_add(1);
             let difficulty = blockchain_guard.get_current_difficulty().await;
-
-            (
-                regular_transactions,
-                last_hash,
-                next_block_index,
-                difficulty,
-                mining_reward,
-            )
+            (last_hash, next_block_index, difficulty)
         };
 
         prep_bar.set_message("Starting hash search...");
         prep_bar.finish_and_clear();
 
-        // Ensure header uses a slice of transactions
+        // Placeholder header: number/parent seed the tip-change guards inside
+        // mine_block; merkle root, timestamp, and difficulty are recomputed per
+        // template rebuild / per dispatch from live state.
         let mut header = ProgPowHeader {
             number: next_block_index,
             parent_hash: last_hash,
             timestamp: Self::get_current_timestamp()?,
-            merkle_root: Blockchain::calculate_merkle_root(&transactions[..])?,
+            merkle_root: Blockchain::calculate_merkle_root(&[])?,
             difficulty,
         };
-
-        // Convert transactions
-        let progpow_transactions: Vec<ProgPowTransaction> = transactions
-            .iter()
-            .map(|tx| ProgPowTransaction {
-                fee: tx.fee(),
-                sender: tx.sender.clone(),
-                recipient: tx.recipient.clone(),
-                amount: tx.amount(),
-                timestamp: tx.timestamp,
-                signature: tx.signature.clone(),
-                pub_key: tx.pub_key.clone(),
-                sig_hash: tx.sig_hash.clone(),
-            })
-            .collect();
 
         match miner
             .mine_block(
                 &mut header,
-                &progpow_transactions,
+                &[],
                 MINING_NONCE_WINDOW,
                 miner_wallet.address.clone(),
                 use_gpu,
@@ -751,17 +700,16 @@ impl Mgmt {
                 writeln!(stdout, "───────────────────")?;
                 stdout.reset()?;
 
-                // The reward actually minted, from the mined block's coinbase:
-                // mine_block rebuilds the template from the LIVE mempool, so the
-                // command-time `mining_reward` figure can be stale by solve time
-                // (fees arrived/left mid-grind, or the height crossed a reward
-                // step during a long grind).
+                // The reward actually minted, from the mined block's coinbase.
+                // mine_block's template builder always inserts the coinbase first,
+                // so the fallback is unreachable in practice (kept only so a
+                // malformed block can't panic the display path).
                 let mining_reward = mined_block
                     .transactions
                     .first()
                     .filter(|tx| tx.sender == "MINING_REWARDS")
                     .map(|tx| tx.amount())
-                    .unwrap_or(mining_reward);
+                    .unwrap_or_default();
 
                 let breakdown = {
                     let blockchain_guard = blockchain.read().await;

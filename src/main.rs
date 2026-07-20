@@ -2162,8 +2162,8 @@ println!("Wallet renamed successfully");
                                 }
 
                                 // NETWORK-CITIZEN PACING between rounds:
-                                // 1) Absorption wait — poll the signed beacon (edge-
-                                //    cached, same cadence as the background watch)
+                                // 1) Absorption wait — poll the signed beacon
+                                //    (edge-cached)
                                 //    until the network reflects a block at our height
                                 //    (ours or a competitor's), so we never stack new
                                 //    blocks faster than the network can propagate
@@ -2183,6 +2183,15 @@ println!("Wallet renamed successfully");
                                     "Waiting for the network to absorb block #{} before the next round…",
                                     mined_height
                                 );
+                                // 500ms poll slice (was 2s): the FIRST poll fires
+                                // milliseconds after local finalize — before our
+                                // publish can possibly have round-tripped — so the
+                                // old 2s slice was a near-guaranteed 2s floor on
+                                // every won block, and overshot the beacon's actual
+                                // refresh by up to 2s more. The 20s DEADLINE is the
+                                // safety property (anti-block-stacking) and stays;
+                                // the slice is only how fast we notice absorption.
+                                // Cost: a few extra edge-cached GETs per block.
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)
@@ -2193,7 +2202,7 @@ println!("Wallet renamed successfully");
                                     match node.network_beacon_height().await {
                                         Some(h) if h >= mined_height => break,
                                         _ => sleep_interruptible(
-                                            Duration::from_secs(2),
+                                            Duration::from_millis(500),
                                             &stop_flag,
                                         )
                                         .await,
