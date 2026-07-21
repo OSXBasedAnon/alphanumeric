@@ -5618,10 +5618,18 @@ impl Blockchain {
         pending_tree.flush()?;
         full_sigs_tree.flush()?;
 
-        // Reset mempool and add all transactions
+        // Reset mempool and rebuild from the durable pending set. Admission is
+        // BEST-EFFORT: the in-memory caps (per-sender / pool size / bytes) are soft
+        // admission-control limits, but the sled pending tree is the source of truth
+        // and can legitimately exceed them across the eviction and TTL windows. A
+        // fatal `?` here aborts the whole sync — and on the initialize() path the
+        // whole process — the instant the durable set overflows a cap, turning a tx
+        // flood into a boot-time DoS (the node then cannot start until the rows age
+        // past the 7200s prune). Drop the overflow from memory and keep going;
+        // get_pending_transactions reads the sled tree directly, so nothing is lost.
         *mempool = Mempool::new();
         for tx in transactions {
-            mempool.add_transaction(tx)?;
+            let _ = mempool.add_transaction(tx);
         }
         drop(mempool);
         self.rebuild_pending_debits_index().await?;
