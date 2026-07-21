@@ -3232,10 +3232,14 @@ async fn handle_network_commands(
             let pb = ProgressBar::new_spinner();
             pb.set_message("Synchronizing with network...");
 
-            // First try to discover peers if needed
-            let peers = node.peers.read().await;
-            if peers.len() < 3 {
-                drop(peers); // Release the lock
+            // First try to discover peers if needed. Snapshot the count in a scoped
+            // block so the peers read guard is ALWAYS released before handle_chain_sync.
+            // The old code only drop()ed it inside the `< 3` branch, so a node with >= 3
+            // peers (the common case) held the read guard across the entire sync — and
+            // the moment sync needs peers.write() the task self-deadlocks (a read guard
+            // held by the same task that is awaiting the write), wedging the node.
+            let peer_count = { node.peers.read().await.len() };
+            if peer_count < 3 {
                 if let Err(e) = node.discover_network_nodes().await {
                     warn!("Peer discovery during sync failed: {}", e);
                 }

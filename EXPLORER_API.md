@@ -22,11 +22,11 @@ and a per-sender mempool rate limit, but a public deployment should add its own.
 
 | Endpoint | Returns |
 |---|---|
-| `/explorer/status` | node/chain status: version, network_id, height, index readiness |
+| `/explorer/status` | node/chain status: version, network_id, height, `finalized_height` + `finality_margin` (see Finality below), index readiness |
 | `/explorer/tip` | latest block header |
 | `/explorer/block/{height}` | full block at height (canonical) |
-| `/explorer/tx/{height}/{position}` | one transaction by block height + position |
-| `/explorer/tx?id={tx_id}` | track one transaction by id: `confirmed` (with height, position, block_hash, confirmations, body), `pending` (in mempool), or 404 |
+| `/explorer/tx/{height}/{position}` | one transaction by block height + position (includes `final`) |
+| `/explorer/tx?id={tx_id}` | track one transaction by id: `confirmed` (with height, position, block_hash, confirmations, `final`, body), `pending` (in mempool), or 404 |
 | `/explorer/address/{address}` | confirmed **balance** + paginated tx **history** |
 | `/explorer/supply` | circulating supply |
 
@@ -37,6 +37,30 @@ includes `balance`, `balance_units` (exact integer string), and `entries`.
 Amounts appear both as a decimal `amount`/`balance` and an exact integer
 `*_units` string — **use the `_units` integer for accounting**; the decimal is
 for display (floats lose precision).
+
+## Finality (for exchanges — credit deposits safely)
+
+The chain finalizes history behind a trusted checkpoint: **blocks at or below
+`finalized_height` are irreversible** — a reorg at/below that height is rejected
+outright by every node. `finalized_height` trails the tip by `finality_margin`
+(currently 64 blocks) and advances only as the node observes signed network
+beacons, so it is *conservative*: under a partition it simply stops advancing
+(you wait longer) and never over-states finality.
+
+- **`/explorer/status`** reports `finalized_height` and `finality_margin`.
+- **`/explorer/tx?id=`** and **`/explorer/tx/{height}/{position}`** include a
+  boolean **`final`** = (`height` ≤ `finalized_height`).
+
+**Credit a deposit as irreversible when its `final` is `true`** — a protocol
+guarantee, not a guess. (If you prefer a fixed-depth rule, wait `finality_margin`
+confirmations; but `final` is better because it also reflects the node's
+beacon/witness state, so it self-adjusts when the network is unhealthy.)
+
+**Reorg handling:** a transaction that is confirmed but not yet `final` can still
+be reorged out. When that happens `/explorer/tx?id=` moves `confirmed → pending`
+(it is returned to the mempool for re-mining) or `404`, and `confirmations` can
+decrease. **Always re-poll; never cache a one-time `confirmed`.** Once `final` is
+`true`, it never reverts.
 
 ## Submit a transaction (POST /explorer/submit-tx)
 
@@ -53,13 +77,19 @@ Body: a signed transaction as JSON. Same shape the read endpoints return:
       "sig_hash":  "<hex>"
     }
 
-Responses:
+Responses (submit is **idempotent** — a resend is safe, never a spurious error):
 
-    200  {"ok": true, "tx_id": "<hex>"}                 accepted + broadcast
+    200  {"ok": true, "status": "accepted",         "tx_id": "<hex>"}   admitted + broadcast
+    200  {"ok": true, "status": "already_pending",  "tx_id": "<hex>"}   identical tx already in mempool
+    200  {"ok": true, "status": "already_confirmed","tx_id": "<hex>",
+          "height": <n>, "final": <bool>}                               already in a block
     400  {"error": "transaction rejected: <reason>"}    failed validation
     422  (malformed JSON body)
     429  {"error": "rate_limited"}
     503  {"error": "node busy"}                         chain lock contended
+
+A withdrawal worker should treat `accepted` / `already_pending` / `already_confirmed`
+all as success, retry on `503`, back off on `429`, and alert only on a real `400`.
 
 On `200` the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and announced it to the network —

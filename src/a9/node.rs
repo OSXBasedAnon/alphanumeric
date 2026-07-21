@@ -5169,6 +5169,12 @@ impl Node {
                 (Some(l), Some(n)) => Some(n.saturating_sub(l)),
                 _ => None,
             };
+            // FINALITY SIGNAL (for exchanges): the highest height the node treats as
+            // irreversible — reorgs at/below it are rejected outright. Trails the tip by
+            // finality_margin and only advances as signed beacons are observed, so it is
+            // conservative under partition (under-reports, never over-reports, finality).
+            // 0 means not yet seeded. A deposit at height <= finalized_height is safe to credit.
+            let finalized_height = chain.trusted_checkpoint_height();
             json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
@@ -5179,6 +5185,8 @@ impl Node {
                 "blocks_behind": blocks_behind,
                 "index_height": index_meta.map(|(height, _)| height),
                 "index_ready": index_meta.is_some(),
+                "finalized_height": finalized_height,
+                "finality_margin": crate::a9::blockchain::CHECKPOINT_REORG_MARGIN,
                 "uptime_secs": SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5238,6 +5246,7 @@ impl Node {
         let Some(tx) = block.transactions.get(position as usize) else {
             return Self::explorer_err(StatusCode::NOT_FOUND, "transaction not found");
         };
+        let finalized_height = chain.trusted_checkpoint_height();
         let mut payload = Self::explorer_tx_json(tx, position as usize);
         if let Some(object) = payload.as_object_mut() {
             object.insert("height".into(), json!(height));
@@ -5246,6 +5255,8 @@ impl Node {
                 "confirmations".into(),
                 json!(tip_height.saturating_sub(height) as u64 + 1),
             );
+            // Irreversible once buried at/below the finality checkpoint.
+            object.insert("final".into(), json!(height <= finalized_height));
         }
         (StatusCode::OK, Json(payload))
     }
@@ -5296,6 +5307,7 @@ impl Node {
                     .iter()
                     .position(|t| t.get_tx_id() == tx_id)
                 {
+                    let finalized_height = chain.trusted_checkpoint_height();
                     let mut payload =
                         Self::explorer_tx_json(&block.transactions[position], position);
                     if let Some(object) = payload.as_object_mut() {
@@ -5308,6 +5320,10 @@ impl Node {
                             "confirmations".into(),
                             json!(tip_height.saturating_sub(height) as u64 + 1),
                         );
+                        // Irreversible once buried at/below the finality checkpoint. An
+                        // exchange should credit a deposit only when this is true (or, if it
+                        // prefers a fixed depth, at finality_margin confirmations).
+                        object.insert("final".into(), json!(height <= finalized_height));
                     }
                     return (StatusCode::OK, Json(payload));
                 }
@@ -5490,11 +5506,13 @@ impl Node {
                 return Self::explorer_busy();
             };
             if let Some(height) = chain.confirmed_tx_height(&tx_id) {
+                let finalized_height = chain.trusted_checkpoint_height();
                 return (
                     StatusCode::OK,
                     Json(json!({
                         "ok": true, "status": "already_confirmed",
-                        "tx_id": tx_id.clone(), "height": height
+                        "tx_id": tx_id.clone(), "height": height,
+                        "final": height <= finalized_height
                     })),
                 );
             }
@@ -7107,7 +7125,16 @@ impl Node {
                                         }
                                         _ => {
                                             warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
-                                            std::process::exit(0);
+                                            // Persist a hard force-rebootstrap marker BEFORE exiting (M10):
+                                            // otherwise the restart's boot reconcile trusts our own stale
+                                            // manifest, skips the re-bootstrap, re-diverges, and respawns
+                                            // in a loop with the beacon frozen network-wide. Cooldown-guarded.
+                                            let _ = node_clone.schedule_force_rebootstrap_hard(
+                                                "publisher: relay chain diverged below reorg window",
+                                            );
+                                            // Nonzero exit so systemd Restart=on-failure / launchd actually
+                                            // respawns us (M9) — exit(0) reads as a clean stop and strands the node.
+                                            std::process::exit(3);
                                         }
                                     }
                                 }
@@ -7195,7 +7222,8 @@ impl Node {
                     if strikes >= 2 {
                         if headless {
                             error!("lock watchdog: restarting to self-heal (supervisor respawns)");
-                            std::process::exit(0);
+                            // Nonzero so Restart=on-failure supervisors actually respawn (M9).
+                            std::process::exit(3);
                         } else if strikes == 2 {
                             // Print the operator hint ONCE; keep counting quietly after
                             // (an interactive session is never killed under the user).
@@ -7207,6 +7235,69 @@ impl Node {
                     }
                 }
             });
+        }
+
+        // OFF-RUNTIME WHOLE-RUNTIME-PIN WATCHDOG (M11). The lock watchdog above is itself a
+        // tokio task, so if EVERY runtime worker is pinned at once (blocking I/O slipped onto
+        // the async workers — the 2026-07-16 6h publisher park class), it cannot run and cannot
+        // self-heal. This guard lives on a dedicated OS thread that never touches the runtime:
+        // a lightweight in-runtime task bumps a heartbeat every 15s; the OS thread checks it and,
+        // if it stays stale for >120s on a HEADLESS node, exits nonzero so the supervisor
+        // respawns. Interactive sessions are never killed. Complementary to the lock probe above,
+        // which still names WHICH single lock wedged.
+        {
+            let headless = std::env::var("ALPHANUMERIC_HEADLESS")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
+            let heartbeat = Arc::new(AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ));
+            // In-runtime bumper: advances the heartbeat whenever ANY worker is free to run it.
+            {
+                let hb = Arc::clone(&heartbeat);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        let secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        hb.store(secs, Ordering::Relaxed);
+                    }
+                });
+            }
+            // Off-runtime checker: a plain OS thread, so it stays able to act even when every
+            // tokio worker is blocked. eprintln! (not the log stack) keeps it working under a pin.
+            let hb = Arc::clone(&heartbeat);
+            let _ = std::thread::Builder::new()
+                .name("runtime-watchdog".into())
+                .spawn(move || {
+                    let mut stale_strikes: u32 = 0;
+                    loop {
+                        std::thread::sleep(Duration::from_secs(30));
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let stale = now.saturating_sub(hb.load(Ordering::Relaxed));
+                        if stale <= 120 {
+                            stale_strikes = 0;
+                            continue;
+                        }
+                        stale_strikes += 1;
+                        eprintln!(
+                            "runtime watchdog: heartbeat stale {}s (strike {}) — async runtime may be fully pinned",
+                            stale, stale_strikes
+                        );
+                        if stale_strikes >= 2 && headless {
+                            eprintln!("runtime watchdog: restarting to self-heal (supervisor respawns)");
+                            std::process::exit(3);
+                        }
+                    }
+                });
         }
 
         info!("Node startup complete - ready to accept connections");
