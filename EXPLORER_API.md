@@ -41,26 +41,31 @@ for display (floats lose precision).
 ## Finality (for exchanges — credit deposits safely)
 
 The chain finalizes history behind a trusted checkpoint: **blocks at or below
-`finalized_height` are irreversible** — a reorg at/below that height is rejected
-outright by every node. `finalized_height` trails the tip by `finality_margin`
-(currently 64 blocks) and advances only as the node observes signed network
-beacons, so it is *conservative*: under a partition it simply stops advancing
-(you wait longer) and never over-states finality.
+`finalized_height` cannot be reorged by this node** — a reorg at/below that height
+is rejected outright. `finalized_height` trails the tip by `finality_margin`
+(currently 64 blocks) and is monotonic (never regresses). It is **this node's own
+view**: it advances both as the node observes signed network beacons *and* as the
+node locally verifies frontier blocks that extend its own canonical tip.
 
 - **`/explorer/status`** reports `finalized_height` and `finality_margin`.
 - **`/explorer/tx?id=`** and **`/explorer/tx/{height}/{position}`** include a
   boolean **`final`** = (`height` ≤ `finalized_height`).
 
-**Credit a deposit as irreversible when its `final` is `true`** — a protocol
-guarantee, not a guess. (If you prefer a fixed-depth rule, wait `finality_margin`
-confirmations; but `final` is better because it also reflects the node's
-beacon/witness state, so it self-adjusts when the network is unhealthy.)
+**Credit a deposit as irreversible when its `final` is `true` AND the node is
+fresh.** `final` is a strong signal, but it reflects the finality of the chain
+*this node is on*. A node that is eclipsed or on the losing side of a network
+partition keeps advancing its own checkpoint on that minority chain, so it can
+report `final: true` for a transaction the majority chain later reorgs away —
+the one direction that costs an exchange money. Guard against it: only trust
+`final` when `/explorer/status` shows healthy freshness (`network_height` present
+and `blocks_behind` small, 0–1), and run your own well-connected node with a seed
+peer configured. On a healthy, majority-connected node, once `final` is `true` it
+never reverts.
 
 **Reorg handling:** a transaction that is confirmed but not yet `final` can still
 be reorged out. When that happens `/explorer/tx?id=` moves `confirmed → pending`
 (it is returned to the mempool for re-mining) or `404`, and `confirmations` can
-decrease. **Always re-poll; never cache a one-time `confirmed`.** Once `final` is
-`true`, it never reverts.
+decrease. **Always re-poll; never cache a one-time `confirmed`.**
 
 ## Submit a transaction (POST /explorer/submit-tx)
 

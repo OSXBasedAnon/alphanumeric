@@ -5169,11 +5169,13 @@ impl Node {
                 (Some(l), Some(n)) => Some(n.saturating_sub(l)),
                 _ => None,
             };
-            // FINALITY SIGNAL (for exchanges): the highest height the node treats as
-            // irreversible — reorgs at/below it are rejected outright. Trails the tip by
-            // finality_margin and only advances as signed beacons are observed, so it is
-            // conservative under partition (under-reports, never over-reports, finality).
-            // 0 means not yet seeded. A deposit at height <= finalized_height is safe to credit.
+            // FINALITY SIGNAL (for exchanges): the highest height THIS node treats as
+            // irreversible — reorgs at/below it are rejected outright; monotonic. Trails the
+            // tip by finality_margin and advances on observed signed beacons AND on locally
+            // verified frontier blocks, so it reflects THIS node's view: an eclipsed / minority-
+            // partitioned node can advance it on a minority chain and thus report final:true for
+            // a tx the majority later reorgs. Consumers must gate on freshness (network_height
+            // present, blocks_behind small). 0 means not yet seeded. See EXPLORER_API.md.
             let finalized_height = chain.trusted_checkpoint_height();
             json!({
                 "ok": true,
@@ -5334,6 +5336,7 @@ impl Node {
                 StatusCode::OK,
                 Json(json!({
                     "ok": true, "status": "confirmed", "tx_id": tx_id, "height": height,
+                    "final": height <= chain.trusted_checkpoint_height(),
                 })),
             );
         }
