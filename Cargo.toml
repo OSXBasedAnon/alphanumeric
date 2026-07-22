@@ -32,7 +32,7 @@ crossbeam-channel = "0.5.15"
 parking_lot = "0.12.1"
 lru = "0.8"
 reed-solomon-erasure = "6.0.0"
-ml-dsa = "0.1.1"
+ml-dsa = "=0.1.1"   # EXACT pin: consensus signature crate — a silent patch bump could change signature bytes (fork). Bump deliberately only, verifying SIGNING_SPEC.md test vector still matches.
 aes-gcm = "0.10"
 zeroize = "1"
 # WebRTC DataChannel transport for the NAT-traversal mesh (feature `webrtc_mesh`). Optional so the
