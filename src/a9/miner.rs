@@ -192,15 +192,23 @@ impl MiningManager {
             return Err(MiningError::MaxNonceExceeded);
         }
 
-        // All cores by default. The old hard cap of 32 left big rigs (e.g. a
-        // 258-thread EPYC) mining at ~12% capacity; header PoW is embarrassingly
-        // parallel, so there is no reason to cap below the machine. Operators
-        // who want to keep cores free set ALPHANUMERIC_MINE_THREADS.
+        // Reserve headroom for the async runtime by default. Header PoW is
+        // embarrassingly parallel, so grabbing every core maximizes raw hashrate,
+        // but the SAME process must also fetch the tip beacon, ingest blocks, and
+        // converge to the tip, and the in-grind tip-change abort can only fire once
+        // that async catch-up advances the local tip. Pinning all cores to BLAKE3
+        // starved that path, so the CPU scan sat on a stale template while the
+        // network moved on. (The GPU path offloads hashing to the device and keeps
+        // cores free on its own — this default is what matters for the CPU fallback
+        // and for a rig that demotes to CPU when its GPU dies mid-session.) Leaving
+        // two cores free keeps catch-up responsive; big rigs lose <1%. Operators
+        // who want a specific count set ALPHANUMERIC_MINE_THREADS (still honored
+        // verbatim, clamped 1..=1024).
         let num_threads = std::env::var("ALPHANUMERIC_MINE_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|n| n.clamp(1, 1024))
-            .unwrap_or_else(|| num_cpus::get())
+            .unwrap_or_else(|| num_cpus::get().saturating_sub(2).max(1))
             .max(1);
         let nonces_per_thread = max_nonce.div_ceil(num_threads as u64);
 
@@ -660,136 +668,182 @@ impl MiningManager {
                 }
             }
 
-            let stop_for_cpu = Arc::clone(&stop);
-            let mining_result: Result<(), MiningError> = (0..num_threads as u64)
-                .into_par_iter()
-                .try_for_each(|thread_id| -> Result<(), MiningError> {
-                    let mut local_header = header.clone();
-                    local_header.merkle_root = merkle_root;
-                    let range_end = current_nonce.saturating_add(max_nonce);
-                    let start_nonce =
-                        current_nonce.saturating_add(thread_id.saturating_mul(nonces_per_thread));
-                    if start_nonce >= range_end {
-                        return Ok(());
-                    }
-                    let end_nonce = start_nonce.saturating_add(nonces_per_thread).min(range_end);
-                    let mut cached_timestamp = 0u64;
-                    let mut cached_difficulty = 0u64;
-                    // Target as fixed-width big-endian bytes: for 256-bit values,
-                    // lexicographic [u8; 32] comparison IS numeric comparison, so
-                    // the hot loop compares the hash directly and never heap-
-                    // allocates a BigUint per nonce (the allocator was the scaling
-                    // ceiling on many-core rigs). Equivalence is unit-tested
-                    // (pow_byte_compare_matches_biguint_compare in blockchain.rs).
-                    let mut cached_target_bytes = [0u8; 32];
-
-                    for nonce in start_nonce..end_nonce {
-                        if found.load(Ordering::Relaxed)
-                            || abort_for_tip_change_check.load(Ordering::Relaxed)
-                            || stop_for_cpu.load(Ordering::Relaxed)
-                        {
-                            return Ok(());
-                        }
-
-                        // Don't create full Block - just calculate hash directly
-                        // We only need the full block when we find a valid nonce
-                        // Clamped to the parent's timestamp: a local clock behind
-                        // the parent would stamp a block that fails parent-
-                        // timestamp validation — discovered only AFTER the grind,
-                        // burning the whole solve.
-                        let timestamp = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            .max(previous_block_timestamp);
-                        if timestamp != cached_timestamp {
-                            cached_timestamp = timestamp;
-                            cached_difficulty = Block::consensus_next_difficulty(
-                                previous_difficulty,
-                                timestamp.saturating_sub(previous_block_timestamp),
-                                local_header.number,
-                            );
-                            cached_target_bytes =
-                                pow_target_bytes(&pow_target_from_difficulty(cached_difficulty));
-                        }
-                        let hash = {
-                            let mut header_data = [0u8; 92];
-                            let mut offset = 0;
-
-                            header_data[offset..offset + 4]
-                                .copy_from_slice(&local_header.number.to_le_bytes());
-                            offset += 4;
-
-                            header_data[offset..offset + 32].copy_from_slice(&previous_block_hash);
-                            offset += 32;
-
-                            header_data[offset..offset + 8]
-                                .copy_from_slice(&timestamp.to_le_bytes());
-                            offset += 8;
-
-                            header_data[offset..offset + 8].copy_from_slice(&nonce.to_le_bytes());
-                            offset += 8;
-
-                            header_data[offset..offset + 8]
-                                .copy_from_slice(&cached_difficulty.to_le_bytes());
-                            offset += 8;
-
-                            header_data[offset..offset + 32].copy_from_slice(&merkle_root);
-
-                            *blake3::hash(&header_data).as_bytes()
-                        };
-
-                        if hash <= cached_target_bytes {
-                            if !found.swap(true, Ordering::Relaxed) {
-                                result_nonce.store(nonce, Ordering::Release);
-                                result_timestamp.store(timestamp, Ordering::Release);
-                                result_difficulty.store(cached_difficulty, Ordering::Release);
-                                if let Ok(mut hash_guard) = hash_result.lock() {
-                                    *hash_guard = hash.to_vec();
-                                }
-                            }
-                            return Ok(());
-                        }
-
-                        if nonce % TIP_CHANGE_CHECK_INTERVAL == 0 {
-                            if tip_change_counter_check.load(Ordering::Acquire)
-                                != template_tip_version
-                            {
-                                abort_for_tip_change_check.store(true, Ordering::Release);
+            let mining_result: Result<(), MiningError> = {
+                // Run the CPU-fallback grind on the blocking pool, NOT the caller's
+                // thread. This path runs when `mine` has no GPU, or when the GPU
+                // died mid-session and demoted to CPU. The GPU fast path above
+                // already offloads via spawn_blocking, but the CPU scan ran the
+                // rayon join inline: on an interactive node the REPL + node monitor
+                // share a single-threaded LocalSet, so the synchronous join parked
+                // that thread for the whole pass while all cores hashed BLAKE3 —
+                // starving the beacon-watch/converge catch-up that advances the
+                // local tip, so the in-grind tip-change abort never fired and the
+                // scan sat on a stale template. spawn_blocking hands the grind to a
+                // blocking thread and yields the caller so convergence keeps running.
+                // Each `let` below shadows an Arc/handle and is MOVED into the task;
+                // the originals (including the result clones the GPU path and the
+                // finalize below also use) stay valid and are read after the join.
+                // JoinError (task panic) -> mining failure, not a silent stall.
+                let found = Arc::clone(&found);
+                let result_nonce = Arc::clone(&result_nonce);
+                let result_timestamp = Arc::clone(&result_timestamp);
+                let result_difficulty = Arc::clone(&result_difficulty);
+                let hash_result = Arc::clone(&hash_result);
+                let abort_for_tip_change_check = Arc::clone(&abort_for_tip_change_check);
+                let tip_change_counter_check = Arc::clone(&tip_change_counter_check);
+                let blockchain_for_tip_checks = Arc::clone(&blockchain_for_tip_checks);
+                let progress_bar = Arc::clone(&progress_bar);
+                let stop_for_cpu = Arc::clone(&stop);
+                let header = header.clone();
+                match tokio::task::spawn_blocking(move || {
+                    (0..num_threads as u64)
+                        .into_par_iter()
+                        .try_for_each(|thread_id| -> Result<(), MiningError> {
+                            let mut local_header = header.clone();
+                            local_header.merkle_root = merkle_root;
+                            let range_end = current_nonce.saturating_add(max_nonce);
+                            let start_nonce = current_nonce
+                                .saturating_add(thread_id.saturating_mul(nonces_per_thread));
+                            if start_nonce >= range_end {
                                 return Ok(());
                             }
-                        }
+                            let end_nonce =
+                                start_nonce.saturating_add(nonces_per_thread).min(range_end);
+                            let mut cached_timestamp = 0u64;
+                            let mut cached_difficulty = 0u64;
+                            // Target as fixed-width big-endian bytes: for 256-bit values,
+                            // lexicographic [u8; 32] comparison IS numeric comparison, so
+                            // the hot loop compares the hash directly and never heap-
+                            // allocates a BigUint per nonce (the allocator was the scaling
+                            // ceiling on many-core rigs). Equivalence is unit-tested
+                            // (pow_byte_compare_matches_biguint_compare in blockchain.rs).
+                            let mut cached_target_bytes = [0u8; 32];
 
-                        if nonce % DB_TIP_CONFIRM_INTERVAL == 0 {
-                            if let Ok(blockchain) = blockchain_for_tip_checks.try_read() {
-                                if let Some(tip) = blockchain.get_last_block() {
-                                    if tip.index != expected_parent_index
-                                        || tip.hash != previous_block_hash
+                            for nonce in start_nonce..end_nonce {
+                                if found.load(Ordering::Relaxed)
+                                    || abort_for_tip_change_check.load(Ordering::Relaxed)
+                                    || stop_for_cpu.load(Ordering::Relaxed)
+                                {
+                                    return Ok(());
+                                }
+
+                                // Don't create full Block - just calculate hash directly
+                                // We only need the full block when we find a valid nonce
+                                // Clamped to the parent's timestamp: a local clock behind
+                                // the parent would stamp a block that fails parent-
+                                // timestamp validation — discovered only AFTER the grind,
+                                // burning the whole solve.
+                                let timestamp = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs()
+                                    .max(previous_block_timestamp);
+                                if timestamp != cached_timestamp {
+                                    cached_timestamp = timestamp;
+                                    cached_difficulty = Block::consensus_next_difficulty(
+                                        previous_difficulty,
+                                        timestamp.saturating_sub(previous_block_timestamp),
+                                        local_header.number,
+                                    );
+                                    cached_target_bytes = pow_target_bytes(
+                                        &pow_target_from_difficulty(cached_difficulty),
+                                    );
+                                }
+                                let hash = {
+                                    let mut header_data = [0u8; 92];
+                                    let mut offset = 0;
+
+                                    header_data[offset..offset + 4]
+                                        .copy_from_slice(&local_header.number.to_le_bytes());
+                                    offset += 4;
+
+                                    header_data[offset..offset + 32]
+                                        .copy_from_slice(&previous_block_hash);
+                                    offset += 32;
+
+                                    header_data[offset..offset + 8]
+                                        .copy_from_slice(&timestamp.to_le_bytes());
+                                    offset += 8;
+
+                                    header_data[offset..offset + 8]
+                                        .copy_from_slice(&nonce.to_le_bytes());
+                                    offset += 8;
+
+                                    header_data[offset..offset + 8]
+                                        .copy_from_slice(&cached_difficulty.to_le_bytes());
+                                    offset += 8;
+
+                                    header_data[offset..offset + 32]
+                                        .copy_from_slice(&merkle_root);
+
+                                    *blake3::hash(&header_data).as_bytes()
+                                };
+
+                                if hash <= cached_target_bytes {
+                                    if !found.swap(true, Ordering::Relaxed) {
+                                        result_nonce.store(nonce, Ordering::Release);
+                                        result_timestamp.store(timestamp, Ordering::Release);
+                                        result_difficulty
+                                            .store(cached_difficulty, Ordering::Release);
+                                        if let Ok(mut hash_guard) = hash_result.lock() {
+                                            *hash_guard = hash.to_vec();
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+
+                                if nonce % TIP_CHANGE_CHECK_INTERVAL == 0 {
+                                    if tip_change_counter_check.load(Ordering::Acquire)
+                                        != template_tip_version
                                     {
-                                        abort_for_tip_change_check.store(true, Ordering::Release);
+                                        abort_for_tip_change_check
+                                            .store(true, Ordering::Release);
                                         return Ok(());
                                     }
                                 }
-                            }
-                        }
 
-                        if nonce % update_interval == 0 {
-                            if let Ok(pb) = progress_bar.try_lock() {
-                                pb.set_position(nonce.saturating_sub(current_nonce));
-                                let hash_hex = hex::encode(hash);
-                                pb.set_message(format!(
-                                    "Hash: {} (Difficulty: {})",
-                                    &hash_hex[..16],
-                                    cached_difficulty
-                                ));
-                            }
+                                if nonce % DB_TIP_CONFIRM_INTERVAL == 0 {
+                                    if let Ok(blockchain) = blockchain_for_tip_checks.try_read()
+                                    {
+                                        if let Some(tip) = blockchain.get_last_block() {
+                                            if tip.index != expected_parent_index
+                                                || tip.hash != previous_block_hash
+                                            {
+                                                abort_for_tip_change_check
+                                                    .store(true, Ordering::Release);
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
 
-                            // Avoid blocking inside rayon threads; height changes will be picked
-                            // up on the next outer loop iteration.
-                        }
-                    }
-                    Ok(())
-                });
+                                if nonce % update_interval == 0 {
+                                    if let Ok(pb) = progress_bar.try_lock() {
+                                        pb.set_position(nonce.saturating_sub(current_nonce));
+                                        let hash_hex = hex::encode(hash);
+                                        pb.set_message(format!(
+                                            "Hash: {} (Difficulty: {})",
+                                            &hash_hex[..16],
+                                            cached_difficulty
+                                        ));
+                                    }
+
+                                    // Avoid blocking inside rayon threads; height changes
+                                    // will be picked up on the next outer loop iteration.
+                                }
+                            }
+                            Ok(())
+                        })
+                })
+                .await
+                {
+                    Ok(inner) => inner,
+                    Err(join_err) => Err(MiningError::MiningFailed(format!(
+                        "mining task failed to join: {}",
+                        join_err
+                    ))),
+                }
+            };
 
             if mining_result.is_err() {
                 if let Ok(pb) = progress_bar.lock() {
