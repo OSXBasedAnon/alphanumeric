@@ -5093,7 +5093,7 @@ impl Node {
         })
     }
 
-    fn explorer_block_json(block: &Block, tip_height: u32) -> Value {
+    fn explorer_block_json(block: &Block, tip_height: u32, finalized_height: u32) -> Value {
         json!({
             "height": block.index,
             "hash": hex::encode(block.hash),
@@ -5104,6 +5104,9 @@ impl Node {
             "nonce": block.nonce,
             "confirmations": tip_height.saturating_sub(block.index) as u64 + 1,
             "transaction_count": block.transactions.len(),
+            // Irreversible once buried at/below the finality checkpoint — matches the tx/status
+            // finality contract exchanges rely on. (EX-P3a)
+            "final": block.index <= finalized_height,
             "transactions": block
                 .transactions
                 .iter()
@@ -5209,9 +5212,10 @@ impl Node {
         match chain.get_last_block() {
             Some(block) => {
                 let tip_height = block.index;
+                let finalized_height = chain.trusted_checkpoint_height();
                 (
                     StatusCode::OK,
-                    Json(Self::explorer_block_json(&block, tip_height)),
+                    Json(Self::explorer_block_json(&block, tip_height, finalized_height)),
                 )
             }
             None => Self::explorer_err(StatusCode::NOT_FOUND, "chain is empty"),
@@ -5226,10 +5230,11 @@ impl Node {
             return Self::explorer_busy();
         };
         let tip_height = chain.get_latest_block_index() as u32;
+        let finalized_height = chain.trusted_checkpoint_height();
         match chain.get_block(height) {
             Ok(block) => (
                 StatusCode::OK,
-                Json(Self::explorer_block_json(&block, tip_height)),
+                Json(Self::explorer_block_json(&block, tip_height, finalized_height)),
             ),
             Err(_) => Self::explorer_err(StatusCode::NOT_FOUND, "block not found"),
         }

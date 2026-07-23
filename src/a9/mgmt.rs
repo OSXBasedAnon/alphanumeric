@@ -991,11 +991,14 @@ impl Mgmt {
 
         // No wallet registry needed - transactions are self-contained with public keys
 
-        // Scope the write guard: `match lock().await.f().await { .. }` keeps the
-        // guard alive for every match arm, and the Ok arm reads the same lock
-        // (get_wallet_balance), causing a self-deadlock right after "Done".
+        // M2: a read guard suffices — add_transaction self-serializes on its internal
+        // state_mutation_lock and runs the ML-DSA verify before taking it, so an exclusive
+        // outer guard here only blocked concurrent block-ingest for no gain (matches the
+        // network callers). Still scoped to the submit alone: the Ok arm re-reads the chain
+        // for the balance (get_wallet_balance), which under a held guard self-deadlocked
+        // right after "Done".
         let submit_result = {
-            let chain = blockchain.write().await;
+            let chain = blockchain.read().await;
             chain.add_transaction(transaction.clone()).await
         };
         match submit_result {
