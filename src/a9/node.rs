@@ -55,7 +55,8 @@ use tokio::{
 };
 
 use crate::a9::blockchain::{
-    Block, Blockchain, BlockchainError, MAX_BLOCK_TX_COUNT, RateLimiter, Transaction,
+    Block, Blockchain, BlockchainError, MAX_BLOCK_TX_COUNT, MIN_RELAY_FEE_UNITS, RateLimiter,
+    Transaction,
     SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
@@ -8925,7 +8926,15 @@ impl Node {
                     // the exclusive lock across the ML-DSA verify (see submit-tx handler).
                     {
                         let blockchain = self.blockchain.read().await;
-                        blockchain.add_transaction(tx.clone()).await?;
+                        if let Err(e) = blockchain.add_transaction(tx.clone()).await {
+                            if matches!(e, BlockchainError::FeeBelowRelayFloor) {
+                                // Policy reject, not a fault — don't error!-spam
+                                // the event pump for pre-floor peers' cheap txs.
+                                debug!("Dropping below-floor-fee gossip tx");
+                                return Ok(());
+                            }
+                            return Err(e.into());
+                        }
                     }
 
                     // SPAWN the gossip off the single-consumer event pump: gossip_transaction
@@ -9215,6 +9224,14 @@ impl Node {
 
             NetworkMessage::Transaction(tx_data) => {
                 let tx_ref = Arc::new(tx_data);
+                // Relay-policy floor, BEFORE the validation cache: the cache
+                // marks validity ahead of admission, so without this gate a
+                // repeat receipt of a cached below-floor tx would re-broadcast
+                // it to 8 peers and defeat the floor. Silent ignore — policy,
+                // not a peer fault (no penalty, no negative cache entry).
+                if tx_ref.fee_units < MIN_RELAY_FEE_UNITS {
+                    return Ok(None);
+                }
                 let tx_hash = tx_ref.create_hash();
 
                 // Check validation cache

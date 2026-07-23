@@ -540,3 +540,31 @@ mod tests {
             .expect("second whisper should use caller-provided spendable balance only");
     }
 }
+
+#[cfg(test)]
+mod relay_floor_tests {
+    use super::*;
+    use crate::a9::blockchain::{Transaction, MIN_RELAY_FEE_UNITS};
+
+    // The relay fee floor (0.0001) must never clip a legitimate whisper: a
+    // whisper's fee is WHISPER_MIN_AMOUNT plus a strictly positive
+    // arithmetic-coded component plus the percentage fee, for ANY code and any
+    // base amount. If this fails, MIN_RELAY_FEE_UNITS was raised past the
+    // whisper-safe bound — lower it or rework the whisper band first.
+    #[test]
+    fn every_whisper_fee_clears_the_relay_floor() {
+        let w = WhisperModule::new();
+        for code in ["a", "aa", "aaaa", "mmmm", "zzzz"] {
+            for base in [WHISPER_MIN_AMOUNT, 0.1, 1.0, 10.0, 1000.0] {
+                let fee = w.encode_message_as_fee(code, 0, base);
+                assert!(
+                    Transaction::to_units(fee) >= MIN_RELAY_FEE_UNITS,
+                    "whisper code {:?} base {} produced below-floor fee {}",
+                    code,
+                    base,
+                    fee
+                );
+            }
+        }
+    }
+}

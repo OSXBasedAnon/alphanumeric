@@ -82,6 +82,13 @@ Body: a signed transaction as JSON. Same shape the read endpoints return:
       "sig_hash":  "<hex>"
     }
 
+The `fee` is a priority signal with a **relay floor of 0.0001 coins** — lower
+fees are rejected at admission (`400 … below the relay floor`). Recommended:
+`max(amount × 0.000563063063, 0.0001)` (≈0.0563%, the reference-wallet rate).
+Miners earn 65% of included fees on top of a fee-scaled block subsidy, so
+higher-fee transactions confirm first when blocks are contested and bare-floor
+batches are the first to queue under load.
+
 Responses (submit is **idempotent** — a resend is safe, never a spurious error):
 
     200  {"ok": true, "status": "accepted",         "tx_id": "<hex>"}   admitted + broadcast

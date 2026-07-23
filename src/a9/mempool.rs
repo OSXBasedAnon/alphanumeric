@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
-use crate::a9::blockchain::{BlockchainError, Transaction};
+use crate::a9::blockchain::{BlockchainError, Transaction, MIN_RELAY_FEE_UNITS};
 use crate::a9::codec;
 
 const MEMPOOL_MAX_BYTES: usize = 50_000_000;
@@ -105,6 +105,21 @@ impl Mempool {
     }
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
+        self.admit(tx, true)
+    }
+
+    /// Re-admit a transaction REVERTED by a reorg. Identical to add_transaction
+    /// except the relay fee floor is skipped: a reverted tx was consensus-valid
+    /// in a mined block (possibly mined by a pre-floor node), and dropping it
+    /// here would silently lose an already-made payment (the reorg re-queue
+    /// exists precisely so reverted txs are not lost). All other caps — per-tx
+    /// size, per-address, eviction, TTL — still apply, and this node's own
+    /// template filter still declines to mine it.
+    pub fn readmit_reverted(&mut self, tx: Transaction) -> Result<(), BlockchainError> {
+        self.admit(tx, false)
+    }
+
+    fn admit(&mut self, tx: Transaction, enforce_floor: bool) -> Result<(), BlockchainError> {
         // Rate-limit the expiry scan off the admission hot path (was a full O(N) scan on every
         // insert). Lazy TTL: a stale tx lingers at most PRUNE_INTERVAL_SECS longer, harmless.
         let now_secs = SystemTime::now()
@@ -121,6 +136,16 @@ impl Mempool {
         // O(1) dedup via the locator index instead of scanning the whole pool.
         if self.tx_locator.contains_key(&tx_id) {
             return Ok(());
+        }
+
+        // Relay-policy fee floor (MIN_RELAY_FEE_UNITS): enforced at the mempool
+        // choke point too, so the direct callers (reorg re-queue, startup
+        // rehydration) can't re-admit a below-floor tx. Admission policy ONLY —
+        // never part of block validity (see Blockchain::add_transaction). The
+        // coinbase's pinned NETWORK_FEE (0.0005) clears the floor by 5x, so no
+        // system tx is affected.
+        if enforce_floor && tx.fee_units < MIN_RELAY_FEE_UNITS {
+            return Err(BlockchainError::FeeBelowRelayFloor);
         }
 
         // Now do the expensive serialization
@@ -587,6 +612,42 @@ mod tests {
             mp.find_transaction_by_id(&victim_id).is_some(),
             "M1 regression: a doomed (cap-exceeded) tx evicted a resident"
         );
+    }
+
+    // Relay-policy floor: below-floor fees are rejected at the mempool choke
+    // point (this also covers the direct reorg-requeue / rehydration callers,
+    // which bypass Blockchain::add_transaction).
+    #[test]
+    fn below_floor_fee_rejected_at_mempool() {
+        let mut mp = Mempool::new();
+        let res = mp.add_transaction(tx_with("senderZ", 1, 1.0, 0.0));
+        assert!(
+            matches!(res, Err(BlockchainError::FeeBelowRelayFloor)),
+            "zero-fee tx must be rejected by the floor, got {:?}",
+            res
+        );
+        // 9_999 units is just under the floor; 10_000 exactly is admitted.
+        let res = mp.add_transaction(tx_with("senderZ", 2, 1.0, 0.00009999));
+        assert!(matches!(res, Err(BlockchainError::FeeBelowRelayFloor)));
+        mp.add_transaction(tx_with("senderZ", 3, 1.0, 0.0001))
+            .expect("floor-exact fee must be admitted");
+    }
+
+    // Reorg continuity: a REVERTED tx (consensus-valid in a mined block,
+    // possibly mined by a pre-floor node) must be re-admittable below the
+    // floor — dropping it would silently lose an already-made payment.
+    #[test]
+    fn reverted_below_floor_tx_is_readmitted() {
+        let mut mp = Mempool::new();
+        let tx = tx_with("senderR", 1, 1.0, 0.0);
+        let id = tx.get_tx_id();
+        assert!(matches!(
+            mp.add_transaction(tx.clone()),
+            Err(BlockchainError::FeeBelowRelayFloor)
+        ));
+        mp.readmit_reverted(tx)
+            .expect("reverted below-floor tx must be readmitted");
+        assert!(mp.find_transaction_by_id(&id).is_some());
     }
 
     // M2: a low-fee incoming tx cannot displace a higher-fee resident when the pool is full.
