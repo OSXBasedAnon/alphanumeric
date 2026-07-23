@@ -68,18 +68,43 @@ impl GpuMiner {
         // Instance::default() ignores the env var, which left no way to steer
         // a box with a broken driver stack (e.g. WGPU_BACKEND=dx12) without a
         // rebuild.
+        let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
+            backends,
             ..Default::default()
         });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or("no GPU adapter found (wgpu)")?;
+        // Multi-GPU (one process per card): ALPHANUMERIC_GPU_INDEX=N pins THIS
+        // process to the Nth enumerated adapter, so a 3-GPU rig runs three
+        // processes (index 0/1/2) and each card grinds a disjoint region of the
+        // nonce space — the per-attempt RANDOM nonce base (see gpu_mine_attempt)
+        // makes separate processes non-overlapping with no cross-process
+        // coordination. Unset = the single best (HighPerformance) adapter,
+        // byte-identical to prior single-GPU behavior. When an index is set the
+        // full roster is printed first so an operator can map index -> card.
+        let gpu_index = std::env::var("ALPHANUMERIC_GPU_INDEX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let adapter = if let Some(idx) = gpu_index {
+            let adapters = instance.enumerate_adapters(backends);
+            for (i, a) in adapters.iter().enumerate() {
+                let gi = a.get_info();
+                eprintln!("  GPU [{}] {} ({:?})", i, gi.name, gi.backend);
+            }
+            let n = adapters.len();
+            adapters.into_iter().nth(idx).ok_or_else(|| format!(
+                "ALPHANUMERIC_GPU_INDEX={idx} is out of range: {n} GPU adapter(s) found (valid indices 0..={})",
+                n.saturating_sub(1)
+            ))?
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok_or("no GPU adapter found (wgpu)")?
+        };
         let info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(
