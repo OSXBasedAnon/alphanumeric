@@ -2707,13 +2707,18 @@ impl Blockchain {
             .collect()
     }
 
-    // NOTE (v7.7.8): the relay witness-REHYDRATION path (try_install_rehydrated_orphan,
-    // reattempt_orphan_adoption, orphan_is_full_witnessed) and the checkpoint-relative
-    // reorg bound live on branch `v779-witness-full`, deferred to v7.7.9 pending the
-    // #2 x coinbase-maturity design + a complete adversarial review + soak proof. v7.7.8
-    // ships only G (the witness_blocked defer/backoff below, which stops the S-01
-    // re-verify/log storm with zero consensus surface); a witness-wedged node still
-    // recovers via the escape-hatch re-bootstrap path (converge NeedsBootstrap -> marker).
+    // NOTE: the witness_blocked memo below (G) records, per deferred branch, the exact
+    // (height,hash) blocks a rehydration consumer WOULD refetch — but that consumer is not
+    // shipped in this tree. An in-place relay witness-REHYDRATION recovery path (fetch the
+    // full-witness body by exact (height,hash), re-run hash+PoW+S-01, install over the
+    // truncated copy, then re-adopt) plus a checkpoint-relative deep-reorg bound were
+    // designed and intentionally deferred: raising the reorg bound deeper than the
+    // coinbase-maturity depth would let a reorg reach a MATURED coinbase, so it must not
+    // land without first resolving the reorg-depth-vs-maturity question, plus a complete
+    // adversarial review and soak. This tree ships only G (the defer/backoff below, which
+    // stops the S-01 re-verify/log storm with zero consensus surface); a witness-wedged node
+    // still recovers via the escape-hatch re-bootstrap path (converge NeedsBootstrap ->
+    // marker). Do NOT add rehydration or a deeper reorg bound without that decision.
 
     /// Rehydrate a reverted transaction to its full-signature form from the retained
     /// witness store. Returns None when this node never held (or has since pruned) the
