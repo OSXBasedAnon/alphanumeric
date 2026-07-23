@@ -166,6 +166,18 @@ pub const MAX_BLOCK_REWARD: f64 = 50.0;
 /// this also bounds a block's byte size. The mining-reward transaction counts toward it.
 pub const MAX_BLOCK_TX_COUNT: usize = 4096;
 pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
+/// RELAY/MEMPOOL POLICY fee floor for user transactions, in 1e-8 units
+/// (10_000 = 0.0001 coins). NOT consensus: block validation deliberately never
+/// checks it (that would be a soft fork) — it gates only what this node admits
+/// to its mempool, relays onward, and selects into its own block templates.
+/// The value is the largest always-whisper-safe flat floor: a whisper's fee is
+/// WHISPER_MIN_AMOUNT (0.0001) plus a strictly positive arithmetic-coded
+/// component plus the percentage fee, so every legitimate whisper clears it.
+/// Deterrence scope (be precise): the fee only BURNS when a tx is mined, so
+/// what the floor prices is confirmed chain-bloat — every spam tx that lands
+/// in a block now costs real coins. Mempool-resident spam that expires unpaid
+/// is instead bounded by the per-sender caps, rate limiter and TTL.
+pub const MIN_RELAY_FEE_UNITS: i128 = 10_000;
 pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
@@ -783,6 +795,10 @@ pub enum BlockchainError {
     /// InvalidBlockHeader so the continuous miner never mistakes an over-full
     /// template for a lost race and re-grinds the same doomed block forever.
     BlockTransactionCountExceeded,
+    /// Mempool/relay POLICY reject: transaction fee below MIN_RELAY_FEE_UNITS.
+    /// Never returned by block validation — a mined block carrying such a tx is
+    /// still fully valid (see the admission guard in add_transaction).
+    FeeBelowRelayFloor,
     BatchValidationFailed(Vec<usize>),
 }
 
@@ -821,6 +837,9 @@ impl fmt::Display for BlockchainError {
             }
             BlockchainError::BlockTransactionCountExceeded => {
                 write!(f, "Block exceeds the maximum transaction count")
+            }
+            BlockchainError::FeeBelowRelayFloor => {
+                write!(f, "Transaction fee below the relay floor (min 0.0001)")
             }
             BlockchainError::BatchValidationFailed(errors) => {
                 write!(f, "Batch validation failed with {} errors", errors.len())
@@ -3193,7 +3212,10 @@ impl Blockchain {
             for tx in reverted_txs {
                 match self.rehydrate_reverted_tx(&tx) {
                     Some(full) => {
-                        let _ = mempool.add_transaction(full);
+                        // readmit_reverted: floor-exempt — a reverted tx was
+                        // consensus-valid in a mined block; the relay floor must
+                        // not turn a reorg into silent loss of that payment.
+                        let _ = mempool.readmit_reverted(full);
                     }
                     None => {
                         debug!(
@@ -5219,6 +5241,19 @@ impl Blockchain {
 
         if !transaction.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
+        // RELAY-POLICY fee floor (anti-spam). Like the self-transfer guard below,
+        // this is deliberately mempool-admission ONLY — block validation never
+        // checks it, so a mined block carrying a lower-fee tx stays fully valid
+        // and this can never fork the chain (enforcing it in validation would be
+        // a soft fork). 0.0001 is the largest always-whisper-safe flat floor
+        // (see MIN_RELAY_FEE_UNITS), so every legitimate wallet/whisper fee
+        // passes. Fees only burn when mined, so this prices CONFIRMED
+        // chain-bloat (each block-landing spam tx costs real coins); unmined
+        // mempool spam stays bounded by the caps, rate limiter and TTL.
+        if transaction.fee_units < MIN_RELAY_FEE_UNITS {
+            return Err(BlockchainError::FeeBelowRelayFloor);
         }
 
         // Reject self-transfers at mempool admission (L06): sender == recipient is a
@@ -9153,6 +9188,86 @@ mod tests {
             .get_orphan_block_by_hash(&competing.hash)
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn relay_floor_rejects_below_floor_fee_at_admission() {
+        let blockchain = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
+
+        // amount 0.01 -> percentage fee 0.00000563 (563 units), under the 10_000-unit floor.
+        let low = signed_transfer(&wallet, "bob", 0.01, 10_000).await;
+        assert!(low.fee_units < MIN_RELAY_FEE_UNITS);
+        let err = blockchain
+            .add_transaction(low)
+            .await
+            .expect_err("below-floor fee must be rejected at admission");
+        assert!(matches!(err, BlockchainError::FeeBelowRelayFloor));
+
+        // amount 1.0 -> percentage fee 0.000563 (56_306 units) clears the floor.
+        let ok = signed_transfer(&wallet, "bob", 1.0, 10_001).await;
+        assert!(ok.fee_units >= MIN_RELAY_FEE_UNITS);
+        blockchain
+            .add_transaction(ok)
+            .await
+            .expect("above-floor fee must be admitted");
+    }
+
+    // ANTI-SOFT-FORK REGRESSION: the relay fee floor is mempool POLICY only. A
+    // mined block carrying a below-floor (even zero) fee tx must never be
+    // rejected for its fee — enforcing the floor in block validation would be a
+    // soft fork against non-upgraded miners. If this test ever fails with
+    // FeeBelowRelayFloor, the floor has leaked into consensus: revert that leak.
+    #[tokio::test]
+    async fn block_with_below_floor_fee_tx_is_not_rejected_for_its_fee() {
+        let bc = test_blockchain();
+        let mut zero_fee = user_tx("alice", "bob", 1.0, 1234);
+        zero_fee.fee_units = 0;
+        let txs = vec![zero_fee];
+        let merkle_root = Blockchain::calculate_merkle_root(&txs).unwrap();
+        let mut block = Block {
+            index: 7,
+            previous_hash: [0u8; 32],
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            transactions: txs,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+
+        // The block may fail for OTHER reasons (no coinbase, dummy signature,
+        // parent linkage) — what it must never fail with is the fee floor.
+        let res = bc.validate_block(&block).await;
+        assert!(
+            !matches!(res, Err(BlockchainError::FeeBelowRelayFloor)),
+            "validate_block must never enforce the relay fee floor (soft fork), got {:?}",
+            res
+        );
+        let res_new = bc.validate_new_block(&block).await;
+        assert!(
+            !matches!(res_new, Err(BlockchainError::FeeBelowRelayFloor)),
+            "validate_new_block must never enforce the relay fee floor (soft fork), got {:?}",
+            res_new
+        );
+    }
+
+    // Mirrors the CLI fee expression in mgmt.rs handle_create_transaction: the
+    // percentage fee floored at the relay minimum, so small sends can't
+    // self-reject at our own mempool.
+    #[test]
+    fn cli_fee_floors_small_sends() {
+        let fee_small =
+            (0.01_f64 * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
+        assert_eq!(Transaction::to_units(fee_small), MIN_RELAY_FEE_UNITS);
+        let fee_large =
+            (1000.0_f64 * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
+        assert!(Transaction::to_units(fee_large) > MIN_RELAY_FEE_UNITS);
     }
 
     fn user_tx(sender: &str, recipient: &str, amount: f64, timestamp: u64) -> Transaction {

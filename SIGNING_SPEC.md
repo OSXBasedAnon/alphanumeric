@@ -77,6 +77,25 @@ public key, not the sig_hash, not JSON. Colons separate the five fields.
    Note the JSON `amount`/`fee` are ordinary decimal numbers; only the *signed
    message* uses the fixed 8-decimal string form.
 
+## Choosing the fee
+
+The fee is a **priority signal, not a fixed rate** — but nodes enforce a relay
+floor, and miners are paid more for higher-fee blocks, so choose deliberately:
+
+- **Relay floor (policy): `0.0001`.** Nodes refuse to mempool or relay a
+  transaction whose fee is below 0.0001 coins (`400 … below the relay floor`
+  from submit-tx). This is relay policy, not consensus — but a below-floor
+  transaction will not propagate, so treat it as a hard minimum.
+- **Recommended: `max(amount × 0.000563063063, 0.0001)`** — ≈0.0563% of the
+  amount, floored. This is what the reference wallet pays, and it is what keeps
+  a payment attractive to include: 65% of a block's fees are re-minted to its
+  miner (35% burn) and the block subsidy itself scales with the fees the block
+  carries, so higher-fee transactions confirm ahead of cheaper ones. Large
+  batched payouts at the bare floor are the first to queue when blocks compete.
+- Fees in the band `0.0001–0.0157` can decode as 4-letter whisper codes (see
+  the whisper module) — harmless; the recommended formula lands above the band
+  once `amount × 0.0563% > 0.0157` and inside it otherwise, which is fine.
+
 ## Test vector (verify your implementation against this)
 
 Deterministic — your bytes must match exactly.

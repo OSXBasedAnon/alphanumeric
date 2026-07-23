@@ -14,9 +14,20 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT, MAX_TX_AGE_SECS, NETWORK_FEE,
+    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT, MAX_TX_AGE_SECS,
+    MIN_RELAY_FEE_UNITS, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
+use crate::a9::codec;
+
+/// Cap on the summed serialized size of the transactions selected into a block
+/// template. Every transport enforces node.rs MAX_MESSAGE_SIZE (4 MiB) per
+/// frame, so a bigger block is unrelayable and would strand this miner on its
+/// own fork. The consensus MAX_BLOCK_TX_COUNT alone does NOT keep templates
+/// under the frame: full ML-DSA-87 witnesses put a signed transfer near ~15 KB,
+/// so a count-full template would serialize to tens of MB. 3.5 MiB leaves
+/// headroom for the header, coinbase and codec envelope.
+const MAX_TEMPLATE_TX_BYTES: usize = 3_500_000;
 
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
@@ -447,6 +458,12 @@ impl MiningManager {
                         if !tx.has_valid_regular_amounts() {
                             return false;
                         }
+                        // Relay-policy floor, belt to the mempool's suspender:
+                        // never template a below-floor tx that slipped in via
+                        // startup rehydration or a reorg readmit.
+                        if tx.fee_units < MIN_RELAY_FEE_UNITS {
+                            return false;
+                        }
                         if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
                             < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
                         {
@@ -499,6 +516,7 @@ impl MiningManager {
                 // exactly by `sender_debits`; selection order and outcomes are
                 // byte-identical to the per-candidate version.
                 let mut confirmed_cache: HashMap<String, i128> = HashMap::new();
+                let mut template_bytes: usize = 0;
 
                 for transaction in ordered {
                     if selected_regular.len() >= regular_cap {
@@ -524,6 +542,17 @@ impl MiningManager {
                     let required_units = transaction.total_debit_units();
 
                     if confirmed_units.saturating_sub(already_selected) >= required_units {
+                        // Relayability cap (MAX_TEMPLATE_TX_BYTES): continue, not
+                        // break — fee-desc order still packs any smaller txs that
+                        // fit under the remaining budget.
+                        let tx_bytes = match codec::serialize(transaction) {
+                            Ok(bytes) => bytes.len(),
+                            Err(_) => continue, // unserializable can't ship in a block
+                        };
+                        if template_bytes.saturating_add(tx_bytes) > MAX_TEMPLATE_TX_BYTES {
+                            continue;
+                        }
+                        template_bytes += tx_bytes;
                         selected_regular.push(transaction.clone());
                         *sender_debits.entry(transaction.sender.clone()).or_default() +=
                             required_units;

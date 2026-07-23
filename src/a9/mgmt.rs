@@ -14,7 +14,7 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
 use tokio::sync::RwLock;
 
-use crate::a9::blockchain::FEE_PERCENTAGE;
+use crate::a9::blockchain::{FEE_PERCENTAGE, MIN_RELAY_FEE_UNITS};
 use crate::a9::{
     blockchain::{
         Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
@@ -869,7 +869,9 @@ impl Mgmt {
         stdout.flush()?;
 
         let blockchain_guard = blockchain.read().await;
-        let fee = amount * FEE_PERCENTAGE;
+        // Percentage fee, floored at the relay-policy minimum so a small send
+        // can't produce a fee our own mempool floor would then reject.
+        let fee = (amount * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
         let total_cost = amount + fee;
         let sender_balance = blockchain_guard.get_wallet_balance(&sender_address).await?;
 
