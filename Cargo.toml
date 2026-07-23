@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric"
-version = "7.8.1"
+version = "7.8.2"
 edition = "2021"
 
 [dependencies]
@@ -39,9 +39,11 @@ zeroize = "1"
 # default binary stays lean (AV-false-positive surface) — release builds enable the feature.
 webrtc = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
-# webrtc's DTLS uses rustls 0.23, which needs a process-wide crypto provider installed explicitly.
-# Pin it to `ring` (the provider this codebase already links) to resolve the provider ambiguity.
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+# rustls 0.23 with the `ring` provider — used by BOTH the DTLS mesh and (since 7.8.2)
+# reqwest's HTTPS via `rustls-no-provider`. Non-optional: reqwest pulls it unconditionally
+# and main() installs the ring provider process-wide. Pinning ring (not aws-lc-rs) drops
+# the aws-lc-sys C build (cmake + NASM), so source builds need only Rust + a C compiler.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 inquire = "0.7.0"
 tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
@@ -61,7 +63,7 @@ serde_json = "1.0"
 async-trait = "0.1.74"
 sled = "0.34.0"
 env_logger = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 zip = "6"
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 axum = "0.6"
@@ -85,7 +87,7 @@ bootstrap_publisher = []
 # Reserved feature flag used by some libp2p/TCP-specific code paths.
 tcp = []
 # WebRTC DataChannel mesh: NAT'd miners hole-punch direct P2P links, signaled by the gateway.
-webrtc_mesh = ["dep:webrtc", "dep:bytes", "dep:rustls"]
+webrtc_mesh = ["dep:webrtc", "dep:bytes"]
 
 # NOTE:
 # Windows Defender ML detections are often triggered by small, stripped, unsigned binaries
