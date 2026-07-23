@@ -2466,6 +2466,16 @@ impl Node {
         if let Some(port) = stats_port {
             payload.insert("stats_port".to_string(), json!(port));
         }
+        // Unsigned advisory telemetry: the node's release version (CARGO_PKG_VERSION),
+        // so the gateway can show the network's per-release spread. Deliberately NOT in
+        // the signed `message` above — the gateway verifies over a fixed field list, so
+        // this extra field never affects signature verification, and it is NEVER the
+        // wire `version` field (that is the load-bearing NETWORK_VERSION handshake gate,
+        // node.rs ~8171). Self-reported and unsigned, which is fine for a version count.
+        payload.insert(
+            "release_version".to_string(),
+            json!(env!("CARGO_PKG_VERSION")),
+        );
         payload.insert(
             "signature".to_string(),
             json!(hex::encode(signature.as_ref())),

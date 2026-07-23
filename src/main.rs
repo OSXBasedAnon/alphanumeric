@@ -460,6 +460,12 @@ const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // Install the process-wide rustls crypto provider (ring) BEFORE any HTTPS. reqwest
+    // uses `rustls-no-provider` (7.8.2), so the first TLS handshake panics with "no
+    // process-level CryptoProvider available" unless a default is installed first. This
+    // is the same `ring` provider the DTLS mesh uses; install_default is idempotent, so
+    // the mesh's later call is a harmless no-op.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let app = std::thread::Builder::new()
         .name("alphanumeric-main".to_string())
         .stack_size(MAIN_THREAD_STACK_BYTES)
