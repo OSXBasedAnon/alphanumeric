@@ -1712,7 +1712,20 @@ impl Blockchain {
         // clear_processed_transactions removes tree rows (pending + signature
         // sidecar + pending-debit index) by tx_id — the same path block
         // confirmation uses, so hygiene cannot diverge from it.
-        let all: Vec<Transaction> = stale.into_iter().chain(tree_stale).collect();
+        //
+        // `stale` (in-memory) and `tree_stale` (sled) OVERLAP: add_transaction writes both the
+        // mempool and the pending tree, and sync_mempool_with_sled rebuilds the mempool FROM the
+        // tree, so a confirmed tx is normally present in both. clear_processed_transactions
+        // subtracts each tx's pending debit PER occurrence (saturating), so listing a tx twice
+        // would double-subtract and wipe the reservation still held by the sender's OTHER pending
+        // txs (a local over-admission bug — block validation still catches real overspends). Dedup
+        // by tx_id so every debit is cleared exactly once; tree/sidecar removal is idempotent.
+        let mut seen = HashSet::new();
+        let all: Vec<Transaction> = stale
+            .into_iter()
+            .chain(tree_stale)
+            .filter(|tx| seen.insert(tx.get_tx_id()))
+            .collect();
         let _ = self.clear_processed_transactions(&all).await;
         all.len()
     }
@@ -8566,6 +8579,54 @@ mod tests {
             .await
             .expect("mempool should load");
         assert_eq!(mempool.len(), 1);
+    }
+
+    // #5: a confirmed tx lives in BOTH the in-memory mempool and the sled pending tree
+    // (add_transaction writes both), so drop_confirmed_mempool_txs' stale+tree_stale union lists it
+    // twice. clear_processed_transactions subtracts the pending debit per occurrence, so without the
+    // tx_id dedup the double-subtract saturates the sender's reservation to 0 and wipes the debit
+    // still held by their OTHER pending tx. This asserts the surviving reservation.
+    #[tokio::test]
+    async fn drop_confirmed_dedups_debit_across_memory_and_sled() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        // Asymmetric amounts (delta_a < delta_b) so the pre-fix double-subtract lands on a specific
+        // non-saturated value (delta_b - delta_a), not merely the saturating floor of 0 — the debit
+        // assertion then pins "cleared exactly once" precisely.
+        let tx_a = signed_transfer(&wallet, "bob", 1.0, 20_001).await;
+        let tx_b = signed_transfer(&wallet, "carol", 2.0, 20_002).await;
+        let delta_a = tx_a.total_debit_units();
+        let delta_b = tx_b.total_debit_units();
+
+        // Fund both so both admit; pending_debit becomes delta_a + delta_b.
+        set_confirmed_balance(&bc, &wallet.address, delta_a + delta_b);
+        bc.add_transaction(tx_a.clone()).await.expect("tx_a admitted");
+        bc.add_transaction(tx_b.clone()).await.expect("tx_b admitted");
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            delta_a + delta_b,
+            "both pending txs reserve their debit"
+        );
+
+        // Mark ONLY tx_a confirmed (it is in both the mempool and the sled tree); tx_b stays pending.
+        let confirmed = bc.open_confirmed_tx_tree().expect("confirmed tx tree");
+        confirmed
+            .insert(tx_a.get_tx_id().as_bytes(), 0u32.to_le_bytes().to_vec())
+            .expect("mark tx_a confirmed");
+
+        let dropped = bc.drop_confirmed_mempool_txs().await;
+        assert_eq!(
+            dropped, 1,
+            "exactly one DISTINCT confirmed tx is dropped (the union is deduped, not double-counted)"
+        );
+
+        // tx_b's reservation must survive. Without the dedup tx_a's debit is subtracted twice, so
+        // pending_debit reads (delta_a + delta_b) - 2*delta_a = delta_b - delta_a (< delta_b) instead.
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            delta_b,
+            "only tx_a's debit is cleared; tx_b's reservation is preserved"
+        );
     }
 
     #[tokio::test]
