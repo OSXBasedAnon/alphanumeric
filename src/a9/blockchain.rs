@@ -4868,6 +4868,20 @@ impl Blockchain {
             }
         };
         let actual_hash = Transaction::signature_hash_hex(&sig_bytes);
+
+        // Bind the CLAIMED sig_hash to the actual signature BEFORE consulting the cache — on every
+        // call, warm or cold. sig_hash is merkle-committed, but the cache key covers only
+        // (tx_id, pub_key, actual_hash), NOT the claimed sig_hash. Left after the cache, a warm
+        // entry from a genuine tx would let a variant carrying the SAME signature but a FORGED
+        // sig_hash skip this check: a warm node accepts a block a cold node rejects — a frontier-
+        // path divergence, since block_signatures_fully_verified delegates here without its own
+        // sig_hash re-derivation. Running it first closes that gap at zero real cost (a hex compare).
+        if let Some(expected_hash) = &tx.sig_hash {
+            if &actual_hash != expected_hash {
+                return Err(BlockchainError::InvalidTransactionSignature);
+            }
+        }
+
         let cache_key = format!("{}:{}:{}", tx.get_tx_id(), pub_key, actual_hash);
 
         if let Some(true) = self.signature_cache.lock().get(&cache_key).copied() {
@@ -4886,12 +4900,6 @@ impl Blockchain {
         let derived_addr = hex::encode(&hasher.finalize()[..20]);
         if derived_addr != tx.sender {
             return Err(BlockchainError::InvalidTransactionSignature);
-        }
-
-        if let Some(expected_hash) = &tx.sig_hash {
-            if &actual_hash != expected_hash {
-                return Err(BlockchainError::InvalidTransactionSignature);
-            }
         }
 
         self.signature_cache.lock().put(cache_key, true);
@@ -7994,6 +8002,71 @@ mod tests {
         assert!(
             Blockchain::validate_parent_timestamp(&child, &parent).is_err(),
             "a child below its parent must be rejected (why the miner clamps)"
+        );
+    }
+
+    // P0 regression: a WARM signature_cache must not let a tx skip its sig_hash bind. sig_hash is
+    // merkle-committed, so a variant carrying the same signature but a forged sig_hash would
+    // otherwise be accepted by a warm node and rejected by a cold one (frontier-path divergence).
+    #[tokio::test]
+    async fn warm_signature_cache_does_not_skip_sig_hash_bind() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("wallet builds");
+        let ts = 1_700_000_000u64;
+
+        // Genuine tx with a correct (bound) sig_hash — verifying it WARMS the cache.
+        let mut genuine = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        let sig_bytes = hex::decode(genuine.signature.as_ref().unwrap()).unwrap();
+        genuine.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+        assert!(
+            bc.verify_transaction_signature(&genuine).is_ok(),
+            "the genuine tx must verify and warm the cache"
+        );
+
+        // Variant: identical core fields + pub_key + signature (so same tx_id + actual_hash ->
+        // COLLIDES with the warmed cache key) but a FORGED, merkle-committed sig_hash.
+        let mut forged = genuine.clone();
+        forged.sig_hash = Some("deadbeef".repeat(8)); // 64 hex chars, != SHA256(signature)
+
+        // PIN the warm-path precondition so the test can't silently rot: get_tx_id excludes
+        // sig_hash, so genuine and forged must share a tx_id, AND the genuine verify must have
+        // actually warmed the cache under the current key (forged looks up that same key). If a
+        // future cache-key redesign moves forged to the COLD path, these asserts fire loudly
+        // instead of the test passing while no longer exercising the warm-skip scenario.
+        assert_eq!(
+            genuine.get_tx_id(),
+            forged.get_tx_id(),
+            "genuine and forged must collide on tx_id to exercise the warm path"
+        );
+        let warmed_key = format!(
+            "{}:{}:{}",
+            genuine.get_tx_id(),
+            genuine.pub_key.as_ref().unwrap(),
+            Transaction::signature_hash_hex(&sig_bytes)
+        );
+        assert!(
+            bc.signature_cache.lock().get(&warmed_key).is_some(),
+            "the genuine verify must have warmed the cache under the key forged collides with"
+        );
+
+        // THE POINT: forged sig_hash rejected even though the cache is warm for the genuine tx.
+        assert!(
+            bc.verify_transaction_signature(&forged).is_err(),
+            "a forged sig_hash must be rejected even when the cache is warm for the genuine tx"
+        );
+
+        // Happy-path guard: the reorder must NOT false-reject a legit tx on a WARM cache.
+        assert!(
+            bc.verify_transaction_signature(&genuine).is_ok(),
+            "the genuine tx must still verify from a warm cache after the reorder"
+        );
+
+        // A tx with NO claimed sig_hash must still verify (the new `if let Some` guard skips None).
+        let mut no_hash = signed_transfer(&wallet, "recipient_addr_for_test", 11.0, ts).await;
+        no_hash.sig_hash = None;
+        assert!(
+            bc.verify_transaction_signature(&no_hash).is_ok(),
+            "a tx without a claimed sig_hash must still verify"
         );
     }
 
