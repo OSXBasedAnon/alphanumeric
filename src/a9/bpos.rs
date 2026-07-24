@@ -1923,7 +1923,6 @@ struct HeaderState {
 struct VerificationState {
     timestamp: u64,
     verifiers: HashSet<String>,
-    mldsa_signatures: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -2279,18 +2278,12 @@ impl HeaderSentinel {
                             VerificationState {
                                 timestamp: now,
                                 verifiers: HashSet::with_capacity(10),
-                                mldsa_signatures: HashMap::with_capacity(10),
                             }
                         });
 
                     // Add verification
                     if verification.verifiers.insert(node_id.to_string()) {
                         valid_count += 1;
-                    }
-                    if signature_valid {
-                        verification
-                            .mldsa_signatures
-                            .insert(node_id.to_string(), signature.clone());
                     }
 
                     header_states.push_back(HeaderState {
@@ -2504,7 +2497,6 @@ impl HeaderSentinel {
                     .or_insert_with(|| VerificationState {
                         timestamp: now,
                         verifiers: HashSet::new(),
-                        mldsa_signatures: HashMap::new(),
                     });
             state.verifiers.insert(local_verifier);
         }
@@ -2516,7 +2508,6 @@ impl HeaderSentinel {
                 .or_insert_with(|| VerificationState {
                     timestamp: now,
                     verifiers: HashSet::new(),
-                    mldsa_signatures: HashMap::new(),
                 })
                 .verifiers
                 .insert(node_id.clone());
@@ -2605,16 +2596,10 @@ impl HeaderSentinel {
                     .or_insert_with(|| VerificationState {
                         timestamp: now,
                         verifiers: HashSet::with_capacity(10),
-                        mldsa_signatures: HashMap::with_capacity(10),
                     });
 
             // Add verification atomically
             verification.verifiers.insert(node_id.to_string());
-            if signature_valid {
-                verification
-                    .mldsa_signatures
-                    .insert(node_id.to_string(), signature);
-            }
 
             (
                 verification.verifiers.len() as u32,
@@ -2855,7 +2840,6 @@ mod tests {
                 verifiers: ["n1".to_string(), "n2".to_string(), "n3".to_string()]
                     .into_iter()
                     .collect(),
-                mldsa_signatures: HashMap::new(),
             },
         );
 
@@ -2891,7 +2875,6 @@ mod tests {
                 verifiers: ["n1".to_string(), "n3a".to_string(), "n3b".to_string()]
                     .into_iter()
                     .collect(),
-                mldsa_signatures: HashMap::new(),
             },
         );
         assert!(
@@ -2907,7 +2890,6 @@ mod tests {
                 verifiers: ["n1".to_string(), "n2".to_string(), "n3a".to_string()]
                     .into_iter()
                     .collect(),
-                mldsa_signatures: HashMap::new(),
             },
         );
         assert!(
