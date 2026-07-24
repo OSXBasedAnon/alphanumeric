@@ -2155,7 +2155,11 @@ println!("Wallet renamed successfully");
                             break 'mining;
                         }
 
-                        let mining_manager = MiningManager::new(Arc::clone(&blockchain));
+                        let mining_manager = MiningManager::new(
+                            Arc::clone(&blockchain),
+                            shutdown_requested.clone(),
+                            stop_flag.clone(),
+                        );
                         let miner = Miner::new(blockchain.clone(), mining_manager);
                         match mgmt
                             .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc)
@@ -2257,6 +2261,15 @@ println!("Wallet renamed successfully");
                                 .await;
                             }
                             Err(e) => {
+                                // Ctrl-C / SIGTERM / Enter-to-stop: the grind now returns
+                                // MiningError::Cancelled promptly instead of hanging. Exit the
+                                // mining loop cleanly — not a fault; don't print an error or
+                                // count it toward the permanent-error stop.
+                                if shutdown_requested.load(Ordering::SeqCst)
+                                    || stop_flag.load(Ordering::SeqCst)
+                                {
+                                    break 'mining;
+                                }
                                 // LOST RACE, not a fault: we solved a height, but the
                                 // network's block for it arrived first and the background
                                 // sync adopted it, so finalization correctly rejects our

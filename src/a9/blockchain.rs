@@ -7616,8 +7616,16 @@ mod tests {
             merkle_root: [0u8; 32],
             difficulty: NETWORK_MIN_DIFFICULTY,
         };
-        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
-        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_a = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let mgr_b = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let (ha, hb) = (header(), header());
         let (ta, tb) = (vec![ptx.clone()], vec![ptx]);
 
@@ -7683,8 +7691,16 @@ mod tests {
         };
         let no_txs: Vec<ProgPowTransaction> = Vec::new();
 
-        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
-        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_a = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let mgr_b = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let (ha, hb) = (header(), header());
         let (txs_a, txs_b) = (no_txs.clone(), no_txs);
 

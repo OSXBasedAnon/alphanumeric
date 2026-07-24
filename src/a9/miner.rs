@@ -55,6 +55,8 @@ pub enum MiningError {
     InvalidHashFormat,
     #[error("Exceeded max nonce limit")]
     MaxNonceExceeded,
+    #[error("Mining cancelled")]
+    Cancelled,
 }
 
 impl From<Box<dyn std::error::Error>> for MiningError {
@@ -118,11 +120,25 @@ impl From<ProgPowTransaction> for Transaction {
 #[derive(Debug)]
 pub struct MiningManager {
     blockchain: Arc<RwLock<Blockchain>>,
+    // Cancellation signals polled by the nonce grind so mining stops PROMPTLY (mid-grind),
+    // not only between block attempts: `shutdown` = process SIGINT/SIGTERM (Ctrl-C), `stop` =
+    // the interactive Enter-to-stop flag. Without these the grind ignored both, so a `mine`
+    // command could not be interrupted until it happened to solve a block.
+    shutdown: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl MiningManager {
-    pub fn new(blockchain: Arc<RwLock<Blockchain>>) -> Self {
-        Self { blockchain }
+    pub fn new(
+        blockchain: Arc<RwLock<Blockchain>>,
+        shutdown: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            blockchain,
+            shutdown,
+            stop,
+        }
     }
 
     pub async fn mine_block(
@@ -209,6 +225,11 @@ impl MiningManager {
         };
 
         'mining: loop {
+            // Stop promptly on Ctrl-C / SIGTERM or Enter-to-stop BEFORE building another
+            // template — otherwise the command grinds template-after-template and never returns.
+            if self.shutdown.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
+                return Err(MiningError::Cancelled);
+            }
             let (
                 previous_difficulty,
                 previous_block_hash,
@@ -360,6 +381,8 @@ impl MiningManager {
                 let result_difficulty = Arc::clone(&result_difficulty);
                 let hash_result = Arc::clone(&hash_result);
                 let abort_for_tip_change_check = Arc::clone(&abort_for_tip_change);
+                let cancel_shutdown = Arc::clone(&self.shutdown);
+                let cancel_stop = Arc::clone(&self.stop);
                 let tip_change_counter_check = Arc::clone(&tip_change_counter);
                 let blockchain_for_tip_checks = Arc::clone(&self.blockchain);
                 let progress_bar = Arc::clone(&progress_bar);
@@ -391,6 +414,8 @@ impl MiningManager {
                             for nonce in start_nonce..end_nonce {
                                 if found.load(Ordering::Relaxed)
                                     || abort_for_tip_change_check.load(Ordering::Relaxed)
+                                    || cancel_shutdown.load(Ordering::Relaxed)
+                                    || cancel_stop.load(Ordering::Relaxed)
                                 {
                                     return Ok(());
                                 }
