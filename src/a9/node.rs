@@ -6963,7 +6963,13 @@ impl Node {
                     // mempool cleans up). Evict instead — this loop is exactly where
                     // stale entries would otherwise get a megaphone.
                     let _ = bc.drop_confirmed_mempool_txs().await;
-                    bc.get_pending_transactions().await.unwrap_or_default()
+                    // Re-announce the FULL-signature form: the persisted pending records carry a
+                    // truncated signature, and gossiping those makes peers defer the tx (they can't
+                    // verify it) — the truncated-witness pathology. This accessor reads the mempool's
+                    // full-signature copy (skipping any tx whose full signature is unavailable).
+                    bc.get_pending_transactions_with_full_signatures()
+                        .await
+                        .unwrap_or_default()
                 };
                 // Small cap: the mempool is tiny on this network, and a pathological
                 // backlog must not turn this loop into its own gossip storm.
