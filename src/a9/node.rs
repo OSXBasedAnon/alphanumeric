@@ -8458,16 +8458,15 @@ impl Node {
                 full_tx.pub_key = tx.pub_key.clone();
             }
 
-            if full_tx.sig_hash.is_none() {
-                if let Some(sig_hex) = &full_tx.signature {
-                    // A resolved witness whose signature is not valid hex cannot verify this block;
-                    // defer (Ok(false)) rather than propagate an error, keeping Phase 1 Err-free.
-                    let sig_bytes = match hex::decode(sig_hex) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return Ok(false),
-                    };
-                    full_tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
-                }
+            // Bind the resolved witness's sig_hash to its OWN signature locally, on every path — not
+            // only when sig_hash is absent. A witness can arrive with a pre-populated sig_hash (from
+            // a peer, the mempool, or the witness cache); trusting it and leaving the
+            // sig_hash<->signature check to verify_transaction_signature (Phase 2) would make this
+            // frontier path depend on that function's internal bind. Deriving here keeps the bind
+            // self-contained: a claimed sig_hash disagreeing with SHA256(signature) is defer-rejected
+            // (Ok(false), self-healing) before the witness is ever trusted or cached.
+            if !Self::bind_witness_sig_hash_to_signature(&mut full_tx) {
+                return Ok(false);
             }
 
             if let Some(expected_hash) = &tx.sig_hash {
@@ -8679,6 +8678,30 @@ impl Node {
             Ok(bytes) => bytes.len() <= 64,
             Err(_) => true,
         }
+    }
+
+    /// Bind a resolved witness's `sig_hash` to its own signature. Returns `false` (the witness
+    /// should be deferred with `Ok(false)`) when the signature hex is invalid or a pre-populated
+    /// `sig_hash` disagrees with `SHA256(signature)`; otherwise sets `sig_hash` to the derived value
+    /// and returns `true`. A missing signature is left untouched (a later check rejects it). Pure and
+    /// synchronous so the frontier-path bind is self-contained and unit-testable without a node.
+    fn bind_witness_sig_hash_to_signature(full_tx: &mut Transaction) -> bool {
+        if let Some(sig_hex) = &full_tx.signature {
+            let sig_bytes = match hex::decode(sig_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
+            let derived = Transaction::signature_hash_hex(&sig_bytes);
+            if full_tx
+                .sig_hash
+                .as_ref()
+                .map_or(false, |claimed| claimed != &derived)
+            {
+                return false;
+            }
+            full_tx.sig_hash = Some(derived);
+        }
+        true
     }
 
     // Witness resolution is bounded to the same transaction count validate_block permits, so it
@@ -11664,6 +11687,44 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3 witness-sidecar bind: a resolved witness's sig_hash is bound to its OWN signature locally,
+    // on every path — not only when sig_hash was absent. A pre-populated sig_hash that disagrees
+    // with SHA256(signature) is defer-rejected here (self-contained on this frontier path) instead
+    // of being trusted and left for verify_transaction_signature (Phase 2) to catch.
+    #[test]
+    fn bind_witness_sig_hash_matches_signature() {
+        let sig_hex = "abcd1234".to_string();
+        let derived = Transaction::signature_hash_hex(&hex::decode(&sig_hex).unwrap());
+
+        // (1) Absent sig_hash: derived from the signature and set.
+        let mut tx = Transaction::new("s".into(), "r".into(), 1.0, 0.0, 1, Some(sig_hex.clone()));
+        tx.sig_hash = None;
+        assert!(Node::bind_witness_sig_hash_to_signature(&mut tx));
+        assert_eq!(tx.sig_hash.as_deref(), Some(derived.as_str()));
+
+        // (2) Pre-populated and matching: accepted, unchanged.
+        let mut tx = Transaction::new("s".into(), "r".into(), 1.0, 0.0, 1, Some(sig_hex.clone()));
+        tx.sig_hash = Some(derived.clone());
+        assert!(Node::bind_witness_sig_hash_to_signature(&mut tx));
+        assert_eq!(tx.sig_hash.as_deref(), Some(derived.as_str()));
+
+        // (3) Pre-populated and MISMATCHING: defer-rejected by the new local guard. Without it this
+        // forged-sig_hash witness would be trusted here and only caught (post-P0) in Phase 2.
+        let mut tx = Transaction::new("s".into(), "r".into(), 1.0, 0.0, 1, Some(sig_hex.clone()));
+        tx.sig_hash = Some("deadbeef".repeat(8));
+        assert!(!Node::bind_witness_sig_hash_to_signature(&mut tx));
+
+        // (4) Invalid signature hex: defer-rejected.
+        let mut tx = Transaction::new("s".into(), "r".into(), 1.0, 0.0, 1, Some("zzzz".into()));
+        assert!(!Node::bind_witness_sig_hash_to_signature(&mut tx));
+
+        // (5) No signature: left untouched (a witness with no signature is rejected downstream).
+        let mut tx = Transaction::new("s".into(), "r".into(), 1.0, 0.0, 1, None);
+        tx.sig_hash = None;
+        assert!(Node::bind_witness_sig_hash_to_signature(&mut tx));
+        assert_eq!(tx.sig_hash, None);
+    }
 
     // Regression: a dropped Node clone must NOT unlink the shared identity lock file while other
     // clones (and the running node) are alive — only the LAST owner may. Before IdentityLock,
