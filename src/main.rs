@@ -513,11 +513,13 @@ async fn async_main() -> Result<()> {
     config.log_config();
     let headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
 
+    // Boot step bar. NOTE: never print! around a live bar — route one-off status
+    // lines through boot_note()/pb.println() so they land ABOVE the bar instead of
+    // baking a stale copy of it into the scrollback (the pre-7.8.2 artifact).
+    let boot_style = ProgressStyle::with_template("{spinner:.green} [{bar:40.cyan/blue}] {msg}")?
+        .progress_chars("█▓░");
     let pb = ProgressBar::new(7);
-    pb.set_style(
-        ProgressStyle::with_template("\r{spinner:.green} [{bar:40.cyan/blue}] {msg}")?
-            .progress_chars("█▓░"),
-    );
+    pb.set_style(boot_style.clone());
 
     // Resolve relative DB paths robustly:
     // - Prefer any path that already contains block data.
@@ -579,7 +581,7 @@ async fn async_main() -> Result<()> {
             .unwrap_or(false);
         let mut peer_bootstrap_mode = false;
         if create_launch_genesis && !has_local_block_data(&db_path) {
-            println!("Bootstrap skipped: creating deterministic launch genesis");
+            boot_note(Some(&pb), "creating deterministic launch genesis".to_string());
         } else if !has_local_block_data(&db_path) {
             // Fresh node (no local blocks): the gateway snapshot is the primary bootstrap.
             // If it is unavailable (Upstash / gateway outage) AND a seed peer is configured,
@@ -587,12 +589,15 @@ async fn async_main() -> Result<()> {
             // reconstruct the chain from the seed peer over P2P GetBlocks (Tier-2 fallback; the
             // reconcile loop's peer full-history sync does the pull, with the SAME validation).
             // With no seed peer, fail closed exactly as before.
-            match ensure_bootstrap_db(&db_path).await {
+            match ensure_bootstrap_db(&db_path, Some(pb.clone())).await {
                 Ok(()) => {}
                 Err(e) if seed_peer_configured => {
-                    println!(
-                        "Bootstrap snapshot unavailable ({}); will reconstruct the chain from a seed peer over P2P",
-                        e
+                    boot_note(
+                        Some(&pb),
+                        format!(
+                            "snapshot unavailable ({}); reconstructing the chain from a seed peer over P2P",
+                            e
+                        ),
                     );
                     peer_bootstrap_mode = true;
                 }
@@ -600,8 +605,19 @@ async fn async_main() -> Result<()> {
             }
         } else {
             // Existing local chain: reconcile it against the signed manifest as before.
-            ensure_bootstrap_db(&db_path).await?;
+            ensure_bootstrap_db(&db_path, Some(pb.clone())).await?;
         }
+        // The bootstrap phase retires the step bar when it runs a download (the
+        // download/extract bars own the screen); re-create it for the remaining
+        // steps so the boot flow keeps one clean live line.
+        let pb = if pb.is_finished() {
+            let npb = ProgressBar::new(7);
+            npb.set_style(boot_style.clone());
+            npb.set_position(1);
+            npb
+        } else {
+            pb
+        };
         pb.set_message("Initializing database...");
         let db = match sled::Config::new()
             .path(&db_path)
@@ -3796,7 +3812,31 @@ async fn load_or_create_node_identity_key(path: &str) -> Result<Vec<u8>> {
     Ok(key_pair_pkcs8.as_ref().to_vec())
 }
 
-async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
+/// Route a one-off boot status line ABOVE a live progress bar so it never bakes a
+/// stale bar copy into the scrollback; falls back to a plain println when no bar
+/// is visible (headless / non-tty — where pb.println would be swallowed).
+fn boot_note(status: Option<&ProgressBar>, line: String) {
+    let line = format!("  {}", line);
+    match status {
+        Some(pb) if !pb.is_finished() && !pb.is_hidden() => pb.println(line),
+        _ => println!("{}", line),
+    }
+}
+
+/// 4751 -> "4,751" for boot-status messages.
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
     // Whether this run was demanded by the runtime divergence marker — captured
     // before the decision (remove_local_db deletes the marker with the dir), so
@@ -3876,10 +3916,11 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                 };
                 match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor, boot_local_tip) {
                     CanonicalReconcile::InSyncOrUnknown => {
-                        println!(
-                            "Bootstrap skipped: launch network DB is on the canonical chain at {}",
-                            db_path
+                        boot_note(
+                            status.as_ref(),
+                            "local chain is on the canonical network".to_string(),
                         );
+                        log::info!("bootstrap skipped: canonical DB at {}", db_path);
                         return Ok(());
                     }
                     CanonicalReconcile::Diverged {
@@ -3887,8 +3928,23 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
                         canonical_height,
                         canonical_hash,
                     } => {
-                        println!(
-                            "Local chain is not canonical (canonical tip {}={}…, local had {}); re-bootstrapping to the canonical chain",
+                        // Short human line up front (the old hash-dump wrapped
+                        // mid-word under the boot bar); full detail to the log.
+                        let behind = boot_local_tip
+                            .map(|tip| canonical_height.saturating_sub(u64::from(tip)))
+                            .unwrap_or(0);
+                        let reason = if behind > 0 {
+                            format!(
+                                "local chain is {} blocks behind the network — downloading the current snapshot",
+                                fmt_thousands(behind)
+                            )
+                        } else {
+                            "local chain diverged from the network — restoring the canonical chain"
+                                .to_string()
+                        };
+                        boot_note(status.as_ref(), reason);
+                        log::info!(
+                            "re-bootstrap: canonical tip {}={}…, local had {}",
                             canonical_height,
                             &canonical_hash[..canonical_hash.len().min(16)],
                             local
@@ -3899,20 +3955,26 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
             }
             LaunchDbStatus::Missing | LaunchDbStatus::Empty => {}
             LaunchDbStatus::WrongGenesis(actual) => {
-                println!(
-                    "Replacing local DB at {}: wrong genesis {}",
-                    db_path, actual
+                boot_note(
+                    status.as_ref(),
+                    format!("replacing local database (wrong genesis {})", actual),
                 );
                 remove_local_db(db_path).await?;
             }
             LaunchDbStatus::Unreadable(err) => {
-                println!("Replacing local DB at {}: {}", db_path, err);
+                boot_note(
+                    status.as_ref(),
+                    format!("replacing local database ({})", err),
+                );
                 remove_local_db(db_path).await?;
             }
         }
     }
     if force_bootstrap {
-        println!("Forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)");
+        boot_note(
+            status.as_ref(),
+            "forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)".to_string(),
+        );
         remove_local_db(db_path).await?;
     }
 
@@ -4004,9 +4066,15 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         )?;
     }
 
+    // Retire the boot step bar before the download bar takes the line — two live
+    // bars clobber each other, and a baked stale copy of the step bar was the
+    // pre-7.8.2 boot artifact. The caller re-creates the step bar afterwards.
+    if let Some(pbb) = status.as_ref() {
+        pbb.finish_and_clear();
+    }
+
     // REAL download progress: the snapshot is hundreds of MB, and a silent wait reads
-    // as a hang. Interactive runs get a live bytes/total + speed + ETA bar (the boot
-    // step bar has no steady tick, so it does not redraw underneath this); headless
+    // as a hang. Interactive runs get a live bytes/total + speed + ETA bar; headless
     // runs log a line at each 10% so service logs show life. Total comes from the
     // signed manifest, falling back to the response's content length.
     let dl_total = expected_compressed_bytes.or(res.content_length());
