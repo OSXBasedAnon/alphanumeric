@@ -4882,7 +4882,13 @@ impl Blockchain {
             }
         }
 
-        let cache_key = format!("{}:{}:{}", tx.get_tx_id(), pub_key, actual_hash);
+        // Digest the pub_key into the cache key rather than embedding the full ML-DSA hex (~4-5 KB
+        // per entry). SHA256 is collision-resistant, so distinct pub_keys can't share a digest: the
+        // key still binds (tx_id, pub_key, actual_hash) exactly — a same-signature but
+        // different-claimed-pub_key tx still misses the warm entry — at ~64 bytes instead of ~5 KB.
+        // At the 50k default capacity this drops the cache from hundreds of MiB to ~10 MiB.
+        let pub_key_digest = Transaction::signature_hash_hex(pub_key.as_bytes());
+        let cache_key = format!("{}:{}:{}", tx.get_tx_id(), pub_key_digest, actual_hash);
 
         if let Some(true) = self.signature_cache.lock().get(&cache_key).copied() {
             return Ok(());
@@ -7990,7 +7996,7 @@ mod tests {
         let warmed_key = format!(
             "{}:{}:{}",
             genuine.get_tx_id(),
-            genuine.pub_key.as_ref().unwrap(),
+            Transaction::signature_hash_hex(genuine.pub_key.as_ref().unwrap().as_bytes()),
             Transaction::signature_hash_hex(&sig_bytes)
         );
         assert!(
