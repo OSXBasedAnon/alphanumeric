@@ -338,7 +338,7 @@ impl Mempool {
         // guard before touching any other map. Holding a DashMap RefMut across a
         // lock acquisition on another shard/map risks a deadlock, and it previously
         // wedged the whole node during block finalization (mempool eviction).
-        let (removed, removed_size) = {
+        let (removed, removed_size, became_empty) = {
             let Some(mut addr_txs) = self.transactions.get_mut(&tx.sender) else {
                 return;
             };
@@ -352,11 +352,19 @@ impl Mempool {
                 }
                 keep
             });
-            (removed, removed_size)
+            (removed, removed_size, addr_txs.is_empty())
         };
 
         if removed == 0 {
             return;
+        }
+        // Reclaim the now-empty sender bucket so `transactions` never grows with
+        // distinct-senders-EVER — its keys are walked on every template build
+        // (get_transactions_for_block). The get_mut guard was dropped above; remove_if
+        // re-checks emptiness atomically, so it can never delete a live bucket. Mirrors
+        // decrement_address_count's decide-under-guard -> drop-guard -> remove pattern.
+        if became_empty {
+            self.transactions.remove_if(&tx.sender, |_, v| v.is_empty());
         }
         self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
         self.total_size.fetch_sub(removed_size, AtomicOrdering::SeqCst);
@@ -417,7 +425,7 @@ impl Mempool {
             // Compute removals under the transactions guard, then DROP it before
             // touching address_counts (never hold two DashMap guards; never remove a
             // key on a DashMap whose RefMut is alive — that deadlocks the node).
-            let removed_here = if let Some(mut txs) = self.transactions.get_mut(&addr) {
+            let (removed_here, became_empty) = if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let mut removed_here = 0usize;
                 let mut removed_size = 0usize;
                 txs.retain(|entry| {
@@ -434,10 +442,14 @@ impl Mempool {
                     self.total_size
                         .fetch_sub(removed_size, AtomicOrdering::SeqCst);
                 }
-                removed_here
+                (removed_here, txs.is_empty())
             } else {
-                0
+                (0, false)
             };
+            // Guard dropped above; reclaim the now-empty bucket (see clear_transaction).
+            if became_empty {
+                self.transactions.remove_if(&addr, |_, v| v.is_empty());
+            }
             if removed_here > 0 {
                 removed += removed_here;
                 self.decrement_address_count(&addr, removed_here);
@@ -519,7 +531,7 @@ impl Mempool {
             // Compute removals under the transactions guard, then DROP it before
             // touching address_counts (never hold two DashMap guards; never remove a
             // key on a DashMap whose RefMut is alive — that deadlocks the node).
-            let removed_here = if let Some(mut txs) = self.transactions.get_mut(&addr) {
+            let (removed_here, became_empty) = if let Some(mut txs) = self.transactions.get_mut(&addr) {
                 let mut removed_here = 0usize;
                 let mut removed_size = 0usize;
                 txs.retain(|entry| {
@@ -536,10 +548,14 @@ impl Mempool {
                     self.total_count
                         .fetch_sub(removed_here, AtomicOrdering::SeqCst);
                 }
-                removed_here
+                (removed_here, txs.is_empty())
             } else {
-                0
+                (0, false)
             };
+            // Guard dropped above; reclaim the now-empty bucket (see clear_transaction).
+            if became_empty {
+                self.transactions.remove_if(&addr, |_, v| v.is_empty());
+            }
             if removed_here > 0 {
                 self.decrement_address_count(&addr, removed_here);
             }
@@ -672,6 +688,165 @@ mod tests {
             "M2 regression: higher-fee resident evicted by a cheaper tx"
         );
         assert!(mp.find_transaction_by_id(&low_id).is_none());
+    }
+
+    // Empty-bucket reclaim: removing a sender's LAST tx must drop its `transactions` key, so the
+    // map never accumulates empty buckets for distinct-senders-ever (walked every template build).
+    // (1) CONFIRMED path — clear_transaction.
+    #[test]
+    fn clear_transaction_reclaims_empty_sender_bucket() {
+        let mut mp = Mempool::new();
+        mp.add_transaction(tx_with("senderA", 1, 1.0, 0.001))
+            .expect("admit A1");
+        mp.add_transaction(tx_with("senderA", 2, 1.0, 0.001))
+            .expect("admit A2");
+        mp.add_transaction(tx_with("senderB", 3, 1.0, 0.001))
+            .expect("admit B1");
+        assert!(mp.transactions.contains_key("senderA"));
+
+        // Remove A's first tx: bucket kept (A still has one).
+        mp.clear_transaction(&tx_with("senderA", 1, 1.0, 0.001));
+        assert!(
+            mp.transactions.contains_key("senderA"),
+            "bucket must remain while A still holds a tx"
+        );
+        // Remove A's last tx: empty bucket must be reclaimed; B's bucket untouched.
+        mp.clear_transaction(&tx_with("senderA", 2, 1.0, 0.001));
+        assert!(
+            !mp.transactions.contains_key("senderA"),
+            "an emptied sender bucket must be reclaimed"
+        );
+        assert!(
+            mp.transactions.contains_key("senderB"),
+            "a non-empty sender bucket must remain"
+        );
+    }
+
+    // (2) EXPIRED path — prune_expired (default mempool TTL is 600s).
+    #[test]
+    fn prune_expired_reclaims_empty_sender_bucket() {
+        let mut mp = Mempool::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        mp.add_transaction(tx_with("stale_sender", 1, 1.0, 0.001))
+            .expect("admit stale tx");
+        mp.add_transaction(tx_with("fresh_sender", 2, 1.0, 0.001))
+            .expect("admit fresh tx");
+        assert!(mp.transactions.contains_key("stale_sender"));
+
+        // Mempool TTL keys on ARRIVAL time (MempoolEntry.timestamp), not the signed tx ts.
+        // Backdate the stale sender's entry past the 600s default TTL so prune_expired evicts it.
+        {
+            let mut bucket = mp.transactions.get_mut("stale_sender").unwrap();
+            for e in bucket.iter_mut() {
+                e.timestamp = now.saturating_sub(700);
+            }
+        } // drop the guard before prune_expired iterates the map
+
+        let pruned = mp.prune_expired();
+        assert_eq!(pruned, 1, "only the stale tx should be pruned");
+        assert!(
+            !mp.transactions.contains_key("stale_sender"),
+            "the emptied stale-sender bucket must be reclaimed"
+        );
+        assert!(
+            mp.transactions.contains_key("fresh_sender"),
+            "the fresh sender's bucket must remain"
+        );
+    }
+
+    // (3) EVICTED path — a high-fee incoming displaces a low-fee resident when the pool is full.
+    #[test]
+    fn eviction_reclaims_empty_sender_bucket() {
+        let mut mp = Mempool::new();
+        mp.add_transaction(tx_with("poor_sender", 1, 1.0, 0.001))
+            .expect("admit low-fee resident");
+        assert!(mp.transactions.contains_key("poor_sender"));
+
+        // Simulate a globally-full pool so the incoming high-fee tx triggers eviction.
+        mp.total_count
+            .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
+        mp.add_transaction(tx_with("rich_sender", 2, 1.0, 100.0))
+            .expect("high-fee tx admitted by displacing the low-fee resident");
+
+        assert!(
+            !mp.transactions.contains_key("poor_sender"),
+            "the evicted sender's emptied bucket must be reclaimed"
+        );
+        assert!(
+            mp.transactions.contains_key("rich_sender"),
+            "the admitted high-fee sender must have a bucket"
+        );
+    }
+
+    // became_empty==FALSE control for the EVICTION path: evicting SOME (not all) of a sender's txs
+    // must KEEP the bucket and the survivor. Guards against a regression to an unconditional
+    // remove (which would evaporate the still-populated bucket and silently drop the survivor).
+    #[test]
+    fn eviction_keeps_bucket_on_partial_removal() {
+        let mut mp = Mempool::new();
+        // One sender with a high-fee survivor and a low-fee victim.
+        let survivor = tx_with("mixed_sender", 1, 1.0, 1.0);
+        let survivor_id = survivor.get_tx_id();
+        mp.add_transaction(survivor).expect("admit survivor");
+        mp.add_transaction(tx_with("mixed_sender", 2, 1.0, 0.001))
+            .expect("admit low-fee victim");
+
+        // Full pool: one incoming high-fee tx frees exactly one slot -> only the cheapest tx
+        // (mixed_sender's 0.001) is evicted; the 1.0-fee survivor stays.
+        mp.total_count
+            .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
+        mp.add_transaction(tx_with("rich_sender", 3, 1.0, 100.0))
+            .expect("high-fee tx admitted");
+
+        assert!(
+            mp.transactions.contains_key("mixed_sender"),
+            "a partially-evicted sender's bucket must be KEPT (became_empty==false)"
+        );
+        assert!(
+            mp.find_transaction_by_id(&survivor_id).is_some(),
+            "the higher-fee survivor must remain in the pool"
+        );
+    }
+
+    // became_empty==FALSE control for the EXPIRY path: expiring one of a sender's two txs keeps
+    // the bucket and the fresh survivor.
+    #[test]
+    fn prune_expired_keeps_bucket_on_partial_removal() {
+        let mut mp = Mempool::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let survivor = tx_with("mixed_sender", 1, 1.0, 0.001);
+        let survivor_id = survivor.get_tx_id();
+        let victim_id = tx_with("mixed_sender", 2, 1.0, 0.001).get_tx_id();
+        mp.add_transaction(survivor).expect("admit survivor");
+        mp.add_transaction(tx_with("mixed_sender", 2, 1.0, 0.001))
+            .expect("admit victim");
+
+        // Backdate ONLY the victim's arrival timestamp past the 600s TTL.
+        {
+            let mut bucket = mp.transactions.get_mut("mixed_sender").unwrap();
+            for e in bucket.iter_mut() {
+                if e.tx_id == victim_id {
+                    e.timestamp = now.saturating_sub(700);
+                }
+            }
+        }
+
+        let pruned = mp.prune_expired();
+        assert_eq!(pruned, 1, "only the backdated victim should be pruned");
+        assert!(
+            mp.transactions.contains_key("mixed_sender"),
+            "a partially-expired sender's bucket must be KEPT (became_empty==false)"
+        );
+        assert!(
+            mp.find_transaction_by_id(&survivor_id).is_some(),
+            "the fresh survivor must remain in the pool"
+        );
     }
 
     // M2 (positive): a high-fee incoming tx DOES displace a strictly-cheaper resident.
