@@ -8074,6 +8074,46 @@ mod tests {
         );
     }
 
+    // Consensus property behind the miner's parent-timestamp clamp (miner::candidate_timestamp):
+    // a child clamped UP to a future-dated parent is valid under the UNCHANGED rules, so old and
+    // new binaries agree on it. Proves (a) the validator's difficulty (adjust_dynamic_difficulty)
+    // equals the miner's (consensus_next_difficulty) for the clamped delta=0 — they must, since the
+    // former delegates to the latter — and (b) validate_parent_timestamp accepts child==parent but
+    // still rejects the pre-clamp child<parent (the wasted-grind bug the clamp removes).
+    #[test]
+    fn clamped_child_is_consensus_valid_against_future_dated_parent() {
+        for parent_diff in [NETWORK_MIN_DIFFICULTY, 500, 10_000, MAX_NETWORK_DIFFICULTY] {
+            assert_eq!(
+                Block::adjust_dynamic_difficulty(
+                    parent_diff,
+                    0, // clamped delta: now < parent -> timestamp == parent -> diff input 0
+                    9,
+                    &mut DifficultyOracle::new(),
+                    1_000_000,
+                ),
+                Block::consensus_next_difficulty(parent_diff, 0, 9),
+                "validator and miner difficulty must agree for the clamped delta=0"
+            );
+        }
+
+        let mut parent = metadata_test_block(5, [0u8; 32], "miner", 1.0);
+        parent.timestamp = 2_000_000; // future-dated but valid parent
+        let mut child = metadata_test_block(6, parent.hash, "miner", 1.0);
+
+        // Clamped child (== parent): the exact block a behind-clock miner now produces — accepted.
+        child.timestamp = parent.timestamp;
+        assert!(
+            Blockchain::validate_parent_timestamp(&child, &parent).is_ok(),
+            "a child clamped to == its parent must be accepted (equal timestamps are valid)"
+        );
+        // Pre-clamp child (< parent): still rejected — this is the wasted-grind the clamp avoids.
+        child.timestamp = parent.timestamp - 1;
+        assert!(
+            Blockchain::validate_parent_timestamp(&child, &parent).is_err(),
+            "a child below its parent must be rejected (why the miner clamps)"
+        );
+    }
+
     #[test]
     fn work_units_follow_pow_target_scaling() {
         assert_eq!(
