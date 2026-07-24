@@ -1364,30 +1364,20 @@ impl BPoSSentinel {
     }
 
     async fn verify_block_at_height(&self, height: u32) -> Result<bool, String> {
-        const BATCH_SIZE: usize = 50;
-
-        // Collect the target + context blocks (owned) and drop the read guard BEFORE the batch
-        // await, so no blockchain lock is held across verification.
-        let blocks_to_verify = {
+        // Snapshot ONLY the target block (owned) and drop the read guard BEFORE the batch await, so
+        // no blockchain lock is held across verification. verify_block_batch validates each block
+        // INDEPENDENTLY (per-block sanity; no cross-block/continuity check), so the target's verdict
+        // never depended on its neighbours: the former "target + 49 context blocks" batch discarded
+        // results[1..] entirely. Because verify_chain_state calls this for a whole range of heights,
+        // collecting the context re-read and re-verified the same heavily-overlapping blocks up to
+        // BATCH_SIZE (50) times per sweep — dropping it cuts ~50x the block reads, verification, and
+        // read-lock hold time with an identical result.
+        let target_block = {
             let blockchain = self.blockchain.read().await;
-            let mut blocks_to_verify = Vec::with_capacity(BATCH_SIZE);
-
-            let target_block = blockchain.get_block(height)?;
-            blocks_to_verify.push(target_block.clone());
-
-            let context_start = height.saturating_sub((BATCH_SIZE - 1) as u32);
-            for h in context_start..height {
-                if let Ok(block) = blockchain.get_block(h) {
-                    blocks_to_verify.push(block);
-                }
-            }
-            blocks_to_verify
+            blockchain.get_block(height)?
         };
 
-        // Run batch verification
-        let results = self.verify_block_batch(&blocks_to_verify).await?;
-
-        // Target block is first in the batch
+        let results = self.verify_block_batch(&[target_block]).await?;
         Ok(results[0])
     }
 
@@ -1398,48 +1388,32 @@ impl BPoSSentinel {
         // Acquiring a read guard while a caller already holds one risks a reentrant self-deadlock on
         // the write-preferring RwLock (a writer queued between the two reads parks the second read).
 
-        // Convert blocks to validation tasks
-        let validation_tasks: Vec<_> = blocks
+        // Each block's verdict is independent of the others (per-block sanity only), so this is a
+        // plain parallel map over the slice.
+        let results: Vec<bool> = blocks
             .into_par_iter()
-            .map(|block| {
-                // Phase 1: Basic validation (can run in parallel)
-                let basic_valid = {
-                    // For confirmed blocks in the chain, skip detailed validation
-                    // These blocks have already been validated when they were mined and accepted
-                    // BPoS anomaly detection should focus on network-level attacks, not re-validation
-
-                    // Basic sanity checks only
-                    if block.transactions.is_empty() && block.index > 0 {
-                        // Empty non-genesis blocks are suspicious
-                        return false;
-                    }
-
-                    // Check for obviously invalid data (negative values, etc.)
-                    for tx in &block.transactions {
-                        if tx.amount_units < 0 || tx.fee_units < 0 {
-                            return false;
-                        }
-                    }
-
-                    true
-                };
-
-                if !basic_valid {
-                    return false;
-                }
-
-                // Return validation result
-                basic_valid
-            })
-            .collect();
-
-        // Run all validations in parallel
-        let results: Vec<bool> = validation_tasks
-            .into_par_iter()
-            .map(|valid| valid)
+            .map(|block| Self::block_passes_basic_checks(block))
             .collect();
 
         Ok(results)
+    }
+
+    /// Per-block sanity for BPoS anomaly detection over ALREADY-CONFIRMED blocks (full validation
+    /// ran at mine time; this focuses on network-level anomalies, not re-validation). Depends on the
+    /// single block ONLY — no cross-block/continuity check — which is exactly why
+    /// verify_block_at_height can verify the target block alone without collecting its neighbours.
+    fn block_passes_basic_checks(block: &Block) -> bool {
+        // Empty non-genesis blocks are suspicious.
+        if block.transactions.is_empty() && block.index > 0 {
+            return false;
+        }
+        // Obviously invalid data (negative amounts / fees).
+        for tx in &block.transactions {
+            if tx.amount_units < 0 || tx.fee_units < 0 {
+                return false;
+            }
+        }
+        true
     }
 
     async fn verify_block_integrity(&self, block: &Block) -> Result<bool, String> {
@@ -2760,6 +2734,63 @@ mod tests {
             source_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, ip_octet)),
             last_seen: 0,
         }
+    }
+
+    fn tx_with(amount_units: i128, fee_units: i128) -> Transaction {
+        Transaction {
+            sender: "s".to_string(),
+            recipient: "r".to_string(),
+            fee_units,
+            amount_units,
+            timestamp: 0,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    fn block_with(index: u32, transactions: Vec<Transaction>) -> Block {
+        Block {
+            index,
+            previous_hash: [0u8; 32],
+            timestamp: 0,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        }
+    }
+
+    // #7: BPoS block verification is PER-BLOCK — block_passes_basic_checks looks at one block only,
+    // never its neighbours — which is exactly what lets verify_block_at_height verify the target
+    // block alone (its former 49-block context batch had every result but [0] discarded).
+    #[test]
+    fn block_basic_checks_are_per_block_independent() {
+        // A non-genesis block with a valid tx passes.
+        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, 1)]
+        )));
+        // Genesis (index 0) is allowed to be empty.
+        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(0, vec![])));
+        // An empty NON-genesis block is rejected.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(5, vec![])));
+        // Negative amount or fee is rejected.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(-1, 0)]
+        )));
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, -1)]
+        )));
+        // One bad tx fails the block regardless of sibling txs — the verdict is a function of this
+        // block alone, so no neighbouring-block context can change it.
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![tx_with(10, 1), tx_with(-1, 0)]
+        )));
     }
 
     #[test]
