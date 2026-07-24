@@ -4064,6 +4064,44 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         )?;
     }
 
+    // REAL download progress: the snapshot is hundreds of MB, and a silent wait reads
+    // as a hang. Interactive runs get a live bytes/total + speed + ETA bar (the boot
+    // step bar has no steady tick, so it does not redraw underneath this); headless
+    // runs log a line at each 10% so service logs show life. Total comes from the
+    // signed manifest, falling back to the response's content length.
+    let dl_total = expected_compressed_bytes.or(res.content_length());
+    let dl_headless = env_flag_enabled("ALPHANUMERIC_HEADLESS");
+    let dl_pb = if dl_headless {
+        None
+    } else {
+        let bar = match dl_total {
+            Some(t) if t > 0 => {
+                let b = ProgressBar::new(t);
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.green} downloading snapshot [{bar:32.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
+                    )
+                    .unwrap_or_else(|_| ProgressStyle::default_bar())
+                    .progress_chars("█▓░"),
+                );
+                b
+            }
+            _ => {
+                let b = ProgressBar::new_spinner();
+                b.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.green} downloading snapshot {bytes} ({bytes_per_sec})",
+                    )
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+                );
+                b
+            }
+        };
+        bar.enable_steady_tick(std::time::Duration::from_millis(120));
+        Some(bar)
+    };
+    let mut dl_last_decile = 0u64;
+
     let mut zip_file = fs::File::create(&zip_path)
         .await
         .map_err(|e| format!("Bootstrap zip write failed at {}: {}", zip_path, e))?;
@@ -4084,6 +4122,20 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
             fallback_zip_limit,
             "downloaded body",
         )?;
+        if let Some(b) = dl_pb.as_ref() {
+            b.set_position(downloaded_size);
+        } else if let Some(total) = dl_total.filter(|t| *t > 0) {
+            let decile = downloaded_size.saturating_mul(10) / total;
+            if decile > dl_last_decile {
+                dl_last_decile = decile;
+                log::info!(
+                    "Bootstrap download {}% ({} / {} MB)",
+                    decile.saturating_mul(10),
+                    downloaded_size / 1_048_576,
+                    total / 1_048_576
+                );
+            }
+        }
         hasher.update(&chunk);
         zip_file
             .write_all(&chunk)
@@ -4095,6 +4147,18 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         .await
         .map_err(|e| format!("Bootstrap zip flush failed at {}: {}", zip_path, e))?;
     drop(zip_file);
+    if let Some(b) = dl_pb.as_ref() {
+        b.finish_and_clear();
+        println!(
+            "  snapshot downloaded ({} MB) — verifying and extracting ...",
+            downloaded_size / 1_048_576
+        );
+    } else {
+        log::info!(
+            "Bootstrap download complete ({} MB); verifying and extracting",
+            downloaded_size / 1_048_576
+        );
+    }
 
     ensure_bootstrap_download_complete(
         downloaded_size,
@@ -4142,14 +4206,36 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
         unverified_extract_limit: (!verified_manifest)
             .then(unverified_bootstrap_extract_limit_bytes),
     };
+    // Per-file extract progress (interactive only). ProgressBar is thread-safe, so
+    // the blocking extraction ticks the same bar; the true length is set once the
+    // archive is opened inside the closure.
+    let extract_pb = (!dl_headless).then(|| {
+        let b = ProgressBar::new(expected_file_count.unwrap_or(0).max(1));
+        b.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.green} extracting snapshot [{bar:32.cyan/blue}] {pos}/{len} files",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("█▓░"),
+        );
+        b.enable_steady_tick(std::time::Duration::from_millis(120));
+        b
+    });
+    let extract_pb_worker = extract_pb.clone();
     let extract_result = tokio::task::spawn_blocking(
         move || -> std::result::Result<BootstrapArchiveStats, String> {
             let file = std::fs::File::open(&zip_path_clone).map_err(|e| e.to_string())?;
             let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+            if let Some(b) = extract_pb_worker.as_ref() {
+                b.set_length(archive.len() as u64);
+            }
             std::fs::create_dir_all(&extract_path).map_err(|e| e.to_string())?;
             let base_dir = std::fs::canonicalize(&extract_path).map_err(|e| e.to_string())?;
             let mut stats = BootstrapArchiveStats::default();
             for i in 0..archive.len() {
+                if let Some(b) = extract_pb_worker.as_ref() {
+                    b.set_position(i as u64);
+                }
                 let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
                 let entry_name = file.name();
                 let relative = std::path::Path::new(entry_name);
@@ -4208,6 +4294,9 @@ async fn ensure_bootstrap_db(db_path: &str) -> Result<()> {
     )
     .await
     .map_err(|e| e.to_string())?;
+    if let Some(b) = extract_pb.as_ref() {
+        b.finish_and_clear();
+    }
 
     if let Err(e) = extract_result {
         let _ = std::fs::remove_dir_all(&temp_extract_path);
