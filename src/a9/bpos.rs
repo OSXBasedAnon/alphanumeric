@@ -29,6 +29,10 @@ pub enum ActionType {
 // Performance and reward constants
 const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
 const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
+// Upper bound on headers accepted in one HeaderSync batch. The broadcaster sends at most 100
+// headers per push (its ranged window), so this leaves 10x headroom while bounding the work an
+// attacker can force in one message; the 4 MiB wire frame alone would otherwise admit ~55k.
+const MAX_HEADER_SYNC_BATCH: usize = 1000;
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
 const MLDSA_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_MLDSA87_BIND_V2";
 
@@ -2167,6 +2171,16 @@ impl HeaderSentinel {
         node_id: &str,
         signature: Vec<u8>,
     ) -> Result<usize, String> {
+        // Bound the attacker-influenced batch BEFORE any O(n) work (serialize, existing-header map,
+        // chunk loop). A legitimate broadcaster sends at most 100 headers per push, so a batch far
+        // over the cap is abusive; reject it up front rather than let the 4 MiB frame admit ~55k.
+        if headers.len() > MAX_HEADER_SYNC_BATCH {
+            return Err(format!(
+                "Header batch too large: {} > {}",
+                headers.len(),
+                MAX_HEADER_SYNC_BATCH
+            ));
+        }
         let mut valid_count = 0;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2829,6 +2843,39 @@ mod tests {
             .peer_mldsa_keys
             .insert("n3".to_string(), reg_key(3, 3));
         assert!(sentinel.should_enforce_consensus_for_headers().await);
+    }
+
+    // #9: verify_headers_batch must reject an over-cap batch BEFORE doing O(n) work. A legitimate
+    // broadcaster sends <=100 headers; an attacker (limited only by the 4 MiB frame) could send ~55k.
+    #[tokio::test]
+    async fn verify_headers_batch_rejects_oversized_batch() {
+        let sentinel = HeaderSentinel::new();
+        let hdr = |h: u32| BlockHeaderInfo {
+            height: h,
+            hash: [0u8; 32],
+            prev_hash: [0u8; 32],
+            timestamp: 0,
+        };
+
+        // One over the cap: rejected specifically for SIZE (before signature/processing).
+        let oversized: Vec<BlockHeaderInfo> =
+            (0..(MAX_HEADER_SYNC_BATCH as u32 + 1)).map(hdr).collect();
+        assert_eq!(oversized.len(), MAX_HEADER_SYNC_BATCH + 1);
+        let err = sentinel
+            .verify_headers_batch(oversized, "n1", vec![])
+            .await
+            .expect_err("an over-cap header batch must be rejected");
+        assert!(err.contains("too large"), "rejected for size, got: {}", err);
+
+        // A within-cap batch must NOT trip the size gate (it may fail later for other reasons).
+        let ok_size: Vec<BlockHeaderInfo> = (0..10u32).map(hdr).collect();
+        if let Err(e) = sentinel.verify_headers_batch(ok_size, "n1", vec![]).await {
+            assert!(
+                !e.contains("too large"),
+                "a within-cap batch must not be size-rejected: {}",
+                e
+            );
+        }
     }
 
     #[tokio::test]
