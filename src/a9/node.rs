@@ -985,6 +985,85 @@ pub struct NodeRuntimeConfig {
     pub data_dir: Option<String>,
 }
 
+/// Byte budget for the transaction-witness memoization cache. The cache is also count-bounded
+/// (witness_cache_capacity), but every witness Transaction carries a full ML-DSA signature and public
+/// key (~14 KB each), so the count cap alone permits hundreds of MB resident. Bound the bytes directly
+/// so a busy chain — or a witness larger than today's — cannot bloat memory past this budget.
+const WITNESS_CACHE_BYTE_BUDGET: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// An LruCache of resolved tx witnesses that also enforces a byte budget: on insert it evicts the
+/// least-recently-used entries until the tracked resident size is within budget (never the entry just
+/// inserted). The count cap still applies — whichever bound binds first wins.
+#[derive(Debug)]
+struct WitnessCache {
+    // Held UNBOUNDED so that every eviction goes through `put` below (which keeps the byte counter in
+    // sync). If the inner LruCache enforced the count cap itself, its internal eviction on a full
+    // insert would drop an entry WITHOUT decrementing `bytes`, leaking the counter (and eventually
+    // wedging the cache) whenever the count cap binds before the byte budget.
+    cache: LruCache<String, Transaction>,
+    bytes: usize,
+    byte_budget: usize,
+    count_cap: usize,
+}
+
+impl WitnessCache {
+    fn new(count_cap: NonZeroUsize, byte_budget: usize) -> Self {
+        Self {
+            cache: LruCache::unbounded(),
+            bytes: 0,
+            byte_budget,
+            count_cap: count_cap.get(),
+        }
+    }
+
+    /// Approximate resident footprint of a cached witness — dominated by the ML-DSA signature and
+    /// public-key hex strings. Byte-exactness is unnecessary; this only paces eviction.
+    fn entry_bytes(tx: &Transaction) -> usize {
+        tx.signature.as_ref().map_or(0, |s| s.len())
+            + tx.pub_key.as_ref().map_or(0, |s| s.len())
+            + tx.sig_hash.as_ref().map_or(0, |s| s.len())
+            + tx.sender.len()
+            + tx.recipient.len()
+            // Slack for what the field sum omits: the String KEY (the tx_id), the LinkedHashMap node,
+            // the Transaction's fixed fields, and String capacity overhead. Deliberately generous so
+            // the budget errs toward LESS resident memory, not more. Dominated by sig+pub_key anyway.
+            + 256
+    }
+
+    fn put(&mut self, tx_id: String, tx: Transaction) {
+        let added = Self::entry_bytes(&tx);
+        if let Some(old) = self.cache.put(tx_id, tx) {
+            self.bytes = self.bytes.saturating_sub(Self::entry_bytes(&old));
+        }
+        self.bytes = self.bytes.saturating_add(added);
+        // Evict LRU until within BOTH the byte budget and the count cap. The just-inserted key is the
+        // MRU, so pop_lru targets older entries; the len() > 1 guard makes it impossible to evict the
+        // entry just inserted even if it alone exceeds the budget.
+        while (self.bytes > self.byte_budget || self.cache.len() > self.count_cap)
+            && self.cache.len() > 1
+        {
+            match self.cache.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(Self::entry_bytes(&evicted));
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn get(&mut self, tx_id: &str) -> Option<&Transaction> {
+        self.cache.get(tx_id)
+    }
+
+    fn pop(&mut self, tx_id: &str) -> Option<Transaction> {
+        let removed = self.cache.pop(tx_id);
+        if let Some(ref tx) = removed {
+            self.bytes = self.bytes.saturating_sub(Self::entry_bytes(tx));
+        }
+        removed
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Node {
     // Core components
@@ -1088,7 +1167,7 @@ pub struct Node {
     configured_seed_nodes: Arc<Vec<String>>,
 
     // Consensus state
-    tx_witness_cache: Arc<PLMutex<LruCache<String, Transaction>>>,
+    tx_witness_cache: Arc<PLMutex<WitnessCache>>,
     pub validation_pool: Arc<ValidationPool>,
     validation_cache: Arc<DashMap<String, ValidationCacheEntry>>,
     // Peers we recently sent a GetBlocks request to. Inbound block responses are
@@ -1369,7 +1448,10 @@ impl Node {
             validation_pool: Arc::new(ValidationPool::new()),
             validation_cache: Arc::new(DashMap::with_capacity(10000)),
             solicited_block_peers: Arc::new(DashMap::new()),
-            tx_witness_cache: Arc::new(PLMutex::new(LruCache::new(witness_cache_capacity))),
+            tx_witness_cache: Arc::new(PLMutex::new(WitnessCache::new(
+                witness_cache_capacity,
+                WITNESS_CACHE_BYTE_BUDGET,
+            ))),
             relay_dead_targets: Arc::new(PLMutex::new(LruCache::new(
                 // Must comfortably exceed the number of distinct dead tips a post-storm
                 // relay window can hold, or eviction re-admits chewed-through dead
@@ -11706,6 +11788,72 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #11: the witness cache enforces a BYTE budget, not just an entry count. Insert many large
+    // witnesses under a tight byte budget (high count cap) and confirm the resident bytes stay within
+    // budget, the newest entry survives (LRU), the oldest is evicted, and the counter tracks pop.
+    #[test]
+    fn witness_cache_evicts_to_byte_budget() {
+        // Tight byte budget, generous count cap -> the byte bound binds first.
+        let mut wc = WitnessCache::new(NonZeroUsize::new(1000).unwrap(), 50_000);
+        for i in 0..100u32 {
+            let mut tx = Transaction::new(
+                format!("s{}", i),
+                "r".to_string(),
+                1.0,
+                0.0,
+                i as u64,
+                Some("ab".repeat(5000)), // ~10 KB "signature"
+            );
+            tx.pub_key = Some("cd".repeat(2500)); // ~5 KB pub_key
+            wc.put(format!("tx{}", i), tx);
+        }
+        // Each entry ~15 KB; budget 50 KB -> only a few entries retained.
+        assert!(
+            wc.bytes <= 50_000,
+            "resident bytes must stay within the byte budget: {}",
+            wc.bytes
+        );
+        assert!(
+            (1..=4).contains(&wc.cache.len()),
+            "a tight byte budget retains only a few large entries: {}",
+            wc.cache.len()
+        );
+        assert!(wc.get("tx99").is_some(), "the newest witness is retained");
+        assert!(wc.get("tx0").is_none(), "the oldest witness was evicted");
+
+        // pop keeps the byte counter in sync.
+        let before = wc.bytes;
+        assert!(wc.pop("tx99").is_some());
+        assert!(wc.bytes < before, "pop decrements the resident byte counter");
+    }
+
+    // #11: with a generous byte budget the COUNT cap binds — and because the inner LruCache is
+    // unbounded, every eviction goes through the wrapper, so the byte counter never leaks (which it
+    // would if the inner cache did its own count-cap eviction without decrementing bytes).
+    #[test]
+    fn witness_cache_count_cap_enforced_without_byte_leak() {
+        let mut wc = WitnessCache::new(NonZeroUsize::new(5).unwrap(), 100 * 1024 * 1024);
+        let mk = |i: u32| {
+            Transaction::new(
+                format!("s{}", i),
+                "r".to_string(),
+                1.0,
+                0.0,
+                i as u64,
+                Some("aa".to_string()),
+            )
+        };
+        for i in 0..50u32 {
+            wc.put(format!("tx{}", i), mk(i));
+        }
+        assert_eq!(wc.cache.len(), 5, "the wrapper enforces the count cap");
+        let expected: usize = (45..50u32).map(|i| WitnessCache::entry_bytes(&mk(i))).sum();
+        assert_eq!(
+            wc.bytes, expected,
+            "byte counter equals the surviving entries — no leak from count-cap eviction"
+        );
+    }
 
     // #3 witness-sidecar bind: a resolved witness's sig_hash is bound to its OWN signature locally,
     // on every path — not only when sig_hash was absent. A pre-populated sig_hash that disagrees
