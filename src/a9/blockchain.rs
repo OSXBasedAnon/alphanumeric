@@ -121,6 +121,10 @@ const TRUSTED_CHECKPOINT_KEY: &[u8] = b"trusted_checkpoint";
 /// must be rebuilt; height behind tip = catch up incrementally. Advanced on every
 /// indexed block, so it is safe for it to lag (re-indexing a block is idempotent).
 const ADDRESS_TX_META_KEY: &[u8] = b"address_tx_indexed_tip";
+/// Explicit "the confirmed-tx replay registry has finished a build" marker. Needed because the
+/// registry is legitimately EMPTY on a chain with no non-system transactions, which is
+/// indistinguishable from "never built" if you only check the prune index for entries.
+const CONFIRMED_TX_BUILT_KEY: &[u8] = b"confirmed_tx_index_built";
 const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
@@ -1875,11 +1879,24 @@ impl Blockchain {
     /// yet (first run under this feature, or right after a bootstrap import). Existing
     /// history is grandfathered — only newly-adopted blocks are replay-checked.
     pub fn ensure_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
-        // Keyed on the prune index: if it's present the registry is already built in
-        // the current (prunable) format; if it's absent we (re)build both trees,
-        // which also migrates a registry built before the prune index existed.
+        // An explicit completion marker distinguishes "registry built, but this chain simply has no
+        // non-system transactions to index" (a quiet / low-tx node) from "never built". Without it,
+        // keying solely on the prune index being non-empty re-derived the whole registry (O(chain))
+        // on EVERY startup for a tx-free chain, since an empty index looks identical to an unbuilt
+        // one. New blocks maintain the registry incrementally, so a stamped-empty registry stays
+        // correct.
+        let meta = self.open_chain_meta_tree()?;
+        if meta.get(CONFIRMED_TX_BUILT_KEY)?.is_some() {
+            return Ok(());
+        }
+        // Back-compat: a registry built by a pre-marker binary has a populated prune index but no
+        // marker. Treat a non-empty index as already-built and just stamp the marker, so this stays
+        // an O(1) check next startup rather than an O(chain) rebuild. (This also preserves the old
+        // "prune index present => current prunable format" migration signal.)
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         if index.iter().next().is_some() {
+            meta.insert(CONFIRMED_TX_BUILT_KEY, vec![1u8])?;
+            meta.flush()?;
             return Ok(());
         }
         self.rebuild_confirmed_tx_index()
@@ -1897,35 +1914,40 @@ impl Blockchain {
         let tree = self.open_confirmed_tx_tree()?;
         tree.clear()?;
         index.clear()?;
-        let Some(tip) = self.highest_block_index() else {
-            return Ok(());
-        };
-        let mut batch = sled::Batch::default();
-        let mut index_batch = sled::Batch::default();
-        for h in 0..=tip {
-            if let Ok(block) = self.get_block(h) {
-                let idx = block.index.to_le_bytes().to_vec();
-                let ts_prefix = block.timestamp.to_be_bytes();
-                for tx in &block.transactions {
-                    if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
-                        continue;
+        if let Some(tip) = self.highest_block_index() {
+            let mut batch = sled::Batch::default();
+            let mut index_batch = sled::Batch::default();
+            for h in 0..=tip {
+                if let Ok(block) = self.get_block(h) {
+                    let idx = block.index.to_le_bytes().to_vec();
+                    let ts_prefix = block.timestamp.to_be_bytes();
+                    for tx in &block.transactions {
+                        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                            continue;
+                        }
+                        let tx_id = tx.get_tx_id();
+                        batch.insert(tx_id.as_bytes(), idx.clone());
+                        let mut index_key = ts_prefix.to_vec();
+                        index_key.extend_from_slice(tx_id.as_bytes());
+                        index_batch.insert(index_key, Vec::<u8>::new());
                     }
-                    let tx_id = tx.get_tx_id();
-                    batch.insert(tx_id.as_bytes(), idx.clone());
-                    let mut index_key = ts_prefix.to_vec();
-                    index_key.extend_from_slice(tx_id.as_bytes());
-                    index_batch.insert(index_key, Vec::<u8>::new());
                 }
             }
+            tree.apply_batch(batch)?;
+            index.apply_batch(index_batch)?;
+            tree.flush()?;
+            index.flush()?;
+            // Drop anything already beyond the freshness window on this first build.
+            if let Some(tip_block) = self.get_last_block() {
+                let _ = self.prune_confirmed_txs(tip_block.timestamp);
+            }
         }
-        tree.apply_batch(batch)?;
-        index.apply_batch(index_batch)?;
-        tree.flush()?;
-        index.flush()?;
-        // Drop anything already beyond the freshness window on this first build.
-        if let Some(tip_block) = self.get_last_block() {
-            let _ = self.prune_confirmed_txs(tip_block.timestamp);
-        }
+        // Stamp the completion marker unconditionally — even for a chain with no blocks or no
+        // indexable txs — so ensure_confirmed_tx_index does not re-derive on every startup. New
+        // blocks keep the registry current incrementally (record_confirmed_txs on commit).
+        let meta = self.open_chain_meta_tree()?;
+        meta.insert(CONFIRMED_TX_BUILT_KEY, vec![1u8])?;
+        meta.flush()?;
         Ok(())
     }
 
@@ -8664,6 +8686,42 @@ mod tests {
             .await
             .expect_err("invalid regular tx amount should be rejected before mining finalization");
         assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
+    }
+
+    // #8: on a chain with no NON-system transactions the confirmed-tx replay registry is
+    // legitimately empty, which pre-fix was indistinguishable from "never built" — so
+    // ensure_confirmed_tx_index re-derived the whole chain (O(chain)) on every startup. The
+    // completion marker must be stamped anyway, and a second ensure must short-circuit.
+    #[test]
+    fn ensure_confirmed_tx_index_marks_built_on_tx_free_chain() {
+        let bc = test_blockchain();
+        // Coinbase-only (MINING_REWARDS = system) block -> no indexable txs -> empty prune index.
+        let b0 = metadata_test_block(0, [0u8; 32], "miner", 1.0);
+        insert_raw_block(&bc, &b0);
+
+        // First ensure builds (empty) and stamps the completion marker.
+        bc.ensure_confirmed_tx_index().expect("ensure builds");
+        let meta = bc.open_chain_meta_tree().expect("meta tree");
+        assert!(
+            meta.get(CONFIRMED_TX_BUILT_KEY).unwrap().is_some(),
+            "completion marker is stamped even with no indexable txs"
+        );
+        let index = bc.db.open_tree(CONFIRMED_TX_TS_INDEX).unwrap();
+        assert!(
+            index.iter().next().is_none(),
+            "no non-system txs -> the prune index is legitimately empty"
+        );
+
+        // Prove the marker short-circuits: seed a sentinel into the confirmed-tx TREE (index still
+        // empty) and call ensure again. A rebuild would clear it — that O(chain) re-derive on every
+        // startup is exactly what this fix removes.
+        let tree = bc.open_confirmed_tx_tree().unwrap();
+        tree.insert(b"sentinel_txid", vec![0u8; 4]).unwrap();
+        bc.ensure_confirmed_tx_index().expect("ensure short-circuits");
+        assert!(
+            tree.get(b"sentinel_txid").unwrap().is_some(),
+            "marker short-circuits ensure; the registry is not re-derived (pre-fix would clear it)"
+        );
     }
 
     #[test]
