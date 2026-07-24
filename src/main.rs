@@ -1962,23 +1962,30 @@ println!("Wallet renamed successfully");
                 Some("mine") => {
                     let parts: Vec<&str> = command.split_whitespace().collect();
                     if parts.len() < 2 {
-                        println!("Usage: mine <miner_wallet_name> [--continuous] [--gpu]");
+                        println!("Usage: mine <miner_wallet_name> [--continuous] [--gpu|--cpu]");
                         continue;
                     }
-                    // Order-independent flags after the wallet name: --continuous/-c
-                    // and --gpu can appear in any order. Anything else is an error.
+                    // Order-independent flags after the wallet name: --continuous/-c,
+                    // --gpu / --cpu can appear in any order. Anything else is an error.
+                    // A GPU build (feature gpu_miner) mines on the GPU by DEFAULT —
+                    // that is the whole point of that binary — so `mine <wallet>` uses
+                    // the GPU with no flag; `--cpu` forces CPU. A default (CPU-only)
+                    // build defaults to CPU and refuses `--gpu` below. (GPU never runs
+                    // the CPU grind alongside it; CPU is only the fallback if the GPU
+                    // dies mid-session — see miner.rs.)
                     let mut continuous = false;
-                    let mut use_gpu = false;
+                    let mut use_gpu = cfg!(feature = "gpu_miner");
                     let mut bad_flag: Option<&str> = None;
                     for flag in &parts[2..] {
                         match *flag {
                             "--continuous" | "-c" => continuous = true,
                             "--gpu" => use_gpu = true,
+                            "--cpu" => use_gpu = false,
                             other => bad_flag = Some(other),
                         }
                     }
                     if let Some(f) = bad_flag {
-                        println!("Unknown mine flag '{}'. Usage: mine <miner_wallet_name> [--continuous] [--gpu]", f);
+                        println!("Unknown mine flag '{}'. Usage: mine <miner_wallet_name> [--continuous] [--gpu|--cpu]", f);
                         continue;
                     }
                     // --gpu only does something in a binary built with the gpu_miner
