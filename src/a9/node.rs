@@ -9501,6 +9501,19 @@ impl Node {
             }
 
             NetworkMessage::Blocks(blocks) => {
+                // Request-correlation at the INGRESS. A `Blocks` push from a peer we did not recently
+                // ask is unsolicited; the ChainResponse event handler already drops it, but only
+                // AFTER it has been enqueued. `Blocks` is not gossip-deduplicated and carries up to a
+                // ~4 MiB batch, so a single peer can flood distinct pushes that each occupy one of the
+                // bounded 1000 event-queue slots — doomed events that back-pressure `tx.send().await`
+                // and starve legitimate events (NewBlock, ChainRequest, …). Dropping here, before the
+                // enqueue, keeps unsolicited pushes out of the queue entirely. Legitimate sync
+                // responses are consumed inline by send_message_with_response and never reach this
+                // handler; a genuinely solicited late reply still passes (same 120s-TTL predicate the
+                // event handler re-checks).
+                if !self.is_solicited_block_source(addr) {
+                    return Ok(None);
+                }
                 tx.send(NetworkEvent::ChainResponse {
                     blocks,
                     sender: addr,
