@@ -2029,6 +2029,26 @@ println!("Wallet renamed successfully");
                     // single stdin line and flips the flag; the mining loop checks it
                     // between every wait slice and round.
                     let stop_flag = Arc::new(AtomicBool::new(false));
+
+                    // Ctrl-C / SIGTERM also stops an in-progress mine: the global handler sets
+                    // shutdown_requested; mirror it into stop_flag so the grind (which observes
+                    // `stop`) halts on signal, not only on Enter — matching `main`, where the
+                    // signal flag and the Enter flag both cancel the grind. Self-exits if Enter
+                    // already stopped it, and is aborted after the loop so it never outlives the
+                    // command.
+                    let signal_bridge = {
+                        let stop_on_signal = Arc::clone(&stop_flag);
+                        let shutdown_watch = Arc::clone(&shutdown_requested);
+                        tokio::spawn(async move {
+                            while !shutdown_watch.load(Ordering::SeqCst) {
+                                if stop_on_signal.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            stop_on_signal.store(true, Ordering::SeqCst);
+                        })
+                    };
                     if continuous {
                         println!(
                             "Continuous mining started. Paced to the network: each block \
@@ -2376,6 +2396,7 @@ println!("Wallet renamed successfully");
                             }
                         }
                     }
+                    signal_bridge.abort();
                     if continuous {
                         if stop_flag.load(Ordering::SeqCst) {
                             println!(
