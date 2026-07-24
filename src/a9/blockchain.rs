@@ -5744,6 +5744,20 @@ impl Blockchain {
         Ok(transactions)
     }
 
+    /// Pending transactions carrying their FULL signatures — for the gossip / re-announce path,
+    /// which must broadcast peer-verifiable transactions. get_pending_transactions returns the
+    /// persisted sled records, which hold a TRUNCATED signature (the full signature lives in the
+    /// PENDING_FULL_SIGNATURES_TREE sidecar); re-announcing those would gossip unverifiable txs that
+    /// peers defer — the truncated-witness pathology. The in-memory mempool holds the full signature,
+    /// so sync from sled first (which rehydrates the full signature and skips any tx whose sidecar
+    /// copy is missing, rather than gossiping it truncated) and read the mempool.
+    pub async fn get_pending_transactions_with_full_signatures(
+        &self,
+    ) -> Result<Vec<Transaction>, BlockchainError> {
+        self.sync_mempool_with_sled().await?;
+        self.get_mempool_transactions().await
+    }
+
     // Temporal Provenance with Causal Linking
     // Add to handle distributions
     pub async fn process_transactions_batch(
@@ -8648,6 +8662,48 @@ mod tests {
             bc.get_pending_debit_units(&wallet.address).await.unwrap(),
             delta_b,
             "only tx_a's debit is cleared; tx_b's reservation is preserved"
+        );
+    }
+
+    // #10: the re-announce accessor must return FULL-signature txs. The persisted pending record
+    // carries a truncated signature (the full one is in the sidecar); gossiping the truncated form
+    // makes peers defer the tx (the truncated-witness pathology).
+    #[tokio::test]
+    async fn reannounce_accessor_returns_full_signatures() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        // A fresh timestamp: sync_mempool_with_sled prunes pending rows older than the TTL.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tx = signed_transfer(&wallet, "bob", 1.0, now).await;
+        let full_sig_len = hex::decode(tx.signature.as_ref().unwrap()).unwrap().len();
+        assert!(full_sig_len > 64, "the created tx carries a full ML-DSA signature");
+        set_confirmed_balance(&bc, &wallet.address, tx.total_debit_units());
+        bc.add_transaction(tx.clone()).await.expect("tx admitted");
+
+        // get_pending_transactions reads the SLED record -> TRUNCATED signature.
+        let sled_pending = bc.get_pending_transactions().await.unwrap();
+        assert_eq!(sled_pending.len(), 1);
+        let sled_sig = hex::decode(sled_pending[0].signature.as_ref().unwrap()).unwrap();
+        assert!(
+            sled_sig.len() <= 64,
+            "sled pending record carries a truncated signature"
+        );
+
+        // The re-announce accessor rehydrates the FULL signature from the sidecar.
+        let full_pending = bc
+            .get_pending_transactions_with_full_signatures()
+            .await
+            .unwrap();
+        assert_eq!(full_pending.len(), 1);
+        assert_eq!(full_pending[0].get_tx_id(), sled_pending[0].get_tx_id());
+        let full_sig = hex::decode(full_pending[0].signature.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            full_sig.len(),
+            full_sig_len,
+            "re-announce accessor must carry the FULL signature, not the truncated one"
         );
     }
 
