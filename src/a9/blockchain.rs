@@ -5821,10 +5821,23 @@ impl Blockchain {
             for tx in transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
-                    // Retain the full witness for a bounded window (before purging the
-                    // pending copy) so peers can serve it for near-tip verification during
-                    // sync. Local-only: no effect on block hashes, merkle roots, or validity.
-                    if let Ok(Some(sig)) = full_sigs_tree.get(tx_id.as_bytes()) {
+                    // Retain the full witness for a bounded window (before purging the pending
+                    // copy) so peers can serve it for near-tip verification during sync.
+                    // Local-only: no effect on block hashes, merkle roots, or validity. Sourced
+                    // from the local mempool sidecar if we gossiped the tx, else from the incoming
+                    // block's OWN just-verified signature (witness_to_retain enforces full-sig +
+                    // sig_hash binding + BlockValidation-only), so a tx first seen inside this
+                    // block is retained instead of lost.
+                    let sidecar_sig = full_sigs_tree
+                        .get(tx_id.as_bytes())
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_vec());
+                    if let Some(sig) = Self::witness_to_retain(
+                        tx,
+                        sidecar_sig,
+                        matches!(context, TransactionContext::BlockValidation),
+                    ) {
                         let mut full_tx = tx.clone();
                         full_tx.signature = Some(hex::encode(&sig));
                         if let Ok(bytes) = codec::serialize(&full_tx) {
@@ -5858,6 +5871,46 @@ impl Blockchain {
         }
 
         Ok(())
+    }
+
+    /// Decide which full signature (if any) to retain as a servable witness for `tx`.
+    /// Prefers the local mempool sidecar copy (`sidecar_sig`, present only if this node gossiped
+    /// the tx); otherwise — under BlockValidation ONLY — falls back to the incoming block's own
+    /// signature, which was just verified upstream. That fallback preserves a tx first seen inside
+    /// a mined block (never gossiped to this node) so it can still be served to peers and
+    /// rehydrated on reorg instead of dropped.
+    ///
+    /// GUARD (money-chain safety): only a FULL signature (>64 bytes — a truncated sig is exactly a
+    /// 64-byte prefix) whose SHA-256 hash equals the tx's committed `sig_hash` is retained. sig_hash
+    /// is committed into the merkle root, so the bind is exact; and ReceiptValidation (historical
+    /// sync) carries TRUNCATED sigs, which must never enter the store — a served truncated witness
+    /// makes peers defer honest blocks (the 2026-07-23 truncated-witness pathology). A poisoned
+    /// witness cannot split the chain regardless (every consumer re-derives sig_hash in
+    /// block_signatures_fully_verified and defers on mismatch); this preserves the store's
+    /// invariant that it holds only full, binding witnesses.
+    fn witness_to_retain(
+        tx: &Transaction,
+        sidecar_sig: Option<Vec<u8>>,
+        is_block_validation: bool,
+    ) -> Option<Vec<u8>> {
+        // The sidecar only ever holds gossip-verified full signatures; the >64 check is
+        // defense-in-depth against a corrupt entry, never a filter on a real one.
+        if let Some(sig) = sidecar_sig {
+            if sig.len() > 64 {
+                return Some(sig);
+            }
+        }
+        if is_block_validation {
+            if let Some(sig) = tx.signature.as_ref().and_then(|s| hex::decode(s).ok()) {
+                if sig.len() > 64
+                    && tx.sig_hash.as_deref()
+                        == Some(Transaction::signature_hash_hex(&sig).as_str())
+                {
+                    return Some(sig);
+                }
+            }
+        }
+        None
     }
 
     /// Remove retained confirmed-transaction witnesses older than the retention
@@ -6432,6 +6485,154 @@ mod tests {
         insert_at(5, "tiny_chain_tx");
         bc.prune_confirmed_witnesses(100).unwrap();
         assert!(bc.get_confirmed_witness_tx("tiny_chain_tx").is_some());
+    }
+
+    // A tx FIRST SEEN inside a mined block (no local mempool sidecar copy) whose own signature is
+    // full and binds to its committed sig_hash must be retained from THAT signature under
+    // BlockValidation — the fix for the first-seen-in-block witness loss (serve-fail + reorg-drop).
+    #[test]
+    fn witness_to_retain_persists_first_seen_in_block_full_hash_bound_sig() {
+        let mut tx = user_tx("alice", "bob", 1.0, 100);
+        let full_sig = vec![7u8; 200]; // >64 bytes = a full (non-truncated) signature
+        tx.signature = Some(hex::encode(&full_sig));
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&full_sig));
+        // No sidecar (never gossiped to this node), BlockValidation context.
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, None, true),
+            Some(full_sig),
+            "full, hash-bound block signature must be retained when the sidecar is empty"
+        );
+    }
+
+    // GUARD: the store must never accept a truncated sig, a hash-mismatched sig, or ANY block
+    // signature under ReceiptValidation (historical sync carries TRUNCATED sigs). A truncated
+    // witness later served to a peer would make it defer honest blocks (the 2026-07-23 pathology).
+    #[test]
+    fn witness_to_retain_rejects_truncated_mismatch_and_receipt_context() {
+        let mut tx = user_tx("alice", "bob", 1.0, 100);
+        let full_sig = vec![7u8; 200];
+        tx.signature = Some(hex::encode(&full_sig));
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&full_sig));
+
+        // ReceiptValidation (is_block_validation = false): never retain from tx.signature.
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, None, false),
+            None,
+            "ReceiptValidation must not retain a block signature (may be truncated)"
+        );
+
+        // Truncated signature (<= 64 bytes) under BlockValidation: rejected even if self-consistent.
+        let trunc = vec![9u8; 64];
+        tx.signature = Some(hex::encode(&trunc));
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&trunc));
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, None, true),
+            None,
+            "a truncated (<=64B) signature must never be retained"
+        );
+
+        // Full signature but sig_hash does NOT bind: rejected.
+        tx.signature = Some(hex::encode(&full_sig));
+        tx.sig_hash = Some("deadbeef".to_string());
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, None, true),
+            None,
+            "a full signature whose hash does not match sig_hash must be rejected"
+        );
+
+        // Full signature but NO committed sig_hash (Transaction::new default): rejected — an
+        // unbound sig cannot be proven to belong to this tx, so it is intentionally not retained.
+        tx.signature = Some(hex::encode(&full_sig));
+        tx.sig_hash = None;
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, None, true),
+            None,
+            "a full signature with no committed sig_hash must not be retained"
+        );
+
+        // A present full sidecar witness is retained regardless of context (existing behavior).
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, Some(full_sig.clone()), false),
+            Some(full_sig),
+            "a present full sidecar witness is retained regardless of context"
+        );
+    }
+
+    // END-TO-END through process_transactions_batch: exercises the WIRING (sidecar read, context
+    // flag, serialize + index-key round-trip) that the helper unit tests skip. A tx first seen
+    // inside a mined block (empty sidecar) becomes serve-able after a BlockValidation apply; the
+    // same tx under ReceiptValidation retains nothing (the block fallback is BlockValidation-gated).
+    #[tokio::test]
+    async fn process_batch_retains_first_seen_in_block_witness() {
+        let ts = 1_700_000_000u64;
+        let wallet = Wallet::new(None).expect("wallet builds");
+
+        // An incoming block's tx: fully signed AND carrying its committed sig_hash, never gossiped
+        // to this node (so PENDING_FULL_SIGNATURES_TREE has no copy).
+        let mut tx = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        let sig_bytes = hex::decode(tx.signature.as_ref().unwrap()).unwrap();
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+        let tx_id = tx.get_tx_id();
+
+        let fund = |bc: &Blockchain| {
+            bc.db
+                .open_tree(BALANCES_TREE)
+                .unwrap()
+                .insert(
+                    wallet.address.as_bytes(),
+                    codec::serialize(&Transaction::to_units(1000.0)).unwrap(),
+                )
+                .unwrap();
+        };
+
+        // BlockValidation apply on a fresh, funded chain retains the just-verified witness.
+        let bc = test_blockchain();
+        fund(&bc);
+        assert!(
+            bc.verify_transaction_signature(&tx).is_ok(),
+            "the incoming block tx must verify"
+        );
+        assert!(
+            bc.db
+                .open_tree(PENDING_FULL_SIGNATURES_TREE)
+                .unwrap()
+                .get(tx_id.as_bytes())
+                .unwrap()
+                .is_none(),
+            "precondition: tx was NOT gossiped (empty sidecar)"
+        );
+        bc.process_transactions_batch(
+            std::slice::from_ref(&tx),
+            TransactionContext::BlockValidation,
+            1,
+        )
+        .await
+        .expect("BlockValidation batch applies");
+
+        let served = bc
+            .get_confirmed_witness_tx(&tx_id)
+            .expect("a first-seen-in-block witness must be retained and serve-able");
+        let served_sig = hex::decode(served.signature.as_ref().unwrap()).unwrap();
+        assert!(served_sig.len() > 64, "served witness must be the FULL signature");
+        assert_eq!(
+            served_sig, sig_bytes,
+            "served witness is the exact verified signature"
+        );
+
+        // Negative: the SAME tx under ReceiptValidation must retain nothing.
+        let bc2 = test_blockchain();
+        fund(&bc2);
+        bc2.process_transactions_batch(
+            std::slice::from_ref(&tx),
+            TransactionContext::ReceiptValidation,
+            1,
+        )
+        .await
+        .expect("ReceiptValidation batch applies");
+        assert!(
+            bc2.get_confirmed_witness_tx(&tx_id).is_none(),
+            "ReceiptValidation must not retain via the block fallback"
+        );
     }
 
     // A transaction reverted by a reorg must be re-queued with its FULL signature
