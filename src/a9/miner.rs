@@ -59,6 +59,18 @@ pub enum MiningError {
     Cancelled,
 }
 
+/// Candidate block timestamp for a child of `parent_timestamp` at wall-clock `now_secs`, clamped
+/// so a mined child is NEVER below its parent (validation rejects child < parent; EQUAL is valid).
+/// Under clock skew or a future-dated parent (valid up to MAX_BLOCK_FUTURE_TIME ahead), this lets
+/// an honest miner EXTEND the tip immediately instead of grinding blocks that only fail validation
+/// until wall-clock catches up. This single value feeds BOTH the block timestamp and the difficulty
+/// input (`this - parent`), so the two are consistent by construction; when now < parent the
+/// difficulty delta floors at 0 (a benign, self-correcting nudge). NOT a consensus-rule change — the
+/// produced block is valid under the unchanged rules, so old and new nodes agree on it.
+fn candidate_timestamp(now_secs: u64, parent_timestamp: u64) -> u64 {
+    now_secs.max(parent_timestamp)
+}
+
 impl From<Box<dyn std::error::Error>> for MiningError {
     fn from(error: Box<dyn std::error::Error>) -> Self {
         MiningError::MiningFailed(error.to_string())
@@ -422,10 +434,13 @@ impl MiningManager {
 
                                 // Don't create full Block - just calculate hash directly
                                 // We only need the full block when we find a valid nonce
-                                let timestamp = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
+                                let timestamp = candidate_timestamp(
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    previous_block_timestamp,
+                                );
                                 if timestamp != cached_timestamp {
                                     cached_timestamp = timestamp;
                                     cached_difficulty = Block::consensus_next_difficulty(
@@ -775,4 +790,36 @@ pub struct BlockHeader {
     pub timestamp: u64,
     pub merkle_root: [u8; 32],
     pub difficulty: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::candidate_timestamp;
+
+    // The mined-candidate timestamp is monotonic vs the parent: never below it (validation rejects
+    // child < parent), so an honest miner can extend a future-dated / clock-skewed tip immediately
+    // instead of grinding doomed blocks. Regression guard for the parent-clamp.
+    #[test]
+    fn candidate_timestamp_never_below_parent() {
+        // now AHEAD of parent -> use now (the normal case).
+        assert_eq!(candidate_timestamp(1_000, 900), 1_000);
+        // now EQUAL to parent -> parent (equal timestamps are valid).
+        assert_eq!(candidate_timestamp(900, 900), 900);
+        // now BEHIND parent (clock skew / future-dated parent) -> clamp UP to parent.
+        assert_eq!(candidate_timestamp(500, 900), 900);
+
+        // Monotonicity holds for arbitrary inputs, and the difficulty input (candidate - parent)
+        // floors at 0 exactly when now < parent (the benign, self-correcting nudge).
+        for (now, parent) in [(0u64, 0u64), (1, 300), (300, 1), (u64::MAX, 5), (5, u64::MAX)] {
+            let ts = candidate_timestamp(now, parent);
+            assert!(ts >= parent, "candidate {ts} must never be below parent {parent}");
+            if now < parent {
+                assert_eq!(
+                    ts.saturating_sub(parent),
+                    0,
+                    "difficulty delta must floor at 0 when now < parent"
+                );
+            }
+        }
+    }
 }
