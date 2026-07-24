@@ -1112,7 +1112,11 @@ pub struct Node {
     webrtc_mesh: Arc<RwLock<Option<Arc<crate::a9::webrtc::WebRtcMesh>>>>,
 
     // Filesystem
-    pub lock_path: Arc<String>,
+    // RAII identity-lock guard (see IdentityLock): the lock file is removed only when the LAST
+    // Node clone drops (process teardown), NOT on every clone drop. Held purely for its Drop —
+    // never read directly, hence allow(dead_code).
+    #[allow(dead_code)]
+    identity_lock: Arc<IdentityLock>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -1317,6 +1321,13 @@ impl Node {
                     }
                 }
             }
+            // Reclaim a STALE lock so create_new below succeeds. A LIVE owner already returned
+            // "Wallet already in use" above, so anything remaining here belongs to a dead PID
+            // (or is unreadable/garbage) left by a crashed instance. Without this a stale lock
+            // makes create_new fail and bricks restart — now reachable because IdentityLock no
+            // longer deletes the lock mid-run on a clone drop. create_new(true) stays the atomic
+            // arbiter if two processes reclaim at once.
+            let _ = std::fs::remove_file(&lock_path);
         }
 
         // Create new lock file
@@ -1396,7 +1407,9 @@ impl Node {
             peer_id,
             peer_failures: Arc::new(RwLock::new(HashMap::new())),
             header_sentinel: Some(Arc::new(HeaderSentinel::new())),
-            lock_path: Arc::new(lock_path.to_string_lossy().into_owned()),
+            identity_lock: Arc::new(IdentityLock {
+                path: lock_path.to_string_lossy().into_owned(),
+            }),
             velocity_manager,
             network_id,
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
@@ -11624,9 +11637,20 @@ impl Node {
     }
 }
 
-impl Drop for Node {
+// RAII guard for the node-identity lock file (temp_dir/node_locks/<pubkey>.lock). Held inside an
+// Arc shared by every Node clone, so the file is removed EXACTLY ONCE — when the last clone drops
+// (process teardown). The previous `impl Drop for Node` unlinked the shared path on EVERY clone
+// drop, so the first transient clone to drop (e.g. a per-connection handler task, ~node.rs:6571)
+// deleted the lock while the node kept running — silently defeating single-instance exclusion and
+// letting a second process reuse the same node_identity.key.
+#[derive(Debug)]
+struct IdentityLock {
+    path: String,
+}
+
+impl Drop for IdentityLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&*self.lock_path);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -11640,6 +11664,35 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: a dropped Node clone must NOT unlink the shared identity lock file while other
+    // clones (and the running node) are alive — only the LAST owner may. Before IdentityLock,
+    // `impl Drop for Node` removed the file on every clone drop, so the first transient clone to
+    // drop deleted the lock mid-run and a second process could reuse the same node_identity.key.
+    #[test]
+    fn identity_lock_removed_only_when_last_owner_drops() {
+        let dir = std::env::temp_dir().join(format!("idlock_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.lock").to_string_lossy().into_owned();
+        std::fs::write(&path, "0").unwrap();
+
+        let lock = std::sync::Arc::new(IdentityLock { path: path.clone() });
+        let clone1 = std::sync::Arc::clone(&lock);
+        let clone2 = std::sync::Arc::clone(&lock);
+        drop(clone1);
+        drop(clone2);
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "identity lock was removed while an owner still lives"
+        );
+
+        drop(lock);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "identity lock not removed after the final owner dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // The dedup bloom seeds its hash per process, so the ~1% false-positive pattern is not
     // identical on every node: the same item must hash to different positions in two instances.
