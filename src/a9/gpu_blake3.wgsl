@@ -31,14 +31,23 @@ const ROOT: u32 = 8u;
 // (`uint compress(...)`) while the body still returns a real `uint[8]`, so FXC
 // rejects it with `error X3017: cannot convert from 'uint[8]' to 'uint'`. Array
 // *arguments* are emitted correctly (`uint cv[8]`), only array *returns* break.
-// Passing/returning a one-member struct sidesteps this entirely: naga emits a
-// normal HLSL `struct` used identically at the signature, the return, and every
-// call site -- exactly what the Metal/MSL backend already does internally
-// (`struct type_1 { uint inner[8]; }`). SPIR-V/Vulkan and Metal are unaffected;
-// a single-member struct wrapping an array is layout-identical to the array on
-// all three backends, so this is a codegen fix, not a math or perf change.
+// Passing/returning a struct sidesteps this entirely: naga emits a normal HLSL
+// `struct` used identically at the signature, the return, and every call site.
+// SPIR-V/Vulkan and Metal are unaffected.
+//
+// Here the struct holds EIGHT NAMED SCALAR FIELDS (no array member at all), so
+// every backend lowers it to plain scalars with no inner array to pack/unpack at
+// the compress boundary -- the leanest correct shape. This is a codegen fix, not
+// a math or perf change.
 struct Cv {
-    w: array<u32, 8>,
+    s0: u32,
+    s1: u32,
+    s2: u32,
+    s3: u32,
+    s4: u32,
+    s5: u32,
+    s6: u32,
+    s7: u32,
 };
 
 struct Params {
@@ -102,8 +111,8 @@ fn g(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> vec4<u32> {
 // (2026-07-12 variant bench; byte-exact vs the blake3 crate throughout).
 // `block` is indexed only by CONSTANT literals, satisfying naga's rule.
 fn compress(cv: Cv, block: array<u32, 16>, block_len: u32, flags: u32) -> Cv {
-    var s0 = cv.w[0]; var s1 = cv.w[1]; var s2 = cv.w[2]; var s3 = cv.w[3];
-    var s4 = cv.w[4]; var s5 = cv.w[5]; var s6 = cv.w[6]; var s7 = cv.w[7];
+    var s0 = cv.s0; var s1 = cv.s1; var s2 = cv.s2; var s3 = cv.s3;
+    var s4 = cv.s4; var s5 = cv.s5; var s6 = cv.s6; var s7 = cv.s7;
     var s8 = IV[0]; var s9 = IV[1]; var s10 = IV[2]; var s11 = IV[3];
     var s12 = 0u; var s13 = 0u; var s14 = block_len; var s15 = flags;
     let m0 = block[0];
@@ -187,10 +196,10 @@ fn compress(cv: Cv, block: array<u32, 16>, block_len: u32, flags: u32) -> Cv {
     r = g(s2, s7, s8, s13, m3, m4); s2 = r.x; s7 = r.y; s8 = r.z; s13 = r.w;
     r = g(s3, s4, s9, s14, m7, m13); s3 = r.x; s4 = r.y; s9 = r.z; s14 = r.w;
 
-    var out: array<u32, 8>;
-    out[0] = s0 ^ s8;  out[1] = s1 ^ s9;  out[2] = s2 ^ s10; out[3] = s3 ^ s11;
-    out[4] = s4 ^ s12; out[5] = s5 ^ s13; out[6] = s6 ^ s14; out[7] = s7 ^ s15;
-    return Cv(out);
+    return Cv(
+        s0 ^ s8,  s1 ^ s9,  s2 ^ s10, s3 ^ s11,
+        s4 ^ s12, s5 ^ s13, s6 ^ s14, s7 ^ s15
+    );
 }
 
 // Leading zero bits of one hash word in canonical BYTE order (little-endian-first
@@ -215,14 +224,14 @@ fn word_leading_zeros(x: u32) -> vec2<u32> {
 fn leading_zero_bits(h: Cv) -> u32 {
     var total = 0u;
     var r: vec2<u32>;
-    r = word_leading_zeros(h.w[0]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[1]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[2]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[3]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[4]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[5]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[6]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h.w[7]); total = total + r.x;
+    r = word_leading_zeros(h.s0); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s1); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s2); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s3); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s4); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s5); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s6); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.s7); total = total + r.x;
     return total;
 }
 
@@ -234,7 +243,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // [4]=w16..19, [5]=w20..23. Nonce occupies w11 (lo) and w12 (hi).
     let h0 = params.header[0]; let h1 = params.header[1]; let h2 = params.header[2];
     let h3 = params.header[3]; let h4 = params.header[4]; let h5 = params.header[5];
-    let cv = Cv(array<u32, 8>(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]));
+    let cv = Cv(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]);
 
     // block1 is nonce-independent (w16..w22); build once per thread.
     let block1 = array<u32, 16>(
@@ -252,10 +261,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             let cv1 = compress(cv, block0, 64u, CHUNK_START);
             let root = compress(cv1, block1, 28u, CHUNK_END | ROOT);
-            result.hash[0] = root.w[0]; result.hash[1] = root.w[1];
-            result.hash[2] = root.w[2]; result.hash[3] = root.w[3];
-            result.hash[4] = root.w[4]; result.hash[5] = root.w[5];
-            result.hash[6] = root.w[6]; result.hash[7] = root.w[7];
+            result.hash[0] = root.s0; result.hash[1] = root.s1;
+            result.hash[2] = root.s2; result.hash[3] = root.s3;
+            result.hash[4] = root.s4; result.hash[5] = root.s5;
+            result.hash[6] = root.s6; result.hash[7] = root.s7;
         }
         return;
     }
