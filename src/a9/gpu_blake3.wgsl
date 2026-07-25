@@ -23,6 +23,24 @@ const CHUNK_START: u32 = 1u;
 const CHUNK_END: u32 = 2u;
 const ROOT: u32 = 8u;
 
+// The 8-word BLAKE3 chaining value / hash, wrapped in a struct so it crosses
+// function boundaries as a struct rather than a bare fixed-size array.
+//
+// naga's HLSL (DX12/FXC) backend cannot return a C-style fixed-size array BY
+// VALUE: it collapses the declared return type down to the bare scalar element
+// (`uint compress(...)`) while the body still returns a real `uint[8]`, so FXC
+// rejects it with `error X3017: cannot convert from 'uint[8]' to 'uint'`. Array
+// *arguments* are emitted correctly (`uint cv[8]`), only array *returns* break.
+// Passing/returning a one-member struct sidesteps this entirely: naga emits a
+// normal HLSL `struct` used identically at the signature, the return, and every
+// call site -- exactly what the Metal/MSL backend already does internally
+// (`struct type_1 { uint inner[8]; }`). SPIR-V/Vulkan and Metal are unaffected;
+// a single-member struct wrapping an array is layout-identical to the array on
+// all three backends, so this is a codegen fix, not a math or perf change.
+struct Cv {
+    w: array<u32, 8>,
+};
+
 struct Params {
     header: array<vec4<u32>, 6>, // w0..w23 (w23 unused/zero)
     nonce_lo: u32,
@@ -68,7 +86,12 @@ fn g(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> vec4<u32> {
     return vec4<u32>(ra, rb, rc, rd);
 }
 
-// One BLAKE3 compression; returns the 8 output words (chaining value / root words).
+// One BLAKE3 compression; returns the 8 output words (chaining value / root words)
+// wrapped in a Cv struct (see the Cv doc-comment for why the wrapper is required
+// for valid DX12/FXC HLSL codegen). The 16-word message `block` stays a bare
+// array argument -- naga emits array *arguments* correctly, only array *returns*
+// need the wrapper.
+//
 // FULLY UNROLLED: all 7 rounds are written out with the message-schedule
 // permutation COMPOSED into constant indices (Alephium-miner style register
 // renaming) instead of a runtime loop that physically shuffles m0..m15 through
@@ -78,9 +101,9 @@ fn g(a: u32, b: u32, c: u32, d: u32, mx: u32, my: u32) -> vec4<u32> {
 // backend — measured +48% kernel throughput on Metal from this change alone
 // (2026-07-12 variant bench; byte-exact vs the blake3 crate throughout).
 // `block` is indexed only by CONSTANT literals, satisfying naga's rule.
-fn compress(cv: array<u32, 8>, block: array<u32, 16>, block_len: u32, flags: u32) -> array<u32, 8> {
-    var s0 = cv[0]; var s1 = cv[1]; var s2 = cv[2]; var s3 = cv[3];
-    var s4 = cv[4]; var s5 = cv[5]; var s6 = cv[6]; var s7 = cv[7];
+fn compress(cv: Cv, block: array<u32, 16>, block_len: u32, flags: u32) -> Cv {
+    var s0 = cv.w[0]; var s1 = cv.w[1]; var s2 = cv.w[2]; var s3 = cv.w[3];
+    var s4 = cv.w[4]; var s5 = cv.w[5]; var s6 = cv.w[6]; var s7 = cv.w[7];
     var s8 = IV[0]; var s9 = IV[1]; var s10 = IV[2]; var s11 = IV[3];
     var s12 = 0u; var s13 = 0u; var s14 = block_len; var s15 = flags;
     let m0 = block[0];
@@ -167,7 +190,7 @@ fn compress(cv: array<u32, 8>, block: array<u32, 16>, block_len: u32, flags: u32
     var out: array<u32, 8>;
     out[0] = s0 ^ s8;  out[1] = s1 ^ s9;  out[2] = s2 ^ s10; out[3] = s3 ^ s11;
     out[4] = s4 ^ s12; out[5] = s5 ^ s13; out[6] = s6 ^ s14; out[7] = s7 ^ s15;
-    return out;
+    return Cv(out);
 }
 
 // Leading zero bits of one hash word in canonical BYTE order (little-endian-first
@@ -186,18 +209,20 @@ fn word_leading_zeros(x: u32) -> vec2<u32> {
     return vec2<u32>(total, 0u);
 }
 
-// Leading zero bits across the 8 hash words (constant-indexed, naga-safe).
-fn leading_zero_bits(h: array<u32, 8>) -> u32 {
+// Leading zero bits across the 8 hash words (constant-indexed, naga-safe). Takes
+// the Cv struct so the hash stays a struct across the call boundary (matches
+// compress's return type; keeps all 8-word values in one HLSL struct).
+fn leading_zero_bits(h: Cv) -> u32 {
     var total = 0u;
     var r: vec2<u32>;
-    r = word_leading_zeros(h[0]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[1]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[2]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[3]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[4]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[5]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[6]); total = total + r.x; if (r.y == 1u) { return total; }
-    r = word_leading_zeros(h[7]); total = total + r.x;
+    r = word_leading_zeros(h.w[0]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[1]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[2]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[3]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[4]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[5]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[6]); total = total + r.x; if (r.y == 1u) { return total; }
+    r = word_leading_zeros(h.w[7]); total = total + r.x;
     return total;
 }
 
@@ -209,7 +234,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // [4]=w16..19, [5]=w20..23. Nonce occupies w11 (lo) and w12 (hi).
     let h0 = params.header[0]; let h1 = params.header[1]; let h2 = params.header[2];
     let h3 = params.header[3]; let h4 = params.header[4]; let h5 = params.header[5];
-    let cv = array<u32, 8>(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]);
+    let cv = Cv(array<u32, 8>(IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7]));
 
     // block1 is nonce-independent (w16..w22); build once per thread.
     let block1 = array<u32, 16>(
@@ -227,10 +252,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             let cv1 = compress(cv, block0, 64u, CHUNK_START);
             let root = compress(cv1, block1, 28u, CHUNK_END | ROOT);
-            result.hash[0] = root[0]; result.hash[1] = root[1];
-            result.hash[2] = root[2]; result.hash[3] = root[3];
-            result.hash[4] = root[4]; result.hash[5] = root[5];
-            result.hash[6] = root[6]; result.hash[7] = root[7];
+            result.hash[0] = root.w[0]; result.hash[1] = root.w[1];
+            result.hash[2] = root.w[2]; result.hash[3] = root.w[3];
+            result.hash[4] = root.w[4]; result.hash[5] = root.w[5];
+            result.hash[6] = root.w[6]; result.hash[7] = root.w[7];
         }
         return;
     }
