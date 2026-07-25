@@ -78,33 +78,132 @@ impl GpuMiner {
         // processes (index 0/1/2) and each card grinds a disjoint region of the
         // nonce space — the per-attempt RANDOM nonce base (see gpu_mine_attempt)
         // makes separate processes non-overlapping with no cross-process
-        // coordination. Unset = the single best (HighPerformance) adapter,
-        // byte-identical to prior single-GPU behavior. When an index is set the
-        // full roster is printed first so an operator can map index -> card.
+        // coordination. Unset = auto-select (best adapter, with fallback). When
+        // an index is set the full roster is printed first so an operator can
+        // map index -> card.
         let gpu_index = std::env::var("ALPHANUMERIC_GPU_INDEX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok());
-        let adapter = if let Some(idx) = gpu_index {
+
+        // The ordered list of adapters to try. Each is attempted (device init +
+        // BLAKE3 self-check) in turn; the FIRST that passes is used.
+        let candidates: Vec<wgpu::Adapter> = if let Some(idx) = gpu_index {
+            // Explicit operator pin: use ONLY the chosen adapter, never fall
+            // back — a sibling process is pinned to each other card, so falling
+            // back here would double up one card and leave another idle.
             let adapters = instance.enumerate_adapters(backends);
             for (i, a) in adapters.iter().enumerate() {
                 let gi = a.get_info();
-                eprintln!("  GPU [{}] {} ({:?})", i, gi.name, gi.backend);
+                // device_type (DiscreteGpu/IntegratedGpu/…) so an operator can
+                // tell at a glance which index is the real card vs the iGPU on a
+                // mixed-GPU laptop/rig before pinning a process to it.
+                eprintln!(
+                    "  GPU [{}] {} ({:?}, {:?})",
+                    i, gi.name, gi.backend, gi.device_type
+                );
             }
             let n = adapters.len();
-            adapters.into_iter().nth(idx).ok_or_else(|| format!(
+            let chosen = adapters.into_iter().nth(idx).ok_or_else(|| format!(
                 "ALPHANUMERIC_GPU_INDEX={idx} is out of range: {n} GPU adapter(s) found (valid indices 0..={})",
                 n.saturating_sub(1)
-            ))?
+            ))?;
+            vec![chosen]
         } else {
-            instance
+            // Auto-select with fallback: the best (HighPerformance) adapter
+            // first, then every OTHER enumerated non-software adapter. A box
+            // whose preferred backend is present but BROKEN — classically a bad
+            // Vulkan driver on Windows/NVIDIA, where request_adapter still hands
+            // back a Vulkan adapter that then fails device-init or the self-check
+            // — now falls back to DX12 instead of silently demoting to CPU (the
+            // exact silent-failure this backend otherwise works hard to avoid).
+            // Cpu/software adapters (llvmpipe) are skipped so we never "succeed"
+            // onto a path slower than the multicore CPU miner. WGPU_BACKEND is
+            // honored: `backends` is already env-filtered, so an operator who
+            // pinned a backend gets only that backend's adapters here — the
+            // fallback never leaves their chosen backend set.
+            let mut candidates = Vec::new();
+            if let Some(primary) = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     compatible_surface: None,
                     force_fallback_adapter: false,
                 })
                 .await
-                .ok_or("no GPU adapter found (wgpu)")?
+            {
+                // Skip a software primary (llvmpipe) too: request_adapter falls
+                // back to software only when NO hardware GPU exists, and the
+                // multicore CPU miner beats llvmpipe — so an empty candidate
+                // list here cleanly demotes to CPU rather than "GPU-mining"
+                // slower than the CPU path.
+                if primary.get_info().device_type != wgpu::DeviceType::Cpu {
+                    candidates.push(primary);
+                }
+            }
+            for a in instance.enumerate_adapters(backends) {
+                let gi = a.get_info();
+                if gi.device_type == wgpu::DeviceType::Cpu {
+                    continue; // never silently mine on llvmpipe
+                }
+                if candidates.iter().any(|c| Self::same_adapter(&c.get_info(), &gi)) {
+                    continue; // already queued (the HighPerformance pick)
+                }
+                candidates.push(a);
+            }
+            // Prefer stronger fallbacks: keep the primary (the HighPerformance
+            // pick) first, then order the rest DiscreteGpu-before-IntegratedGpu
+            // so a broken discrete primary falls back to the SAME card on another
+            // backend (e.g. DX12) rather than to a weak iGPU that could be slower
+            // than the multicore CPU miner. Stable sort keeps enumerate order
+            // within a device_type; len>1 guards the [1..] slice.
+            if candidates.len() > 1 {
+                candidates[1..].sort_by_key(|a| match a.get_info().device_type {
+                    wgpu::DeviceType::DiscreteGpu => 0u8,
+                    wgpu::DeviceType::IntegratedGpu => 1,
+                    wgpu::DeviceType::VirtualGpu => 2,
+                    _ => 3, // Other (Cpu already filtered out above)
+                });
+            }
+            candidates
         };
+
+        if candidates.is_empty() {
+            return Err("no GPU adapter found (wgpu)".into());
+        }
+
+        // Try each candidate in order; the first that both initializes a device
+        // AND passes the BLAKE3 self-check wins. Errors are collected so a total
+        // failure reports WHY each adapter was rejected, not just "no GPU".
+        let mut errors: Vec<String> = Vec::new();
+        for adapter in candidates {
+            let gi = adapter.get_info();
+            let label = format!("{} ({:?})", gi.name, gi.backend);
+            match Self::try_build(&adapter).await {
+                Ok(miner) => return Ok(miner),
+                Err(e) => errors.push(format!("{label}: {e}")),
+            }
+        }
+        Err(format!(
+            "no usable GPU adapter (tried {}): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
+
+    /// Two adapter handles refer to the same physical device+backend. Used to
+    /// avoid re-trying the HighPerformance pick when it reappears in the
+    /// enumerate_adapters() fallback list (AdapterInfo isn't Eq).
+    fn same_adapter(a: &wgpu::AdapterInfo, b: &wgpu::AdapterInfo) -> bool {
+        a.name == b.name
+            && a.backend == b.backend
+            && a.device == b.device
+            && a.vendor == b.vendor
+    }
+
+    /// Initialize a device + pipeline + buffers on ONE adapter and gate it on
+    /// the BLAKE3 self-check. Returns Err (never mines) on any failure so
+    /// new_async can try the next candidate adapter — this is what turns a
+    /// broken preferred backend into a fallback instead of a CPU demotion.
+    async fn try_build(adapter: &wgpu::Adapter) -> Result<Self, String> {
         let info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(
@@ -117,8 +216,51 @@ impl GpuMiner {
                 None,
             )
             .await
-            .map_err(|e| format!("GPU device init failed: {e}"))?;
+            .map_err(|e| format!("device init failed: {e}"))?;
 
+        // build_checked (pipeline/buffers + self-check dispatch) is SYNCHRONOUS
+        // and can PANIC on a broken driver — wgpu routes shader/pipeline
+        // validation errors through a handler that panic!()s, and a wedged
+        // device can panic in get_mapped_range during the self-check. Contain
+        // that panic (the release profile is panic=unwind) so new_async falls
+        // through to the NEXT candidate — e.g. DX12 when the Vulkan driver is
+        // broken — instead of unwinding all the way out to a CPU demotion. This
+        // is what lets the fallback cover the COMMON broken-driver case (a
+        // crash), not just clean Err returns. AssertUnwindSafe is sound because a
+        // caught panic discards this device/queue and the next candidate builds
+        // a fresh one. (A driver that HANGS in poll(Wait) rather than panicking
+        // still can't be recovered — an unavoidable limit, same as baseline.)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            Self::build_checked(device, queue, &info)
+        })) {
+            Ok(res) => res,
+            Err(_) => Err("driver panicked during pipeline/self-check init".into()),
+        }
+    }
+
+    /// Synchronous: build the pipeline + buffers on an initialized device and
+    /// gate on the BLAKE3 self-check. Split out so try_build can run it under
+    /// catch_unwind. Production always goes through here (never build_unchecked
+    /// directly), so no adapter mines without passing the self-check.
+    fn build_checked(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        info: &wgpu::AdapterInfo,
+    ) -> Result<Self, String> {
+        let miner = Self::build_unchecked(device, queue, info);
+        // Gate on BLAKE3 correctness BEFORE this adapter can ever mine: a kernel
+        // that disagrees with the CPU blake3 crate rejects the adapter here and
+        // the caller falls through to the next candidate.
+        miner.self_check()?;
+        Ok(miner)
+    }
+
+    /// Build the pipeline + buffers WITHOUT the self-check. Production always
+    /// uses build_checked; only the tests construct this directly, so a broken
+    /// kernel FAILS their explicit hash asserts loudly instead of the whole GPU
+    /// suite silently skipping (which is what an internal self-check gate would
+    /// cause via the `miner()` helper returning None).
+    fn build_unchecked(device: wgpu::Device, queue: wgpu::Queue, info: &wgpu::AdapterInfo) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blake3-pow"),
             source: wgpu::ShaderSource::Wgsl(WGSL.into()),
@@ -169,7 +311,7 @@ impl GpuMiner {
             ],
         });
 
-        Ok(Self {
+        Self {
             device,
             queue,
             pipeline,
@@ -178,7 +320,7 @@ impl GpuMiner {
             readback_buf,
             bind,
             adapter_name: format!("{} ({:?})", info.name, info.backend),
-        })
+        }
     }
 
     fn header_words(header: &[u8; 92]) -> [u32; 24] {
@@ -221,12 +363,15 @@ impl GpuMiner {
         self.queue.submit([enc.finish()]);
 
         let slice = self.readback_buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+        // poll(Wait) below IS the synchronization: wgpu 22 guarantees every
+        // map_async callback has already fired by the time Maintain::Wait
+        // returns. The callback is required by the API but need do nothing — the
+        // old mpsc channel + rx.recv() added a per-dispatch allocation and a
+        // no-op wait whose Result was discarded anyway. A failed map still
+        // surfaces as a panic in get_mapped_range, exactly as before. DO NOT
+        // remove poll(Wait) — deleting it (rather than the channel) deadlocks.
+        slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::Maintain::Wait);
-        let _ = rx.recv();
         let out: ResultBuf = *bytemuck::from_bytes(&slice.get_mapped_range());
         self.readback_buf.unmap();
         out
@@ -399,13 +544,12 @@ fn record_tip_change_observation() {
 static LAST_DIFFICULTY: AtomicU64 = AtomicU64::new(0);
 
 fn shared_gpu_status() -> &'static Result<GpuMiner, String> {
-    GPU.get_or_init(|| match GpuMiner::new() {
-        Ok(m) => match m.self_check() {
-            Ok(()) => Ok(m),
-            Err(e) => Err(format!("self-check failed on {}: {e}", m.adapter_name)),
-        },
-        Err(e) => Err(e),
-    })
+    // GpuMiner::new() now self-checks each adapter inside its fallback loop, so
+    // an Ok here is already a verified-correct BLAKE3 kernel on a working
+    // adapter (with a broken preferred backend having fallen back rather than
+    // demoted to CPU). The Err side keeps the per-adapter rejection reasons so
+    // the mine command can show the user exactly why no GPU was usable.
+    GPU.get_or_init(GpuMiner::new)
 }
 
 /// Adapter name + backend if the GPU is usable, or the reason it is not.
@@ -729,14 +873,46 @@ mod tests {
         assert_eq!(adaptive_dispatch_target_ms(60_000), 250.0);
     }
 
+    /// Build a miner on the best adapter WITHOUT the internal self-check, so the
+    /// correctness tests below run their OWN explicit hash asserts and FAIL
+    /// LOUDLY on a broken kernel. Production's GpuMiner::new() self-checks
+    /// internally (the adapter-fallback gate), which would instead make this
+    /// return None and SILENTLY SKIP the whole GPU suite on a broken kernel —
+    /// exactly the regression a correctness test must not have. Returns None only
+    /// when no GPU adapter/device exists (a legitimate skip on a headless box).
     fn miner() -> Option<GpuMiner> {
-        match GpuMiner::new() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!("skipping GPU tests: {e}");
-                None
-            }
+        let m = pollster::block_on(async {
+            let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..Default::default()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await?;
+            let info = adapter.get_info();
+            let (device, queue) = adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("alphanumeric-gpu-miner-test"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::downlevel_defaults(),
+                        memory_hints: wgpu::MemoryHints::Performance,
+                    },
+                    None,
+                )
+                .await
+                .ok()?;
+            Some(GpuMiner::build_unchecked(device, queue, &info))
+        });
+        if m.is_none() {
+            eprintln!("skipping GPU tests: no usable GPU adapter/device");
         }
+        m
     }
 
     fn header_with_nonce(seed: u8, nonce: u64) -> [u8; 92] {
