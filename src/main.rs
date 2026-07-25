@@ -4717,11 +4717,15 @@ fn canonical_reconcile_decision(
     }
 
     // Plain BEHIND (anchor region on canonical, or no anchor to check). If the
-    // gap to the live tip is within STREAM_WINDOW, the running node catches up by fetching
-    // those blocks forward (the beacon-watch loop's exact-walked adoption) — do
-    // NOT re-download the whole chain for a gap the node will close on its own;
-    // that is what normal syncing is. Only a gap deeper than the window (or a
-    // near-empty DB) is worth a full re-bootstrap.
+    // gap to the live tip is within STREAM_WINDOW, KEEP the local DB: the running
+    // node closes the gap in place via the idle-reconcile bulk delta-sync
+    // (sync_full_history_from_peer, which pulls [tip+1..=beacon] over GetBlocks
+    // from any full-history peer's complete DB — see STREAM_WINDOW's note). Do
+    // NOT nuke a valid canonical prefix and re-download the whole chain for a gap
+    // that normal syncing closes; that also avoids the ~3x bulk-import bloat a
+    // fresh snapshot leaves in sled. A near-empty DB has, by construction, a gap
+    // deeper than the window (live_height - tiny_tip), so it re-bootstraps here
+    // where the fixed-size snapshot is the faster tool.
     if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
@@ -4733,32 +4737,48 @@ fn canonical_reconcile_decision(
     }
 }
 
-/// How far behind a genesis-valid chain may be and still be caught up by the
-/// live beacon-watch loop instead of a full re-download. History of this value:
-/// it was 96 (≈8 min at 5s blocks) because the boot decision had to stay
-/// conservative — if live convergence was broken, "restart the node" had to
-/// reliably trigger a re-bootstrap; a wide window once told a 181-behind node it
-/// was in sync at boot while its live loop couldn't converge either, trapping it
-/// with no way out (2026-07-08). That escape now comes from the
-/// force-rebootstrap marker instead (the runtime divergence exit drops it and
-/// the next boot honors it unconditionally), so the window no longer carries the
-/// recovery burden and can reflect what streaming is actually good at: any
-/// casual close-and-reopen used to trigger a FULL re-download past 8 minutes
-/// ("every time I open the client it's behind", 2026-07-10).
+/// How far behind a genesis-valid, on-canonical chain may be at boot and still
+/// be caught up in place (keep the local DB, stream forward) instead of nuking
+/// it and re-downloading the full snapshot. History of this value: it was 96
+/// (≈8 min at 5s blocks), then 1024, because the boot decision had to stay
+/// conservative — a wide window once told a 181-behind node it was in sync at
+/// boot while its live loop couldn't converge either, trapping it with no way
+/// out (2026-07-08). That escape now comes from the force-rebootstrap marker
+/// (the runtime divergence exit drops it and the next boot honors it
+/// unconditionally), so the window no longer carries the recovery burden and can
+/// reflect what streaming is actually good at: any casual close-and-reopen used
+/// to trigger a FULL re-download past the window ("every time I open the client
+/// it re-downloads the whole chain", 2026-07-10 / 2026-07-25).
 ///
-/// The value is TIED to the converge engine's hard per-append bound
-/// (ORPHAN_REORG_DEPTH): a boot window wider than what the live loop will
-/// actually stream boots "in sync" and then marker-exits ~40s later — strictly
-/// worse than re-bootstrapping at boot (review finding, 2026-07-11; an initial
-/// 2000 overshot the 1024 engine bound and the 1025..=2000 band deterministically
-/// took the exit path). 1024 blocks ≈ 85 min at target cadence, ~16 relay
-/// windows — streams in seconds-to-a-minute in the background while the client
-/// is already usable. Gaps the relay can't actually serve (24h TIME-based
-/// retention vs slow-cadence eras, fork-storm slot holes) are caught by the
-/// converge stall watchdog, which escalates to the marker path within minutes.
-/// Forked-at-checkpoint chains (hash mismatch above) never reach this window and
-/// still re-bootstrap immediately.
-const STREAM_WINDOW: u32 = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
+/// DECOUPLED from ORPHAN_REORG_DEPTH (was tied to it): the old reason was that
+/// the live catch-up was the converge engine, whose forward adoption is hard-
+/// bounded by ORPHAN_REORG_DEPTH — a wider window booted "in sync" and then
+/// marker-exited ~40s later because the engine could not stream past 1024
+/// (review finding, 2026-07-11; an initial 2000 left the 1025..=2000 band
+/// deterministically taking the exit path). That bound no longer governs
+/// catch-up: the idle-reconcile loop now escalates a stalled converge to a bulk
+/// delta-sync (sync_full_history_from_peer), which pulls [tip+1..=beacon] in
+/// MAX_GETBLOCKS_SPAN batches from any full-history peer. GetBlocks is served
+/// straight from that peer's COMPLETE block DB (ChainRequest -> get_block; no
+/// 24h relay-retention limit — that limit is on gossip, not block serving), so
+/// a full peer serves any historical range and the delta-sync closes a gap of
+/// ANY size. The window is therefore now a stream-vs-snapshot tradeoff, not an
+/// engine bound: within it we keep the compact, incrementally-built DB and
+/// stream the tail (a snapshot re-bootstrap instead leaves ~3x bulk-import bloat
+/// in sled that never self-heals); a genuinely enormous gap (weeks abandoned)
+/// re-bootstraps, where the fixed-size snapshot download is decisively faster
+/// and there is proportionally little local prefix worth preserving.
+///
+/// Seven days of blocks at target cadence — comfortably covers any realistic
+/// close-and-reopen while bounding the worst-case boot catch-up (~120k blocks
+/// stream in ~1-2 min in the background while the client is already usable).
+/// Escapes are unchanged: a node NO peer can serve has its stalled delta-sync
+/// fall through to the 2-strike -> marker -> re-bootstrap path; a runtime-proven
+/// divergence drops the marker (honored unconditionally next boot); and a
+/// forked-at-checkpoint chain (hash mismatch above) never reaches this window
+/// and re-bootstraps immediately.
+const STREAM_WINDOW: u32 =
+    (7 * 24 * 60 * 60 / alphanumeric::a9::blockchain::TARGET_BLOCK_TIME) as u32;
 
 // Marker + cooldown live in a9::node (single source, shared by the runtime
 // divergence exit, mine-prep scheduling, and this boot-time reconcile):
