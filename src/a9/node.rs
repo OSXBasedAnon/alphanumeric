@@ -7236,7 +7236,7 @@ impl Node {
                                     // peer over GetBlocks (same validation, beacon-anchored).
                                     // No-op if no seed is configured -> falls through to the
                                     // original restart, so behaviour is unchanged there.
-                                    match node_clone.sync_full_history_from_peer().await {
+                                    match node_clone.sync_full_history_from_peer(false).await {
                                         Converge::Converged
                                         | Converge::AtTipAhead
                                         | Converge::Progressed => {
@@ -7274,7 +7274,7 @@ impl Node {
                                 // TIER 2: reconstruct the canonical chain from a seed peer
                                 // (gateway-independent body acquisition) instead of relying
                                 // solely on the gateway snapshot. No-op without a seed peer.
-                                match node_clone.sync_full_history_from_peer().await {
+                                match node_clone.sync_full_history_from_peer(false).await {
                                     Converge::Converged
                                     | Converge::AtTipAhead
                                     | Converge::Progressed => {
@@ -11028,6 +11028,25 @@ impl Node {
         }
     }
 
+    /// Connected peers that report a height at or above `beacon_height`, tallest first (address as a
+    /// deterministic tiebreak) — the candidate set the boot / idle delta-sync tries when no
+    /// configured seed can serve the beacon. The reported height is only a cheap PRE-filter;
+    /// sync_full_history_from_peer independently re-verifies each candidate (verify_peer +
+    /// request_peer_height + the tip probe) before applying any block, so a lying peer that inflates
+    /// its height is filtered out there, not here.
+    fn full_sync_candidate_peers(
+        peers: &HashMap<SocketAddr, PeerInfo>,
+        beacon_height: u32,
+    ) -> Vec<SocketAddr> {
+        let mut ranked: Vec<(SocketAddr, u32)> = peers
+            .iter()
+            .filter(|(_, info)| info.blocks >= beacon_height)
+            .map(|(addr, info)| (*addr, info.blocks))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(addr, _)| addr).collect()
+    }
+
     /// Next GetBlocks span [start, end], bounded so (end - start) < MAX_GETBLOCKS_SPAN (the
     /// server ingress cap) and `end` never exceeds the fixed target height.
     fn full_sync_next_span(cursor: u32, target: u32) -> (u32, u32) {
@@ -11061,7 +11080,7 @@ impl Node {
     /// gateway-attested beacon hash. Genesis is the built-in pinned block, never fetched. Returns
     /// a Converge outcome; touches NO state on the no-peer / no-beacon path, so every existing
     /// gateway/relay path is byte-for-byte unchanged when this cannot help.
-    pub async fn sync_full_history_from_peer(&self) -> Converge {
+    pub async fn sync_full_history_from_peer(&self, include_connected_peers: bool) -> Converge {
         // STEP 0: trusted anchor = the signed tip beacon (the SAME canonical (height,hash)
         // converge_to_canonical already trusts). No beacon -> no anchor -> caller falls through.
         let Some(beacon) = self.fetch_tip_beacon().await else {
@@ -11088,6 +11107,31 @@ impl Node {
                 }
             }
         }
+        // If no configured seed served the beacon and the caller allows it (the boot / idle client
+        // path — NOT the publisher live loop), fall back to already-CONNECTED peers reporting a
+        // height at or above the beacon. Source is irrelevant to safety: the STEP-2 tip probe and
+        // the per-block PoW/hash/witness checks below reject any peer not truly on the canonical
+        // chain, so this only WIDENS who can serve the delta, never what is accepted. A seedless
+        // client (the common case) thus gets a real delta-sync path instead of the full snapshot.
+        if chosen.is_none() && include_connected_peers {
+            let candidates = {
+                let peers = self.peers.read().await;
+                Self::full_sync_candidate_peers(&peers, beacon.height)
+            };
+            for addr in candidates {
+                if self.verify_peer(addr).await.is_err() {
+                    continue;
+                }
+                let Ok(peer_height) = self.request_peer_height(addr).await else {
+                    continue;
+                };
+                if Self::full_sync_anchor_height(beacon.height, peer_height).is_some() {
+                    chosen = Some(addr);
+                    break;
+                }
+            }
+        }
+
         let Some(peer) = chosen else {
             return Converge::NeedsBootstrap;
         };
@@ -11788,6 +11832,40 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Change 3: connected-peer candidate selection for the boot/idle delta-sync. Peers at or above
+    // the beacon height are candidates (tallest first, deterministic); below-beacon peers are
+    // excluded. (The reported height is only a pre-filter; the real per-peer verification happens in
+    // sync_full_history_from_peer via the tip probe.)
+    #[test]
+    fn full_sync_candidate_peers_ranks_at_or_above_beacon() {
+        use std::collections::HashMap;
+        let mk = |octet: u8, blocks: u32| -> (SocketAddr, PeerInfo) {
+            let addr: SocketAddr = format!("10.0.0.{}:7000", octet).parse().unwrap();
+            let mut info = PeerInfo::new(addr);
+            info.blocks = blocks;
+            (addr, info)
+        };
+        let beacon = 1000u32;
+        let entries = [mk(1, 1005), mk(2, 1000), mk(3, 999), mk(4, 2000)];
+        let below = entries[2].0; // height 999
+        let peers: HashMap<SocketAddr, PeerInfo> = entries.iter().cloned().collect();
+
+        let ranked = Node::full_sync_candidate_peers(&peers, beacon);
+        assert!(
+            !ranked.contains(&below),
+            "a peer below the beacon must not be a candidate"
+        );
+        assert_eq!(ranked.len(), 3, "only the three at/above the beacon qualify");
+        // tallest first: 2000, 1005, 1000
+        let heights: Vec<u32> = ranked
+            .iter()
+            .map(|a| peers.get(a).unwrap().blocks)
+            .collect();
+        assert_eq!(heights, vec![2000, 1005, 1000], "candidates ranked tallest first");
+        // none qualify when the beacon is above every peer
+        assert!(Node::full_sync_candidate_peers(&peers, 3000).is_empty());
+    }
 
     // #11: the witness cache enforces a BYTE budget, not just an entry count. Insert many large
     // witnesses under a tight byte budget (high count cap) and confirm the resident bytes stay within
