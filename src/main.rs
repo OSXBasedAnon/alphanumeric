@@ -1334,7 +1334,7 @@ async fn async_main() -> Result<()> {
                             // then. Read-only + mining-neutral: mine-prep still
                             // re-checks convergence and writes its own marker
                             // (schedule_force_rebootstrap_hard) untouched.
-                            let genuinely_too_far = {
+                            let (genuinely_too_far, forked) = {
                                 let local_tip = node_recon
                                     .blockchain
                                     .read()
@@ -1396,7 +1396,10 @@ async fn async_main() -> Result<()> {
                                     }
                                 }
                                 let beacon_height = beacon.as_ref().map(|(h, _)| *h);
-                                idle_reconcile_needs_snapshot(local_tip, beacon_height, forked)
+                                (
+                                    idle_reconcile_needs_snapshot(local_tip, beacon_height, forked),
+                                    forked,
+                                )
                             };
                             if !genuinely_too_far {
                                 strikes = 0;
@@ -1407,6 +1410,42 @@ async fn async_main() -> Result<()> {
                                     behind_logged = true;
                                 }
                                 continue;
+                            }
+                            // Genuinely too far, but NOT forked: an on-canonical prefix
+                            // that has simply fallen far behind (> ORPHAN_REORG_DEPTH).
+                            // Before escalating to a full-snapshot re-bootstrap (marker +
+                            // exit + ~885 MB download + a BLOATED bulk-imported DB), try to
+                            // close the gap with a bulk P2P delta-sync from any full-history
+                            // peer — seeds OR already-connected peers (include_connected_peers
+                            // = true). This keeps the node UP, keeps its sled DB COMPACT
+                            // (incremental append vs bulk import), and only re-bootstraps
+                            // when no peer can actually serve the range. A genuine FORK still
+                            // escalates immediately (skipped here). If the delta-sync can't
+                            // proceed — no full-history peer, aged-out span, or a stall — we
+                            // fall straight through to the existing strike/snapshot path, so
+                            // the snapshot stays the guaranteed escape and no forked or truly
+                            // stranded node is left behind. Source-independent safety: the
+                            // sync's STEP-2 tip probe pins the tip to the gateway-signed
+                            // beacon hash and every block is validated on ingest, so a lying
+                            // or off-canonical peer cannot advance us (returns NeedsBootstrap
+                            // -> falls through). Mining-neutral: read-only convergence, no
+                            // marker written, mine-prep's own reconcile untouched.
+                            if !forked {
+                                match node_recon.sync_full_history_from_peer(true).await {
+                                    Converge::Converged
+                                    | Converge::AtTipAhead
+                                    | Converge::Progressed => {
+                                        strikes = 0;
+                                        if !behind_logged {
+                                            println!(
+                                                "Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving."
+                                            );
+                                            behind_logged = true;
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
                             }
                             behind_logged = false;
                             strikes += 1;
