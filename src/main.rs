@@ -5052,6 +5052,68 @@ async fn bootstrap_publish_loop(
     }
 }
 
+/// Zip a directory tree (the exported snapshot DB) into `zip_path` with `compression`,
+/// returning the archive stats (file_count + uncompressed/extracted bytes). Only the
+/// publisher builds snapshots (and the round-trip test exercises it), so it is compiled
+/// only for those — a plain client build does not carry it. Split out of
+/// publish_bootstrap_snapshot so the build -> client-extract -> reopen round-trip is unit-
+/// testable and the compression method is a single, reviewable knob. For any given method
+/// the behavior is identical to the former inline logic.
+#[cfg(any(feature = "bootstrap_publisher", test))]
+fn write_bootstrap_archive_zip(
+    source_dir: &std::path::Path,
+    zip_path: &std::path::Path,
+    compression: zip::CompressionMethod,
+) -> std::result::Result<BootstrapArchiveStats, String> {
+    let file = std::fs::File::create(zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(compression)
+        .unix_permissions(0o644);
+
+    fn add_dir(
+        zip: &mut zip::ZipWriter<std::fs::File>,
+        base: &std::path::Path,
+        path: &std::path::Path,
+        options: zip::write::SimpleFileOptions,
+        stats: &mut BootstrapArchiveStats,
+    ) -> std::result::Result<(), String> {
+        for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let p = entry.path();
+            let rel = p
+                .strip_prefix(base)
+                .map_err(|e| format!("strip_prefix: {}", e))?;
+            let name = rel.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                let dir_name = if name.ends_with('/') {
+                    name
+                } else {
+                    format!("{}/", name)
+                };
+                zip.add_directory(dir_name, options)
+                    .map_err(|e| e.to_string())?;
+                add_dir(zip, base, &p, options, stats)?;
+            } else if p.is_file() {
+                zip.start_file(name, options).map_err(|e| e.to_string())?;
+                let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
+                let copied = std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
+                update_bootstrap_archive_stats(
+                    stats,
+                    copied,
+                    BootstrapArchiveExpectations::default(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut stats = BootstrapArchiveStats::default();
+    add_dir(&mut zip, source_dir, source_dir, options, &mut stats)?;
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
 #[cfg(feature = "bootstrap_publisher")]
 async fn publish_bootstrap_snapshot(
     db: &sled::Db,
@@ -5113,8 +5175,10 @@ async fn publish_bootstrap_snapshot(
     ));
     let zip_path_string = zip_path.to_string_lossy().to_string();
     let export_dir = tmp.join(format!(
-        "alphanumeric-bootstrap-export-{}-{}",
-        height, now_secs
+        "alphanumeric-bootstrap-export-{}-{}-{}",
+        height,
+        now_secs,
+        std::process::id()
     ));
     let export_dir_string = export_dir.to_string_lossy().to_string();
 
@@ -5154,96 +5218,71 @@ async fn publish_bootstrap_snapshot(
 
     // Build a zip of a re-imported sled database in a temp directory (not the live DB dir)
     // to avoid Windows file locks (os error 33) when reading active log files.
+    // STEP 1 (UNDER the quiesce lock): flush + logical export/import into a temp DB dir.
+    // This is the ONLY part that reads the live DB, so it must hold the write lock (the
+    // 2026-07-16 park fix). Kept deliberately short — NO compression here (see STEP 2).
+    let export_dir_for_import = export_dir_string.clone();
+    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+        let export_path = std::path::Path::new(&export_dir_for_import);
+        if export_path.exists() {
+            std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
+
+        db_clone.flush().map_err(|e| e.to_string())?;
+        let export = db_clone.export();
+        let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
+        // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
+        tmp_db.import(export);
+        tmp_db.flush().map_err(|e| e.to_string())?;
+        drop(tmp_db);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("export task failed: {}", e))??;
+
+    // Live-DB work (export/import) is done — release the quiesce lock NOW, BEFORE the
+    // CPU-heavy compression, the zip read, and any network I/O. The temp DB is a standalone
+    // copy, so nothing below needs the lock; ingest resumes immediately.
+    let quiesce_secs = quiesce_started.elapsed().as_secs();
+    drop(quiesce);
+
+    // SCALING GUARD (v7.8.0): the write-lock hold == the export/import wall-time. Compression
+    // is OFF the lock as of 7.8.3, so it no longer counts toward this. If the export/import
+    // ever nears the in-process lock watchdog's 10s read-probe window it could self-exit the
+    // headless publisher every publish (a crash-loop). Warn well before. ~3s at ~266MB logical.
+    if quiesce_secs >= 8 {
+        log::warn!(
+            "bootstrap export held the chain write lock {}s (>=8s; lock-watchdog probe=10s) — \
+             bound/chunk the export/import before the DB grows into a publish-cycle crash-loop",
+            quiesce_secs
+        );
+    }
+
+    // STEP 2 (OFF the lock): DEFLATE-compress the temp DB into the snapshot zip. Deflate of
+    // the full export is far heavier than the former Stored copy, so it MUST run off the
+    // quiesce lock — under it, the compression time would stretch the lock-hold past the
+    // watchdog and crash-loop the publisher (that is the whole reason for the STEP 1/STEP 2
+    // split). The sled export is almost all low-entropy padding, so DEFLATE shrinks the
+    // published snapshot ~15-20x with no change to the extracted bytes; every client decodes
+    // DEFLATE (standard zip, default `deflate` feature; verified byte-identical round-trip),
+    // and the manifest's sha256/compressed_bytes below are computed over THIS zip, with
+    // per-file CRC + genesis/tip validation unchanged.
     let archive_stats = tokio::task::spawn_blocking(
         move || -> std::result::Result<BootstrapArchiveStats, String> {
             let export_path = std::path::Path::new(&export_dir_string);
-            if export_path.exists() {
-                std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
-            }
-            std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
-
-            // Flush and logically export/import into a temp DB directory.
-            db_clone.flush().map_err(|e| e.to_string())?;
-            let export = db_clone.export();
-            let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
-            // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
-            tmp_db.import(export);
-            tmp_db.flush().map_err(|e| e.to_string())?;
-            drop(tmp_db);
-
-            let file = std::fs::File::create(&zip_path_string).map_err(|e| e.to_string())?;
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::FileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored)
-                .unix_permissions(0o644);
-
-            fn add_dir(
-                zip: &mut zip::ZipWriter<std::fs::File>,
-                base: &std::path::Path,
-                path: &std::path::Path,
-                options: zip::write::SimpleFileOptions,
-                stats: &mut BootstrapArchiveStats,
-            ) -> std::result::Result<(), String> {
-                for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
-                    let entry = entry.map_err(|e| e.to_string())?;
-                    let p = entry.path();
-                    let rel = p
-                        .strip_prefix(base)
-                        .map_err(|e| format!("strip_prefix: {}", e))?;
-                    let name = rel.to_string_lossy().replace('\\', "/");
-                    if p.is_dir() {
-                        let dir_name = if name.ends_with('/') {
-                            name
-                        } else {
-                            format!("{}/", name)
-                        };
-                        zip.add_directory(dir_name, options)
-                            .map_err(|e| e.to_string())?;
-                        add_dir(zip, base, &p, options, stats)?;
-                    } else if p.is_file() {
-                        zip.start_file(name, options).map_err(|e| e.to_string())?;
-                        let mut f = std::fs::File::open(&p).map_err(|e| e.to_string())?;
-                        let copied = std::io::copy(&mut f, zip).map_err(|e| e.to_string())?;
-                        update_bootstrap_archive_stats(
-                            stats,
-                            copied,
-                            BootstrapArchiveExpectations::default(),
-                        )?;
-                    }
-                }
-                Ok(())
-            }
-
-            let mut stats = BootstrapArchiveStats::default();
-            add_dir(&mut zip, export_path, export_path, options, &mut stats)?;
-            zip.finish().map_err(|e| e.to_string())?;
-
-            // Best-effort cleanup of export directory.
+            let stats = write_bootstrap_archive_zip(
+                export_path,
+                std::path::Path::new(&zip_path_string),
+                zip::CompressionMethod::Deflated,
+            )?;
+            // Best-effort cleanup of the export dir (RAII TempCleanup is the backstop).
             let _ = std::fs::remove_dir_all(export_path);
             Ok(stats)
         },
     )
     .await
     .map_err(|e| format!("zip task failed: {}", e))??;
-
-    // Live-DB work is done; release the quiesce lock BEFORE any file read / network I/O so
-    // ingest resumes and the lock never spans the (slow, possibly-blackholed) upload.
-    drop(quiesce);
-
-    // SCALING GUARD (v7.8.0): the write-lock hold == full-DB export wall-time, which grows with
-    // the chain. If it ever nears the in-process lock watchdog's 10s read-probe window an export
-    // could self-exit the headless publisher every publish (a crash-loop). Warn loudly well
-    // before that so the bounded flush+clone export (export off-lock — v7.8.1) ships with runway.
-    // ~3s today at ~266MB logical.
-    let quiesce_secs = quiesce_started.elapsed().as_secs();
-    if quiesce_secs >= 8 {
-        log::warn!(
-            "bootstrap export held the chain write lock {}s (>=8s; lock-watchdog probe=10s) — \
-             bound/chunk the export (flush+clone, export off-lock) before the DB grows into a \
-             publish-cycle crash-loop",
-            quiesce_secs
-        );
-    }
 
     let bytes = fs::read(&zip_path).await?;
     let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -5252,9 +5291,10 @@ async fn publish_bootstrap_snapshot(
     let sha256 = hex::encode(hasher.finalize());
 
     // SOAK SAFETY (env-gated, OFF in production): the upload target is hardcoded to the real
-    // gateway, so an isolated soak node must never push to it. The park-triggering work
-    // (flush+export+import+zip) has already run above under the quiesce lock; this only skips
-    // shipping the result. With ALPHANUMERIC_SOAK_NO_UPLOAD unset, behavior is identical.
+    // gateway, so an isolated soak node must never push to it. The full build (export/import
+    // under the lock + DEFLATE compression off it) has already run above, so a soak node
+    // still exercises the whole snapshot pipeline; this only skips shipping the result. With
+    // ALPHANUMERIC_SOAK_NO_UPLOAD unset, behavior is identical.
     if std::env::var("ALPHANUMERIC_SOAK_NO_UPLOAD").is_ok() {
         log::info!(
             "soak: bootstrap snapshot built ({} bytes, sha {}…) — skipping upload",
@@ -5703,6 +5743,192 @@ mod tests {
         // not even for the raw escape (it cannot reach `command` in that path).
         assert!(!is_recall_line("\u{1b}[A", true));
         assert!(!is_recall_line("\u{1b}OA", true));
+    }
+
+    // Bootstrap snapshot compression: the published zip switched from Stored to
+    // Deflated (7.8.3). This proves the change is (a) LOSSLESS — extracting a
+    // Deflated archive the way a client does reproduces the source DB byte-for-byte
+    // and it reopens with the same keys, and (b) actually smaller than Stored on
+    // low-entropy content (the sled import padding the real snapshot is full of).
+    // Runs entirely on a throwaway temp DB — never touches any live instance.
+    #[test]
+    fn bootstrap_archive_deflate_roundtrips_lossless_and_smaller() {
+        use std::io::Read;
+        let uniq = std::process::id();
+        let src_dir = std::env::temp_dir().join(format!("a9_ziptest_src_{}", uniq));
+        let out_dir = std::env::temp_dir().join(format!("a9_ziptest_out_{}", uniq));
+        let defl_zip = std::env::temp_dir().join(format!("a9_ziptest_defl_{}.zip", uniq));
+        let stor_zip = std::env::temp_dir().join(format!("a9_ziptest_stor_{}.zip", uniq));
+        for p in [&src_dir, &out_dir] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+
+        // Build a throwaway sled DB: block_ keys + low-entropy padding so DEFLATE has
+        // something to work with (mirrors the ~3x sled bulk-import bloat, which is
+        // almost entirely compressible zeros). Closed before we zip it.
+        {
+            let db = sled::Config::new().path(&src_dir).open().unwrap();
+            for h in 0u32..64 {
+                let b = reconcile_test_block(h, (h % 251) as u8);
+                db.insert(
+                    format!("block_{}", h).as_bytes(),
+                    alphanumeric::a9::codec::serialize(&b).unwrap(),
+                )
+                .unwrap();
+            }
+            for i in 0u32..40 {
+                db.insert(format!("pad_{}", i).as_bytes(), vec![0u8; 32 * 1024])
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let defl = write_bootstrap_archive_zip(&src_dir, &defl_zip, zip::CompressionMethod::Deflated)
+            .unwrap();
+        let stor = write_bootstrap_archive_zip(&src_dir, &stor_zip, zip::CompressionMethod::Stored)
+            .unwrap();
+
+        // Same logical content either way (compression changes only the on-wire size).
+        assert_eq!(defl.file_count, stor.file_count);
+        assert_eq!(defl.extracted_bytes, stor.extracted_bytes);
+        let defl_size = std::fs::metadata(&defl_zip).unwrap().len();
+        let stor_size = std::fs::metadata(&stor_zip).unwrap().len();
+        assert!(
+            defl_size < stor_size,
+            "deflated {defl_size} must be < stored {stor_size}"
+        );
+
+        // Extract the DEFLATED archive exactly the way a client does (zip crate).
+        std::fs::create_dir_all(&out_dir).unwrap();
+        {
+            let f = std::fs::File::open(&defl_zip).unwrap();
+            let mut archive = zip::ZipArchive::new(f).unwrap();
+            for i in 0..archive.len() {
+                let mut zf = archive.by_index(i).unwrap();
+                let rel = zf.name().to_string();
+                let outpath = out_dir.join(&rel);
+                if rel.ends_with('/') {
+                    std::fs::create_dir_all(&outpath).unwrap();
+                } else {
+                    if let Some(parent) = outpath.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&outpath, buf).unwrap();
+                }
+            }
+        }
+
+        // (a) LOSSLESS: every source file is byte-identical in the extraction.
+        fn assert_tree_identical(a: &std::path::Path, b: &std::path::Path) {
+            for entry in std::fs::read_dir(a).unwrap() {
+                let entry = entry.unwrap();
+                let ap = entry.path();
+                let bp = b.join(entry.file_name());
+                if ap.is_dir() {
+                    assert!(bp.is_dir(), "missing dir after round-trip: {bp:?}");
+                    assert_tree_identical(&ap, &bp);
+                } else {
+                    assert_eq!(
+                        std::fs::read(&ap).unwrap(),
+                        std::fs::read(&bp).unwrap(),
+                        "byte mismatch after round-trip: {ap:?}"
+                    );
+                }
+            }
+        }
+        assert_tree_identical(&src_dir, &out_dir);
+
+        // (b) The extracted DB reopens with every block_ key intact.
+        {
+            let db = sled::Config::new().path(&out_dir).open().unwrap();
+            for h in 0u32..64 {
+                assert!(
+                    db.get(format!("block_{}", h).as_bytes()).unwrap().is_some(),
+                    "block_{h} missing after round-trip"
+                );
+            }
+        }
+        assert_eq!(local_tip_height(out_dir.to_str().unwrap()), Some(63));
+
+        for p in [&src_dir, &out_dir] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+        let _ = std::fs::remove_file(&defl_zip);
+        let _ = std::fs::remove_file(&stor_zip);
+    }
+
+    // Isolated REAL-DATA validation: run the actual snapshot zip helper against a COPY
+    // of a real chain DB (NEVER the live publisher), confirm the Deflated archive
+    // extracts to a boot-VALID DB (the client's own local_launch_db_status), the tip
+    // survives, and report the real compression ratio. Ignored by default; run with:
+    //   ALPHANUMERIC_TEST_DB=/path/to/copy-of-blockchain.db \
+    //     cargo test bootstrap_archive_deflate_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bootstrap_archive_deflate_real_db() {
+        use std::io::Read;
+        let src = match std::env::var("ALPHANUMERIC_TEST_DB") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("set ALPHANUMERIC_TEST_DB to a COPY of a real blockchain.db dir");
+                return;
+            }
+        };
+        assert!(src.is_dir(), "ALPHANUMERIC_TEST_DB must be a sled dir: {src:?}");
+        let uniq = std::process::id();
+        let out_dir = std::env::temp_dir().join(format!("a9_realzip_out_{}", uniq));
+        let defl_zip = std::env::temp_dir().join(format!("a9_realzip_defl_{}.zip", uniq));
+        let stor_zip = std::env::temp_dir().join(format!("a9_realzip_stor_{}.zip", uniq));
+        let _ = std::fs::remove_dir_all(&out_dir);
+
+        // The helper only READS the source dir (no sled lock), safe on a static copy.
+        write_bootstrap_archive_zip(&src, &defl_zip, zip::CompressionMethod::Deflated).unwrap();
+        write_bootstrap_archive_zip(&src, &stor_zip, zip::CompressionMethod::Stored).unwrap();
+        let defl_size = std::fs::metadata(&defl_zip).unwrap().len();
+        let stor_size = std::fs::metadata(&stor_zip).unwrap().len();
+        eprintln!(
+            "REAL DB: stored {:.1} MB -> deflated {:.1} MB ({:.1}x smaller download)",
+            stor_size as f64 / 1e6,
+            defl_size as f64 / 1e6,
+            stor_size as f64 / defl_size.max(1) as f64
+        );
+        assert!(defl_size < stor_size);
+
+        // Extract the Deflated archive the way a client does, then confirm it BOOTS.
+        std::fs::create_dir_all(&out_dir).unwrap();
+        {
+            let f = std::fs::File::open(&defl_zip).unwrap();
+            let mut archive = zip::ZipArchive::new(f).unwrap();
+            for i in 0..archive.len() {
+                let mut zf = archive.by_index(i).unwrap();
+                let rel = zf.name().to_string();
+                let outpath = out_dir.join(&rel);
+                if rel.ends_with('/') {
+                    std::fs::create_dir_all(&outpath).unwrap();
+                } else {
+                    if let Some(parent) = outpath.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).unwrap();
+                    std::fs::write(&outpath, buf).unwrap();
+                }
+            }
+        }
+        let status = local_launch_db_status(out_dir.to_str().unwrap());
+        let tip = local_tip_height(out_dir.to_str().unwrap());
+        eprintln!("extracted real DB -> launch status {status:?}, tip {tip:?}");
+        assert!(
+            matches!(status, LaunchDbStatus::Valid),
+            "extracted real DB must be boot-valid, got {status:?}"
+        );
+        assert!(tip.is_some(), "extracted real DB must have a tip");
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let _ = std::fs::remove_file(&defl_zip);
+        let _ = std::fs::remove_file(&stor_zip);
     }
 
     fn reconcile_test_block(index: u32, tag: u8) -> Block {
