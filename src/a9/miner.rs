@@ -14,7 +14,8 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, MAX_BLOCK_TX_COUNT, NETWORK_FEE,
+    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT, MAX_TX_AGE_SECS,
+    MIN_RELAY_FEE_UNITS, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
@@ -69,6 +70,28 @@ pub enum MiningError {
 /// produced block is valid under the unchanged rules, so old and new nodes agree on it.
 fn candidate_timestamp(now_secs: u64, parent_timestamp: u64) -> u64 {
     now_secs.max(parent_timestamp)
+}
+
+/// Random nonce-window base for one mining attempt (splitmix64 of the clock +
+/// pid). NOT crypto — it only de-correlates the search windows of same-wallet
+/// rigs: the reward tx is deterministic with a whole-second timestamp, so two
+/// rigs on one wallet routinely build IDENTICAL merkle roots in the same
+/// second, and with every searcher anchored at nonce 0 they then scan
+/// near-100% overlapping (timestamp, nonce) space — half their combined
+/// hashrate thrown away. Random ~2^34-nonce windows in a 2^64 space collide
+/// with probability ~6e-9 per attempt. Masked to 2^62 so the CPU path's
+/// saturating/checked range math never nears the u64 ceiling.
+pub(crate) fn attempt_nonce_base() -> u64 {
+    let mut x = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ ((std::process::id() as u64) << 32);
+    // splitmix64 finalizer
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (x ^ (x >> 31)) & ((1u64 << 62) - 1)
 }
 
 impl From<Box<dyn std::error::Error>> for MiningError {
@@ -160,23 +183,10 @@ impl MiningManager {
         max_nonce: u64,
         miner_address: String,
     ) -> Result<(u64, String, Block), MiningError> {
-        let transactions: Vec<Transaction> = transactions
-            .iter()
-            .map(|ptx| {
-                let mut tx = Transaction::new(
-                    ptx.sender.clone(),
-                    ptx.recipient.clone(),
-                    ptx.amount,
-                    ptx.fee,
-                    ptx.timestamp,
-                    ptx.signature.clone(),
-                );
-                tx.pub_key = ptx.pub_key.clone();
-                tx.sig_hash = ptx.sig_hash.clone();
-                tx
-            })
-            .collect();
-        let mining_transactions = transactions;
+        // The command-time snapshot is no longer mined from — the template
+        // rebuild below selects from the LIVE mempool every pass, so txs that
+        // confirm mid-grind leave the template and new arrivals enter it.
+        let _ = transactions;
 
         let found = Arc::new(AtomicBool::new(false));
         let abort_for_tip_change = Arc::new(AtomicBool::new(false));
@@ -226,7 +236,7 @@ impl MiningManager {
             }
         }
 
-        let mut current_nonce: u64 = 0;
+        let mut current_nonce: u64 = attempt_nonce_base();
         // Progress-bar refresh cadence per thread. try_lock keeps losers from
         // blocking, but with hundreds of threads even the attempts are traffic —
         // 8192 still repaints many times a second while staying off the hot path.
@@ -262,13 +272,20 @@ impl MiningManager {
                 )
             };
 
-            if current_height > header.number {
+            // `!=`, not `>`: a reorg can LOWER the tip, and with `>` the header
+            // kept its stale-high index while previous_hash tracked the real
+            // (lower) tip, so every subsequent solve was doomed at finalize
+            // until the chain grew back past the stale number. This governs only
+            // WHEN the template is rebuilt (bump header.number + continue) —
+            // validity is still judged later by validate_new_block/finalize
+            // against the actual tip.
+            if current_height != header.number {
                 header.number = current_height;
                 if let Ok(pb) = progress_bar.lock() {
                     pb.set_prefix(format!("Block #{}", header.number));
                     pb.set_message("New network tip detected; rebuilding block template...");
                 }
-                current_nonce = 0;
+                current_nonce = attempt_nonce_base();
                 continue;
             }
 
@@ -281,6 +298,76 @@ impl MiningManager {
                 // freezing the miner whenever the mempool held a pending tx. A shared read
                 // guard lets ingest proceed and never blocks it for the whole rebuild.
                 let blockchain_lock = self.blockchain.read().await;
+                // LIVE mempool, not the command-time snapshot: mine_block runs
+                // for hours, and against a static snapshot (a) a tx another
+                // miner confirmed mid-grind stays in our template and burns the
+                // whole solve at finalize's replay guard, and (b) txs that
+                // arrived after the command never enter the template at all —
+                // no fees, and their confirmation waits on other miners.
+                // Source = get_transactions_for_block (prunes expired, applies
+                // the MAX_TX_AGE_SECS freshness gate) + the handle_mine_command
+                // gates + the consensus bounds the block itself will be checked
+                // against: age with a margin (the block is stamped up to an
+                // attempt later than this filter runs — a tx within seconds of
+                // expiry would pass here and burn the solve at finalize) and
+                // the future-dating bound (a sender's skewed clock would
+                // otherwise poison every rebuilt template).
+                // TIP-CHANGE HOT PATH: this rebuild runs on every ~5s network
+                // tip change, and every ms here is a ms not spent hashing the
+                // new block. When the pool is EMPTY (the common state) an
+                // atomic-counter probe is the ONLY mempool work — the sweep,
+                // selection lock, and filters below never run, and the rebuild
+                // is back to sub-ms. There is nothing to go stale in an empty
+                // template, so the correctness gates below are vacuous anyway.
+                let live_transactions: Vec<Transaction> = if blockchain_lock
+                    .mempool_is_empty()
+                    .await
+                {
+                    Vec::new()
+                } else {
+                let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
+                blockchain_lock
+                    .get_transactions_for_block()
+                    .await
+                    .into_iter()
+                    .filter(|tx| {
+                        if tx.sender == "MINING_REWARDS" {
+                            return false;
+                        }
+                        if blockchain_lock.is_tx_confirmed(&tx.get_tx_id()) {
+                            return false;
+                        }
+                        if !tx.has_valid_regular_amounts() {
+                            return false;
+                        }
+                        // Relay-policy floor, belt to the mempool's suspender:
+                        // never template a below-floor tx that slipped in via
+                        // startup rehydration or a reorg readmit.
+                        if tx.fee_units < MIN_RELAY_FEE_UNITS {
+                            return false;
+                        }
+                        if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
+                            < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
+                        {
+                            return false;
+                        }
+                        if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
+                            return false;
+                        }
+                        if let Some(sig_hex) = &tx.signature {
+                            if let Ok(bytes) = hex::decode(sig_hex) {
+                                return bytes.len() > 64;
+                            }
+                        }
+                        false
+                    })
+                    .collect()
+                };
 
                 // Reserve one slot for the coinbase so the finalized block never exceeds
                 // the consensus per-block transaction cap. Without this bound, a mempool
@@ -292,11 +379,11 @@ impl MiningManager {
                 let regular_cap = MAX_BLOCK_TX_COUNT.saturating_sub(1);
 
                 // Order candidates highest-fee first, then oldest first, so that when the
-                // mempool exceeds the cap we keep the most valuable / longest-waiting
-                // transactions rather than an arbitrary DashMap-iteration subset. Regular
-                // transactions are near-constant size (the ML-DSA signature dominates), so
-                // exact fee order tracks fee-per-byte.
-                let mut ordered: Vec<&Transaction> = mining_transactions.iter().collect();
+                // live mempool exceeds the cap we keep the most valuable / longest-waiting
+                // transactions rather than an arbitrary subset. Regular transactions are
+                // near-constant size (the ML-DSA signature dominates), so exact fee order
+                // tracks fee-per-byte.
+                let mut ordered: Vec<&Transaction> = live_transactions.iter().collect();
                 ordered.sort_by(|a, b| {
                     b.fee_units
                         .cmp(&a.fee_units)
@@ -304,8 +391,18 @@ impl MiningManager {
                 });
 
                 let mut selected_regular =
-                    Vec::with_capacity(regular_cap.min(mining_transactions.len()));
+                    Vec::with_capacity(regular_cap.min(live_transactions.len()));
                 let mut sender_debits: HashMap<String, i128> = HashMap::new();
+                // One confirmed-balance read PER UNIQUE SENDER, not per candidate.
+                // The chain read lock is held across this loop, so a sender's
+                // confirmed balance cannot change mid-selection — the per-candidate
+                // re-await only serialized an O(candidates) chain of redundant index
+                // reads on the tip-change hot path. Worst case was exactly the
+                // dust-storm shape (thousands of txs from a handful of senders).
+                // Intra-template spending is still tracked exactly by
+                // `sender_debits`; selection order and outcomes are byte-identical
+                // to the per-candidate version.
+                let mut confirmed_cache: HashMap<String, i128> = HashMap::new();
                 let mut template_bytes: usize = 0;
 
                 for transaction in ordered {
@@ -315,9 +412,16 @@ impl MiningManager {
                     // Exact i128: tx selection must agree with the consensus writer's
                     // affordability so it doesn't select a tx that finalize then rejects
                     // (the f64 round-trip drifts above ~33.55M coins — 2026-07-12 audit).
-                    let confirmed_units = blockchain_lock
-                        .get_confirmed_balance_units(&transaction.sender)
-                        .await?;
+                    let confirmed_units = match confirmed_cache.get(&transaction.sender) {
+                        Some(units) => *units,
+                        None => {
+                            let units = blockchain_lock
+                                .get_confirmed_balance_units(&transaction.sender)
+                                .await?;
+                            confirmed_cache.insert(transaction.sender.clone(), units);
+                            units
+                        }
+                    };
                     let already_selected = sender_debits
                         .get(&transaction.sender)
                         .copied()
@@ -567,7 +671,7 @@ impl MiningManager {
                 if let Some(height) = latest_height {
                     header.number = height;
                 }
-                current_nonce = 0;
+                current_nonce = attempt_nonce_base();
                 if let Ok(pb) = progress_bar.lock() {
                     pb.reset();
                     pb.set_prefix(format!("Block #{}", header.number));
@@ -691,7 +795,7 @@ impl MiningManager {
                                             });
                                         if let Some((height, true)) = stale_template {
                                             header.number = height;
-                                            current_nonce = 0;
+                                            current_nonce = attempt_nonce_base();
                                             if let Ok(pb) = progress_bar.lock() {
                                                 pb.reset();
                                                 pb.set_prefix(format!("Block #{}", header.number));
