@@ -657,8 +657,14 @@ impl MiningManager {
                         // (driver reset/TDR, eGPU unplug). Without demotion this
                         // would re-panic every attempt forever, mining nothing:
                         // the same wedge the startup check closes, one step
-                        // later. Demote to the CPU scan for the rest of the
-                        // command; a restart re-probes the GPU.
+                        // later. Demote to the CPU scan for the rest of THIS
+                        // command, and poison the shared GPU cache so the NEXT
+                        // command backs off to CPU for a while instead of
+                        // re-initializing wgpu + crashing again every block on a
+                        // card that flaps under load — the GPU auto-recovers
+                        // after the backoff (a driver reset usually clears in
+                        // ~2s) with no process restart.
+                        crate::a9::gpu_miner::note_gpu_died(&join_err.to_string());
                         _gpu_display_guard = None; // stop the GPU display task
                         if let Ok(pb) = progress_bar.lock() {
                             pb.println(format!(

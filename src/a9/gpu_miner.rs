@@ -480,17 +480,44 @@ impl GpuMiner {
 }
 
 use std::sync::atomic::AtomicU64;
-use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::a9::blockchain::Block;
 
 /// Process-wide cached GPU miner (init is ~100-200ms; reuse it across blocks).
-/// The Err side keeps the init/self-check failure so the mine command can SHOW
-/// the user why the GPU is unusable — the default log filter is Error-only, so
-/// a log::warn here was invisible and `mine --gpu` on a broken adapter looked
-/// like mining while doing nothing.
-static GPU: OnceLock<Result<GpuMiner, String>> = OnceLock::new();
+///
+/// REBUILDABLE (was a write-once OnceLock): a mid-session device loss — Windows
+/// TDR, a driver reset, an eGPU unplug — used to poison the cache permanently,
+/// demoting to CPU for the rest of the PROCESS even though the GPU usually
+/// recovers in ~2s. Now the cache can be rebuilt: gpu_status() detects the dead
+/// device on the next command and calls rebuild_gpu(), resuming GPU mining. The
+/// miner is held behind an Arc so the hot mining path clones a handle under a
+/// short lock and a rebuild can swap the cached miner without disturbing an
+/// in-flight attempt (which keeps its old Arc, fails once, and picks up the new
+/// one next attempt). Failed keeps the reason (shown to the user — the default
+/// log filter is Error-only) plus a backoff clock so a truly-dead GPU doesn't
+/// thrash re-creating a device every command. Recovery is split by WHERE the
+/// death is detected: an IDLE loss (device reset between commands) leaves the
+/// cache Ready(dead) and gpu_status rebuilds it IMMEDIATELY on the next command
+/// (likely a transient TDR, recovers in ~2s); an UNDER-LOAD loss (the mining
+/// dispatch panics mid-attempt) routes through note_gpu_died() into Failed, so
+/// the backoff throttles it (a card that dies under load is likely FLAPPING —
+/// marginal PSU/thermal/OC — and re-initializing wgpu every block is pure waste).
+enum GpuCache {
+    Uninit,
+    Ready(Arc<GpuMiner>),
+    Failed { reason: String, since: Instant },
+}
+
+static GPU: Mutex<GpuCache> = Mutex::new(GpuCache::Uninit);
+
+/// Min gap between rebuild attempts once the GPU is in the Failed state, so a
+/// persistently-dead / flapping card retries at most ~once per this window
+/// instead of re-initializing wgpu (~100-200ms) + burning a crashed attempt on
+/// every mine command. Monotonic Instant (not wall-clock) so an NTP step can't
+/// perturb recovery timing.
+const REBUILD_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Converged dispatch size, carried ACROSS attempts. Attempts end on every
 /// network tip change (~5s), and restarting the adaptive sizing from 4 each
@@ -543,37 +570,117 @@ fn record_tip_change_observation() {
 /// Difficulty of the most recent dispatch — read by the display task.
 static LAST_DIFFICULTY: AtomicU64 = AtomicU64::new(0);
 
-fn shared_gpu_status() -> &'static Result<GpuMiner, String> {
-    // GpuMiner::new() now self-checks each adapter inside its fallback loop, so
-    // an Ok here is already a verified-correct BLAKE3 kernel on a working
-    // adapter (with a broken preferred backend having fallen back rather than
-    // demoted to CPU). The Err side keeps the per-adapter rejection reasons so
-    // the mine command can show the user exactly why no GPU was usable.
-    GPU.get_or_init(GpuMiner::new)
+/// (Re)build the miner into `cache` and return a handle. GpuMiner::new() self-
+/// checks each adapter inside its fallback loop, so an Ok here is a verified-
+/// correct BLAKE3 kernel on a working adapter (a broken preferred backend having
+/// fallen back, not demoted). Records Failed with a fresh backoff clock on error.
+fn build_into(cache: &mut GpuCache) -> Result<Arc<GpuMiner>, String> {
+    // catch_unwind: GpuMiner::new() -> new_async() can PANIC OUTSIDE try_build's
+    // own catch_unwind — a wedged driver's wgpu error handler panics in
+    // request_adapter/request_device/Instance::new, which are before the guarded
+    // region. Without catching it here the panic would unwind through the held
+    // Mutex guard: it would POISON the lock AND skip the `*cache = Failed` write
+    // below, so the backoff would never engage and every command would re-init +
+    // re-panic. Catching it records Failed (backoff engages) and lets the guard
+    // drop normally (no poison). GpuMiner::new is a plain fn item, so it is
+    // UnwindSafe without AssertUnwindSafe.
+    let built = std::panic::catch_unwind(GpuMiner::new)
+        .unwrap_or_else(|_| Err("GPU init panicked (driver crash)".to_string()));
+    match built {
+        Ok(m) => {
+            // A rebuild may have switched adapters (fast dGPU -> slower fallback);
+            // re-arm the adaptive dispatch size from the floor so the first
+            // dispatch on the new adapter can't inherit the old one's converged
+            // (possibly MAX) iters and run for seconds before shrinking (during
+            // which the tip/stop checks can't fire). Cheap: rebuilds are rare.
+            LAST_ITERS.store(4, std::sync::atomic::Ordering::Relaxed);
+            let arc = Arc::new(m);
+            *cache = GpuCache::Ready(Arc::clone(&arc));
+            Ok(arc)
+        }
+        Err(e) => {
+            *cache = GpuCache::Failed {
+                reason: e.clone(),
+                since: Instant::now(),
+            };
+            Err(e)
+        }
+    }
+}
+
+/// A live miner handle, building it on first use and rebuilding a Failed cache
+/// once its backoff has elapsed. Cheap on the hot path (Arc clone under a short
+/// lock). The build runs while holding the lock — this serializes concurrent
+/// first-inits exactly like the old OnceLock::get_or_init, and there is no await
+/// held across the std Mutex (GpuMiner::new() is synchronous).
+fn shared_gpu_arc() -> Result<Arc<GpuMiner>, String> {
+    let mut cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    match &*cache {
+        GpuCache::Ready(m) => return Ok(Arc::clone(m)),
+        GpuCache::Failed { reason, since } => {
+            if since.elapsed() < REBUILD_BACKOFF {
+                return Err(reason.clone()); // within backoff: don't thrash re-init
+            }
+            // past backoff: fall through and retry the build
+        }
+        GpuCache::Uninit => {} // first use: fall through and build
+    }
+    build_into(&mut cache)
+}
+
+/// Force a rebuild NOW, ignoring the Failed backoff — called only when a re-check
+/// has just proved the cached device dead (an IDLE loss, cache still Ready), so a
+/// transient TDR (recovers in ~2s) resumes GPU mining immediately instead of
+/// waiting out the backoff window. (An UNDER-LOAD loss goes through
+/// note_gpu_died() into Failed, so it is backoff-throttled, not rebuilt here.)
+fn rebuild_gpu() -> Result<Arc<GpuMiner>, String> {
+    let mut cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    build_into(&mut cache)
+}
+
+/// Record that the GPU died UNDER LOAD (mid-attempt) — called from the miner's
+/// spawn_blocking JoinError arm. Poisons the cache to Failed so the NEXT command
+/// backs off to CPU for REBUILD_BACKOFF instead of re-initializing wgpu + burning
+/// a crashed attempt every block. A card that dies specifically under mining load
+/// is likely FLAPPING (marginal PSU/thermal/OC), so throttling is right; a benign
+/// transient that happened to hit under load simply waits out one backoff window
+/// (still self-heals, unlike the old permanent-CPU demotion).
+pub fn note_gpu_died(reason: &str) {
+    let mut cache = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = GpuCache::Failed {
+        reason: format!("GPU lost mid-session: {reason}"),
+        since: Instant::now(),
+    };
 }
 
 /// Adapter name + backend if the GPU is usable, or the reason it is not.
 /// The mine command prints this ONCE on stdout so `--gpu` is never silent
 /// about which adapter it picked (or that it picked none).
-pub fn gpu_status() -> Result<&'static str, String> {
-    match shared_gpu_status() {
-        Ok(m) => {
-            // Re-verify per mine command: the OnceLock caches Ok forever, but a
-            // mid-session device loss (driver reset/TDR) survives into the NEXT
-            // command — without this the status line would claim a healthy GPU
-            // on a dead device. One 92-byte hash (~ms); if the dead device makes
-            // this panic instead of erroring, the caller's spawn_blocking
-            // JoinError arm already demotes to CPU.
-            m.self_check()
-                .map_err(|e| format!("{} failed re-check: {e}", m.adapter_name))?;
-            Ok(m.adapter_name.as_str())
+pub fn gpu_status() -> Result<String, String> {
+    let miner = shared_gpu_arc()?;
+    // Re-verify per mine command: a cached-Ready miner can have died since the
+    // last command (driver reset/TDR) — without this the status line would claim
+    // a healthy GPU on a dead device. One 92-byte hash (~ms). A dead device can
+    // make the readback PANIC (get_mapped_range on a lost device) rather than
+    // return Err, so catch that too and treat it as a loss.
+    let alive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| miner.self_check()))
+        .unwrap_or_else(|_| Err("device panicked during re-check".into()));
+    match alive {
+        Ok(()) => Ok(miner.adapter_name.clone()),
+        Err(_dead) => {
+            // Rebuild once now (new() self-checks + falls back internally). A
+            // transient TDR recovers in ~2s so GPU mining resumes this command;
+            // a persistently-dead GPU caches Failed and shared_gpu_arc's backoff
+            // throttles further attempts. Either way the caller's spawn_blocking
+            // JoinError arm still demotes to CPU if the rebuild itself dies.
+            let rebuilt = rebuild_gpu()?;
+            Ok(rebuilt.adapter_name.clone())
         }
-        Err(e) => Err(e.clone()),
     }
 }
 
-fn shared_gpu() -> Option<&'static GpuMiner> {
-    shared_gpu_status().as_ref().ok()
+fn shared_gpu() -> Option<Arc<GpuMiner>> {
+    shared_gpu_arc().ok()
 }
 
 /// Build the 92-byte mining header (matches the CPU miner's layout exactly).
