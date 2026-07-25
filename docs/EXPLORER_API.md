@@ -1,7 +1,8 @@
 # Explorer API — run your own explorer
 
 Any node can serve read-only chain data over local HTTP for a website, an
-exchange integration, or scripts. It is **off by default** and costs nothing
+exchange integration, or scripts — plus a client-signed `POST /explorer/submit-tx`
+endpoint for broadcasting transactions. It is **off by default** and costs nothing
 when disabled: no thread, no socket. Your node syncs and verifies the chain
 itself (proof of work, the signed network tip, frontier signature checks), so
 everything this API serves is data **your** machine validated — you do not have
@@ -30,6 +31,11 @@ base units as a string (`amount_units`) so JavaScript never loses precision.
 | `GET /explorer/tx/{height}/{position}` | one transaction plus its block hash and confirmations |
 | `GET /explorer/address/{address}` | balance, whole-history totals, newest-first transactions (paged) |
 | `GET /explorer/supply` | circulating supply (sum of confirmed balances) |
+| `POST /explorer/submit-tx` | accept a client-signed transaction and broadcast it to the network |
+
+`submit-tx` is the one write route and exists only on a node's own explorer API
+(`ALPHANUMERIC_EXPLORER_API`). The public gateway proxies the `GET` read routes
+only and does **not** expose `submit-tx`.
 
 ### Address paging
 
@@ -57,12 +63,15 @@ treated as final well before that (the network's finality margin is 64 blocks).
   seconds. Binding a non-loopback address is allowed but logged with a warning:
   the node serves unauthenticated chain data and is not meant to face the
   internet directly.
-- **Read-only by construction.** Explorer requests can never write to the
-  database, trigger index rebuilds, spend, or see wallet keys; a busy chain
-  lock returns `503 {"error":"chain busy"}` rather than queueing work.
+- **No custody, no server-side signing.** Read requests never write to the
+  database, trigger index rebuilds, or touch wallet keys. The one write path,
+  `POST /explorer/submit-tx`, only accepts an already-signed transaction and
+  relays it — the node never spends or sees a private key. A busy chain lock
+  returns `503 {"error":"chain busy, retry shortly"}` rather than queueing work.
 - **`index_ready: false`** in a response means the address-history index has
   not finished its first build (it builds automatically at startup, normally in
   well under a second). Balances are still served.
-- A small VPS is plenty: the node is self-contained and the database is
-  currently a few megabytes. Run it under systemd/launchd so it restarts
-  itself.
+- A small VPS is plenty, but provision disk for growth: the node is
+  self-contained and the on-disk database is on the order of ~700MB-1GB and
+  grows with chain height (sled never shrinks). Run it under systemd/launchd so
+  it restarts itself.

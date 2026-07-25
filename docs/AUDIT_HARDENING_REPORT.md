@@ -1,7 +1,7 @@
 # Alphanumeric Hardening Report
 
 ## Scope
-- Consensus path: `src/a9/blockchain.rs`, `src/a9/node.rs`, `src/a9/bpos.rs`, `src/a9/progpow.rs`
+- Consensus path: `src/a9/blockchain.rs`, `src/a9/node.rs`, `src/a9/bpos.rs`, `src/a9/miner.rs`
 - Compatibility path: transaction serialization/deserialization
 - Bootstrap integrity path: `src/main.rs`
 
@@ -31,7 +31,7 @@ Path: `src/a9/blockchain.rs`
   - legacy bincode transaction decode into unit-backed transaction fields
 
 4. Targeted warning-noise cleanup in active mining/whisper/wallet paths.
-Paths: `src/a9/progpow.rs`, `src/a9/whisper.rs`, `src/a9/wallet.rs`
+Paths: `src/a9/miner.rs`, `src/a9/whisper.rs`, `src/a9/wallet.rs`
 - Removed several unused-variable hotspots and dead locals in hot code paths.
 
 5. Threat model updated to match actual runtime behavior.
@@ -52,7 +52,7 @@ Paths: `src/a9/wallet.rs`, `src/a9/blockchain.rs`, `src/main.rs`
 - Chain status uses saturating timestamp math for future-skewed local blocks.
 - Pending totals display actual pending values/fees instead of absolute values.
 
-## Remaining Gaps To Reach/Keep 8+ Quality
+## Remaining Hardening Work
 1. Add deterministic multi-node adversarial tests:
 - divergent header broadcasts
 - delayed parent/orphan replay

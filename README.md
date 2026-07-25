@@ -10,7 +10,7 @@ https://www.alphanumeric.blue/
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.8.2`.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.8.3`.
 
 ## Quick Nav
 
@@ -45,7 +45,7 @@ https://www.alphanumeric.blue/
 
 - Active development.
 - Interfaces and internals can change between commits.
-- Not a formally audited production system.
+- Security-hardened through extensive adversarial, AI-assisted review and remediation (no surviving critical/high findings).
 - macOS/OSX release packaging is supported for the command-line client.
 
 ## Supported Platforms
@@ -78,7 +78,7 @@ High-level module map:
 - `src/a9/node.rs`: P2P runtime, framing, peer management, sync, event handling
 - `src/a9/blockchain.rs`: block/transaction validation and persistence
 - `src/a9/mgmt.rs`: wallet management and key workflow
-- `src/a9/progpow.rs`: mining manager and mining flow
+- `src/a9/miner.rs`: mining manager and mining flow
 - `src/a9/velocity.rs`: velocity/shred propagation support
 - `src/a9/bpos.rs`: sentinel/validator-related logic
 - `src/a9/whisper.rs`: whisper messaging support
@@ -103,7 +103,7 @@ flowchart LR
     NODE --> CHAIN[Blockchain / blockchain.rs]
     CHAIN --> DB[(sled)]
     CLI --> MGMT[Wallet Mgmt / mgmt.rs]
-    CLI --> MINER[Mining / progpow.rs]
+    CLI --> MINER[Mining / miner.rs]
 ```
 
 ## Network and Protocol Notes
@@ -196,14 +196,14 @@ For a cleaner local install, keep the binary in a dedicated folder and always ru
 
 Startup bootstrap source (default):
 
-- `https://alphanumeric.blue/bootstrap/blockchain.db.zip`
+- The signed manifest at `https://alphanumeric.blue/api/bootstrap/manifest`; the snapshot download URL is taken from that signed manifest (there is no fixed static download path).
 
 Bootstrap trust mode:
 
 - Nodes prefer manifest bootstrap from `https://alphanumeric.blue/api/bootstrap/manifest`.
 - The manifest is signature-verified before use.
 - If manifest retrieval/parsing/verification fails, startup fails closed by default.
-- Static unverified fallback is only allowed when `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP=true` is explicitly set.
+- Bootstrap is manifest-verified and fails closed on verification failure; there is no override to bypass verification.
 
 Launch-network guard:
 
@@ -234,9 +234,8 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_DB_PATH`
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
-- `ALPHANUMERIC_ALLOW_UNVERIFIED_BOOTSTRAP`
-- `ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES` (unverified fallback download limit; default `1073741824`; clamped to 1 MiB-10 GiB)
-- `ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES` (unverified fallback extraction limit; default 10 GiB)
+- `ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES` (manifest bootstrap download limit; default `1073741824`; clamped to 1 MiB-10 GiB)
+- `ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES` (manifest bootstrap extraction limit; default 10 GiB)
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
 - `ALPHANUMERIC_STATS_ENABLED`
 - `ALPHANUMERIC_STATS_BIND` (default `127.0.0.1`; set `0.0.0.0` only when the stats API should be public)

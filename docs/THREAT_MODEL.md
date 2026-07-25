@@ -1,7 +1,7 @@
 # Alphanumeric Threat Model
 
 ## Scope
-This model covers consensus-critical behavior in `src/a9/blockchain.rs`, `src/a9/progpow.rs`, `src/a9/bpos.rs`, `src/a9/node.rs`, and bootstrap state loading in `src/main.rs`.
+This model covers consensus-critical behavior in `src/a9/blockchain.rs`, `src/a9/miner.rs`, `src/a9/bpos.rs`, `src/a9/node.rs`, and bootstrap state loading in `src/main.rs`.
 
 ## Security Goals
 - Deterministic block validity across nodes.

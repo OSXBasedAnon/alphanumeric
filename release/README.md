@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This is the user guide for Alphanumeric client version 7.8.2.
+This is the user guide for Alphanumeric client version 7.8.3.
 
 The prebuilt download is for **macOS (Apple Silicon)**. On **Windows** and
 **Linux** you build from source — it takes a few minutes and one `cargo`
@@ -251,7 +251,7 @@ gateway snapshot:
 ```bash
 ALPHANUMERIC_PUBLIC_NODE=true \
 ALPHANUMERIC_PUBLIC_IP=<your.routable.ip> \
-ALPHANUMERIC_PORT=7367 \
+ALPHANUMERIC_PORT=7177 \
 ./alphanumeric
 ```
 
