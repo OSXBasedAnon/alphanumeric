@@ -70,7 +70,10 @@ impl NetworkConfig {
         let mut config = Self::default();
 
         if let Ok(port) = env::var("ALPHANUMERIC_PORT") {
-            match port.parse::<u16>() {
+            match port.trim().parse::<u16>() {
+                Ok(0) => eprintln!(
+                    "WARNING: ALPHANUMERIC_PORT='0' was provided; binding to an ephemeral port."
+                ),
                 Ok(p) => config.port = p,
                 // Mirror BIND_IP below: warn loudly instead of silently swallowing a bad value,
                 // so an operator whose override was ignored actually finds out.
@@ -96,7 +99,7 @@ impl NetworkConfig {
         }
 
         if let Ok(max_peers) = env::var("ALPHANUMERIC_MAX_PEERS") {
-            match max_peers.parse::<usize>() {
+            match max_peers.trim().parse::<usize>() {
                 Ok(n) => {
                     config.max_peers =
                         Self::clamp_usize(n, MIN_CONFIGURED_PEERS, MAX_CONFIGURED_PEERS)
@@ -109,12 +112,52 @@ impl NetworkConfig {
         }
 
         if let Ok(max_connections) = env::var("ALPHANUMERIC_MAX_CONNECTIONS") {
-            if let Ok(max_connections) = max_connections.parse::<usize>() {
-                config.max_connections = Self::clamp_usize(
-                    max_connections,
-                    MIN_CONFIGURED_CONNECTIONS,
-                    MAX_CONFIGURED_CONNECTIONS,
-                );
+            let max_connections = max_connections.trim();
+            match max_connections.parse::<usize>() {
+                Ok(max_connections) => {
+                    config.max_connections = Self::clamp_usize(
+                        max_connections,
+                        MIN_CONFIGURED_CONNECTIONS,
+                        MAX_CONFIGURED_CONNECTIONS,
+                    );
+                }
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_MAX_CONNECTIONS='{}' is not a valid number; ignoring it and using {}.",
+                    max_connections, config.max_connections
+                ),
+            }
+        }
+
+        if let Ok(velocity_enabled) = env::var("ALPHANUMERIC_VELOCITY_ENABLED") {
+            let velocity_enabled = velocity_enabled.trim().to_ascii_lowercase();
+            match velocity_enabled.as_str() {
+                "1" | "true" | "on" | "yes" => config.velocity_enabled = true,
+                "0" | "false" | "off" | "no" => config.velocity_enabled = false,
+                "" => {
+                    eprintln!(
+                        "WARNING: ALPHANUMERIC_VELOCITY_ENABLED is empty; using {}.",
+                        config.velocity_enabled
+                    )
+                }
+                _ => {
+                    eprintln!(
+                        "WARNING: ALPHANUMERIC_VELOCITY_ENABLED='{}' is not a valid boolean; using {}.",
+                        velocity_enabled, config.velocity_enabled
+                    )
+                }
+            }
+        }
+
+        if let Ok(max_shred_size) = env::var("ALPHANUMERIC_MAX_SHRED_SIZE") {
+            let max_shred_size = max_shred_size.trim();
+            match max_shred_size.parse::<usize>() {
+                Ok(size) => {
+                    config.max_shred_size = Self::clamp_usize(size, MIN_SHRED_SIZE, MAX_SHRED_SIZE);
+                }
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_MAX_SHRED_SIZE='{}' is not a valid number; ignoring it and using {}.",
+                    max_shred_size, config.max_shred_size
+                ),
             }
         }
 
@@ -130,26 +173,30 @@ impl NetworkConfig {
                 .collect();
         }
 
-        if let Ok(velocity_enabled) = env::var("ALPHANUMERIC_VELOCITY_ENABLED") {
-            config.velocity_enabled = velocity_enabled.eq_ignore_ascii_case("true");
-        }
-
-        if let Ok(max_shred_size) = env::var("ALPHANUMERIC_MAX_SHRED_SIZE") {
-            if let Ok(size) = max_shred_size.parse::<usize>() {
-                config.max_shred_size = Self::clamp_usize(size, MIN_SHRED_SIZE, MAX_SHRED_SIZE);
-            }
-        }
-
         if let Ok(erasure_shards) = env::var("ALPHANUMERIC_ERASURE_SHARDS") {
-            if let Ok(shards) = erasure_shards.parse::<usize>() {
-                config.erasure_shards =
-                    Self::clamp_usize(shards, MIN_ERASURE_SHARDS, MAX_ERASURE_SHARDS);
+            let erasure_shards = erasure_shards.trim();
+            match erasure_shards.parse::<usize>() {
+                Ok(shards) => {
+                    config.erasure_shards =
+                        Self::clamp_usize(shards, MIN_ERASURE_SHARDS, MAX_ERASURE_SHARDS);
+                }
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_ERASURE_SHARDS='{}' is not a valid number; ignoring it and using {}.",
+                    erasure_shards, config.erasure_shards
+                ),
             }
         }
 
         if let Ok(erasure_parity) = env::var("ALPHANUMERIC_ERASURE_PARITY") {
-            if let Ok(parity) = erasure_parity.parse::<usize>() {
-                config.erasure_parity = parity.min(MAX_ERASURE_PARITY);
+            let erasure_parity = erasure_parity.trim();
+            match erasure_parity.parse::<usize>() {
+                Ok(parity) => {
+                    config.erasure_parity = parity.min(MAX_ERASURE_PARITY);
+                }
+                Err(_) => eprintln!(
+                    "WARNING: ALPHANUMERIC_ERASURE_PARITY='{}' is not a valid number; ignoring it and using {}.",
+                    erasure_parity, config.erasure_parity
+                ),
             }
         }
 

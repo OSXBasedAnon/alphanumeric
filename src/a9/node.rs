@@ -55,8 +55,8 @@ use tokio::{
 };
 
 use crate::a9::blockchain::{
-    Block, Blockchain, BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT_BYTES, MIN_RELAY_FEE_UNITS, RateLimiter, Transaction, SYSTEM_ADDRESSES,
+    Block, Blockchain, BlockchainError, RateLimiter, Transaction, FEE_SYSTEM_ACTIVATION_HEIGHT,
+    MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
@@ -83,10 +83,10 @@ const MAX_PEERS_PER_SUBNET: usize = 3;
 // 4x the 64-aligned convergence window, so it never throttles catch-up.
 pub const MAX_GETBLOCKS_SPAN: u32 = 256;
 const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
-// Group IPv6 peers by /48, NOT /64: a single rented /48 contains 65,536 /64s, so a /64
-// grouping let one attacker present that many distinct "subnets" and completely bypass the
-// MAX_PEERS_PER_SUBNET anti-eclipse cap. /48 is the typical site allocation, so all of an
-// attacker's addresses within one rental collapse to one group and the cap bites.
+                                 // Group IPv6 peers by /48, NOT /64: a single rented /48 contains 65,536 /64s, so a /64
+                                 // grouping let one attacker present that many distinct "subnets" and completely bypass the
+                                 // MAX_PEERS_PER_SUBNET anti-eclipse cap. /48 is the typical site allocation, so all of an
+                                 // attacker's addresses within one rental collapse to one group and the cap bites.
 const SUBNET_MASK_IPV6: u8 = 48; // /48 subnet
 
 // Timeouts and intervals
@@ -1371,8 +1371,7 @@ pub struct Node {
     /// Per-block set of peers that successfully received the compact announcement.
     /// Failed or never-selected peers remain eligible on a later relay pass; this
     /// bookkeeping is independent from full-block relay and acceptance dedup.
-    compact_relay_delivered:
-        Arc<PLMutex<LruCache<[u8; 32], HashSet<SocketAddr>>>>,
+    compact_relay_delivered: Arc<PLMutex<LruCache<[u8; 32], HashSet<SocketAddr>>>>,
     /// Peers that advertised CompactBlockV1 over the backward-compatible ping/pong
     /// capability marker. Entries expire unless refreshed by health pings.
     compact_capable_peers: Arc<DashMap<SocketAddr, Instant>>,
@@ -1564,17 +1563,13 @@ impl CompactPendingCache {
         if let Some(previous) = self.entries.pop(&block_hash) {
             self.bytes = self.bytes.saturating_sub(previous.cache_bytes);
         }
-        while self.bytes.saturating_add(entry.cache_bytes)
-            > COMPACT_PENDING_CACHE_BYTE_BUDGET
-        {
+        while self.bytes.saturating_add(entry.cache_bytes) > COMPACT_PENDING_CACHE_BYTE_BUDGET {
             let Some((_, evicted)) = self.entries.pop_lru() else {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(evicted.cache_bytes);
         }
-        if self.bytes.saturating_add(entry.cache_bytes)
-            > COMPACT_PENDING_CACHE_BYTE_BUDGET
-        {
+        if self.bytes.saturating_add(entry.cache_bytes) > COMPACT_PENDING_CACHE_BYTE_BUDGET {
             return false;
         }
 
@@ -1605,17 +1600,13 @@ impl CompactFullBlockCache {
         if let Some(previous) = self.entries.pop(&block_hash) {
             self.bytes = self.bytes.saturating_sub(previous.encoded_bytes);
         }
-        while self.bytes.saturating_add(entry.encoded_bytes)
-            > COMPACT_FULL_CACHE_BYTE_BUDGET
-        {
+        while self.bytes.saturating_add(entry.encoded_bytes) > COMPACT_FULL_CACHE_BYTE_BUDGET {
             let Some((_, evicted)) = self.entries.pop_lru() else {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(evicted.encoded_bytes);
         }
-        if self.bytes.saturating_add(entry.encoded_bytes)
-            > COMPACT_FULL_CACHE_BYTE_BUDGET
-        {
+        if self.bytes.saturating_add(entry.encoded_bytes) > COMPACT_FULL_CACHE_BYTE_BUDGET {
             return false;
         }
 
@@ -2592,7 +2583,10 @@ impl Node {
     /// as "public/dialable" (SSRF / internal-host dialing). Non-mapped addresses pass through.
     fn canonical_ip(ip: IpAddr) -> IpAddr {
         match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
             v4 => v4,
         }
     }
@@ -3088,11 +3082,19 @@ impl Node {
         let marker = force_rebootstrap_marker_path(dir);
         match std::fs::write(&marker, format!("{}\n", reason)) {
             Ok(()) => {
-                warn!("Force re-bootstrap scheduled ({}): {}", reason, marker.display());
+                warn!(
+                    "Force re-bootstrap scheduled ({}): {}",
+                    reason,
+                    marker.display()
+                );
                 true
             }
             Err(e) => {
-                warn!("Could not write re-bootstrap marker {}: {}", marker.display(), e);
+                warn!(
+                    "Could not write re-bootstrap marker {}: {}",
+                    marker.display(),
+                    e
+                );
                 false
             }
         }
@@ -3182,7 +3184,13 @@ impl Node {
     /// Pure gate for announce_to_discovery: allow when the last SUCCESS is older
     /// than `interval` AND the last ATTEMPT is older than `retry`. Zero means
     /// "never". Kept as a pure function so the two-marker semantics are testable.
-    fn announce_gate(now: u64, last_success: u64, last_attempt: u64, interval: u64, retry: u64) -> bool {
+    fn announce_gate(
+        now: u64,
+        last_success: u64,
+        last_attempt: u64,
+        interval: u64,
+        retry: u64,
+    ) -> bool {
         if last_success > 0 && now.saturating_sub(last_success) < interval {
             return false;
         }
@@ -3228,8 +3236,7 @@ impl Node {
         // posts still advanced the height marker (stored pre-POST at the time), so
         // the trigger skipped ahead without the snapshot ever landing and VERIFIED
         // drifted 38+ behind during the very bursts this exists to cover.
-        let delta_due =
-            tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 7;
+        let delta_due = tip_now.saturating_sub(last_h) >= 8 && now.saturating_sub(last_at) >= 7;
         if delta_due {
             // Claim the burst window atomically. A bare store let two concurrent callers
             // (the 5s periodic loop and the post-mine path) both observe delta_due and both
@@ -3481,7 +3488,8 @@ impl Node {
                 // Also feed the forever-monotonic high-water used by the unreachable
                 // fail-open bound (see field doc): it must NOT age out, or a total
                 // beacon outage would drop a far-behind node into orphan mining.
-                self.last_seen_beacon_height.fetch_max(height, Ordering::AcqRel);
+                self.last_seen_beacon_height
+                    .fetch_max(height, Ordering::AcqRel);
             }
             return Some(TipBeaconInfo {
                 height: height as u32,
@@ -4031,7 +4039,6 @@ impl Node {
             )
         };
 
-
         // Caught-up FAST PATH (runs ~every 1s on the publisher). Cheapest first: the
         // gateway-maintained relay-head hint ({height,hash} of the newest ACCEPTED
         // block POST, refreshed/purged on every write). One CDN-fresh read replaces a
@@ -4106,8 +4113,7 @@ impl Node {
         // held a ~120-block dead fork), and the per-tick candidate budget could burn
         // entirely on dead mid-fork blocks before ever reaching the live chain's
         // fresh tip.
-        let parent_hashes: HashSet<[u8; 32]> =
-            blocks.iter().map(|b| b.previous_hash).collect();
+        let parent_hashes: HashSet<[u8; 32]> = blocks.iter().map(|b| b.previous_hash).collect();
         let mut candidates: Vec<(u32, [u8; 32])> = blocks
             .iter()
             .filter(|b| b.index >= local_tip && !parent_hashes.contains(&b.hash))
@@ -4164,8 +4170,7 @@ impl Node {
         // dead fork while a reorg to ~2272 was available). This is a HINT prepended to
         // the candidate list; it still routes through the same validated converge.
         {
-            let present: std::collections::HashSet<u32> =
-                blocks.iter().map(|b| b.index).collect();
+            let present: std::collections::HashSet<u32> = blocks.iter().map(|b| b.index).collect();
             let max_h = blocks.iter().map(|b| b.index).max().unwrap_or(local_tip);
             let mut first_gap = None;
             let mut h = local_tip.saturating_add(1);
@@ -4259,7 +4264,11 @@ impl Node {
             if height == local_tip && Some(hash) == local_hash {
                 // Our own tip: nothing above us that converged — we are as caught up
                 // as the relay allows this tick.
-                return if tried == 0 { Converge::Converged } else { last };
+                return if tried == 0 {
+                    Converge::Converged
+                } else {
+                    last
+                };
             }
             {
                 let mut dead = self.relay_dead_targets.lock();
@@ -4286,15 +4295,14 @@ impl Node {
                 hash,
                 version: 0,
             };
-            let outcome = match timeout(PER_CANDIDATE_TIMEOUT, self.converge_to_canonical(&target))
-                .await
-            {
-                Ok(outcome) => outcome,
-                // Ran out its slice (deep walk / slow relay): treat as a transient gap.
-                // Soft-memoized below so the next tick tries a DIFFERENT branch first
-                // instead of re-sinking the budget into the same slow walk.
-                Err(_) => Converge::BeaconStale,
-            };
+            let outcome =
+                match timeout(PER_CANDIDATE_TIMEOUT, self.converge_to_canonical(&target)).await {
+                    Ok(outcome) => outcome,
+                    // Ran out its slice (deep walk / slow relay): treat as a transient gap.
+                    // Soft-memoized below so the next tick tries a DIFFERENT branch first
+                    // instead of re-sinking the budget into the same slow walk.
+                    Err(_) => Converge::BeaconStale,
+                };
             match outcome {
                 done @ (Converge::Converged | Converge::AtTipAhead | Converge::Progressed) => {
                     return done;
@@ -4308,10 +4316,8 @@ impl Node {
                     // Lineage-dead (propagates to children via ancestry_dead): a branch
                     // that fails validation OR whose fork point is below the finality
                     // window damns every future tip minted on it. Gap verdicts stay soft.
-                    let lineage_dead = matches!(
-                        failed,
-                        Converge::BranchInvalid | Converge::NeedsBootstrap
-                    );
+                    let lineage_dead =
+                        matches!(failed, Converge::BranchInvalid | Converge::NeedsBootstrap);
                     self.relay_dead_targets
                         .lock()
                         .put((height, hash), (Instant::now(), lineage_dead));
@@ -4447,7 +4453,10 @@ impl Node {
                 );
                 definitive_miss = true;
             } else {
-                debug!("exact-block fetch #{}: inner block failed to deserialize", height);
+                debug!(
+                    "exact-block fetch #{}: inner block failed to deserialize",
+                    height
+                );
                 definitive_miss = true;
             }
         }
@@ -5116,7 +5125,10 @@ impl Node {
                 warn!("Tip beacon unreachable; mining on local tip (fail-open)");
                 return Ok(());
             };
-            debug!("mine-prep: beacon h{} v{}; converge round", beacon.height, beacon.version);
+            debug!(
+                "mine-prep: beacon h{} v{}; converge round",
+                beacon.height, beacon.version
+            );
             // Backstop timeout per round: the deadline is only checked BETWEEN rounds,
             // and one converge round can fan out into many relay window fetches (each
             // individually HTTP-bounded but unbounded in count on a deeply forked
@@ -5206,8 +5218,7 @@ impl Node {
                         (backoff * 2).min(Duration::from_secs(5))
                     };
                     tokio::time::sleep(backoff).await;
-                    last_round_tip =
-                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    last_round_tip = self.blockchain.read().await.get_latest_block_index() as u32;
                 }
                 // Transient relay gap. A DEEP gap (history aged out) already escalated to
                 // NeedsBootstrap above (M3), so this is a near-the-tip hiccup: after the
@@ -5277,8 +5288,7 @@ impl Node {
                         (backoff * 2).min(Duration::from_secs(5))
                     };
                     tokio::time::sleep(backoff).await;
-                    last_round_tip =
-                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    last_round_tip = self.blockchain.read().await.get_latest_block_index() as u32;
                 }
                 // The canonical branch we were pointed at failed validation locally.
                 // Terminal for that branch, not for us: mine on our local tip and let
@@ -5423,12 +5433,7 @@ impl Node {
             };
             if !discovered_peers.is_empty() {
                 direct_result = self
-                    .broadcast_block(
-                        Arc::new(block.clone()),
-                        None,
-                        discovered_peers,
-                        false,
-                    )
+                    .broadcast_block(Arc::new(block.clone()), None, discovered_peers, false)
                     .await;
             }
         }
@@ -5626,10 +5631,7 @@ impl Node {
     }
 
     fn explorer_busy() -> (StatusCode, Json<Value>) {
-        Self::explorer_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "chain busy, retry shortly",
-        )
+        Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "chain busy, retry shortly")
     }
 
     /// Addresses are hex strings (or the MINING_REWARDS literal); reject anything
@@ -5766,9 +5768,7 @@ impl Node {
         (StatusCode::OK, Json(payload))
     }
 
-    async fn explorer_tip_handler(
-        State(state): State<ExplorerState>,
-    ) -> (StatusCode, Json<Value>) {
+    async fn explorer_tip_handler(State(state): State<ExplorerState>) -> (StatusCode, Json<Value>) {
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -5778,7 +5778,11 @@ impl Node {
                 let finalized_height = chain.trusted_checkpoint_height();
                 (
                     StatusCode::OK,
-                    Json(Self::explorer_block_json(&block, tip_height, finalized_height)),
+                    Json(Self::explorer_block_json(
+                        &block,
+                        tip_height,
+                        finalized_height,
+                    )),
                 )
             }
             None => Self::explorer_err(StatusCode::NOT_FOUND, "chain is empty"),
@@ -5797,7 +5801,11 @@ impl Node {
         match chain.get_block(height) {
             Ok(block) => (
                 StatusCode::OK,
-                Json(Self::explorer_block_json(&block, tip_height, finalized_height)),
+                Json(Self::explorer_block_json(
+                    &block,
+                    tip_height,
+                    finalized_height,
+                )),
             ),
             Err(_) => Self::explorer_err(StatusCode::NOT_FOUND, "block not found"),
         }
@@ -5980,14 +5988,18 @@ impl Node {
             return Self::explorer_busy();
         };
         let payload = {
-            let balance_units = chain.confirmed_balance_units_readonly(&address).unwrap_or(0);
+            let balance_units = chain
+                .confirmed_balance_units_readonly(&address)
+                .unwrap_or(0);
             let index_meta = chain.address_index_meta();
             let summary = chain.address_history_summary(&address).unwrap_or(None);
-            let entries = chain.address_txs_page(&address, limit, before).unwrap_or_default();
+            let entries = chain
+                .address_txs_page(&address, limit, before)
+                .unwrap_or_default();
             let next = if entries.len() == limit {
-                entries.last().map(|entry| {
-                    json!({ "before_height": entry.height, "before_pos": entry.position })
-                })
+                entries.last().map(
+                    |entry| json!({ "before_height": entry.height, "before_pos": entry.position }),
+                )
             } else {
                 None
             };
@@ -6192,9 +6204,9 @@ impl Node {
         let listener = std::net::TcpListener::bind(addr).map_err(|e| {
             NodeError::Network(format!("Explorer API failed to bind {}: {}", addr, e))
         })?;
-        listener.set_nonblocking(true).map_err(|e| {
-            NodeError::Network(format!("Explorer API nonblocking listener: {}", e))
-        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| NodeError::Network(format!("Explorer API nonblocking listener: {}", e)))?;
 
         tokio::spawn(async move {
             match axum::Server::from_tcp(listener) {
@@ -7196,8 +7208,7 @@ impl Node {
         // are the known failure mode there, 2026-07-08).
         let node_clone = node.clone();
         tokio::spawn(async move {
-            let relay_every =
-                (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
+            let relay_every = (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
             let mut tick: u64 = 0;
             let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_RETRY_SECS));
             loop {
@@ -7285,8 +7296,7 @@ impl Node {
         {
             let node_clone = node.clone();
             tokio::spawn(async move {
-                let mut version_check =
-                    interval(Duration::from_secs(VERSION_CHECK_INTERVAL_SECS));
+                let mut version_check = interval(Duration::from_secs(VERSION_CHECK_INTERVAL_SECS));
                 loop {
                     version_check.tick().await;
                     node_clone.check_client_version_and_warn().await;
@@ -7315,9 +7325,7 @@ impl Node {
                 // the cap holding dead/rotated addresses forever.
                 {
                     let mut book = node_clone.pex_addr_book.write().await;
-                    book.retain(|_, learned| {
-                        now.saturating_sub(*learned) < PEX_ADDR_TTL_SECS
-                    });
+                    book.retain(|_, learned| now.saturating_sub(*learned) < PEX_ADDR_TTL_SECS);
                 }
                 let pex_targets: Vec<SocketAddr> = {
                     let peers = node_clone.peers.read().await;
@@ -7463,7 +7471,10 @@ impl Node {
                 .unwrap_or(512)
                 .min(4096);
             if depth > 0 {
-                info!("Deep relay heal: re-posting last {} blocks to refill any gaps", depth);
+                info!(
+                    "Deep relay heal: re-posting last {} blocks to refill any gaps",
+                    depth
+                );
                 heal_node.post_recent_blocks_to_relay(depth).await;
             }
         });
@@ -7551,7 +7562,11 @@ impl Node {
             // instead of forking. A plain client is driven by the beacon and only
             // does a rare safety pull, so it never blind-polls the relay.
             let is_publisher = Self::public_header_snapshots_enabled();
-            let tick_secs = if is_publisher { 1 } else { BEACON_POLL_INTERVAL_SECS };
+            let tick_secs = if is_publisher {
+                1
+            } else {
+                BEACON_POLL_INTERVAL_SECS
+            };
             let safety_secs = if is_publisher { 1 } else { 30 };
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
@@ -7751,7 +7766,9 @@ impl Node {
                             // transiently around its own reorg). Wait for the next
                             // beacon rather than escalate.
                             Converge::BranchInvalid => {
-                                debug!("Beacon branch failed local validation; awaiting next beacon");
+                                debug!(
+                                    "Beacon branch failed local validation; awaiting next beacon"
+                                );
                             }
                         }
                     }
@@ -8450,10 +8467,7 @@ impl Node {
         let response = self.send_message_with_response(addr, &ping).await?;
 
         match response {
-            NetworkMessage::Pong {
-                timestamp,
-                node_id,
-            } => {
+            NetworkMessage::Pong { timestamp, node_id } => {
                 self.observe_compact_capability(addr, &node_id);
                 if now.abs_diff(timestamp) <= 5 {
                     Ok(())
@@ -9302,19 +9316,14 @@ impl Node {
         Ok(None)
     }
 
-    fn witness_matches_committed_receipt(
-        receipt: &Transaction,
-        candidate: &Transaction,
-    ) -> bool {
+    fn witness_matches_committed_receipt(receipt: &Transaction, candidate: &Transaction) -> bool {
         candidate.get_tx_id() == receipt.get_tx_id()
-            && receipt
-                .pub_key
-                .as_ref()
-                .map_or(true, |expected| candidate.pub_key.as_ref() == Some(expected))
-            && receipt
-                .sig_hash
-                .as_ref()
-                .map_or(true, |expected| candidate.sig_hash.as_ref() == Some(expected))
+            && receipt.pub_key.as_ref().map_or(true, |expected| {
+                candidate.pub_key.as_ref() == Some(expected)
+            })
+            && receipt.sig_hash.as_ref().map_or(true, |expected| {
+                candidate.sig_hash.as_ref() == Some(expected)
+            })
     }
 
     fn is_signature_truncated(sig_hex: &str) -> bool {
@@ -9390,8 +9399,7 @@ impl Node {
             return;
         };
         if signature.len() <= 64
-            || tx.sig_hash.as_deref()
-                != Some(Transaction::signature_hash_hex(&signature).as_str())
+            || tx.sig_hash.as_deref() != Some(Transaction::signature_hash_hex(&signature).as_str())
         {
             return;
         }
@@ -9399,9 +9407,7 @@ impl Node {
             return;
         };
         let tx_id = tx.get_tx_id();
-        self.tx_witness_cache
-            .lock()
-            .put(tx_id.clone(), tx.clone());
+        self.tx_witness_cache.lock().put(tx_id.clone(), tx.clone());
         self.compact_tx_index.lock().put(leaf, tx_id);
     }
 
@@ -9419,10 +9425,7 @@ impl Node {
         }
     }
 
-    fn lookup_verified_compact_transaction(
-        &self,
-        leaf: &[u8; 32],
-    ) -> Option<Transaction> {
+    fn lookup_verified_compact_transaction(&self, leaf: &[u8; 32]) -> Option<Transaction> {
         let tx_id = self.compact_tx_index.lock().get(leaf).cloned()?;
         let tx = match self.tx_witness_cache.lock().get(&tx_id).cloned() {
             Some(tx) => tx,
@@ -9552,11 +9555,7 @@ impl Node {
         }
     }
 
-    fn remember_pending_compact(
-        &self,
-        announcement: CompactBlockV1,
-        source: SocketAddr,
-    ) -> bool {
+    fn remember_pending_compact(&self, announcement: CompactBlockV1, source: SocketAddr) -> bool {
         let mut pending = self.compact_pending.lock();
         if let Some(existing) = pending.entries.get_mut(&announcement.hash) {
             if existing.announcement != announcement {
@@ -9572,8 +9571,7 @@ impl Node {
         else {
             return false;
         };
-        let Some(coinbase_bytes) =
-            Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+        let Some(coinbase_bytes) = Self::compact_transaction_encoded_bytes(&announcement.coinbase)
         else {
             return false;
         };
@@ -9605,11 +9603,7 @@ impl Node {
         )
     }
 
-    fn compact_sources(
-        &self,
-        block_hash: &[u8; 32],
-        primary: SocketAddr,
-    ) -> Vec<SocketAddr> {
+    fn compact_sources(&self, block_hash: &[u8; 32], primary: SocketAddr) -> Vec<SocketAddr> {
         let mut sources = vec![primary];
         if let Some(inflight) = self.compact_inflight.get(block_hash) {
             for source in &inflight.sources {
@@ -9641,10 +9635,8 @@ impl Node {
         }
 
         let mut pending = self.compact_pending.lock();
-        let Some((expected_hash, previous_bytes, old_assembled, old_cache_bytes)) = pending
-            .entries
-            .peek(block_hash)
-            .and_then(|entry| {
+        let Some((expected_hash, previous_bytes, old_assembled, old_cache_bytes)) =
+            pending.entries.peek(block_hash).and_then(|entry| {
                 entry
                     .announcement
                     .transaction_hashes
@@ -9699,7 +9691,10 @@ impl Node {
         &self,
         block_hash: &[u8; 32],
         indexes: &[u16],
-    ) -> (Vec<IndexedCompactTransactionV1>, Option<PendingCompactRoute>) {
+    ) -> (
+        Vec<IndexedCompactTransactionV1>,
+        Option<PendingCompactRoute>,
+    ) {
         if let Some(block) = self
             .compact_full_blocks
             .lock()
@@ -10479,8 +10474,7 @@ impl Node {
         if !Self::compact_header_extends_parent(compact, parent) {
             return None;
         }
-        let claimed =
-            Self::claim_compact_inflight_in(inflight, compact.hash, source, started)?;
+        let claimed = Self::claim_compact_inflight_in(inflight, compact.hash, source, started)?;
         match Arc::clone(slots).try_acquire_owned() {
             Ok(permit) => Some((claimed, permit)),
             Err(_) => {
@@ -10772,8 +10766,7 @@ impl Node {
                             return Err(e.into());
                         }
                     }
-                    self.seed_compact_index_from_admitted_transaction(&tx)
-                        .await;
+                    self.seed_compact_index_from_admitted_transaction(&tx).await;
 
                     // SPAWN the gossip off the single-consumer event pump: gossip_transaction
                     // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
@@ -10834,7 +10827,12 @@ impl Node {
 
                             // Fallback to traditional broadcast (broadcast_block also floods the mesh)
                             if let Err(e) = self
-                                .broadcast_block(Arc::new(block.clone()), None, selected_peers, true)
+                                .broadcast_block(
+                                    Arc::new(block.clone()),
+                                    None,
+                                    selected_peers,
+                                    true,
+                                )
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
@@ -10859,8 +10857,9 @@ impl Node {
                         let node = self.clone();
                         let block_arc = Arc::new(block.clone());
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                node.broadcast_block(block_arc, None, selected_peers, true).await
+                            if let Err(e) = node
+                                .broadcast_block(block_arc, None, selected_peers, true)
+                                .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
                             }
@@ -10943,8 +10942,7 @@ impl Node {
                             let blockchain = self.blockchain.read().await;
                             for i in idx..=chunk_end {
                                 if let Ok(block) = blockchain.get_block(i) {
-                                    bytes +=
-                                        codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
+                                    bytes += codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
                                     if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
                                         break 'serve;
                                     }
@@ -10986,7 +10984,9 @@ impl Node {
                     return Ok(());
                 }
                 for block in blocks {
-                    if block.calculate_hash_for_block() != block.hash || !block.verify_pow_meets_floor() {
+                    if block.calculate_hash_for_block() != block.hash
+                        || !block.verify_pow_meets_floor()
+                    {
                         continue;
                     }
                     // Verify transaction signatures (via witnesses fetched from the
@@ -11174,16 +11174,13 @@ impl Node {
                         // difficulty before touching either the in-flight table
                         // or one of the four reconstruction work slots. Recheck
                         // while claiming so a concurrent tip change fails closed.
-                        let claim =
-                            self.try_claim_compact_reconstruction(&compact, addr).await;
+                        let claim = self.try_claim_compact_reconstruction(&compact, addr).await;
                         let Some((started, _work_permit)) = claim else {
                             if self.compact_ingress_route(&compact).await
                                 == CompactIngressRoute::FetchFullCompetitor
                             {
-                                self.process_compact_competitor_fallback(
-                                    compact, addr, tx,
-                                )
-                                .await?;
+                                self.process_compact_competitor_fallback(compact, addr, tx)
+                                    .await?;
                             }
                             return Ok(None);
                         };
@@ -11303,10 +11300,7 @@ impl Node {
                                 // Retain the committed full body for bounded missing-tx
                                 // replies, but do not seed the verified witness index
                                 // until the normal validation pipeline succeeds.
-                                self.remember_compact_full_block(
-                                    Arc::clone(&block_ref),
-                                    false,
-                                );
+                                self.remember_compact_full_block(Arc::clone(&block_ref), false);
                                 let compact_targets: Vec<SocketAddr> = {
                                     let peers = self.peers.read().await;
                                     self.select_broadcast_peers(&peers, peers.len().min(16))
@@ -11340,7 +11334,12 @@ impl Node {
                         }
                     }
 
-                    if cheap_ok && self.verify_block_parallel(&block_ref).await.unwrap_or(false) {
+                    if cheap_ok
+                        && self
+                            .verify_block_parallel(&block_ref)
+                            .await
+                            .unwrap_or(false)
+                    {
                         // Standalone-VALID tip-extender. Source-filter the targets FIRST and only
                         // claim the single relay slot when there is somewhere to forward it, so a node
                         // whose only peer IS the source does not burn the claim and suppress the
@@ -11401,7 +11400,12 @@ impl Node {
                         drop(peers);
 
                         if let Err(e) = self
-                            .broadcast_block(Arc::clone(&block_ref), Some(addr), selected_peers, true)
+                            .broadcast_block(
+                                Arc::clone(&block_ref),
+                                Some(addr),
+                                selected_peers,
+                                true,
+                            )
                             .await
                         {
                             warn!("Failed to propagate block to selected peers: {}", e);
@@ -11440,7 +11444,10 @@ impl Node {
                     Ok(Ok(blocks)) => return Ok(Some(NetworkMessage::Blocks(blocks))),
                     Ok(Err(_)) => {}
                     Err(_) => {
-                        warn!("GetBlocks [{}..{}] response timed out internally", start, end);
+                        warn!(
+                            "GetBlocks [{}..{}] response timed out internally",
+                            start, end
+                        );
                     }
                 }
             }
@@ -11507,6 +11514,7 @@ impl Node {
                                     block_hash,
                                     indices,
                                     from: addr,
+                                    permit: None,
                                 })
                                 .await?;
                         }
@@ -11530,7 +11538,10 @@ impl Node {
                                 self.record_peer_failure(addr).await;
                                 return Err(NodeError::Network("Shred range too large".into()));
                             }
-                            if !self.rate_limiter.check_limit(&format!("shred_range:{}", addr)) {
+                            if !self
+                                .rate_limiter
+                                .check_limit(&format!("shred_range:{}", addr))
+                            {
                                 self.record_peer_failure(addr).await;
                                 return Err(NodeError::Network("Shred range rate limited".into()));
                             }
@@ -11543,9 +11554,8 @@ impl Node {
                                 let mut bytes = 0usize;
                                 for height in start_height..=end_height {
                                     if let Ok(block) = blockchain.get_block(height) {
-                                        bytes += codec::serialize(&block)
-                                            .map(|v| v.len())
-                                            .unwrap_or(0);
+                                        bytes +=
+                                            codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
                                         if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
                                             break;
                                         }
@@ -11574,10 +11584,7 @@ impl Node {
                 }
             }
 
-            NetworkMessage::Ping {
-                timestamp,
-                node_id,
-            } => {
+            NetworkMessage::Ping { timestamp, node_id } => {
                 self.observe_compact_capability(addr, &node_id);
                 // Update peer info
                 let mut peers = self.peers.write().await;
@@ -11594,10 +11601,7 @@ impl Node {
                 }));
             }
 
-            NetworkMessage::Pong {
-                timestamp,
-                node_id,
-            } => {
+            NetworkMessage::Pong { timestamp, node_id } => {
                 self.observe_compact_capability(addr, &node_id);
                 // Calculate and update latency
                 let now = SystemTime::now()
@@ -11757,7 +11761,10 @@ impl Node {
         // So enabling it can only help propagation, never reduce base reachability. Opt out explicitly
         // with ALPHANUMERIC_WEBRTC_MESH=false (or 0/no/off).
         match std::env::var("ALPHANUMERIC_WEBRTC_MESH") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
             Err(_) => true,
         }
     }
@@ -11828,9 +11835,13 @@ impl Node {
         if !Self::webrtc_mesh_enabled() {
             return;
         }
-        let gateway_base = Self::discovery_bases().into_iter().next().unwrap_or_default();
+        let gateway_base = Self::discovery_bases()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         let transport: Arc<dyn SignalTransport> =
-            match HttpSignalTransport::new(self.handshake_key_bytes.as_ref().clone(), gateway_base) {
+            match HttpSignalTransport::new(self.handshake_key_bytes.as_ref().clone(), gateway_base)
+            {
                 Ok(t) => Arc::new(t),
                 Err(e) => {
                     warn!("WebRTC mesh: transport init failed: {}", e);
@@ -11878,7 +11889,9 @@ impl Node {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     // Fail-safe: only an explicit gateway `mesh_enabled: false` disables the mesh.
                     if !node.fetch_mesh_enabled().await {
-                        warn!("WebRTC mesh disabled by gateway kill switch — shutting the mesh down");
+                        warn!(
+                            "WebRTC mesh disabled by gateway kill switch — shutting the mesh down"
+                        );
                         enabled.store(false, std::sync::atomic::Ordering::Relaxed);
                         *store.write().await = None; // stop mesh_gossip immediately
                         mesh.wake(); // break the poll loop out of its sleep so it exits promptly
@@ -11993,8 +12006,9 @@ impl Node {
             // Mesh-local seen-set: dedups block replays / gossip loops WITHOUT touching the shared
             // network_bloom, so a mesh block that fails standalone validation never poisons the shared
             // dedup path (and can't be re-validated on every replay).
-            let mesh_seen: Arc<PLMutex<LruCache<String, ()>>> =
-                Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
+            let mesh_seen: Arc<PLMutex<LruCache<String, ()>>> = Arc::new(PLMutex::new(
+                LruCache::new(NonZeroUsize::new(8192).unwrap()),
+            ));
             tokio::spawn(async move {
                 while let Some((_peer, bytes)) = inbound_rx.recv().await {
                     node.handle_mesh_message(bytes, &mesh_seen).await;
@@ -12020,12 +12034,15 @@ impl Node {
         network_bloom: &NetworkBloom,
         block_hash: &[u8; 32],
     ) -> bool {
-        mesh_seen.lock().contains(&hex::encode(block_hash))
-            || network_bloom.check(block_hash)
+        mesh_seen.lock().contains(&hex::encode(block_hash)) || network_bloom.check(block_hash)
     }
 
     #[cfg(feature = "webrtc_mesh")]
-    async fn handle_mesh_message(&self, bytes: Vec<u8>, mesh_seen: &Arc<PLMutex<LruCache<String, ()>>>) {
+    async fn handle_mesh_message(
+        &self,
+        bytes: Vec<u8>,
+        mesh_seen: &Arc<PLMutex<LruCache<String, ()>>>,
+    ) {
         let msg: NetworkMessage = match codec::deserialize(&bytes) {
             Ok(m) => m,
             Err(_) => return,
@@ -12037,17 +12054,13 @@ impl Node {
                 };
                 if !compact.validate_commitment()
                     || !self.compact_extends_local_tip(&compact).await
-                    || Self::mesh_block_already_seen(
-                        mesh_seen,
-                        &self.network_bloom,
-                        &compact.hash,
-                    )
+                    || Self::mesh_block_already_seen(mesh_seen, &self.network_bloom, &compact.hash)
                 {
                     return;
                 }
                 let hash = hex::encode(compact.hash);
-                let Ok(_work_permit) = Arc::clone(&self.compact_reconstruction_slots)
-                    .try_acquire_owned()
+                let Ok(_work_permit) =
+                    Arc::clone(&self.compact_reconstruction_slots).try_acquire_owned()
                 else {
                     return;
                 };
@@ -12073,11 +12086,7 @@ impl Node {
             NetworkMessage::Block(b) => {
                 let calculated_hash = b.calculate_hash_for_block();
                 let hash = hex::encode(calculated_hash);
-                if Self::mesh_block_already_seen(
-                    mesh_seen,
-                    &self.network_bloom,
-                    &calculated_hash,
-                ) {
+                if Self::mesh_block_already_seen(mesh_seen, &self.network_bloom, &calculated_hash) {
                     return; // mesh-local dedup: replay, compact success, or gossip loop
                 }
                 // Reject below-floor PoW cheaply, BEFORE acquiring a validation permit — the same gate
@@ -12291,19 +12300,14 @@ impl Node {
         // still be available to start convergence. Fetch its exact full body in
         // the separate fallback lane; older/deeper gaps are recovered by range
         // sync, where ancestry can be validated in order.
-        if compact.index == tip.index
-            || compact.index == tip.index.saturating_add(1)
-        {
+        if compact.index == tip.index || compact.index == tip.index.saturating_add(1) {
             CompactIngressRoute::FetchFullCompetitor
         } else {
             CompactIngressRoute::DeferToChainSync
         }
     }
 
-    async fn compact_ingress_route(
-        &self,
-        compact: &CompactBlockV1,
-    ) -> CompactIngressRoute {
+    async fn compact_ingress_route(&self, compact: &CompactBlockV1) -> CompactIngressRoute {
         let Some(tip) = self.blockchain.read().await.get_last_block() else {
             return CompactIngressRoute::DeferToChainSync;
         };
@@ -12358,11 +12362,8 @@ impl Node {
                             e
                         ))
                     })?;
-                    node.send_message(
-                        peer,
-                        &NetworkMessage::CompactBlockV1((*compact).clone()),
-                    )
-                    .await
+                    node.send_message(peer, &NetworkMessage::CompactBlockV1((*compact).clone()))
+                        .await
                 }
                 .await;
                 (peer, result)
@@ -12381,8 +12382,7 @@ impl Node {
         }
         if delivered > 0 {
             Ok(delivered)
-        } else if let Some((_, Err(err))) =
-            results.into_iter().find(|(_, result)| result.is_err())
+        } else if let Some((_, Err(err))) = results.into_iter().find(|(_, result)| result.is_err())
         {
             Err(err)
         } else {
@@ -12498,10 +12498,7 @@ impl Node {
                             NodeError::Network("Compact broadcast body unavailable".into())
                         })?;
                         match node
-                            .send_message(
-                                peer,
-                                &NetworkMessage::CompactBlockV1((*compact).clone()),
-                            )
+                            .send_message(peer, &NetworkMessage::CompactBlockV1((*compact).clone()))
                             .await
                         {
                             Ok(()) => Ok(()),
@@ -12511,11 +12508,8 @@ impl Node {
                                     "Compact broadcast to {} failed ({}); retrying full block",
                                     peer, compact_error
                                 );
-                                node.send_message(
-                                    peer,
-                                    &NetworkMessage::Block((*block).clone()),
-                                )
-                                .await
+                                node.send_message(peer, &NetworkMessage::Block((*block).clone()))
+                                    .await
                             }
                         }
                     } else {
@@ -12814,15 +12808,16 @@ impl Node {
 
                     // Enforce authenticated transport after a successful handshake.
                     // Any decrypt failure or missing secret is treated as a protocol violation.
-                    let (message, plaintext) =
-                        match self.decrypt_message_with_plaintext(data_to_process, &shared_secret) {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                warn!("Decryption failed from {}: {}", peer_addr, e);
-                                self.record_peer_failure(peer_addr).await;
-                                break 'connection;
-                            }
-                        };
+                    let (message, plaintext) = match self
+                        .decrypt_message_with_plaintext(data_to_process, &shared_secret)
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!("Decryption failed from {}: {}", peer_addr, e);
+                            self.record_peer_failure(peer_addr).await;
+                            break 'connection;
+                        }
+                    };
 
                     // Process message; the plaintext bytes carry the dedup/length checks (no
                     // re-serialize, no second deserialize).
@@ -13348,8 +13343,8 @@ impl Node {
 
         // STEP 3: bulk-pull [local_tip+1 .. target] ascending, applying each block through the
         // SAME ingest path as every other source. The checkpoint is NOT advanced here (Step 4).
-        let mut cursor = { self.blockchain.read().await.get_latest_block_index() as u32 }
-            .saturating_add(1);
+        let mut cursor =
+            { self.blockchain.read().await.get_latest_block_index() as u32 }.saturating_add(1);
         loop {
             if cursor > target {
                 break;
@@ -13597,14 +13592,12 @@ impl Node {
                                 // an inflated handshake height cannot lower the checkpoint,
                                 // so it cannot route tip-extending blocks into the receipt
                                 // fast-path.
-                                let verify_from = {
-                                    self.blockchain.read().await.verification_floor()
-                                }
-                                .saturating_add(1);
+                                let verify_from =
+                                    { self.blockchain.read().await.verification_floor() }
+                                        .saturating_add(1);
                                 for block in candidate_blocks {
                                     let before = {
-                                        self.blockchain.read().await.get_latest_block_index()
-                                            as u32
+                                        self.blockchain.read().await.get_latest_block_index() as u32
                                     };
                                     let result = if block.index >= verify_from {
                                         self.accept_peer_block(&block, Some(*peer_addr)).await
@@ -14055,13 +14048,21 @@ mod tests {
             !ranked.contains(&below),
             "a peer below the beacon must not be a candidate"
         );
-        assert_eq!(ranked.len(), 3, "only the three at/above the beacon qualify");
+        assert_eq!(
+            ranked.len(),
+            3,
+            "only the three at/above the beacon qualify"
+        );
         // tallest first: 2000, 1005, 1000
         let heights: Vec<u32> = ranked
             .iter()
             .map(|a| peers.get(a).unwrap().blocks)
             .collect();
-        assert_eq!(heights, vec![2000, 1005, 1000], "candidates ranked tallest first");
+        assert_eq!(
+            heights,
+            vec![2000, 1005, 1000],
+            "candidates ranked tallest first"
+        );
         // none qualify when the beacon is above every peer
         assert!(Node::full_sync_candidate_peers(&peers, 3000).is_empty());
     }
@@ -14102,7 +14103,10 @@ mod tests {
         // pop keeps the byte counter in sync.
         let before = wc.bytes;
         assert!(wc.pop("tx99").is_some());
-        assert!(wc.bytes < before, "pop decrements the resident byte counter");
+        assert!(
+            wc.bytes < before,
+            "pop decrements the resident byte counter"
+        );
     }
 
     // #11: with a generous byte budget the COUNT cap binds — and because the inner LruCache is
@@ -14263,7 +14267,8 @@ mod tests {
     #[test]
     fn ipv4_mapped_ipv6_is_canonicalized_before_filtering() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let mapped = |a: u8, b: u8, c: u8, d: u8| IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
+        let mapped =
+            |a: u8, b: u8, c: u8, d: u8| IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
         let metadata = mapped(169, 254, 169, 254); // link-local cloud metadata endpoint
         let private = mapped(10, 0, 0, 1);
         let loopback = mapped(127, 0, 0, 1);
@@ -14289,10 +14294,18 @@ mod tests {
     #[test]
     fn any_peer_ahead_flags_only_a_genuinely_higher_peer() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let peer = |p: u16, h: u32| (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), p), h);
+        let peer = |p: u16, h: u32| {
+            (
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), p),
+                h,
+            )
+        };
         // No peers, or every peer at/below us -> caught up, not behind.
         assert!(!Node::any_peer_ahead(&[], 100));
-        assert!(!Node::any_peer_ahead(&[peer(1, 100), peer(2, 99), peer(3, 1)], 100));
+        assert!(!Node::any_peer_ahead(
+            &[peer(1, 100), peer(2, 99), peer(3, 1)],
+            100
+        ));
         // A peer strictly ahead -> genuinely behind.
         assert!(Node::any_peer_ahead(&[peer(1, 100), peer(2, 101)], 100));
     }
@@ -14304,8 +14317,9 @@ mod tests {
     // independent.
     #[test]
     fn early_relay_claim_is_single_winner() {
-        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> =
-            Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
+        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> = Arc::new(PLMutex::new(LruCache::new(
+            NonZeroUsize::new(8192).unwrap(),
+        )));
         let claim = |h: [u8; 32]| seen.lock().put(h, ()).is_none();
         let h = [7u8; 32];
         assert!(claim(h), "first claim wins");
@@ -14319,8 +14333,9 @@ mod tests {
     #[test]
     fn early_relay_claim_has_exactly_one_concurrent_winner() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> =
-            Arc::new(PLMutex::new(LruCache::new(NonZeroUsize::new(8192).unwrap())));
+        let seen: Arc<PLMutex<LruCache<[u8; 32], ()>>> = Arc::new(PLMutex::new(LruCache::new(
+            NonZeroUsize::new(8192).unwrap(),
+        )));
         let wins = Arc::new(AtomicUsize::new(0));
         let h = [42u8; 32];
         let mut handles = Vec::new();
@@ -14374,24 +14389,38 @@ mod tests {
         let mut wrong_height = make();
         wrong_height.index = (tip_index + 2) as u32;
         wrong_height.hash = wrong_height.calculate_hash_for_block();
-        assert!(!Node::early_relay_cheap_gate(&wrong_height, tip_index, &tip_hash));
+        assert!(!Node::early_relay_cheap_gate(
+            &wrong_height,
+            tip_index,
+            &tip_hash
+        ));
 
         // Wrong parent: rejected.
         let mut wrong_parent = make();
         wrong_parent.previous_hash = [1u8; 32];
         wrong_parent.hash = wrong_parent.calculate_hash_for_block();
-        assert!(!Node::early_relay_cheap_gate(&wrong_parent, tip_index, &tip_hash));
+        assert!(!Node::early_relay_cheap_gate(
+            &wrong_parent,
+            tip_index,
+            &tip_hash
+        ));
 
         // Lied-about hash (claimed != computed): rejected.
         let mut hash_liar = make();
         hash_liar.hash = [7u8; 32];
-        assert!(!Node::early_relay_cheap_gate(&hash_liar, tip_index, &tip_hash));
+        assert!(!Node::early_relay_cheap_gate(
+            &hash_liar, tip_index, &tip_hash
+        ));
 
         // Merkle root not matching the tx set: rejected (recompute hash so only merkle fails).
         let mut merkle_liar = make();
         merkle_liar.merkle_root = [3u8; 32];
         merkle_liar.hash = merkle_liar.calculate_hash_for_block();
-        assert!(!Node::early_relay_cheap_gate(&merkle_liar, tip_index, &tip_hash));
+        assert!(!Node::early_relay_cheap_gate(
+            &merkle_liar,
+            tip_index,
+            &tip_hash
+        ));
     }
 
     fn compact_test_block() -> Block {
@@ -14480,8 +14509,7 @@ mod tests {
         assert!(!wrong_ordered_leaf.validate_commitment());
 
         let mut too_many = compact;
-        too_many.transaction_hashes =
-            vec![[1u8; 32]; MAX_BLOCK_TX_COUNT.saturating_add(1)];
+        too_many.transaction_hashes = vec![[1u8; 32]; MAX_BLOCK_TX_COUNT.saturating_add(1)];
         assert!(!too_many.validate_commitment());
 
         let mut oversized_coinbase = compact_test_block();
@@ -14562,19 +14590,20 @@ mod tests {
             let mut unrelated = honest.clone();
             unrelated.hash[0] ^= (i as u8).saturating_add(1);
             unrelated.previous_hash[0] ^= 1;
-            assert!(
-                Node::try_claim_compact_reconstruction_in(
-                    &unrelated,
-                    &parent,
-                    &inflight,
-                    &slots,
-                    source(8_000 + i as u16),
-                    Instant::now(),
-                )
-                .is_none()
-            );
+            assert!(Node::try_claim_compact_reconstruction_in(
+                &unrelated,
+                &parent,
+                &inflight,
+                &slots,
+                source(8_000 + i as u16),
+                Instant::now(),
+            )
+            .is_none());
         }
-        assert_eq!(slots.available_permits(), COMPACT_RECONSTRUCTION_CONCURRENCY);
+        assert_eq!(
+            slots.available_permits(),
+            COMPACT_RECONSTRUCTION_CONCURRENCY
+        );
         assert!(inflight.is_empty());
 
         let (started, permit) = Node::try_claim_compact_reconstruction_in(
@@ -14593,7 +14622,10 @@ mod tests {
         assert!(inflight.contains_key(&honest.hash));
         inflight.remove_if(&honest.hash, |_, current| current.started == started);
         drop(permit);
-        assert_eq!(slots.available_permits(), COMPACT_RECONSTRUCTION_CONCURRENCY);
+        assert_eq!(
+            slots.available_permits(),
+            COMPACT_RECONSTRUCTION_CONCURRENCY
+        );
     }
 
     #[test]
@@ -14622,8 +14654,9 @@ mod tests {
         let mut same_height_competitor = next.clone();
         same_height_competitor.index = tip.index;
         same_height_competitor.previous_hash = [0xabu8; 32];
-        same_height_competitor.hash =
-            same_height_competitor.header_block().calculate_hash_for_block();
+        same_height_competitor.hash = same_height_competitor
+            .header_block()
+            .calculate_hash_for_block();
         assert_eq!(
             Node::compact_ingress_route_against_tip(&same_height_competitor, &tip),
             CompactIngressRoute::FetchFullCompetitor,
@@ -14664,13 +14697,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let source = SocketAddr::from(([198, 51, 100, 1], 8_000 + i as u16));
                 barrier.wait();
-                if Node::claim_compact_inflight_in(
-                    &inflight,
-                    hash,
-                    source,
-                    Instant::now(),
-                )
-                .is_some()
+                if Node::claim_compact_inflight_in(&inflight, hash, source, Instant::now())
+                    .is_some()
                 {
                     winners.fetch_add(1, Ordering::Relaxed);
                 }
@@ -14732,9 +14760,7 @@ mod tests {
             Blockchain::calculate_merkle_leaf_hash(&receipt).unwrap(),
             compact.transaction_hashes[1]
         );
-        assert!(!Node::compact_transaction_has_full_bound_witness(
-            &receipt
-        ));
+        assert!(!Node::compact_transaction_has_full_bound_witness(&receipt));
         assert!(
             !Node::apply_compact_body(
                 &compact,
@@ -14838,8 +14864,7 @@ mod tests {
         let base_block = Arc::new(compact_test_block());
         let mut full = CompactFullBlockCache {
             entries: LruCache::new(
-                NonZeroUsize::new(COMPACT_FULL_BLOCK_CACHE_ENTRIES)
-                    .expect("nonzero full cache"),
+                NonZeroUsize::new(COMPACT_FULL_BLOCK_CACHE_ENTRIES).expect("nonzero full cache"),
             ),
             bytes: 0,
         };
@@ -14928,8 +14953,7 @@ mod tests {
         block.hash = block.calculate_hash_for_block();
 
         let encoded_block = codec::serialize(&block).unwrap().len();
-        let encoded_full_frame =
-            codec::serialize(&NetworkMessage::Block(block.clone())).unwrap();
+        let encoded_full_frame = codec::serialize(&NetworkMessage::Block(block.clone())).unwrap();
         assert!(encoded_block > COMPACT_SAFE_ASSEMBLED_BYTES);
         assert!(
             encoded_full_frame.len() <= MAX_MESSAGE_SIZE,
@@ -14961,38 +14985,25 @@ mod tests {
 
     #[test]
     fn compact_delivery_success_is_tracked_per_target() {
-        let mut delivered =
-            LruCache::new(NonZeroUsize::new(8).expect("nonzero delivery cache"));
+        let mut delivered = LruCache::new(NonZeroUsize::new(8).expect("nonzero delivery cache"));
         let hash = [0x33u8; 32];
         let a = SocketAddr::from(([203, 0, 113, 1], 7_001));
         let b = SocketAddr::from(([203, 0, 113, 2], 7_002));
         let c = SocketAddr::from(([203, 0, 113, 3], 7_003));
 
         assert_eq!(
-            Node::compact_targets_not_delivered_in(
-                &mut delivered,
-                &hash,
-                [a, b, c],
-            ),
+            Node::compact_targets_not_delivered_in(&mut delivered, &hash, [a, b, c],),
             vec![a, b, c]
         );
         Node::mark_compact_delivered_in(&mut delivered, &hash, a);
         assert_eq!(
-            Node::compact_targets_not_delivered_in(
-                &mut delivered,
-                &hash,
-                [a, b, c],
-            ),
+            Node::compact_targets_not_delivered_in(&mut delivered, &hash, [a, b, c],),
             vec![b, c],
             "one successful peer must not suppress retries to untouched peers"
         );
         Node::mark_compact_delivered_in(&mut delivered, &hash, c);
         assert_eq!(
-            Node::compact_targets_not_delivered_in(
-                &mut delivered,
-                &hash,
-                [a, b, c],
-            ),
+            Node::compact_targets_not_delivered_in(&mut delivered, &hash, [a, b, c],),
             vec![b],
             "a failed/unsent target remains eligible"
         );
@@ -15011,8 +15022,7 @@ mod tests {
         block.hash = block.calculate_hash_for_block();
         let compact = CompactBlockV1::from_block(&block).unwrap();
         let full_bytes = codec::serialize(&NetworkMessage::Block(block)).unwrap();
-        let compact_bytes =
-            codec::serialize(&NetworkMessage::CompactBlockV1(compact)).unwrap();
+        let compact_bytes = codec::serialize(&NetworkMessage::CompactBlockV1(compact)).unwrap();
         assert!(
             compact_bytes.len() < 2 * 1024,
             "11-payment compact announcement unexpectedly large: {}",
@@ -15030,8 +15040,7 @@ mod tests {
     fn compact_protocol_messages_round_trip() {
         let block = compact_test_block();
         let compact = CompactBlockV1::from_block(&block).unwrap();
-        let encoded =
-            codec::serialize(&NetworkMessage::CompactBlockV1(compact.clone())).unwrap();
+        let encoded = codec::serialize(&NetworkMessage::CompactBlockV1(compact.clone())).unwrap();
         match codec::deserialize::<NetworkMessage>(&encoded).unwrap() {
             NetworkMessage::CompactBlockV1(decoded) => assert_eq!(decoded, compact),
             _ => panic!("wrong compact announcement variant"),
@@ -15134,8 +15143,7 @@ mod tests {
         }
 
         let mut wrong_version = raw;
-        wrong_version[MESH_COMPACT_V1_MAGIC.len()] =
-            MESH_COMPACT_V1_VERSION.saturating_add(1);
+        wrong_version[MESH_COMPACT_V1_MAGIC.len()] = MESH_COMPACT_V1_VERSION.saturating_add(1);
         assert!(
             CompactBlockV1::decode_mesh_envelope(&wrong_version).is_none(),
             "unknown envelopes remain ignorable by version"
@@ -15150,11 +15158,7 @@ mod tests {
         let mesh_seen = Arc::new(PLMutex::new(LruCache::new(
             NonZeroUsize::new(8).expect("nonzero mesh seen cache"),
         )));
-        assert!(!Node::mesh_block_already_seen(
-            &mesh_seen,
-            &bloom,
-            &hash
-        ));
+        assert!(!Node::mesh_block_already_seen(&mesh_seen, &bloom, &hash));
 
         // The normal NewBlock path commits the accepted hash to network_bloom
         // before relaying. Therefore the immediately-following ordered full
@@ -15175,10 +15179,7 @@ mod tests {
     fn tcp_compact_extension_is_fail_closed_for_this_release() {
         let node_id = "ab".repeat(32);
         assert!(!Node::advertises_compact_v1(&node_id));
-        let marked = format!(
-            "{}{}",
-            node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX
-        );
+        let marked = format!("{}{}", node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX);
         assert!(Node::compact_v1_marker_well_formed(&marked));
         assert!(
             !Node::advertises_compact_v1(&marked),
@@ -15230,9 +15231,9 @@ mod tests {
                 .all(Node::is_tcp_compact_extension),
             "every compact request, response, and announcement must hit the inert ingress/egress gate"
         );
-        assert!(!Node::is_tcp_compact_extension(
-            &NetworkMessage::Block(compact_test_block())
-        ));
+        assert!(!Node::is_tcp_compact_extension(&NetworkMessage::Block(
+            compact_test_block()
+        )));
     }
 
     // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
@@ -15245,8 +15246,11 @@ mod tests {
         assert!(Node::witness_count_within_limit(1));
         assert!(Node::witness_count_within_limit(MAX_BLOCK_TX_COUNT)); // full valid block: ok
         assert!(!Node::witness_count_within_limit(MAX_BLOCK_TX_COUNT + 1)); // over the limit: rejected
-        // The pre-check bound is the ledger bound, not an independent number.
-        assert_eq!(MAX_BLOCK_TX_COUNT, crate::a9::blockchain::MAX_BLOCK_TX_COUNT);
+                                                                            // The pre-check bound is the ledger bound, not an independent number.
+        assert_eq!(
+            MAX_BLOCK_TX_COUNT,
+            crate::a9::blockchain::MAX_BLOCK_TX_COUNT
+        );
     }
 
     // The read-endpoint token bucket shared by /stats and the explorer reads admits a burst up
@@ -15298,7 +15302,10 @@ mod tests {
         let mut held = Vec::new();
         for _ in 0..MAX_PARALLEL_WITNESS_FETCHES {
             let slot = pool.acquire_fetch_slot();
-            assert!(slot.is_some(), "a fetch slot must be available up to the pool size");
+            assert!(
+                slot.is_some(),
+                "a fetch slot must be available up to the pool size"
+            );
             held.push(slot.unwrap());
         }
         // Saturated: refuse rather than queue behind slow peers (the caller defers the block).
@@ -15324,11 +15331,11 @@ mod tests {
         // Genuinely behind by more than a race -> refuse.
         assert!(Node::stale_tip_mine_refused(41370, 41395));
         assert!(Node::stale_tip_mine_refused(41370, 41373)); // exactly 3 behind
-        // Same/next-height race (<=2) -> mine.
+                                                             // Same/next-height race (<=2) -> mine.
         assert!(!Node::stale_tip_mine_refused(41395, 41395)); // at tip
         assert!(!Node::stale_tip_mine_refused(41395, 41396)); // 1-block race
         assert!(!Node::stale_tip_mine_refused(41395, 41397)); // 2-block race (edge)
-        // Legitimately AHEAD of the last-seen beacon (we mined faster) -> mine.
+                                                              // Legitimately AHEAD of the last-seen beacon (we mined faster) -> mine.
         assert!(!Node::stale_tip_mine_refused(41397, 41395));
         // No beacon ever seen (known_tip 0) -> never refuses.
         assert!(!Node::stale_tip_mine_refused(41395, 0));
@@ -15354,7 +15361,10 @@ mod tests {
         obs.push_back((now - Duration::from_secs(5), 41370)); // stale CDN copy
         obs.push_back((now - Duration::from_secs(1), 41395));
         assert_eq!(Node::window_high_water(&obs, now, W), 41395);
-        assert!(Node::stale_tip_mine_refused(41370, Node::window_high_water(&obs, now, W)));
+        assert!(Node::stale_tip_mine_refused(
+            41370,
+            Node::window_high_water(&obs, now, W)
+        ));
 
         // (b) REGRESSION RECOVERY: the old high 41395 is now OUTSIDE the window; only a
         // fresh regressed height 41380 remains in-window -> max drops to 41380, so a node
@@ -15364,7 +15374,10 @@ mod tests {
         regressed.push_back((now - Duration::from_secs(30), 41380)); // fresh, regressed
         regressed.push_back((now - Duration::from_secs(2), 41380));
         assert_eq!(Node::window_high_water(&regressed, now, W), 41380);
-        assert!(!Node::stale_tip_mine_refused(41380, Node::window_high_water(&regressed, now, W)));
+        assert!(!Node::stale_tip_mine_refused(
+            41380,
+            Node::window_high_water(&regressed, now, W)
+        ));
 
         // Empty / nothing in-window -> 0 (fail-open, never pins).
         assert_eq!(Node::window_high_water(&VecDeque::new(), now, W), 0);
@@ -15379,9 +15392,15 @@ mod tests {
         let margin = crate::a9::blockchain::CHECKPOINT_REORG_MARGIN;
         let n = CONVERGE_STALL_ESCALATE_CALLS as u64;
         // Small gap: never counts, always resets.
-        assert_eq!(Node::converge_stall_verdict(500, 500, margin, 99), (0, false));
+        assert_eq!(
+            Node::converge_stall_verdict(500, 500, margin, 99),
+            (0, false)
+        );
         // Progress: resets even when far behind.
-        assert_eq!(Node::converge_stall_verdict(500, 501, margin + 300, 99), (0, false));
+        assert_eq!(
+            Node::converge_stall_verdict(500, 501, margin + 300, 99),
+            (0, false)
+        );
         // No progress, far behind: accumulates without escalating below the bar…
         assert_eq!(
             Node::converge_stall_verdict(500, 500, margin + 300, n - 2),
@@ -15466,7 +15485,10 @@ mod tests {
         assert_eq!(Node::announce_retry_secs_for_streak(4, interval), 300);
         // Streak beyond the shift cap must neither overflow nor exceed the interval.
         assert_eq!(Node::announce_retry_secs_for_streak(50, interval), 300);
-        assert_eq!(Node::announce_retry_secs_for_streak(u64::MAX, interval), 300);
+        assert_eq!(
+            Node::announce_retry_secs_for_streak(u64::MAX, interval),
+            300
+        );
         // A pathologically small interval can't push retry below the floor.
         assert_eq!(Node::announce_retry_secs_for_streak(4, 10), 30);
     }

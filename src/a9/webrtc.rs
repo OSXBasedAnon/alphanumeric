@@ -291,7 +291,11 @@ impl SignalTransport for HttpSignalTransport {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("post_signal {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "post_signal {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
         }
         Ok(())
     }
@@ -309,10 +313,17 @@ impl SignalTransport for HttpSignalTransport {
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
-            return Err(format!("drain {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "drain {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let envs = v.get("envelopes").cloned().unwrap_or(serde_json::Value::Null);
+        let envs = v
+            .get("envelopes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         Ok(serde_json::from_value(envs).unwrap_or_default())
     }
 }
@@ -369,7 +380,12 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(rate: f64, burst: f64) -> Self {
-        Self { tokens: burst, last: Instant::now(), rate, burst }
+        Self {
+            tokens: burst,
+            last: Instant::now(),
+            rate,
+            burst,
+        }
     }
     /// Refill by elapsed time, then try to spend one token. false => over budget, drop the message.
     fn allow(&mut self) -> bool {
@@ -469,7 +485,10 @@ impl WebRtcMesh {
             *k = fresh.clone();
         }
         // Prune backoff for departed peers so the map can't grow without bound over a churning net.
-        self.dial_backoff.lock().await.retain(|id, _| fresh.contains(id));
+        self.dial_backoff
+            .lock()
+            .await
+            .retain(|id, _| fresh.contains(id));
     }
 
     /// Mark signaling activity now (a handshake in progress, or a reason to expect one soon — e.g. a
@@ -513,7 +532,8 @@ impl WebRtcMesh {
     pub async fn shutdown(&self) {
         // Set BEFORE clearing conns so any dial/offer racing this (checking `closed` under the conns
         // lock in new_pc) refuses to insert instead of leaking a pc we never close here.
-        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let pcs: Vec<Arc<RTCPeerConnection>> = {
             let mut conns = self.conns.lock().await;
             let pcs = conns.values().map(|c| c.pc.clone()).collect();
@@ -639,7 +659,10 @@ impl WebRtcMesh {
         let inbound = self.inbound_tx.clone();
         let peer_for_msg = peer_id.clone();
         // One token bucket per peer (this closure is this peer's only message handler).
-        let bucket = Arc::new(std::sync::Mutex::new(TokenBucket::new(MESH_MSG_RATE, MESH_MSG_BURST)));
+        let bucket = Arc::new(std::sync::Mutex::new(TokenBucket::new(
+            MESH_MSG_RATE,
+            MESH_MSG_BURST,
+        )));
         dc.on_message(Box::new(move |msg: DcMessage| {
             let inbound = inbound.clone();
             let peer = peer_for_msg.clone();
@@ -727,7 +750,8 @@ impl WebRtcMesh {
                     return;
                 }
                 if let (Some(mesh), Some(pc)) = (mesh_weak.upgrade(), pc_weak.upgrade()) {
-                    mesh.on_terminal_pc_state(&peer2, &pc, matches!(s, St::Failed)).await;
+                    mesh.on_terminal_pc_state(&peer2, &pc, matches!(s, St::Failed))
+                        .await;
                 }
             })
         }));
@@ -750,7 +774,13 @@ impl WebRtcMesh {
                 let _ = pc.close().await;
                 return Err("mesh at capacity".to_string());
             }
-            conns.insert(peer_id.to_string(), PeerConn { pc: pc.clone(), created: Instant::now() });
+            conns.insert(
+                peer_id.to_string(),
+                PeerConn {
+                    pc: pc.clone(),
+                    created: Instant::now(),
+                },
+            );
         }
         Ok(pc)
     }
@@ -800,8 +830,12 @@ impl WebRtcMesh {
             .map_err(|e| e.to_string())?;
         self.register_channel(peer_id.to_string(), dc);
         let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
-        let offer = set_local_and_gather(pc, offer).await.map_err(|e| e.to_string())?;
-        self.transport.post_signal(peer_id, "offer", &offer.sdp).await
+        let offer = set_local_and_gather(pc, offer)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.transport
+            .post_signal(peer_id, "offer", &offer.sdp)
+            .await
     }
 
     /// Returns Ok(true) only if this offer ADVANCED a handshake (a fresh answer was posted). A dropped
@@ -853,10 +887,16 @@ impl WebRtcMesh {
     ) -> Result<(), String> {
         let remote = RTCSessionDescription::offer(strip_local_candidates_from_sdp(sdp))
             .map_err(|e| e.to_string())?;
-        pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
+        pc.set_remote_description(remote)
+            .await
+            .map_err(|e| e.to_string())?;
         let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
-        let answer = set_local_and_gather(pc, answer).await.map_err(|e| e.to_string())?;
-        self.transport.post_signal(from, "answer", &answer.sdp).await
+        let answer = set_local_and_gather(pc, answer)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.transport
+            .post_signal(from, "answer", &answer.sdp)
+            .await
     }
 
     /// Ok(true) only if the answer advanced a still-FORMING handshake. A stray answer to an
@@ -870,7 +910,9 @@ impl WebRtcMesh {
             }
             let remote = RTCSessionDescription::answer(strip_local_candidates_from_sdp(sdp))
                 .map_err(|e| e.to_string())?;
-            pc.set_remote_description(remote).await.map_err(|e| e.to_string())?;
+            pc.set_remote_description(remote)
+                .await
+                .map_err(|e| e.to_string())?;
             return Ok(true);
         }
         Ok(false)
@@ -917,10 +959,11 @@ impl WebRtcMesh {
                 _ => Ok(false),
             };
             if let Err(err) = r {
+                let from_prefix: String = e.from.chars().take(8).collect();
                 log::debug!(
                     "mesh signal {} from {} failed: {}",
                     e.kind,
-                    &e.from[..8.min(e.from.len())],
+                    from_prefix,
                     err
                 );
             }
@@ -975,7 +1018,10 @@ pub fn select_dial_targets(local_id: &str, sorted_ids: &[String], degree: usize)
     if degree == 0 {
         return Vec::new();
     }
-    let higher: Vec<&String> = sorted_ids.iter().filter(|id| id.as_str() > local_id).collect();
+    let higher: Vec<&String> = sorted_ids
+        .iter()
+        .filter(|id| id.as_str() > local_id)
+        .collect();
     if higher.len() <= degree {
         return higher.into_iter().cloned().collect();
     }
@@ -1006,7 +1052,10 @@ mod tests {
     fn gen_key() -> Vec<u8> {
         use ring::rand::SystemRandom;
         use ring::signature::Ed25519KeyPair;
-        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref().to_vec()
+        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .unwrap()
+            .as_ref()
+            .to_vec()
     }
 
     // A remote peer's candidates arrive un-vetted inside its SDP. The strip filter must drop
@@ -1017,21 +1066,39 @@ mod tests {
         let public = "a=candidate:1 1 udp 1677729535 8.8.8.8 3478 typ srflx raddr 0.0.0.0 rport 0";
         let private = "a=candidate:2 1 udp 2122260223 192.168.1.5 54321 typ host";
         let linklocal = "a=candidate:3 1 udp 2122260223 169.254.1.1 54321 typ host";
-        let sdp = format!("v=0\r\n{public}\r\n{private}\r\n{linklocal}\r\nm=application 9 UDP/DTLS/SCTP\r\n");
+        let sdp = format!(
+            "v=0\r\n{public}\r\n{private}\r\n{linklocal}\r\nm=application 9 UDP/DTLS/SCTP\r\n"
+        );
 
         let out = strip_local_candidates_from_sdp(&sdp);
-        assert!(out.contains("8.8.8.8"), "public srflx candidate must be preserved");
-        assert!(!out.contains("192.168.1.5"), "private host candidate must be stripped");
-        assert!(!out.contains("169.254.1.1"), "link-local candidate must be stripped");
-        assert!(out.contains("v=0") && out.contains("m=application"), "non-candidate lines survive");
+        assert!(
+            out.contains("8.8.8.8"),
+            "public srflx candidate must be preserved"
+        );
+        assert!(
+            !out.contains("192.168.1.5"),
+            "private host candidate must be stripped"
+        );
+        assert!(
+            !out.contains("169.254.1.1"),
+            "link-local candidate must be stripped"
+        );
+        assert!(
+            out.contains("v=0") && out.contains("m=application"),
+            "non-candidate lines survive"
+        );
 
         // The per-line predicate: public passes, private/link-local are flagged local.
         assert!(!candidate_line_is_local(public));
         assert!(candidate_line_is_local(private));
         assert!(candidate_line_is_local(linklocal));
         // A trickle candidate string (no "a=" prefix) uses the same token-4 layout.
-        assert!(candidate_line_is_local("candidate:2 1 udp 2122260223 10.0.0.9 54321 typ host"));
-        assert!(!candidate_line_is_local("candidate:1 1 udp 1677729535 8.8.8.8 3478 typ srflx"));
+        assert!(candidate_line_is_local(
+            "candidate:2 1 udp 2122260223 10.0.0.9 54321 typ host"
+        ));
+        assert!(!candidate_line_is_local(
+            "candidate:1 1 udp 1677729535 8.8.8.8 3478 typ srflx"
+        ));
     }
 
     // The topology guarantee that was broken before: with the OLD "dial the 12 globally-smallest ids"
@@ -1059,8 +1126,11 @@ mod tests {
             // matches numeric order, same as real hex pubkeys sorted by the gateway/dialer).
             let mut ids: Vec<String> = (0..n).map(|i| format!("{:064x}", i * 131 + 17)).collect();
             ids.sort();
-            let index: HashMap<&str, usize> =
-                ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let index: HashMap<&str, usize> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.as_str(), i))
+                .collect();
             let mut parent: Vec<usize> = (0..n).collect();
             let mut degree = vec![0usize; n];
 
@@ -1068,7 +1138,10 @@ mod tests {
                 let targets = select_dial_targets(id, &ids, 12);
                 let a = index[id.as_str()];
                 for t in &targets {
-                    assert!(t.as_str() > id.as_str(), "n={n}: must only ever dial higher ids");
+                    assert!(
+                        t.as_str() > id.as_str(),
+                        "n={n}: must only ever dial higher ids"
+                    );
                     let b = index[t.as_str()];
                     degree[a] += 1;
                     degree[b] += 1;
@@ -1079,8 +1152,15 @@ mod tests {
 
             let root = find(&mut parent, 0);
             for i in 0..n {
-                assert_eq!(find(&mut parent, i), root, "n={n}: node {i} is in a separate component");
-                assert!(degree[i] > 0, "n={n}: node {i} is isolated (zero mesh edges)");
+                assert_eq!(
+                    find(&mut parent, i),
+                    root,
+                    "n={n}: node {i} is in a separate component"
+                );
+                assert!(
+                    degree[i] > 0,
+                    "n={n}: node {i} is isolated (zero mesh edges)"
+                );
             }
         }
     }
@@ -1089,19 +1169,30 @@ mod tests {
     // evict a fresh pc that a concurrent re-dial rebound to the same peer id.
     #[tokio::test]
     async fn forget_if_current_only_removes_the_matching_pc() {
-        let t: Arc<dyn SignalTransport> =
-            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
-        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let t: Arc<dyn SignalTransport> = Arc::new(
+            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
+        );
+        let (mesh, _rx) =
+            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
         let peer = "peer-x";
         let pc1 = mesh.new_pc(peer).await.unwrap();
         // A re-dial rebinds `peer` to a fresh pc (HashMap insert replaces the entry).
         let pc2 = mesh.new_pc(peer).await.unwrap();
         assert!(!Arc::ptr_eq(&pc1, &pc2));
         // A stale callback holding pc1 must be a no-op now that pc2 owns the id.
-        assert!(!mesh.forget_if_current(peer, &pc1).await, "stale pc1 must not evict current pc2");
-        assert!(mesh.conns.lock().await.contains_key(peer), "pc2 must still be tracked");
+        assert!(
+            !mesh.forget_if_current(peer, &pc1).await,
+            "stale pc1 must not evict current pc2"
+        );
+        assert!(
+            mesh.conns.lock().await.contains_key(peer),
+            "pc2 must still be tracked"
+        );
         // The current pc removes correctly.
-        assert!(mesh.forget_if_current(peer, &pc2).await, "current pc2 removes");
+        assert!(
+            mesh.forget_if_current(peer, &pc2).await,
+            "current pc2 removes"
+        );
         assert!(!mesh.conns.lock().await.contains_key(peer));
         let _ = pc1.close().await;
         let _ = pc2.close().await;
@@ -1111,12 +1202,17 @@ mod tests {
     // every ~60s (each re-dial would otherwise pin the node at the fast signaling cadence).
     #[tokio::test]
     async fn dial_backoff_grows_after_failures() {
-        let t: Arc<dyn SignalTransport> =
-            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
-        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let t: Arc<dyn SignalTransport> = Arc::new(
+            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
+        );
+        let (mesh, _rx) =
+            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
         assert!(mesh.dial_allowed("p").await, "no history -> allowed");
         mesh.note_dial_failure("p").await;
-        assert!(!mesh.dial_allowed("p").await, "after a failure -> backing off");
+        assert!(
+            !mesh.dial_allowed("p").await,
+            "after a failure -> backing off"
+        );
         mesh.note_dial_failure("p").await;
         assert_eq!(
             mesh.dial_backoff.lock().await.get("p").map(|e| e.0),
@@ -1129,14 +1225,20 @@ mod tests {
     // forever (else the map grows without bound on a churning network).
     #[tokio::test]
     async fn set_known_peers_prunes_departed_backoff() {
-        let t: Arc<dyn SignalTransport> =
-            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
-        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let t: Arc<dyn SignalTransport> = Arc::new(
+            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
+        );
+        let (mesh, _rx) =
+            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
         mesh.note_dial_failure("gone").await;
         mesh.note_dial_failure("stays").await;
-        mesh.set_known_peers(&["stays".to_string(), "other".to_string()]).await;
+        mesh.set_known_peers(&["stays".to_string(), "other".to_string()])
+            .await;
         let b = mesh.dial_backoff.lock().await;
-        assert!(b.contains_key("stays"), "still-advertised peer keeps its backoff");
+        assert!(
+            b.contains_key("stays"),
+            "still-advertised peer keeps its backoff"
+        );
         assert!(!b.contains_key("gone"), "departed peer's backoff is pruned");
     }
 
@@ -1147,9 +1249,11 @@ mod tests {
     #[tokio::test]
     async fn reap_stale_backs_off_responder_side_peers_too() {
         use std::time::{Duration, Instant};
-        let t: Arc<dyn SignalTransport> =
-            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
-        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let t: Arc<dyn SignalTransport> = Arc::new(
+            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
+        );
+        let (mesh, _rx) =
+            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
         // A responder-side id: strictly LESS than our local id, so the old guard skipped it.
         let peer = "!".to_string();
         assert!(
@@ -1188,7 +1292,7 @@ mod tests {
         // Internal mapped addresses classify as LAN/local (stripped from a remote SDP).
         assert!(is_lan_or_local(mapped(169, 254, 169, 254))); // link-local cloud metadata
         assert!(is_lan_or_local(mapped(10, 0, 0, 1))); // RFC1918
-        // A mapped PUBLIC address is preserved (real connectivity unaffected).
+                                                       // A mapped PUBLIC address is preserved (real connectivity unaffected).
         assert!(!is_lan_or_local(mapped(8, 8, 8, 8)));
     }
 
@@ -1197,24 +1301,38 @@ mod tests {
     // pc AND records backoff; failed=false (a normal Close) drops it WITHOUT backoff.
     #[tokio::test]
     async fn failed_pc_teardown_records_backoff() {
-        let t: Arc<dyn SignalTransport> =
-            Arc::new(HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap());
-        let (mesh, _rx) = WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        let t: Arc<dyn SignalTransport> = Arc::new(
+            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
+        );
+        let (mesh, _rx) =
+            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
 
         // Failed teardown -> pc dropped AND backoff recorded.
         let peer = "peer-failed";
         let pc = mesh.new_pc(peer).await.unwrap();
         assert!(mesh.dial_allowed(peer).await, "no backoff before failure");
         mesh.on_terminal_pc_state(peer, &pc, true).await;
-        assert!(!mesh.conns.lock().await.contains_key(peer), "failed pc is dropped");
-        assert!(!mesh.dial_allowed(peer).await, "a Failed teardown records dial backoff");
+        assert!(
+            !mesh.conns.lock().await.contains_key(peer),
+            "failed pc is dropped"
+        );
+        assert!(
+            !mesh.dial_allowed(peer).await,
+            "a Failed teardown records dial backoff"
+        );
 
         // Closed teardown (normal shutdown) -> pc dropped WITHOUT backoff.
         let peer2 = "peer-closed";
         let pc2 = mesh.new_pc(peer2).await.unwrap();
         mesh.on_terminal_pc_state(peer2, &pc2, false).await;
-        assert!(!mesh.conns.lock().await.contains_key(peer2), "closed pc is dropped");
-        assert!(mesh.dial_allowed(peer2).await, "a normal Close does not back off");
+        assert!(
+            !mesh.conns.lock().await.contains_key(peer2),
+            "closed pc is dropped"
+        );
+        assert!(
+            mesh.dial_allowed(peer2).await,
+            "a normal Close does not back off"
+        );
         let _ = pc2.close().await;
     }
 
@@ -1239,11 +1357,21 @@ mod tests {
                 ts: 0,
                 signature: String::new(),
             };
-            self.boxes.lock().unwrap().entry(to.to_string()).or_default().push(env);
+            self.boxes
+                .lock()
+                .unwrap()
+                .entry(to.to_string())
+                .or_default()
+                .push(env);
             Ok(())
         }
         async fn drain_signals(&self) -> Result<Vec<SignalEnvelope>, String> {
-            Ok(self.boxes.lock().unwrap().remove(&self.id).unwrap_or_default())
+            Ok(self
+                .boxes
+                .lock()
+                .unwrap()
+                .remove(&self.id)
+                .unwrap_or_default())
         }
     }
 
@@ -1257,15 +1385,19 @@ mod tests {
     #[ignore]
     async fn multi_node_mesh_forms_and_delivers_over_loopback() {
         const N: usize = 4;
-        let boxes = Arc::new(std::sync::Mutex::new(HashMap::<String, Vec<SignalEnvelope>>::new()));
+        let boxes = Arc::new(std::sync::Mutex::new(
+            HashMap::<String, Vec<SignalEnvelope>>::new(),
+        ));
         let mut ids: Vec<String> = (0..N).map(|i| format!("{:064x}", i * 7 + 3)).collect();
         ids.sort();
 
         let mut meshes = Vec::new();
         let mut rxs = Vec::new();
         for id in &ids {
-            let t: Arc<dyn SignalTransport> =
-                Arc::new(MockTransport { id: id.clone(), boxes: boxes.clone() });
+            let t: Arc<dyn SignalTransport> = Arc::new(MockTransport {
+                id: id.clone(),
+                boxes: boxes.clone(),
+            });
             let (mesh, rx) =
                 WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
             mesh.set_known_peers(&ids).await;
@@ -1313,12 +1445,18 @@ mod tests {
         assert!(!peers0.is_empty(), "node 0 has a direct peer");
         let target = peers0[0].clone();
         let target_idx = ids.iter().position(|id| *id == target).unwrap();
-        assert!(meshes[0].send_to(&target, b"multi-block").await, "send to a connected peer");
+        assert!(
+            meshes[0].send_to(&target, b"multi-block").await,
+            "send to a connected peer"
+        );
         let got = tokio::time::timeout(Duration::from_secs(5), rxs[target_idx].recv())
             .await
             .expect("no inbound message")
             .expect("channel closed");
-        assert_eq!(&got.1, b"multi-block", "block delivered intact P2P across the overlay");
+        assert_eq!(
+            &got.1, b"multi-block",
+            "block delivered intact P2P across the overlay"
+        );
     }
 
     // Proves the node's Rust Ed25519 signing + canonicalization is byte-compatible with the
@@ -1339,7 +1477,10 @@ mod tests {
 
         let drained = bob.drain_signals().await.expect("drain");
         assert_eq!(drained.len(), 1, "bob received exactly the offer");
-        assert_eq!(drained[0].payload, payload, "payload preserved byte-for-byte");
+        assert_eq!(
+            drained[0].payload, payload,
+            "payload preserved byte-for-byte"
+        );
         assert_eq!(drained[0].from, alice.node_id, "from = alice");
         assert_eq!(drained[0].kind, "offer");
 
@@ -1395,16 +1536,25 @@ mod tests {
             }
         })
         .await;
-        assert!(opened.is_ok(), "DataChannel did not open via gateway signaling in time");
+        assert!(
+            opened.is_ok(),
+            "DataChannel did not open via gateway signaling in time"
+        );
 
         // Alice pushes a "block" to Bob directly over the mesh.
-        assert!(mesh_a.send_to(&b_id, b"mesh-block-payload").await, "send over channel");
+        assert!(
+            mesh_a.send_to(&b_id, b"mesh-block-payload").await,
+            "send over channel"
+        );
         let got = tokio::time::timeout(Duration::from_secs(10), rx_b.recv())
             .await
             .expect("no inbound message")
             .expect("inbound channel closed");
         assert_eq!(got.0, a_id, "message tagged with the sender's node_id");
-        assert_eq!(&got.1, b"mesh-block-payload", "payload delivered intact P2P");
+        assert_eq!(
+            &got.1, b"mesh-block-payload",
+            "payload delivered intact P2P"
+        );
 
         let _ = mesh_a.broadcast(b"x").await;
     }
@@ -1417,8 +1567,12 @@ mod tests {
     #[tokio::test]
     async fn datachannel_handshake_delivers_a_message() {
         let api = build_api(true).expect("api");
-        let offerer = new_peer_connection(&api, ice_config(&[])).await.expect("offerer pc");
-        let answerer = new_peer_connection(&api, ice_config(&[])).await.expect("answerer pc");
+        let offerer = new_peer_connection(&api, ice_config(&[]))
+            .await
+            .expect("offerer pc");
+        let answerer = new_peer_connection(&api, ice_config(&[]))
+            .await
+            .expect("answerer pc");
 
         // Receiver side: when the answerer sees the channel, forward its messages to a queue.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
@@ -1449,13 +1603,23 @@ mod tests {
 
         // Offer (with gathered candidates) -> answerer.
         let offer = offerer.create_offer(None).await.expect("create offer");
-        let offer = set_local_and_gather(&offerer, offer).await.expect("gather offer");
-        answerer.set_remote_description(offer).await.expect("set remote offer");
+        let offer = set_local_and_gather(&offerer, offer)
+            .await
+            .expect("gather offer");
+        answerer
+            .set_remote_description(offer)
+            .await
+            .expect("set remote offer");
 
         // Answer (with gathered candidates) -> offerer.
         let answer = answerer.create_answer(None).await.expect("create answer");
-        let answer = set_local_and_gather(&answerer, answer).await.expect("gather answer");
-        offerer.set_remote_description(answer).await.expect("set remote answer");
+        let answer = set_local_and_gather(&answerer, answer)
+            .await
+            .expect("gather answer");
+        offerer
+            .set_remote_description(answer)
+            .await
+            .expect("set remote answer");
 
         // The channel should open and deliver the message within a few seconds over loopback ICE.
         let got = tokio::time::timeout(Duration::from_secs(15), rx.recv())
@@ -1499,8 +1663,14 @@ mod tests {
             let toks: Vec<&str> = line.split_whitespace().collect();
             if let Some(addr) = toks.get(4) {
                 if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
-                    assert!(!is_lan_or_local(ip), "leaked a LAN/private candidate: {line}");
-                    assert!(!ip.is_loopback(), "gathered a loopback candidate in prod: {line}");
+                    assert!(
+                        !is_lan_or_local(ip),
+                        "leaked a LAN/private candidate: {line}"
+                    );
+                    assert!(
+                        !ip.is_loopback(),
+                        "gathered a loopback candidate in prod: {line}"
+                    );
                 }
             }
         }

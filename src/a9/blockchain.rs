@@ -888,7 +888,10 @@ impl fmt::Display for BlockchainError {
                 write!(f, "Transaction fields are not canonically encoded")
             }
             BlockchainError::FeeAccountingLimitExceeded => {
-                write!(f, "Transaction fees are outside the current block accounting range")
+                write!(
+                    f,
+                    "Transaction fees are outside the current block accounting range"
+                )
             }
             BlockchainError::FeeBelowRelayFloor => {
                 write!(f, "Transaction fee below the relay floor (min 0.0001)")
@@ -1626,7 +1629,10 @@ impl Blockchain {
         self.rebuild_confirmed_tx_index()?; // (3) re-derive replay registry
         if let Err(e) = self.rebuild_address_tx_index() {
             // (4) display-only: a failure must not abort the apply/startup
-            warn!("Address history index rebuild failed during recovery: {}", e);
+            warn!(
+                "Address history index rebuild failed during recovery: {}",
+                e
+            );
         }
         self.clear_chain_state_dirty()?; // (5) clear LAST
         Ok(())
@@ -2059,7 +2065,11 @@ impl Blockchain {
         value
     }
 
-    fn decode_address_tx_entry(prefix_len: usize, key: &[u8], value: &[u8]) -> Option<AddressTxEntry> {
+    fn decode_address_tx_entry(
+        prefix_len: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> Option<AddressTxEntry> {
         if key.len() != prefix_len + 8 || value.len() < 41 {
             return None;
         }
@@ -2761,10 +2771,7 @@ impl Blockchain {
     /// checkpoint-finality guard, balance validation, and frontier-signature gate
     /// all apply — and on success it disconnects the losing blocks, connects the
     /// heavier canonical branch, and fires notify_tip_changed. Never re-downloads.
-    pub async fn adopt_external_branch(
-        &self,
-        blocks: Vec<Block>,
-    ) -> Result<bool, BlockchainError> {
+    pub async fn adopt_external_branch(&self, blocks: Vec<Block>) -> Result<bool, BlockchainError> {
         if blocks.is_empty() {
             return Ok(false);
         }
@@ -2784,7 +2791,9 @@ impl Blockchain {
     fn witness_branch_backoff_active(&self, tip_hash: &[u8; 32]) -> bool {
         let now = Self::now_unix_secs();
         let map = self.witness_blocked.lock();
-        map.get(tip_hash).map(|e| now < e.retry_after).unwrap_or(false)
+        map.get(tip_hash)
+            .map(|e| now < e.retry_after)
+            .unwrap_or(false)
     }
 
     /// Record (or refresh) a witness-deferred branch: arm the backoff, bump the
@@ -3014,11 +3023,13 @@ impl Blockchain {
 
         // Best-first: greater overlap-work delta wins; an equal delta breaks to the lower tip
         // hash (identical to the former single-best rule, now expressed as a total order).
-        ranked.sort_by(|a, b| match Self::compare_work_delta(&a.1, &a.2, &b.1, &b.2) {
-            std::cmp::Ordering::Greater => std::cmp::Ordering::Less,
-            std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
-            std::cmp::Ordering::Equal => a.3.cmp(&b.3),
-        });
+        ranked.sort_by(
+            |a, b| match Self::compare_work_delta(&a.1, &a.2, &b.1, &b.2) {
+                std::cmp::Ordering::Greater => std::cmp::Ordering::Less,
+                std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
+                std::cmp::Ordering::Equal => a.3.cmp(&b.3),
+            },
+        );
 
         // Try branches best-first and adopt the first that passes every validity gate. Bounded
         // so a flood of invalid high-ranked competitors cannot force many dry-runs.
@@ -3269,12 +3280,8 @@ impl Blockchain {
                 let fork_base = (fork_start as u64).saturating_sub(1);
                 batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&fork_base)?);
                 balances_tree.apply_batch(batch)?;
-                self.catch_up_balances_index(
-                    &balances_tree,
-                    fork_base,
-                    branch_tip.index as u64,
-                )
-                .await?;
+                self.catch_up_balances_index(&balances_tree, fork_base, branch_tip.index as u64)
+                    .await?;
             }
             None => {
                 self.rebuild_balances_index(&balances_tree).await?;
@@ -4082,7 +4089,8 @@ impl Blockchain {
                 touched.insert(tx.recipient.clone());
             }
         };
-        let mut reverted_blocks: Vec<Block> = Vec::with_capacity((old_tip - fork_start + 1) as usize);
+        let mut reverted_blocks: Vec<Block> =
+            Vec::with_capacity((old_tip - fork_start + 1) as usize);
         for h in fork_start..=old_tip {
             let Ok(block) = self.get_block(h) else {
                 return Ok(None);
@@ -4620,8 +4628,7 @@ impl Blockchain {
         // re-scanning the maturity window per transaction (equal value-for-value; see
         // immature_rewards_by_recipient). in_flight = &[] semantics preserved: the block's own
         // coinbase is excluded, matching the per-tx scan and the authoritative apply below.
-        let immature_by_addr =
-            self.immature_rewards_by_recipient(&block.transactions, block.index);
+        let immature_by_addr = self.immature_rewards_by_recipient(&block.transactions, block.index);
 
         // Second pass: Validate transactions and track effects
         for tx in &block.transactions {
@@ -4751,6 +4758,7 @@ impl Blockchain {
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
+        let pending_credits_tree = self.open_pending_credits_tree()?;
         let mut batch = sled::Batch::default();
         let mut full_batch = sled::Batch::default();
 
@@ -4768,6 +4776,10 @@ impl Blockchain {
                 let next_debit = current_debit.saturating_sub(delta);
                 Self::set_pending_debit_for(&pending_debits_tree, &tx.sender, next_debit)?;
             }
+
+            let current_credit = self.get_pending_credit_units(&tx.recipient).await?;
+            let next_credit = current_credit.saturating_sub(tx.amount_units);
+            Self::set_pending_credit_for(&pending_credits_tree, &tx.recipient, next_credit)?;
         }
 
         // Apply batch deletion
@@ -4784,6 +4796,7 @@ impl Blockchain {
         pending_tree.flush()?;
         full_sigs_tree.flush()?;
         pending_debits_tree.flush()?;
+        pending_credits_tree.flush()?;
 
         Ok(())
     }
@@ -5235,9 +5248,7 @@ impl Blockchain {
 
     /// Fixed block plus canonical coinbase weight reserved before regular template
     /// packing begins.
-    pub fn mining_template_base_weight(
-        miner_address: &str,
-    ) -> Result<usize, BlockchainError> {
+    pub fn mining_template_base_weight(miner_address: &str) -> Result<usize, BlockchainError> {
         if !is_canonical_user_address(miner_address) {
             return Err(BlockchainError::NonCanonicalTransaction);
         }
@@ -5443,8 +5454,7 @@ impl Blockchain {
         // Precompute the M06 immature-reward overlay once for the whole block instead of
         // re-scanning the maturity window per transaction (equal value-for-value; see
         // immature_rewards_by_recipient). in_flight = &[] semantics preserved.
-        let immature_by_addr =
-            self.immature_rewards_by_recipient(&block.transactions, block.index);
+        let immature_by_addr = self.immature_rewards_by_recipient(&block.transactions, block.index);
 
         // Validate each regular transaction
         for tx in regular_transactions {
@@ -5665,7 +5675,9 @@ impl Blockchain {
 
         // Exact i128 on both operands, same reasoning as validate_transaction:
         // f64 confirmed/pending subtraction is lossy at large balances (2026-07-12 audit).
-        let confirmed_units = self.get_confirmed_balance_units(&transaction.sender).await?;
+        let confirmed_units = self
+            .get_confirmed_balance_units(&transaction.sender)
+            .await?;
         let pending_units = self.get_pending_debit_units(&transaction.sender).await?;
 
         // M06 (advisory): don't admit a tx that spends an immature reward at the next height.
@@ -5751,9 +5763,7 @@ impl Blockchain {
         self.mempool.write().await.add_transaction(tx)
     }
 
-    fn aggregate_regular_fee_units(
-        transactions: &[Transaction],
-    ) -> Result<i128, BlockchainError> {
+    fn aggregate_regular_fee_units(transactions: &[Transaction]) -> Result<i128, BlockchainError> {
         transactions
             .iter()
             .filter(|tx| tx.sender != "MINING_REWARDS")
@@ -6640,7 +6650,10 @@ impl Blockchain {
     /// f64 round-trip is not the identity above ~33.55M coins (2^25 coins) and drifts
     /// the incrementally-maintained ledger away from the exact rebuild/catch-up path,
     /// a latent chain split on a large-balance payment (2026-07-12 audit).
-    pub async fn get_confirmed_balance_units(&self, address: &str) -> Result<i128, BlockchainError> {
+    pub async fn get_confirmed_balance_units(
+        &self,
+        address: &str,
+    ) -> Result<i128, BlockchainError> {
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
         // The auto-rebuild flag is fixed for the process lifetime; read the env once and cache it
         // instead of taking the process-wide env lock + allocating a String on every balance read.
@@ -6828,9 +6841,7 @@ impl Blockchain {
     /// transport from drifting away from the consensus commitment: public key,
     /// signature hash, and the stored 64-byte signature prefix are all bound,
     /// unlike the display-oriented transaction id.
-    pub fn calculate_merkle_leaf_hash(
-        tx: &Transaction,
-    ) -> Result<[u8; 32], BlockchainError> {
+    pub fn calculate_merkle_leaf_hash(tx: &Transaction) -> Result<[u8; 32], BlockchainError> {
         // Consensus merkle leaves must be stable across:
         // - in-memory full-signature transactions (used for admission verification)
         // - on-disk truncated-signature blocks (used for storage efficiency)
@@ -7313,7 +7324,10 @@ mod tests {
             .get_confirmed_witness_tx(&tx_id)
             .expect("a first-seen-in-block witness must be retained and serve-able");
         let served_sig = hex::decode(served.signature.as_ref().unwrap()).unwrap();
-        assert!(served_sig.len() > 64, "served witness must be the FULL signature");
+        assert!(
+            served_sig.len() > 64,
+            "served witness must be the FULL signature"
+        );
         assert_eq!(
             served_sig, sig_bytes,
             "served witness is the exact verified signature"
@@ -7373,7 +7387,10 @@ mod tests {
             .rehydrate_reverted_tx(&reverted)
             .expect("full witness present");
         let sig = hex::decode(got.signature.unwrap()).unwrap();
-        assert!(sig.len() > 64, "rehydrated tx must carry the full signature");
+        assert!(
+            sig.len() > 64,
+            "rehydrated tx must carry the full signature"
+        );
 
         // A witness whose own signature is truncated is treated as absent (it could
         // not pass the full-signature gate either).
@@ -7560,7 +7577,10 @@ mod tests {
         b.timestamp = block_ts;
         b.transactions.push(payment.clone());
         bc.record_confirmed_txs(&b).unwrap();
-        assert!(bc.confirmed_tx_index(&tx_id).is_some(), "entry must be registered");
+        assert!(
+            bc.confirmed_tx_index(&tx_id).is_some(),
+            "entry must be registered"
+        );
 
         // At the block-timestamp horizon the transaction can STILL be replayed — its
         // own freshness window closes MAX_BLOCK_FUTURE_TIME later — so the registry
@@ -7590,7 +7610,10 @@ mod tests {
         let mut block = metadata_test_block(1, [0u8; 32], "alice", 1.0);
         block.difficulty = 0;
         block.hash = block.calculate_hash_for_block();
-        assert!(block.verify_pow(), "difficulty-0 PoW is trivially valid as a mechanism");
+        assert!(
+            block.verify_pow(),
+            "difficulty-0 PoW is trivially valid as a mechanism"
+        );
         assert!(
             !block.verify_pow_meets_floor(),
             "the ingress floor must reject a sub-minimum-difficulty block"
@@ -7637,7 +7660,8 @@ mod tests {
         // receipt-trusts through them instead of stalling on the frontier gate.
         assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR);
         // Once the checkpoint rises above the floor, the checkpoint dominates.
-        bc.raise_trusted_checkpoint(WITNESS_LOSS_FLOOR + 100).unwrap();
+        bc.raise_trusted_checkpoint(WITNESS_LOSS_FLOOR + 100)
+            .unwrap();
         assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR + 100);
     }
 
@@ -7687,8 +7711,8 @@ mod tests {
         for u in [
             0i128,
             1,
-            100_000_000,               // 1 coin
-            2_250_000_000_000_000,     // ~22.5M coins
+            100_000_000,           // 1 coin
+            2_250_000_000_000_000, // ~22.5M coins
             1i128 << 50,
             1i128 << 51,
         ] {
@@ -7722,7 +7746,10 @@ mod tests {
             .unwrap();
 
         // Exact getter: byte-for-byte the stored value.
-        assert_eq!(bc.get_confirmed_balance_units("whale").await.unwrap(), DRIFTY);
+        assert_eq!(
+            bc.get_confirmed_balance_units("whale").await.unwrap(),
+            DRIFTY
+        );
 
         // The f64 path round-trips and drifts — exactly why consensus reads the units getter.
         let via_f64 = Transaction::to_units(bc.get_confirmed_balance("whale").await.unwrap());
@@ -7732,8 +7759,11 @@ mod tests {
         );
 
         // A reachable-range balance is identical either way (value-identical, no fork).
-        tree.insert("small".as_bytes(), codec::serialize(&2_250_000_000_000_000i128).unwrap())
-            .unwrap();
+        tree.insert(
+            "small".as_bytes(),
+            codec::serialize(&2_250_000_000_000_000i128).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             bc.get_confirmed_balance_units("small").await.unwrap(),
             Transaction::to_units(bc.get_confirmed_balance("small").await.unwrap()),
@@ -7764,7 +7794,10 @@ mod tests {
         assert!(tree.get("nobody_1".as_bytes()).unwrap().is_none());
         tree.insert("funded".as_bytes(), codec::serialize(&12_345i128).unwrap())
             .unwrap();
-        assert_eq!(bc.get_confirmed_balance_units("funded").await.unwrap(), 12_345);
+        assert_eq!(
+            bc.get_confirmed_balance_units("funded").await.unwrap(),
+            12_345
+        );
     }
 
     /// The mining affordability gates (validate_new_block / finalize_block) must pass
@@ -7796,7 +7829,10 @@ mod tests {
         let without_inflight = bc.immature_reward_units_scan("W", spend_height, &[]);
         let with_inflight =
             bc.immature_reward_units_scan("W", spend_height, std::slice::from_ref(&own_coinbase));
-        assert_eq!(without_inflight, 0, "no stored immature coinbase for W on a fresh chain");
+        assert_eq!(
+            without_inflight, 0,
+            "no stored immature coinbase for W on a fresh chain"
+        );
         assert_eq!(
             with_inflight - without_inflight,
             reward,
@@ -7887,7 +7923,10 @@ mod tests {
         // Below the activation height the overlay is inert (empty map, scan 0), and at the
         // exact boundary it engages — both must still agree with the scan.
         let below = bc.immature_rewards_by_recipient(&txs, MATURITY_ACTIVATION_HEIGHT - 1);
-        assert!(below.is_empty(), "overlay is empty below the activation height");
+        assert!(
+            below.is_empty(),
+            "overlay is empty below the activation height"
+        );
         for s in ["alice", "bob"] {
             assert_eq!(
                 below.get(s).copied().unwrap_or(0),
@@ -7935,8 +7974,7 @@ mod tests {
             // the only requirement is "== current_max, no panic".
             let base = current_max * 0.2; // empty-block base
             if current_max >= MIN_BLOCK_REWARD {
-                let expected =
-                    Transaction::round_amount(base.clamp(MIN_BLOCK_REWARD, current_max));
+                let expected = Transaction::round_amount(base.clamp(MIN_BLOCK_REWARD, current_max));
                 assert!(
                     (got - expected).abs() < 1e-9,
                     "period {periods}: reward {got} != fixed-floor expected {expected} \
@@ -8006,11 +8044,7 @@ mod tests {
     }
 
     fn add_canonical_test_witnesses(block: &mut Block, receipt: bool) {
-        let signature_bytes = if receipt {
-            64
-        } else {
-            mldsa::SIGNATURE_BYTES
-        };
+        let signature_bytes = if receipt { 64 } else { mldsa::SIGNATURE_BYTES };
         for tx in block
             .transactions
             .iter_mut()
@@ -8029,15 +8063,11 @@ mod tests {
             (Vec::new(), 10.0),
             (vec![Transaction::to_units(0.0005)], 1.006695),
             (vec![Transaction::to_units(0.005)], 1.06695),
-            (
-                vec![Transaction::to_units(0.71677928)],
-                10.59767456,
-            ),
+            (vec![Transaction::to_units(0.71677928)], 10.59767456),
         ];
 
         for (fees, expected) in vectors {
-            let block =
-                fee_accounting_test_block(&bc, 99, genesis.timestamp, fees.as_slice());
+            let block = fee_accounting_test_block(&bc, 99, genesis.timestamp, fees.as_slice());
             assert_eq!(
                 bc.calculate_block_reward(&block).unwrap(),
                 expected,
@@ -8093,12 +8123,8 @@ mod tests {
         bc.validate_block_reward_rules_at(&admissible, 100)
             .expect("the activated predicate accepts the same exact template");
 
-        let excluded = fee_accounting_test_block(
-            &bc,
-            100,
-            genesis.timestamp,
-            &[Transaction::to_units(1.0)],
-        );
+        let excluded =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, &[Transaction::to_units(1.0)]);
         assert_eq!(
             excluded.transactions[0].amount_units,
             Transaction::to_units(bc.calculate_block_reward(&excluded).unwrap())
@@ -8156,19 +8182,14 @@ mod tests {
             Err(BlockchainError::FeeAccountingLimitExceeded)
         ));
 
-        let fee_funded = fee_accounting_test_block(
-            &bc,
-            100,
-            genesis.timestamp,
-            &[Transaction::to_units(40.0)],
-        );
+        let fee_funded =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, &[Transaction::to_units(40.0)]);
         assert_eq!(
             fee_funded.transactions[0].amount_units,
             Transaction::to_units(MAX_BLOCK_REWARD),
             "the historical reward calculation remains exactly capped at 50"
         );
-        let fee_units =
-            Blockchain::aggregate_regular_fee_units(&fee_funded.transactions).unwrap();
+        let fee_units = Blockchain::aggregate_regular_fee_units(&fee_funded.transactions).unwrap();
         let baseline = bc
             .scheduled_fee_accounting_baseline_units(&fee_funded)
             .unwrap();
@@ -8184,12 +8205,8 @@ mod tests {
     #[test]
     fn fee_accounting_rejects_only_over_bound_templates_and_keeps_exact_coinbase() {
         let (bc, genesis) = fee_accounting_test_chain();
-        let over_bound = fee_accounting_test_block(
-            &bc,
-            100,
-            genesis.timestamp,
-            &[Transaction::to_units(1.0)],
-        );
+        let over_bound =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, &[Transaction::to_units(1.0)]);
         assert!(matches!(
             bc.validate_block_reward_rules_at(&over_bound, 100),
             Err(BlockchainError::FeeAccountingLimitExceeded)
@@ -8218,12 +8235,8 @@ mod tests {
     #[test]
     fn fee_accounting_template_helper_tracks_aggregate_and_checked_arithmetic() {
         let (bc, genesis) = fee_accounting_test_chain();
-        let individual = fee_accounting_test_block(
-            &bc,
-            100,
-            genesis.timestamp,
-            &[Transaction::to_units(0.4)],
-        );
+        let individual =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, &[Transaction::to_units(0.4)]);
         let first = individual.transactions[1].clone();
         assert!(
             bc.template_fee_accounting_is_admissible_at(
@@ -8281,12 +8294,8 @@ mod tests {
                 .timestamp
                 .saturating_add(period.saturating_mul(SIX_MONTHS));
             for fee in [0.0001, 0.0005] {
-                let block = fee_accounting_test_block(
-                    &bc,
-                    100,
-                    timestamp,
-                    &[Transaction::to_units(fee)],
-                );
+                let block =
+                    fee_accounting_test_block(&bc, 100, timestamp, &[Transaction::to_units(fee)]);
                 bc.validate_block_reward_rules_at(&block, 100)
                     .unwrap_or_else(|error| {
                         panic!("period {period}, fee {fee:.4} must remain mineable: {error}")
@@ -8356,12 +8365,8 @@ mod tests {
         ));
 
         let timestamp = genesis.timestamp + 13 * SIX_MONTHS;
-        let at_envelope = fee_accounting_test_block(
-            &bc,
-            100,
-            timestamp,
-            &[LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS],
-        );
+        let at_envelope =
+            fee_accounting_test_block(&bc, 100, timestamp, &[LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS]);
         bc.validate_block_reward_rules_at(&at_envelope, 100)
             .expect("the scheduled compatibility envelope is inclusive");
 
@@ -8382,20 +8387,15 @@ mod tests {
         const SIX_MONTHS: u64 = 15_768_000;
         let (bc, genesis) = fee_accounting_test_chain();
         let fees = [
-            0.0001, 0.0005, 0.01, 0.10, 0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 5.0, 10.0,
-            25.0, 50.0,
+            0.0001, 0.0005, 0.01, 0.10, 0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0,
         ];
         let mut saw_excluded_region = false;
 
         for period in 0u64..=30 {
             let timestamp = genesis.timestamp + period * SIX_MONTHS;
             for fee in fees {
-                let block = fee_accounting_test_block(
-                    &bc,
-                    100,
-                    timestamp,
-                    &[Transaction::to_units(fee)],
-                );
+                let block =
+                    fee_accounting_test_block(&bc, 100, timestamp, &[Transaction::to_units(fee)]);
                 let reward_units = block.transactions[0].amount_units;
                 let fee_units = Blockchain::aggregate_regular_fee_units(&block.transactions)
                     .expect("sample fees sum exactly");
@@ -8431,16 +8431,11 @@ mod tests {
     fn activated_shape_rules_are_canonical_bounded_and_storage_invariant() {
         let (bc, genesis) = fee_accounting_test_chain();
         let pool_fees = vec![Transaction::to_units(0.0005); 10];
-        let mut full =
-            fee_accounting_test_block(&bc, 100, genesis.timestamp, pool_fees.as_slice());
+        let mut full = fee_accounting_test_block(&bc, 100, genesis.timestamp, pool_fees.as_slice());
         add_canonical_test_witnesses(&mut full, false);
 
-        Blockchain::validate_block_shape_rules_at(
-            &full,
-            SignatureValidationMode::RequireFull,
-            100,
-        )
-        .expect("current ten-payout pool shape remains valid");
+        Blockchain::validate_block_shape_rules_at(&full, SignatureValidationMode::RequireFull, 100)
+            .expect("current ten-payout pool shape remains valid");
         let full_weight = Blockchain::full_witness_weight(&full).unwrap();
         assert!(
             codec::serialize(&full).unwrap().len() <= full_weight,
@@ -8526,8 +8521,7 @@ mod tests {
         ));
 
         let mut uppercase_witness = full.clone();
-        uppercase_witness.transactions[1].pub_key =
-            Some("AB".repeat(mldsa::PUBLIC_KEY_BYTES));
+        uppercase_witness.transactions[1].pub_key = Some("AB".repeat(mldsa::PUBLIC_KEY_BYTES));
         assert!(matches!(
             Blockchain::validate_block_shape_rules_at(
                 &uppercase_witness,
@@ -8705,14 +8699,23 @@ mod tests {
         let a = user_tx("alice", "bob", 1.0, 100);
         let b = user_tx("alice", "carol", 2.0, 200);
 
-        assert!(!Blockchain::has_duplicate_regular_tx(&[a.clone(), b.clone()]));
-        assert!(Blockchain::has_duplicate_regular_tx(&[a.clone(), a.clone()]));
+        assert!(!Blockchain::has_duplicate_regular_tx(&[
+            a.clone(),
+            b.clone()
+        ]));
+        assert!(Blockchain::has_duplicate_regular_tx(&[
+            a.clone(),
+            a.clone()
+        ]));
 
         // Two entries with the same id but different signature bytes are still a duplicate.
         let mut a_resigned = a.clone();
         a_resigned.signature = Some("bb".repeat(2400));
         assert_eq!(a.get_tx_id(), a_resigned.get_tx_id());
-        assert!(Blockchain::has_duplicate_regular_tx(&[a.clone(), a_resigned]));
+        assert!(Blockchain::has_duplicate_regular_tx(&[
+            a.clone(),
+            a_resigned
+        ]));
 
         // Coinbase (MINING_REWARDS) entries are exempt even when identical.
         let coinbase = Transaction {
@@ -8761,7 +8764,10 @@ mod tests {
             merkle_root,
         };
         block.hash = block.calculate_hash_for_block();
-        assert!(block.validate_header().is_ok(), "crafted block header should be valid");
+        assert!(
+            block.validate_header().is_ok(),
+            "crafted block header should be valid"
+        );
         assert!(
             matches!(
                 bc.validate_block(&block).await,
@@ -8856,7 +8862,10 @@ mod tests {
         // Record -> backoff active, queued for R with the exact needed blocks.
         bc.record_witness_blocked(tip_a, needed.clone());
         assert!(bc.witness_branch_backoff_active(&tip_a));
-        assert!(!bc.witness_branch_backoff_active(&tip_b), "unrelated branch unaffected");
+        assert!(
+            !bc.witness_branch_backoff_active(&tip_b),
+            "unrelated branch unaffected"
+        );
         let snap = bc.witness_blocked_snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].0, tip_a);
@@ -8906,21 +8915,34 @@ mod tests {
         // (1) Above activation, immature: reward at `a`, spend at a+m-1 (depth m-1) -> rejected.
         {
             let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
-            Blockchain::replay_apply_block_checked(a, &[coinbase("A", 1000)], &mut bal, &mut recent)
-                .unwrap();
+            Blockchain::replay_apply_block_checked(
+                a,
+                &[coinbase("A", 1000)],
+                &mut bal,
+                &mut recent,
+            )
+            .unwrap();
             let r = Blockchain::replay_apply_block_checked(
                 a + m - 1,
                 &[spend("A", "B", 500)],
                 &mut bal,
                 &mut recent,
             );
-            assert!(r.is_err(), "reward buried only m-1 deep must not be spendable");
+            assert!(
+                r.is_err(),
+                "reward buried only m-1 deep must not be spendable"
+            );
         }
         // (2) Above activation, mature: reward at `a`, spend at a+m (depth m) -> allowed.
         {
             let (mut bal, mut recent) = (HashMap::new(), VecDeque::new());
-            Blockchain::replay_apply_block_checked(a, &[coinbase("A", 1000)], &mut bal, &mut recent)
-                .unwrap();
+            Blockchain::replay_apply_block_checked(
+                a,
+                &[coinbase("A", 1000)],
+                &mut bal,
+                &mut recent,
+            )
+            .unwrap();
             let r = Blockchain::replay_apply_block_checked(
                 a + m,
                 &[spend("A", "B", 500)],
@@ -8939,7 +8961,10 @@ mod tests {
                 &mut bal,
                 &mut recent,
             );
-            assert!(r.is_err(), "spending the fresh coinbase in its own block must be rejected");
+            assert!(
+                r.is_err(),
+                "spending the fresh coinbase in its own block must be rejected"
+            );
         }
         // (4) Below activation: identical immediate-spend scenario is unchanged (overlay off).
         {
@@ -8950,7 +8975,10 @@ mod tests {
                 &mut bal,
                 &mut recent,
             );
-            assert!(r.is_ok(), "below activation, an immediate reward spend must still be allowed");
+            assert!(
+                r.is_ok(),
+                "below activation, an immediate reward spend must still be allowed"
+            );
             assert_eq!(*bal.get("A").unwrap(), 500);
         }
     }
@@ -9017,7 +9045,10 @@ mod tests {
             .filter(|(rh, r, _)| r == "X" && (*rh as u64) + m as u64 > spend_h as u64)
             .map(|(_, _, amt)| *amt)
             .sum();
-        assert_eq!(replay_immature, scanned, "scan and replay must agree on the immature total");
+        assert_eq!(
+            replay_immature, scanned,
+            "scan and replay must agree on the immature total"
+        );
     }
 
     /// Display breakdown (WalletBalanceBreakdown): the maturing list must be exactly the
@@ -9031,9 +9062,9 @@ mod tests {
         let act = MATURITY_ACTIVATION_HEIGHT;
         let m = MINING_REWARD_MATURITY; // 100
         let tip = act + 10; // 1510
-        // Contiguous chain 0..=tip; "M" mines four blocks around the maturity window:
-        // two already mature at the tip (outside the window), one at the window's lower
-        // edge, one at the tip itself.
+                            // Contiguous chain 0..=tip; "M" mines four blocks around the maturity window:
+                            // two already mature at the tip (outside the window), one at the window's lower
+                            // edge, one at the tip itself.
         let m_blocks: HashMap<u32, f64> = [
             (act - 200, 2.0),   // 1300: long mature
             (tip - m + 1, 3.0), // 1411: exactly below the window (low edge is 1412)
@@ -9062,8 +9093,14 @@ mod tests {
             vec![(tip - m + 2, 5.0), (tip, 7.0)],
             "exactly the coinbases inside the maturity window, ascending by height"
         );
-        assert_eq!(breakdown.confirmed, 17.0, "confirmed includes immature coinbases");
-        assert_eq!(breakdown.spendable, 5.0, "spendable excludes the maturing portion");
+        assert_eq!(
+            breakdown.confirmed, 17.0,
+            "confirmed includes immature coinbases"
+        );
+        assert_eq!(
+            breakdown.spendable, 5.0,
+            "spendable excludes the maturing portion"
+        );
         assert_eq!(
             breakdown.spendable,
             bc.get_wallet_balance("M").await.unwrap(),
@@ -9080,7 +9117,10 @@ mod tests {
             vec![(tip, 7.0)],
             "oldest maturing reward must leave the set exactly one block later"
         );
-        assert_eq!(after.spendable, 10.0, "the just-matured reward becomes spendable");
+        assert_eq!(
+            after.spendable, 10.0,
+            "the just-matured reward becomes spendable"
+        );
     }
 
     /// Below the M06 activation height the overlay is off: a fresh coinbase is spendable
@@ -9097,7 +9137,10 @@ mod tests {
         bc.rebuild_chain_tip_metadata().unwrap();
         bc.ensure_balances_index().await.unwrap();
         let breakdown = bc.get_wallet_balance_breakdown("M").await.unwrap();
-        assert!(breakdown.maturing.is_empty(), "overlay is a no-op below activation");
+        assert!(
+            breakdown.maturing.is_empty(),
+            "overlay is a no-op below activation"
+        );
         assert_eq!(breakdown.confirmed, 4.0);
         assert_eq!(
             breakdown.spendable, 4.0,
@@ -9123,7 +9166,10 @@ mod tests {
             drop(guard);
         })
         .await;
-        assert!(fixed.is_ok(), "reusing the held write guard must not deadlock");
+        assert!(
+            fixed.is_ok(),
+            "reusing the held write guard must not deadlock"
+        );
 
         // OLD (removed) pattern: acquire a second guard on the same lock while the
         // write guard is held. Must never be granted -> times out (i.e. deadlocked).
@@ -9312,8 +9358,16 @@ mod tests {
         .expect("neither miner may hang: the loser must recover from the lost race")
         .expect("mining tasks should not panic");
 
-        assert!(joined.0.is_ok(), "miner A should complete: {:?}", joined.0.err());
-        assert!(joined.1.is_ok(), "miner B should complete: {:?}", joined.1.err());
+        assert!(
+            joined.0.is_ok(),
+            "miner A should complete: {:?}",
+            joined.0.err()
+        );
+        assert!(
+            joined.1.is_ok(),
+            "miner B should complete: {:?}",
+            joined.1.err()
+        );
     }
 
     // Backport validation (2026-07-25): PROVE the CPU miner — after the
@@ -9703,11 +9757,7 @@ mod tests {
         blockchain.store_orphan_block(&lower_grandchild).unwrap();
 
         let branches = blockchain
-            .collect_orphan_branches_from(
-                std::sync::Arc::new(start),
-                8,
-                ORPHAN_BRANCH_SEARCH_LIMIT,
-            )
+            .collect_orphan_branches_from(std::sync::Arc::new(start), 8, ORPHAN_BRANCH_SEARCH_LIMIT)
             .unwrap();
 
         assert!(branches.iter().any(|branch| branch.len() == 2));
@@ -9789,7 +9839,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(branches.len(), 5, "every fanout child yields a branch (none dropped)");
+        assert_eq!(
+            branches.len(),
+            5,
+            "every fanout child yields a branch (none dropped)"
+        );
         assert_eq!(
             branches.iter().filter(|b| b.len() == 3).count(),
             1,
@@ -10138,8 +10192,12 @@ mod tests {
 
         // Fund both so both admit; pending_debit becomes delta_a + delta_b.
         set_confirmed_balance(&bc, &wallet.address, delta_a + delta_b);
-        bc.add_transaction(tx_a.clone()).await.expect("tx_a admitted");
-        bc.add_transaction(tx_b.clone()).await.expect("tx_b admitted");
+        bc.add_transaction(tx_a.clone())
+            .await
+            .expect("tx_a admitted");
+        bc.add_transaction(tx_b.clone())
+            .await
+            .expect("tx_b admitted");
         assert_eq!(
             bc.get_pending_debit_units(&wallet.address).await.unwrap(),
             delta_a + delta_b,
@@ -10167,6 +10225,49 @@ mod tests {
         );
     }
 
+    // #11: clear_processed_transactions also removes pending credit reservations, preventing
+    // already-spent income entries from remaining available after a tx is confirmed.
+    #[tokio::test]
+    async fn clear_processed_transactions_clears_pending_credits() {
+        let bc = test_blockchain();
+        let sender = Wallet::new(None).expect("sender wallet should build");
+        let recipient = Wallet::new(None).expect("recipient wallet should build");
+
+        let tx = signed_transfer(&sender, &recipient.address, 1.75, 10_000).await;
+        set_confirmed_balance(&bc, &sender.address, tx.total_debit_units());
+        bc.add_transaction(tx.clone()).await.expect("tx admitted");
+
+        assert_eq!(
+            bc.get_pending_debit_units(&sender.address)
+                .await
+                .expect("pending debit should read"),
+            tx.total_debit_units()
+        );
+        assert_eq!(
+            bc.get_pending_credit_units(&recipient.address)
+                .await
+                .expect("pending credit should read"),
+            tx.amount_units
+        );
+
+        bc.clear_processed_transactions(std::slice::from_ref(&tx))
+            .await
+            .expect("confirmed tx should clear pending reservations");
+
+        assert_eq!(
+            bc.get_pending_debit_units(&sender.address)
+                .await
+                .expect("pending debit should clear"),
+            0
+        );
+        assert_eq!(
+            bc.get_pending_credit_units(&recipient.address)
+                .await
+                .expect("pending credit should clear"),
+            0
+        );
+    }
+
     // #10: the re-announce accessor must return FULL-signature txs. The persisted pending record
     // carries a truncated signature (the full one is in the sidecar); gossiping the truncated form
     // makes peers defer the tx (the truncated-witness pathology).
@@ -10181,7 +10282,10 @@ mod tests {
             .as_secs();
         let tx = signed_transfer(&wallet, "bob", 1.0, now).await;
         let full_sig_len = hex::decode(tx.signature.as_ref().unwrap()).unwrap().len();
-        assert!(full_sig_len > 64, "the created tx carries a full ML-DSA signature");
+        assert!(
+            full_sig_len > 64,
+            "the created tx carries a full ML-DSA signature"
+        );
         set_confirmed_balance(&bc, &wallet.address, tx.total_debit_units());
         bc.add_transaction(tx.clone()).await.expect("tx admitted");
 
@@ -10275,7 +10379,8 @@ mod tests {
         // startup is exactly what this fix removes.
         let tree = bc.open_confirmed_tx_tree().unwrap();
         tree.insert(b"sentinel_txid", vec![0u8; 4]).unwrap();
-        bc.ensure_confirmed_tx_index().expect("ensure short-circuits");
+        bc.ensure_confirmed_tx_index()
+            .expect("ensure short-circuits");
         assert!(
             tree.get(b"sentinel_txid").unwrap().is_some(),
             "marker short-circuits ensure; the registry is not re-derived (pre-fix would clear it)"
@@ -10359,7 +10464,10 @@ mod tests {
         // store block 2 (tip stays 1). Mark dirty, exactly as the failed finalize would have.
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
         balances
-            .insert("minerx".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+            .insert(
+                "minerx".as_bytes(),
+                codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+            )
             .unwrap();
         Blockchain::set_balances_height(&balances, 2).unwrap();
         bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
@@ -10416,7 +10524,11 @@ mod tests {
         bc.reconcile_chain_state_if_dirty().await.unwrap();
 
         assert_eq!(bc.chain_state_dirty().unwrap(), None);
-        assert_eq!(bc.get_latest_block_index(), 4, "tip re-anchored to the taller branch B");
+        assert_eq!(
+            bc.get_latest_block_index(),
+            4,
+            "tip re-anchored to the taller branch B"
+        );
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
         assert_eq!(Blockchain::get_balances_height(&balances).unwrap(), Some(4));
         assert_eq!(
@@ -10444,7 +10556,10 @@ mod tests {
             let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
             // marker-ahead poison identical to T1.
             balances
-                .insert("m1".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+                .insert(
+                    "m1".as_bytes(),
+                    codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+                )
                 .unwrap();
             Blockchain::set_balances_height(&balances, 2).unwrap();
             bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
@@ -10480,12 +10595,18 @@ mod tests {
         let before = dump_balances(&bc);
         bc.reconcile_chain_state_if_dirty().await.unwrap();
         bc.reconcile_chain_state_if_dirty().await.unwrap();
-        assert_eq!(dump_balances(&bc), before, "clean reconcile changes nothing");
+        assert_eq!(
+            dump_balances(&bc),
+            before,
+            "clean reconcile changes nothing"
+        );
         assert_eq!(bc.chain_state_dirty().unwrap(), None);
         // The healthy invariant: marker never ahead of the tip once clean.
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
         assert!(
-            Blockchain::get_balances_height(&balances).unwrap().unwrap_or(0)
+            Blockchain::get_balances_height(&balances)
+                .unwrap()
+                .unwrap_or(0)
                 <= bc.get_latest_block_index()
         );
     }
@@ -10508,7 +10629,10 @@ mod tests {
         // The H4 poison a failed finalize leaves: marker ahead + coinbase double-credited, unstored.
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
         balances
-            .insert("minerx".as_bytes(), codec::serialize(&Transaction::to_units(10.0)).unwrap())
+            .insert(
+                "minerx".as_bytes(),
+                codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+            )
             .unwrap();
         Blockchain::set_balances_height(&balances, 2).unwrap();
         bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
@@ -10517,7 +10641,11 @@ mod tests {
         let retry = metadata_test_block(2, block1.hash, "minery", 5.0);
         let _ = bc.finalize_block(retry, "minery".to_string()).await;
 
-        assert_eq!(bc.chain_state_dirty().unwrap(), None, "finalize healed the marker");
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "finalize healed the marker"
+        );
         assert_eq!(
             bc.get_confirmed_balance("minerx").await.unwrap(),
             5.0,
@@ -10549,7 +10677,11 @@ mod tests {
 
         let _ = bc.try_adopt_orphan_branch().await;
 
-        assert_eq!(bc.chain_state_dirty().unwrap(), None, "try_adopt healed the marker");
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "try_adopt healed the marker"
+        );
         assert_eq!(
             bc.get_latest_block_index(),
             2,
@@ -10612,7 +10744,10 @@ mod tests {
         assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(3));
         // Sentinel: survives catch-up, would be removed by a full rebuild.
         a_tree
-            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .insert(
+                "zz_sentinel".as_bytes(),
+                codec::serialize(&777i128).unwrap(),
+            )
             .unwrap();
         for b in &chain[4..] {
             insert_raw_block(&a, b);
@@ -10621,7 +10756,10 @@ mod tests {
         a.ensure_balances_index().await.unwrap();
         assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(8));
         assert_eq!(
-            a_tree.get("zz_sentinel".as_bytes()).unwrap().map(|v| v.to_vec()),
+            a_tree
+                .get("zz_sentinel".as_bytes())
+                .unwrap()
+                .map(|v| v.to_vec()),
             Some(codec::serialize(&777i128).unwrap()),
             "catch-up path should have run (full rebuild would remove the sentinel)"
         );
@@ -10692,7 +10830,10 @@ mod tests {
             Blockchain::replay_revert_block(&b.transactions, &mut balances);
         }
         for (addr, v) in &balances {
-            assert_eq!(*v, 0, "address {addr} did not return to its pre-apply value");
+            assert_eq!(
+                *v, 0,
+                "address {addr} did not return to its pre-apply value"
+            );
         }
     }
 
@@ -10742,7 +10883,10 @@ mod tests {
         let a_tree = a.db.open_tree(BALANCES_TREE).unwrap();
         assert_eq!(Blockchain::get_balances_height(&a_tree).unwrap(), Some(6));
         a_tree
-            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .insert(
+                "zz_sentinel".as_bytes(),
+                codec::serialize(&777i128).unwrap(),
+            )
             .unwrap();
 
         let fork_state = a
@@ -10848,8 +10992,14 @@ mod tests {
             .is_none());
         // Genesis fork or inverted span: refuse.
         Blockchain::set_balances_height(&tree, 5).unwrap();
-        assert!(bc.balances_at_fork_state(&tree, 0, 5, &[]).unwrap().is_none());
-        assert!(bc.balances_at_fork_state(&tree, 6, 5, &[]).unwrap().is_none());
+        assert!(bc
+            .balances_at_fork_state(&tree, 0, 5, &[])
+            .unwrap()
+            .is_none());
+        assert!(bc
+            .balances_at_fork_state(&tree, 6, 5, &[])
+            .unwrap()
+            .is_none());
     }
 
     /// Catch-up starting MID-WAY through the coinbase-maturity window must seed
@@ -10894,7 +11044,10 @@ mod tests {
             Some(resume_from as u64)
         );
         a_tree
-            .insert("zz_sentinel".as_bytes(), codec::serialize(&777i128).unwrap())
+            .insert(
+                "zz_sentinel".as_bytes(),
+                codec::serialize(&777i128).unwrap(),
+            )
             .unwrap();
         for b in &chain[resume_from + 1..] {
             insert_raw_block(&a, b);
@@ -10943,7 +11096,8 @@ mod tests {
 
         insert_raw_block(&bc, &b2);
         bc.rebuild_chain_tip_metadata().unwrap();
-        bc.mark_chain_state_dirty(2, "test_writer_in_flight").unwrap();
+        bc.mark_chain_state_dirty(2, "test_writer_in_flight")
+            .unwrap();
         bc.ensure_balances_index().await.unwrap();
         assert_eq!(
             Blockchain::get_balances_height(&tree).unwrap(),
@@ -11099,7 +11253,10 @@ mod tests {
             .validate_new_block(&block)
             .await
             .expect_err("over-full block must be rejected");
-        assert!(matches!(err, BlockchainError::BlockTransactionCountExceeded));
+        assert!(matches!(
+            err,
+            BlockchainError::BlockTransactionCountExceeded
+        ));
         // The classification guard: this must never read as a lost race.
         assert!(!err.to_string().contains("Block header is invalid"));
     }
@@ -11263,13 +11420,12 @@ mod tests {
             Transaction::to_units(1.0)
         );
 
-        let activation_parent =
-            metadata_test_block(
-                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
-                [0u8; 32],
-                &"11".repeat(20),
-                1.0,
-            );
+        let activation_parent = metadata_test_block(
+            FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+            [0u8; 32],
+            &"11".repeat(20),
+            1.0,
+        );
         insert_raw_block(&bc, &activation_parent);
         bc.write_chain_tip_metadata(&activation_parent)
             .expect("activation-boundary tip metadata should write");
@@ -11320,13 +11476,12 @@ mod tests {
     #[tokio::test]
     async fn activation_pending_revalidation_rearms_after_a_lower_tip() {
         let (bc, genesis) = fee_accounting_test_chain();
-        let activation_parent =
-            metadata_test_block(
-                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
-                [0u8; 32],
-                &"11".repeat(20),
-                1.0,
-            );
+        let activation_parent = metadata_test_block(
+            FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+            [0u8; 32],
+            &"11".repeat(20),
+            1.0,
+        );
         insert_raw_block(&bc, &activation_parent);
         bc.write_chain_tip_metadata(&activation_parent).unwrap();
         bc.ensure_pending_rules_for_next_block()
@@ -11435,13 +11590,12 @@ mod tests {
     #[tokio::test]
     async fn activated_admission_rejects_noncanonical_witness_text_without_reserving_balance() {
         let (bc, _) = fee_accounting_test_chain();
-        let activation_parent =
-            metadata_test_block(
-                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
-                [0u8; 32],
-                &"11".repeat(20),
-                1.0,
-            );
+        let activation_parent = metadata_test_block(
+            FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+            [0u8; 32],
+            &"11".repeat(20),
+            1.0,
+        );
         insert_raw_block(&bc, &activation_parent);
         bc.write_chain_tip_metadata(&activation_parent)
             .expect("activation-boundary tip metadata should write");
@@ -11458,8 +11612,7 @@ mod tests {
         for variant in 0..3u64 {
             let wallet = Wallet::new(None).expect("test wallet should build");
             set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
-            let mut tx =
-                signed_transfer(&wallet, &"22".repeat(20), 1.0, timestamp + variant).await;
+            let mut tx = signed_transfer(&wallet, &"22".repeat(20), 1.0, timestamp + variant).await;
             let signature_bytes =
                 hex::decode(tx.signature.as_deref().expect("signed transfer")).unwrap();
             tx.sig_hash = Some(Transaction::signature_hash_hex(&signature_bytes));
@@ -11486,10 +11639,7 @@ mod tests {
                 .add_transaction(tx)
                 .await
                 .expect_err("noncanonical witness text must not enter pending state");
-            assert!(matches!(
-                error,
-                BlockchainError::NonCanonicalTransaction
-            ));
+            assert!(matches!(error, BlockchainError::NonCanonicalTransaction));
             assert_eq!(
                 bc.get_pending_debit_units(&sender).await.unwrap(),
                 0,
@@ -11583,7 +11733,9 @@ mod tests {
         // Coinbase to "miner" + payment alice->bob + self-send carol->carol.
         let mut block = metadata_test_block(5, [0u8; 32], "miner", 2.0);
         block.transactions.push(user_tx("alice", "bob", 2.5, 5_000));
-        block.transactions.push(user_tx("carol", "carol", 1.0, 5_001));
+        block
+            .transactions
+            .push(user_tx("carol", "carol", 1.0, 5_001));
         bc.record_confirmed_txs(&block).unwrap();
 
         // The miner's coinbase receipt IS indexed (the replay registry skips
@@ -11619,7 +11771,10 @@ mod tests {
         assert_eq!(carol.received_units, Transaction::to_units(1.0));
 
         // The system address itself is never indexed.
-        let system = bc.address_history_summary("MINING_REWARDS").unwrap().unwrap();
+        let system = bc
+            .address_history_summary("MINING_REWARDS")
+            .unwrap()
+            .unwrap();
         assert_eq!(system.tx_count, 0);
 
         // A prefix address must not leak entries from a longer address.
@@ -11636,7 +11791,10 @@ mod tests {
             .push(user_tx("alice", "bob", 2.5, 5_000));
         bc.record_confirmed_txs(&old_block).unwrap();
         assert_eq!(
-            bc.address_history_summary("alice").unwrap().unwrap().tx_count,
+            bc.address_history_summary("alice")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
 
@@ -11651,7 +11809,10 @@ mod tests {
         bc.record_confirmed_txs(&new_block).unwrap();
 
         assert_eq!(
-            bc.address_history_summary("alice").unwrap().unwrap().tx_count,
+            bc.address_history_summary("alice")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             0,
             "reverted payment must leave the sender's history"
         );
@@ -11664,7 +11825,10 @@ mod tests {
             "reverted coinbase must leave the old miner's history"
         );
         assert_eq!(
-            bc.address_history_summary("dave").unwrap().unwrap().tx_count,
+            bc.address_history_summary("dave")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
         assert_eq!(
@@ -11690,7 +11854,10 @@ mod tests {
         bc.rebuild_address_tx_index().unwrap();
         assert!(bc.address_index_ready());
         assert_eq!(
-            bc.address_history_summary("miner3").unwrap().unwrap().tx_count,
+            bc.address_history_summary("miner3")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
 
@@ -11702,14 +11869,20 @@ mod tests {
         bc.rebuild_chain_tip_metadata().unwrap();
         bc.ensure_address_tx_index().unwrap();
         assert_eq!(
-            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            bc.address_history_summary("miner5")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
 
         // Ensure is idempotent: re-running must not duplicate entries.
         bc.ensure_address_tx_index().unwrap();
         assert_eq!(
-            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            bc.address_history_summary("miner5")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
 
@@ -11720,12 +11893,18 @@ mod tests {
         bc.rebuild_chain_tip_metadata().unwrap();
         bc.ensure_address_tx_index().unwrap();
         assert_eq!(
-            bc.address_history_summary("miner5").unwrap().unwrap().tx_count,
+            bc.address_history_summary("miner5")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             0,
             "entries from the rewritten block must not survive"
         );
         assert_eq!(
-            bc.address_history_summary("usurper").unwrap().unwrap().tx_count,
+            bc.address_history_summary("usurper")
+                .unwrap()
+                .unwrap()
+                .tx_count,
             1
         );
     }
@@ -11803,9 +11982,15 @@ mod tests {
             );
         }
         // A cursor below everything returns an empty page.
-        assert!(bc.address_txs_page("alice", 3, Some((1, 0))).unwrap().is_empty());
+        assert!(bc
+            .address_txs_page("alice", 3, Some((1, 0)))
+            .unwrap()
+            .is_empty());
         // Prefix addresses must not bleed into the page window.
-        assert!(bc.address_txs_page("ali", 10, Some((5, 2))).unwrap().is_empty());
+        assert!(bc
+            .address_txs_page("ali", 10, Some((5, 2)))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
