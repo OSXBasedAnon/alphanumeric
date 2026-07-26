@@ -6688,7 +6688,7 @@ impl Blockchain {
             // writer persists real entries for every address a block actually touches.
             return Ok(0);
         }
-        // Slow path: calculate from blocks, then cache in balances tree.
+        // Slow path: calculate from blocks.
         let mut balance_units: i128 = 0;
         let mut current_batch = Vec::with_capacity(200);
 
@@ -6726,7 +6726,6 @@ impl Blockchain {
             }
         }
 
-        balances_tree.insert(address.as_bytes(), codec::serialize(&balance_units)?)?;
         Ok(balance_units)
     }
 
