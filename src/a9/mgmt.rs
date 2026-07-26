@@ -764,7 +764,25 @@ impl Mgmt {
     // rename_wallet) already persists private.key by merging with the on-disk contents, so the
     // function was both redundant and destructive.
 
-    pub async fn rename_wallet(&self, old_name: &str, new_name: &str) -> Result<()> {
+    pub async fn rename_wallet(
+        &self,
+        wallets: &mut HashMap<String, Wallet>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        if old_name == new_name {
+            return Err("Wallet name is unchanged".into());
+        }
+        if new_name.trim().is_empty() {
+            return Err("New wallet name cannot be empty".into());
+        }
+        if !wallets.contains_key(old_name) {
+            return Err(Box::new(BlockchainError::WalletNotFound));
+        }
+        if wallets.contains_key(new_name) {
+            return Err("Duplicate wallet name".into());
+        }
+
         let mut wallet_key_data = match fs::read_to_string(KEY_FILE_PATH).await {
             Ok(data) => serde_json::from_str::<Vec<WalletKeyData>>(&data)?,
             Err(_) => {
@@ -774,22 +792,27 @@ impl Mgmt {
             }
         };
 
+        if wallet_key_data
+            .iter()
+            .any(|w| w.wallet_name == new_name && w.wallet_name != old_name)
+        {
+            return Err("Duplicate wallet name".into());
+        }
+
         // Find the wallet by old name and update it
         if let Some(wallet) = wallet_key_data
             .iter_mut()
             .find(|w| w.wallet_name == old_name)
         {
-            let updated_wallet = WalletKeyData::new(
-                new_name.to_string(),
-                wallet.wallet_address.clone(),
-                wallet.private_key.clone(),
-                wallet.is_encrypted,
-            );
-            *wallet = updated_wallet;
+            wallet.wallet_name = new_name.to_string();
 
             // Write the updated wallet key data back to the file
-            let updated_data = serde_json::to_string(&wallet_key_data)?;
-            write_secret_file(KEY_FILE_PATH, updated_data.as_ref()).await?;
+            persist_wallet_keys(KEY_FILE_PATH, &wallet_key_data).await?;
+
+            if let Some(mut wallet) = wallets.remove(old_name) {
+                wallet.name = new_name.to_string();
+                wallets.insert(new_name.to_string(), wallet);
+            }
 
             info!("Wallet renamed from '{}' to '{}'", old_name, new_name);
             Ok(())
