@@ -23,16 +23,16 @@ and a per-sender mempool rate limit, but a public deployment should add its own.
 | Endpoint | Returns |
 |---|---|
 | `/explorer/status` | node/chain status: version, network_id, height, `finalized_height` + `finality_margin` (see Finality below), index readiness |
-| `/explorer/tip` | latest block header |
+| `/explorer/tip` | latest block, including display-form transactions |
 | `/explorer/block/{height}` | full block at height (canonical) |
 | `/explorer/tx/{height}/{position}` | one transaction by block height + position (includes `final`) |
 | `/explorer/tx?id={tx_id}` | track one transaction by id: `confirmed` (with height, position, block_hash, confirmations, `final`, body), `pending` (in mempool), or 404 |
 | `/explorer/address/{address}` | confirmed **balance** + paginated tx **history** |
-| `/explorer/supply` | circulating supply |
+| `/explorer/supply` | total confirmed positive balances, including immature mining rewards |
 
 `/explorer/address/{address}` query params: `limit` (1–200, default 50) and a
 `before_height` + `before_pos` cursor (pass both) for pagination. Response
-includes `balance`, `balance_units` (exact integer string), and `entries`.
+includes `balance`, `balance_units` (exact integer string), and `transactions`.
 
 Amounts appear both as a decimal `amount`/`balance` and an exact integer
 `*_units` string — **use the `_units` integer for accounting**; the decimal is
@@ -69,51 +69,70 @@ decrease. **Always re-poll; never cache a one-time `confirmed`.**
 
 ## Submit a transaction (POST /explorer/submit-tx)
 
-Body: a signed transaction as JSON. Same shape the read endpoints return:
+Body: a signed transaction as JSON. Read responses are display-oriented
+(`from`/`to`) and are not valid submit payloads; construct this client-side
+shape explicitly:
 
-    {
-      "sender":    "<40-hex address>",
-      "recipient": "<40-hex address>",
-      "amount":    1.5,                 // decimal coins
-      "fee":       0.001,
-      "timestamp": 1783600000,          // unix seconds
-      "signature": "<hex ML-DSA-87 signature>",
-      "pub_key":   "<hex ML-DSA public key>",
-      "sig_hash":  "<hex>"
-    }
+```json
+{
+  "sender": "<40-char lowercase hex address>",
+  "recipient": "<40-char lowercase hex address>",
+  "amount": 1.5,
+  "fee": 0.001,
+  "timestamp": 1783600000,
+  "signature": "<hex ML-DSA-87 signature>",
+  "pub_key": "<hex ML-DSA public key>",
+  "sig_hash": "<hex>"
+}
+```
 
 The `fee` is a priority signal with a **relay floor of 0.0001 coins** — lower
-fees are rejected at admission (`400 … below the relay floor`). Recommended:
-`max(amount × 0.000563063063, 0.0001)` (≈0.0563%, the reference-wallet rate).
-Miners earn 65% of included fees on top of a fee-scaled block subsidy, so
-higher-fee transactions confirm first when blocks are contested and bare-floor
-batches are the first to queue under load.
+fees are rejected at admission (`400 … below the relay floor`). The bounded
+reference-wallet policy is recommended for ordinary payments:
 
-Responses (submit is **idempotent** — a resend is safe, never a spurious error):
+    raw_fee_units = round(amount_units / 1776)
+    fee_units = clamp(raw_fee_units, 10_000, 50_000)
 
-    200  {"ok": true, "status": "accepted",         "tx_id": "<hex>"}   admitted + broadcast
-    200  {"ok": true, "status": "already_pending",  "tx_id": "<hex>"}   identical tx already in mempool
-    200  {"ok": true, "status": "already_confirmed","tx_id": "<hex>",
+Here one coin is 100,000,000 units and positive exact halves round upward. This
+is a `0.0001–0.0005` fee; exchange withdrawal systems may instead choose an
+absolute fee appropriate to their batching and service policy, subject to
+current node admission and block-accounting rules. Miners can use fees to
+prioritize transactions when blocks are contested, but paying far above the
+reference range does not guarantee a particular confirmation time.
+
+Submission is idempotent: retrying the identical signed transaction cannot
+create a second payment, and a processed duplicate is reported explicitly.
+Retries can still receive transient `429` or `503` responses:
+
+    200  {"ok": true, "status": "accepted",         "tx_id": "<opaque id>"}   admitted; announcement scheduled
+    200  {"ok": true, "status": "already_pending",  "tx_id": "<opaque id>"}   identical tx already in mempool
+    200  {"ok": true, "status": "already_confirmed","tx_id": "<opaque id>",
           "height": <n>, "final": <bool>}                               already in a block
     400  {"error": "transaction rejected: <reason>"}    failed validation
     422  (malformed JSON body)
     429  {"error": "rate_limited"}
-    503  {"error": "node busy"}                         chain lock contended
+    503  {"error": "chain busy, retry shortly"}         chain lock contended
 
 A withdrawal worker should treat `accepted` / `already_pending` / `already_confirmed`
-all as success, retry on `503`, back off on `429`, and alert only on a real `400`.
+all as success, retry on `503`, back off on `429`, and alert on a real `400` or
+malformed-payload `422`.
 
-On `200` the node has admitted the tx to its mempool (after full signature,
-balance, replay, and already-confirmed checks) and announced it to the network —
-any miner can now include it. There is no separate confirmation step; poll
+On `accepted`, the node has admitted the tx to its mempool (after full signature,
+balance, replay, and already-confirmed checks) and scheduled its network
+announcement. It is then eligible for miner consideration. There is no separate
+confirmation step; poll
 `/explorer/tx?id=` with the returned `tx_id` (it reports `pending` then
 `confirmed` with a rising `confirmations` count), or watch `/explorer/address`
 for the sender/recipient, to see it land in a block.
 
+Treat the returned `tx_id` as an opaque string, not a hex digest. URL-encode it
+when passing it to `/explorer/tx?id=...`; its current representation contains
+transaction fields and separators and may change independently of API clients.
+
 ### Signing (client side — you build this)
 
-Transactions are signed with **ML-DSA-87 (FIPS 204)**, a standards-track
-post-quantum signature with existing libraries in most languages (e.g.
+Transactions are signed with **ML-DSA-87 (FIPS 204)**, a standardized
+post-quantum signature with implementations in multiple ecosystems (e.g.
 `@noble/post-quantum`'s `ml_dsa87` in JS/TS) — so no code from this repo is
 needed. A wallet must sign **client-side** so the private key never leaves the
 device.
@@ -124,8 +143,9 @@ implementation byte-for-byte. In short: sign the UTF-8 string
 `sender:recipient:amount:fee:timestamp` (amount/fee at 8 decimals) with
 ML-DSA-87, then POST the transaction JSON to `/explorer/submit-tx`.
 
-This repo intentionally ships no wallet UI — the spec is everything the
-community needs to build one.
+This repo intentionally ships no wallet UI. The signing spec defines the
+network-facing key, address, message, and transaction encodings an integration
+must reproduce.
 
 ## Notes for exchanges
 

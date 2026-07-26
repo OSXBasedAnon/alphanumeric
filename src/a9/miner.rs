@@ -14,8 +14,8 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT, MAX_TX_AGE_SECS,
-    MIN_RELAY_FEE_UNITS, NETWORK_FEE,
+    BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT,
+    MAX_BLOCK_WEIGHT_BYTES, MAX_TX_AGE_SECS, MIN_RELAY_FEE_UNITS, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
@@ -27,7 +27,7 @@ use crate::a9::codec;
 /// under the frame: full ML-DSA-87 witnesses put a signed transfer near ~15 KB,
 /// so a count-full template would serialize to tens of MB. 3.5 MiB leaves
 /// headroom for the header, coinbase and codec envelope.
-const MAX_TEMPLATE_TX_BYTES: usize = 3_500_000;
+const MAX_TEMPLATE_TX_BYTES: usize = MAX_BLOCK_WEIGHT_BYTES;
 
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
@@ -70,6 +70,19 @@ pub enum MiningError {
 /// produced block is valid under the unchanged rules, so old and new nodes agree on it.
 fn candidate_timestamp(now_secs: u64, parent_timestamp: u64) -> u64 {
     now_secs.max(parent_timestamp)
+}
+
+fn coinbase_matches_reward_schedule(
+    blockchain: &Blockchain,
+    block: &Block,
+) -> Result<bool, BlockchainError> {
+    let expected = blockchain.calculate_block_reward(block)?;
+    Ok(block
+        .transactions
+        .first()
+        .filter(|tx| tx.sender == "MINING_REWARDS")
+        .map(|tx| tx.amount_units == Transaction::to_units(expected))
+        .unwrap_or(false))
 }
 
 /// Random nonce-window base for one mining attempt (splitmix64 of the clock +
@@ -314,59 +327,67 @@ impl MiningManager {
                 // otherwise poison every rebuilt template).
                 // TIP-CHANGE HOT PATH: this rebuild runs on every ~5s network
                 // tip change, and every ms here is a ms not spent hashing the
-                // new block. When the pool is EMPTY (the common state) an
-                // atomic-counter probe is the ONLY mempool work — the sweep,
+                // new block. Apart from the one-time activation reconciliation,
+                // when the pool is EMPTY (the common state) an atomic-counter
+                // probe is the ONLY mempool work — the sweep,
                 // selection lock, and filters below never run, and the rebuild
                 // is back to sub-ms. There is nothing to go stale in an empty
                 // template, so the correctness gates below are vacuous anyway.
+                let template_timestamp = candidate_timestamp(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    previous_block_timestamp,
+                );
+                blockchain_lock
+                    .ensure_pending_rules_for_next_block()
+                    .await?;
                 let live_transactions: Vec<Transaction> = if blockchain_lock
                     .mempool_is_empty()
                     .await
                 {
                     Vec::new()
                 } else {
-                let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
-                blockchain_lock
-                    .get_transactions_for_block()
-                    .await
-                    .into_iter()
-                    .filter(|tx| {
-                        if tx.sender == "MINING_REWARDS" {
-                            return false;
-                        }
-                        if blockchain_lock.is_tx_confirmed(&tx.get_tx_id()) {
-                            return false;
-                        }
-                        if !tx.has_valid_regular_amounts() {
-                            return false;
-                        }
-                        // Relay-policy floor, belt to the mempool's suspender:
-                        // never template a below-floor tx that slipped in via
-                        // startup rehydration or a reorg readmit.
-                        if tx.fee_units < MIN_RELAY_FEE_UNITS {
-                            return false;
-                        }
-                        if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
-                            < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
-                        {
-                            return false;
-                        }
-                        if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
-                            return false;
-                        }
-                        if let Some(sig_hex) = &tx.signature {
-                            if let Ok(bytes) = hex::decode(sig_hex) {
-                                return bytes.len() > 64;
+                    let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
+                    let now_secs = template_timestamp;
+                    const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
+                    blockchain_lock
+                        .get_transactions_for_block()
+                        .await
+                        .into_iter()
+                        .filter(|tx| {
+                            if tx.sender == "MINING_REWARDS" {
+                                return false;
                             }
-                        }
-                        false
-                    })
-                    .collect()
+                            if blockchain_lock.is_tx_confirmed(&tx.get_tx_id()) {
+                                return false;
+                            }
+                            if !tx.has_valid_regular_amounts() {
+                                return false;
+                            }
+                            // Relay-policy floor, belt to the mempool's suspender:
+                            // never template a below-floor tx that slipped in via
+                            // startup rehydration or a reorg readmit.
+                            if tx.fee_units < MIN_RELAY_FEE_UNITS {
+                                return false;
+                            }
+                            if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
+                                < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
+                            {
+                                return false;
+                            }
+                            if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
+                                return false;
+                            }
+                            if let Some(sig_hex) = &tx.signature {
+                                if let Ok(bytes) = hex::decode(sig_hex) {
+                                    return bytes.len() > 64;
+                                }
+                            }
+                            false
+                        })
+                        .collect()
                 };
 
                 // Reserve one slot for the coinbase so the finalized block never exceeds
@@ -404,6 +425,12 @@ impl MiningManager {
                 // to the per-candidate version.
                 let mut confirmed_cache: HashMap<String, i128> = HashMap::new();
                 let mut template_bytes: usize = 0;
+                let activated_shape_rules = header.number >= FEE_SYSTEM_ACTIVATION_HEIGHT;
+                let mut consensus_template_weight = if activated_shape_rules {
+                    Blockchain::mining_template_base_weight(&miner_address)?
+                } else {
+                    0
+                };
 
                 for transaction in ordered {
                     if selected_regular.len() >= regular_cap {
@@ -439,18 +466,61 @@ impl MiningManager {
                         if template_bytes.saturating_add(tx_bytes) > MAX_TEMPLATE_TX_BYTES {
                             continue;
                         }
-                        template_bytes += tx_bytes;
+                        let next_consensus_weight = if activated_shape_rules {
+                            let tx_weight = match Blockchain::template_regular_transaction_weight(
+                                header.number,
+                                transaction,
+                            ) {
+                                Ok(Some(weight)) => weight,
+                                Ok(None) | Err(_) => continue,
+                            };
+                            let Some(next_weight) =
+                                consensus_template_weight.checked_add(tx_weight)
+                            else {
+                                continue;
+                            };
+                            if next_weight > MAX_BLOCK_WEIGHT_BYTES {
+                                continue;
+                            }
+                            Some(next_weight)
+                        } else {
+                            None
+                        };
                         selected_regular.push(transaction.clone());
+                        if !blockchain_lock.template_fee_accounting_is_admissible(
+                            header.number,
+                            template_timestamp,
+                            &selected_regular,
+                        )? {
+                            selected_regular.pop();
+                            continue;
+                        }
+                        template_bytes += tx_bytes;
+                        if let Some(next_weight) = next_consensus_weight {
+                            consensus_template_weight = next_weight;
+                        }
                         *sender_debits.entry(transaction.sender.clone()).or_default() +=
                             required_units;
                     }
                 }
 
-                let reward_amount = blockchain_lock.get_block_reward(&selected_regular);
-                let reward_timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                // Calculate the coinbase against the SAME schedule timestamp used
+                // by fee-accounting template selection. `get_block_reward` stamps
+                // an independent wall-clock time; at an exact six-month boundary
+                // that could select the next reward period while the template
+                // accounting above still used the preceding one.
+                let reward_template = Block {
+                    index: header.number,
+                    previous_hash: previous_block_hash,
+                    timestamp: template_timestamp,
+                    transactions: selected_regular.clone(),
+                    nonce: 0,
+                    difficulty: 0,
+                    hash: [0u8; 32],
+                    merkle_root: [0u8; 32],
+                };
+                let reward_amount = blockchain_lock.calculate_block_reward(&reward_template)?;
+                let reward_timestamp = template_timestamp;
                 let reward_tx = Transaction::new(
                     "MINING_REWARDS".to_string(),
                     miner_address.clone(),
@@ -712,6 +782,29 @@ impl MiningManager {
                     .map_err(|_| MiningError::InvalidHashFormat)?;
                 let mined_block = new_block.clone();
 
+                // The hot nonce loop refreshes the header timestamp as wall time
+                // advances, while the Merkle-committed coinbase necessarily stays
+                // fixed for one template. Usually that is value-identical; only a
+                // six-month schedule boundary can change the required amount. Do
+                // this cheap exact check before full validation so a solve found
+                // across that boundary rebuilds cleanly instead of terminating the
+                // continuous miner with InvalidTransactionAmount.
+                let reward_matches_header = {
+                    let blockchain_lock = self.blockchain.read().await;
+                    coinbase_matches_reward_schedule(&blockchain_lock, &new_block)?
+                };
+                if !reward_matches_header {
+                    current_nonce = attempt_nonce_base();
+                    if let Ok(pb) = progress_bar.lock() {
+                        pb.reset();
+                        pb.set_prefix(format!("Block #{}", header.number));
+                        pb.set_message(
+                            "Reward schedule advanced; rebuilding block template...",
+                        );
+                    }
+                    continue;
+                }
+
                 // Separate verification step with timeout and logging
                 match tokio::time::timeout(Duration::from_secs(8), async {
                     let blockchain_lock = self.blockchain.read().await;
@@ -898,7 +991,13 @@ pub struct BlockHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::candidate_timestamp;
+    use super::{
+        candidate_timestamp, coinbase_matches_reward_schedule, Block, Blockchain,
+        Transaction, NETWORK_FEE,
+    };
+    use crate::a9::blockchain::RateLimiter;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
 
     // The mined-candidate timestamp is monotonic vs the parent: never below it (validation rejects
     // child < parent), so an honest miner can extend a future-dated / clock-skewed tip immediately
@@ -925,5 +1024,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reward_boundary_requires_a_fresh_coinbase_template() {
+        const SIX_MONTHS_SECS: u64 = 15_768_000;
+
+        let db = sled::Config::new()
+            .temporary(true)
+            .open()
+            .expect("temporary mining-boundary DB");
+        let blockchain = Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            5,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(TokioMutex::new(464)),
+        );
+        blockchain
+            .create_genesis_block()
+            .await
+            .expect("launch genesis");
+        let genesis = blockchain.get_block(0).expect("stored genesis");
+
+        let mut candidate = Block {
+            index: 1,
+            previous_hash: genesis.hash,
+            timestamp: genesis.timestamp + SIX_MONTHS_SECS - 1,
+            transactions: vec![Transaction::new(
+                "MINING_REWARDS".to_string(),
+                "11".repeat(20),
+                0.0,
+                NETWORK_FEE,
+                genesis.timestamp + SIX_MONTHS_SECS - 1,
+                None,
+            )],
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        };
+        let before = blockchain
+            .calculate_block_reward(&candidate)
+            .expect("pre-boundary reward");
+        candidate.transactions[0].amount_units = Transaction::to_units(before);
+        assert!(
+            coinbase_matches_reward_schedule(&blockchain, &candidate).unwrap(),
+            "template coinbase must match its frozen accounting timestamp"
+        );
+
+        candidate.timestamp += 1;
+        assert!(
+            !coinbase_matches_reward_schedule(&blockchain, &candidate).unwrap(),
+            "a solve crossing the six-month boundary must rebuild, not be finalized"
+        );
+
+        let after = blockchain
+            .calculate_block_reward(&candidate)
+            .expect("post-boundary reward");
+        candidate.transactions[0].amount_units = Transaction::to_units(after);
+        assert!(
+            coinbase_matches_reward_schedule(&blockchain, &candidate).unwrap(),
+            "the rebuilt post-boundary template must match exactly"
+        );
     }
 }

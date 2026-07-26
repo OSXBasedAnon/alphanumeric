@@ -1,5 +1,10 @@
 # Alphanumeric Hardening Report
 
+> Historical record (pre-7.9.0): this report describes the hardening pass that
+> preceded the coordinated fee-accounting and block-weight release. It is not a
+> current release-safety statement; consult `README.md`, `THREAT_MODEL.md`, and
+> the activation notice shipped with the current release.
+
 ## Scope
 - Consensus path: `src/a9/blockchain.rs`, `src/a9/node.rs`, `src/a9/bpos.rs`, `src/a9/miner.rs`
 - Compatibility path: transaction serialization/deserialization
@@ -67,7 +72,8 @@ Paths: `src/a9/wallet.rs`, `src/a9/blockchain.rs`, `src/main.rs`
 - forced mixed-version simulation for PoW edge difficulty handling
 
 ## Fork Risk Statement
-- Current hardening is designed to avoid immediate fork requirements by:
+- The hardening covered by this historical report was designed to avoid an
+  immediate fork requirement by:
   - preserving transaction wire-field compatibility
   - applying BPoS quorum enforcement only when verifier context exists
   - keeping bootstrap fallback behavior operational

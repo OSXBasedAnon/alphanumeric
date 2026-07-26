@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures_util::future::join_all;
 use igd_next::{search_gateway, PortMappingProtocol};
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -55,12 +55,12 @@ use tokio::{
 };
 
 use crate::a9::blockchain::{
-    Block, Blockchain, BlockchainError, MAX_BLOCK_TX_COUNT, MIN_RELAY_FEE_UNITS, RateLimiter,
-    Transaction,
-    SYSTEM_ADDRESSES,
+    Block, Blockchain, BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT,
+    MAX_BLOCK_WEIGHT_BYTES, MIN_RELAY_FEE_UNITS, RateLimiter, Transaction, SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
+use crate::a9::mldsa;
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
 
 //----------------------------------------------------------------------
@@ -326,6 +326,56 @@ const BLOOM_FILTER_FPR: f64 = 0.01;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
 const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
+/// Capability marker carried in the existing Ping/Pong `node_id` field. Older
+/// peers already ignore that field after the authenticated handshake, so this
+/// negotiates compact transport without changing NETWORK_VERSION or the signed
+/// handshake schema. New message variants are sent only after observing it.
+const COMPACT_BLOCK_V1_CAPABILITY_SUFFIX: &str = "|a9-compact-block-v1";
+/// Release safety gate for the TCP compact extension.
+///
+/// The TCP reader processes one frame at a time, while compact reconstruction
+/// may require bounded pull/proxy requests.  Until that path has a receiver ACK
+/// and an independently framed fallback that cannot sit behind reconstruction,
+/// TCP compact is deliberately dormant: no capability is advertised or
+/// observed, no compact message is transmitted or processed, and no body/full
+/// response is served.  Traditional unchanged full-block TCP relay remains the
+/// reliability path.  WebRTC's local-only compact hint plus ordered full-frame
+/// fallback is separate and does not consult this gate.
+const TCP_COMPACT_V1_ENABLED: bool = false;
+/// Keep a transaction-body response comfortably below the 4 MiB frame ceiling
+/// even when every entry carries a full ML-DSA witness.
+const COMPACT_TX_BATCH_MAX: usize = 64;
+const COMPACT_SOURCE_MAX: usize = 8;
+const COMPACT_PROXY_HOPS_MAX: u8 = 1;
+const COMPACT_PENDING_CACHE_ENTRIES: usize = 32;
+const COMPACT_FULL_BLOCK_CACHE_ENTRIES: usize = 32;
+const COMPACT_TX_INDEX_ENTRIES: usize = 50_000;
+const COMPACT_RECONSTRUCTION_CONCURRENCY: usize = 4;
+const COMPACT_FORK_FALLBACK_CONCURRENCY: usize = 2;
+const COMPACT_FORK_FALLBACK_DEADLINE: Duration = Duration::from_secs(15);
+const COMPACT_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const COMPACT_TRANSACTION_MAX_ENCODED_BYTES: usize = 1024 * 1024;
+/// The largest valid 4,096-transaction announcement is only about 150 KiB.
+/// Leave ample codec/headroom while preventing an announcement itself from
+/// consuming the full block-frame allowance.
+const COMPACT_ANNOUNCEMENT_MAX_BYTES: usize = 512 * 1024;
+const COMPACT_SAFE_ASSEMBLED_BYTES: usize = MAX_MESSAGE_SIZE - 64 * 1024;
+const COMPACT_PENDING_CACHE_BYTE_BUDGET: usize = 24 * 1024 * 1024;
+const COMPACT_FULL_CACHE_BYTE_BUDGET: usize = 40 * 1024 * 1024;
+const COMPACT_GLOBAL_CACHE_BYTE_BUDGET: usize =
+    COMPACT_PENDING_CACHE_BYTE_BUDGET + COMPACT_FULL_CACHE_BYTE_BUDGET;
+const MESH_COMPACT_V1_MAGIC: [u8; 8] = *b"A9CMPCT\0";
+const MESH_COMPACT_V1_VERSION: u8 = 1;
+/// Fresh coinbases are small. Keeping this transport-only ceiling well above
+/// their canonical encoding prevents a malformed full-frame coinbase from
+/// defeating the purpose of the compact announcement. Construction falls back
+/// to the traditional full-block path if this limit is ever exceeded.
+const COMPACT_COINBASE_MAX_ENCODED_BYTES: usize = 16 * 1024;
+const COMPACT_CAPABILITY_TTL: Duration = Duration::from_secs(15 * 60);
+const COMPACT_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
+/// Covers compact body resolution, the normal witness-resolution deadline, and
+/// validation headroom. A stale claim can be replaced atomically after this.
+const COMPACT_INFLIGHT_TTL: Duration = Duration::from_secs(70);
 
 // STUN servers for NAT traversal
 const STUN_SERVERS: &[&str] = &[
@@ -579,6 +629,194 @@ pub struct HandshakeMessage {
     pub signature: Vec<u8>,
 }
 
+/// A transport-only compact block announcement.
+///
+/// `transaction_hashes` contains the ordered, full 32-byte hashes of the exact
+/// normalized transaction encodings used by the consensus Merkle tree. The full
+/// coinbase is included because it is block-specific; regular transactions are
+/// reconstructed from the verified mempool/witness cache or requested in bounded
+/// batches from the announcing peer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactBlockV1 {
+    pub index: u32,
+    pub previous_hash: [u8; 32],
+    pub timestamp: u64,
+    pub nonce: u64,
+    pub difficulty: u64,
+    pub hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub coinbase: Transaction,
+    pub transaction_hashes: Vec<[u8; 32]>,
+}
+
+impl CompactBlockV1 {
+    fn from_block(block: &Block) -> Result<Self, NodeError> {
+        // Compact is only an optimization for blocks whose unchanged full body
+        // can be reconstructed and carried by this transport.  Never announce a
+        // block that downstream peers could not recover after a cache miss.
+        if !Node::compact_block_transport_ok(block) {
+            return Err(NodeError::InvalidBlock(
+                "compact block source is not transport eligible".into(),
+            ));
+        }
+        let coinbase = block
+            .transactions
+            .first()
+            .filter(|tx| tx.sender == "MINING_REWARDS")
+            .cloned()
+            .ok_or_else(|| {
+                NodeError::InvalidBlock("compact block source has no leading coinbase".into())
+            })?;
+        if !Self::coinbase_transport_size_ok(&coinbase) {
+            return Err(NodeError::InvalidBlock(
+                "compact block coinbase exceeds transport limit".into(),
+            ));
+        }
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(Blockchain::calculate_merkle_leaf_hash)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let compact = Self {
+            index: block.index,
+            previous_hash: block.previous_hash,
+            timestamp: block.timestamp,
+            nonce: block.nonce,
+            difficulty: block.difficulty,
+            hash: block.hash,
+            merkle_root: block.merkle_root,
+            coinbase,
+            transaction_hashes,
+        };
+        if codec::serialize(&compact)?.len() > COMPACT_ANNOUNCEMENT_MAX_BYTES {
+            return Err(NodeError::InvalidBlock(
+                "compact block announcement exceeds transport limit".into(),
+            ));
+        }
+        Ok(compact)
+    }
+
+    fn coinbase_transport_size_ok(coinbase: &Transaction) -> bool {
+        codec::serialize(coinbase)
+            .map(|encoded| encoded.len() <= COMPACT_COINBASE_MAX_ENCODED_BYTES)
+            .unwrap_or(false)
+    }
+
+    fn encode_mesh_envelope(&self) -> Result<Vec<u8>, NodeError> {
+        let payload = codec::serialize(self)?;
+        let capacity = MESH_COMPACT_V1_MAGIC
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_add(payload.len()))
+            .ok_or_else(|| NodeError::Serialization("compact mesh envelope overflow".into()))?;
+        if capacity > COMPACT_ANNOUNCEMENT_MAX_BYTES {
+            return Err(NodeError::InvalidBlock(
+                "compact mesh envelope exceeds transport limit".into(),
+            ));
+        }
+        let mut envelope = Vec::with_capacity(capacity);
+        envelope.extend_from_slice(&MESH_COMPACT_V1_MAGIC);
+        envelope.push(MESH_COMPACT_V1_VERSION);
+        envelope.extend_from_slice(&payload);
+        Ok(envelope)
+    }
+
+    fn decode_mesh_envelope(raw: &[u8]) -> Option<Self> {
+        let header_len = MESH_COMPACT_V1_MAGIC.len().checked_add(1)?;
+        if raw.len() <= header_len
+            || raw.len() > COMPACT_ANNOUNCEMENT_MAX_BYTES
+            || raw.get(..MESH_COMPACT_V1_MAGIC.len())? != MESH_COMPACT_V1_MAGIC
+            || *raw.get(MESH_COMPACT_V1_MAGIC.len())? != MESH_COMPACT_V1_VERSION
+        {
+            return None;
+        }
+        codec::deserialize(raw.get(header_len..)?).ok()
+    }
+
+    fn header_block(&self) -> Block {
+        Block {
+            index: self.index,
+            previous_hash: self.previous_hash,
+            timestamp: self.timestamp,
+            transactions: Vec::new(),
+            nonce: self.nonce,
+            difficulty: self.difficulty,
+            hash: self.hash,
+            merkle_root: self.merkle_root,
+        }
+    }
+
+    fn validate_commitment(&self) -> bool {
+        if self.transaction_hashes.is_empty()
+            || self.transaction_hashes.len() > MAX_BLOCK_TX_COUNT
+            || self.coinbase.sender != "MINING_REWARDS"
+            || !Self::coinbase_transport_size_ok(&self.coinbase)
+        {
+            return false;
+        }
+
+        let coinbase_hash = match Blockchain::calculate_merkle_leaf_hash(&self.coinbase) {
+            Ok(hash) => hash,
+            Err(_) => return false,
+        };
+        if self.transaction_hashes[0] != coinbase_hash {
+            return false;
+        }
+
+        let committed_root =
+            match Blockchain::calculate_merkle_root_from_leaf_hashes(&self.transaction_hashes) {
+                Ok(root) => root,
+                Err(_) => return false,
+            };
+        if committed_root != self.merkle_root {
+            return false;
+        }
+
+        let header = self.header_block();
+        header.validate_header().is_ok() && header.verify_pow_meets_floor()
+    }
+
+    fn reconstruct(&self, transactions: Vec<Transaction>) -> Result<Block, NodeError> {
+        if transactions.len() != self.transaction_hashes.len() {
+            return Err(NodeError::InvalidBlock(
+                "compact block transaction count mismatch".into(),
+            ));
+        }
+        for (tx, expected) in transactions.iter().zip(&self.transaction_hashes) {
+            let actual = Blockchain::calculate_merkle_leaf_hash(tx)?;
+            if &actual != expected {
+                return Err(NodeError::InvalidBlock(
+                    "compact block transaction commitment mismatch".into(),
+                ));
+            }
+        }
+
+        let block = Block {
+            index: self.index,
+            previous_hash: self.previous_hash,
+            timestamp: self.timestamp,
+            transactions,
+            nonce: self.nonce,
+            difficulty: self.difficulty,
+            hash: self.hash,
+            merkle_root: self.merkle_root,
+        };
+        if block.calculate_hash_for_block() != block.hash {
+            return Err(NodeError::InvalidBlock(
+                "compact block reconstructed header mismatch".into(),
+            ));
+        }
+        Ok(block)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IndexedCompactTransactionV1 {
+    pub index: u16,
+    pub transaction: Transaction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     Version {
@@ -657,6 +895,26 @@ pub enum NetworkMessage {
         node_id: String,
     },
     RawData(Vec<u8>),
+    // APPEND transport extensions so existing NetworkMessage variant indexes stay
+    // byte-for-byte stable. These are sent only to capability-negotiated peers.
+    CompactBlockV1(CompactBlockV1),
+    GetCompactTransactionsV1 {
+        block_hash: [u8; 32],
+        indexes: Vec<u16>,
+        proxy_hops: u8,
+    },
+    CompactTransactionsV1 {
+        block_hash: [u8; 32],
+        transactions: Vec<IndexedCompactTransactionV1>,
+    },
+    GetCompactBlockV1 {
+        block_hash: [u8; 32],
+        proxy_hops: u8,
+    },
+    CompactBlockResponseV1 {
+        block_hash: [u8; 32],
+        block: Option<Block>,
+    },
 }
 
 #[derive(Debug)]
@@ -1110,6 +1368,35 @@ pub struct Node {
     // path: a block forwarded early is recorded here, never in the shared bloom, so it can never
     // suppress a later witness-bearing delivery that the node must still fully validate and accept.
     early_relay_seen: Arc<PLMutex<LruCache<[u8; 32], ()>>>,
+    /// Per-block set of peers that successfully received the compact announcement.
+    /// Failed or never-selected peers remain eligible on a later relay pass; this
+    /// bookkeeping is independent from full-block relay and acceptance dedup.
+    compact_relay_delivered:
+        Arc<PLMutex<LruCache<[u8; 32], HashSet<SocketAddr>>>>,
+    /// Peers that advertised CompactBlockV1 over the backward-compatible ping/pong
+    /// capability marker. Entries expire unless refreshed by health pings.
+    compact_capable_peers: Arc<DashMap<SocketAddr, Instant>>,
+    /// Bounds duplicate concurrent reconstruction work without poisoning the
+    /// definitive block dedup bloom on a transient missing-body failure.
+    compact_inflight: Arc<DashMap<[u8; 32], CompactInflight>>,
+    /// Caps all simultaneous compact reconstruction/validation work. Excess
+    /// announcements retain their source metadata and await the normal full
+    /// transport instead of queueing unbounded allocations.
+    compact_reconstruction_slots: Arc<Semaphore>,
+    /// Separate, low-concurrency lane for retrieving the unchanged full body of
+    /// a same-height/next-height competitor. It preserves ordinary fork delivery
+    /// without allowing off-tip announcements to occupy reconstruction slots.
+    compact_fork_fallback_slots: Arc<Semaphore>,
+    /// Recent compact announcements and exact-hash-matched transaction bodies,
+    /// retained so a cut-through relay can serve or proxy downstream batch requests.
+    compact_pending: Arc<PLMutex<CompactPendingCache>>,
+    /// Recent full bodies, bounded independently. Used for missing-body replies and
+    /// explicit fallback; gateway and canonical storage remain unchanged.
+    compact_full_blocks: Arc<PLMutex<CompactFullBlockCache>>,
+    /// Exact normalized Merkle leaf -> verified witness-cache key. This small index
+    /// reuses the existing bounded full-witness cache instead of duplicating ML-DSA
+    /// transaction bodies.
+    compact_tx_index: Arc<PLMutex<LruCache<[u8; 32], String>>>,
     last_public_announce_at: Arc<AtomicU64>,
     /// Last announce ATTEMPT (success or failure) — throttles failure retries to
     /// ANNOUNCE_RETRY_SECS without silencing the loop for the full interval.
@@ -1214,6 +1501,130 @@ struct ScanRange {
 struct ValidationCacheEntry {
     pub valid: bool,
     pub timestamp: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCompactBlock {
+    announcement: CompactBlockV1,
+    sources: Vec<SocketAddr>,
+    /// Bodies whose exact normalized leaf hash was checked against the ordered
+    /// announcement. They are not considered signature-verified until the normal
+    /// block validation pipeline succeeds.
+    transactions: HashMap<u16, Transaction>,
+    transaction_sizes: HashMap<u16, usize>,
+    assembled_bytes: usize,
+    cache_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCompactRoute {
+    announcement: CompactBlockV1,
+    sources: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone)]
+struct CompactInflight {
+    started: Instant,
+    sources: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactIngressRoute {
+    ReconstructLocalTip,
+    FetchFullCompetitor,
+    DeferToChainSync,
+}
+
+#[derive(Debug)]
+struct CompactPendingCache {
+    entries: LruCache<[u8; 32], PendingCompactBlock>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompactFullBlockEntry {
+    block: Arc<Block>,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompactFullBlockCache {
+    entries: LruCache<[u8; 32], CompactFullBlockEntry>,
+    bytes: usize,
+}
+
+impl CompactPendingCache {
+    fn insert(&mut self, block_hash: [u8; 32], entry: PendingCompactBlock) -> bool {
+        if entry.cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || entry.cache_bytes > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        if let Some(previous) = self.entries.pop(&block_hash) {
+            self.bytes = self.bytes.saturating_sub(previous.cache_bytes);
+        }
+        while self.bytes.saturating_add(entry.cache_bytes)
+            > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.cache_bytes);
+        }
+        if self.bytes.saturating_add(entry.cache_bytes)
+            > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        self.bytes = self.bytes.saturating_add(entry.cache_bytes);
+        if let Some((_, evicted)) = self.entries.push(block_hash, entry) {
+            self.bytes = self.bytes.saturating_sub(evicted.cache_bytes);
+        }
+        true
+    }
+
+    fn remove(&mut self, block_hash: &[u8; 32]) -> Option<PendingCompactBlock> {
+        let removed = self.entries.pop(block_hash);
+        if let Some(ref entry) = removed {
+            self.bytes = self.bytes.saturating_sub(entry.cache_bytes);
+        }
+        removed
+    }
+}
+
+impl CompactFullBlockCache {
+    fn insert(&mut self, block_hash: [u8; 32], entry: CompactFullBlockEntry) -> bool {
+        if entry.encoded_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || entry.encoded_bytes > COMPACT_FULL_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        if let Some(previous) = self.entries.pop(&block_hash) {
+            self.bytes = self.bytes.saturating_sub(previous.encoded_bytes);
+        }
+        while self.bytes.saturating_add(entry.encoded_bytes)
+            > COMPACT_FULL_CACHE_BYTE_BUDGET
+        {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.encoded_bytes);
+        }
+        if self.bytes.saturating_add(entry.encoded_bytes)
+            > COMPACT_FULL_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        self.bytes = self.bytes.saturating_add(entry.encoded_bytes);
+        if let Some((_, evicted)) = self.entries.push(block_hash, entry) {
+            self.bytes = self.bytes.saturating_sub(evicted.encoded_bytes);
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -1364,6 +1775,10 @@ impl Node {
             .filter(|d| !d.trim().is_empty())
             .map(Arc::from);
         let peer_cache_path = Self::resolve_peer_cache_path(data_dir.as_deref());
+        debug_assert_eq!(
+            COMPACT_GLOBAL_CACHE_BYTE_BUDGET,
+            COMPACT_PENDING_CACHE_BYTE_BUDGET + COMPACT_FULL_CACHE_BYTE_BUDGET
+        );
 
         // Initialize socket and listener
         let (bind_addr, listener) = Self::initialize_listener(bind_addr)?;
@@ -1463,6 +1878,32 @@ impl Node {
             // as the mesh seen-set; a block hash is a fixed 32 bytes so this is ~small.
             early_relay_seen: Arc::new(PLMutex::new(LruCache::new(
                 NonZeroUsize::new(8192).expect("nonzero"),
+            ))),
+            compact_relay_delivered: Arc::new(PLMutex::new(LruCache::new(
+                NonZeroUsize::new(8192).expect("nonzero"),
+            ))),
+            compact_capable_peers: Arc::new(DashMap::new()),
+            compact_inflight: Arc::new(DashMap::new()),
+            compact_reconstruction_slots: Arc::new(Semaphore::new(
+                COMPACT_RECONSTRUCTION_CONCURRENCY,
+            )),
+            compact_fork_fallback_slots: Arc::new(Semaphore::new(
+                COMPACT_FORK_FALLBACK_CONCURRENCY,
+            )),
+            compact_pending: Arc::new(PLMutex::new(CompactPendingCache {
+                entries: LruCache::new(
+                    NonZeroUsize::new(COMPACT_PENDING_CACHE_ENTRIES).expect("nonzero"),
+                ),
+                bytes: 0,
+            })),
+            compact_full_blocks: Arc::new(PLMutex::new(CompactFullBlockCache {
+                entries: LruCache::new(
+                    NonZeroUsize::new(COMPACT_FULL_BLOCK_CACHE_ENTRIES).expect("nonzero"),
+                ),
+                bytes: 0,
+            })),
+            compact_tx_index: Arc::new(PLMutex::new(LruCache::new(
+                NonZeroUsize::new(COMPACT_TX_INDEX_ENTRIES).expect("nonzero"),
             ))),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
             bind_addr,
@@ -4899,13 +5340,29 @@ impl Node {
         #[cfg(feature = "webrtc_mesh")]
         self.mesh_gossip_block(&block).await;
 
-        // PROPAGATION-CRITICAL, FIRST: POST to the gateway relay immediately — it is the
-        // authoritative propagation path across NAT, so it must NOT wait behind the
-        // peerless p2p discovery (~6s timeout) below, which almost never yields a
-        // reachable peer. Fronting the relay POST shaves that latency off the time a
-        // freshly-mined block takes to reach every other miner — the exact window during
-        // which they would otherwise mine a competing fork.
-        if let Err(e) = self.post_block_relay(&block).await {
+        // Start the gateway relay and already-connected direct peers together.
+        // They are independent transports; serializing them made the direct path
+        // inherit the full HTTP upload latency, precisely when a witness-heavy
+        // block benefits most from the compact announcement. Peer discovery is
+        // still deferred until afterward so a peerless node never delays its
+        // authoritative NAT-friendly relay POST.
+        let initial_peers = {
+            let peers = self.peers.read().await;
+            self.select_broadcast_peers(&peers, peers.len().min(16))
+        };
+        let initial_block = Arc::new(block.clone());
+        let relay_fut = self.post_block_relay(&block);
+        let direct_fut = async {
+            if initial_peers.is_empty() {
+                Ok(0)
+            } else {
+                self.broadcast_block(initial_block, None, initial_peers.clone(), false)
+                    .await
+            }
+        };
+        let (relay_result, mut direct_result) = tokio::join!(relay_fut, direct_fut);
+
+        if let Err(e) = relay_result {
             warn!("{} block relay failed: {}", context, e);
             // A rate-limited FRESH block is the one post that matters most for
             // propagation (everyone else forks against it until it lands). Give it a
@@ -4949,9 +5406,9 @@ impl Node {
             });
         }
 
-        // Best-effort direct p2p broadcast (usually a no-op across NAT), done AFTER the
-        // relay post so its discovery timeout can never delay propagation.
-        if self.peers.read().await.is_empty() {
+        // If there were no already-connected peers, discovery gets one best-effort
+        // second chance only after the relay POST has completed.
+        if initial_peers.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
                 if post_mine {
                     warn!("{} discovery failed: {}", context, e);
@@ -4959,59 +5416,60 @@ impl Node {
                     debug!("{} discovery deferred: {}", context, e);
                 }
             }
+
+            let discovered_peers = {
+                let peers = self.peers.read().await;
+                self.select_broadcast_peers(&peers, peers.len().min(16))
+            };
+            if !discovered_peers.is_empty() {
+                direct_result = self
+                    .broadcast_block(
+                        Arc::new(block.clone()),
+                        None,
+                        discovered_peers,
+                        false,
+                    )
+                    .await;
+            }
         }
 
-        let selected_peers = {
-            let peers = self.peers.read().await;
-            self.select_broadcast_peers(&peers, peers.len().min(16))
-        };
-
-        if selected_peers.is_empty() {
-            // No TCP peers. The mined block was already flooded over the mesh at the top of this
-            // function (the fastest path for a peerless NAT miner), so there is nothing to do here
-            // but note the missing TCP fan-out.
-            if post_mine {
-                warn!("Mined block saved locally, but no peers were available for block broadcast");
-            } else {
-                debug!(
-                    "{} publish deferred: no peers available for broadcast",
-                    context
-                );
+        match direct_result {
+            Ok(0) => {
+                // No TCP peers. The mined block was already flooded over the mesh at the top of
+                // this function (the fastest path for a peerless NAT miner), so there is nothing
+                // to do here but note the missing TCP fan-out.
+                if post_mine {
+                    warn!(
+                        "Mined block saved locally, but no peers were available for block broadcast"
+                    );
+                } else {
+                    debug!(
+                        "{} publish deferred: no peers available for broadcast",
+                        context
+                    );
+                }
             }
-        } else {
-            match self
-                .broadcast_block(Arc::new(block.clone()), None, selected_peers, false)
-                .await
-            {
-                Ok(0) => {
-                    if post_mine {
-                        warn!("Mined block broadcast had no eligible target peers");
-                    } else {
-                        debug!("{} publish deferred: no eligible target peers", context);
-                    }
+            Ok(delivered) => {
+                if post_mine {
+                    info!(
+                        "Published mined block #{} to {} peer(s)",
+                        block.index, delivered
+                    );
+                } else {
+                    debug!(
+                        "{} published block #{} to {} peer(s)",
+                        context, block.index, delivered
+                    );
                 }
-                Ok(delivered) => {
-                    if post_mine {
-                        info!(
-                            "Published mined block #{} to {} peer(s)",
-                            block.index, delivered
-                        );
-                    } else {
-                        debug!(
-                            "{} published block #{} to {} peer(s)",
-                            context, block.index, delivered
-                        );
-                    }
-                }
-                Err(e) => {
-                    if post_mine {
-                        warn!(
-                            "Mined block broadcast failed for every selected peer: {}",
-                            e
-                        );
-                    } else {
-                        debug!("{} broadcast failed for selected peers: {}", context, e);
-                    }
+            }
+            Err(e) => {
+                if post_mine {
+                    warn!(
+                        "Mined block broadcast failed for every selected peer: {}",
+                        e
+                    );
+                } else {
+                    debug!("{} broadcast failed for selected peers: {}", context, e);
                 }
             }
         }
@@ -5655,8 +6113,10 @@ impl Node {
         match submit {
             Ok(()) => {
                 // Announce now (mesh + peers) instead of waiting for the periodic
-                // re-gossip, so a withdrawal propagates immediately. Detached: the
-                // HTTP response never blocks on network I/O.
+                // re-gossip, so a withdrawal propagates immediately. The detached
+                // gossip task also seeds the compact leaf index from the canonical
+                // admitted mempool entry; keeping that work out of this handler
+                // preserves Axum's Send future requirement.
                 let node = state.node.clone();
                 let announce = tx.clone();
                 tokio::spawn(async move { node.gossip_transaction(&announce).await });
@@ -7910,6 +8370,69 @@ impl Node {
         }
     }
 
+    fn capability_node_id(&self) -> String {
+        Self::tcp_capability_node_id(&self.node_id)
+    }
+
+    fn tcp_capability_node_id(base_node_id: &str) -> String {
+        if TCP_COMPACT_V1_ENABLED {
+            format!("{}{}", base_node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
+        } else {
+            base_node_id.to_string()
+        }
+    }
+
+    fn observe_compact_capability(&self, addr: SocketAddr, advertised_node_id: &str) {
+        if !TCP_COMPACT_V1_ENABLED {
+            return;
+        }
+        if !Self::advertises_compact_v1(advertised_node_id) {
+            return;
+        }
+        self.compact_capable_peers.insert(addr, Instant::now());
+    }
+
+    fn advertises_compact_v1(advertised_node_id: &str) -> bool {
+        if !TCP_COMPACT_V1_ENABLED {
+            return false;
+        }
+        Self::compact_v1_marker_well_formed(advertised_node_id)
+    }
+
+    fn compact_v1_marker_well_formed(advertised_node_id: &str) -> bool {
+        let Some(base_id) = advertised_node_id.strip_suffix(COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
+        else {
+            return false;
+        };
+        // The authenticated session prevents off-path capability injection.
+        // Require the established 32-byte node-id shape as well so an arbitrary
+        // ping payload cannot accidentally enable an extension.
+        base_id.len() == 64
+            && hex::decode(base_id)
+                .map(|bytes| bytes.len() == 32)
+                .unwrap_or(false)
+    }
+
+    fn tcp_compact_peer_eligible(advertised_fresh: bool) -> bool {
+        TCP_COMPACT_V1_ENABLED && advertised_fresh
+    }
+
+    fn peer_supports_compact_v1(&self, addr: SocketAddr) -> bool {
+        let fresh = self
+            .compact_capable_peers
+            .get(&addr)
+            .map(|seen| seen.elapsed() < COMPACT_CAPABILITY_TTL)
+            .unwrap_or(false);
+        if Self::tcp_compact_peer_eligible(fresh) {
+            true
+        } else {
+            if self.compact_capable_peers.contains_key(&addr) {
+                self.compact_capable_peers.remove(&addr);
+            }
+            false
+        }
+    }
+
     // Peer health check implementation
     async fn check_peer_health_internal(&self, addr: SocketAddr) -> Result<(), NodeError> {
         // Simple ping-pong health check
@@ -7920,7 +8443,7 @@ impl Node {
 
         let ping = NetworkMessage::Ping {
             timestamp: now,
-            node_id: self.node_id.clone(),
+            node_id: self.capability_node_id(),
         };
 
         // Send ping with timeout and expect pong
@@ -7929,8 +8452,9 @@ impl Node {
         match response {
             NetworkMessage::Pong {
                 timestamp,
-                node_id: _,
+                node_id,
             } => {
+                self.observe_compact_capability(addr, &node_id);
                 if now.abs_diff(timestamp) <= 5 {
                     Ok(())
                 } else {
@@ -7992,6 +8516,12 @@ impl Node {
                 failures.remove(&addr);
             }
         }
+
+        self.compact_capable_peers.retain(|addr, seen| {
+            active_peers.contains(addr) && seen.elapsed() < COMPACT_CAPABILITY_TTL
+        });
+        self.compact_inflight
+            .retain(|_, state| state.started.elapsed() < COMPACT_INFLIGHT_TTL);
     }
 
     pub async fn request_blocks(
@@ -8356,6 +8886,12 @@ impl Node {
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
         const MAX_ATTEMPTS: u32 = 2;
 
+        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(message) {
+            return Err(NodeError::Network(
+                "TCP compact transport is disabled".to_string(),
+            ));
+        }
+
         // Rate limit check
         let rate_key = format!("msg_to_{}", addr);
         if !self.rate_limiter.check_limit(&rate_key) {
@@ -8594,9 +9130,7 @@ impl Node {
             // Signature verified — safe to memoize so a sibling or later block carrying the same
             // transaction resolves it without another fetch. This is the only path that writes the
             // witness cache, which is precisely what lets the read side trust a cached entry.
-            self.tx_witness_cache
-                .lock()
-                .put(full_tx.get_tx_id(), full_tx.clone());
+            self.cache_verified_compact_transaction(full_tx);
         }
 
         let mut validation_result = {
@@ -8716,11 +9250,16 @@ impl Node {
         let cached = {
             let mut cache = self.tx_witness_cache.lock();
             match cache.get(&tx_id).cloned() {
-                Some(c) if c.get_tx_id() == tx_id => Some(c),
-                Some(_) => {
+                Some(c) if Self::witness_matches_committed_receipt(tx, &c) => Some(c),
+                Some(c) if c.get_tx_id() != tx_id => {
                     cache.pop(&tx_id);
                     None
                 }
+                // A legitimately re-signed transaction can share get_tx_id()
+                // while committing to a different sig_hash/Merkle leaf. Keep the
+                // cached variant for its own block, but fall through to the
+                // incoming full body or peer fetch for this exact receipt.
+                Some(_) => None,
                 None => None,
             }
         };
@@ -8742,7 +9281,9 @@ impl Node {
             .await
         {
             if let Some(sig_hex) = &mempool_tx.signature {
-                if !Self::is_signature_truncated(sig_hex) {
+                if !Self::is_signature_truncated(sig_hex)
+                    && Self::witness_matches_committed_receipt(tx, &mempool_tx)
+                {
                     return Ok(Some(mempool_tx));
                 }
             }
@@ -8759,6 +9300,21 @@ impl Node {
         }
 
         Ok(None)
+    }
+
+    fn witness_matches_committed_receipt(
+        receipt: &Transaction,
+        candidate: &Transaction,
+    ) -> bool {
+        candidate.get_tx_id() == receipt.get_tx_id()
+            && receipt
+                .pub_key
+                .as_ref()
+                .map_or(true, |expected| candidate.pub_key.as_ref() == Some(expected))
+            && receipt
+                .sig_hash
+                .as_ref()
+                .map_or(true, |expected| candidate.sig_hash.as_ref() == Some(expected))
     }
 
     fn is_signature_truncated(sig_hex: &str) -> bool {
@@ -8821,6 +9377,1138 @@ impl Node {
             Ok(Err(e)) => Err(e),
             Err(_) => Ok(None),
         }
+    }
+
+    fn cache_verified_compact_transaction(&self, tx: &Transaction) {
+        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            return;
+        }
+        // Preserve the witness cache's verified-full-body invariant. This helper
+        // is also called while preparing a stored block for relay, and stored
+        // receipts intentionally carry only a 64-byte signature prefix.
+        let Some(signature) = tx.signature.as_ref().and_then(|sig| hex::decode(sig).ok()) else {
+            return;
+        };
+        if signature.len() <= 64
+            || tx.sig_hash.as_deref()
+                != Some(Transaction::signature_hash_hex(&signature).as_str())
+        {
+            return;
+        }
+        let Ok(leaf) = Blockchain::calculate_merkle_leaf_hash(tx) else {
+            return;
+        };
+        let tx_id = tx.get_tx_id();
+        self.tx_witness_cache
+            .lock()
+            .put(tx_id.clone(), tx.clone());
+        self.compact_tx_index.lock().put(leaf, tx_id);
+    }
+
+    async fn seed_compact_index_from_admitted_transaction(&self, transaction: &Transaction) {
+        if let Some(admitted) = self
+            .blockchain
+            .read()
+            .await
+            .get_mempool_transaction_by_id(&transaction.get_tx_id())
+            .await
+        {
+            if Self::witness_matches_committed_receipt(transaction, &admitted) {
+                self.cache_verified_compact_transaction(&admitted);
+            }
+        }
+    }
+
+    fn lookup_verified_compact_transaction(
+        &self,
+        leaf: &[u8; 32],
+    ) -> Option<Transaction> {
+        let tx_id = self.compact_tx_index.lock().get(leaf).cloned()?;
+        let tx = match self.tx_witness_cache.lock().get(&tx_id).cloned() {
+            Some(tx) => tx,
+            None => {
+                self.compact_tx_index.lock().pop(leaf);
+                return None;
+            }
+        };
+        match Blockchain::calculate_merkle_leaf_hash(&tx) {
+            Ok(actual) if &actual == leaf => Some(tx),
+            _ => {
+                self.compact_tx_index.lock().pop(leaf);
+                None
+            }
+        }
+    }
+
+    fn compact_transaction_encoded_bytes(tx: &Transaction) -> Option<usize> {
+        codec::serialize(tx).ok().map(|bytes| bytes.len())
+    }
+
+    fn compact_hex_field_has_decoded_len(value: &str, decoded_len: usize) -> bool {
+        decoded_len
+            .checked_mul(2)
+            .is_some_and(|encoded_len| value.len() == encoded_len)
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    }
+
+    /// Compact transaction bodies are a witness-bearing transport contract, not
+    /// stored receipts.  Merkle leaves deliberately normalize a full signature
+    /// and its 64-byte stored prefix to the same commitment, so a leaf match
+    /// alone cannot distinguish a body that can be validated without another
+    /// network fetch.  Require the canonical full ML-DSA shape and bind the
+    /// signature to its committed sig_hash before treating a body as resolved.
+    fn compact_transaction_has_full_bound_witness(tx: &Transaction) -> bool {
+        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            return true;
+        }
+        let (Some(signature), Some(public_key), Some(sig_hash)) = (
+            tx.signature.as_deref(),
+            tx.pub_key.as_deref(),
+            tx.sig_hash.as_deref(),
+        ) else {
+            return false;
+        };
+        if !Self::compact_hex_field_has_decoded_len(signature, mldsa::SIGNATURE_BYTES)
+            || !Self::compact_hex_field_has_decoded_len(public_key, mldsa::PUBLIC_KEY_BYTES)
+            || !Self::compact_hex_field_has_decoded_len(sig_hash, 32)
+        {
+            return false;
+        }
+        let Ok(signature_bytes) = hex::decode(signature) else {
+            return false;
+        };
+        sig_hash == Transaction::signature_hash_hex(&signature_bytes)
+    }
+
+    fn compact_block_transport_ok_at(block: &Block, activation_height: u32) -> bool {
+        if block.transactions.is_empty()
+            || block.transactions.len() > MAX_BLOCK_TX_COUNT
+            || block.transactions[0].sender != "MINING_REWARDS"
+            || !block
+                .transactions
+                .iter()
+                .skip(1)
+                .all(Self::compact_transaction_has_full_bound_witness)
+        {
+            return false;
+        }
+        let encoded_ok = codec::serialize(block)
+            .map(|encoded| encoded.len() <= COMPACT_SAFE_ASSEMBLED_BYTES)
+            .unwrap_or(false);
+        if !encoded_ok {
+            return false;
+        }
+        block.index < activation_height
+            || Blockchain::full_witness_weight(block)
+                .map(|weight| weight <= MAX_BLOCK_WEIGHT_BYTES)
+                .unwrap_or(false)
+    }
+
+    fn compact_block_transport_ok(block: &Block) -> bool {
+        Self::compact_block_transport_ok_at(block, FEE_SYSTEM_ACTIVATION_HEIGHT)
+    }
+
+    fn compact_full_block_matches_announcement(
+        announcement: &CompactBlockV1,
+        block: &Block,
+    ) -> bool {
+        Self::compact_block_transport_ok(block)
+            && CompactBlockV1::from_block(block)
+                .map(|candidate| candidate == *announcement)
+                .unwrap_or(false)
+    }
+
+    fn remember_compact_full_block(&self, block: Arc<Block>, verified: bool) -> bool {
+        if !Self::compact_block_transport_ok(&block) {
+            return false;
+        }
+        let Some(encoded_bytes) = codec::serialize(block.as_ref())
+            .ok()
+            .map(|encoded| encoded.len())
+        else {
+            return false;
+        };
+        let retained = self.compact_full_blocks.lock().insert(
+            block.hash,
+            CompactFullBlockEntry {
+                block: Arc::clone(&block),
+                encoded_bytes,
+            },
+        );
+        if verified {
+            for tx in &block.transactions {
+                self.cache_verified_compact_transaction(tx);
+            }
+        }
+        retained
+    }
+
+    fn add_compact_source(sources: &mut Vec<SocketAddr>, source: SocketAddr) {
+        if !sources.contains(&source) && sources.len() < COMPACT_SOURCE_MAX {
+            sources.push(source);
+        }
+    }
+
+    fn remember_pending_compact(
+        &self,
+        announcement: CompactBlockV1,
+        source: SocketAddr,
+    ) -> bool {
+        let mut pending = self.compact_pending.lock();
+        if let Some(existing) = pending.entries.get_mut(&announcement.hash) {
+            if existing.announcement != announcement {
+                return false;
+            }
+            Self::add_compact_source(&mut existing.sources, source);
+            return true;
+        }
+
+        let Some(announcement_bytes) = codec::serialize(&announcement)
+            .ok()
+            .map(|encoded| encoded.len())
+        else {
+            return false;
+        };
+        let Some(coinbase_bytes) =
+            Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+        else {
+            return false;
+        };
+        let Some(cache_bytes) = announcement_bytes.checked_add(coinbase_bytes) else {
+            return false;
+        };
+        if announcement_bytes > COMPACT_ANNOUNCEMENT_MAX_BYTES
+            || cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || coinbase_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES
+        {
+            return false;
+        }
+
+        let mut transactions = HashMap::new();
+        transactions.insert(0, announcement.coinbase.clone());
+        let mut transaction_sizes = HashMap::new();
+        transaction_sizes.insert(0, coinbase_bytes);
+        let block_hash = announcement.hash;
+        pending.insert(
+            block_hash,
+            PendingCompactBlock {
+                announcement,
+                sources: vec![source],
+                transactions,
+                transaction_sizes,
+                assembled_bytes: coinbase_bytes,
+                cache_bytes,
+            },
+        )
+    }
+
+    fn compact_sources(
+        &self,
+        block_hash: &[u8; 32],
+        primary: SocketAddr,
+    ) -> Vec<SocketAddr> {
+        let mut sources = vec![primary];
+        if let Some(inflight) = self.compact_inflight.get(block_hash) {
+            for source in &inflight.sources {
+                Self::add_compact_source(&mut sources, *source);
+            }
+        }
+        if let Some(pending) = self.compact_pending.lock().entries.peek(block_hash) {
+            for source in &pending.sources {
+                Self::add_compact_source(&mut sources, *source);
+            }
+        }
+        sources
+    }
+
+    fn cache_pending_compact_transaction(
+        &self,
+        block_hash: &[u8; 32],
+        index: u16,
+        transaction: &Transaction,
+    ) -> bool {
+        if !Self::compact_transaction_has_full_bound_witness(transaction) {
+            return false;
+        }
+        let Some(encoded_bytes) = Self::compact_transaction_encoded_bytes(transaction) else {
+            return false;
+        };
+        if encoded_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+            return false;
+        }
+
+        let mut pending = self.compact_pending.lock();
+        let Some((expected_hash, previous_bytes, old_assembled, old_cache_bytes)) = pending
+            .entries
+            .peek(block_hash)
+            .and_then(|entry| {
+                entry
+                    .announcement
+                    .transaction_hashes
+                    .get(index as usize)
+                    .map(|expected| {
+                        (
+                            *expected,
+                            entry.transaction_sizes.get(&index).copied().unwrap_or(0),
+                            entry.assembled_bytes,
+                            entry.cache_bytes,
+                        )
+                    })
+            })
+        else {
+            return false;
+        };
+        if !Blockchain::calculate_merkle_leaf_hash(transaction)
+            .map(|leaf| leaf == expected_hash)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let new_assembled = old_assembled
+            .saturating_sub(previous_bytes)
+            .saturating_add(encoded_bytes);
+        let new_cache_bytes = old_cache_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(encoded_bytes);
+        let new_total_cache = pending
+            .bytes
+            .saturating_sub(old_cache_bytes)
+            .saturating_add(new_cache_bytes);
+        if new_assembled > COMPACT_SAFE_ASSEMBLED_BYTES
+            || new_cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || new_total_cache > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        pending.bytes = new_total_cache;
+        let Some(entry) = pending.entries.get_mut(block_hash) else {
+            return false;
+        };
+        entry.assembled_bytes = new_assembled;
+        entry.cache_bytes = new_cache_bytes;
+        entry.transaction_sizes.insert(index, encoded_bytes);
+        entry.transactions.insert(index, transaction.clone());
+        true
+    }
+
+    fn local_compact_transactions(
+        &self,
+        block_hash: &[u8; 32],
+        indexes: &[u16],
+    ) -> (Vec<IndexedCompactTransactionV1>, Option<PendingCompactRoute>) {
+        if let Some(block) = self
+            .compact_full_blocks
+            .lock()
+            .entries
+            .get(block_hash)
+            .map(|entry| Arc::clone(&entry.block))
+        {
+            let transactions = indexes
+                .iter()
+                .filter_map(|index| {
+                    block
+                        .transactions
+                        .get(*index as usize)
+                        .cloned()
+                        .map(|transaction| IndexedCompactTransactionV1 {
+                            index: *index,
+                            transaction,
+                        })
+                })
+                .collect();
+            return (transactions, None);
+        }
+
+        let (mut transactions, route) = {
+            let mut pending = self.compact_pending.lock();
+            let Some(entry) = pending.entries.get(block_hash) else {
+                return (Vec::new(), None);
+            };
+            let mut transactions = Vec::with_capacity(indexes.len());
+            for index in indexes {
+                if let Some(transaction) = entry.transactions.get(index).cloned() {
+                    transactions.push(IndexedCompactTransactionV1 {
+                        index: *index,
+                        transaction,
+                    });
+                }
+            }
+            (
+                transactions,
+                PendingCompactRoute {
+                    announcement: entry.announcement.clone(),
+                    sources: entry.sources.clone(),
+                },
+            )
+        };
+        if route.announcement.transaction_hashes.is_empty() {
+            return (Vec::new(), None);
+        }
+        let mut have: HashSet<u16> = transactions.iter().map(|item| item.index).collect();
+        for index in indexes {
+            if have.contains(index) {
+                continue;
+            }
+            let idx = *index as usize;
+            if let Some(leaf) = route.announcement.transaction_hashes.get(idx) {
+                if let Some(transaction) = self.lookup_verified_compact_transaction(leaf) {
+                    have.insert(*index);
+                    transactions.push(IndexedCompactTransactionV1 {
+                        index: *index,
+                        transaction,
+                    });
+                }
+            }
+        }
+        (transactions, Some(route))
+    }
+
+    async fn request_compact_transaction_batch(
+        &self,
+        addr: SocketAddr,
+        block_hash: [u8; 32],
+        indexes: Vec<u16>,
+        proxy_hops: u8,
+        request_timeout: Duration,
+    ) -> Result<Vec<IndexedCompactTransactionV1>, NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Err(NodeError::Network(
+                "TCP compact transport is disabled".into(),
+            ));
+        }
+        if indexes.is_empty() || indexes.len() > COMPACT_TX_BATCH_MAX {
+            return Err(NodeError::Network(
+                "Invalid compact transaction request batch".into(),
+            ));
+        }
+        let requested: HashSet<u16> = indexes.iter().copied().collect();
+        if requested.len() != indexes.len() {
+            return Err(NodeError::Network(
+                "Duplicate compact transaction request index".into(),
+            ));
+        }
+        let request = NetworkMessage::GetCompactTransactionsV1 {
+            block_hash,
+            indexes,
+            proxy_hops: proxy_hops.min(COMPACT_PROXY_HOPS_MAX),
+        };
+        let response = tokio::time::timeout(
+            request_timeout.min(Duration::from_secs(5)),
+            self.send_message_with_response(addr, &request),
+        )
+        .await
+        .map_err(|_| NodeError::Timeout("Compact transaction request timed out".into()))??;
+        match response {
+            NetworkMessage::CompactTransactionsV1 {
+                block_hash: response_hash,
+                transactions,
+            } if response_hash == block_hash => {
+                let mut seen = HashSet::with_capacity(transactions.len());
+                if transactions.len() > COMPACT_TX_BATCH_MAX
+                    || transactions
+                        .iter()
+                        .any(|item| !requested.contains(&item.index) || !seen.insert(item.index))
+                    || codec::serialize(&transactions)
+                        .map(|encoded| encoded.len() > COMPACT_RESPONSE_MAX_BYTES)
+                        .unwrap_or(true)
+                    || transactions.iter().any(|item| {
+                        Self::compact_transaction_encoded_bytes(&item.transaction)
+                            .map(|bytes| bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES)
+                            .unwrap_or(true)
+                    })
+                {
+                    return Err(NodeError::Network(
+                        "Invalid compact transaction response".into(),
+                    ));
+                }
+                Ok(transactions)
+            }
+            _ => Err(NodeError::Network(
+                "Unexpected compact transaction response".into(),
+            )),
+        }
+    }
+
+    async fn serve_compact_transactions(
+        &self,
+        requester: SocketAddr,
+        block_hash: [u8; 32],
+        indexes: Vec<u16>,
+        proxy_hops: u8,
+    ) -> Result<Vec<IndexedCompactTransactionV1>, NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Ok(Vec::new());
+        }
+        if indexes.is_empty() || indexes.len() > COMPACT_TX_BATCH_MAX {
+            return Err(NodeError::Network(
+                "Invalid compact transaction request size".into(),
+            ));
+        }
+        let requested: HashSet<u16> = indexes.iter().copied().collect();
+        if requested.len() != indexes.len()
+            || indexes
+                .iter()
+                .any(|index| *index as usize >= MAX_BLOCK_TX_COUNT)
+        {
+            return Err(NodeError::Network(
+                "Invalid compact transaction request index".into(),
+            ));
+        }
+        let rate_key = format!("compact_tx_body:{}", requester);
+        let rate_cost = 1usize.saturating_add(indexes.len().div_ceil(16));
+        if !(0..rate_cost).all(|_| self.rate_limiter.check_limit(&rate_key)) {
+            return Err(NodeError::Network(
+                "Compact transaction request rate limited".into(),
+            ));
+        }
+
+        let (mut found, pending) = self.local_compact_transactions(&block_hash, &indexes);
+        let mut have: HashSet<u16> = found.iter().map(|item| item.index).collect();
+        let missing: Vec<u16> = indexes
+            .iter()
+            .copied()
+            .filter(|index| !have.contains(index))
+            .collect();
+
+        // A cut-through relay may not have finished reconstructing when its
+        // downstream asks. Proxy the single bounded batch toward the original
+        // source, then retain exact-commitment-matched bodies for later peers.
+        if !missing.is_empty() && proxy_hops > 0 {
+            if let Some(route) = pending {
+                for source in route.sources {
+                    if source == requester || !self.peer_supports_compact_v1(source) {
+                        continue;
+                    }
+                    if let Ok(proxied) = self
+                        .request_compact_transaction_batch(
+                            source,
+                            block_hash,
+                            missing.clone(),
+                            proxy_hops.saturating_sub(1),
+                            Duration::from_secs(5),
+                        )
+                        .await
+                    {
+                        for item in proxied {
+                            let idx = item.index as usize;
+                            let valid = route
+                                .announcement
+                                .transaction_hashes
+                                .get(idx)
+                                .and_then(|expected| {
+                                    Blockchain::calculate_merkle_leaf_hash(&item.transaction)
+                                        .ok()
+                                        .map(|actual| &actual == expected)
+                                })
+                                .unwrap_or(false)
+                                && Self::compact_transaction_has_full_bound_witness(
+                                    &item.transaction,
+                                );
+                            if valid && have.insert(item.index) {
+                                self.cache_pending_compact_transaction(
+                                    &block_hash,
+                                    item.index,
+                                    &item.transaction,
+                                );
+                                found.push(item);
+                            }
+                        }
+                    }
+                    if have.len() == indexes.len() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        found.sort_unstable_by_key(|item| item.index);
+        // The request count is bounded, but historical/pre-activation transaction
+        // strings can still be unusually large. Bound the response by encoded
+        // bytes as well so the connection writer never discovers too late that a
+        // syntactically valid batch exceeds the encrypted 4 MiB frame.
+        let mut encoded_bytes = 1024usize; // enum/vector/envelope + AEAD headroom
+        let mut bounded = Vec::with_capacity(found.len());
+        for item in found {
+            let item_bytes = codec::serialize(&item)
+                .map(|bytes| bytes.len())
+                .unwrap_or(MAX_MESSAGE_SIZE);
+            let Some(next) = encoded_bytes.checked_add(item_bytes) else {
+                break;
+            };
+            if next > COMPACT_RESPONSE_MAX_BYTES {
+                break;
+            }
+            encoded_bytes = next;
+            bounded.push(item);
+        }
+        Ok(bounded)
+    }
+
+    async fn request_compact_full_block(
+        &self,
+        addr: SocketAddr,
+        block_hash: [u8; 32],
+        proxy_hops: u8,
+        request_timeout: Duration,
+    ) -> Result<Option<Block>, NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Err(NodeError::Network(
+                "TCP compact transport is disabled".into(),
+            ));
+        }
+        let request = NetworkMessage::GetCompactBlockV1 {
+            block_hash,
+            proxy_hops: proxy_hops.min(COMPACT_PROXY_HOPS_MAX),
+        };
+        let response = tokio::time::timeout(
+            request_timeout.min(Duration::from_secs(5)),
+            self.send_message_with_response(addr, &request),
+        )
+        .await
+        .map_err(|_| NodeError::Timeout("Compact block fallback timed out".into()))??;
+        match response {
+            NetworkMessage::CompactBlockResponseV1 {
+                block_hash: response_hash,
+                block,
+            } if response_hash == block_hash => Ok(block.filter(|b| b.hash == block_hash)),
+            _ => Err(NodeError::Network(
+                "Unexpected compact block fallback response".into(),
+            )),
+        }
+    }
+
+    async fn serve_compact_full_block(
+        &self,
+        requester: SocketAddr,
+        block_hash: [u8; 32],
+        proxy_hops: u8,
+    ) -> Option<Block> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return None;
+        }
+        let rate_key = format!("compact_full_body:{}", requester);
+        if !(0..16).all(|_| self.rate_limiter.check_limit(&rate_key)) {
+            return None;
+        }
+        if let Some(block) = self
+            .compact_full_blocks
+            .lock()
+            .entries
+            .get(&block_hash)
+            .map(|entry| Arc::clone(&entry.block))
+        {
+            return Some((*block).clone());
+        }
+
+        let sources = self
+            .compact_pending
+            .lock()
+            .entries
+            .peek(&block_hash)
+            .map(|entry| entry.sources.clone())
+            .unwrap_or_default();
+        if proxy_hops > 0 {
+            for source in sources {
+                if source == requester || !self.peer_supports_compact_v1(source) {
+                    continue;
+                }
+                if let Ok(Some(block)) = self
+                    .request_compact_full_block(
+                        source,
+                        block_hash,
+                        proxy_hops.saturating_sub(1),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    if block.calculate_hash_for_block() == block.hash
+                        && block.verify_pow_meets_floor()
+                        && Blockchain::calculate_merkle_root(&block.transactions)
+                            .map(|root| root == block.merkle_root)
+                            .unwrap_or(false)
+                        && Self::compact_block_transport_ok(&block)
+                    {
+                        let block = Arc::new(block);
+                        self.remember_compact_full_block(Arc::clone(&block), false);
+                        return Some((*block).clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn apply_compact_body(
+        announcement: &CompactBlockV1,
+        transactions: &mut [Option<Transaction>],
+        assembled_bytes: &mut usize,
+        item: IndexedCompactTransactionV1,
+    ) -> Result<bool, NodeError> {
+        let idx = item.index as usize;
+        if idx >= transactions.len() || transactions[idx].is_some() {
+            return Ok(false);
+        }
+        if !Self::compact_transaction_has_full_bound_witness(&item.transaction) {
+            return Ok(false);
+        }
+        let Some(encoded_bytes) = Self::compact_transaction_encoded_bytes(&item.transaction) else {
+            return Ok(false);
+        };
+        if encoded_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+            return Err(NodeError::Network(
+                "Compact transaction body exceeds transport limit".into(),
+            ));
+        }
+        if !Blockchain::calculate_merkle_leaf_hash(&item.transaction)
+            .map(|leaf| leaf == announcement.transaction_hashes[idx])
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let Some(next_bytes) = assembled_bytes.checked_add(encoded_bytes) else {
+            return Err(NodeError::Network(
+                "Compact transaction assembly overflow".into(),
+            ));
+        };
+        if next_bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
+            return Err(NodeError::Network(
+                "Compact transaction assembly exceeds transport limit".into(),
+            ));
+        }
+        *assembled_bytes = next_bytes;
+        transactions[idx] = Some(item.transaction);
+        Ok(true)
+    }
+
+    fn missing_compact_indexes(transactions: &[Option<Transaction>]) -> Vec<u16> {
+        transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tx)| tx.is_none().then_some(idx as u16))
+            .collect()
+    }
+
+    fn compact_deadline_remaining(deadline: Instant) -> Option<Duration> {
+        deadline.checked_duration_since(Instant::now())
+    }
+
+    fn reconstruct_compact_block_locally(
+        &self,
+        announcement: &CompactBlockV1,
+    ) -> Result<Option<Block>, NodeError> {
+        let mut transactions = Vec::with_capacity(announcement.transaction_hashes.len());
+        transactions.push(announcement.coinbase.clone());
+        let mut assembled_bytes =
+            Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+                .ok_or_else(|| NodeError::Network("Compact coinbase encoding failed".into()))?;
+        for leaf in announcement.transaction_hashes.iter().skip(1) {
+            let Some(transaction) = self.lookup_verified_compact_transaction(leaf) else {
+                return Ok(None);
+            };
+            let Some(encoded_bytes) = Self::compact_transaction_encoded_bytes(&transaction) else {
+                return Ok(None);
+            };
+            if encoded_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+                return Ok(None);
+            }
+            assembled_bytes = assembled_bytes
+                .checked_add(encoded_bytes)
+                .ok_or_else(|| NodeError::Network("Compact local assembly overflow".into()))?;
+            if assembled_bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
+                return Ok(None);
+            }
+            transactions.push(transaction);
+        }
+        let block = announcement.reconstruct(transactions)?;
+        if !Self::compact_block_transport_ok(&block) {
+            return Ok(None);
+        }
+        Ok(Some(block))
+    }
+
+    async fn reconstruct_compact_block(
+        &self,
+        announcement: &CompactBlockV1,
+        primary_source: SocketAddr,
+    ) -> Result<Option<(Block, SocketAddr)>, NodeError> {
+        let deadline = Instant::now() + COMPACT_RESOLVE_DEADLINE;
+        let mut transactions: Vec<Option<Transaction>> =
+            vec![None; announcement.transaction_hashes.len()];
+        transactions[0] = Some(announcement.coinbase.clone());
+        let mut assembled_bytes =
+            Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+                .ok_or_else(|| NodeError::Network("Compact coinbase encoding failed".into()))?;
+        if assembled_bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
+            return Ok(None);
+        }
+
+        for (idx, leaf) in announcement.transaction_hashes.iter().enumerate().skip(1) {
+            if let Some(tx) = self.lookup_verified_compact_transaction(leaf) {
+                let Some(tx_bytes) = Self::compact_transaction_encoded_bytes(&tx) else {
+                    continue;
+                };
+                if tx_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+                    continue;
+                }
+                let Some(next) = assembled_bytes.checked_add(tx_bytes) else {
+                    return Ok(None);
+                };
+                if next > COMPACT_SAFE_ASSEMBLED_BYTES {
+                    return Ok(None);
+                }
+                assembled_bytes = next;
+                transactions[idx] = Some(tx);
+            }
+        }
+
+        let mut attempted = HashSet::new();
+        let mut witness_source = primary_source;
+        loop {
+            let source = self
+                .compact_sources(&announcement.hash, primary_source)
+                .into_iter()
+                .find(|candidate| attempted.insert(*candidate));
+            let Some(source) = source else {
+                break;
+            };
+            let missing = Self::missing_compact_indexes(&transactions);
+            if missing.is_empty() {
+                break;
+            }
+            for batch in missing.chunks(COMPACT_TX_BATCH_MAX) {
+                let Some(remaining) = Self::compact_deadline_remaining(deadline) else {
+                    break;
+                };
+                let response = match self
+                    .request_compact_transaction_batch(
+                        source,
+                        announcement.hash,
+                        batch.to_vec(),
+                        COMPACT_PROXY_HOPS_MAX,
+                        remaining,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => break,
+                };
+                for item in response {
+                    let index = item.index;
+                    if Self::apply_compact_body(
+                        announcement,
+                        &mut transactions,
+                        &mut assembled_bytes,
+                        item,
+                    )? {
+                        if let Some(transaction) =
+                            transactions.get(index as usize).and_then(Option::as_ref)
+                        {
+                            self.cache_pending_compact_transaction(
+                                &announcement.hash,
+                                index,
+                                transaction,
+                            );
+                        }
+                        witness_source = source;
+                    }
+                }
+            }
+        }
+
+        if transactions.iter().any(Option::is_none) {
+            let mut fallback_attempted = HashSet::new();
+            loop {
+                let source = self
+                    .compact_sources(&announcement.hash, primary_source)
+                    .into_iter()
+                    .find(|candidate| fallback_attempted.insert(*candidate));
+                let Some(source) = source else {
+                    return Ok(None);
+                };
+                let Some(remaining) = Self::compact_deadline_remaining(deadline) else {
+                    return Ok(None);
+                };
+                if let Ok(Some(full)) = self
+                    .request_compact_full_block(
+                        source,
+                        announcement.hash,
+                        COMPACT_PROXY_HOPS_MAX,
+                        remaining,
+                    )
+                    .await
+                {
+                    if Self::compact_full_block_matches_announcement(announcement, &full) {
+                        return Ok(Some((full, source)));
+                    }
+                }
+            }
+        }
+
+        let complete = transactions
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| NodeError::InvalidBlock("compact reconstruction incomplete".into()))?;
+        let block = announcement.reconstruct(complete)?;
+        if !Self::compact_block_transport_ok(&block) {
+            return Ok(None);
+        }
+        Ok(Some((block, witness_source)))
+    }
+
+    async fn process_compact_block(
+        &self,
+        announcement: CompactBlockV1,
+        source: SocketAddr,
+        events: &mpsc::Sender<NetworkEvent>,
+    ) -> Result<(), NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Ok(());
+        }
+        if !self.remember_pending_compact(announcement.clone(), source) {
+            return Ok(());
+        }
+
+        // Cut-through is deliberately narrower than acceptance: only a strict
+        // local-tip extension is relayed, and only after the compact's header,
+        // PoW and ordered Merkle commitment passed. Full transaction validation
+        // remains mandatory below before state is touched.
+        if self.compact_extends_local_tip(&announcement).await {
+            let targets: Vec<_> = {
+                let peers = self.peers.read().await;
+                self.select_broadcast_peers(&peers, peers.len().min(16))
+            }
+            .into_iter()
+            .filter(|peer| *peer != source && self.peer_supports_compact_v1(*peer))
+            .collect();
+            if !targets.is_empty() {
+                let node = self.clone();
+                let compact = Arc::new(announcement.clone());
+                tokio::spawn(async move {
+                    if let Err(err) = node
+                        .broadcast_compact_block(compact, Some(source), targets)
+                        .await
+                    {
+                        warn!("Compact cut-through relay failed: {}", err);
+                    }
+                });
+            }
+        }
+
+        let Some((block, witness_source)) = self
+            .reconstruct_compact_block(&announcement, source)
+            .await?
+        else {
+            debug!(
+                "Compact block {} deferred: transaction bodies unavailable",
+                announcement.index
+            );
+            return Ok(());
+        };
+        let block = Arc::new(block);
+        self.remember_compact_full_block(Arc::clone(&block), false);
+
+        if !self
+            .verify_block_with_witness(&block, Some(witness_source))
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.network_bloom.insert(&block.hash);
+        self.blockchain.write().await.save_block(&block).await?;
+        self.remember_compact_full_block(Arc::clone(&block), true);
+        self.compact_pending.lock().remove(&block.hash);
+        self.publish_discovery_state("Accepted compact block").await;
+        events
+            .send(NetworkEvent::NewBlock((*block).clone()))
+            .await
+            .map_err(|e| NodeError::Network(format!("Failed to send block event: {}", e)))?;
+
+        // The compact relay claim is independent, so older peers still receive
+        // the fully-validated body exactly once after acceptance.
+        if self.claim_relay(&block.hash) {
+            let selected_peers = {
+                let peers = self.peers.read().await;
+                self.select_broadcast_peers(&peers, peers.len().min(16))
+            };
+            if let Err(err) = self
+                .broadcast_block(Arc::clone(&block), Some(source), selected_peers, true)
+                .await
+            {
+                warn!("Post-accept compact block propagation failed: {}", err);
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_compact_competitor_fallback(
+        &self,
+        announcement: CompactBlockV1,
+        source: SocketAddr,
+        events: &mpsc::Sender<NetworkEvent>,
+    ) -> Result<(), NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Ok(());
+        }
+        if !self.remember_pending_compact(announcement.clone(), source) {
+            return Ok(());
+        }
+        let Some(started) = Self::claim_compact_inflight_in(
+            &self.compact_inflight,
+            announcement.hash,
+            source,
+            Instant::now(),
+        ) else {
+            return Ok(());
+        };
+
+        let block_hash = announcement.hash;
+        let result = async {
+            let deadline = Instant::now() + COMPACT_FORK_FALLBACK_DEADLINE;
+            let Some(wait) = Self::compact_deadline_remaining(deadline) else {
+                return Ok(());
+            };
+            let Ok(Ok(_permit)) = tokio::time::timeout(
+                wait,
+                Arc::clone(&self.compact_fork_fallback_slots).acquire_owned(),
+            )
+            .await
+            else {
+                return Ok(());
+            };
+
+            let mut attempted = HashSet::new();
+            loop {
+                let candidate = self
+                    .compact_sources(&block_hash, source)
+                    .into_iter()
+                    .find(|peer| attempted.insert(*peer));
+                let Some(candidate) = candidate else {
+                    return Ok(());
+                };
+                let Some(remaining) = Self::compact_deadline_remaining(deadline) else {
+                    return Ok(());
+                };
+                let Ok(Some(full)) = self
+                    .request_compact_full_block(
+                        candidate,
+                        block_hash,
+                        COMPACT_PROXY_HOPS_MAX,
+                        remaining,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                if !Self::compact_full_block_matches_announcement(&announcement, &full) {
+                    continue;
+                }
+
+                // Re-enter the ordinary full-block event path. It performs the
+                // same standalone validation, save/orphan/reorg handling, bloom
+                // commit, and relay semantics as pre-compact TCP delivery.
+                self.remember_compact_full_block(Arc::new(full.clone()), false);
+                events
+                    .send(NetworkEvent::NewBlock(full))
+                    .await
+                    .map_err(|err| {
+                        NodeError::Network(format!(
+                            "Failed to enqueue compact competitor fallback: {}",
+                            err
+                        ))
+                    })?;
+                self.compact_pending.lock().remove(&block_hash);
+                return Ok(());
+            }
+        }
+        .await;
+        self.release_compact_inflight(&block_hash, started);
+        result
+    }
+
+    /// Atomically claim reconstruction work for one block hash. Returning the
+    /// start token lets the caller release only its own claim; an older timed-out
+    /// worker can never erase a replacement worker's entry.
+    fn claim_compact_inflight_in(
+        inflight: &DashMap<[u8; 32], CompactInflight>,
+        block_hash: [u8; 32],
+        source: SocketAddr,
+        started: Instant,
+    ) -> Option<Instant> {
+        match inflight.entry(block_hash) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().started.elapsed() < COMPACT_INFLIGHT_TTL {
+                    Self::add_compact_source(&mut entry.get_mut().sources, source);
+                    None
+                } else {
+                    entry.insert(CompactInflight {
+                        started,
+                        sources: vec![source],
+                    });
+                    Some(started)
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(CompactInflight {
+                    started,
+                    sources: vec![source],
+                });
+                Some(started)
+            }
+        }
+    }
+
+    /// Admit scarce reconstruction work only for a compact header that is an
+    /// exact next-block candidate for the supplied parent. The parent/difficulty
+    /// check intentionally happens before both the in-flight claim and semaphore:
+    /// unrelated-fork announcements remain available to the ordinary
+    /// header/full-block convergence paths, but cannot starve the low-latency
+    /// local-tip path.
+    fn try_claim_compact_reconstruction_in(
+        compact: &CompactBlockV1,
+        parent: &Block,
+        inflight: &DashMap<[u8; 32], CompactInflight>,
+        slots: &Arc<Semaphore>,
+        source: SocketAddr,
+        started: Instant,
+    ) -> Option<(Instant, tokio::sync::OwnedSemaphorePermit)> {
+        if !Self::compact_header_extends_parent(compact, parent) {
+            return None;
+        }
+        let claimed =
+            Self::claim_compact_inflight_in(inflight, compact.hash, source, started)?;
+        match Arc::clone(slots).try_acquire_owned() {
+            Ok(permit) => Some((claimed, permit)),
+            Err(_) => {
+                inflight.remove_if(&compact.hash, |_, current| current.started == claimed);
+                None
+            }
+        }
+    }
+
+    async fn try_claim_compact_reconstruction(
+        &self,
+        compact: &CompactBlockV1,
+        source: SocketAddr,
+    ) -> Option<(Instant, tokio::sync::OwnedSemaphorePermit)> {
+        let parent = self.blockchain.read().await.get_last_block()?;
+        Self::try_claim_compact_reconstruction_in(
+            compact,
+            &parent,
+            &self.compact_inflight,
+            &self.compact_reconstruction_slots,
+            source,
+            Instant::now(),
+        )
+    }
+
+    fn release_compact_inflight(&self, block_hash: &[u8; 32], started: Instant) {
+        self.compact_inflight
+            .remove_if(block_hash, |_, current| current.started == started);
     }
 
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
@@ -8917,12 +10605,21 @@ impl Node {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const MAX_ATTEMPTS: u32 = 2;
 
+        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(message) {
+            return Err(NodeError::Network(
+                "TCP compact transport is disabled".to_string(),
+            ));
+        }
+
         // Rate limit check. Blocks are exempt: a burst of tx/gossip traffic to a peer must
         // never spend the budget that a block send needs, since dropping a block send stalls
         // propagation and raises the orphan rate. Our own block sends are already bounded by
         // the valid-PoW production rate and guarded by the outbound circuit breaker below, so
         // exempting them adds no amplification. All other message types stay paced per peer.
-        if !matches!(message, NetworkMessage::Block(_)) {
+        if !matches!(
+            message,
+            NetworkMessage::Block(_) | NetworkMessage::CompactBlockV1(_)
+        ) {
             let rate_key = format!("send_to_{}", addr);
             if !self.rate_limiter.check_limit(&rate_key) {
                 return Err(NodeError::Network("Rate limit exceeded".to_string()));
@@ -9075,6 +10772,8 @@ impl Node {
                             return Err(e.into());
                         }
                     }
+                    self.seed_compact_index_from_admitted_transaction(&tx)
+                        .await;
 
                     // SPAWN the gossip off the single-consumer event pump: gossip_transaction
                     // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
@@ -9091,14 +10790,18 @@ impl Node {
             }
 
             NetworkEvent::NewBlock(block) => {
-                // Deduplicate blocks using bloom filter
+                // A bloom hit is read-only until validation succeeds.  Event
+                // sources include best-effort transports, so a transient permit
+                // or witness miss must not poison the hash and suppress a later
+                // unchanged full-block delivery.
                 let block_hash = block.calculate_hash_for_block();
-                if !self.network_bloom.insert(&block_hash) {
+                if !Self::event_block_should_validate(&self.network_bloom, &block_hash) {
                     return Ok(());
                 }
 
                 // Verify block before processing
                 if self.verify_block_parallel(&block).await? {
+                    Self::commit_validated_event_block(&self.network_bloom, &block_hash);
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
 
@@ -9195,6 +10898,7 @@ impl Node {
                 self.peer_secrets.write().await.remove(&addr);
                 self.outbound_connections.write().await.remove(&addr);
                 self.outbound_circuit_breakers.write().await.remove(&addr);
+                self.compact_capable_peers.remove(&addr);
 
                 // Clear from validation cache
                 let peer_key = format!("peer_{}", addr);
@@ -9298,6 +11002,14 @@ impl Node {
         Ok(())
     }
 
+    fn event_block_should_validate(network_bloom: &NetworkBloom, block_hash: &[u8; 32]) -> bool {
+        !network_bloom.check(block_hash)
+    }
+
+    fn commit_validated_event_block(network_bloom: &NetworkBloom, block_hash: &[u8; 32]) {
+        let _ = network_bloom.insert(block_hash);
+    }
+
     async fn handle_peer_message(
         &self,
         message: NetworkMessage,
@@ -9310,6 +11022,13 @@ impl Node {
         if raw.len() > MAX_MESSAGE_SIZE {
             self.record_peer_failure(addr).await;
             return Err(NodeError::Network("Message too large".into()));
+        }
+
+        // Fail closed before dedup, rate accounting, cache access, reconstruction,
+        // proxying, or response generation.  The extension variants remain
+        // decodable for wire compatibility, but are inert in this release.
+        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(&message) {
+            return Ok(None);
         }
 
         // Deduplicate gossip only. Requests/responses must always be processed, otherwise one
@@ -9417,6 +11136,8 @@ impl Node {
                         blockchain.add_transaction((*tx_ref).clone()).await.is_ok()
                     };
                     if tx_added {
+                        self.seed_compact_index_from_admitted_transaction(&tx_ref)
+                            .await;
                         // Broadcast to peers
                         let peers = self.peers.read().await;
                         let selected_peers = self.select_broadcast_peers(&peers, 8);
@@ -9434,6 +11155,95 @@ impl Node {
                         })?;
                     }
                 }
+            }
+
+            NetworkMessage::CompactBlockV1(compact) => {
+                if !compact.validate_commitment() {
+                    self.record_peer_failure(addr).await;
+                    return Err(NodeError::Network(
+                        "Invalid compact block commitment".into(),
+                    ));
+                }
+                if self.network_bloom.check(&compact.hash) {
+                    return Ok(None);
+                }
+
+                match self.compact_ingress_route(&compact).await {
+                    CompactIngressRoute::ReconstructLocalTip => {
+                        // Require an exact local-tip parent and consensus-next
+                        // difficulty before touching either the in-flight table
+                        // or one of the four reconstruction work slots. Recheck
+                        // while claiming so a concurrent tip change fails closed.
+                        let claim =
+                            self.try_claim_compact_reconstruction(&compact, addr).await;
+                        let Some((started, _work_permit)) = claim else {
+                            if self.compact_ingress_route(&compact).await
+                                == CompactIngressRoute::FetchFullCompetitor
+                            {
+                                self.process_compact_competitor_fallback(
+                                    compact, addr, tx,
+                                )
+                                .await?;
+                            }
+                            return Ok(None);
+                        };
+                        let block_hash = compact.hash;
+                        let result = self.process_compact_block(compact, addr, tx).await;
+                        self.release_compact_inflight(&block_hash, started);
+                        result?;
+                    }
+                    CompactIngressRoute::FetchFullCompetitor => {
+                        // Same-height fork tie-breaks and one-ahead alternate
+                        // tips retain pre-compact delivery semantics, but use a
+                        // separate low-concurrency full-body lane and never a
+                        // reconstruction permit.
+                        self.process_compact_competitor_fallback(compact, addr, tx)
+                            .await?;
+                    }
+                    CompactIngressRoute::DeferToChainSync => {
+                        debug!(
+                            "Deferring compact block {} to ordered chain sync",
+                            compact.index
+                        );
+                    }
+                }
+            }
+
+            NetworkMessage::GetCompactTransactionsV1 {
+                block_hash,
+                indexes,
+                proxy_hops,
+            } => {
+                let transactions = self
+                    .serve_compact_transactions(addr, block_hash, indexes, proxy_hops)
+                    .await?;
+                return Ok(Some(NetworkMessage::CompactTransactionsV1 {
+                    block_hash,
+                    transactions,
+                }));
+            }
+
+            NetworkMessage::CompactTransactionsV1 { .. } => {
+                // Correlated responses are consumed synchronously by
+                // request_compact_transaction_batch. Unsolicited bodies never
+                // enter a cache or validation path.
+            }
+
+            NetworkMessage::GetCompactBlockV1 {
+                block_hash,
+                proxy_hops,
+            } => {
+                let block = self
+                    .serve_compact_full_block(addr, block_hash, proxy_hops)
+                    .await;
+                return Ok(Some(NetworkMessage::CompactBlockResponseV1 {
+                    block_hash,
+                    block,
+                }));
+            }
+
+            NetworkMessage::CompactBlockResponseV1 { .. } => {
+                // Correlated fallback responses are consumed synchronously.
             }
 
             NetworkMessage::Block(block) => {
@@ -9457,22 +11267,18 @@ impl Node {
                     return Ok(None);
                 }
 
-                // EARLY RELAY (forward ahead of the peer-witness-fetch verify and the save_block
-                // write lock below): relay a block that already extends OUR tip AND passes a
-                // STANDALONE validation, before the accept pipeline runs. This is the poison-free
-                // contract the mesh ingest path uses — verify_block_parallel runs real ML-DSA on the
-                // block's own transactions with NO peer fetch, so a block that fails standalone
-                // validation is never relayed. A valid PoW alone cannot authorize a relay: the PoW
-                // commits only to a merkle root over truncated signatures + sig_hash receipts, so an
-                // attacker can preserve a block's hash while mangling a full signature
-                // (calculate_merkle_root, blockchain.rs) — only the standalone ML-DSA verify rejects
-                // that. Acceptance is unchanged: the block is still fully validated and saved by the
-                // pipeline below; only the relay hop moves earlier.
+                // EARLY PROPAGATION, always ahead of the save lock:
+                // - compact-capable peers receive the ordered commitment after header,
+                //   parent difficulty, PoW and Merkle checks;
+                // - traditional full-block relay still waits for standalone ML-DSA
+                //   validation.
+                // Acceptance is unchanged: every path reconstructs and fully validates
+                // the block below before saving it.
                 let mut early_relayed = false;
                 {
-                    // Cheap local pre-filter (claimed hash + strict tip-extension + merkle binding)
-                    // against a dropped chain snapshot, THEN the standalone poison-free verify. Only
-                    // tip-extenders early-relay; fork/orphan blocks take the post-accept relay.
+                    // Cheap local pre-filter against a dropped chain snapshot. Only
+                    // tip-extenders cut through; fork/orphan blocks take the
+                    // post-accept relay.
                     let cheap_ok = {
                         let bc = self.blockchain.read().await;
                         let tip_index = bc.get_latest_block_index();
@@ -9483,6 +11289,56 @@ impl Node {
                             Err(_) => false,
                         }
                     };
+
+                    // TCP compact is release-gated off before construction as
+                    // well as at send/ingress.  This avoids hashing/serializing
+                    // an announcement or mutating its unverified body cache on
+                    // an ordinary full-block receive while the extension is
+                    // dormant.
+                    if TCP_COMPACT_V1_ENABLED && cheap_ok {
+                        if let Ok(compact) = CompactBlockV1::from_block(&block_ref) {
+                            if compact.validate_commitment()
+                                && self.compact_extends_local_tip(&compact).await
+                            {
+                                // Retain the committed full body for bounded missing-tx
+                                // replies, but do not seed the verified witness index
+                                // until the normal validation pipeline succeeds.
+                                self.remember_compact_full_block(
+                                    Arc::clone(&block_ref),
+                                    false,
+                                );
+                                let compact_targets: Vec<SocketAddr> = {
+                                    let peers = self.peers.read().await;
+                                    self.select_broadcast_peers(&peers, peers.len().min(16))
+                                }
+                                .into_iter()
+                                .filter(|peer| {
+                                    *peer != addr && self.peer_supports_compact_v1(*peer)
+                                })
+                                .collect();
+                                if !compact_targets.is_empty() {
+                                    let node = self.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = node
+                                            .broadcast_compact_block(
+                                                Arc::new(compact),
+                                                Some(addr),
+                                                compact_targets,
+                                            )
+                                            .await
+                                        {
+                                            warn!("Compact cut-through relay failed: {}", err);
+                                        }
+                                    });
+                                }
+                            } else {
+                                debug!(
+                                    "Skipping compact cut-through for block {}: header does not match the local next-block rules",
+                                    block_ref.index
+                                );
+                            }
+                        }
+                    }
 
                     if cheap_ok && self.verify_block_parallel(&block_ref).await.unwrap_or(false) {
                         // Standalone-VALID tip-extender. Source-filter the targets FIRST and only
@@ -9524,6 +11380,7 @@ impl Node {
                     // brief check-then-insert race is closed by save_block's state lock +
                     // same-hash short-circuit), so a duplicate delivery is a safe no-op.
                     self.blockchain.write().await.save_block(&block_ref).await?;
+                    self.remember_compact_full_block(Arc::clone(&block_ref), true);
                     self.publish_discovery_state("Accepted block").await;
 
                     // Send network event
@@ -9719,8 +11576,9 @@ impl Node {
 
             NetworkMessage::Ping {
                 timestamp,
-                node_id: _node_id,
+                node_id,
             } => {
+                self.observe_compact_capability(addr, &node_id);
                 // Update peer info
                 let mut peers = self.peers.write().await;
                 if let Some(info) = peers.get_mut(&addr) {
@@ -9732,14 +11590,15 @@ impl Node {
 
                 return Ok(Some(NetworkMessage::Pong {
                     timestamp,
-                    node_id: self.node_id.clone(),
+                    node_id: self.capability_node_id(),
                 }));
             }
 
             NetworkMessage::Pong {
                 timestamp,
-                node_id: _,
+                node_id,
             } => {
+                self.observe_compact_capability(addr, &node_id);
                 // Calculate and update latency
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -9820,6 +11679,17 @@ impl Node {
         }
 
         Ok(None)
+    }
+
+    fn is_tcp_compact_extension(message: &NetworkMessage) -> bool {
+        matches!(
+            message,
+            NetworkMessage::CompactBlockV1(_)
+                | NetworkMessage::GetCompactTransactionsV1 { .. }
+                | NetworkMessage::CompactTransactionsV1 { .. }
+                | NetworkMessage::GetCompactBlockV1 { .. }
+                | NetworkMessage::CompactBlockResponseV1 { .. }
+        )
     }
 
     fn should_dedup_message(message: &NetworkMessage) -> bool {
@@ -10145,20 +12015,70 @@ impl Node {
     /// attacker to supply, so this ingest cannot be used to poison/censor. A mesh-local seen-set dedups
     /// replays so an invalid block can't be re-validated on every arrival.
     #[cfg(feature = "webrtc_mesh")]
+    fn mesh_block_already_seen(
+        mesh_seen: &Arc<PLMutex<LruCache<String, ()>>>,
+        network_bloom: &NetworkBloom,
+        block_hash: &[u8; 32],
+    ) -> bool {
+        mesh_seen.lock().contains(&hex::encode(block_hash))
+            || network_bloom.check(block_hash)
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
     async fn handle_mesh_message(&self, bytes: Vec<u8>, mesh_seen: &Arc<PLMutex<LruCache<String, ()>>>) {
         let msg: NetworkMessage = match codec::deserialize(&bytes) {
             Ok(m) => m,
             Err(_) => return,
         };
         match msg {
-            NetworkMessage::Block(b) => {
-                let hash = hex::encode(b.calculate_hash_for_block());
+            NetworkMessage::RawData(raw) => {
+                let Some(compact) = CompactBlockV1::decode_mesh_envelope(&raw) else {
+                    return;
+                };
+                if !compact.validate_commitment()
+                    || !self.compact_extends_local_tip(&compact).await
+                    || Self::mesh_block_already_seen(
+                        mesh_seen,
+                        &self.network_bloom,
+                        &compact.hash,
+                    )
                 {
-                    let mut seen = mesh_seen.lock();
-                    if seen.get(&hash).is_some() {
-                        return; // mesh-local dedup: replay or gossip loop
-                    }
-                    seen.put(hash, ());
+                    return;
+                }
+                let hash = hex::encode(compact.hash);
+                let Ok(_work_permit) = Arc::clone(&self.compact_reconstruction_slots)
+                    .try_acquire_owned()
+                else {
+                    return;
+                };
+                let Some(block) = self
+                    .reconstruct_compact_block_locally(&compact)
+                    .unwrap_or(None)
+                else {
+                    // The full block is sent immediately after this envelope on
+                    // the same ordered DataChannel task and remains the fallback.
+                    return;
+                };
+                if !self.verify_block_parallel(&block).await.unwrap_or(false) {
+                    return;
+                }
+                if self
+                    .handle_network_event(NetworkEvent::NewBlock(block))
+                    .await
+                    .is_ok()
+                {
+                    mesh_seen.lock().put(hash, ());
+                }
+            }
+            NetworkMessage::Block(b) => {
+                let calculated_hash = b.calculate_hash_for_block();
+                let hash = hex::encode(calculated_hash);
+                if Self::mesh_block_already_seen(
+                    mesh_seen,
+                    &self.network_bloom,
+                    &calculated_hash,
+                ) {
+                    return; // mesh-local dedup: replay, compact success, or gossip loop
                 }
                 // Reject below-floor PoW cheaply, BEFORE acquiring a validation permit — the same gate
                 // every other ingress applies (mirrors the TCP block handler). Keeps a no-PoW mesh flood
@@ -10172,6 +12092,8 @@ impl Node {
                 if self.verify_block_parallel(&b).await.unwrap_or(false) {
                     if let Err(err) = self.handle_network_event(NetworkEvent::NewBlock(b)).await {
                         debug!("WebRTC mesh: block processing error: {}", err);
+                    } else {
+                        mesh_seen.lock().put(hash, ());
                     }
                 }
             }
@@ -10200,6 +12122,11 @@ impl Node {
     /// erroring on a duplicate mempool add. Sends are time-boxed and the peers guard is
     /// snapshot-then-drop (never held across an await — the 2026-07-08/09 wedge class).
     pub async fn gossip_transaction(&self, tx_ref: &Transaction) {
+        // Confirm O(1) mempool membership before treating this as verified. This
+        // covers local CLI and periodic re-gossip paths while avoiding any
+        // per-announcement scan of the up-to-50k transaction pool.
+        self.seed_compact_index_from_admitted_transaction(tx_ref)
+            .await;
         if let Ok(tx_bytes) = codec::serialize(tx_ref) {
             let _ = self.network_bloom.insert(&tx_bytes);
         }
@@ -10257,11 +12184,209 @@ impl Node {
             if mesh.connected_peers().await.is_empty() {
                 return;
             }
-            if let Ok(bytes) = codec::serialize(&NetworkMessage::Block(block.clone())) {
-                tokio::spawn(async move {
-                    let _ = mesh.broadcast(&bytes).await;
+            let Ok((compact_frame, full_frame)) = Self::mesh_block_frames(block) else {
+                return;
+            };
+            // One spawned task owns both frames. Each peer's future writes the
+            // compact envelope first and the unchanged full block second on the
+            // same ordered DataChannel. Older nodes ignore RawData and still see
+            // the full fallback; one slow peer cannot delay another.
+            tokio::spawn(async move {
+                let peer_ids = mesh.connected_peers().await;
+                let sends = peer_ids.into_iter().map(|peer_id| {
+                    let mesh = Arc::clone(&mesh);
+                    let compact_frame = compact_frame.clone();
+                    let full_frame = full_frame.clone();
+                    async move {
+                        if let Some(compact_frame) = compact_frame {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                mesh.send_to(&peer_id, &compact_frame),
+                            )
+                            .await;
+                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            mesh.send_to(&peer_id, &full_frame),
+                        )
+                        .await;
+                    }
                 });
+                join_all(sends).await;
+            });
+        }
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
+    fn mesh_block_frames(block: &Block) -> Result<(Option<Vec<u8>>, Vec<u8>), NodeError> {
+        let compact_frame = CompactBlockV1::from_block(block)
+            .and_then(|compact| {
+                compact.encode_mesh_envelope().and_then(|raw| {
+                    codec::serialize(&NetworkMessage::RawData(raw)).map_err(NodeError::from)
+                })
+            })
+            .ok();
+        let full_frame = codec::serialize(&NetworkMessage::Block(block.clone()))?;
+        Ok((compact_frame, full_frame))
+    }
+
+    fn compact_targets_not_delivered(
+        &self,
+        block_hash: &[u8; 32],
+        targets: impl IntoIterator<Item = SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        let mut delivered = self.compact_relay_delivered.lock();
+        Self::compact_targets_not_delivered_in(&mut delivered, block_hash, targets)
+    }
+
+    fn compact_targets_not_delivered_in(
+        delivered: &mut LruCache<[u8; 32], HashSet<SocketAddr>>,
+        block_hash: &[u8; 32],
+        targets: impl IntoIterator<Item = SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        let already = delivered.get(block_hash).cloned().unwrap_or_default();
+        targets
+            .into_iter()
+            .filter(|target| !already.contains(target))
+            .collect()
+    }
+
+    fn mark_compact_delivered(&self, block_hash: &[u8; 32], peer: SocketAddr) {
+        let mut delivered = self.compact_relay_delivered.lock();
+        Self::mark_compact_delivered_in(&mut delivered, block_hash, peer);
+    }
+
+    fn mark_compact_delivered_in(
+        delivered: &mut LruCache<[u8; 32], HashSet<SocketAddr>>,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+    ) {
+        if !delivered.contains(block_hash) {
+            delivered.put(*block_hash, HashSet::new());
+        }
+        if let Some(peers) = delivered.get_mut(block_hash) {
+            peers.insert(peer);
+        }
+    }
+
+    async fn compact_extends_local_tip(&self, compact: &CompactBlockV1) -> bool {
+        let blockchain = self.blockchain.read().await;
+        let Some(parent) = blockchain.get_last_block() else {
+            return false;
+        };
+        Self::compact_header_extends_parent(compact, &parent)
+    }
+
+    fn compact_ingress_route_against_tip(
+        compact: &CompactBlockV1,
+        tip: &Block,
+    ) -> CompactIngressRoute {
+        if Self::compact_header_extends_parent(compact, tip) {
+            return CompactIngressRoute::ReconstructLocalTip;
+        }
+
+        // Preserve the full-block behavior compact-capable TCP peers had before
+        // negotiation: a competing block at our height must still reach normal
+        // orphan/tie-break processing, and a one-ahead block on another tip must
+        // still be available to start convergence. Fetch its exact full body in
+        // the separate fallback lane; older/deeper gaps are recovered by range
+        // sync, where ancestry can be validated in order.
+        if compact.index == tip.index
+            || compact.index == tip.index.saturating_add(1)
+        {
+            CompactIngressRoute::FetchFullCompetitor
+        } else {
+            CompactIngressRoute::DeferToChainSync
+        }
+    }
+
+    async fn compact_ingress_route(
+        &self,
+        compact: &CompactBlockV1,
+    ) -> CompactIngressRoute {
+        let Some(tip) = self.blockchain.read().await.get_last_block() else {
+            return CompactIngressRoute::DeferToChainSync;
+        };
+        Self::compact_ingress_route_against_tip(compact, &tip)
+    }
+
+    fn compact_header_extends_parent(compact: &CompactBlockV1, parent: &Block) -> bool {
+        if compact.index != parent.index.saturating_add(1)
+            || compact.previous_hash != parent.hash
+            || compact.timestamp < parent.timestamp
+        {
+            return false;
+        }
+        let expected_difficulty = Block::consensus_next_difficulty(
+            parent.difficulty,
+            compact.timestamp.saturating_sub(parent.timestamp),
+            compact.index,
+        );
+        compact.difficulty == expected_difficulty
+    }
+
+    async fn broadcast_compact_block(
+        &self,
+        compact: Arc<CompactBlockV1>,
+        source: Option<SocketAddr>,
+        peers: Vec<SocketAddr>,
+    ) -> Result<usize, NodeError> {
+        if !TCP_COMPACT_V1_ENABLED {
+            return Ok(0);
+        }
+        let targets = self.compact_targets_not_delivered(
+            &compact.hash,
+            peers
+                .into_iter()
+                .filter(|addr| Some(*addr) != source && self.peer_supports_compact_v1(*addr)),
+        );
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        const MAX_CONCURRENT: usize = 10;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let sends = targets.into_iter().map(|peer| {
+            let compact = Arc::clone(&compact);
+            let permit = semaphore.clone().acquire_owned();
+            let node = self.clone();
+            async move {
+                let result = async {
+                    let _permit = permit.await.map_err(|e| {
+                        NodeError::Network(format!(
+                            "Compact broadcast semaphore acquisition failed: {}",
+                            e
+                        ))
+                    })?;
+                    node.send_message(
+                        peer,
+                        &NetworkMessage::CompactBlockV1((*compact).clone()),
+                    )
+                    .await
+                }
+                .await;
+                (peer, result)
             }
+        });
+        let results = join_all(sends).await;
+        let delivered = results.iter().filter(|(_, result)| result.is_ok()).count();
+        for (peer, result) in &results {
+            match result {
+                Ok(()) => self.mark_compact_delivered(&compact.hash, *peer),
+                Err(err) => {
+                    self.compact_capable_peers.remove(peer);
+                    warn!("Failed to broadcast compact block to {}: {}", peer, err);
+                }
+            }
+        }
+        if delivered > 0 {
+            Ok(delivered)
+        } else if let Some((_, Err(err))) =
+            results.into_iter().find(|(_, result)| result.is_err())
+        {
+            Err(err)
+        } else {
+            Ok(0)
         }
     }
 
@@ -10307,6 +12432,8 @@ impl Node {
         }
         #[cfg(not(feature = "webrtc_mesh"))]
         let _ = gossip_mesh;
+        self.remember_compact_full_block(Arc::clone(&block), true);
+
         let targets: Vec<_> = peers
             .into_iter()
             .filter(|addr| Some(*addr) != source)
@@ -10315,11 +12442,49 @@ impl Node {
             return Ok(0);
         }
 
+        // Snapshot each peer's capability exactly once. Besides avoiding a
+        // duplicate lookup, this prevents a simultaneous ping refresh from
+        // placing a peer in neither partition (or both).
+        let mut compact_targets = Vec::new();
+        let mut full_targets = Vec::new();
+        for addr in targets {
+            if self.peer_supports_compact_v1(addr) {
+                compact_targets.push(addr);
+            } else {
+                full_targets.push(addr);
+            }
+        }
+
+        let compact = (!compact_targets.is_empty())
+            .then(|| CompactBlockV1::from_block(&block).ok())
+            .flatten()
+            .map(Arc::new);
+
+        // If compact construction ever fails, preserve delivery by treating all
+        // targets as traditional full-block peers. Successful compact delivery is
+        // tracked per target; peers not actually reached remain eligible on every
+        // later relay pass.
+        let mut sends: Vec<(SocketAddr, bool)> =
+            full_targets.into_iter().map(|peer| (peer, false)).collect();
+        if compact.is_some() {
+            sends.extend(
+                self.compact_targets_not_delivered(&block.hash, compact_targets)
+                    .into_iter()
+                    .map(|peer| (peer, true)),
+            );
+        } else {
+            sends.extend(compact_targets.into_iter().map(|peer| (peer, false)));
+        }
+        if sends.is_empty() {
+            return Ok(0);
+        }
+
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
-        let broadcast_futures = targets.into_iter().map(|peer| {
+        let broadcast_futures = sends.into_iter().map(|(peer, use_compact)| {
             let block = Arc::clone(&block);
+            let compact = compact.clone();
             let permit = semaphore.clone().acquire_owned();
             let node = self.clone();
 
@@ -10328,27 +12493,59 @@ impl Node {
                     let _permit = permit.await.map_err(|e| {
                         NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
                     })?;
-                    node.send_message(peer, &NetworkMessage::Block((*block).clone()))
-                        .await
+                    if use_compact {
+                        let compact = compact.ok_or_else(|| {
+                            NodeError::Network("Compact broadcast body unavailable".into())
+                        })?;
+                        match node
+                            .send_message(
+                                peer,
+                                &NetworkMessage::CompactBlockV1((*compact).clone()),
+                            )
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(compact_error) => {
+                                node.compact_capable_peers.remove(&peer);
+                                debug!(
+                                    "Compact broadcast to {} failed ({}); retrying full block",
+                                    peer, compact_error
+                                );
+                                node.send_message(
+                                    peer,
+                                    &NetworkMessage::Block((*block).clone()),
+                                )
+                                .await
+                            }
+                        }
+                    } else {
+                        node.send_message(peer, &NetworkMessage::Block((*block).clone()))
+                            .await
+                    }
                 }
                 .await;
-                (peer, result)
+                (peer, use_compact, result)
             }
         });
 
-        let results: Vec<(SocketAddr, Result<(), NodeError>)> =
+        let results: Vec<(SocketAddr, bool, Result<(), NodeError>)> =
             futures::future::join_all(broadcast_futures).await;
-        let delivered = results.iter().filter(|(_, result)| result.is_ok()).count();
-        for (peer, result) in &results {
-            if let Err(e) = result {
-                warn!("Failed to broadcast block to {}: {}", peer, e);
+        let delivered = results
+            .iter()
+            .filter(|(_, _, result)| result.is_ok())
+            .count();
+        for (peer, used_compact, result) in &results {
+            match result {
+                Ok(()) if *used_compact => self.mark_compact_delivered(&block.hash, *peer),
+                Err(e) => warn!("Failed to broadcast block to {}: {}", peer, e),
+                _ => {}
             }
         }
 
         if delivered > 0 {
             Ok(delivered)
-        } else if let Some((_, Err(first_error))) =
-            results.into_iter().find(|(_, result)| result.is_err())
+        } else if let Some((_, _, Err(first_error))) =
+            results.into_iter().find(|(_, _, result)| result.is_err())
         {
             Err(first_error)
         } else {
@@ -10727,6 +12924,7 @@ impl Node {
             .write()
             .await
             .remove(&peer_addr);
+        self.compact_capable_peers.remove(&peer_addr);
 
         // Notify disconnect
         tx.send(NetworkEvent::PeerLeave(peer_addr))
@@ -10792,7 +12990,7 @@ impl Node {
 
         let ping = NetworkMessage::Ping {
             timestamp,
-            node_id: self.node_id.clone(),
+            node_id: self.capability_node_id(),
         };
 
         // Send ping with timeout and consume the direct pong response on the same stream.
@@ -10804,7 +13002,8 @@ impl Node {
         .map_err(|_| NodeError::Network("Ping timeout".to_string()))??;
 
         match response {
-            NetworkMessage::Pong { timestamp, .. } => {
+            NetworkMessage::Pong { timestamp, node_id } => {
+                self.observe_compact_capability(addr, &node_id);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -11971,6 +14170,38 @@ mod tests {
         assert_eq!(tx.sig_hash, None);
     }
 
+    #[test]
+    fn witness_cache_match_binds_fields_omitted_from_display_tx_id() {
+        let mut receipt = Transaction::new(
+            "sender".into(),
+            "recipient".into(),
+            1.0,
+            0.0005,
+            7,
+            Some("aa".repeat(64)),
+        );
+        receipt.pub_key = Some("11".repeat(32));
+        receipt.sig_hash = Some("22".repeat(32));
+
+        let mut exact = receipt.clone();
+        exact.signature = Some("bb".repeat(4_627));
+        assert!(Node::witness_matches_committed_receipt(&receipt, &exact));
+
+        let mut resigned = exact.clone();
+        resigned.sig_hash = Some("33".repeat(32));
+        assert_eq!(receipt.get_tx_id(), resigned.get_tx_id());
+        assert!(
+            !Node::witness_matches_committed_receipt(&receipt, &resigned),
+            "same display tx id is insufficient when the Merkle-committed signature hash differs"
+        );
+
+        let mut wrong_key = exact;
+        wrong_key.pub_key = Some("44".repeat(32));
+        assert!(!Node::witness_matches_committed_receipt(
+            &receipt, &wrong_key
+        ));
+    }
+
     // Regression: a dropped Node clone must NOT unlink the shared identity lock file while other
     // clones (and the running node) are alive — only the LAST owner may. Before IdentityLock,
     // `impl Drop for Node` removed the file on every clone drop, so the first transient clone to
@@ -12161,6 +14392,847 @@ mod tests {
         merkle_liar.merkle_root = [3u8; 32];
         merkle_liar.hash = merkle_liar.calculate_hash_for_block();
         assert!(!Node::early_relay_cheap_gate(&merkle_liar, tip_index, &tip_hash));
+    }
+
+    fn compact_test_block() -> Block {
+        let coinbase = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "11".repeat(20),
+            amount_units: Transaction::to_units(10.0),
+            fee_units: 0,
+            timestamp: 1,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        let signature_bytes = vec![0xabu8; 4_627];
+        let payment = Transaction {
+            sender: "22".repeat(20),
+            recipient: "33".repeat(20),
+            amount_units: Transaction::to_units(2.0),
+            fee_units: Transaction::to_units(0.0005),
+            timestamp: 2,
+            signature: Some(hex::encode(&signature_bytes)),
+            pub_key: Some(hex::encode(vec![0xcdu8; 2_592])),
+            sig_hash: Some(Transaction::signature_hash_hex(&signature_bytes)),
+        };
+        let transactions = vec![coinbase, payment];
+        let merkle_root = Blockchain::calculate_merkle_root(&transactions).unwrap();
+        let mut block = Block {
+            index: 0,
+            previous_hash: [0u8; 32],
+            timestamp: 2,
+            transactions,
+            nonce: 7,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root,
+        };
+        block.hash = block.calculate_hash_for_block();
+        block
+    }
+
+    #[test]
+    fn compact_block_round_trip_binds_exact_normalized_merkle_leaves() {
+        let block = compact_test_block();
+        let compact = CompactBlockV1::from_block(&block).expect("compact construction");
+        assert!(compact.validate_commitment());
+        assert_eq!(compact.transaction_hashes.len(), block.transactions.len());
+        for (leaf, tx) in compact.transaction_hashes.iter().zip(&block.transactions) {
+            assert_eq!(
+                *leaf,
+                Blockchain::calculate_merkle_leaf_hash(tx).unwrap(),
+                "announcement must carry the exact consensus leaf, in order"
+            );
+        }
+
+        let reconstructed = compact
+            .reconstruct(block.transactions.clone())
+            .expect("exact bodies reconstruct");
+        assert_eq!(reconstructed.hash, block.hash);
+        assert_eq!(reconstructed.merkle_root, block.merkle_root);
+        assert_eq!(reconstructed.transactions, block.transactions);
+
+        // get_tx_id() does not bind pub_key, but the compact identifier must.
+        let mut wrong_bodies = block.transactions.clone();
+        wrong_bodies[1].pub_key = Some("ef".repeat(2_592));
+        assert_eq!(
+            wrong_bodies[1].get_tx_id(),
+            block.transactions[1].get_tx_id(),
+            "test precondition: display transaction id collides"
+        );
+        assert!(
+            compact.reconstruct(wrong_bodies).is_err(),
+            "an exact Merkle-leaf mismatch must never reconstruct"
+        );
+    }
+
+    #[test]
+    fn compact_commitment_gate_rejects_mutation_and_oversized_lists() {
+        let compact = CompactBlockV1::from_block(&compact_test_block()).unwrap();
+
+        let mut wrong_coinbase = compact.clone();
+        wrong_coinbase.coinbase.recipient = "44".repeat(20);
+        assert!(!wrong_coinbase.validate_commitment());
+
+        let mut wrong_ordered_leaf = compact.clone();
+        wrong_ordered_leaf.transaction_hashes[1][0] ^= 1;
+        assert!(!wrong_ordered_leaf.validate_commitment());
+
+        let mut too_many = compact;
+        too_many.transaction_hashes =
+            vec![[1u8; 32]; MAX_BLOCK_TX_COUNT.saturating_add(1)];
+        assert!(!too_many.validate_commitment());
+
+        let mut oversized_coinbase = compact_test_block();
+        oversized_coinbase.transactions[0].recipient =
+            "44".repeat(COMPACT_COINBASE_MAX_ENCODED_BYTES);
+        oversized_coinbase.merkle_root =
+            Blockchain::calculate_merkle_root(&oversized_coinbase.transactions).unwrap();
+        oversized_coinbase.hash = oversized_coinbase.calculate_hash_for_block();
+        assert!(
+            CompactBlockV1::from_block(&oversized_coinbase).is_err(),
+            "an oversized coinbase must fall back to full-block transport"
+        );
+    }
+
+    #[test]
+    fn compact_cut_through_requires_exact_parent_difficulty_rule() {
+        let mut parent = compact_test_block();
+        parent.index = 100;
+        parent.timestamp = 1_000;
+        parent.difficulty = 670;
+        parent.hash = parent.calculate_hash_for_block();
+
+        let mut compact = CompactBlockV1::from_block(&compact_test_block()).unwrap();
+        compact.index = 101;
+        compact.previous_hash = parent.hash;
+        compact.timestamp = 1_005;
+        compact.difficulty = Block::consensus_next_difficulty(
+            parent.difficulty,
+            compact.timestamp - parent.timestamp,
+            compact.index,
+        );
+        compact.hash = compact.header_block().calculate_hash_for_block();
+        assert!(Node::compact_header_extends_parent(&compact, &parent));
+
+        let mut wrong_difficulty = compact.clone();
+        wrong_difficulty.difficulty = wrong_difficulty.difficulty.saturating_sub(1);
+        assert!(!Node::compact_header_extends_parent(
+            &wrong_difficulty,
+            &parent
+        ));
+
+        let mut time_regression = compact;
+        time_regression.timestamp = parent.timestamp.saturating_sub(1);
+        assert!(!Node::compact_header_extends_parent(
+            &time_regression,
+            &parent
+        ));
+    }
+
+    #[test]
+    fn off_tip_compacts_cannot_starve_reconstruction_slots() {
+        let mut parent = compact_test_block();
+        parent.index = 100;
+        parent.timestamp = 1_000;
+        parent.difficulty = 670;
+        parent.hash = parent.calculate_hash_for_block();
+
+        let mut honest = CompactBlockV1::from_block(&compact_test_block()).unwrap();
+        honest.index = parent.index + 1;
+        honest.previous_hash = parent.hash;
+        honest.timestamp = parent.timestamp + 5;
+        honest.difficulty = Block::consensus_next_difficulty(
+            parent.difficulty,
+            honest.timestamp - parent.timestamp,
+            honest.index,
+        );
+        honest.hash = honest.header_block().calculate_hash_for_block();
+
+        let inflight = DashMap::new();
+        let slots = Arc::new(Semaphore::new(COMPACT_RECONSTRUCTION_CONCURRENCY));
+        let source = |port| SocketAddr::from(([192, 0, 2, 1], port));
+
+        // Regression: four unrelated, otherwise well-shaped announcements used
+        // to acquire all four permits before their parent/difficulty mismatch was
+        // discovered in normal block validation. The mismatch must now reject
+        // before either scarce resource is touched.
+        for i in 0..COMPACT_RECONSTRUCTION_CONCURRENCY {
+            let mut unrelated = honest.clone();
+            unrelated.hash[0] ^= (i as u8).saturating_add(1);
+            unrelated.previous_hash[0] ^= 1;
+            assert!(
+                Node::try_claim_compact_reconstruction_in(
+                    &unrelated,
+                    &parent,
+                    &inflight,
+                    &slots,
+                    source(8_000 + i as u16),
+                    Instant::now(),
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(slots.available_permits(), COMPACT_RECONSTRUCTION_CONCURRENCY);
+        assert!(inflight.is_empty());
+
+        let (started, permit) = Node::try_claim_compact_reconstruction_in(
+            &honest,
+            &parent,
+            &inflight,
+            &slots,
+            source(9_000),
+            Instant::now(),
+        )
+        .expect("an exact local-tip candidate must still get a reconstruction slot");
+        assert_eq!(
+            slots.available_permits(),
+            COMPACT_RECONSTRUCTION_CONCURRENCY - 1
+        );
+        assert!(inflight.contains_key(&honest.hash));
+        inflight.remove_if(&honest.hash, |_, current| current.started == started);
+        drop(permit);
+        assert_eq!(slots.available_permits(), COMPACT_RECONSTRUCTION_CONCURRENCY);
+    }
+
+    #[test]
+    fn compact_route_preserves_same_height_fork_delivery() {
+        let mut tip = compact_test_block();
+        tip.index = 100;
+        tip.timestamp = 1_000;
+        tip.difficulty = 670;
+        tip.hash = tip.calculate_hash_for_block();
+
+        let mut next = CompactBlockV1::from_block(&compact_test_block()).unwrap();
+        next.index = tip.index + 1;
+        next.previous_hash = tip.hash;
+        next.timestamp = tip.timestamp + 5;
+        next.difficulty = Block::consensus_next_difficulty(
+            tip.difficulty,
+            next.timestamp - tip.timestamp,
+            next.index,
+        );
+        next.hash = next.header_block().calculate_hash_for_block();
+        assert_eq!(
+            Node::compact_ingress_route_against_tip(&next, &tip),
+            CompactIngressRoute::ReconstructLocalTip
+        );
+
+        let mut same_height_competitor = next.clone();
+        same_height_competitor.index = tip.index;
+        same_height_competitor.previous_hash = [0xabu8; 32];
+        same_height_competitor.hash =
+            same_height_competitor.header_block().calculate_hash_for_block();
+        assert_eq!(
+            Node::compact_ingress_route_against_tip(&same_height_competitor, &tip),
+            CompactIngressRoute::FetchFullCompetitor,
+            "a same-height competing block must enter ordinary full-body tie-break processing"
+        );
+
+        let mut alternate_next = next;
+        alternate_next.previous_hash = [0xcdu8; 32];
+        alternate_next.hash = alternate_next.header_block().calculate_hash_for_block();
+        assert_eq!(
+            Node::compact_ingress_route_against_tip(&alternate_next, &tip),
+            CompactIngressRoute::FetchFullCompetitor
+        );
+
+        let mut gap = alternate_next;
+        gap.index = tip.index + 2;
+        gap.hash = gap.header_block().calculate_hash_for_block();
+        assert_eq!(
+            Node::compact_ingress_route_against_tip(&gap, &tip),
+            CompactIngressRoute::DeferToChainSync
+        );
+    }
+
+    #[test]
+    fn compact_inflight_retains_bounded_alternate_sources_under_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let inflight = Arc::new(DashMap::new());
+        let barrier = Arc::new(Barrier::new(COMPACT_SOURCE_MAX));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let hash = [0x5au8; 32];
+        let mut handles = Vec::new();
+        for i in 0..COMPACT_SOURCE_MAX {
+            let inflight = Arc::clone(&inflight);
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                let source = SocketAddr::from(([198, 51, 100, 1], 8_000 + i as u16));
+                barrier.wait();
+                if Node::claim_compact_inflight_in(
+                    &inflight,
+                    hash,
+                    source,
+                    Instant::now(),
+                )
+                .is_some()
+                {
+                    winners.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(winners.load(Ordering::Relaxed), 1);
+        let entry = inflight.get(&hash).expect("one in-flight route");
+        assert_eq!(
+            entry.sources.len(),
+            COMPACT_SOURCE_MAX,
+            "every simultaneous duplicate is retained as a bounded alternate"
+        );
+        let unique: HashSet<_> = entry.sources.iter().copied().collect();
+        assert_eq!(unique.len(), COMPACT_SOURCE_MAX);
+    }
+
+    #[test]
+    fn compact_receipt_body_stays_missing_until_full_alternate_completes() {
+        let mut block = compact_test_block();
+        let mut third = block.transactions[1].clone();
+        third.timestamp += 1;
+        block.transactions.push(third.clone());
+        block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
+        block.hash = block.calculate_hash_for_block();
+        let compact = CompactBlockV1::from_block(&block).unwrap();
+
+        let mut bodies = vec![None; block.transactions.len()];
+        bodies[0] = Some(block.transactions[0].clone());
+        let mut assembled =
+            Node::compact_transaction_encoded_bytes(&block.transactions[0]).unwrap();
+
+        let mut wrong = block.transactions[1].clone();
+        wrong.pub_key = Some("ef".repeat(2_592));
+        assert!(
+            !Node::apply_compact_body(
+                &compact,
+                &mut bodies,
+                &mut assembled,
+                IndexedCompactTransactionV1 {
+                    index: 1,
+                    transaction: wrong,
+                },
+            )
+            .unwrap(),
+            "a commitment-mismatched body from the first source is ignored"
+        );
+        assert_eq!(Node::missing_compact_indexes(&bodies), vec![1, 2]);
+
+        // Full and stored receipt forms intentionally commit to the same Merkle
+        // leaf.  A hostile/under-hydrated source must not turn that receipt into
+        // a "resolved" compact body and capture later witness resolution.
+        let sig_hash = block.transactions[1].sig_hash.clone().unwrap();
+        let receipt = block.transactions[1].with_truncated_signature(sig_hash);
+        assert_eq!(
+            Blockchain::calculate_merkle_leaf_hash(&receipt).unwrap(),
+            compact.transaction_hashes[1]
+        );
+        assert!(!Node::compact_transaction_has_full_bound_witness(
+            &receipt
+        ));
+        assert!(
+            !Node::apply_compact_body(
+                &compact,
+                &mut bodies,
+                &mut assembled,
+                IndexedCompactTransactionV1 {
+                    index: 1,
+                    transaction: receipt.clone(),
+                },
+            )
+            .unwrap(),
+            "a committed receipt is still missing, not a usable witness body"
+        );
+        assert_eq!(Node::missing_compact_indexes(&bodies), vec![1, 2]);
+
+        let mut receipt_fallback = block.clone();
+        receipt_fallback.transactions[1] = receipt;
+        assert_eq!(receipt_fallback.merkle_root, block.merkle_root);
+        assert_eq!(receipt_fallback.calculate_hash_for_block(), block.hash);
+        assert!(
+            !Node::compact_full_block_matches_announcement(&compact, &receipt_fallback),
+            "receipt-only full fallback must be rejected so another source can heal it"
+        );
+
+        assert!(Node::apply_compact_body(
+            &compact,
+            &mut bodies,
+            &mut assembled,
+            IndexedCompactTransactionV1 {
+                index: 1,
+                transaction: block.transactions[1].clone(),
+            },
+        )
+        .unwrap());
+        assert_eq!(
+            Node::missing_compact_indexes(&bodies),
+            vec![2],
+            "a partial response remains explicitly incomplete"
+        );
+
+        assert!(Node::apply_compact_body(
+            &compact,
+            &mut bodies,
+            &mut assembled,
+            IndexedCompactTransactionV1 {
+                index: 2,
+                transaction: third,
+            },
+        )
+        .unwrap());
+        let reconstructed = compact
+            .reconstruct(bodies.into_iter().collect::<Option<Vec<_>>>().unwrap())
+            .unwrap();
+        assert_eq!(reconstructed.hash, block.hash);
+    }
+
+    #[test]
+    fn compact_caches_enforce_entry_and_global_byte_budgets() {
+        let base_announcement = CompactBlockV1::from_block(&compact_test_block()).unwrap();
+        let entry_bytes = 3 * 1024 * 1024;
+        let mut pending = CompactPendingCache {
+            entries: LruCache::new(
+                NonZeroUsize::new(COMPACT_PENDING_CACHE_ENTRIES).expect("nonzero pending cache"),
+            ),
+            bytes: 0,
+        };
+        for tag in 0..10u8 {
+            let mut announcement = base_announcement.clone();
+            announcement.hash = [tag; 32];
+            assert!(pending.insert(
+                announcement.hash,
+                PendingCompactBlock {
+                    announcement,
+                    sources: vec![SocketAddr::from(([192, 0, 2, tag], 7_000))],
+                    transactions: HashMap::new(),
+                    transaction_sizes: HashMap::new(),
+                    assembled_bytes: 0,
+                    cache_bytes: entry_bytes,
+                },
+            ));
+        }
+        assert_eq!(pending.entries.len(), 8);
+        assert_eq!(pending.bytes, 8 * entry_bytes);
+        assert!(pending.bytes <= COMPACT_PENDING_CACHE_BYTE_BUDGET);
+
+        let mut oversized_announcement = base_announcement.clone();
+        oversized_announcement.hash = [0xfe; 32];
+        assert!(!pending.insert(
+            oversized_announcement.hash,
+            PendingCompactBlock {
+                announcement: oversized_announcement,
+                sources: Vec::new(),
+                transactions: HashMap::new(),
+                transaction_sizes: HashMap::new(),
+                assembled_bytes: 0,
+                cache_bytes: COMPACT_SAFE_ASSEMBLED_BYTES + 1,
+            },
+        ));
+
+        let full_entry_bytes = 3_500_000;
+        let base_block = Arc::new(compact_test_block());
+        let mut full = CompactFullBlockCache {
+            entries: LruCache::new(
+                NonZeroUsize::new(COMPACT_FULL_BLOCK_CACHE_ENTRIES)
+                    .expect("nonzero full cache"),
+            ),
+            bytes: 0,
+        };
+        for tag in 0..12u8 {
+            assert!(full.insert(
+                [tag; 32],
+                CompactFullBlockEntry {
+                    block: Arc::clone(&base_block),
+                    encoded_bytes: full_entry_bytes,
+                },
+            ));
+        }
+        assert_eq!(full.entries.len(), 11);
+        assert_eq!(full.bytes, 11 * full_entry_bytes);
+        assert!(full.bytes <= COMPACT_FULL_CACHE_BYTE_BUDGET);
+        assert!(
+            pending.bytes + full.bytes <= COMPACT_GLOBAL_CACHE_BYTE_BUDGET,
+            "the independently enforced cache partitions cannot exceed the global cap"
+        );
+    }
+
+    #[test]
+    fn compact_transport_accepts_max_weight_and_rejects_next_transaction() {
+        let mut block = compact_test_block();
+        block.index = 1;
+        let payment = block.transactions[1].clone();
+        let mut sequence = 3u64;
+        let overflow_transaction = loop {
+            let mut next = payment.clone();
+            next.timestamp = sequence;
+            sequence += 1;
+            block.transactions.push(next);
+            if Blockchain::full_witness_weight(&block).unwrap() > MAX_BLOCK_WEIGHT_BYTES {
+                break block.transactions.pop().unwrap();
+            }
+        };
+        block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
+        block.hash = block.calculate_hash_for_block();
+
+        let valid_weight = Blockchain::full_witness_weight(&block).unwrap();
+        let valid_encoded = codec::serialize(&block).unwrap().len();
+        assert!(valid_weight <= MAX_BLOCK_WEIGHT_BYTES);
+        assert!(
+            valid_weight + 20_000 > MAX_BLOCK_WEIGHT_BYTES,
+            "test block must exercise the upper edge, not a small sample"
+        );
+        assert!(valid_encoded <= COMPACT_SAFE_ASSEMBLED_BYTES);
+        assert!(Node::compact_block_transport_ok_at(&block, block.index));
+
+        let mut over = block.clone();
+        over.transactions.push(overflow_transaction);
+        over.merkle_root = Blockchain::calculate_merkle_root(&over.transactions).unwrap();
+        over.hash = over.calculate_hash_for_block();
+        assert!(Blockchain::full_witness_weight(&over).unwrap() > MAX_BLOCK_WEIGHT_BYTES);
+        assert!(
+            !Node::compact_block_transport_ok_at(&over, over.index),
+            "post-activation transport must never reconstruct an overweight block"
+        );
+        assert!(
+            Node::compact_block_transport_ok_at(&over, over.index + 1),
+            "the transport rule must not retroactively reject pre-activation history"
+        );
+    }
+
+    #[test]
+    fn oversized_for_compact_block_keeps_unchanged_full_mesh_fallback() {
+        let mut block = compact_test_block();
+        let payment = block.transactions[1].clone();
+        let encoded_payment = codec::serialize(&payment).unwrap().len().max(1);
+        let approximate_count = COMPACT_SAFE_ASSEMBLED_BYTES
+            .saturating_div(encoded_payment)
+            .saturating_sub(8);
+        for offset in 1..approximate_count {
+            let mut next = payment.clone();
+            next.timestamp = next.timestamp.saturating_add(offset as u64);
+            block.transactions.push(next);
+        }
+        while codec::serialize(&block).unwrap().len() <= COMPACT_SAFE_ASSEMBLED_BYTES {
+            let mut next = payment.clone();
+            next.timestamp = next
+                .timestamp
+                .saturating_add(block.transactions.len() as u64);
+            block.transactions.push(next);
+        }
+        block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
+        block.hash = block.calculate_hash_for_block();
+
+        let encoded_block = codec::serialize(&block).unwrap().len();
+        let encoded_full_frame =
+            codec::serialize(&NetworkMessage::Block(block.clone())).unwrap();
+        assert!(encoded_block > COMPACT_SAFE_ASSEMBLED_BYTES);
+        assert!(
+            encoded_full_frame.len() <= MAX_MESSAGE_SIZE,
+            "fixture must remain valid for the unchanged full TCP/frame path"
+        );
+        assert!(!Node::compact_block_transport_ok(&block));
+        assert!(
+            CompactBlockV1::from_block(&block).is_err(),
+            "an unreconstructable block must never become a compact announcement"
+        );
+
+        #[cfg(feature = "webrtc_mesh")]
+        {
+            let (compact_frame, full_frame) =
+                Node::mesh_block_frames(&block).expect("full fallback frame");
+            assert!(
+                compact_frame.is_none(),
+                "oversized compact hint is omitted, never substituted for delivery"
+            );
+            match codec::deserialize::<NetworkMessage>(&full_frame).unwrap() {
+                NetworkMessage::Block(fallback) => {
+                    assert_eq!(fallback.hash, block.hash);
+                    assert_eq!(fallback.transactions, block.transactions);
+                }
+                _ => panic!("eligible unchanged full frame must remain the fallback"),
+            }
+        }
+    }
+
+    #[test]
+    fn compact_delivery_success_is_tracked_per_target() {
+        let mut delivered =
+            LruCache::new(NonZeroUsize::new(8).expect("nonzero delivery cache"));
+        let hash = [0x33u8; 32];
+        let a = SocketAddr::from(([203, 0, 113, 1], 7_001));
+        let b = SocketAddr::from(([203, 0, 113, 2], 7_002));
+        let c = SocketAddr::from(([203, 0, 113, 3], 7_003));
+
+        assert_eq!(
+            Node::compact_targets_not_delivered_in(
+                &mut delivered,
+                &hash,
+                [a, b, c],
+            ),
+            vec![a, b, c]
+        );
+        Node::mark_compact_delivered_in(&mut delivered, &hash, a);
+        assert_eq!(
+            Node::compact_targets_not_delivered_in(
+                &mut delivered,
+                &hash,
+                [a, b, c],
+            ),
+            vec![b, c],
+            "one successful peer must not suppress retries to untouched peers"
+        );
+        Node::mark_compact_delivered_in(&mut delivered, &hash, c);
+        assert_eq!(
+            Node::compact_targets_not_delivered_in(
+                &mut delivered,
+                &hash,
+                [a, b, c],
+            ),
+            vec![b],
+            "a failed/unsent target remains eligible"
+        );
+    }
+
+    #[test]
+    fn compact_announcement_is_materially_smaller_than_full_witness_block() {
+        let mut block = compact_test_block();
+        let payment = block.transactions[1].clone();
+        for offset in 1..11u64 {
+            let mut next = payment.clone();
+            next.timestamp = next.timestamp.saturating_add(offset);
+            block.transactions.push(next);
+        }
+        block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
+        block.hash = block.calculate_hash_for_block();
+        let compact = CompactBlockV1::from_block(&block).unwrap();
+        let full_bytes = codec::serialize(&NetworkMessage::Block(block)).unwrap();
+        let compact_bytes =
+            codec::serialize(&NetworkMessage::CompactBlockV1(compact)).unwrap();
+        assert!(
+            compact_bytes.len() < 2 * 1024,
+            "11-payment compact announcement unexpectedly large: {}",
+            compact_bytes.len()
+        );
+        assert!(
+            compact_bytes.len() * 100 < full_bytes.len(),
+            "compact={} full={}",
+            compact_bytes.len(),
+            full_bytes.len()
+        );
+    }
+
+    #[test]
+    fn compact_protocol_messages_round_trip() {
+        let block = compact_test_block();
+        let compact = CompactBlockV1::from_block(&block).unwrap();
+        let encoded =
+            codec::serialize(&NetworkMessage::CompactBlockV1(compact.clone())).unwrap();
+        match codec::deserialize::<NetworkMessage>(&encoded).unwrap() {
+            NetworkMessage::CompactBlockV1(decoded) => assert_eq!(decoded, compact),
+            _ => panic!("wrong compact announcement variant"),
+        }
+
+        let body = IndexedCompactTransactionV1 {
+            index: 1,
+            transaction: block.transactions[1].clone(),
+        };
+        let response = NetworkMessage::CompactTransactionsV1 {
+            block_hash: block.hash,
+            transactions: vec![body.clone()],
+        };
+        let encoded_response = codec::serialize(&response).unwrap();
+        match codec::deserialize::<NetworkMessage>(&encoded_response).unwrap() {
+            NetworkMessage::CompactTransactionsV1 {
+                block_hash,
+                transactions,
+            } => {
+                assert_eq!(block_hash, block.hash);
+                assert_eq!(transactions, vec![body]);
+            }
+            _ => panic!("wrong compact transaction response variant"),
+        }
+
+        for request in [
+            NetworkMessage::GetCompactTransactionsV1 {
+                block_hash: block.hash,
+                indexes: vec![1],
+                proxy_hops: COMPACT_PROXY_HOPS_MAX,
+            },
+            NetworkMessage::GetCompactBlockV1 {
+                block_hash: block.hash,
+                proxy_hops: COMPACT_PROXY_HOPS_MAX,
+            },
+        ] {
+            let encoded = codec::serialize(&request).unwrap();
+            let decoded: NetworkMessage = codec::deserialize(&encoded).unwrap();
+            match (request, decoded) {
+                (
+                    NetworkMessage::GetCompactTransactionsV1 {
+                        block_hash: expected_hash,
+                        indexes: expected_indexes,
+                        proxy_hops: expected_hops,
+                    },
+                    NetworkMessage::GetCompactTransactionsV1 {
+                        block_hash,
+                        indexes,
+                        proxy_hops,
+                    },
+                ) => {
+                    assert_eq!(block_hash, expected_hash);
+                    assert_eq!(indexes, expected_indexes);
+                    assert_eq!(proxy_hops, expected_hops);
+                }
+                (
+                    NetworkMessage::GetCompactBlockV1 {
+                        block_hash: expected_hash,
+                        proxy_hops: expected_hops,
+                    },
+                    NetworkMessage::GetCompactBlockV1 {
+                        block_hash,
+                        proxy_hops,
+                    },
+                ) => {
+                    assert_eq!(block_hash, expected_hash);
+                    assert_eq!(proxy_hops, expected_hops);
+                }
+                _ => panic!("compact request variant changed during round trip"),
+            }
+        }
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
+    #[test]
+    fn mesh_compact_envelope_precedes_unchanged_full_fallback() {
+        let block = compact_test_block();
+        let expected_compact = CompactBlockV1::from_block(&block).unwrap();
+        let (compact_frame, full_frame) =
+            Node::mesh_block_frames(&block).expect("mesh block frames");
+        let compact_frame = compact_frame.expect("eligible block has compact envelope");
+
+        // This is exactly what an older node sees first: a pre-existing RawData
+        // variant it safely ignores. Its next ordered frame remains the unchanged
+        // full Block variant.
+        let raw = match codec::deserialize::<NetworkMessage>(&compact_frame).unwrap() {
+            NetworkMessage::RawData(raw) => raw,
+            _ => panic!("first mesh frame must use the backward-safe RawData variant"),
+        };
+        assert_eq!(
+            CompactBlockV1::decode_mesh_envelope(&raw),
+            Some(expected_compact)
+        );
+        match codec::deserialize::<NetworkMessage>(&full_frame).unwrap() {
+            NetworkMessage::Block(fallback) => {
+                assert_eq!(fallback.hash, block.hash);
+                assert_eq!(fallback.transactions, block.transactions);
+            }
+            _ => panic!("second ordered mesh frame must remain the full-block fallback"),
+        }
+
+        let mut wrong_version = raw;
+        wrong_version[MESH_COMPACT_V1_MAGIC.len()] =
+            MESH_COMPACT_V1_VERSION.saturating_add(1);
+        assert!(
+            CompactBlockV1::decode_mesh_envelope(&wrong_version).is_none(),
+            "unknown envelopes remain ignorable by version"
+        );
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
+    #[test]
+    fn mesh_compact_acceptance_suppresses_full_fallback_reprocessing() {
+        let hash = compact_test_block().hash;
+        let bloom = NetworkBloom::new(4_096, 0.01);
+        let mesh_seen = Arc::new(PLMutex::new(LruCache::new(
+            NonZeroUsize::new(8).expect("nonzero mesh seen cache"),
+        )));
+        assert!(!Node::mesh_block_already_seen(
+            &mesh_seen,
+            &bloom,
+            &hash
+        ));
+
+        // The normal NewBlock path commits the accepted hash to network_bloom
+        // before relaying. Therefore the immediately-following ordered full
+        // fallback is dropped even before the mesh-local success marker is
+        // consulted; it cannot be revalidated or trigger a second gossip.
+        bloom.insert(&hash);
+        assert!(Node::mesh_block_already_seen(&mesh_seen, &bloom, &hash));
+
+        mesh_seen.lock().put(hex::encode(hash), ());
+        bloom.clear();
+        assert!(
+            Node::mesh_block_already_seen(&mesh_seen, &bloom, &hash),
+            "mesh-local success remains a second independent replay guard"
+        );
+    }
+
+    #[test]
+    fn tcp_compact_extension_is_fail_closed_for_this_release() {
+        let node_id = "ab".repeat(32);
+        assert!(!Node::advertises_compact_v1(&node_id));
+        let marked = format!(
+            "{}{}",
+            node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX
+        );
+        assert!(Node::compact_v1_marker_well_formed(&marked));
+        assert!(
+            !Node::advertises_compact_v1(&marked),
+            "even a well-formed remote marker cannot activate dormant TCP compact"
+        );
+        assert_eq!(
+            Node::tcp_capability_node_id(&node_id),
+            node_id,
+            "the local ping/pong node id must not emit the capability suffix"
+        );
+        assert!(
+            !Node::tcp_compact_peer_eligible(true),
+            "a fresh injected capability record still cannot enable TCP compact"
+        );
+        assert!(!Node::advertises_compact_v1(
+            COMPACT_BLOCK_V1_CAPABILITY_SUFFIX
+        ));
+        assert!(!Node::advertises_compact_v1(&format!(
+            "{}{}",
+            "zz".repeat(32),
+            COMPACT_BLOCK_V1_CAPABILITY_SUFFIX
+        )));
+
+        let block = compact_test_block();
+        let compact = CompactBlockV1::from_block(&block).unwrap();
+        let extension_messages = [
+            NetworkMessage::CompactBlockV1(compact),
+            NetworkMessage::GetCompactTransactionsV1 {
+                block_hash: block.hash,
+                indexes: vec![1],
+                proxy_hops: 0,
+            },
+            NetworkMessage::CompactTransactionsV1 {
+                block_hash: block.hash,
+                transactions: Vec::new(),
+            },
+            NetworkMessage::GetCompactBlockV1 {
+                block_hash: block.hash,
+                proxy_hops: 0,
+            },
+            NetworkMessage::CompactBlockResponseV1 {
+                block_hash: block.hash,
+                block: Some(block),
+            },
+        ];
+        assert!(
+            extension_messages
+                .iter()
+                .all(Node::is_tcp_compact_extension),
+            "every compact request, response, and announcement must hit the inert ingress/egress gate"
+        );
+        assert!(!Node::is_tcp_compact_extension(
+            &NetworkMessage::Block(compact_test_block())
+        ));
     }
 
     // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
@@ -12514,6 +15586,23 @@ mod tests {
     }
 
     #[test]
+    fn event_block_bloom_commits_only_after_successful_validation() {
+        let bloom = NetworkBloom::new(4_096, 0.01);
+        let hash = [0x5cu8; 32];
+
+        assert!(Node::event_block_should_validate(&bloom, &hash));
+        // A transient validation failure performs no commit, so a later full
+        // delivery remains eligible for validation.
+        assert!(Node::event_block_should_validate(&bloom, &hash));
+
+        Node::commit_validated_event_block(&bloom, &hash);
+        assert!(
+            !Node::event_block_should_validate(&bloom, &hash),
+            "only a successfully validated hash becomes a dedup hit"
+        );
+    }
+
+    #[test]
     fn validation_cache_prune_removes_expired_and_caps_oldest() {
         let cache = DashMap::new();
         let now = UNIX_EPOCH + Duration::from_secs(10_000);
@@ -12548,6 +15637,13 @@ mod tests {
 
     #[test]
     fn network_dedup_applies_only_to_gossip_messages() {
+        // RawData was the final pre-compact variant. Pin its wire bytes so a
+        // future insertion before the appended compact variants cannot silently
+        // renumber messages understood by already-running peers.
+        assert_eq!(
+            hex::encode(codec::serialize(&NetworkMessage::RawData(vec![1, 2, 3])).unwrap()),
+            "41394d5347320000020081a75261774461746193010203"
+        );
         assert!(Node::should_dedup_message(&NetworkMessage::AlertMessage(
             "notice".to_string()
         )));
@@ -12562,6 +15658,11 @@ mod tests {
             timestamp: 123,
             node_id: "node".to_string(),
         }));
+        assert!(!Node::should_dedup_message(
+            &NetworkMessage::CompactBlockV1(
+                CompactBlockV1::from_block(&compact_test_block()).unwrap()
+            )
+        ));
         assert!(!Node::should_dedup_message(&NetworkMessage::BlockHeight(1)));
     }
 

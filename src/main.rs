@@ -26,7 +26,9 @@ use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
         Block, Blockchain, RateLimiter, Transaction, CONSENSUS_HEADER_RULES_VERSION,
-        MAX_BLOCK_FUTURE_TIME, MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
+        FEE_ACCOUNTING_RULES_VERSION, FEE_SYSTEM_ACTIVATION_HEIGHT,
+        LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES,
+        MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
@@ -429,7 +431,7 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
         .unwrap_or_else(|_| "missing_genesis".to_string());
 
     let descriptor = format!(
-        "fee={:.12};reward={:.8};adj={};block_time={};target_block_time={};network_fee={:.8};mint_clip={:.8};genesis={};hdr_rules_ver={};hdr_future={}",
+        "fee={:.12};reward={:.8};adj={};block_time={};target_block_time={};network_fee={:.8};mint_clip={:.8};genesis={};hdr_rules_ver={};hdr_future={};fee_rules_ver={};fee_activation={};fee_envelope_units={};max_block_weight={}",
         blockchain.transaction_fee,
         blockchain.mining_reward,
         blockchain.difficulty_adjustment_interval,
@@ -439,7 +441,11 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
         MINT_CLIP,
         genesis_hash,
         CONSENSUS_HEADER_RULES_VERSION,
-        MAX_BLOCK_FUTURE_TIME
+        MAX_BLOCK_FUTURE_TIME,
+        FEE_ACCOUNTING_RULES_VERSION,
+        FEE_SYSTEM_ACTIVATION_HEIGHT,
+        LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS,
+        MAX_BLOCK_WEIGHT_BYTES
     );
 
     let mut hasher = Sha256::new();
@@ -1514,7 +1520,9 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
 
-        println!("1. Create Transaction (format: create sender recipient amount)");
+        println!(
+            "1. Create Transaction (format: create sender recipient amount [--fee ALPHA])"
+        );
         println!("2. Whisper Code (format: whisper address msg)");
         println!("3. Show Balance (format: balance)");
         println!("4. Make New Wallet (format: new [wallet_name])");
@@ -1920,7 +1928,11 @@ async fn async_main() -> Result<()> {
     writeln!(stdout, "Hashrate:          {:.2} {}", hr_value, hr_unit)?;
     color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
     stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Fee Rate:          {:.8}%", blockchain_guard.transaction_fee * 100.0)?;
+    writeln!(
+        stdout,
+        "Whisper Compat:    {:.8}%",
+        blockchain_guard.transaction_fee * 100.0
+    )?;
     writeln!(stdout, "Block Time Target: {}s", blockchain_guard.block_time)?;
 
     if let Some(last_block) = blockchain_guard.get_last_block() {
@@ -2882,7 +2894,10 @@ Some("help") => {
     writeln!(stdout, "\n Available Commands")?;
     stdout.reset()?;
     println!("───────────────────");
-    println!("create <sender> <recipient> <amount>  - Create a new transaction");
+    println!(
+        "create <sender> <recipient> <amount> [--fee <ALPHA>]  - Create a new transaction"
+    );
+    println!("  explicit reference-wallet fees are limited to 0.01 ALPHA");
     println!("whisper <address> <msg>               - Send a whisper message (amount optional)");
     println!("balance                               - Show all wallet balances");
     println!("new [wallet_name]                     - Create a new wallet");
@@ -5724,6 +5739,39 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consensus_fingerprint_commits_activated_fee_and_weight_rules() {
+        let db = sled::Config::new()
+            .temporary(true)
+            .open()
+            .expect("temporary fingerprint DB");
+        let blockchain = Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            TARGET_BLOCK_TIME as u32,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(Mutex::new(321)),
+        );
+        let (descriptor, _) = compute_consensus_fingerprint(&blockchain);
+
+        for component in [
+            format!("hdr_rules_ver={CONSENSUS_HEADER_RULES_VERSION}"),
+            format!("fee_rules_ver={FEE_ACCOUNTING_RULES_VERSION}"),
+            format!("fee_activation={FEE_SYSTEM_ACTIVATION_HEIGHT}"),
+            format!(
+                "fee_envelope_units={LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS}"
+            ),
+            format!("max_block_weight={MAX_BLOCK_WEIGHT_BYTES}"),
+        ] {
+            assert!(
+                descriptor.contains(&component),
+                "fingerprint descriptor omitted {component}"
+            );
+        }
+    }
 
     // Arrow-up recall must fire ONLY for a bare arrow-up escape typed as the whole line in the
     // raw-stdin fallback — never for a payload that merely contains an ESC byte or "[A", which

@@ -1,20 +1,21 @@
 # alphanumeric transaction signing spec
 
-Everything a wallet needs to build and sign a transaction that the network
-accepts — for web wallets, mobile wallets, exchange withdrawal signers, in any
-language. Pair this with `EXPLORER_API.md` (which covers reading the chain and
-the `POST /explorer/submit-tx` endpoint you send the signed result to).
+The network-facing key, address, message, and transaction encodings needed to
+build and sign a transaction the network accepts — for web wallets, mobile
+wallets, and exchange withdrawal signers. Pair this with `EXPLORER_API.md`
+(which covers reading the chain and the `POST /explorer/submit-tx` endpoint).
 
 This is a spec + test vectors, not a library. The signature scheme is a
-standards-track primitive with existing implementations in most languages, so
-no code from this repo is required to sign.
+standardized primitive with implementations in multiple ecosystems, so no code
+from this repo is required to sign.
 
 ## Signature scheme
 
 **ML-DSA-87 (FIPS 204)** — the NIST post-quantum lattice signature. Use any
 conformant implementation, e.g. JavaScript/TypeScript `@noble/post-quantum`
 (`ml_dsa87`), or a native FIPS 204 library. This node uses the RustCrypto
-`ml-dsa` crate; any FIPS 204 ML-DSA-87 implementation is interoperable.
+`ml-dsa` crate. Interoperability requires pure ML-DSA-87, the standard encoded
+key/signature forms below, and an empty context string.
 
 Sizes and encodings (all hex in the JSON are lowercase, unpadded byte hex):
 
@@ -24,9 +25,10 @@ Sizes and encodings (all hex in the JSON are lowercase, unpadded byte hex):
 | public (verifying) key | 2592 | standard FIPS 204 encoded verifying key |
 | signature | 4627 | standard FIPS 204 encoded signature |
 
-Signatures are **deterministic**: signing the same message with the same key
-always yields the identical bytes. (This is what makes the test vector below an
-exact check.)
+FIPS 204 permits randomized signatures and an optional deterministic variant.
+The node accepts either when the signature is otherwise valid. The reference
+client and the exact test vector below use the optional deterministic variant
+with an empty context string.
 
 ## Keys
 
@@ -34,10 +36,10 @@ exact check.)
   device. The signing key is `ML-DSA-87.key_from_seed(seed)`.
 - **Public key** is the encoded verifying key of that signing key (2592 bytes),
   hex-encoded into the transaction's `pub_key` field.
-- An **address** is derived from the public key elsewhere in the wallet; a
-  sending wallet already holds the address/pubkey pair, so address derivation is
-  not needed just to sign. (Addresses are the 40-hex strings you see in the
-  explorer.)
+- An **address** is the lowercase hexadecimal encoding of the first 20 bytes of
+  `SHA-256(encoded_public_key_bytes)`. It is therefore exactly 40 lowercase hex
+  characters. Validate that the sender address supplied to a signer matches the
+  public key before signing.
 
 ## The message that gets signed
 
@@ -49,7 +51,9 @@ with **amount and fee formatted to exactly 8 decimal places**, and timestamp as
 a plain unsigned integer (unix seconds). Nothing else is included — not the
 public key, not the sig_hash, not JSON. Colons separate the five fields.
 
-- `sender`, `recipient`: the 40-hex address strings, verbatim.
+- `sender`, `recipient`: exactly 40 lowercase ASCII hexadecimal characters,
+  verbatim. Validate this before signing; never change case after constructing
+  the signed message.
 - `amount`, `fee`: decimal coin values, **always 8 fractional digits**
   (e.g. `1.5` → `1.50000000`, `0.001` → `0.00100000`). This is the one place to
   get exactly right — match the test vector byte-for-byte.
@@ -58,47 +62,60 @@ public key, not the sig_hash, not JSON. Colons separate the five fields.
 ## Signing steps
 
 1. Build the message string above and encode it UTF-8.
-2. `signature = ML-DSA-87.sign(seed, message)` (deterministic).
-3. `sig_hash = SHA-256(signature_bytes)` — hex. (A compact identifier the
-   mempool uses; include it.)
+2. Sign it with pure ML-DSA-87 and an empty context. Randomized and optional
+   deterministic signing both verify; use deterministic mode to reproduce the
+   exact vector below.
+3. `sig_hash = SHA-256(encoded_signature_bytes)` — lowercase hex. This is the
+   commitment to the signature bytes; include it.
 4. Assemble the transaction JSON and POST it to `/explorer/submit-tx`:
 
-       {
-         "sender":    "<40-hex>",
-         "recipient": "<40-hex>",
-         "amount":    1.5,          // decimal coins (JSON number)
-         "fee":       0.001,
-         "timestamp": 1783600000,
-         "signature": "<hex, 4627 bytes>",
-         "pub_key":   "<hex, 2592 bytes>",
-         "sig_hash":  "<hex, sha256(signature)>"
-       }
+   ```json
+   {
+     "sender": "<40-char lowercase hex address>",
+     "recipient": "<40-char lowercase hex address>",
+     "amount": 1.5,
+     "fee": 0.001,
+     "timestamp": 1783600000,
+     "signature": "<9254-char lowercase hex signature>",
+     "pub_key": "<5184-char lowercase hex public key>",
+     "sig_hash": "<64-char lowercase hex SHA-256>"
+   }
+   ```
 
-   Note the JSON `amount`/`fee` are ordinary decimal numbers; only the *signed
-   message* uses the fixed 8-decimal string form.
+   The JSON `amount`/`fee` are ordinary decimal numbers; only the *signed
+   message* uses the fixed 8-decimal string form. Quantize both values to integer
+   atomic units first, then derive both representations from those same units.
 
 ## Choosing the fee
 
-The fee is a **priority signal, not a fixed rate** — but nodes enforce a relay
-floor, and miners are paid more for higher-fee blocks, so choose deliberately:
+The fee is a **priority signal, not a fixed rate** — nodes enforce a relay
+floor, so choose it deliberately:
 
 - **Relay floor (policy): `0.0001`.** Nodes refuse to mempool or relay a
   transaction whose fee is below 0.0001 coins (`400 … below the relay floor`
   from submit-tx). This is relay policy, not consensus — but a below-floor
   transaction will not propagate, so treat it as a hard minimum.
-- **Recommended: `max(amount × 0.000563063063, 0.0001)`** — ≈0.0563% of the
-  amount, floored. This is what the reference wallet pays, and it is what keeps
-  a payment attractive to include: 65% of a block's fees are re-minted to its
-  miner (35% burn) and the block subsidy itself scales with the fees the block
-  carries, so higher-fee transactions confirm ahead of cheaper ones. Large
-  batched payouts at the bare floor are the first to queue when blocks compete.
-- Fees in the band `0.0001–0.0157` can decode as 4-letter whisper codes (see
-  the whisper module) — harmless; the recommended formula lands above the band
-  once `amount × 0.0563% > 0.0157` and inside it otherwise, which is fine.
+- **Recommended bounded policy:** calculate in atomic units (100,000,000 units
+  per coin), round `amount_units / 1776` to the nearest unit with positive exact
+  halves rounded upward, then clamp the result to `10,000–50,000` units
+  (`0.0001–0.0005` coins). In integer arithmetic:
+
+      raw_fee_units = amount_units / 1776
+      if amount_units % 1776 >= 888: raw_fee_units += 1
+      fee_units = clamp(raw_fee_units, 10_000, 50_000)
+
+  This is the reference wallet default. Exchanges and payout processors may
+  choose an explicit absolute fee for their batching policy. Explicit fees remain
+  subject to current node admission and block-accounting policy; acceptance of
+  one value does not imply that every larger value is accepted, nor does a larger
+  fee guarantee a particular confirmation time.
+- Whisper uses a separate historical, amount-dependent application encoding in
+  the fee field. It is not regular-payment fee guidance, and numerical overlap
+  with an ordinary fee is not by itself a message marker.
 
 ## Test vector (verify your implementation against this)
 
-Deterministic — your bytes must match exactly.
+Reference deterministic mode — your bytes must match exactly.
 
     secret key (seed), hex:
       0707070707070707070707070707070707070707070707070707070707070707
@@ -131,7 +148,14 @@ If both match, your implementation is byte-compatible with the network.
   transaction: signature over the message above, sender balance, replay guard,
   already-confirmed guard, and (network-side) rate limits. A wrong message
   format is rejected as `transaction signature is invalid or missing`.
-- Amounts overflowing 8 decimals or non-canonical formatting will change the
-  signed bytes and fail verification — always format to exactly 8 places.
+- Quantize amounts to integer atomic units before signing. Do not submit more
+  than eight decimal places or rely on language-specific floating-point
+  rounding; sign the exact canonical eight-decimal value represented by those
+  units.
+- Use the current Unix timestamp close to submission. A transaction must be
+  mined within 21,600 seconds (6 hours) of its signed timestamp. Pending
+  retention defaults to 7,200 seconds (2 hours), so a valid transaction can
+  return to `not_found` before its consensus freshness window ends; retry the
+  identical signed transaction safely and handle that state explicitly.
 - This document describes the current format; the node source
   (`Transaction::get_message`, `src/a9/mldsa.rs`) is the ultimate reference.

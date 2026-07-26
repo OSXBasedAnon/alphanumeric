@@ -14,7 +14,7 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
 use tokio::sync::RwLock;
 
-use crate::a9::blockchain::{FEE_PERCENTAGE, MIN_RELAY_FEE_UNITS};
+use crate::a9::blockchain::{is_canonical_user_address, MIN_RELAY_FEE_UNITS};
 use crate::a9::{
     blockchain::{
         Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
@@ -26,6 +26,17 @@ use crate::a9::{
 
 const KEY_FILE_PATH: &str = "private.key";
 const MINING_NONCE_WINDOW: u64 = 67_108_864;
+/// Reference-wallet fee policy. These are wallet defaults, not consensus rules:
+/// externally signed transactions may choose their own fee subject to current
+/// relay admission and block-accounting policy.
+const DEFAULT_WALLET_FEE_DIVISOR: i128 = 1_776;
+const DEFAULT_WALLET_FEE_CAP_UNITS: i128 = 50_000; // 0.0005 ALPHA
+/// Hard safety ceiling for the reference wallet's explicit-fee path. This is
+/// wallet policy, not a universal network limit; externally signed integrations
+/// retain control subject to current admission and block-accounting policy.
+const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = 1_000_000; // 0.01 ALPHA
+const CREATE_TRANSACTION_USAGE: &str =
+    "Usage: create <sender_address> <recipient_address> <amount> [--fee <ALPHA>]";
 
 /// Blocks until the coinbase mined at `reward_height` leaves the M06 immature set — i.e.
 /// until the wallet's spendable balance includes it. It drops out once the tip reaches
@@ -55,6 +66,183 @@ fn format_maturity_eta(blocks_left: u64) -> String {
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[derive(Debug, Eq, PartialEq)]
+struct CreateTransactionArgs {
+    sender_address: String,
+    recipient_address: String,
+    amount_units: i128,
+    fee_units: i128,
+}
+
+/// Parse a CLI coin amount without routing user input through `f64`. Transaction
+/// values have eight decimal places on the wire, so accepting exponent notation
+/// or silently rounding a ninth decimal would make the displayed fee differ from
+/// the value actually signed.
+fn parse_coin_units(value: &str, field: &str) -> std::result::Result<i128, String> {
+    let mut components = value.split('.');
+    let whole = components.next().unwrap_or_default();
+    let fractional = components.next();
+
+    if components.next().is_some()
+        || (whole.is_empty() && fractional.unwrap_or_default().is_empty())
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || fractional
+            .map(|part| !part.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} must be a plain non-negative decimal number",
+            field
+        ));
+    }
+
+    let fractional = fractional.unwrap_or_default();
+    if fractional.len() > 8 {
+        return Err(format!("{} may have at most 8 decimal places", field));
+    }
+
+    let whole_units = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<i128>()
+            .map_err(|_| format!("{} is too large", field))?
+            .checked_mul(100_000_000)
+            .ok_or_else(|| format!("{} is too large", field))?
+    };
+
+    let mut fractional_units = if fractional.is_empty() {
+        0
+    } else {
+        fractional
+            .parse::<i128>()
+            .map_err(|_| format!("{} is invalid", field))?
+    };
+    for _ in fractional.len()..8 {
+        fractional_units = fractional_units
+            .checked_mul(10)
+            .ok_or_else(|| format!("{} is too large", field))?;
+    }
+
+    whole_units
+        .checked_add(fractional_units)
+        .ok_or_else(|| format!("{} is too large", field))
+}
+
+/// Round a positive integer ratio to the nearest atomic unit, with exact halves
+/// rounded upward (matching the reference wallet's historical positive-value
+/// rounding), then apply the wallet policy bounds.
+fn default_wallet_fee_units(amount_units: i128) -> i128 {
+    let quotient = amount_units / DEFAULT_WALLET_FEE_DIVISOR;
+    let remainder = amount_units % DEFAULT_WALLET_FEE_DIVISOR;
+    let rounded = quotient + i128::from(remainder >= (DEFAULT_WALLET_FEE_DIVISOR + 1) / 2);
+    rounded.clamp(MIN_RELAY_FEE_UNITS, DEFAULT_WALLET_FEE_CAP_UNITS)
+}
+
+fn ensure_wire_exact(units: i128, field: &str) -> std::result::Result<(), String> {
+    if Transaction::to_units(Transaction::from_units(units)) != units {
+        return Err(format!(
+            "{} is outside the transaction format's exact numeric range",
+            field
+        ));
+    }
+    Ok(())
+}
+
+fn parse_create_transaction_command(
+    command: &str,
+) -> std::result::Result<CreateTransactionArgs, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.len() < 4 {
+        return Err("invalid command format".to_string());
+    }
+
+    let amount_units = parse_coin_units(parts[3], "amount")?;
+    if amount_units <= 0 {
+        return Err("amount must be greater than zero".to_string());
+    }
+    ensure_wire_exact(amount_units, "amount")?;
+
+    let mut explicit_fee_units = None;
+    let mut index = 4;
+    while index < parts.len() {
+        match parts[index] {
+            "--fee" => {
+                if explicit_fee_units.is_some() {
+                    return Err("--fee may only be specified once".to_string());
+                }
+                index += 1;
+                let value = parts
+                    .get(index)
+                    .ok_or_else(|| "--fee requires a decimal ALPHA value".to_string())?;
+                explicit_fee_units = Some(parse_coin_units(value, "fee")?);
+            }
+            option if option.starts_with("--fee=") => {
+                if explicit_fee_units.is_some() {
+                    return Err("--fee may only be specified once".to_string());
+                }
+                let value = option.strip_prefix("--fee=").expect("prefix checked above");
+                if value.is_empty() {
+                    return Err("--fee requires a decimal ALPHA value".to_string());
+                }
+                explicit_fee_units = Some(parse_coin_units(value, "fee")?);
+            }
+            unknown => {
+                return Err(format!("unrecognized transaction option: {}", unknown));
+            }
+        }
+        index += 1;
+    }
+
+    let fee_units = match explicit_fee_units {
+        Some(fee_units) => {
+            ensure_wire_exact(fee_units, "fee")?;
+            if fee_units < MIN_RELAY_FEE_UNITS {
+                return Err(format!(
+                    "fee is below the relay floor of {:.8} ALPHA",
+                    Transaction::from_units(MIN_RELAY_FEE_UNITS)
+                ));
+            }
+            if fee_units > EXPLICIT_FEE_SAFETY_LIMIT_UNITS {
+                return Err(format!(
+                    "fee exceeds the reference wallet safety limit of {:.8} ALPHA",
+                    Transaction::from_units(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
+                ));
+            }
+            fee_units
+        }
+        None => default_wallet_fee_units(amount_units),
+    };
+
+    amount_units
+        .checked_add(fee_units)
+        .ok_or_else(|| "amount plus fee is too large".to_string())?;
+
+    Ok(CreateTransactionArgs {
+        sender_address: parts[1].to_string(),
+        recipient_address: parts[2].to_string(),
+        amount_units,
+        fee_units,
+    })
+}
+
+fn validate_wallet_transaction_addresses(
+    sender: &str,
+    recipient: &str,
+) -> std::result::Result<(), String> {
+    if !is_canonical_user_address(sender) {
+        return Err(
+            "sender address must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    if !is_canonical_user_address(recipient) {
+        return Err(
+            "recipient address must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WalletKeyData {
@@ -771,22 +959,34 @@ impl Mgmt {
     ) -> Result<Transaction> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
-        // Parse command
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.len() != 4 {
+        let parsed = match parse_create_transaction_command(command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(stdout, ": {}", error)?;
+                writeln!(stdout, "{}", CREATE_TRANSACTION_USAGE)?;
+                return Err(error.into());
+            }
+        };
+
+        let sender_address = parsed.sender_address;
+        let recipient_address = parsed.recipient_address;
+        let amount_units = parsed.amount_units;
+        let fee_units = parsed.fee_units;
+        let amount = Transaction::from_units(amount_units);
+        let fee = Transaction::from_units(fee_units);
+
+        if let Err(error) =
+            validate_wallet_transaction_addresses(&sender_address, &recipient_address)
+        {
             stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
             write!(stdout, "error")?;
             stdout.reset()?;
-            writeln!(stdout, ": invalid command format")?;
-            writeln!(
-                stdout,
-                "Usage: create <sender_address> <recipient_address> <amount>"
-            )?;
-            return Err("Invalid command format".into());
+            writeln!(stdout, ": {}", error)?;
+            return Err(error.into());
         }
-
-        let sender_address = parts[1].to_string();
-        let recipient_address = parts[2].to_string();
 
         // Prevent self-transfers
         if sender_address == recipient_address {
@@ -796,24 +996,6 @@ impl Mgmt {
             writeln!(stdout, ": cannot transfer to the same address")?;
             return Err("Self-transfer not allowed".into());
         }
-
-        let amount: f64 = match parts[3].parse::<f64>() {
-            Ok(amount) if amount.is_finite() && amount > 0.0 => amount,
-            Err(_) => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
-                write!(stdout, "error")?;
-                stdout.reset()?;
-                writeln!(stdout, ": invalid amount format")?;
-                return Err("Invalid amount".into());
-            }
-            _ => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
-                write!(stdout, "error")?;
-                stdout.reset()?;
-                writeln!(stdout, ": amount must be a positive finite number")?;
-                return Err("Invalid amount".into());
-            }
-        };
 
         // Progress bar header
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
@@ -860,20 +1042,28 @@ impl Mgmt {
         stdout.flush()?;
 
         let blockchain_guard = blockchain.read().await;
-        // Percentage fee, floored at the relay-policy minimum so a small send
-        // can't produce a fee our own mempool floor would then reject.
-        let fee = (amount * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
-        let total_cost = amount + fee;
-        let sender_balance = blockchain_guard.get_wallet_balance(&sender_address).await?;
+        // Keep affordability entirely in exact atomic units. Conversions below
+        // are presentation-only and never influence admission.
+        let total_cost_units = amount_units
+            .checked_add(fee_units)
+            .ok_or("amount plus fee is too large")?;
+        let total_cost = Transaction::from_units(total_cost_units);
+        let sender_balance_units = blockchain_guard
+            .get_spendable_balance_units(&sender_address)
+            .await?;
 
-        if sender_balance < total_cost {
+        if sender_balance_units < total_cost_units {
             writeln!(stdout)?;
             stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
             write!(stdout, "error")?;
             stdout.reset()?;
             writeln!(stdout, ": insufficient balance")?;
             writeln!(stdout, "required: {}", total_cost)?;
-            writeln!(stdout, "available: {}", sender_balance)?;
+            writeln!(
+                stdout,
+                "available: {}",
+                Transaction::from_units(sender_balance_units)
+            )?;
             return Err("Insufficient balance".into());
         }
         writeln!(stdout, "Done")?;
@@ -918,14 +1108,16 @@ impl Mgmt {
         writeln!(stdout, " to blockchain...")?;
         stdout.flush()?;
 
-        let mut transaction = Transaction::new(
-            sender_address.clone(),
-            recipient_address.clone(),
-            amount,
-            fee,
+        let mut transaction = Transaction {
+            sender: sender_address.clone(),
+            recipient: recipient_address.clone(),
+            amount_units,
+            fee_units,
             timestamp,
-            Some(signature),
-        );
+            signature: Some(signature),
+            pub_key: None,
+            sig_hash: None,
+        };
         transaction.pub_key = sender_wallet.get_public_key_hex().await;
         if transaction.pub_key.is_none() {
             writeln!(stdout)?;
@@ -1397,7 +1589,178 @@ impl Mgmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn wallet_coin_parser_is_exact_and_never_silently_rounds() {
+        assert_eq!(parse_coin_units("1", "amount").unwrap(), 100_000_000);
+        assert_eq!(parse_coin_units("1.2", "amount").unwrap(), 120_000_000);
+        assert_eq!(
+            parse_coin_units("1.23456789", "amount").unwrap(),
+            123_456_789
+        );
+        assert_eq!(parse_coin_units(".0001", "fee").unwrap(), 10_000);
+
+        for invalid in ["", ".", "-1", "+1", "1e-4", "1.2.3", "0.000000001"] {
+            assert!(
+                parse_coin_units(invalid, "value").is_err(),
+                "{invalid:?} must not be silently rounded or reinterpreted"
+            );
+        }
+    }
+
+    #[test]
+    fn default_wallet_fee_is_exact_rounded_ratio_with_floor_and_cap() {
+        assert_eq!(
+            default_wallet_fee_units(parse_coin_units("0.1", "amount").unwrap()),
+            MIN_RELAY_FEE_UNITS
+        );
+        assert_eq!(
+            default_wallet_fee_units(parse_coin_units("0.5", "amount").unwrap()),
+            28_153
+        );
+        assert_eq!(
+            default_wallet_fee_units(parse_coin_units("0.888", "amount").unwrap()),
+            DEFAULT_WALLET_FEE_CAP_UNITS
+        );
+        assert_eq!(
+            default_wallet_fee_units(parse_coin_units("1000000", "amount").unwrap()),
+            DEFAULT_WALLET_FEE_CAP_UNITS
+        );
+
+        let exact_half = 20_000 * DEFAULT_WALLET_FEE_DIVISOR
+            + DEFAULT_WALLET_FEE_DIVISOR / 2;
+        assert_eq!(
+            default_wallet_fee_units(exact_half),
+            20_001,
+            "an exact half atomic unit rounds upward"
+        );
+    }
+
+    #[test]
+    fn create_command_keeps_existing_syntax_and_accepts_exact_fee_override() {
+        let existing = parse_create_transaction_command("create sender recipient 0.5").unwrap();
+        assert_eq!(existing.amount_units, 50_000_000);
+        assert_eq!(existing.fee_units, 28_153);
+
+        let explicit =
+            parse_create_transaction_command("create sender recipient 2 --fee 0.001").unwrap();
+        assert_eq!(explicit.amount_units, 200_000_000);
+        assert_eq!(explicit.fee_units, 100_000);
+
+        let equals =
+            parse_create_transaction_command("create sender recipient 2 --fee=0.0005").unwrap();
+        assert_eq!(equals.fee_units, 50_000);
+
+        for alias in ["send", "transfer"] {
+            let command = format!("{alias} sender recipient 2 --fee 0.001");
+            let parsed = parse_create_transaction_command(&command).unwrap();
+            assert_eq!(parsed.amount_units, 200_000_000);
+            assert_eq!(parsed.fee_units, 100_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_wallet_values_survive_signed_json_and_codec_round_trips() {
+        let wallet = Wallet::new(None).expect("test wallet");
+        let mut tx = Transaction {
+            sender: wallet.address.clone(),
+            recipient: "22".repeat(20),
+            amount_units: 123_456_789,
+            fee_units: 28_153,
+            timestamp: 1_783_600_000,
+            signature: None,
+            pub_key: wallet.get_public_key_hex().await,
+            sig_hash: None,
+        };
+        let signed_message = format!(
+            "{}:{}:{:.8}:{:.8}:{}",
+            tx.sender,
+            tx.recipient,
+            tx.amount(),
+            tx.fee(),
+            tx.timestamp
+        );
+        tx.signature = wallet.sign_transaction(signed_message.as_bytes()).await;
+        let signature = hex::decode(tx.signature.as_deref().expect("signed")).expect("hex");
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&signature));
+        assert!(
+            tx.is_valid(tx.pub_key.as_deref().expect("public key")),
+            "source transaction signature"
+        );
+
+        let json = serde_json::to_vec(&tx).expect("transaction JSON");
+        let from_json: Transaction =
+            serde_json::from_slice(&json).expect("transaction JSON round-trip");
+        assert_eq!(from_json.amount_units, tx.amount_units);
+        assert_eq!(from_json.fee_units, tx.fee_units);
+        assert!(from_json.is_valid(from_json.pub_key.as_deref().unwrap()));
+
+        let encoded = codec::serialize(&tx).expect("transaction codec");
+        let from_codec: Transaction =
+            codec::deserialize(&encoded).expect("transaction codec round-trip");
+        assert_eq!(from_codec.amount_units, tx.amount_units);
+        assert_eq!(from_codec.fee_units, tx.fee_units);
+        assert!(from_codec.is_valid(from_codec.pub_key.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn create_command_fee_guards_are_deterministic_for_automation() {
+        let floor =
+            parse_create_transaction_command("create sender recipient 1 --fee 0.0001").unwrap();
+        assert_eq!(floor.fee_units, MIN_RELAY_FEE_UNITS);
+
+        let safety_limit =
+            parse_create_transaction_command("create sender recipient 1 --fee 0.01").unwrap();
+        assert_eq!(safety_limit.fee_units, EXPLICIT_FEE_SAFETY_LIMIT_UNITS);
+
+        assert!(
+            parse_create_transaction_command("create sender recipient 1 --fee 0.00009999")
+                .unwrap_err()
+                .contains("relay floor")
+        );
+        assert!(
+            parse_create_transaction_command("create sender recipient 1 --fee 0.01000001")
+                .unwrap_err()
+                .contains("safety limit")
+        );
+
+        for malformed in [
+            "create sender recipient 1 --fee",
+            "create sender recipient 1 --fee 0.001 --fee 0.002",
+            "create sender recipient 1 --unknown",
+            "create sender recipient 1 --fee 1e-4",
+        ] {
+            assert!(
+                parse_create_transaction_command(malformed).is_err(),
+                "{malformed:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn wallet_rejects_noncanonical_addresses_before_signing() {
+        let sender = "ab".repeat(20);
+        let recipient = "cd".repeat(20);
+        assert!(validate_wallet_transaction_addresses(&sender, &recipient).is_ok());
+
+        assert!(
+            validate_wallet_transaction_addresses(&sender.to_uppercase(), &recipient)
+                .unwrap_err()
+                .contains("sender address")
+        );
+        assert!(
+            validate_wallet_transaction_addresses(&sender, &recipient.to_uppercase())
+                .unwrap_err()
+                .contains("recipient address")
+        );
+        assert!(
+            validate_wallet_transaction_addresses(&sender, "not-an-address")
+                .unwrap_err()
+                .contains("recipient address")
+        );
+    }
 
     // H4: only a NotFound read error is a genuine first run. Every other read error must NOT be
     // treated as first-run — doing so would overwrite an existing private.key and destroy funds.
