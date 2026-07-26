@@ -11,13 +11,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::a9::blockchain::Block;
 use crate::a9::codec;
@@ -123,11 +123,14 @@ pub struct SubnetManager {
     last_update: Arc<AtomicU64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShredRequest {
     pub block_hash: [u8; 32],
     pub indices: Vec<u32>,
     pub from: SocketAddr,
+
+    #[serde(skip, default)]
+    pub permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -721,6 +724,7 @@ impl VelocityManager {
             block_hash,
             indices,
             from,
+            permit: _permit,
         } = request;
         // Dedup + cap the attacker-supplied indices before scanning the cache: there are only
         // ERASURE_TOTAL_SHARD_COUNT slots per block, so 20 distinct indices is the most any
@@ -891,16 +895,23 @@ impl VelocityManager {
             self.pending_requests.remove(&block_hash);
         }
 
-        // Acquire request permit with timeout
-        let _permit = tokio::time::timeout(Duration::from_secs(1), self.request_limiter.acquire())
-            .await
-            .map_err(|_| VelocityError::RateLimit)?;
+        // Reserve a request slot with timeout so outbound shard requests obey backpressure all the
+        // way through processing. The permit lives on the request itself, then drops once we
+        // finish the corresponding work.
+        let permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            self.request_limiter.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| VelocityError::RateLimit)?
+        .map_err(|_| VelocityError::RateLimit)?;
 
         // Send request to request processor
         let request = ShredRequest {
             block_hash,
             indices: missing,
             from,
+            permit: Some(permit),
         };
 
         self.request_tx
@@ -931,6 +942,7 @@ impl VelocityManager {
             block_hash,
             indices,
             from,
+            permit: _permit,
         } = request;
 
         // Get available shreds from cache
@@ -1142,8 +1154,8 @@ impl VelocityProtocol for Node {
 pub struct VelocityMetrics {
     shreds_processed: AtomicU64,
     blocks_reconstructed: AtomicU64,
-    request_latency: Arc<parking_lot::Mutex<Vec<f64>>>,
-    propagation_latency: Arc<parking_lot::Mutex<Vec<f64>>>,
+    request_latency: Arc<parking_lot::Mutex<VecDeque<f64>>>,
+    propagation_latency: Arc<parking_lot::Mutex<VecDeque<f64>>>,
 }
 
 impl VelocityMetrics {
@@ -1155,11 +1167,11 @@ impl VelocityMetrics {
         self.blocks_reconstructed.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_latency(storage: &Arc<parking_lot::Mutex<Vec<f64>>>, value: f64) {
+    fn record_latency(storage: &Arc<parking_lot::Mutex<VecDeque<f64>>>, value: f64) {
         let mut data = storage.lock();
-        data.push(value);
-        if data.len() > 1000 {
-            data.remove(0);
+        data.push_back(value);
+        while data.len() > 1000 {
+            data.pop_front();
         }
     }
 
@@ -1224,11 +1236,17 @@ mod tests {
         let mut poison = test_shred(bh, 0);
         poison.nonce = 999; // different key, passes the bloom
         poison.data = vec![0xEE];
-        assert!(!cache.add_shred(poison), "a second shred for a filled slot is refused");
+        assert!(
+            !cache.add_shred(poison),
+            "a second shred for a filled slot is refused"
+        );
 
         // The slot still holds the first shred's data, not the poison.
         let guard = cache.cache.lock();
-        let slot = guard.peek(&bh).and_then(|s| s[0].clone()).expect("slot 0 present");
+        let slot = guard
+            .peek(&bh)
+            .and_then(|s| s[0].clone())
+            .expect("slot 0 present");
         assert_eq!(slot.data, first.data, "the original shred must be retained");
     }
 
