@@ -15,7 +15,7 @@ use std::error::Error as StdError;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, RwLock};
@@ -160,14 +160,32 @@ const GENESIS_LAUNCH_RECIPIENT: &str = "ALPHANUMERIC_1776_ARTIFACT";
 const GENESIS_LAUNCH_DIFFICULTY: u64 = 0;
 const GENESIS_LAUNCH_NONCE: u64 = 7_377;
 
+// Whisper arithmetic compatibility. Regular wallet fee policy is defined separately.
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
 pub const MAX_BLOCK_REWARD: f64 = 50.0;
+/// Coordinated activation for the deterministic fee-accounting and block-shape
+/// rules below: at the pinned activation height + 241,920 blocks after the
+/// release reference, a soft-hard-fork boundary where the stricter accounting,
+/// canonical shape, and weight predicate begin.
+/// Active pinned value: bootstrap manifest tip (275_663 from
+/// https://alphanumeric.blue/api/bootstrap/manifest on 2026-07-26) + 241,920 =
+/// 517,583.
+pub const FEE_SYSTEM_ACTIVATION_HEIGHT: u32 = 517_583;
+pub const FEE_ACCOUNTING_RULES_VERSION: u32 = 1;
+/// Aggregate low-fee compatibility envelope used by the scheduled accounting
+/// baseline (500,000 atomic units = 0.005 ALPHA).
+pub const LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS: i128 = 500_000;
+/// Deterministic full-witness-equivalent block budget. The metric deliberately
+/// charges stored receipt signatures at their full wire cost, so validity is the
+/// same for an incoming full block and its locally compacted representation.
+pub const MAX_BLOCK_WEIGHT_BYTES: usize = 3_500_000;
 /// Consensus cap on transactions per block. Without it a single block could carry
 /// an unbounded number of transactions and stall the serial block-processing loop
-/// (a cheap DoS). Generous for throughput (~800 tx/s at the 5s target) and raisable
-/// with the network; per-transaction size is bounded by the fixed ML-DSA fields, so
-/// this also bounds a block's byte size. The mining-reward transaction counts toward it.
+/// (a cheap DoS). The full-witness weight limit below is the effective bound for
+/// ordinary transfers (roughly 237 per five-second block today); this independent
+/// count ceiling also bounds pathological tiny encodings. The mining-reward
+/// transaction counts toward it.
 pub const MAX_BLOCK_TX_COUNT: usize = 4096;
 pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 /// RELAY/MEMPOOL POLICY fee floor for user transactions, in 1e-8 units
@@ -182,7 +200,7 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 /// in a block now costs real coins. Mempool-resident spam that expires unpaid
 /// is instead bounded by the per-sender caps, rate limiter and TTL.
 pub const MIN_RELAY_FEE_UNITS: i128 = 10_000;
-pub const MINT_CLIP: f64 = 0.35; // Burned/clipped portion of tx fees (anti self-fee recycling)
+pub const MINT_CLIP: f64 = 0.35; // Fee-weighted reward damping
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
 // The launch floor maps to roughly 2^29 expected hashes. On the launch reference
@@ -195,8 +213,23 @@ const DIFFICULTY_RETARGET_HALF_LIFE_SECS: i128 = 60;
 pub const MAX_BLOCK_FUTURE_TIME: u64 = 300;
 pub const CONSENSUS_HEADER_RULES_VERSION: u32 = 3;
 pub const MAX_TARGET_BYTES: [u8; 32] = [0xff; 32];
+// Conservative encoded-size accounting. Variable witness fields are charged
+// separately below; these allowances cover framing, numeric fields and options.
+const BLOCK_WEIGHT_FIXED_BYTES: usize = 512;
+const TRANSACTION_WEIGHT_FIXED_BYTES: usize = 128;
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
+}
+
+/// Canonical user/miner address form used by wallets and activated block rules.
+/// This validates only the textual address representation; signature validation
+/// separately binds a sender address to its public key.
+pub fn is_canonical_user_address(address: &str) -> bool {
+    address.len() == 40
+        && address
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 pub(crate) fn pow_target_from_difficulty(difficulty: u64) -> BigUint {
@@ -799,6 +832,12 @@ pub enum BlockchainError {
     /// InvalidBlockHeader so the continuous miner never mistakes an over-full
     /// template for a lost race and re-grinds the same doomed block forever.
     BlockTransactionCountExceeded,
+    /// The deterministic full-witness-equivalent block budget is exceeded.
+    BlockWeightExceeded,
+    /// An activated transaction field is not in its canonical wire form.
+    NonCanonicalTransaction,
+    /// The candidate falls outside the activated block fee-accounting range.
+    FeeAccountingLimitExceeded,
     /// Mempool/relay POLICY reject: transaction fee below MIN_RELAY_FEE_UNITS.
     /// Never returned by block validation — a mined block carrying such a tx is
     /// still fully valid (see the admission guard in add_transaction).
@@ -841,6 +880,15 @@ impl fmt::Display for BlockchainError {
             }
             BlockchainError::BlockTransactionCountExceeded => {
                 write!(f, "Block exceeds the maximum transaction count")
+            }
+            BlockchainError::BlockWeightExceeded => {
+                write!(f, "Block exceeds the maximum full-witness weight")
+            }
+            BlockchainError::NonCanonicalTransaction => {
+                write!(f, "Transaction fields are not canonically encoded")
+            }
+            BlockchainError::FeeAccountingLimitExceeded => {
+                write!(f, "Transaction fees are outside the current block accounting range")
             }
             BlockchainError::FeeBelowRelayFloor => {
                 write!(f, "Transaction fee below the relay floor (min 0.0001)")
@@ -1079,6 +1127,16 @@ pub struct Blockchain {
     pub chain_sentinel: Arc<ChainSentinel>,
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
     state_mutation_lock: Arc<Mutex<()>>,
+    /// Single-flight gate for the one-time pending-set transition at the
+    /// coordinated fee-system height. Lock order is this gate ->
+    /// state_mutation_lock; callers must invoke the public ensure method without
+    /// already holding the state lock.
+    pending_rules_gate: Arc<Mutex<()>>,
+    /// Set only after the activated pending set, sidecars, in-memory mempool and
+    /// debit/credit indexes have all been reconciled successfully.
+    pending_rules_complete: Arc<AtomicBool>,
+    #[cfg(test)]
+    pending_rules_revalidation_runs: Arc<AtomicUsize>,
     /// Single-flight gate for balances-index maintenance (rebuild / catch-up).
     /// Concurrent get_confirmed_balance callers finding a stale index WAIT here
     /// and re-check instead of each launching their own O(chain) replay — the
@@ -1244,6 +1302,12 @@ impl Blockchain {
     }
 
     fn notify_tip_changed(&self, block: &Block) {
+        if block.index.saturating_add(1) < FEE_SYSTEM_ACTIVATION_HEIGHT {
+            // A reorg can move the next candidate back below activation after a
+            // completed transition. Clear the one-time marker so any pending
+            // entries admitted on that lower branch are reconciled on recross.
+            self.pending_rules_complete.store(false, Ordering::Release);
+        }
         let version = self.tip_change_counter.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.tip_watch_tx.send(ChainTipSignal {
             height: block.index,
@@ -4225,6 +4289,10 @@ impl Blockchain {
             chain_sentinel,
             signature_cache,
             state_mutation_lock: Arc::new(Mutex::new(())),
+            pending_rules_gate: Arc::new(Mutex::new(())),
+            pending_rules_complete: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            pending_rules_revalidation_runs: Arc::new(AtomicUsize::new(0)),
             balances_index_gate: Arc::new(Mutex::new(())),
             tip_change_counter,
             chain_tip_cache: Arc::new(PLMutex::new(None)),
@@ -4258,6 +4326,10 @@ impl Blockchain {
         // Sync mempool with sled
         let _ = self.prune_pending_transactions();
         self.sync_mempool_with_sled().await?;
+        self.pending_rules_complete.store(
+            self.next_block_index() >= FEE_SYSTEM_ACTIVATION_HEIGHT,
+            Ordering::Release,
+        );
         self.rebuild_pending_debits_index().await?;
 
         // Recover from an interrupted apply (a crash OR a live mid-apply Err) via the SAME path the
@@ -5012,6 +5084,170 @@ impl Blockchain {
         false
     }
 
+    fn hex_field_has_decoded_len(value: &str, decoded_len: usize) -> bool {
+        let Some(encoded_len) = decoded_len.checked_mul(2) else {
+            return false;
+        };
+        value.len() == encoded_len
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    }
+
+    fn full_witness_transaction_weight(tx: &Transaction) -> Result<usize, BlockchainError> {
+        let mut tx_weight = TRANSACTION_WEIGHT_FIXED_BYTES
+            .checked_add(tx.sender.len())
+            .and_then(|value| value.checked_add(tx.recipient.len()))
+            .ok_or(BlockchainError::BlockWeightExceeded)?;
+
+        if !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            let signature_bytes = mldsa::SIGNATURE_BYTES
+                .checked_mul(2)
+                .ok_or(BlockchainError::BlockWeightExceeded)?;
+            let public_key_bytes = mldsa::PUBLIC_KEY_BYTES
+                .checked_mul(2)
+                .ok_or(BlockchainError::BlockWeightExceeded)?;
+            tx_weight = tx_weight
+                .checked_add(signature_bytes)
+                .and_then(|value| value.checked_add(public_key_bytes))
+                .and_then(|value| value.checked_add(64))
+                .ok_or(BlockchainError::BlockWeightExceeded)?;
+        }
+        Ok(tx_weight)
+    }
+
+    /// Deterministic block weight with every regular transaction charged as a
+    /// full ML-DSA witness. Stored blocks therefore have exactly the same weight
+    /// as the full blocks from which their receipt signatures were derived.
+    pub fn full_witness_weight(block: &Block) -> Result<usize, BlockchainError> {
+        let mut weight = BLOCK_WEIGHT_FIXED_BYTES;
+        for tx in &block.transactions {
+            weight = weight
+                .checked_add(Self::full_witness_transaction_weight(tx)?)
+                .ok_or(BlockchainError::BlockWeightExceeded)?;
+        }
+        Ok(weight)
+    }
+
+    fn validate_activated_transaction_shape(
+        tx: &Transaction,
+        sig_mode: SignatureValidationMode,
+    ) -> Result<(), BlockchainError> {
+        if !is_canonical_user_address(&tx.recipient) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+
+        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+            if tx.signature.is_some() || tx.pub_key.is_some() || tx.sig_hash.is_some() {
+                return Err(BlockchainError::NonCanonicalTransaction);
+            }
+            return Ok(());
+        }
+
+        if !is_canonical_user_address(&tx.sender) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+
+        let pub_key = tx
+            .pub_key
+            .as_deref()
+            .ok_or(BlockchainError::NonCanonicalTransaction)?;
+        if !Self::hex_field_has_decoded_len(pub_key, mldsa::PUBLIC_KEY_BYTES) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+
+        let sig_hash = tx
+            .sig_hash
+            .as_deref()
+            .ok_or(BlockchainError::NonCanonicalTransaction)?;
+        if !Self::hex_field_has_decoded_len(sig_hash, 32) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+
+        let signature = tx
+            .signature
+            .as_deref()
+            .ok_or(BlockchainError::NonCanonicalTransaction)?;
+        let is_full = Self::hex_field_has_decoded_len(signature, mldsa::SIGNATURE_BYTES);
+        let is_receipt = Self::hex_field_has_decoded_len(signature, 64);
+        if !is_full && !(sig_mode == SignatureValidationMode::AllowTruncatedStored && is_receipt) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+        Ok(())
+    }
+
+    fn validate_activated_block_shape(
+        block: &Block,
+        sig_mode: SignatureValidationMode,
+    ) -> Result<(), BlockchainError> {
+        for tx in &block.transactions {
+            Self::validate_activated_transaction_shape(tx, sig_mode)?;
+        }
+
+        if Self::full_witness_weight(block)? > MAX_BLOCK_WEIGHT_BYTES {
+            return Err(BlockchainError::BlockWeightExceeded);
+        }
+        Ok(())
+    }
+
+    fn validate_block_shape_rules_at(
+        block: &Block,
+        sig_mode: SignatureValidationMode,
+        activation_height: u32,
+    ) -> Result<(), BlockchainError> {
+        if block.index < activation_height {
+            return Ok(());
+        }
+        Self::validate_activated_block_shape(block, sig_mode)
+    }
+
+    fn template_regular_transaction_weight_at(
+        block_index: u32,
+        transaction: &Transaction,
+        activation_height: u32,
+    ) -> Result<Option<usize>, BlockchainError> {
+        if block_index < activation_height {
+            return Ok(None);
+        }
+        if SYSTEM_ADDRESSES.contains(&transaction.sender.as_str()) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+        Self::validate_activated_transaction_shape(
+            transaction,
+            SignatureValidationMode::RequireFull,
+        )?;
+        Self::full_witness_transaction_weight(transaction).map(Some)
+    }
+
+    /// Activated template check for one regular full-witness transaction.
+    /// `None` means the activation height has not yet been reached.
+    pub fn template_regular_transaction_weight(
+        block_index: u32,
+        transaction: &Transaction,
+    ) -> Result<Option<usize>, BlockchainError> {
+        Self::template_regular_transaction_weight_at(
+            block_index,
+            transaction,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// Fixed block plus canonical coinbase weight reserved before regular template
+    /// packing begins.
+    pub fn mining_template_base_weight(
+        miner_address: &str,
+    ) -> Result<usize, BlockchainError> {
+        if !is_canonical_user_address(miner_address) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+        BLOCK_WEIGHT_FIXED_BYTES
+            .checked_add(TRANSACTION_WEIGHT_FIXED_BYTES)
+            .and_then(|value| value.checked_add("MINING_REWARDS".len()))
+            .and_then(|value| value.checked_add(miner_address.len()))
+            .ok_or(BlockchainError::BlockWeightExceeded)
+    }
+
     pub async fn validate_block(&self, block: &Block) -> Result<(), BlockchainError> {
         self.validate_block_internal(block, SignatureValidationMode::AllowTruncatedStored)
             .await
@@ -5037,6 +5273,8 @@ impl Blockchain {
         if block.transactions.len() > MAX_BLOCK_TX_COUNT {
             return Err(BlockchainError::BlockTransactionCountExceeded);
         }
+
+        Self::validate_block_shape_rules_at(block, sig_mode, FEE_SYSTEM_ACTIVATION_HEIGHT)?;
 
         // Intra-block transaction-id uniqueness: a block must not contain the same non-coinbase
         // transaction more than once. Honest block construction never produces this (the mempool
@@ -5097,29 +5335,10 @@ impl Blockchain {
             }
         }
 
-        // Validate transactions if present
-        let reward_txs: Vec<&Transaction> = block
-            .transactions
-            .iter()
-            .filter(|tx| tx.sender == "MINING_REWARDS")
-            .collect();
-
-        if reward_txs.len() != 1 {
-            return Err(BlockchainError::InvalidSystemTransaction);
-        }
-
-        if block.transactions.first().map(|tx| tx.sender.as_str()) != Some("MINING_REWARDS") {
-            return Err(BlockchainError::InvalidSystemTransaction);
-        }
-
-        let reward_tx = reward_txs[0];
-        if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE) {
-            return Err(BlockchainError::InvalidSystemTransaction);
-        }
-        let expected_reward = self.calculate_block_reward(block)?;
-        if reward_tx.amount_units != Transaction::to_units(expected_reward) {
-            return Err(BlockchainError::InvalidTransactionAmount);
-        }
+        // Validate the single, first-position reward and the activated fee-accounting
+        // invariant. The required coinbase remains the historical reward calculation
+        // exactly; the added rule only narrows which fee combinations are admissible.
+        self.validate_block_reward_rules_at(block, FEE_SYSTEM_ACTIVATION_HEIGHT)?;
 
         for tx in &block.transactions {
             if tx.sender == "MINING_REWARDS" {
@@ -5188,6 +5407,15 @@ impl Blockchain {
         // built by some other path.
         if block.transactions.len() > MAX_BLOCK_TX_COUNT {
             return Err(BlockchainError::BlockTransactionCountExceeded);
+        }
+
+        Self::validate_block_shape_rules_at(
+            block,
+            SignatureValidationMode::RequireFull,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+        )?;
+        if block.index >= FEE_SYSTEM_ACTIVATION_HEIGHT {
+            self.validate_block_reward_rules_at(block, FEE_SYSTEM_ACTIVATION_HEIGHT)?;
         }
 
         // Get current confirmed balances before validation
@@ -5363,11 +5591,59 @@ impl Blockchain {
         let mut mempool_tx = transaction.clone();
         mempool_tx.sig_hash = Some(sig_hash.clone());
 
+        // The activation transition owns its own gate and takes the state lock
+        // internally. Run it before admission takes that lock so concurrent first
+        // post-activation submissions cannot deadlock or bypass pending cleanup.
+        self.ensure_pending_rules_for_next_block().await?;
+
+        // Serialize admission with block application before deriving the candidate
+        // height. This closes the activation-boundary race where validation could
+        // observe the preceding height, wait for a block apply, then reserve a
+        // transaction under rules that had become active in the meantime.
+        let _state_guard = self.state_mutation_lock.lock().await;
+        let candidate_index = self.next_block_index();
+        let candidate_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if candidate_index < FEE_SYSTEM_ACTIVATION_HEIGHT {
+            // `ensure_pending_rules_for_next_block` runs before this lock. A
+            // reorg may have moved the tip below activation while admission was
+            // waiting here; clear completion under the serialized tip view so a
+            // later recross cannot skip cleanup of this pre-rule admission.
+            self.pending_rules_complete.store(false, Ordering::Release);
+        } else {
+            // A caller may omit sig_hash because admission derives it from the
+            // verified full witness. If one is supplied, however, it must already
+            // be the canonical commitment rather than an alternate textual form.
+            if transaction
+                .sig_hash
+                .as_ref()
+                .is_some_and(|claimed| claimed != &sig_hash)
+            {
+                return Err(BlockchainError::NonCanonicalTransaction);
+            }
+            if !self.pending_transaction_is_admissible_at(
+                candidate_index,
+                candidate_timestamp,
+                &mempool_tx,
+                FEE_SYSTEM_ACTIVATION_HEIGHT,
+            )? {
+                return Err(BlockchainError::FeeAccountingLimitExceeded);
+            }
+        }
+
         // Create storage version with truncated signature + signature hash
         let storage_tx = mempool_tx.with_truncated_signature(sig_hash);
         let tx_id = storage_tx.get_tx_id();
 
-        let _state_guard = self.state_mutation_lock.lock().await;
+        // The cheap early replay check avoids unnecessary ML-DSA work. Repeat it
+        // under the state lock so a transaction confirmed while its signature was
+        // being verified cannot be reinserted into pending state.
+        if self.confirmed_tx_index(&tx_id).is_some() {
+            return Err(BlockchainError::InvalidTransaction);
+        }
+
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
         let pending_credits_tree = self.open_pending_credits_tree()?;
@@ -5473,6 +5749,220 @@ impl Blockchain {
 
     pub async fn add_to_mempool(&self, tx: Transaction) -> Result<(), BlockchainError> {
         self.mempool.write().await.add_transaction(tx)
+    }
+
+    fn aggregate_regular_fee_units(
+        transactions: &[Transaction],
+    ) -> Result<i128, BlockchainError> {
+        transactions
+            .iter()
+            .filter(|tx| tx.sender != "MINING_REWARDS")
+            .try_fold(0i128, |total, tx| {
+                if tx.fee_units < 0 {
+                    return Err(BlockchainError::InvalidTransactionAmount);
+                }
+                total
+                    .checked_add(tx.fee_units)
+                    .ok_or(BlockchainError::InvalidTransactionAmount)
+            })
+    }
+
+    /// Transaction-independent accounting baseline for this schedule point. It is
+    /// the greatest net issuance among the historical empty-block reward, the
+    /// zero-fee nonempty floor, and the scheduled low-fee compatibility envelope.
+    /// Delegating all vectors to the unchanged reward calculation preserves every
+    /// six-month and long-horizon rounding boundary while keeping normal batched
+    /// low-fee traffic continuously mineable.
+    fn scheduled_fee_accounting_baseline_units(
+        &self,
+        block: &Block,
+    ) -> Result<i128, BlockchainError> {
+        if block.index == 0 {
+            return Ok(Transaction::to_units(GENESIS_LAUNCH_AMOUNT));
+        }
+        let empty = Block {
+            index: block.index,
+            previous_hash: block.previous_hash,
+            timestamp: block.timestamp,
+            transactions: Vec::new(),
+            nonce: block.nonce,
+            difficulty: block.difficulty,
+            hash: block.hash,
+            merkle_root: block.merkle_root,
+        };
+        let empty_units = Transaction::to_units(self.calculate_block_reward(&empty)?);
+
+        let mut nonempty_floor = empty;
+        nonempty_floor.transactions.push(Transaction {
+            sender: "0".repeat(40),
+            recipient: "1".repeat(40),
+            fee_units: 0,
+            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
+            timestamp: block.timestamp,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        });
+        let nonempty_floor_units =
+            Transaction::to_units(self.calculate_block_reward(&nonempty_floor)?);
+
+        nonempty_floor.transactions[0].fee_units = LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS;
+        let compatibility_reward_units =
+            Transaction::to_units(self.calculate_block_reward(&nonempty_floor)?);
+        let compatibility_net_units = compatibility_reward_units
+            .checked_sub(LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
+
+        Ok(empty_units
+            .max(nonempty_floor_units)
+            .max(compatibility_net_units))
+    }
+
+    fn fee_accounting_is_admissible_for_block(
+        &self,
+        block: &Block,
+        expected_reward_units: i128,
+    ) -> Result<bool, BlockchainError> {
+        let total_fee_units = Self::aggregate_regular_fee_units(&block.transactions)?;
+        let scheduled_baseline_units = self.scheduled_fee_accounting_baseline_units(block)?;
+        let net_issuance_units = expected_reward_units
+            .checked_sub(total_fee_units)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
+        Ok(net_issuance_units <= scheduled_baseline_units)
+    }
+
+    fn validate_block_reward_rules_at(
+        &self,
+        block: &Block,
+        activation_height: u32,
+    ) -> Result<(), BlockchainError> {
+        let reward_txs: Vec<&Transaction> = block
+            .transactions
+            .iter()
+            .filter(|tx| tx.sender == "MINING_REWARDS")
+            .collect();
+
+        if reward_txs.len() != 1 {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+        if block.transactions.first().map(|tx| tx.sender.as_str()) != Some("MINING_REWARDS") {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+
+        let reward_tx = reward_txs[0];
+        if reward_tx.fee_units != Transaction::to_units(NETWORK_FEE) {
+            return Err(BlockchainError::InvalidSystemTransaction);
+        }
+
+        let expected_reward_units = Transaction::to_units(self.calculate_block_reward(block)?);
+        if reward_tx.amount_units != expected_reward_units {
+            return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
+        if block.index >= activation_height
+            && !self.fee_accounting_is_admissible_for_block(block, expected_reward_units)?
+        {
+            return Err(BlockchainError::FeeAccountingLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn template_fee_accounting_is_admissible_at(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        transactions: &[Transaction],
+        activation_height: u32,
+    ) -> Result<bool, BlockchainError> {
+        if block_index < activation_height {
+            return Ok(true);
+        }
+
+        // Reward accounting depends only on system-vs-regular classification,
+        // amount, fee and transaction count. Build a witness-free view instead
+        // of cloning multi-kilobyte ML-DSA fields on every miner packing probe.
+        let accounting_transactions = transactions
+            .iter()
+            .map(|tx| Transaction {
+                sender: if tx.sender == "MINING_REWARDS" {
+                    "MINING_REWARDS".to_string()
+                } else {
+                    String::new()
+                },
+                recipient: String::new(),
+                fee_units: tx.fee_units,
+                amount_units: tx.amount_units,
+                timestamp: tx.timestamp,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            })
+            .collect();
+        let block = Block {
+            index: block_index,
+            previous_hash: [0u8; 32],
+            timestamp: block_timestamp,
+            transactions: accounting_transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        };
+        let expected_reward_units = Transaction::to_units(self.calculate_block_reward(&block)?);
+        self.fee_accounting_is_admissible_for_block(&block, expected_reward_units)
+    }
+
+    /// Mempool/miner policy helper for the next candidate template. Returning
+    /// `false` means the transaction set cannot be included together under the
+    /// activated fee-accounting rule; callers may retain other candidates.
+    pub fn template_fee_accounting_is_admissible(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        transactions: &[Transaction],
+    ) -> Result<bool, BlockchainError> {
+        self.template_fee_accounting_is_admissible_at(
+            block_index,
+            block_timestamp,
+            transactions,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// Single-transaction form used by admission and pending-set revalidation.
+    pub fn transaction_fee_accounting_is_admissible(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        transaction: &Transaction,
+    ) -> Result<bool, BlockchainError> {
+        self.template_fee_accounting_is_admissible(
+            block_index,
+            block_timestamp,
+            std::slice::from_ref(transaction),
+        )
+    }
+
+    fn pending_transaction_is_admissible_at(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        transaction: &Transaction,
+        activation_height: u32,
+    ) -> Result<bool, BlockchainError> {
+        if block_index < activation_height {
+            return Ok(true);
+        }
+        Self::validate_activated_transaction_shape(
+            transaction,
+            SignatureValidationMode::RequireFull,
+        )?;
+        self.template_fee_accounting_is_admissible_at(
+            block_index,
+            block_timestamp,
+            std::slice::from_ref(transaction),
+            activation_height,
+        )
     }
 
     pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
@@ -5628,6 +6118,60 @@ impl Blockchain {
     }
 
     pub async fn sync_mempool_with_sled(&self) -> Result<(), BlockchainError> {
+        self.sync_mempool_with_sled_at(FEE_SYSTEM_ACTIVATION_HEIGHT)
+            .await
+    }
+
+    fn next_block_index(&self) -> u32 {
+        u32::try_from(self.get_latest_block_index())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    }
+
+    /// Reconcile pending state exactly once when the next candidate reaches the
+    /// coordinated rules height. The separate gate makes concurrent admission,
+    /// mining and startup callers share one successful pass. Completion is never
+    /// published after an error; a later caller retries. If a shallow reorg moves
+    /// the candidate below activation, clearing the flag makes the next crossing
+    /// run the same transition again.
+    ///
+    /// This method acquires `state_mutation_lock` through the sync routine. It
+    /// must therefore be called before, never from inside, a state mutation.
+    pub async fn ensure_pending_rules_for_next_block(&self) -> Result<(), BlockchainError> {
+        if self.next_block_index() < FEE_SYSTEM_ACTIVATION_HEIGHT {
+            self.pending_rules_complete.store(false, Ordering::Release);
+            return Ok(());
+        }
+        if self.pending_rules_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let _gate = self.pending_rules_gate.lock().await;
+        if self.next_block_index() < FEE_SYSTEM_ACTIVATION_HEIGHT {
+            self.pending_rules_complete.store(false, Ordering::Release);
+            return Ok(());
+        }
+        if self.pending_rules_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.pending_rules_revalidation_runs
+            .fetch_add(1, Ordering::AcqRel);
+        self.sync_mempool_with_sled().await?;
+
+        if self.next_block_index() >= FEE_SYSTEM_ACTIVATION_HEIGHT {
+            self.pending_rules_complete.store(true, Ordering::Release);
+        } else {
+            self.pending_rules_complete.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn sync_mempool_with_sled_at(
+        &self,
+        activation_height: u32,
+    ) -> Result<(), BlockchainError> {
         let _state_guard = self.state_mutation_lock.lock().await;
         // Clear existing mempool
         let mut mempool = self.mempool.write().await;
@@ -5641,6 +6185,13 @@ impl Blockchain {
         // pending indexes and future mining attempts cannot stay poisoned.
         let mut transactions = Vec::new();
         let mut invalid_txs = Vec::new();
+        let candidate_index = u32::try_from(self.get_latest_block_index())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let candidate_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         for result in pending_tree.iter() {
             let (key, tx_bytes) = result?;
             let Ok(mut tx) = deserialize_transaction(&tx_bytes) else {
@@ -5695,6 +6246,20 @@ impl Blockchain {
             if self.verify_transaction_signature(&tx).is_err() {
                 invalid_txs.push(key.to_vec());
                 continue;
+            }
+
+            match self.pending_transaction_is_admissible_at(
+                candidate_index,
+                candidate_timestamp,
+                &tx,
+                activation_height,
+            ) {
+                Ok(true) => {}
+                Ok(false) | Err(BlockchainError::NonCanonicalTransaction) => {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
 
             transactions.push(tx);
@@ -6166,6 +6731,42 @@ impl Blockchain {
         Ok(self.get_wallet_balance_breakdown(address).await?.spendable)
     }
 
+    async fn wallet_balance_components_units(
+        &self,
+        address: &str,
+    ) -> Result<(i128, i128, Vec<(u32, i128)>, u64), BlockchainError> {
+        let confirmed_units = self.get_confirmed_balance_units(address).await?;
+        let pending_debit_units = self.get_pending_debit_units(address).await?;
+        let as_of_height = self.get_latest_block_index() as u64;
+        let maturing_units =
+            self.immature_coinbase_details(address, as_of_height.saturating_add(1), &[]);
+        Ok((
+            confirmed_units,
+            pending_debit_units,
+            maturing_units,
+            as_of_height,
+        ))
+    }
+
+    /// Exact spendable balance for transaction construction and affordability
+    /// checks: confirmed minus pending debits minus immature mining rewards.
+    pub async fn get_spendable_balance_units(
+        &self,
+        address: &str,
+    ) -> Result<i128, BlockchainError> {
+        let (confirmed, pending_debit, maturing, _) =
+            self.wallet_balance_components_units(address).await?;
+        let immature = maturing.iter().try_fold(0i128, |total, (_, amount)| {
+            total
+                .checked_add(*amount)
+                .ok_or(BlockchainError::InvalidTransactionAmount)
+        })?;
+        confirmed
+            .checked_sub(pending_debit)
+            .and_then(|value| value.checked_sub(immature))
+            .ok_or(BlockchainError::InvalidTransactionAmount)
+    }
+
     /// get_wallet_balance with its components kept separate (see WalletBalanceBreakdown).
     /// Same cost as get_wallet_balance — one confirmed read, one pending read, one
     /// maturity-window scan — so display callers can switch to this for free.
@@ -6173,20 +6774,23 @@ impl Blockchain {
         &self,
         address: &str,
     ) -> Result<WalletBalanceBreakdown, BlockchainError> {
-        let confirmed = self.get_confirmed_balance(address).await?;
-        let pending_debit = self.get_pending_debit_for(address).await?;
-        // M06 (display): exclude still-immature rewards from the spendable balance the UI/send
-        // flow offers — they'd be rejected at consensus. Prospective next height, no in-flight.
-        let as_of_height = self.get_latest_block_index() as u64;
-        let maturing_units = self.immature_coinbase_details(address, as_of_height + 1, &[]);
-        let immature: i128 = maturing_units.iter().map(|(_, amt)| *amt).sum();
-        let net_units = Transaction::to_units(confirmed)
-            .saturating_sub(Transaction::to_units(pending_debit))
-            .saturating_sub(immature);
+        let (confirmed_units, pending_debit_units, maturing_units, as_of_height) =
+            self.wallet_balance_components_units(address).await?;
+        let immature_units = maturing_units
+            .iter()
+            .try_fold(0i128, |total, (_, amount)| {
+                total
+                    .checked_add(*amount)
+                    .ok_or(BlockchainError::InvalidTransactionAmount)
+            })?;
+        let spendable_units = confirmed_units
+            .checked_sub(pending_debit_units)
+            .and_then(|value| value.checked_sub(immature_units))
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
         Ok(WalletBalanceBreakdown {
-            confirmed,
-            pending_debit,
-            spendable: Transaction::from_units(net_units),
+            confirmed: Transaction::from_units(confirmed_units),
+            pending_debit: Transaction::from_units(pending_debit_units),
+            spendable: Transaction::from_units(spendable_units),
             maturing: maturing_units
                 .into_iter()
                 .map(|(height, amt)| (height, Transaction::from_units(amt)))
@@ -6210,48 +6814,76 @@ impl Blockchain {
             return Ok(hasher.finalize().into());
         }
 
-        // Consensus merkle root must be stable across:
+        let leaves = transactions
+            .iter()
+            .map(Self::calculate_merkle_leaf_hash)
+            .collect::<Result<Vec<_>, BlockchainError>>()?;
+        Self::calculate_merkle_root_from_leaf_hashes(&leaves)
+    }
+
+    /// Hash one transaction exactly as the consensus Merkle tree does.
+    ///
+    /// Compact block transport uses this full 32-byte digest as its transaction
+    /// identifier. Keeping the normalization in the ledger module prevents the
+    /// transport from drifting away from the consensus commitment: public key,
+    /// signature hash, and the stored 64-byte signature prefix are all bound,
+    /// unlike the display-oriented transaction id.
+    pub fn calculate_merkle_leaf_hash(
+        tx: &Transaction,
+    ) -> Result<[u8; 32], BlockchainError> {
+        // Consensus merkle leaves must be stable across:
         // - in-memory full-signature transactions (used for admission verification)
         // - on-disk truncated-signature blocks (used for storage efficiency)
         //
-        // So we hash a normalized transaction encoding where non-system signatures are always truncated to 64 bytes
-        // and a `sig_hash` is present (or derivable) for identity binding.
-        let mut current_level: Vec<[u8; 32]> = transactions
-            .iter()
-            .map(|tx| {
-                // Normalize to the stored (truncated-signature, sig_hash-bound) form. Derive the
-                // sig_hash only when absent and the signature decodes to non-empty bytes; when a
-                // sig_hash is available, truncate directly off the borrow. Byte-identical to the
-                // prior clone-then-truncate path (consensus merkle input must not change).
-                let tx_for_merkle = if tx.sender == "MINING_REWARDS" {
-                    tx.clone()
-                } else {
-                    let sig_hash = match &tx.sig_hash {
-                        Some(h) => Some(h.clone()),
-                        None => tx.signature.as_ref().and_then(|sig_hex| {
-                            hex::decode(sig_hex).ok().and_then(|sig_bytes| {
-                                if sig_bytes.is_empty() {
-                                    None
-                                } else {
-                                    Some(Transaction::signature_hash_hex(&sig_bytes))
-                                }
-                            })
-                        }),
-                    };
+        // Normalize to the stored (truncated-signature, sig_hash-bound) form.
+        // Derive sig_hash only when absent and the signature decodes to non-empty
+        // bytes. This is byte-identical to the historical calculate_merkle_root
+        // input and is therefore a refactor, not a consensus change.
+        let tx_for_merkle = if tx.sender == "MINING_REWARDS" {
+            tx.clone()
+        } else {
+            let sig_hash = match &tx.sig_hash {
+                Some(h) => Some(h.clone()),
+                None => tx.signature.as_ref().and_then(|sig_hex| {
+                    hex::decode(sig_hex).ok().and_then(|sig_bytes| {
+                        if sig_bytes.is_empty() {
+                            None
+                        } else {
+                            Some(Transaction::signature_hash_hex(&sig_bytes))
+                        }
+                    })
+                }),
+            };
 
-                    match sig_hash {
-                        Some(sig_hash) => tx.with_truncated_signature(sig_hash),
-                        None => tx.clone(),
-                    }
-                };
+            match sig_hash {
+                Some(sig_hash) => tx.with_truncated_signature(sig_hash),
+                None => tx.clone(),
+            }
+        };
 
-                let tx_bytes = codec::serialize(&tx_for_merkle)
-                    .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
-                let mut hasher = Sha256::new();
-                hasher.update(&tx_bytes);
-                Ok(hasher.finalize().into())
-            })
-            .collect::<Result<Vec<_>, BlockchainError>>()?;
+        let tx_bytes = codec::serialize(&tx_for_merkle)
+            .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&tx_bytes);
+        Ok(hasher.finalize().into())
+    }
+
+    /// Build the consensus Merkle root from already-normalized leaf hashes.
+    ///
+    /// This intentionally preserves the chain's existing tree rules, including
+    /// duplicating a lone leaf and carrying an odd final leaf through a level by
+    /// hashing it once. Compact block receivers use it to validate the ordered
+    /// commitment before requesting any transaction bodies.
+    pub fn calculate_merkle_root_from_leaf_hashes(
+        leaves: &[[u8; 32]],
+    ) -> Result<[u8; 32], BlockchainError> {
+        if leaves.is_empty() {
+            let mut hasher = Sha256::new();
+            hasher.update(b"empty_transactions_hash");
+            return Ok(hasher.finalize().into());
+        }
+
+        let mut current_level = leaves.to_vec();
 
         // Correct handling of single transaction: DUPLICATE the hash
         if current_level.len() == 1 {
@@ -7320,6 +7952,631 @@ mod tests {
         }
     }
 
+    fn fee_accounting_test_chain() -> (Blockchain, Block) {
+        let bc = test_blockchain();
+        let genesis = Blockchain::genesis_launch_block().expect("launch genesis");
+        insert_raw_block(&bc, &genesis);
+        (bc, genesis)
+    }
+
+    fn fee_accounting_test_block(
+        bc: &Blockchain,
+        index: u32,
+        timestamp: u64,
+        fee_units: &[i128],
+    ) -> Block {
+        let mut transactions = vec![Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "11".repeat(20),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: 0,
+            timestamp,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }];
+        for (position, fee_units) in fee_units.iter().copied().enumerate() {
+            transactions.push(Transaction {
+                sender: format!("{:040x}", position + 2),
+                recipient: "22".repeat(20),
+                fee_units,
+                amount_units: Transaction::to_units(1.0),
+                timestamp: timestamp.saturating_sub(position as u64),
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            });
+        }
+
+        let mut block = Block {
+            index,
+            previous_hash: [0u8; 32],
+            timestamp,
+            transactions,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        };
+        let expected = bc
+            .calculate_block_reward(&block)
+            .expect("historical reward calculation");
+        block.transactions[0].amount_units = Transaction::to_units(expected);
+        block
+    }
+
+    fn add_canonical_test_witnesses(block: &mut Block, receipt: bool) {
+        let signature_bytes = if receipt {
+            64
+        } else {
+            mldsa::SIGNATURE_BYTES
+        };
+        for tx in block
+            .transactions
+            .iter_mut()
+            .filter(|tx| tx.sender != "MINING_REWARDS")
+        {
+            tx.signature = Some("aa".repeat(signature_bytes));
+            tx.pub_key = Some("bb".repeat(mldsa::PUBLIC_KEY_BYTES));
+            tx.sig_hash = Some("cc".repeat(32));
+        }
+    }
+
+    #[test]
+    fn fee_accounting_activation_preserves_historical_reward_vectors() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let vectors = [
+            (Vec::new(), 10.0),
+            (vec![Transaction::to_units(0.0005)], 1.006695),
+            (vec![Transaction::to_units(0.005)], 1.06695),
+            (
+                vec![Transaction::to_units(0.71677928)],
+                10.59767456,
+            ),
+        ];
+
+        for (fees, expected) in vectors {
+            let block =
+                fee_accounting_test_block(&bc, 99, genesis.timestamp, fees.as_slice());
+            assert_eq!(
+                bc.calculate_block_reward(&block).unwrap(),
+                expected,
+                "the historical reward vector must remain byte-for-byte unchanged"
+            );
+            bc.validate_block_reward_rules_at(&block, 100)
+                .expect("all exact historical coinbases remain valid before activation");
+        }
+    }
+
+    #[test]
+    fn fee_accounting_accepts_compatibility_vectors() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let (bc, genesis) = fee_accounting_test_chain();
+
+        let current_period_fee_vector = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(0.71677928)],
+        );
+        bc.validate_block_reward_rules_at(&current_period_fee_vector, 100)
+            .expect("current-period compatibility vector remains admissible");
+
+        let pool_fees = vec![Transaction::to_units(0.0005); 10];
+        for (index, timestamp) in [
+            (100, genesis.timestamp),
+            (101, genesis.timestamp + SIX_MONTHS),
+        ] {
+            let pool = fee_accounting_test_block(&bc, index, timestamp, &pool_fees);
+            bc.validate_block_reward_rules_at(&pool, 100)
+                .expect("ten existing pool payouts remain admissible");
+        }
+    }
+
+    #[test]
+    fn activated_fee_accounting_is_a_strict_subset_of_the_prior_reward_rule() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let admissible = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(0.0005)],
+        );
+        let prior_reward_units =
+            Transaction::to_units(bc.calculate_block_reward(&admissible).unwrap());
+        assert_eq!(
+            admissible.transactions[0].amount_units, prior_reward_units,
+            "an admissible activated template keeps the exact prior coinbase"
+        );
+        bc.validate_block_reward_rules_at(&admissible, 101)
+            .expect("the prior-height predicate accepts the admissible template");
+        bc.validate_block_reward_rules_at(&admissible, 100)
+            .expect("the activated predicate accepts the same exact template");
+
+        let excluded = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(1.0)],
+        );
+        assert_eq!(
+            excluded.transactions[0].amount_units,
+            Transaction::to_units(bc.calculate_block_reward(&excluded).unwrap())
+        );
+        bc.validate_block_reward_rules_at(&excluded, 101)
+            .expect("the prior-height predicate accepts its exact historical reward");
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&excluded, 100),
+            Err(BlockchainError::FeeAccountingLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn current_schedule_high_reward_region_is_bounded_by_net_issuance() {
+        let (bc, genesis) = fee_accounting_test_chain();
+
+        for (fee, expected_reward) in [(3.0, 41.17), (3.84615385, 50.0)] {
+            let candidate = fee_accounting_test_block(
+                &bc,
+                100,
+                genesis.timestamp,
+                &[Transaction::to_units(fee)],
+            );
+            let reward_units = candidate.transactions[0].amount_units;
+            let fee_units =
+                Blockchain::aggregate_regular_fee_units(&candidate.transactions).unwrap();
+            let baseline = bc
+                .scheduled_fee_accounting_baseline_units(&candidate)
+                .unwrap();
+
+            assert_eq!(reward_units, Transaction::to_units(expected_reward));
+            assert_eq!(baseline, Transaction::to_units(10.0));
+            assert!(
+                reward_units - fee_units > baseline,
+                "the high-reward vector must exceed the scheduled net-issuance baseline"
+            );
+            assert!(matches!(
+                bc.validate_block_reward_rules_at(&candidate, 100),
+                Err(BlockchainError::FeeAccountingLimitExceeded)
+            ));
+        }
+
+        let one_atom_over = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(39.99999999)],
+        );
+        assert_eq!(
+            one_atom_over.transactions[0].amount_units,
+            Transaction::to_units(MAX_BLOCK_REWARD)
+        );
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&one_atom_over, 100),
+            Err(BlockchainError::FeeAccountingLimitExceeded)
+        ));
+
+        let fee_funded = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(40.0)],
+        );
+        assert_eq!(
+            fee_funded.transactions[0].amount_units,
+            Transaction::to_units(MAX_BLOCK_REWARD),
+            "the historical reward calculation remains exactly capped at 50"
+        );
+        let fee_units =
+            Blockchain::aggregate_regular_fee_units(&fee_funded.transactions).unwrap();
+        let baseline = bc
+            .scheduled_fee_accounting_baseline_units(&fee_funded)
+            .unwrap();
+        assert_eq!(
+            fee_funded.transactions[0].amount_units - fee_units,
+            baseline,
+            "a capped reward is admissible only when fees fund everything above baseline issuance"
+        );
+        bc.validate_block_reward_rules_at(&fee_funded, 100)
+            .expect("a fee-funded reward at the exact net-issuance boundary must remain valid");
+    }
+
+    #[test]
+    fn fee_accounting_rejects_only_over_bound_templates_and_keeps_exact_coinbase() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let over_bound = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(1.0)],
+        );
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&over_bound, 100),
+            Err(BlockchainError::FeeAccountingLimitExceeded)
+        ));
+
+        let mut lower_coinbase = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(0.0005)],
+        );
+        lower_coinbase.transactions[0].amount_units -= 1;
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&lower_coinbase, 100),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+
+        let mut higher_coinbase = lower_coinbase.clone();
+        higher_coinbase.transactions[0].amount_units += 2;
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&higher_coinbase, 100),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+    }
+
+    #[test]
+    fn fee_accounting_template_helper_tracks_aggregate_and_checked_arithmetic() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let individual = fee_accounting_test_block(
+            &bc,
+            100,
+            genesis.timestamp,
+            &[Transaction::to_units(0.4)],
+        );
+        let first = individual.transactions[1].clone();
+        assert!(
+            bc.template_fee_accounting_is_admissible_at(
+                100,
+                genesis.timestamp,
+                std::slice::from_ref(&first),
+                100,
+            )
+            .unwrap(),
+            "each individual transaction fits"
+        );
+        assert!(
+            !bc.template_fee_accounting_is_admissible_at(
+                100,
+                genesis.timestamp,
+                &[first.clone(), first.clone()],
+                100,
+            )
+            .unwrap(),
+            "the miner must account for the aggregate template"
+        );
+        assert!(
+            bc.template_fee_accounting_is_admissible_at(
+                99,
+                genesis.timestamp,
+                &[first.clone(), first],
+                100,
+            )
+            .unwrap(),
+            "the helper is inert before activation"
+        );
+
+        let mut overflow = individual.transactions[1].clone();
+        overflow.fee_units = i128::MAX;
+        assert!(matches!(
+            bc.template_fee_accounting_is_admissible_at(
+                100,
+                genesis.timestamp,
+                &[overflow.clone(), overflow],
+                100,
+            ),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+    }
+
+    #[test]
+    fn fee_accounting_keeps_bounded_transfer_fees_mineable_across_the_full_schedule() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let (bc, genesis) = fee_accounting_test_chain();
+        let mut saw_floor_regime = false;
+        let mut saw_below_floor_ceiling = false;
+
+        for period in 0u64..=60 {
+            let timestamp = genesis
+                .timestamp
+                .saturating_add(period.saturating_mul(SIX_MONTHS));
+            for fee in [0.0001, 0.0005] {
+                let block = fee_accounting_test_block(
+                    &bc,
+                    100,
+                    timestamp,
+                    &[Transaction::to_units(fee)],
+                );
+                bc.validate_block_reward_rules_at(&block, 100)
+                    .unwrap_or_else(|error| {
+                        panic!("period {period}, fee {fee:.4} must remain mineable: {error}")
+                    });
+            }
+            for fees in [
+                vec![Transaction::to_units(0.0005); 10],
+                vec![Transaction::to_units(0.001); 5],
+                vec![Transaction::to_units(0.0001); 50],
+            ] {
+                let block = fee_accounting_test_block(&bc, 100, timestamp, &fees);
+                bc.validate_block_reward_rules_at(&block, 100)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "period {period}, aggregate low-fee compatibility template failed: {error}"
+                        )
+                    });
+            }
+
+            let reference = fee_accounting_test_block(&bc, 100, timestamp, &[]);
+            let baseline = bc
+                .scheduled_fee_accounting_baseline_units(&reference)
+                .unwrap();
+            if period == 13 {
+                assert!(
+                    baseline >= Transaction::to_units(MIN_BLOCK_REWARD)
+                        && baseline < Transaction::to_units(1.1),
+                    "the scheduled floor plus low-fee compatibility envelope remains bounded"
+                );
+                saw_floor_regime = true;
+            }
+            if period == 22 {
+                assert!(
+                    baseline < Transaction::to_units(MIN_BLOCK_REWARD),
+                    "the baseline follows the ceiling once it falls below the fixed floor"
+                );
+                saw_below_floor_ceiling = true;
+            }
+        }
+
+        assert!(saw_floor_regime && saw_below_floor_ceiling);
+    }
+
+    #[test]
+    fn fee_accounting_envelope_boundary_is_atomic_in_the_rising_regime() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let (bc, genesis) = fee_accounting_test_chain();
+        let period_twelve_timestamp = genesis.timestamp + 12 * SIX_MONTHS;
+        let period_twelve_boundary_units = Transaction::to_units(0.00674327);
+        let period_twelve_boundary = fee_accounting_test_block(
+            &bc,
+            100,
+            period_twelve_timestamp,
+            &[period_twelve_boundary_units],
+        );
+        bc.validate_block_reward_rules_at(&period_twelve_boundary, 100)
+            .expect("the pre-floor schedule boundary is inclusive");
+        let period_twelve_above = fee_accounting_test_block(
+            &bc,
+            100,
+            period_twelve_timestamp,
+            &[period_twelve_boundary_units + 1],
+        );
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&period_twelve_above, 100),
+            Err(BlockchainError::FeeAccountingLimitExceeded)
+        ));
+
+        let timestamp = genesis.timestamp + 13 * SIX_MONTHS;
+        let at_envelope = fee_accounting_test_block(
+            &bc,
+            100,
+            timestamp,
+            &[LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS],
+        );
+        bc.validate_block_reward_rules_at(&at_envelope, 100)
+            .expect("the scheduled compatibility envelope is inclusive");
+
+        let above_envelope = fee_accounting_test_block(
+            &bc,
+            100,
+            timestamp,
+            &[LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS + 1],
+        );
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&above_envelope, 100),
+            Err(BlockchainError::FeeAccountingLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn fee_accounting_acceptance_matches_the_net_issuance_invariant() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let (bc, genesis) = fee_accounting_test_chain();
+        let fees = [
+            0.0001, 0.0005, 0.01, 0.10, 0.25, 0.50, 0.75, 1.0, 2.0, 3.0, 5.0, 10.0,
+            25.0, 50.0,
+        ];
+        let mut saw_excluded_region = false;
+
+        for period in 0u64..=30 {
+            let timestamp = genesis.timestamp + period * SIX_MONTHS;
+            for fee in fees {
+                let block = fee_accounting_test_block(
+                    &bc,
+                    100,
+                    timestamp,
+                    &[Transaction::to_units(fee)],
+                );
+                let reward_units = block.transactions[0].amount_units;
+                let fee_units = Blockchain::aggregate_regular_fee_units(&block.transactions)
+                    .expect("sample fees sum exactly");
+                let baseline = bc
+                    .scheduled_fee_accounting_baseline_units(&block)
+                    .expect("scheduled baseline");
+                let should_accept = reward_units.checked_sub(fee_units).unwrap() <= baseline;
+                let result = bc.validate_block_reward_rules_at(&block, 100);
+
+                if should_accept {
+                    result.unwrap_or_else(|error| {
+                        panic!(
+                            "period {period}, fee {fee}: invariant-compliant block rejected: {error}"
+                        )
+                    });
+                } else {
+                    saw_excluded_region = true;
+                    assert!(matches!(
+                        result,
+                        Err(BlockchainError::FeeAccountingLimitExceeded)
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            saw_excluded_region,
+            "the sampled schedule must exercise the narrowed accounting region"
+        );
+    }
+
+    #[test]
+    fn activated_shape_rules_are_canonical_bounded_and_storage_invariant() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let pool_fees = vec![Transaction::to_units(0.0005); 10];
+        let mut full =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, pool_fees.as_slice());
+        add_canonical_test_witnesses(&mut full, false);
+
+        Blockchain::validate_block_shape_rules_at(
+            &full,
+            SignatureValidationMode::RequireFull,
+            100,
+        )
+        .expect("current ten-payout pool shape remains valid");
+        let full_weight = Blockchain::full_witness_weight(&full).unwrap();
+        assert!(
+            codec::serialize(&full).unwrap().len() <= full_weight,
+            "the deterministic weight must conservatively cover the full encoded block"
+        );
+        let packed_weight = full.transactions[1..]
+            .iter()
+            .try_fold(
+                Blockchain::mining_template_base_weight(&full.transactions[0].recipient).unwrap(),
+                |weight, tx| {
+                    let tx_weight =
+                        Blockchain::template_regular_transaction_weight_at(100, tx, 100)
+                            .unwrap()
+                            .unwrap();
+                    weight.checked_add(tx_weight)
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            packed_weight, full_weight,
+            "incremental miner accounting and canonical block accounting must agree"
+        );
+        assert!(
+            full_weight < MAX_BLOCK_WEIGHT_BYTES / 10,
+            "current pool batches retain ample weight headroom"
+        );
+
+        let mut receipt = full.clone();
+        add_canonical_test_witnesses(&mut receipt, true);
+        assert_eq!(
+            Blockchain::full_witness_weight(&receipt).unwrap(),
+            full_weight,
+            "stored receipt form and incoming full form have identical weight"
+        );
+        Blockchain::validate_block_shape_rules_at(
+            &receipt,
+            SignatureValidationMode::AllowTruncatedStored,
+            100,
+        )
+        .expect("exact stored receipt signatures are valid");
+        assert!(matches!(
+            Blockchain::validate_block_shape_rules_at(
+                &receipt,
+                SignatureValidationMode::RequireFull,
+                100,
+            ),
+            Err(BlockchainError::NonCanonicalTransaction)
+        ));
+
+        let mut malformed = full.clone();
+        malformed.transactions[1].recipient = "NOT_AN_ADDRESS".to_string();
+        assert_eq!(
+            Blockchain::template_regular_transaction_weight_at(
+                99,
+                &malformed.transactions[1],
+                100,
+            )
+            .unwrap(),
+            None,
+            "pre-activation pending entries retain their historical template treatment"
+        );
+        assert!(matches!(
+            Blockchain::template_regular_transaction_weight_at(
+                100,
+                &malformed.transactions[1],
+                100,
+            ),
+            Err(BlockchainError::NonCanonicalTransaction)
+        ));
+        Blockchain::validate_block_shape_rules_at(
+            &malformed,
+            SignatureValidationMode::RequireFull,
+            101,
+        )
+        .expect("shape restrictions are inert before activation");
+        assert!(matches!(
+            Blockchain::validate_block_shape_rules_at(
+                &malformed,
+                SignatureValidationMode::RequireFull,
+                100,
+            ),
+            Err(BlockchainError::NonCanonicalTransaction)
+        ));
+
+        let mut uppercase_witness = full.clone();
+        uppercase_witness.transactions[1].pub_key =
+            Some("AB".repeat(mldsa::PUBLIC_KEY_BYTES));
+        assert!(matches!(
+            Blockchain::validate_block_shape_rules_at(
+                &uppercase_witness,
+                SignatureValidationMode::RequireFull,
+                100,
+            ),
+            Err(BlockchainError::NonCanonicalTransaction)
+        ));
+
+        let heavy_fees = vec![Transaction::to_units(0.0005); 238];
+        let mut heavy =
+            fee_accounting_test_block(&bc, 100, genesis.timestamp, heavy_fees.as_slice());
+        add_canonical_test_witnesses(&mut heavy, false);
+        assert!(Blockchain::full_witness_weight(&heavy).unwrap() > MAX_BLOCK_WEIGHT_BYTES);
+        assert!(matches!(
+            Blockchain::validate_block_shape_rules_at(
+                &heavy,
+                SignatureValidationMode::RequireFull,
+                100,
+            ),
+            Err(BlockchainError::BlockWeightExceeded)
+        ));
+    }
+
+    #[test]
+    fn canonical_user_address_is_exact_lowercase_hex() {
+        assert!(is_canonical_user_address(&"01ab".repeat(10)));
+        assert!(!is_canonical_user_address(&"01AB".repeat(10)));
+        assert!(!is_canonical_user_address(&"0".repeat(39)));
+        assert!(!is_canonical_user_address(&"g".repeat(40)));
+        assert!(!is_canonical_user_address("MINING_REWARDS"));
+    }
+
+    #[tokio::test]
+    async fn spendable_units_accessor_never_round_trips_through_f64() {
+        let bc = test_blockchain();
+        let address = "12".repeat(20);
+        let confirmed_units = 4_567_890_123_456_789i128;
+        let pending_units = 123_456_789i128;
+        set_confirmed_balance(&bc, &address, confirmed_units);
+        let pending_tree = bc.open_pending_debits_tree().unwrap();
+        Blockchain::set_pending_debit_for(&pending_tree, &address, pending_units).unwrap();
+
+        assert_eq!(
+            bc.get_spendable_balance_units(&address).await.unwrap(),
+            confirmed_units - pending_units
+        );
+    }
+
     #[test]
     fn tip_signal_counter_and_watch_update_together() {
         let blockchain = test_blockchain();
@@ -7376,6 +8633,68 @@ mod tests {
         );
         tx.pub_key = wallet.get_public_key_hex().await;
         tx
+    }
+
+    #[test]
+    fn merkle_leaf_helper_preserves_normalized_consensus_encoding() {
+        let signature = vec![0xabu8; 4_627];
+        let mut tx = Transaction {
+            sender: "11".repeat(20),
+            recipient: "22".repeat(20),
+            fee_units: Transaction::to_units(0.0005),
+            amount_units: Transaction::to_units(3.0),
+            timestamp: 123,
+            signature: Some(hex::encode(&signature)),
+            pub_key: Some(hex::encode(vec![0xcdu8; 2_592])),
+            sig_hash: None,
+        };
+
+        // Reproduce the historical calculate_merkle_root leaf input directly:
+        // derive sig_hash from the full signature, truncate to 64 bytes, serialize,
+        // then SHA-256. The new helper must remain byte-identical.
+        let sig_hash = Transaction::signature_hash_hex(&signature);
+        let normalized = tx.with_truncated_signature(sig_hash.clone());
+        let bytes = codec::serialize(&normalized).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let historical_leaf: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(
+            Blockchain::calculate_merkle_leaf_hash(&tx).unwrap(),
+            historical_leaf
+        );
+
+        // Full and stored/truncated forms commit to the same leaf.
+        tx.sig_hash = Some(sig_hash);
+        assert_eq!(
+            Blockchain::calculate_merkle_leaf_hash(&tx).unwrap(),
+            Blockchain::calculate_merkle_leaf_hash(&normalized).unwrap()
+        );
+    }
+
+    #[test]
+    fn merkle_root_from_leaf_hashes_matches_transaction_path_for_all_shapes() {
+        let txs = vec![
+            user_tx("alice", "bob", 1.0, 1),
+            user_tx("carol", "dave", 2.0, 2),
+            user_tx("erin", "frank", 3.0, 3),
+            user_tx("grace", "heidi", 4.0, 4),
+            user_tx("ivan", "judy", 5.0, 5),
+        ];
+        for count in 0..=txs.len() {
+            let slice = &txs[..count];
+            let leaves = slice
+                .iter()
+                .map(Blockchain::calculate_merkle_leaf_hash)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                Blockchain::calculate_merkle_root(slice).unwrap(),
+                Blockchain::calculate_merkle_root_from_leaf_hashes(&leaves).unwrap(),
+                "root mismatch at transaction count {}",
+                count
+            );
+        }
     }
 
     // ===== intra-block transaction-uniqueness rule =====
@@ -9709,6 +11028,345 @@ mod tests {
             .expect("above-floor fee must be admitted");
     }
 
+    #[tokio::test]
+    async fn pending_revalidation_evicts_newly_inadmissible_fee_and_releases_balance() {
+        let (bc, _) = fee_accounting_test_chain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let recipient = "22".repeat(20);
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            recipient.clone(),
+            1.0,
+            1.0,
+            timestamp,
+            None,
+        );
+        tx.signature = wallet.sign_transaction(&tx.get_message()).await;
+        tx.pub_key = wallet.get_public_key_hex().await;
+        let tx_id = tx.get_tx_id();
+
+        // Force the revalidation path via a low activation floor.
+        bc.add_transaction(tx)
+            .await
+            .expect("pre-activation pending transaction should stage");
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            Transaction::to_units(2.0)
+        );
+        assert_eq!(
+            bc.get_pending_credit_units(&recipient).await.unwrap(),
+            Transaction::to_units(1.0)
+        );
+
+        bc.sync_mempool_with_sled_at(1)
+            .await
+            .expect("activated pending revalidation should complete");
+
+        let pending_tree = bc.db.open_tree(PENDING_TRANSACTIONS_TREE).unwrap();
+        let full_sigs_tree = bc.db.open_tree(PENDING_FULL_SIGNATURES_TREE).unwrap();
+        assert!(pending_tree.get(tx_id.as_bytes()).unwrap().is_none());
+        assert!(full_sigs_tree.get(tx_id.as_bytes()).unwrap().is_none());
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            0,
+            "rebuilding pending indexes releases the sender's reserved balance"
+        );
+        assert_eq!(
+            bc.get_pending_credit_units(&recipient).await.unwrap(),
+            0,
+            "rebuilding pending indexes releases the recipient's pending credit"
+        );
+        assert!(bc.get_mempool_transaction_by_id(&tx_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_pending_revalidation_is_single_flight_and_releases_both_indexes() {
+        let (bc, _) = fee_accounting_test_chain();
+        let bc = Arc::new(bc);
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let recipient = "22".repeat(20);
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            recipient.clone(),
+            1.0,
+            1.0,
+            timestamp,
+            None,
+        );
+        tx.signature = wallet.sign_transaction(&tx.get_message()).await;
+        tx.pub_key = wallet.get_public_key_hex().await;
+        let tx_id = tx.get_tx_id();
+        bc.add_transaction(tx)
+            .await
+            .expect("pre-activation pending transaction should stage");
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            Transaction::to_units(2.0)
+        );
+        assert_eq!(
+            bc.get_pending_credit_units(&recipient).await.unwrap(),
+            Transaction::to_units(1.0)
+        );
+
+        let activation_parent =
+            metadata_test_block(
+                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+                [0u8; 32],
+                &"11".repeat(20),
+                1.0,
+            );
+        insert_raw_block(&bc, &activation_parent);
+        bc.write_chain_tip_metadata(&activation_parent)
+            .expect("activation-boundary tip metadata should write");
+
+        let calls = (0..16).map(|_| {
+            let bc = Arc::clone(&bc);
+            async move { bc.ensure_pending_rules_for_next_block().await }
+        });
+        for result in futures::future::join_all(calls).await {
+            result.expect("all concurrent transition callers should share a successful pass");
+        }
+        assert_eq!(
+            bc.pending_rules_revalidation_runs.load(Ordering::Acquire),
+            1,
+            "the activation transition must be single-flight"
+        );
+        bc.ensure_pending_rules_for_next_block()
+            .await
+            .expect("a completed transition should be an idempotent no-op");
+        assert_eq!(
+            bc.pending_rules_revalidation_runs.load(Ordering::Acquire),
+            1,
+            "completion must suppress repeat full pending scans"
+        );
+
+        assert!(bc
+            .db
+            .open_tree(PENDING_TRANSACTIONS_TREE)
+            .unwrap()
+            .get(tx_id.as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(bc
+            .db
+            .open_tree(PENDING_FULL_SIGNATURES_TREE)
+            .unwrap()
+            .get(tx_id.as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(bc.get_mempool_transaction_by_id(&tx_id).await.is_none());
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            0
+        );
+        assert_eq!(bc.get_pending_credit_units(&recipient).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn activation_pending_revalidation_rearms_after_a_lower_tip() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let activation_parent =
+            metadata_test_block(
+                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+                [0u8; 32],
+                &"11".repeat(20),
+                1.0,
+            );
+        insert_raw_block(&bc, &activation_parent);
+        bc.write_chain_tip_metadata(&activation_parent).unwrap();
+        bc.ensure_pending_rules_for_next_block()
+            .await
+            .expect("first activation crossing should complete");
+        assert!(bc.pending_rules_complete.load(Ordering::Acquire));
+        assert_eq!(
+            bc.pending_rules_revalidation_runs.load(Ordering::Acquire),
+            1
+        );
+
+        bc.write_chain_tip_metadata(&genesis).unwrap();
+        bc.notify_tip_changed(&genesis);
+        assert!(
+            !bc.pending_rules_complete.load(Ordering::Acquire),
+            "a canonical tip whose next block is pre-activation must rearm cleanup"
+        );
+
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let recipient = "22".repeat(20);
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            recipient.clone(),
+            1.0,
+            1.0,
+            timestamp,
+            None,
+        );
+        tx.signature = wallet.sign_transaction(&tx.get_message()).await;
+        tx.pub_key = wallet.get_public_key_hex().await;
+        let tx_id = tx.get_tx_id();
+        bc.add_transaction(tx)
+            .await
+            .expect("the lower branch should retain pre-activation admission behavior");
+
+        bc.write_chain_tip_metadata(&activation_parent).unwrap();
+        bc.ensure_pending_rules_for_next_block()
+            .await
+            .expect("recrossing activation should reconcile again");
+        assert_eq!(
+            bc.pending_rules_revalidation_runs.load(Ordering::Acquire),
+            2
+        );
+        assert!(bc
+            .db
+            .open_tree(PENDING_TRANSACTIONS_TREE)
+            .unwrap()
+            .get(tx_id.as_bytes())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            0
+        );
+        assert_eq!(bc.get_pending_credit_units(&recipient).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn activation_revalidation_evicts_noncanonical_pending_shape() {
+        let (bc, _) = fee_accounting_test_chain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            "pre_activation_recipient".to_string(),
+            1.0,
+            NETWORK_FEE,
+            timestamp,
+            None,
+        );
+        tx.signature = wallet.sign_transaction(&tx.get_message()).await;
+        tx.pub_key = wallet.get_public_key_hex().await;
+        let tx_id = tx.get_tx_id();
+
+        bc.add_transaction(tx)
+            .await
+            .expect("pre-activation pending shape should stage");
+        bc.sync_mempool_with_sled_at(1)
+            .await
+            .expect("activation revalidation should complete");
+
+        assert!(bc
+            .db
+            .open_tree(PENDING_TRANSACTIONS_TREE)
+            .unwrap()
+            .get(tx_id.as_bytes())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            0
+        );
+        assert!(bc.get_mempool_transaction_by_id(&tx_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn activated_admission_rejects_noncanonical_witness_text_without_reserving_balance() {
+        let (bc, _) = fee_accounting_test_chain();
+        let activation_parent =
+            metadata_test_block(
+                FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1),
+                [0u8; 32],
+                &"11".repeat(20),
+                1.0,
+            );
+        insert_raw_block(&bc, &activation_parent);
+        bc.write_chain_tip_metadata(&activation_parent)
+            .expect("activation-boundary tip metadata should write");
+        assert_eq!(
+            bc.get_latest_block_index(),
+            u64::from(FEE_SYSTEM_ACTIVATION_HEIGHT.saturating_sub(1))
+        );
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut candidates = Vec::new();
+        for variant in 0..3u64 {
+            let wallet = Wallet::new(None).expect("test wallet should build");
+            set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(3.0));
+            let mut tx =
+                signed_transfer(&wallet, &"22".repeat(20), 1.0, timestamp + variant).await;
+            let signature_bytes =
+                hex::decode(tx.signature.as_deref().expect("signed transfer")).unwrap();
+            tx.sig_hash = Some(Transaction::signature_hash_hex(&signature_bytes));
+            match variant {
+                0 => {
+                    tx.signature = tx.signature.map(|value| value.to_ascii_uppercase());
+                }
+                1 => {
+                    tx.pub_key = tx.pub_key.map(|value| value.to_ascii_uppercase());
+                }
+                2 => {
+                    tx.sig_hash = tx.sig_hash.map(|value| value.to_ascii_uppercase());
+                }
+                _ => unreachable!(),
+            }
+            candidates.push((wallet.address.clone(), tx));
+        }
+
+        let pending_tree = bc.db.open_tree(PENDING_TRANSACTIONS_TREE).unwrap();
+        let full_sigs_tree = bc.db.open_tree(PENDING_FULL_SIGNATURES_TREE).unwrap();
+        for (sender, tx) in candidates {
+            let tx_id = tx.get_tx_id();
+            let error = bc
+                .add_transaction(tx)
+                .await
+                .expect_err("noncanonical witness text must not enter pending state");
+            assert!(matches!(
+                error,
+                BlockchainError::NonCanonicalTransaction
+            ));
+            assert_eq!(
+                bc.get_pending_debit_units(&sender).await.unwrap(),
+                0,
+                "rejected admission must not reserve the sender's balance"
+            );
+            assert!(pending_tree.get(tx_id.as_bytes()).unwrap().is_none());
+            assert!(full_sigs_tree.get(tx_id.as_bytes()).unwrap().is_none());
+            assert!(bc.get_mempool_transaction_by_id(&tx_id).await.is_none());
+        }
+    }
+
+    #[test]
+    fn transaction_admission_future_remains_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let bc = test_blockchain();
+        let tx = user_tx(&"11".repeat(20), &"22".repeat(20), 1.0, 1);
+        assert_send(bc.add_transaction(tx));
+    }
+
     // ANTI-SOFT-FORK REGRESSION: the relay fee floor is mempool POLICY only. A
     // mined block carrying a below-floor (even zero) fee tx must never be
     // rejected for its fee — enforcing the floor in block validation would be a
@@ -9750,19 +11408,6 @@ mod tests {
             "validate_new_block must never enforce the relay fee floor (soft fork), got {:?}",
             res_new
         );
-    }
-
-    // Mirrors the CLI fee expression in mgmt.rs handle_create_transaction: the
-    // percentage fee floored at the relay minimum, so small sends can't
-    // self-reject at our own mempool.
-    #[test]
-    fn cli_fee_floors_small_sends() {
-        let fee_small =
-            (0.01_f64 * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
-        assert_eq!(Transaction::to_units(fee_small), MIN_RELAY_FEE_UNITS);
-        let fee_large =
-            (1000.0_f64 * FEE_PERCENTAGE).max(Transaction::from_units(MIN_RELAY_FEE_UNITS));
-        assert!(Transaction::to_units(fee_large) > MIN_RELAY_FEE_UNITS);
     }
 
     fn user_tx(sender: &str, recipient: &str, amount: f64, timestamp: u64) -> Transaction {

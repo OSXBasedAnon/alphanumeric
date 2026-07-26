@@ -10,7 +10,7 @@ https://www.alphanumeric.blue/
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.8.3`.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.0`.
 
 ## Quick Nav
 
@@ -45,7 +45,8 @@ https://www.alphanumeric.blue/
 
 - Active development.
 - Interfaces and internals can change between commits.
-- Security-hardened through extensive adversarial, AI-assisted review and remediation (no surviving critical/high findings).
+- Extensively reviewed and tested through internal adversarial and AI-assisted
+  hardening. This is not a third-party audit or a guarantee that no defects remain.
 - macOS/OSX release packaging is supported for the command-line client.
 
 ## Supported Platforms
@@ -150,17 +151,25 @@ If you are integrating against this repository, pin a commit hash and validate b
 - In practice this creates **asymptotic supply behavior**:
   - total supply can continue to increase
   - but new issuance becomes progressively smaller over time
-- **5-year max-supply estimate from now (network live ~6 months): ~625.8M tokens**
+- Launch genesis is dated **2026-07-04 UTC**. Any forward supply projection must
+  state its starting height/time, assumed block cadence, and transaction-fee
+  activity; an undated “max supply from now” estimate is not authoritative.
 
 ### Runtime Parameters (Current Code)
 
-- Fee rate: `FEE_PERCENTAGE = 0.000563063063` (0.0563063063%)
-- Reward range: `MIN_BLOCK_REWARD = 1.0`, `MAX_BLOCK_REWARD = 50.0`
+- Reference-wallet fee: exact `amount / 1776`, rounded to the nearest atomic
+  unit and bounded to `0.0001–0.0005`
+- `FEE_PERCENTAGE = 0.000563063063` remains the Whisper encoding constant; it is
+  not the regular-wallet fee policy
+- Reward constants: `MIN_BLOCK_REWARD = 1.0`, launch
+  `MAX_BLOCK_REWARD = 50.0`; the effective ceiling decays by 17% every six
+  months and eventually falls below the nominal floor
 - Reward network fee: `NETWORK_FEE = 0.0005`
 - Fee clipping factor: `MINT_CLIP = 0.35`
 - Target block time: `TARGET_BLOCK_TIME = 5` seconds
-- Empty blocks start at 20% of current max reward
-- Non-empty block rewards scale with effective fees and are clamped to `[MIN_BLOCK_REWARD, current_max]`
+- Empty-block rewards are clamped from `0.2 * current_max` into
+  `[min(MIN_BLOCK_REWARD, current_max), current_max]`
+- Non-empty block rewards scale with effective fees and are clamped to `[min(MIN_BLOCK_REWARD, current_max), current_max]`
 
 Actual realized issuance still depends on real network activity (block production + transaction fees).
 
@@ -273,7 +282,7 @@ Bootstrap publishing is maintainer infrastructure, not part of normal macOS node
 
 Interactive command loop examples:
 
-- `create <sender> <recipient> <amount>`
+- `create <sender> <recipient> <amount> [--fee <ALPHA>]`
 - `whisper <address> <msg>` (amount can be provided depending on flow)
 - `balance`
 - `new [wallet_name]`
@@ -283,6 +292,14 @@ Interactive command loop examples:
 - `mine <wallet_name>`
 - `info`
 - `diagnostics`
+
+With no `--fee`, the wallet applies its bounded default in exact eight-decimal
+atomic units. Exchanges and other automated operators can select an absolute
+fee with `--fee`; values must meet the `0.0001` relay floor. The CLI refuses an
+explicit fee above `0.01` as a hard safety ceiling. This is reference-wallet
+policy, not a universal network limit; externally signed integrations retain
+control of their fee policy subject to current node admission and block-accounting
+rules.
 
 Process flags/network commands:
 

@@ -1,6 +1,6 @@
 # Alphanumeric Client User Guide
 
-This is the user guide for Alphanumeric client version 7.8.3.
+This is the user guide for Alphanumeric client version 7.9.0.
 
 The prebuilt download is for **macOS (Apple Silicon)**. On **Windows** and
 **Linux** you build from source — it takes a few minutes and one `cargo`
@@ -137,14 +137,21 @@ account 84dab431b53e6522fe2e74914eec99f17758f4e3
 Send funds:
 
 ```text
-create sender_wallet recipient_address amount
+create sender_address recipient_address amount [--fee ALPHA]
 ```
 
 Example:
 
 ```text
-create my_wallet 84dab431b53e6522fe2e74914eec99f17758f4e3 1.25
+create <your_40_hex_sender_address> 84dab431b53e6522fe2e74914eec99f17758f4e3 1.25
 ```
+
+The wallet selects a bounded `0.0001–0.0005` fee by default. Exchanges and
+advanced operators can set an exact absolute fee, for example
+`--fee 0.001`. The reference CLI rejects explicit fees above `0.01`, preventing
+unattended scripts from overpaying because of a misplaced decimal. That ceiling
+is reference-wallet policy, not a universal network limit; every transaction
+remains subject to current node admission and block-accounting rules.
 
 Show all commands:
 
@@ -181,8 +188,8 @@ Endpoints: `/explorer/tip`, `/explorer/block/{height}`,
 `/explorer/tx/{height}/{position}`, `/explorer/address/{address}`,
 `/explorer/supply`, `/explorer/status`. It is off by default and costs nothing
 when disabled. Keep the port on localhost and put your web server in front if
-your site is public. Full guide: `EXPLORER_API.md` (included with this
-download and in the repository under `docs/`).
+your site is public. The full `EXPLORER_API.md` guide is maintained at the
+repository root; release packagers should include it next to this guide.
 
 ## Keeping Your Data Safe
 
@@ -228,9 +235,9 @@ links to other miners (coordinated by the gateway, no port-forwarding needed), s
 node-to-node and catch-up is much faster. As of v7.6.1 the mesh is **on by default** — there is
 nothing to configure.
 
-It falls back to the normal gateway relay automatically for any peer it can't reach directly, and a
-node with no mesh peers just runs on the relay exactly as before — so there is no downside. If you
-ever want to turn it off:
+It falls back to the normal gateway relay automatically for any peer it cannot
+reach directly, and a node with no mesh peers continues on the relay path. If
+you want to turn the mesh off:
 
 ```bash
 ALPHANUMERIC_WEBRTC_MESH=false ./alphanumeric
