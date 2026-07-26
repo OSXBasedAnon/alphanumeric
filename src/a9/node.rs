@@ -104,6 +104,7 @@ const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 // one from a slow-responding peer. Reaching it defers the block (re-verified later, never
 // negative-cached) rather than letting resolution run for an unbounded stretch.
 const WITNESS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
+const WITNESS_RESOLVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
 /// origin/Redis nothing, so this stays O(1) in client count; a version change is
 /// the ONLY thing that triggers a block fetch, so there is no redundant pulling.
@@ -9065,6 +9066,15 @@ impl Node {
         // resolve_full_tx_for_block; locally-resolvable blocks never contend at all. The deadline
         // caps how long a single block may spend here.
         let witness_deadline = Instant::now() + WITNESS_RESOLVE_DEADLINE;
+        let mut witness_fetch_budget = if peer.is_some() {
+            block
+                .transactions
+                .iter()
+                .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+                .count()
+        } else {
+            0
+        };
         let mut resolved: Vec<Transaction> = Vec::with_capacity(block.transactions.len());
 
         for tx in &block.transactions {
@@ -9079,7 +9089,15 @@ impl Node {
             // error while fetching — means this block cannot be verified right now. Defer it
             // (Ok(false), not negative-cached, re-verified later) rather than surfacing an error, so
             // a transient hiccup on an honest block self-corrects and Phase 1 never returns Err.
-            let mut full_tx = match self.resolve_full_tx_for_block(tx, peer).await {
+            let mut full_tx = match self
+                .resolve_full_tx_for_block(
+                    tx,
+                    peer,
+                    witness_deadline,
+                    &mut witness_fetch_budget,
+                )
+                .await
+            {
                 Ok(Some(tx)) => tx,
                 Ok(None) | Err(_) => return Ok(false),
             };
@@ -9256,6 +9274,8 @@ impl Node {
         &self,
         tx: &Transaction,
         peer: Option<SocketAddr>,
+        witness_deadline: Instant,
+        witness_fetch_budget: &mut usize,
     ) -> Result<Option<Transaction>, NodeError> {
         let tx_id = tx.get_tx_id();
         // The cache holds only witnesses that already passed signature verification during block
@@ -9304,13 +9324,27 @@ impl Node {
         }
 
         if let Some(peer_addr) = peer {
+            let Some(remaining) = witness_deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            if *witness_fetch_budget == 0 {
+                return Ok(None);
+            }
+            // Consume one budget slot per remote witness resolution attempt before entering the
+            // outbound-request path. This keeps resource usage bounded when every entry is
+            // unresolvable and blocks verification from being monopolized by one block.
+            *witness_fetch_budget = witness_fetch_budget.saturating_sub(1);
             // Bound concurrent outbound fetches on their own pool; if it is saturated, report the
             // witness as unresolved so the block defers instead of piling up behind slow peers.
             let _fetch_slot = match self.validation_pool.acquire_fetch_slot() {
                 Some(slot) => slot,
                 None => return Ok(None),
             };
-            return self.request_tx_witness(peer_addr, &tx_id).await;
+            let timeout = remaining.min(WITNESS_RESOLVE_REQUEST_TIMEOUT);
+            if timeout.is_zero() {
+                return Ok(None);
+            }
+            return self.request_tx_witness(peer_addr, &tx_id, timeout).await;
         }
 
         Ok(None)
@@ -9368,12 +9402,13 @@ impl Node {
         &self,
         addr: SocketAddr,
         tx_id: &str,
+        timeout: Duration,
     ) -> Result<Option<Transaction>, NodeError> {
         let request = NetworkMessage::TxRequest {
             tx_id: tx_id.to_string(),
         };
         match tokio::time::timeout(
-            Duration::from_secs(3),
+            timeout,
             self.send_message_with_response(addr, &request),
         )
         .await
@@ -15282,7 +15317,7 @@ mod tests {
     // whose witnesses only a slow peer can supply cannot run unbounded.
     #[test]
     fn witness_resolve_deadline_leaves_honest_headroom_yet_stays_bounded() {
-        let per_fetch = Duration::from_secs(3); // request_tx_witness per-request timeout
+        let per_fetch = WITNESS_RESOLVE_REQUEST_TIMEOUT;
         assert!(
             WITNESS_RESOLVE_DEADLINE >= per_fetch * 8,
             "deadline too tight — an honest block with a few slow fetches could be deferred"
