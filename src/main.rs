@@ -2004,9 +2004,9 @@ println!("Usage: rename <old_name> <new_name>");
 } else {
 let old_name = parts[1];
 let new_name = parts[2];
-if let Err(e) = mgmt.rename_wallet(old_name, new_name).await {
-error!("Wallet rename failed: {}", e);
-println!("Failed to rename wallet: {}", e);
+if let Err(e) = mgmt.rename_wallet(&mut wallets, old_name, new_name).await {
+    error!("Wallet rename failed: {}", e);
+    println!("Failed to rename wallet: {}", e);
 } else {
 println!("Wallet renamed successfully");
 }
