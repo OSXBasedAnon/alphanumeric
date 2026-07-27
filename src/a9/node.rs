@@ -1630,6 +1630,66 @@ impl CompactFullBlockCache {
     }
 }
 
+/// Spawn a load-bearing background loop under a supervisor. A panic in a plain
+/// `tokio::spawn` unwinds into a JoinError nobody reads: the loop dies SILENTLY
+/// and the node keeps running visibly "up" with the subsystem gone (no sync, no
+/// maintenance, no watchdog — depending on which loop died). The supervisor
+/// makes the panic loud and re-arms the loop with exponential backoff (2s..32s).
+/// A body that returns cleanly is an intentional exit (shutdown) — not restarted.
+fn spawn_supervised<F, Fut>(name: &'static str, mut body: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restarts: u32 = 0;
+        loop {
+            match tokio::spawn(body()).await {
+                Ok(()) => return,
+                Err(e) if e.is_panic() => {
+                    restarts = restarts.saturating_add(1);
+                    let wait = Duration::from_secs(2u64.saturating_pow(restarts.min(5)));
+                    error!(
+                        "Background task '{}' PANICKED (restart #{}); re-arming in {:?}",
+                        name, restarts, wait
+                    );
+                    eprintln!(
+                        "BUG: background task '{}' panicked and was restarted (#{}). The node keeps running — please report this.",
+                        name, restarts
+                    );
+                    sleep(wait).await;
+                }
+                // Cancelled (runtime shutdown/abort): nothing to re-arm.
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// Panic-VISIBILITY wrapper for background tasks that cannot be restarted
+/// (they own a non-recreatable resource, e.g. the TCP listener): the task stays
+/// down after a panic, but the operator is told instead of the node silently
+/// degrading.
+fn spawn_logged<Fut>(name: &'static str, fut: Fut)
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = tokio::spawn(fut).await {
+            if e.is_panic() {
+                error!(
+                    "Background task '{}' PANICKED and is DOWN until the node restarts",
+                    name
+                );
+                eprintln!(
+                    "BUG: background task '{}' panicked and is no longer running — restart the node and please report this.",
+                    name
+                );
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
 struct OutboundConnection {
     stream: TcpStream,
@@ -7284,20 +7344,27 @@ impl Node {
         // Keep libp2p swarm events flowing only when a swarm was initialized.
         if self.p2p_swarm.lock().await.is_some() {
             let p2p_node = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(e) = p2p_node.handle_p2p_events().await {
-                        warn!("P2P event pump cycle failed: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+            spawn_supervised("p2p-event-pump", move || {
+                let p2p_node = p2p_node.clone();
+                async move {
+                    loop {
+                        if let Err(e) = p2p_node.handle_p2p_events().await {
+                            warn!("P2P event pump cycle failed: {}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
                     }
                 }
             });
         }
 
-        // Create message processing channel
-        let (msg_tx, mut msg_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        // Create message processing channel. The receiver lives behind an
+        // Arc<Mutex<..>> so the supervised pump below can be restarted after a
+        // panic without losing the channel — a future-owned receiver dies with
+        // the panicked task, closing the queue for every connection forever.
+        let (msg_tx, msg_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let msg_rx = Arc::new(Mutex::new(msg_rx));
         let node = self.clone();
 
         // Start connection handler for incoming connections
@@ -7306,7 +7373,10 @@ impl Node {
             let node_clone = node.clone();
             let msg_tx_clone = msg_tx.clone();
 
-            tokio::spawn(async move {
+            // spawn_logged (not supervised): the loop owns the bound listener, which
+            // a restart cannot recreate — but a panic here must at least be LOUD,
+            // since it means the node silently stops accepting connections.
+            spawn_logged("tcp-accept", async move {
                 info!("Starting connection handler on {}", node_clone.bind_addr);
 
                 // Connection limiter to prevent DOS
@@ -7320,10 +7390,11 @@ impl Node {
                                 Ok((stream, addr)) => {
                                     info!("New incoming connection from {}", addr);
 
-                                    // Configure TCP socket
+                                    // Configure TCP socket. Best-effort: NODELAY is a
+                                    // latency nicety — dropping an otherwise-usable
+                                    // connection over it was needlessly unforgiving.
                                     if let Err(e) = stream.set_nodelay(true) {
                                         warn!("Failed to set TCP_NODELAY for {}: {}", addr, e);
-                                        continue;
                                     }
 
                                     // Handle connection in a separate task
@@ -7354,8 +7425,13 @@ impl Node {
                             }
                         }
                         Err(e) => {
-                            warn!("Connection limiter error: {}", e);
-                            sleep(Duration::from_millis(200)).await;
+                            // acquire_owned errors only when the semaphore is CLOSED —
+                            // unreachable for this locally-owned limiter, but if it ever
+                            // happens the listener can never accept again: die loudly
+                            // (spawn_logged reports it) instead of spinning a warn loop
+                            // at 5Hz forever.
+                            error!("Connection limiter closed (accept loop exiting): {}", e);
+                            return;
                         }
                     }
                 }
@@ -7364,20 +7440,25 @@ impl Node {
             info!("No listener configured - node will not accept incoming connections");
         }
 
-        // Start network maintenance in the background
+        // Start network maintenance in the background. Supervised: if this loop
+        // dies, dead peers are never evicted and the runtime maps grow unbounded.
         let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut maintenance_interval = interval(Duration::from_secs(MAINTENANCE_INTERVAL));
+        spawn_supervised("network-maintenance", move || {
+            let node_clone = node_clone.clone();
+            async move {
+                let mut maintenance_interval = interval(Duration::from_secs(MAINTENANCE_INTERVAL));
+                maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-            loop {
-                maintenance_interval.tick().await;
+                loop {
+                    maintenance_interval.tick().await;
 
-                if let Err(e) = node_clone.maintain_peer_connections().await {
-                    warn!("Peer maintenance error: {}", e);
+                    if let Err(e) = node_clone.maintain_peer_connections().await {
+                        warn!("Peer maintenance error: {}", e);
+                    }
+                    node_clone.cleanup_outbound_connections().await;
+                    node_clone.prune_runtime_maps().await;
+                    node_clone.prune_validation_cache();
                 }
-                node_clone.cleanup_outbound_connections().await;
-                node_clone.prune_runtime_maps().await;
-                node_clone.prune_validation_cache();
             }
         });
 
@@ -7399,10 +7480,11 @@ impl Node {
         // fast: it keeps its original interval via the tick counter (post storms
         // are the known failure mode there, 2026-07-08).
         let node_clone = node.clone();
-        tokio::spawn(async move {
+        spawn_logged("discovery-announce", async move {
             let relay_every = (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
             let mut tick: u64 = 0;
             let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_RETRY_SECS));
+            announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 announce_interval.tick().await;
                 if tick % relay_every == 0 {
@@ -7425,12 +7507,16 @@ impl Node {
         // check of chances to run — the gate must own the cadence, not the timer.
         if Self::public_header_snapshots_enabled() {
             let node_clone = node.clone();
-            tokio::spawn(async move {
-                let mut header_interval = interval(Duration::from_secs(5));
-                loop {
-                    header_interval.tick().await;
-                    if let Err(e) = node_clone.post_header_snapshot().await {
-                        debug!("Header snapshot error: {}", e);
+            spawn_supervised("header-snapshots", move || {
+                let node_clone = node_clone.clone();
+                async move {
+                    let mut header_interval = interval(Duration::from_secs(5));
+                    header_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    loop {
+                        header_interval.tick().await;
+                        if let Err(e) = node_clone.post_header_snapshot().await {
+                            debug!("Header snapshot error: {}", e);
+                        }
                     }
                 }
             });
@@ -7441,27 +7527,33 @@ impl Node {
         // ChainTipSignal — no timer, per-block fresh — so a new block is visible
         // to every client within one edge-cached beacon poll.
         if Self::public_header_snapshots_enabled() {
+            // Supervised: this loop IS the network's beacon — if it dies on the
+            // publisher, the signed tip freezes for every client until a restart.
             let node_clone = node.clone();
-            tokio::spawn(async move {
-                let mut rx = { node_clone.blockchain.read().await.subscribe_tip_changes() };
-                // Heartbeat so the beacon never expires during idle (no mining): it
-                // is re-posted on every tip change AND at least this often, keeping
-                // the network's live tip visible to anyone who opens their client.
-                let mut heartbeat = interval(Duration::from_secs(60));
-                if let Err(e) = node_clone.post_tip_beacon().await {
-                    debug!("Initial tip beacon post: {}", e);
-                }
-                loop {
-                    tokio::select! {
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                        }
-                        _ = heartbeat.tick() => {}
-                    }
+            spawn_supervised("tip-beacon", move || {
+                let node_clone = node_clone.clone();
+                async move {
+                    let mut rx = { node_clone.blockchain.read().await.subscribe_tip_changes() };
+                    // Heartbeat so the beacon never expires during idle (no mining): it
+                    // is re-posted on every tip change AND at least this often, keeping
+                    // the network's live tip visible to anyone who opens their client.
+                    let mut heartbeat = interval(Duration::from_secs(60));
+                    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     if let Err(e) = node_clone.post_tip_beacon().await {
-                        debug!("Tip beacon post: {}", e);
+                        debug!("Initial tip beacon post: {}", e);
+                    }
+                    loop {
+                        tokio::select! {
+                            changed = rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                            _ = heartbeat.tick() => {}
+                        }
+                        if let Err(e) = node_clone.post_tip_beacon().await {
+                            debug!("Tip beacon post: {}", e);
+                        }
                     }
                 }
             });
@@ -7470,13 +7562,17 @@ impl Node {
         // Periodic stats snapshot submissions (push)
         if Self::public_stats_snapshots_enabled() {
             let node_clone = node.clone();
-            tokio::spawn(async move {
-                let mut stats_interval =
-                    interval(Duration::from_secs(Self::stats_snapshot_interval_secs()));
-                loop {
-                    stats_interval.tick().await;
-                    if let Err(e) = node_clone.post_stats_snapshot().await {
-                        debug!("Stats snapshot error: {}", e);
+            spawn_supervised("stats-snapshots", move || {
+                let node_clone = node_clone.clone();
+                async move {
+                    let mut stats_interval =
+                        interval(Duration::from_secs(Self::stats_snapshot_interval_secs()));
+                    stats_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    loop {
+                        stats_interval.tick().await;
+                        if let Err(e) = node_clone.post_stats_snapshot().await {
+                            debug!("Stats snapshot error: {}", e);
+                        }
                     }
                 }
             });
@@ -7487,11 +7583,16 @@ impl Node {
         // Notice only — never auto-updates.
         {
             let node_clone = node.clone();
-            tokio::spawn(async move {
-                let mut version_check = interval(Duration::from_secs(VERSION_CHECK_INTERVAL_SECS));
-                loop {
-                    version_check.tick().await;
-                    node_clone.check_client_version_and_warn().await;
+            spawn_supervised("version-check", move || {
+                let node_clone = node_clone.clone();
+                async move {
+                    let mut version_check =
+                        interval(Duration::from_secs(VERSION_CHECK_INTERVAL_SECS));
+                    version_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    loop {
+                        version_check.tick().await;
+                        node_clone.check_client_version_and_warn().await;
+                    }
                 }
             });
         }
@@ -7504,8 +7605,9 @@ impl Node {
         // outage. Live peers keep priority in the 200-slot file; PEX entries fill
         // the remainder.
         let node_clone = node.clone();
-        tokio::spawn(async move {
+        spawn_logged("peer-cache-pex", async move {
             let mut cache_interval = interval(Duration::from_secs(120));
+            cache_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             let mut save_failure_logged = false;
             loop {
                 cache_interval.tick().await;
@@ -7632,12 +7734,30 @@ impl Node {
             }
         });
 
-        // Message processing loop
+        // Message processing loop — the SOLE consumer of the network event queue.
+        // Supervised: this pump calls the whole message-handling surface, and an
+        // unsupervised panic here silently backed the bounded queue up to capacity,
+        // parking every connection task on its send — and with it the accept-loop
+        // permits: the "node stops accepting connections" cascade.
         let node_clone = node.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = msg_rx.recv().await {
-                if let Err(e) = node_clone.handle_network_event(msg).await {
-                    error!("Error handling network event: {}", e);
+        let pump_rx = Arc::clone(&msg_rx);
+        spawn_supervised("network-event-pump", move || {
+            let node = node_clone.clone();
+            let rx = Arc::clone(&pump_rx);
+            async move {
+                loop {
+                    // Scope the lock to the recv itself: the handler must run
+                    // unlocked so a restarted pump can always re-acquire.
+                    let msg = { rx.lock().await.recv().await };
+                    match msg {
+                        Some(msg) => {
+                            if let Err(e) = node.handle_network_event(msg).await {
+                                error!("Error handling network event: {}", e);
+                            }
+                        }
+                        // Channel closed (shutdown): clean exit, not restarted.
+                        None => return,
+                    }
                 }
             }
         });
@@ -7695,8 +7815,9 @@ impl Node {
         // idempotent: receivers dedup via their network bloom, duplicate mempool adds
         // are rejected, and the mesh send is a no-op with no links up.
         let regossip_node = node.clone();
-        tokio::spawn(async move {
+        spawn_logged("pending-regossip", async move {
             let mut regossip_interval = interval(Duration::from_secs(45));
+            regossip_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             regossip_interval.tick().await; // consume the immediate first tick
             loop {
                 regossip_interval.tick().await;
@@ -7760,7 +7881,7 @@ impl Node {
                 BEACON_POLL_INTERVAL_SECS
             };
             let safety_secs = if is_publisher { 1 } else { 30 };
-            tokio::spawn(async move {
+            spawn_logged("beacon-watch", async move {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
                 // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
                 // the default Burst behavior replays every slept-through tick back-to-back
@@ -7998,37 +8119,42 @@ impl Node {
             let headless = std::env::var("ALPHANUMERIC_HEADLESS")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false);
-            tokio::spawn(async move {
-                let mut strikes: u32 = 0;
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    let chain_ok = timeout(Duration::from_secs(10), wd.blockchain.read())
-                        .await
-                        .is_ok();
-                    let peers_ok = timeout(Duration::from_secs(10), wd.peers.read())
-                        .await
-                        .is_ok();
-                    if chain_ok && peers_ok {
-                        strikes = 0;
-                        continue;
-                    }
-                    strikes += 1;
-                    error!(
-                        "lock watchdog: core lock wedged (chain_ok={}, peers_ok={}) strike {}",
-                        chain_ok, peers_ok, strikes
-                    );
-                    if strikes >= 2 {
-                        if headless {
-                            error!("lock watchdog: restarting to self-heal (supervisor respawns)");
-                            // Nonzero so Restart=on-failure supervisors actually respawn (M9).
-                            std::process::exit(3);
-                        } else if strikes == 2 {
-                            // Print the operator hint ONCE; keep counting quietly after
-                            // (an interactive session is never killed under the user).
-                            println!(
-                                "A background task has stalled (watchdog: chain_ok={}, peers_ok={}). Mining/commands may degrade — restart the client when convenient.",
-                                chain_ok, peers_ok
-                            );
+            // Supervised: the watchdog is the self-heal mechanism — its own silent
+            // death would remove the safety net without anyone noticing.
+            spawn_supervised("lock-watchdog", move || {
+                let wd = wd.clone();
+                async move {
+                    let mut strikes: u32 = 0;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        let chain_ok = timeout(Duration::from_secs(10), wd.blockchain.read())
+                            .await
+                            .is_ok();
+                        let peers_ok = timeout(Duration::from_secs(10), wd.peers.read())
+                            .await
+                            .is_ok();
+                        if chain_ok && peers_ok {
+                            strikes = 0;
+                            continue;
+                        }
+                        strikes += 1;
+                        error!(
+                            "lock watchdog: core lock wedged (chain_ok={}, peers_ok={}) strike {}",
+                            chain_ok, peers_ok, strikes
+                        );
+                        if strikes >= 2 {
+                            if headless {
+                                error!("lock watchdog: restarting to self-heal (supervisor respawns)");
+                                // Nonzero so Restart=on-failure supervisors actually respawn (M9).
+                                std::process::exit(3);
+                            } else if strikes == 2 {
+                                // Print the operator hint ONCE; keep counting quietly after
+                                // (an interactive session is never killed under the user).
+                                println!(
+                                    "A background task has stalled (watchdog: chain_ok={}, peers_ok={}). Mining/commands may degrade — restart the client when convenient.",
+                                    chain_ok, peers_ok
+                                );
+                            }
                         }
                     }
                 }
@@ -8053,24 +8179,30 @@ impl Node {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             ));
-            // In-runtime bumper: advances the heartbeat whenever ANY worker is free to run it.
+            // In-runtime bumper: advances the heartbeat whenever ANY worker is free to
+            // run it. Supervised — an INVERTED failure mode lives here: if the bumper
+            // silently dies, the heartbeat goes stale and the off-runtime checker
+            // kills a perfectly healthy headless node every ~150s.
             {
                 let hb = Arc::clone(&heartbeat);
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(15)).await;
-                        let secs = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        hb.store(secs, Ordering::Relaxed);
+                spawn_supervised("runtime-heartbeat", move || {
+                    let hb = Arc::clone(&hb);
+                    async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                            let secs = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            hb.store(secs, Ordering::Relaxed);
+                        }
                     }
                 });
             }
             // Off-runtime checker: a plain OS thread, so it stays able to act even when every
             // tokio worker is blocked. eprintln! (not the log stack) keeps it working under a pin.
             let hb = Arc::clone(&heartbeat);
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("runtime-watchdog".into())
                 .spawn(move || {
                     let mut stale_strikes: u32 = 0;
@@ -8096,6 +8228,15 @@ impl Node {
                         }
                     }
                 });
+            // Builder::spawn fails exactly under the resource exhaustion this
+            // last-resort guard exists for (EAGAIN / thread limits) — say so
+            // instead of silently running unguarded.
+            if let Err(e) = spawned {
+                eprintln!(
+                    "runtime watchdog thread failed to start: {} — whole-runtime-pin self-heal is DISABLED for this session",
+                    e
+                );
+            }
         }
 
         info!("Node startup complete - ready to accept connections");
@@ -12354,7 +12495,9 @@ impl Node {
             let mesh_seen: Arc<PLMutex<LruCache<String, ()>>> = Arc::new(PLMutex::new(
                 LruCache::new(NonZeroUsize::new(8192).unwrap()),
             ));
-            tokio::spawn(async move {
+            // Logged, not supervised: the receiver is owned by the future, so a
+            // panic loses the mesh ingest until restart — make it loud.
+            spawn_logged("mesh-ingest", async move {
                 while let Some((_peer, bytes)) = inbound_rx.recv().await {
                     node.handle_mesh_message(bytes, &mesh_seen).await;
                 }
