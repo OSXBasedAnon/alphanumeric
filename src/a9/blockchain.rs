@@ -7856,6 +7856,52 @@ mod tests {
     // dropped entirely when no full witness is available — a truncated copy could
     // never be mined and would only poison the block template until it ages out.
     #[test]
+    fn beacon_can_unfreeze_a_node_whose_own_checkpoint_cannot_advance() {
+        // The frozen-tip deadlock: verification_floor() comes from the node's OWN
+        // trusted checkpoint, which only advances when it APPLIES a block. A node
+        // that cannot apply block H+1 (unobtainable witnesses) therefore keeps H+1
+        // above its floor forever, so it keeps demanding full witnesses for it
+        // forever — even once the network has buried it. Live: 80 minutes frozen.
+        //
+        // The escape is advancing the checkpoint from the SIGNED BEACON. This pins
+        // the two properties that make that safe and effective.
+        // Mirrors Node::routes_via_witness (private to node.rs): a block AT or
+        // ABOVE floor+1 is on the unfinalized frontier and needs full witnesses.
+        let needs_full_witness = |h: u32, floor: u32| h >= floor.saturating_add(1);
+        let (bc, _genesis) = fee_accounting_test_chain();
+        let stuck_tip = 292_952u32;
+        let blocked = stuck_tip + 1;
+
+        // While the network has NOT yet buried the blocked block by the reorg
+        // margin, the beacon must NOT be able to receipt-trust it — finality is
+        // never brought nearer the tip than CHECKPOINT_REORG_MARGIN.
+        let too_soon = blocked + CHECKPOINT_REORG_MARGIN - 1;
+        bc.advance_checkpoint_behind(too_soon).unwrap();
+        assert!(
+            needs_full_witness(blocked, bc.verification_floor()),
+            "a block the network has not yet buried must still require full witnesses"
+        );
+
+        // Once the beacon is a full margin past it, the floor covers it and the
+        // block routes via the receipt path — the node can move again.
+        let buried = blocked + CHECKPOINT_REORG_MARGIN;
+        bc.advance_checkpoint_behind(buried).unwrap();
+        assert!(
+            !needs_full_witness(blocked, bc.verification_floor()),
+            "once the beacon has buried the block by the reorg margin it must be receipt-trustable"
+        );
+
+        // Monotonic: a lower/stale beacon can never walk finality backwards.
+        let floor_before = bc.verification_floor();
+        bc.advance_checkpoint_behind(buried - 100).unwrap();
+        assert_eq!(
+            bc.verification_floor(),
+            floor_before,
+            "checkpoint advancement must be monotonic — finality can never regress"
+        );
+    }
+
+    #[test]
     fn witness_completeness_gates_the_relay_publish_shape() {
         // The relay-publish poison guard: a body is publishable only when EVERY
         // non-system tx carries a full (>64-byte) ML-DSA signature. A truncated
