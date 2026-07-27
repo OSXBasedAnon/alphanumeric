@@ -1,7 +1,8 @@
-**Alphanumeric v7.9.1 — nodes can no longer get permanently stuck**
+**Alphanumeric v7.9.2 — nodes can no longer get permanently stuck**
 
-Reliability release. No change to block validity rules, wire format, or network
-compatibility — 7.9.1 and 7.9.0 nodes stay on the same chain and can be upgraded
+Supersedes v7.9.1 (same day — three more client fixes landed right after
+tagging; if you grabbed 7.9.1, take this instead). No change to block validity rules, wire format, or network
+compatibility — 7.9.2, 7.9.1 and 7.9.0 nodes stay on the same chain and can be upgraded
 in any order. **Recommended for every node.**
 
 ### The main fix
@@ -30,6 +31,13 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
 - Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
   block you mined gets reorged out.
 
+### Also fixed after 7.9.1
+- Reopening a client after hours away no longer says "cannot mine" — it reports
+  how far behind it is and starts on its own (and no longer discards a good local
+  chain on the next launch).
+- The prompt no longer swallows the command you type after mining ends.
+- Sync status is one updating line, not a wall of text.
+
 ### Interface
 - One display language across every screen — balances, wallets, mining,
   transactions and `info` now share the same layout, colours and spacing.
@@ -45,13 +53,13 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
   plots the raw per-sample series.
 
 ### Download (macOS, Apple Silicon)
-Standard: `alphanumeric-v7.9.1-macos-arm64.zip`
-GPU: `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
+Standard: `alphanumeric-v7.9.2-macos-arm64.zip`
+GPU: `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
 
 ### Artifacts + checksums
-- `alphanumeric-v7.9.1-macos-arm64.zip`
+- `alphanumeric-v7.9.2-macos-arm64.zip`
   - `73d254f8ffc9218beba0381d25f892034102e037c6bb360241130a60ca2d8e1d`
-- `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
+- `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
   - `6b2d810a158db54b9e1398a06465aae4e957e04c8d002cf24abcf72a8132e036`
 
 Source build commands:
@@ -59,4 +67,4 @@ Source build commands:
 - GPU: `git checkout gpu-mining && cargo build --release --features gpu_miner`
 
 GitHub tag placeholder:
-https://github.com/OSXBasedAnon/alphanumeric/releases/tag/v7.9.1
+https://github.com/OSXBasedAnon/alphanumeric/releases/tag/v7.9.2

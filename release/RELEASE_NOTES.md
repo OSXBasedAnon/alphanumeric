@@ -1,8 +1,10 @@
-# alphanumeric v7.9.1
+# alphanumeric v7.9.2
 
-Reliability release. **No change to block validity rules** — nothing about which
-blocks are valid changes, so 7.9.1 and 7.9.0 nodes stay on the same chain and can
-be upgraded in any order. macOS (Apple Silicon) prebuilt below; Linux/Windows/
+Reliability release, and it **supersedes v7.9.1** — same day, three further
+client fixes found immediately after tagging. If you grabbed 7.9.1, take this
+instead. **No change to block validity rules** — nothing about which blocks are
+valid changes, so 7.9.2, 7.9.1 and 7.9.0 nodes stay on the same chain and can be
+upgraded in any order. macOS (Apple Silicon) prebuilt below; Linux/Windows/
 other platforms build from source.
 
 **Recommended for every node.** The headline fix ends a state in which a node
@@ -20,7 +22,7 @@ of the network had buried it. It needed to apply the block to advance the floor,
 and needed the floor to advance to apply the block. Seen in the wild as a node
 frozen at a single height for 80+ minutes while the network ran on without it.
 
-7.9.1 breaks the cycle with the signed tip beacon: if the local tip has not moved
+7.9.2 breaks the cycle with the signed tip beacon: if the local tip has not moved
 for 90 seconds and the beacon is more than the reorg margin ahead, the node
 advances its checkpoint from the beacon and applies the blocked block from its
 receipt — exactly as it already trusts the history inside a bootstrap snapshot.
@@ -80,20 +82,37 @@ seconds to 5 minutes instead of never.
   sample, the other a median of the recent window — so they could sit a spike
   apart. The chart itself still plots the raw per-sample series, bursts included.
 
+## Fixed after 7.9.1 (this release)
+- **Reopening a client after hours away no longer refuses to mine.** If catch-up
+  could not finish inside one prep window — the normal case for a client that has
+  been closed a while, or at startup before peers finish connecting — `mine`
+  reported "cannot mine right now" and stopped, *and* scheduled a re-bootstrap
+  that discarded a perfectly good local chain on the next launch. Being behind is
+  not being diverged: it now reports how far behind it is and starts mining by
+  itself once the chain is current.
+- **The prompt no longer swallows your next command.** `mine --continuous` parks
+  a thread on stdin for its Enter-to-stop, and when mining ended any other way
+  that thread was still holding the terminal — so the next command went to it
+  instead of the prompt and came back as "invalid command" with the cursor
+  misplaced, needing a restart. Lines typed after mining ends are now handed back
+  to the prompt and run normally.
+- **Sync status is a single updating line** instead of a new line every few
+  seconds burying the screen during a long catch-up.
+
 ## Install / verify
-- **Standard**: use `alphanumeric-v7.9.1-macos-arm64.zip`
-- **GPU mining (opt-in)**: use `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
+- **Standard**: use `alphanumeric-v7.9.2-macos-arm64.zip`
+- **GPU mining (opt-in)**: use `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
 - **Signature model / protocol** unchanged; no protocol migration.
 - Upgrading is a drop-in binary replacement: no database migration, no resync.
 
 ## Artifacts
 | file | sha256 |
 |---|---|
-| alphanumeric-v7.9.1-macos-arm64.zip | `73d254f8ffc9218beba0381d25f892034102e037c6bb360241130a60ca2d8e1d` |
-| alphanumeric-v7.9.1-gpu-macos-arm64.zip (opt-in GPU mining) | `6b2d810a158db54b9e1398a06465aae4e957e04c8d002cf24abcf72a8132e036` |
+| alphanumeric-v7.9.2-macos-arm64.zip | `73d254f8ffc9218beba0381d25f892034102e037c6bb360241130a60ca2d8e1d` |
+| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `6b2d810a158db54b9e1398a06465aae4e957e04c8d002cf24abcf72a8132e036` |
 
 ## Notes
 - Build verification source: `cargo build --release` on `main`, and
   `cargo build --release --features gpu_miner` on `gpu-mining`.
-- Version in this repo is `7.9.1`; this release uses the existing macOS packaging
+- Version in this repo is `7.9.2`; this release uses the existing macOS packaging
   layout from prior releases.
