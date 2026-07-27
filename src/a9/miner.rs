@@ -14,20 +14,14 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage,
-    BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT_BYTES, MAX_TX_AGE_SECS, MIN_RELAY_FEE_UNITS, NETWORK_FEE,
+    BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES,
+    MAX_TEMPLATE_TX_BYTES, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
 
-/// Cap on the summed serialized size of the transactions selected into a block
-/// template. Every transport enforces node.rs MAX_MESSAGE_SIZE (4 MiB) per
-/// frame, so a bigger block is unrelayable and would strand this miner on its
-/// own fork. The consensus MAX_BLOCK_TX_COUNT alone does NOT keep templates
-/// under the frame: full ML-DSA-87 witnesses put a signed transfer near ~15 KB,
-/// so a count-full template would serialize to tens of MB. 3.5 MiB leaves
-/// headroom for the header, coinbase and codec envelope.
-const MAX_TEMPLATE_TX_BYTES: usize = MAX_BLOCK_WEIGHT_BYTES;
+// MAX_TEMPLATE_TX_BYTES moved to blockchain.rs (single source shared with the
+// fee estimator); the 4 MiB-frame relayability rationale lives on its doc there.
 
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
@@ -475,43 +469,19 @@ impl MiningManager {
                     Vec::new()
                 } else {
                     let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
+                    // Template-time is the candidate clock (NOT wall time): the
+                    // shared predicate re-applies the relay floor, freshness (with
+                    // the template margin), future-bound and full-witness checks.
+                    // Blockchain::is_template_candidate is THE single source for
+                    // these rules — the fee estimator replays it, so wallet fee
+                    // recommendations always price the same competition this
+                    // selection sees.
                     let now_secs = template_timestamp;
-                    const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
                     blockchain_lock
                         .get_transactions_for_block()
                         .await
                         .into_iter()
-                        .filter(|tx| {
-                            if tx.sender == "MINING_REWARDS" {
-                                return false;
-                            }
-                            if blockchain_lock.is_tx_confirmed(&tx.get_tx_id()) {
-                                return false;
-                            }
-                            if !tx.has_valid_regular_amounts() {
-                                return false;
-                            }
-                            // Relay-policy floor, belt to the mempool's suspender:
-                            // never template a below-floor tx that slipped in via
-                            // startup rehydration or a reorg readmit.
-                            if tx.fee_units < MIN_RELAY_FEE_UNITS {
-                                return false;
-                            }
-                            if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
-                                < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
-                            {
-                                return false;
-                            }
-                            if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
-                                return false;
-                            }
-                            if let Some(sig_hex) = &tx.signature {
-                                if let Ok(bytes) = hex::decode(sig_hex) {
-                                    return bytes.len() > 64;
-                                }
-                            }
-                            false
-                        })
+                        .filter(|tx| blockchain_lock.is_template_candidate(tx, now_secs))
                         .collect()
                 };
 
@@ -530,11 +500,7 @@ impl MiningManager {
                 // near-constant size (the ML-DSA signature dominates), so exact fee order
                 // tracks fee-per-byte.
                 let mut ordered: Vec<&Transaction> = live_transactions.iter().collect();
-                ordered.sort_by(|a, b| {
-                    b.fee_units
-                        .cmp(&a.fee_units)
-                        .then_with(|| a.timestamp.cmp(&b.timestamp))
-                });
+                ordered.sort_by(|a, b| Blockchain::template_candidate_order(a, b));
 
                 let mut selected_regular =
                     Vec::with_capacity(regular_cap.min(live_transactions.len()));

@@ -26,7 +26,7 @@ use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
         Block, Blockchain, RateLimiter, Transaction, CONSENSUS_HEADER_RULES_VERSION,
-        FEE_ACCOUNTING_RULES_VERSION, FEE_SYSTEM_ACTIVATION_HEIGHT,
+        FEE_ACCOUNTING_RULES_VERSION, FEE_ESTIMATE_ANCHOR_UNITS, FEE_SYSTEM_ACTIVATION_HEIGHT,
         LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES,
         MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
@@ -1928,6 +1928,30 @@ async fn async_main() -> Result<()> {
     writeln!(stdout, "Hashrate:          {:.2} {}", hr_value, hr_unit)?;
     color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
     stdout.set_color(&color_spec)?;
+    // Wallet auto fee — what `create` attaches when --fee is absent, priced off
+    // the live mempool (Blockchain::fee_estimate). try_: the info path must not
+    // await while holding the chain guard; a momentarily contended mempool
+    // (miner mid-template) falls back to displaying the quiet-network anchor.
+    match blockchain_guard.try_fee_estimate() {
+        Some(estimate) => writeln!(
+            stdout,
+            "Default Fee:       {:.8}{}",
+            Transaction::from_units(estimate.recommended_units),
+            if estimate.congested {
+                " (auto · congested)"
+            } else {
+                " (auto)"
+            }
+        )?,
+        // Mempool momentarily write-locked (miner mid-template). Say so rather
+        // than printing the anchor as if it were a live reading — contention
+        // correlates with load, i.e. exactly when the real figure may be higher.
+        None => writeln!(
+            stdout,
+            "Default Fee:       {:.8} (auto · anchor, mempool busy)",
+            Transaction::from_units(FEE_ESTIMATE_ANCHOR_UNITS)
+        )?,
+    }
     writeln!(
         stdout,
         "Whisper Compat:    {:.8}%",

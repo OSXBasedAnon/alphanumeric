@@ -200,6 +200,54 @@ pub const NETWORK_FEE: f64 = 0.0005; // Operator fee from mining rewards
 /// in a block now costs real coins. Mempool-resident spam that expires unpaid
 /// is instead bounded by the per-sender caps, rate limiter and TTL.
 pub const MIN_RELAY_FEE_UNITS: i128 = 10_000;
+/// Reference-wallet safety ceiling for ANY fee the wallet will attach (explicit
+/// --fee or the auto estimate), in 1e-8 units (1_000_000 = 0.01 coins). Wallet
+/// POLICY, not consensus: it exists so neither a typo nor a manipulated fee
+/// recommendation can burn a meaningful balance in one transaction. Single
+/// source of truth — mgmt.rs (the --fee guard) and the fee estimator both
+/// derive from this constant.
+pub const WALLET_FEE_SAFETY_LIMIT_UNITS: i128 = 1_000_000;
+/// Quiet-network default fee the reference wallet attaches when the mempool is
+/// uncontended, expressed as a multiple of the relay floor so it tracks any
+/// future floor change automatically. 2x the floor (0.0002 coins today) keeps a
+/// default-wallet transaction strictly ahead of floor-paying bulk templates
+/// (mining pools/exchanges submitting at exactly MIN_RELAY_FEE_UNITS) in the
+/// miner's fee-descending selection, while staying far below the old
+/// amount-proportional cap. Anti-spam is NOT this constant's job — the relay
+/// floor and the per-block weight budget already price chain-bloat.
+pub const FEE_ESTIMATE_ANCHOR_UNITS: i128 = MIN_RELAY_FEE_UNITS * 2;
+/// Ceiling for the AUTOMATIC fee only — deliberately an order of magnitude
+/// below WALLET_FEE_SAFETY_LIMIT_UNITS (which stays the ceiling for a fee the
+/// user explicitly typed). A fee nobody chose must never be able to spend a
+/// meaningful balance because the mempool happened to be contended (or was
+/// deliberately stuffed) at the instant of send: 10x the anchor is more than
+/// enough to outbid any honest backlog, and a user who genuinely wants to pay
+/// more can always pass --fee. Also bounds the payoff of fee-pumping the
+/// estimate: an attacker who fills blocks with ceiling-fee traffic moves
+/// default wallets by at most this much.
+pub const FEE_ESTIMATE_AUTO_CAP_UNITS: i128 = FEE_ESTIMATE_ANCHOR_UNITS * 10;
+/// Serialized size allowance for ONE ordinary full-witness transfer, used by
+/// the estimator to reserve next-block headroom for the caller's own
+/// transaction (the miner reserves the coinbase slot the same way). Derived
+/// from the fixed transaction framing plus the ML-DSA-87 witness that
+/// dominates it; deliberately generous, since over-reserving only makes the
+/// estimator declare congestion one transaction early.
+pub const TYPICAL_FULL_WITNESS_TX_BYTES: usize = 16 * 1024;
+/// Cap on the summed serialized size of the transactions selected into a block
+/// template. Every transport enforces node.rs MAX_MESSAGE_SIZE (4 MiB) per
+/// frame, so a bigger block is unrelayable and would strand the miner on its
+/// own fork. The consensus MAX_BLOCK_TX_COUNT alone does NOT keep templates
+/// under the frame: full ML-DSA-87 witnesses put a signed transfer near ~15 KB,
+/// so a count-full template would serialize to tens of MB. 3.5 MiB leaves
+/// headroom for the header, coinbase and codec envelope. Single source of
+/// truth — the miner's packing loop and the fee estimator both use this.
+pub const MAX_TEMPLATE_TX_BYTES: usize = MAX_BLOCK_WEIGHT_BYTES;
+/// Safety margin the template selector (and the fee estimator, which must
+/// mirror it exactly) applies on top of the consensus freshness rule: a
+/// transaction within this margin of MAX_TX_AGE_SECS expiry is not templated,
+/// so a block can never be rejected because its transactions aged out during
+/// the nonce grind.
+pub const TEMPLATE_FRESHNESS_MARGIN_SECS: u64 = 60;
 pub const MINT_CLIP: f64 = 0.35; // Fee-weighted reward damping
 pub const SYSTEM_ADDRESSES: [&str; 1] = ["MINING_REWARDS"];
 pub const TARGET_BLOCK_TIME: u64 = 5;
@@ -219,6 +267,49 @@ const BLOCK_WEIGHT_FIXED_BYTES: usize = 512;
 const TRANSACTION_WEIGHT_FIXED_BYTES: usize = 128;
 lazy_static! {
     pub static ref MAX_TARGET: BigUint = BigUint::from_bytes_be(&MAX_TARGET_BYTES);
+}
+
+/// Non-consensus fee recommendation for the reference wallet and API users —
+/// the output of Blockchain::fee_estimate(). Every field is advisory POLICY;
+/// nothing here is validated by consensus. `recommended_units` is what the
+/// reference wallet attaches when `create` is run without --fee; explicit fees
+/// (mining pools, exchanges, power users) bypass the estimator entirely and are
+/// bounded only by the relay floor and the wallet safety ceiling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeeEstimate {
+    /// The fee a default wallet/API user should attach right now.
+    pub recommended_units: i128,
+    /// Quiet-network default (FEE_ESTIMATE_ANCHOR_UNITS).
+    pub anchor_units: i128,
+    /// Relay-policy floor (MIN_RELAY_FEE_UNITS) — never recommend below.
+    pub floor_units: i128,
+    /// Ceiling the AUTO path clamps to (FEE_ESTIMATE_AUTO_CAP_UNITS). Lower
+    /// than the explicit --fee ceiling on purpose: an automatic fee nobody
+    /// typed should never be able to spend a meaningful balance.
+    pub auto_cap_units: i128,
+    /// The wallet's explicit-fee ceiling (WALLET_FEE_SAFETY_LIMIT_UNITS) —
+    /// reported for reference; only a user-supplied --fee may reach it.
+    pub explicit_cap_units: i128,
+    /// True when next-block capacity cannot absorb the eligible backlog PLUS
+    /// the caller's own transaction, i.e. the recommendation is priced off the
+    /// marginal included fee rather than the anchor.
+    pub congested: bool,
+    /// Template-eligible transactions seen within the bounded scan.
+    pub pending_candidates: usize,
+    /// How many of those fit the modeled next block.
+    pub next_block_fits: usize,
+}
+
+impl FeeEstimate {
+    /// Stable label for displays and the explorer API: what priced the
+    /// recommendation.
+    pub fn basis(&self) -> &'static str {
+        if self.congested {
+            "next-block"
+        } else {
+            "quiet"
+        }
+    }
 }
 
 /// Canonical user/miner address form used by wallets and activated block rules.
@@ -5755,6 +5846,254 @@ impl Blockchain {
         Ok(mempool.get_all_transactions())
     }
 
+    /// Whether a mempool transaction is eligible for the miner's next block
+    /// template. This is THE template-candidate predicate: the miner's packing
+    /// loop and the fee estimator both call it, so the two can never drift —
+    /// the estimator prices exactly the competition the miner will consider.
+    /// Checks, in order: not a system/coinbase sender, not already confirmed,
+    /// canonical positive amounts, at or above the relay-policy fee floor,
+    /// fresh enough to survive the nonce grind (MAX_TX_AGE_SECS minus the
+    /// template margin), not future-dated beyond consensus tolerance, and
+    /// carrying its FULL witness (a truncated stored signature can never be
+    /// templated — the mined block would fail full verification).
+    pub fn is_template_candidate(&self, tx: &Transaction, now_secs: u64) -> bool {
+        if tx.sender == "MINING_REWARDS" {
+            return false;
+        }
+        if self.is_tx_confirmed(&tx.get_tx_id()) {
+            return false;
+        }
+        if !tx.has_valid_regular_amounts() {
+            return false;
+        }
+        if tx.fee_units < MIN_RELAY_FEE_UNITS {
+            return false;
+        }
+        if tx.timestamp.saturating_add(MAX_TX_AGE_SECS)
+            < now_secs.saturating_add(TEMPLATE_FRESHNESS_MARGIN_SECS)
+        {
+            return false;
+        }
+        if tx.timestamp > now_secs.saturating_add(MAX_BLOCK_FUTURE_TIME) {
+            return false;
+        }
+        if let Some(sig_hex) = &tx.signature {
+            if let Ok(bytes) = hex::decode(sig_hex) {
+                return bytes.len() > 64;
+            }
+        }
+        false
+    }
+
+    /// THE template-selection ordering: highest fee first, ties broken by the
+    /// oldest signed timestamp. Shared by the miner's packing loop and the fee
+    /// estimator (see is_template_candidate for why sharing matters). Regular
+    /// transactions are near-constant size (the ML-DSA witness dominates), so
+    /// exact fee order tracks fee-per-byte.
+    pub fn template_candidate_order(a: &Transaction, b: &Transaction) -> std::cmp::Ordering {
+        b.fee_units
+            .cmp(&a.fee_units)
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
+    }
+
+    /// Snapshot the raw mempool and produce the wallet/API fee recommendation.
+    /// Async canonical form (CLI create path): briefly takes the INNER mempool
+    /// read lock only — it never touches the outer chain RwLock, so it is safe
+    /// to call while the caller already holds a chain read guard (the miner and
+    /// the info command both hold one across mempool access; same lock order).
+    pub async fn fee_estimate(&self) -> FeeEstimate {
+        let candidates = {
+            // Prune first, exactly like the miner's template path: an
+            // arrival-TTL-expired transaction is competition the miner will
+            // never see, and counting it would inflate the recommendation.
+            let mut mempool = self.mempool.write().await;
+            mempool.prune_expired();
+            mempool.get_all_transactions()
+        };
+        self.fee_estimate_from_candidates(candidates, Self::now_unix_secs())
+    }
+
+    /// Non-blocking form for sync contexts that must never await while holding
+    /// the chain read guard (explorer handlers, the info display): None when
+    /// the mempool lock is momentarily contended (miner mid-template) — callers
+    /// surface "busy" or say so rather than blocking. Read-only, so it cannot
+    /// prune: transactions past their arrival TTL but not yet swept (bounded by
+    /// the re-announce loop's prune cadence) may still count as competition,
+    /// which errs toward recommending MORE, never less.
+    pub fn try_fee_estimate(&self) -> Option<FeeEstimate> {
+        let candidates = self.mempool.try_read().ok()?.get_all_transactions();
+        Some(self.fee_estimate_from_candidates(candidates, Self::now_unix_secs()))
+    }
+
+    /// The estimator core: a pure function of the mempool snapshot and the
+    /// template-selection rules. Deliberately STATELESS (no history, no EMA) so
+    /// it stays deterministic, testable, and never needs retuning: every input
+    /// is a constant that already governs block building, so if those evolve
+    /// the estimate follows automatically.
+    ///
+    /// Model: replay the real path a transaction takes into a block, in the
+    /// order the pipeline actually applies it.
+    ///
+    /// STAGE 1 — the mempool feed. Mempool::get_transactions_for_block caps its
+    /// output at MAX_TRANSACTIONS_PER_BLOCK / MAX_BLOCK_SIZE over the RAW pool,
+    /// BEFORE the miner filters anything. Ineligible-but-pooled transactions
+    /// (sub-floor rehydrations, truncated-witness reorg readmits, stale
+    /// timestamps) therefore consume real selection budget, so this walk debits
+    /// them too and only skips them for INCLUSION. Modeling the two stages in
+    /// the wrong order would report "quiet" while junk starves the template.
+    ///
+    /// STAGE 2 — the miner's packing gates: the count cap (MAX_BLOCK_TX_COUNT
+    /// minus the coinbase slot), the serialized-bytes relayability cap
+    /// (MAX_TEMPLATE_TX_BYTES), and post-activation the consensus weight budget
+    /// (MAX_BLOCK_WEIGHT_BYTES, from the canonical coinbase base weight —
+    /// identical for every canonical miner address, so a placeholder is exact).
+    ///
+    /// The walk is BOUNDED: it stops as soon as the feed budget is spent, so
+    /// cost is O(next-block capacity), never O(mempool). That matters because
+    /// this runs behind an unauthenticated endpoint and under a chain read
+    /// guard — an attacker cannot turn a 50k-transaction pool into 50k
+    /// serializations per request.
+    ///
+    /// Verdict: capacity must absorb the eligible backlog PLUS the caller's own
+    /// transaction — the estimate exists to price THAT transaction in, so the
+    /// walk reserves TYPICAL_FULL_WITNESS_TX_BYTES of headroom exactly like the
+    /// miner reserves the coinbase slot. Room to spare means uncontended:
+    /// recommend the flat anchor. Otherwise recommend one unit above the
+    /// weakest INCLUDED fee (the age tiebreak favors incumbents, so merely
+    /// matching it loses), clamped to FEE_ESTIMATE_AUTO_CAP_UNITS so no mempool
+    /// state — organic or deliberately stuffed — can make an automatic fee
+    /// spend a meaningful balance.
+    ///
+    /// Deliberate approximations, all erring toward recommending MORE than
+    /// strictly needed (overshoot still lands next block, and the oldest-first
+    /// tiebreak guarantees eventual inclusion regardless):
+    ///   - affordability and fee-accounting probes are skipped (they depend on
+    ///     sender balances; failures only FREE capacity);
+    ///   - the feed orders by fee-per-byte while this walk orders by fee;
+    ///     regular transactions are near-constant size so the orders coincide
+    ///     (the miner's own selection comment makes this argument).
+    fn fee_estimate_from_candidates(
+        &self,
+        mut candidates: Vec<Transaction>,
+        now_secs: u64,
+    ) -> FeeEstimate {
+        // Sort BEFORE filtering: ordering is cheap (integer compares) and the
+        // filter is not (a confirmed-index lookup plus a witness hex decode per
+        // transaction), so the bounded walk below pays the expensive check only
+        // for the transactions that actually compete for the next block.
+        candidates.sort_by(|a, b| Self::template_candidate_order(a, b));
+
+        let next_height = self.next_block_index();
+        let activated = next_height >= FEE_SYSTEM_ACTIVATION_HEIGHT;
+        // Every canonical address is exactly 40 chars, so the coinbase base
+        // weight is identical for any miner; a placeholder is exact, and the
+        // error arm is unreachable (kept non-panicking on principle).
+        const PLACEHOLDER_MINER: &str = "0000000000000000000000000000000000000000";
+        let mut consensus_weight = if activated {
+            Self::mining_template_base_weight(PLACEHOLDER_MINER).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let feed_count_cap = crate::a9::mempool::MAX_TRANSACTIONS_PER_BLOCK;
+        let feed_byte_cap = crate::a9::mempool::MAX_BLOCK_SIZE;
+        let count_cap = feed_count_cap.min(MAX_BLOCK_TX_COUNT.saturating_sub(1));
+        let byte_cap = feed_byte_cap.min(MAX_TEMPLATE_TX_BYTES);
+
+        let mut feed_count = 0usize;
+        let mut feed_bytes = 0usize;
+        let mut template_bytes = 0usize;
+        let mut included = 0usize;
+        let mut eligible_seen = 0usize;
+        let mut min_included_fee: Option<i128> = None;
+        let mut excluded_any = false;
+
+        for tx in &candidates {
+            // STAGE 1: feed budget, spent by eligible and ineligible alike.
+            // Exhausted feed budget means the pool outruns what the miner can
+            // even see — congestion, and the bound that keeps this walk O(1)
+            // in the size of the mempool.
+            if feed_count >= feed_count_cap || feed_bytes >= feed_byte_cap {
+                excluded_any = true;
+                break;
+            }
+            let tx_bytes = match codec::serialize(tx) {
+                Ok(bytes) => bytes.len(),
+                Err(_) => continue, // unserializable can't ship in a block
+            };
+            feed_count += 1;
+            feed_bytes = feed_bytes.saturating_add(tx_bytes);
+
+            if !self.is_template_candidate(tx, now_secs) {
+                continue; // consumed feed budget, can never be templated
+            }
+            eligible_seen += 1;
+
+            // STAGE 2: the miner's packing gates. continue-not-break mirrors
+            // the miner: an oversize transaction is skipped while smaller
+            // lower-fee ones may still pack in.
+            if included >= count_cap {
+                excluded_any = true;
+                continue;
+            }
+            if template_bytes.saturating_add(tx_bytes) > byte_cap {
+                excluded_any = true;
+                continue;
+            }
+            if activated {
+                let tx_weight = match Self::template_regular_transaction_weight(next_height, tx) {
+                    Ok(Some(weight)) => weight,
+                    Ok(None) | Err(_) => continue,
+                };
+                let Some(next_weight) = consensus_weight.checked_add(tx_weight) else {
+                    continue;
+                };
+                if next_weight > MAX_BLOCK_WEIGHT_BYTES {
+                    excluded_any = true;
+                    continue;
+                }
+                consensus_weight = next_weight;
+            }
+            template_bytes = template_bytes.saturating_add(tx_bytes);
+            included += 1;
+            min_included_fee =
+                Some(min_included_fee.map_or(tx.fee_units, |m| m.min(tx.fee_units)));
+        }
+
+        // Headroom for the transaction this estimate is FOR: if the caller's
+        // own transfer would not fit alongside everything above, the network is
+        // contended for them even though no existing transaction was displaced.
+        let caller_fits = included < count_cap
+            && template_bytes.saturating_add(TYPICAL_FULL_WITNESS_TX_BYTES) <= byte_cap
+            && feed_count < feed_count_cap
+            && feed_bytes.saturating_add(TYPICAL_FULL_WITNESS_TX_BYTES) <= feed_byte_cap
+            && (!activated
+                || consensus_weight.saturating_add(TYPICAL_FULL_WITNESS_TX_BYTES)
+                    <= MAX_BLOCK_WEIGHT_BYTES);
+
+        let congested = excluded_any || !caller_fits;
+        let recommended_units = if congested {
+            min_included_fee
+                .unwrap_or(FEE_ESTIMATE_ANCHOR_UNITS)
+                .saturating_add(1)
+                .max(FEE_ESTIMATE_ANCHOR_UNITS)
+        } else {
+            FEE_ESTIMATE_ANCHOR_UNITS
+        }
+        .min(FEE_ESTIMATE_AUTO_CAP_UNITS);
+
+        FeeEstimate {
+            recommended_units,
+            anchor_units: FEE_ESTIMATE_ANCHOR_UNITS,
+            floor_units: MIN_RELAY_FEE_UNITS,
+            auto_cap_units: FEE_ESTIMATE_AUTO_CAP_UNITS,
+            explicit_cap_units: WALLET_FEE_SAFETY_LIMIT_UNITS,
+            congested,
+            pending_candidates: eligible_seen,
+            next_block_fits: included,
+        }
+    }
+
     pub async fn get_mempool_transaction_by_id(&self, tx_id: &str) -> Option<Transaction> {
         self.mempool.read().await.find_transaction_by_id(tx_id)
     }
@@ -7994,6 +8333,228 @@ mod tests {
         let genesis = Blockchain::genesis_launch_block().expect("launch genesis");
         insert_raw_block(&bc, &genesis);
         (bc, genesis)
+    }
+
+    /// A template-eligible user transaction for estimator tests. sig_bytes
+    /// controls the decoded signature length (must exceed 64 to count as a
+    /// full witness) and, through the hex string, the serialized size — which
+    /// is how the byte-budget congestion tests steer capacity with few txs.
+    fn estimator_tx(fee_units: i128, timestamp: u64, sig_bytes: usize) -> Transaction {
+        Transaction {
+            sender: "11".repeat(20),
+            recipient: "22".repeat(20),
+            amount_units: 100_000_000,
+            fee_units,
+            timestamp,
+            signature: Some("ab".repeat(sig_bytes)),
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    const ESTIMATOR_NOW: u64 = 2_000_000_000;
+
+    #[test]
+    fn fee_estimate_quiet_mempool_recommends_the_anchor() {
+        let bc = test_blockchain();
+
+        // Anchor invariants the wallet relies on: strictly above the relay
+        // floor, under the AUTO ceiling, which is itself well under the
+        // explicit --fee ceiling (an automatic fee must never reach it).
+        assert_eq!(FEE_ESTIMATE_ANCHOR_UNITS, MIN_RELAY_FEE_UNITS * 2);
+        assert!(FEE_ESTIMATE_ANCHOR_UNITS < FEE_ESTIMATE_AUTO_CAP_UNITS);
+        assert!(FEE_ESTIMATE_AUTO_CAP_UNITS < WALLET_FEE_SAFETY_LIMIT_UNITS);
+
+        let empty = bc.fee_estimate_from_candidates(Vec::new(), ESTIMATOR_NOW);
+        assert_eq!(empty.recommended_units, FEE_ESTIMATE_ANCHOR_UNITS);
+        assert!(!empty.congested);
+        assert_eq!(empty.pending_candidates, 0);
+        assert_eq!(empty.next_block_fits, 0);
+        assert_eq!(empty.basis(), "quiet");
+
+        // A lightly loaded mempool that fully fits the next block still prices
+        // at the anchor — fees only rise when inclusion is actually contended.
+        let light = bc.fee_estimate_from_candidates(
+            vec![
+                estimator_tx(MIN_RELAY_FEE_UNITS, ESTIMATOR_NOW - 10, 65),
+                estimator_tx(30_000, ESTIMATOR_NOW - 5, 65),
+                estimator_tx(500_000, ESTIMATOR_NOW - 1, 65),
+            ],
+            ESTIMATOR_NOW,
+        );
+        assert_eq!(light.recommended_units, FEE_ESTIMATE_ANCHOR_UNITS);
+        assert!(!light.congested);
+        assert_eq!(light.pending_candidates, 3);
+        assert_eq!(light.next_block_fits, 3);
+    }
+
+    #[test]
+    fn fee_estimate_prices_one_unit_over_the_marginal_fee_under_congestion() {
+        let bc = test_blockchain();
+        // Three ~480 KB transactions against the mempool feed's 1 MB byte
+        // budget (the binding constraint pre-activation): the two highest fees
+        // fit, the third is excluded, so the recommendation must beat the
+        // weakest INCLUDED fee by exactly one unit (the oldest-first tiebreak
+        // means merely matching it loses).
+        let sig_bytes = 240_000;
+        let estimate = bc.fee_estimate_from_candidates(
+            vec![
+                estimator_tx(50_000, ESTIMATOR_NOW - 30, sig_bytes),
+                estimator_tx(40_000, ESTIMATOR_NOW - 20, sig_bytes),
+                estimator_tx(30_000, ESTIMATOR_NOW - 10, sig_bytes),
+            ],
+            ESTIMATOR_NOW,
+        );
+        assert!(estimate.congested);
+        assert_eq!(estimate.next_block_fits, 2);
+        assert_eq!(estimate.pending_candidates, 3);
+        assert_eq!(estimate.recommended_units, 40_001);
+        assert_eq!(estimate.basis(), "next-block");
+    }
+
+    #[test]
+    fn fee_estimate_is_clamped_to_the_automatic_ceiling() {
+        let bc = test_blockchain();
+        // A mempool stuffed with maximum-fee transactions must not drag the
+        // AUTOMATIC fee up with it: marginal+1 far exceeds the auto cap, so the
+        // clamp binds. This is the bound that keeps a hostile (or merely rich)
+        // mempool from spending a default user's balance, and it caps the payoff
+        // of deliberately fee-pumping the estimator.
+        let sig_bytes = 240_000;
+        let estimate = bc.fee_estimate_from_candidates(
+            vec![
+                estimator_tx(WALLET_FEE_SAFETY_LIMIT_UNITS, ESTIMATOR_NOW - 30, sig_bytes),
+                estimator_tx(WALLET_FEE_SAFETY_LIMIT_UNITS, ESTIMATOR_NOW - 20, sig_bytes),
+                estimator_tx(WALLET_FEE_SAFETY_LIMIT_UNITS, ESTIMATOR_NOW - 10, sig_bytes),
+            ],
+            ESTIMATOR_NOW,
+        );
+        assert!(estimate.congested);
+        assert_eq!(estimate.recommended_units, FEE_ESTIMATE_AUTO_CAP_UNITS);
+        assert!(estimate.recommended_units < WALLET_FEE_SAFETY_LIMIT_UNITS);
+    }
+
+    #[test]
+    fn fee_estimate_reserves_headroom_for_the_callers_own_transaction() {
+        let bc = test_blockchain();
+        // Every existing transaction fits, so nothing is displaced — but the
+        // remaining byte budget cannot hold one more ordinary transfer. The
+        // estimate exists to price THAT transfer, so this must read congested
+        // (the pre-fix code called it quiet and recommended the anchor, which
+        // would have been outbid by every incumbent).
+        // Two ~494 KB transactions leave under TYPICAL_FULL_WITNESS_TX_BYTES of
+        // the 1 MB feed budget free.
+        let sig_bytes = 247_000;
+        let estimate = bc.fee_estimate_from_candidates(
+            vec![
+                estimator_tx(60_000, ESTIMATOR_NOW - 30, sig_bytes),
+                estimator_tx(50_000, ESTIMATOR_NOW - 20, sig_bytes),
+            ],
+            ESTIMATOR_NOW,
+        );
+        assert_eq!(estimate.next_block_fits, 2, "both incumbents fit");
+        assert!(
+            estimate.congested,
+            "no room left for the caller's own transaction"
+        );
+        assert_eq!(estimate.recommended_units, 50_001);
+    }
+
+    #[test]
+    fn fee_estimate_charges_ineligible_transactions_against_the_feed_budget() {
+        let bc = test_blockchain();
+        // Ineligible transactions still consume the mempool feed's selection
+        // budget (the feed caps the RAW pool before the miner filters), so a
+        // pool clogged with junk is congestion even though little is minable.
+        // Truncated-witness readmits are the real-world shape: high fee, tiny,
+        // never templatable.
+        let junk_sig = 64; // stored/truncated witness -> not a template candidate
+        let mut candidates = vec![estimator_tx(80_000, ESTIMATOR_NOW - 60, 245_000)];
+        for i in 0..40 {
+            candidates.push(estimator_tx(90_000, ESTIMATOR_NOW - 50 + i, junk_sig));
+        }
+        candidates.push(estimator_tx(70_000, ESTIMATOR_NOW - 5, 245_000));
+
+        let estimate = bc.fee_estimate_from_candidates(candidates, ESTIMATOR_NOW);
+        assert_eq!(
+            estimate.pending_candidates, 2,
+            "only the two full-witness transfers are template-eligible"
+        );
+        assert!(
+            estimate.congested,
+            "junk consuming feed budget is real congestion"
+        );
+    }
+
+    #[test]
+    fn fee_estimate_walk_is_bounded_by_next_block_capacity() {
+        let bc = test_blockchain();
+        // A large pool must not cost O(mempool): the walk stops once the feed
+        // budget is spent. With ~480 KB transactions the 1 MB feed byte cap is
+        // reached after 3, so the remaining thousands are never serialized —
+        // this is what keeps the unauthenticated estimate endpoint cheap.
+        let sig_bytes = 240_000;
+        let candidates: Vec<Transaction> = (0..4_000)
+            .map(|i| estimator_tx(50_000 + i as i128, ESTIMATOR_NOW - 100, sig_bytes))
+            .collect();
+        let estimate = bc.fee_estimate_from_candidates(candidates, ESTIMATOR_NOW);
+        assert!(estimate.congested);
+        assert!(
+            estimate.pending_candidates <= 8,
+            "scan stopped at feed capacity, saw {} candidates",
+            estimate.pending_candidates
+        );
+    }
+
+    #[test]
+    fn template_candidate_predicate_matches_selection_rules() {
+        let bc = test_blockchain();
+        let good = estimator_tx(MIN_RELAY_FEE_UNITS, ESTIMATOR_NOW - 10, 65);
+        assert!(bc.is_template_candidate(&good, ESTIMATOR_NOW));
+
+        let mut coinbase = good.clone();
+        coinbase.sender = "MINING_REWARDS".to_string();
+        assert!(!bc.is_template_candidate(&coinbase, ESTIMATOR_NOW));
+
+        let mut below_floor = good.clone();
+        below_floor.fee_units = MIN_RELAY_FEE_UNITS - 1;
+        assert!(!bc.is_template_candidate(&below_floor, ESTIMATOR_NOW));
+
+        let mut stale = good.clone();
+        stale.timestamp = ESTIMATOR_NOW
+            .saturating_sub(MAX_TX_AGE_SECS)
+            .saturating_sub(TEMPLATE_FRESHNESS_MARGIN_SECS);
+        assert!(!bc.is_template_candidate(&stale, ESTIMATOR_NOW));
+
+        let mut future = good.clone();
+        future.timestamp = ESTIMATOR_NOW + MAX_BLOCK_FUTURE_TIME + 1;
+        assert!(!bc.is_template_candidate(&future, ESTIMATOR_NOW));
+
+        let mut truncated = good.clone();
+        truncated.signature = Some("ab".repeat(64)); // stored form, not a full witness
+        assert!(!bc.is_template_candidate(&truncated, ESTIMATOR_NOW));
+
+        let mut unsigned = good.clone();
+        unsigned.signature = None;
+        assert!(!bc.is_template_candidate(&unsigned, ESTIMATOR_NOW));
+    }
+
+    #[test]
+    fn template_candidate_order_is_fee_desc_then_oldest_first() {
+        let high = estimator_tx(50_000, 100, 65);
+        let low = estimator_tx(20_000, 50, 65);
+        let low_newer = estimator_tx(20_000, 60, 65);
+
+        assert_eq!(
+            Blockchain::template_candidate_order(&high, &low),
+            std::cmp::Ordering::Less,
+            "higher fee sorts first"
+        );
+        assert_eq!(
+            Blockchain::template_candidate_order(&low, &low_newer),
+            std::cmp::Ordering::Less,
+            "equal fees break ties oldest-first"
+        );
     }
 
     fn fee_accounting_test_block(

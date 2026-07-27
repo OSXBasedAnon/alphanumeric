@@ -5712,6 +5712,7 @@ impl Node {
                 "/explorer/tx?id={tx_id}  (status of a tx by id: confirmed/pending/not_found)",
                 "/explorer/address/{address}?limit=&before_height=&before_pos=",
                 "/explorer/supply",
+                "/explorer/fee-estimate  (advisory next-block fee recommendation)",
                 "POST /explorer/submit-tx  (body: signed transaction JSON)",
             ],
         }))
@@ -6051,6 +6052,47 @@ impl Node {
         (StatusCode::OK, Json(payload))
     }
 
+    /// Advisory fee recommendation for external integrators (web wallets,
+    /// exchanges building their own signing flows) — the same estimate the
+    /// reference wallet's `create` uses when --fee is absent. Pure POLICY, no
+    /// consensus surface: callers may attach any fee at or above the relay
+    /// floor; this endpoint just prices next-block inclusion off this node's
+    /// live mempool. try_fee_estimate is sync, so the chain guard is never held
+    /// across an await (the explorer design rule); a momentarily contended
+    /// mempool surfaces the standard 503 busy.
+    async fn explorer_fee_estimate_handler(
+        State(state): State<ExplorerState>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
+            return Self::explorer_busy();
+        };
+        let payload = {
+            let Some(estimate) = chain.try_fee_estimate() else {
+                return Self::explorer_busy();
+            };
+            json!({
+                "recommended_fee": Transaction::from_units(estimate.recommended_units),
+                "recommended_fee_units": estimate.recommended_units.to_string(),
+                "anchor_fee": Transaction::from_units(estimate.anchor_units),
+                "anchor_fee_units": estimate.anchor_units.to_string(),
+                "floor_fee": Transaction::from_units(estimate.floor_units),
+                "floor_fee_units": estimate.floor_units.to_string(),
+                "auto_cap_fee": Transaction::from_units(estimate.auto_cap_units),
+                "auto_cap_fee_units": estimate.auto_cap_units.to_string(),
+                "explicit_cap_fee": Transaction::from_units(estimate.explicit_cap_units),
+                "explicit_cap_fee_units": estimate.explicit_cap_units.to_string(),
+                "congested": estimate.congested,
+                "pending_candidates": estimate.pending_candidates,
+                "next_block_fits": estimate.next_block_fits,
+                "basis": estimate.basis(),
+            })
+        };
+        (StatusCode::OK, Json(payload))
+    }
+
     /// Submit a signed transaction to the network (opt-in explorer API write path).
     /// This is the endpoint web wallets / exchanges POST a signed tx to. It changes
     /// NO consensus surface: the tx goes through the SAME add_transaction validation
@@ -6196,6 +6238,10 @@ impl Node {
                 get(Self::explorer_address_handler),
             )
             .route("/explorer/supply", get(Self::explorer_supply_handler))
+            .route(
+                "/explorer/fee-estimate",
+                get(Self::explorer_fee_estimate_handler),
+            )
             .route(
                 "/explorer/submit-tx",
                 axum::routing::post(Self::explorer_submit_tx_handler),
