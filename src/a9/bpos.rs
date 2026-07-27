@@ -197,16 +197,41 @@ impl BPoSSentinel {
             blockchain.get_latest_block_index()
         };
 
-        // Update all node metrics
-        for mut metrics_ref in self.node_metrics.iter_mut() {
-            let metrics = metrics_ref.value_mut();
+        // Update all node metrics. Keys snapshotted FIRST: `iter_mut` holds a
+        // DashMap SHARD guard — a synchronous parking_lot lock — and the old loop
+        // awaited three times underneath it (headers read, chain read, balance),
+        // a genuine multi-threaded deadlock that stayed harmless only because
+        // nothing populates node_metrics yet. All awaits now run unguarded; the
+        // mutation at the end is brief and sync.
+        let addresses: Vec<String> = self
+            .node_metrics
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in addresses {
+            let address = match self.node_metrics.get(&key) {
+                Some(m) => m.address.clone(),
+                None => continue,
+            };
 
             // Don't reset blocks_verified, only update if new verifications found
-            let headers = self.header_sentinel.headers.read().await;
-            let verified_count = headers
-                .iter()
-                .filter(|state| state.verified_by.contains(&metrics.address))
-                .count();
+            let verified_count = {
+                let headers = self.header_sentinel.headers.read().await;
+                headers
+                    .iter()
+                    .filter(|state| state.verified_by.contains(&address))
+                    .count()
+            };
+            // Stake contribution input, read before taking the shard guard.
+            let balance = {
+                let blockchain = self.blockchain.read().await;
+                blockchain.get_wallet_balance(&address).await.ok()
+            };
+
+            let Some(mut metrics_ref) = self.node_metrics.get_mut(&key) else {
+                continue;
+            };
+            let metrics = metrics_ref.value_mut();
 
             if verified_count > metrics.blocks_verified as usize {
                 metrics.blocks_verified = verified_count as u64;
@@ -232,9 +257,8 @@ impl BPoSSentinel {
                 }
             }
 
-            // Calculate stake contribution
-            let blockchain = self.blockchain.read().await;
-            if let Ok(balance) = blockchain.get_wallet_balance(&metrics.address).await {
+            // Calculate stake contribution (balance was read above, unguarded).
+            if let Some(balance) = balance {
                 metrics.staked_amount = balance * AUTO_STAKE_PERCENTAGE;
             }
 
@@ -750,16 +774,17 @@ impl BPoSSentinel {
     }
 
     async fn verify_fork_switch(&self, current: &Block, new_hash: [u8; 32]) -> Result<f64, String> {
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop: holding the peers guard across a network fan-out is
+        // the exact wedge class named in the lock-watchdog comment (node.rs).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(5).collect()
+        };
         let mut confirmation_score = 0.0;
 
-        let peer_futures: Vec<_> = peers
-            .iter()
-            .take(5)
-            .map(|(addr, _)| {
-                self.node
-                    .request_blocks(*addr, current.index, current.index)
-            })
+        let peer_futures: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| self.node.request_blocks(addr, current.index, current.index))
             .collect();
 
         for blocks in futures::future::join_all(peer_futures)
@@ -778,12 +803,17 @@ impl BPoSSentinel {
     }
 
     async fn get_all_block_versions(&self, height: u32) -> Result<Vec<Block>, String> {
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop + a cap (this fan-out had neither: every peer in the
+        // table, under the guard).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(8).collect()
+        };
         let mut all_versions = Vec::new();
 
-        let peer_futures: Vec<_> = peers
-            .keys()
-            .map(|addr| self.node.request_blocks(*addr, height, height))
+        let peer_futures: Vec<_> = addrs
+            .into_iter()
+            .map(|addr| self.node.request_blocks(addr, height, height))
             .collect();
 
         for mut blocks in futures::future::join_all(peer_futures)
@@ -1072,17 +1102,24 @@ impl BPoSSentinel {
     }
 
     async fn repair_chain(&self) -> Result<(), String> {
-        let blockchain = self.blockchain.read().await;
-        let current_height = blockchain.get_latest_block_index() as u32;
-
-        // Get peer blocks
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop BOTH guards: the old shape held the chain read guard
+        // AND the peers guard across a serial per-peer request_blocks loop —
+        // worst case minutes of both core locks starved (the watchdog wedge
+        // class), safe only while this path stays unreachable.
+        let current_height = {
+            let blockchain = self.blockchain.read().await;
+            blockchain.get_latest_block_index() as u32
+        };
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(8).collect()
+        };
         let mut peer_blocks = Vec::new();
 
-        for (addr, _) in peers.iter() {
+        for addr in addrs {
             if let Ok(blocks) = self
                 .node
-                .request_blocks(*addr, current_height.saturating_sub(10), current_height)
+                .request_blocks(addr, current_height.saturating_sub(10), current_height)
                 .await
             {
                 peer_blocks.push(blocks);
@@ -1100,12 +1137,16 @@ impl BPoSSentinel {
 
     async fn get_competing_blocks(&self, block_height: u32) -> Result<Vec<Block>, String> {
         let mut competing_blocks = Vec::new();
-        let peers = self.node.peers.read().await;
+        // Snapshot-then-drop (see repair_chain).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(8).collect()
+        };
 
-        for (addr, _) in peers.iter() {
+        for addr in addrs {
             if let Ok(blocks) = self
                 .node
-                .request_blocks(*addr, block_height, block_height)
+                .request_blocks(addr, block_height, block_height)
                 .await
             {
                 competing_blocks.extend(blocks);
@@ -1116,11 +1157,14 @@ impl BPoSSentinel {
     }
 
     async fn get_block_from_network(&self, hash: [u8; 32]) -> Result<Option<Block>, String> {
-        // Try to get block from connected peers
-        let peers = self.node.peers.read().await;
-        for (addr, _) in peers.iter().take(3) {
+        // Try to get block from connected peers. Snapshot-then-drop (see repair_chain).
+        let addrs: Vec<std::net::SocketAddr> = {
+            let peers = self.node.peers.read().await;
+            peers.keys().copied().take(3).collect()
+        };
+        for addr in addrs {
             // Try up to 3 peers
-            if let Ok(blocks) = self.node.request_blocks(*addr, 0, 0).await {
+            if let Ok(blocks) = self.node.request_blocks(addr, 0, 0).await {
                 if let Some(block) = blocks.into_iter().find(|b| b.hash == hash) {
                     return Ok(Some(block));
                 }
