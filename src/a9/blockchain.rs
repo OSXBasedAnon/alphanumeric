@@ -9079,6 +9079,109 @@ mod tests {
     }
 
     #[test]
+    fn activation_keeps_realistically_full_blocks_mineable_and_bounds_capacity() {
+        // The other activation tests use tiny aggregates (<=50 txs, <=0.005 total
+        // fees). The case that would actually bite a live network — a block filled
+        // with ORDINARY transactions at the fee the wallet really recommends — was
+        // untested. The activated rule caps NET issuance (reward - fees) at the
+        // scheduled baseline, and because the coinbase is pinned to an exact value
+        // a miner cannot voluntarily take less: past the bound the only legal move
+        // is to include FEWER transactions. So per-block capacity is bounded by
+        // aggregate FEES, not by tx count or bytes. This test pins both halves:
+        // a full mempool feed at the anchor fee stays mineable today, and the
+        // capacity bound is where we think it is.
+        let (bc, genesis) = fee_accounting_test_chain();
+
+        // A full 2000-tx mempool feed at the anchor fee (what the estimator
+        // recommends on a quiet network) must remain mineable.
+        let full_feed = vec![FEE_ESTIMATE_ANCHOR_UNITS; 2_000];
+        let block = fee_accounting_test_block(&bc, 100, genesis.timestamp, &full_feed);
+        bc.validate_block_reward_rules_at(&block, 100)
+            .expect("a full 2000-tx feed at the anchor fee must stay mineable after activation");
+
+        // Capacity bound: find the largest admissible anchor-fee tx count by
+        // bisection, so a formula change that silently moves it fails here.
+        let admits = |count: usize| -> bool {
+            let fees = vec![FEE_ESTIMATE_ANCHOR_UNITS; count];
+            let candidate = fee_accounting_test_block(&bc, 100, genesis.timestamp, &fees);
+            bc.validate_block_reward_rules_at(&candidate, 100).is_ok()
+        };
+        let (mut lo, mut hi) = (0usize, MAX_BLOCK_TX_COUNT);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if admits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        assert!(
+            lo >= 2_000,
+            "anchor-fee capacity ({lo}) must cover a full mempool feed"
+        );
+        assert!(
+            lo < MAX_BLOCK_TX_COUNT,
+            "capacity ({lo}) is expected to bind below the hard tx cap at this schedule point"
+        );
+
+        // The bound is on AGGREGATE fees, so a higher per-tx fee reaches it with
+        // proportionally fewer transactions — this is the number that shrinks as
+        // the emission schedule decays, and the reason an un-upgraded miner can
+        // only ever produce a rejected block when a block carries real fee volume.
+        let ten_x = FEE_ESTIMATE_ANCHOR_UNITS * 10;
+        let over = vec![ten_x; (lo / 10) + 2];
+        let over_block = fee_accounting_test_block(&bc, 100, genesis.timestamp, &over);
+        assert!(
+            matches!(
+                bc.validate_block_reward_rules_at(&over_block, 100),
+                Err(BlockchainError::FeeAccountingLimitExceeded)
+            ),
+            "aggregate fees past the bound must be rejected regardless of tx count"
+        );
+    }
+
+    #[test]
+    fn activation_shape_rules_accept_transactions_built_by_pre_activation_clients() {
+        // Compatibility guard for the flag day: the activated shape rules demand
+        // pub_key + sig_hash + a full signature on every regular tx, and NO
+        // signature fields on the system coinbase. Pre-activation clients already
+        // build exactly this (admission sets sig_hash and requires pub_key;
+        // Transaction::new leaves the coinbase's fields None), so their
+        // transactions and templates stay valid across the boundary. If a future
+        // change ever makes the shape stricter than what shipped clients emit,
+        // this test fails instead of the live network splitting.
+        let coinbase = Transaction::new(
+            "MINING_REWARDS".to_string(),
+            "11".repeat(20),
+            0.0,
+            NETWORK_FEE,
+            1_700_000_000,
+            None,
+        );
+        Blockchain::validate_activated_transaction_shape(
+            &coinbase,
+            SignatureValidationMode::RequireFull,
+        )
+        .expect("a pre-activation client's coinbase shape must stay valid");
+
+        let mut regular = Transaction::new(
+            "a".repeat(40),
+            "b".repeat(40),
+            1.0,
+            NETWORK_FEE,
+            1_700_000_000,
+            Some("aa".repeat(mldsa::SIGNATURE_BYTES)),
+        );
+        regular.pub_key = Some("bb".repeat(mldsa::PUBLIC_KEY_BYTES));
+        regular.sig_hash = Some("cc".repeat(32));
+        Blockchain::validate_activated_transaction_shape(
+            &regular,
+            SignatureValidationMode::RequireFull,
+        )
+        .expect("a pre-activation client's signed transfer must stay valid");
+    }
+
+    #[test]
     fn fee_accounting_envelope_boundary_is_atomic_in_the_rising_regime() {
         const SIX_MONTHS: u64 = 15_768_000;
         let (bc, genesis) = fee_accounting_test_chain();
