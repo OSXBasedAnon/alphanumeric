@@ -641,6 +641,14 @@ impl MiningManager {
             let blockchain_for_tip_checks = Arc::clone(&self.blockchain);
             let expected_parent_index = header.number.saturating_sub(1);
 
+            // Aggregate hash counter for the progress bar (per pass): each worker
+            // adds its reporting quantum, so the bar shows TOTAL work done instead
+            // of whichever thread's absolute offset last won the try_lock (the old
+            // bar oscillated between thread positions), and a real local hashrate
+            // becomes derivable for the message line.
+            let hashes_done = Arc::new(AtomicU64::new(0));
+            let grind_started = Instant::now();
+
             // GPU FAST PATH (feature gpu_miner + runtime `mine --gpu`). Propose a
             // winning nonce on the GPU; on success set the SAME result atomics the
             // CPU search would, so the finalization below builds and re-verifies the
@@ -776,6 +784,7 @@ impl MiningManager {
                 let tip_change_counter_check = Arc::clone(&tip_change_counter_check);
                 let blockchain_for_tip_checks = Arc::clone(&blockchain_for_tip_checks);
                 let progress_bar = Arc::clone(&progress_bar);
+                let hashes_done = Arc::clone(&hashes_done);
                 let stop_for_cpu = Arc::clone(&stop);
                 let header = header.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -802,38 +811,52 @@ impl MiningManager {
                             // (pow_byte_compare_matches_biguint_compare in blockchain.rs).
                             let mut cached_target_bytes = [0u8; 32];
 
+                            // Flag checks + the clock read on a 1024-nonce cadence, not
+                            // per nonce: SystemTime::now() is an opaque ~25ns vDSO call
+                            // the optimizer cannot hoist, and against a ~60-120ns blake3
+                            // of 92 bytes it (plus the per-nonce atomic loads) was a
+                            // double-digit percentage of the whole loop. Timestamps are
+                            // second-granularity, so a <=1024-nonce lag is invisible;
+                            // stop/abort latency stays in the microseconds at any
+                            // realistic hashrate.
+                            const HOT_CHECK_INTERVAL: u64 = 1024;
+                            let mut until_check: u64 = 0;
                             for nonce in start_nonce..end_nonce {
-                                if found.load(Ordering::Relaxed)
-                                    || abort_for_tip_change_check.load(Ordering::Relaxed)
-                                    || stop_for_cpu.load(Ordering::Relaxed)
-                                {
-                                    return Ok(());
-                                }
+                                if until_check == 0 {
+                                    until_check = HOT_CHECK_INTERVAL;
+                                    if found.load(Ordering::Relaxed)
+                                        || abort_for_tip_change_check.load(Ordering::Relaxed)
+                                        || stop_for_cpu.load(Ordering::Relaxed)
+                                    {
+                                        return Ok(());
+                                    }
 
-                                // Don't create full Block - just calculate hash directly
-                                // We only need the full block when we find a valid nonce
-                                // Clamped to the parent's timestamp: a local clock behind
-                                // the parent would stamp a block that fails parent-
-                                // timestamp validation — discovered only AFTER the grind,
-                                // burning the whole solve.
-                                let timestamp = candidate_timestamp(
-                                    SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    previous_block_timestamp,
-                                );
-                                if timestamp != cached_timestamp {
-                                    cached_timestamp = timestamp;
-                                    cached_difficulty = Block::consensus_next_difficulty(
-                                        previous_difficulty,
-                                        timestamp.saturating_sub(previous_block_timestamp),
-                                        local_header.number,
+                                    // Don't create full Block - just calculate hash
+                                    // directly; the full block is only built for a valid
+                                    // nonce. Clamped to the parent's timestamp: a local
+                                    // clock behind the parent would stamp a block that
+                                    // fails parent-timestamp validation — discovered only
+                                    // AFTER the grind, burning the whole solve.
+                                    let timestamp = candidate_timestamp(
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        previous_block_timestamp,
                                     );
-                                    cached_target_bytes = pow_target_bytes(
-                                        &pow_target_from_difficulty(cached_difficulty),
-                                    );
+                                    if timestamp != cached_timestamp {
+                                        cached_timestamp = timestamp;
+                                        cached_difficulty = Block::consensus_next_difficulty(
+                                            previous_difficulty,
+                                            timestamp.saturating_sub(previous_block_timestamp),
+                                            local_header.number,
+                                        );
+                                        cached_target_bytes = pow_target_bytes(
+                                            &pow_target_from_difficulty(cached_difficulty),
+                                        );
+                                    }
                                 }
+                                until_check -= 1;
                                 let hash = {
                                     let mut header_data = [0u8; 92];
                                     let mut offset = 0;
@@ -847,7 +870,7 @@ impl MiningManager {
                                     offset += 32;
 
                                     header_data[offset..offset + 8]
-                                        .copy_from_slice(&timestamp.to_le_bytes());
+                                        .copy_from_slice(&cached_timestamp.to_le_bytes());
                                     offset += 8;
 
                                     header_data[offset..offset + 8]
@@ -867,7 +890,7 @@ impl MiningManager {
                                 if hash <= cached_target_bytes {
                                     if !found.swap(true, Ordering::Relaxed) {
                                         result_nonce.store(nonce, Ordering::Release);
-                                        result_timestamp.store(timestamp, Ordering::Release);
+                                        result_timestamp.store(cached_timestamp, Ordering::Release);
                                         result_difficulty
                                             .store(cached_difficulty, Ordering::Release);
                                         if let Ok(mut hash_guard) = hash_result.lock() {
@@ -903,13 +926,24 @@ impl MiningManager {
                                 }
 
                                 if nonce % update_interval == 0 {
+                                    // Aggregate position: total hashes across ALL
+                                    // workers this pass. The old per-thread absolute
+                                    // offset made the bar oscillate between whichever
+                                    // thread last won the try_lock. Also surface the
+                                    // one number a miner actually wants: live local MH/s.
+                                    let total = hashes_done
+                                        .fetch_add(update_interval, Ordering::Relaxed)
+                                        .saturating_add(update_interval);
                                     if let Ok(pb) = progress_bar.try_lock() {
-                                        pb.set_position(nonce.saturating_sub(current_nonce));
+                                        pb.set_position(total);
                                         let hash_hex = hex::encode(hash);
+                                        let secs =
+                                            grind_started.elapsed().as_secs_f64().max(0.001);
                                         pb.set_message(format!(
-                                            "Hash: {} (Difficulty: {})",
+                                            "Hash: {} (Difficulty: {}) · {:.2} MH/s",
                                             &hash_hex[..16],
-                                            cached_difficulty
+                                            cached_difficulty,
+                                            total as f64 / secs / 1.0e6
                                         ));
                                     }
 
