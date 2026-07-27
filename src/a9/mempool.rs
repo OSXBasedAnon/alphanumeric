@@ -81,16 +81,21 @@ pub struct Mempool {
 
 impl Mempool {
     fn mempool_ttl_secs() -> Option<u64> {
-        const DEFAULT_TTL_SECS: u64 = 600;
-        let ttl = std::env::var("ALPHANUMERIC_MEMPOOL_TTL_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_TTL_SECS);
-        if ttl == 0 {
-            None
-        } else {
-            Some(ttl)
-        }
+        // Parsed once per process: this sits on the admission/prune paths, and
+        // std::env::var takes the process env lock and allocates on every call.
+        static TTL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *TTL.get_or_init(|| {
+            const DEFAULT_TTL_SECS: u64 = 600;
+            let ttl = std::env::var("ALPHANUMERIC_MEMPOOL_TTL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_TTL_SECS);
+            if ttl == 0 {
+                None
+            } else {
+                Some(ttl)
+            }
+        })
     }
 
     pub fn new() -> Self {
