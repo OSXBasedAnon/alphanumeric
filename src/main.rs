@@ -1289,6 +1289,14 @@ async fn async_main() -> Result<()> {
             let db_path_recon = db_path.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(20));
+                // Wake-from-sleep: where Instant advances across an OS suspend
+                // (Windows), the default Burst behavior replays every slept-through
+                // tick back-to-back — two NeedsBootstrap iterations (= two strikes,
+                // marker + exit) could fire within seconds of waking, before
+                // discovery had re-dialed a single live peer. Delay ticks once
+                // immediately, then resumes the 20s cadence, so the wake-recovery
+                // delta-sync gets its chance and strikes stay >= 20s apart.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut strikes = 0u32;
                 let mut cooldown_logged = false;
                 let mut behind_logged = false;

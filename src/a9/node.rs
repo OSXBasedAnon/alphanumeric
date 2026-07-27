@@ -51,7 +51,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
-    time::{interval, sleep, timeout},
+    time::{interval, sleep, timeout, MissedTickBehavior},
 };
 
 use crate::a9::blockchain::{
@@ -82,6 +82,11 @@ const MAX_PEERS_PER_SUBNET: usize = 3;
 // lockstep). Bounds the per-request disk reads on the event loop and the reply size. 256 =
 // 4x the 64-aligned convergence window, so it never throttles catch-up.
 pub const MAX_GETBLOCKS_SPAN: u32 = 256;
+// Max connected peers a single sync_full_history_from_peer call will probe for a fresh
+// height before giving up. Each probe is bounded by the message timeouts (5s connect /
+// 30s response worst case against a half-open post-sleep socket), so this also bounds
+// the call's worst-case candidate-selection time.
+const FULL_SYNC_MAX_CANDIDATES: usize = 8;
 const SUBNET_MASK_IPV4: u8 = 24; // /24 subnet
                                  // Group IPv6 peers by /48, NOT /64: a single rented /48 contains 65,536 /64s, so a /64
                                  // grouping let one attacker present that many distinct "subnets" and completely bypass the
@@ -1416,6 +1421,12 @@ pub struct Node {
     /// Consecutive zero-progress converge calls while > reorg-margin behind a
     /// fresh beacon; escalates to NeedsBootstrap at CONVERGE_STALL_ESCALATE_CALLS.
     converge_stall_cycles: Arc<AtomicU64>,
+    /// True while a bulk peer delta-sync (sync_full_history_from_peer) is streaming.
+    /// The idle reconcile loop, the beacon-watch loop and mine-prep can all decide to
+    /// heal the same far-behind chain at once (they all fire together on a
+    /// wake-from-sleep); overlapping calls return immediately instead of
+    /// double-streaming the same span. See sync_full_history_from_peer_bounded.
+    full_sync_in_flight: Arc<AtomicBool>,
     /// Rolling window of recent (observed-at, height) beacon reads that positively
     /// matched our network. The mine-prep stale-tip guard consults the MAX height in
     /// the window as "the freshest network height we can trust." A ROLLING max (not a
@@ -1912,6 +1923,7 @@ impl Node {
             converge_stall_tip: Arc::new(AtomicU64::new(0)),
             converge_stall_last_ms: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
+            full_sync_in_flight: Arc::new(AtomicBool::new(false)),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
@@ -5182,18 +5194,97 @@ impl Node {
                     }
                     return Ok(());
                 }
-                // Diverged below the finality window — incremental convergence cannot
-                // fix this; SCHEDULE the re-bootstrap here so the "restart" advice is
-                // true (2026-07-11: prep told a wedged operator to restart while the
-                // boot check kept streaming-skipping — a perfect advice loop).
+                // Diverged below the finality window — or (far more common) simply fallen
+                // further behind than the converge engine's bounded forward append can
+                // cross (> ORPHAN_REORG_DEPTH ≈ 1.4h of blocks: any machine that slept
+                // through an evening). Incremental convergence cannot fix either, but a
+                // RESTART is no longer the first answer: try the same bulk peer delta-sync
+                // the idle reconcile loop uses (signed-beacon-anchored, tip-probed, every
+                // block through normal ingest validation; includes a discovery kick for
+                // the wake-from-sleep dead-socket case). A genuine fork cannot pass the
+                // sync's ingest/linkage checks, so it falls through unhealed. Only when no
+                // reachable peer could serve the missing span do we schedule the snapshot
+                // re-bootstrap and stop — and then the "restart" advice is true
+                // (2026-07-11: prep told a wedged operator to restart while the boot
+                // check kept streaming-skipping — a perfect advice loop; that fix stays).
                 Converge::NeedsBootstrap => {
-                    let scheduled =
-                        self.schedule_force_rebootstrap_hard("mine-prep: diverged below finality");
-                    return Err(NodeError::ConsensusFailure(if scheduled {
-                        "chain diverged below the finality window; a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain".into()
-                    } else {
-                        "chain diverged below the finality window; a re-bootstrap ran recently — the node keeps retrying in the background".into()
-                    }));
+                    let tip_before =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    // Slice the sync to the caller's budget, floored at 10s so a
+                    // nearly-expired budget still gets one usable probe+stream window
+                    // (bounded overshoot, same spirit as the round cap's 2s floor).
+                    let slice = deadline.max(Instant::now() + Duration::from_secs(10));
+                    let healed = self
+                        .sync_full_history_from_peer_bounded(true, Some(slice))
+                        .await;
+                    let tip_after =
+                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    match healed {
+                        Converge::Converged | Converge::AtTipAhead => {
+                            // Same ghost-block guard as the Converged arm: one stale
+                            // beacon read must not let us mine below the freshest
+                            // height the network is known to have reached.
+                            let known_tip = self.beacon_high_water_height();
+                            if Self::stale_tip_mine_refused(tip_after, known_tip) {
+                                return Err(NodeError::Retryable(format!(
+                                    "caught up to {} via a peer but the network has reached {}; not mining a stale tip",
+                                    tip_after, known_tip
+                                )));
+                            }
+                            info!(
+                                "mine-prep: healed a {}-block deficit in place via peer delta-sync",
+                                tip_after.saturating_sub(tip_before)
+                            );
+                            return Ok(());
+                        }
+                        // Real forward progress (slice expired mid-stream / peer went
+                        // away mid-span): resume from the advanced tip, don't stop.
+                        _ if tip_after > tip_before => {
+                            if Instant::now() >= deadline {
+                                return Err(NodeError::Retryable(format!(
+                                    "recovered {} blocks from a peer and still catching up; retry",
+                                    tip_after.saturating_sub(tip_before)
+                                )));
+                            }
+                            backoff = Duration::from_millis(500);
+                            last_round_tip = tip_after;
+                        }
+                        // Another loop's delta-sync already owns the stream
+                        // (single-flight guard): the tip is being advanced for us —
+                        // wait it out instead of hard-stopping.
+                        Converge::Progressed => {
+                            if Instant::now() >= deadline {
+                                return Err(NodeError::Retryable(
+                                    "a background peer sync is closing the gap; retry shortly".into(),
+                                ));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(5));
+                            last_round_tip =
+                                self.blockchain.read().await.get_latest_block_index() as u32;
+                        }
+                        // No peer could serve the span (none reachable, none passing
+                        // the tip probe — includes the genuine-fork case, whose blocks
+                        // cannot link onto our branch). Within budget keep retrying:
+                        // prep-discovery / the wake recovery may land fresh peers any
+                        // moment. At budget end the snapshot re-bootstrap is genuinely
+                        // the only cure left.
+                        _ => {
+                            if Instant::now() < deadline {
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(5));
+                                continue;
+                            }
+                            let scheduled = self.schedule_force_rebootstrap_hard(
+                                "mine-prep: diverged below finality and no peer could serve the gap",
+                            );
+                            return Err(NodeError::ConsensusFailure(if scheduled {
+                                "chain diverged below the finality window and no reachable peer could serve the missing history; a re-bootstrap is scheduled — restart this node to re-sync onto the canonical chain".into()
+                            } else {
+                                "chain diverged below the finality window; a re-bootstrap ran recently — the node keeps retrying in the background".into()
+                            }));
+                        }
+                    }
                 }
                 // Made forward progress but not fully caught up: keep trying with backoff;
                 // after the deadline hand back Retryable so the caller re-invokes (the
@@ -5242,6 +5333,47 @@ impl Node {
                             bc.get_latest_block_index() as u32
                         };
                         if beacon.height > local_tip.saturating_add(64) {
+                            // Before conceding to a restart, try the bulk peer
+                            // delta-sync once (same heal as the NeedsBootstrap arm):
+                            // a Transient-ancestor stall with a big gap usually means
+                            // relay holes, and exact GetBlocks spans from a
+                            // full-history peer bypass the relay entirely.
+                            let slice = Instant::now() + Duration::from_secs(10);
+                            let healed = self
+                                .sync_full_history_from_peer_bounded(true, Some(slice))
+                                .await;
+                            let tip_now =
+                                self.blockchain.read().await.get_latest_block_index() as u32;
+                            match healed {
+                                Converge::Converged | Converge::AtTipAhead => {
+                                    let known_tip = self.beacon_high_water_height();
+                                    if Self::stale_tip_mine_refused(tip_now, known_tip) {
+                                        return Err(NodeError::Retryable(format!(
+                                            "caught up to {} via a peer but the network has reached {}; not mining a stale tip",
+                                            tip_now, known_tip
+                                        )));
+                                    }
+                                    info!("mine-prep: healed a relay-hole deficit in place via peer delta-sync");
+                                    return Ok(());
+                                }
+                                // Progress (ours, partial) or an in-flight background
+                                // sync: the gap is being closed — report Retryable so
+                                // the caller re-invokes instead of a restart hard-stop.
+                                Converge::Progressed => {
+                                    return Err(NodeError::Retryable(format!(
+                                        "network tip {} is {} blocks ahead; a peer sync is closing the gap — retry",
+                                        beacon.height,
+                                        beacon.height.saturating_sub(tip_now)
+                                    )));
+                                }
+                                _ if tip_now > local_tip => {
+                                    return Err(NodeError::Retryable(format!(
+                                        "recovered {} blocks from a peer and still catching up; retry",
+                                        tip_now.saturating_sub(local_tip)
+                                    )));
+                                }
+                                _ => {}
+                            }
                             // Same advice-loop fix as the NeedsBootstrap arm: schedule
                             // the re-bootstrap so restarting actually performs it.
                             let scheduled = self.schedule_force_rebootstrap(
@@ -7617,6 +7749,11 @@ impl Node {
             let safety_secs = if is_publisher { 1 } else { 30 };
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
+                // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
+                // the default Burst behavior replays every slept-through tick back-to-back
+                // — hours of beacon polls and converge calls fired in seconds. One
+                // immediate tick, then the normal cadence.
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 let mut last_version: u64 = u64::MAX;
                 let mut ticks_since_full: u64 = 0;
                 let mut publisher_bootstrap_strikes: u32 = 0;
@@ -7793,10 +7930,14 @@ impl Node {
                                     "Divergence below finality window at beacon {}; trying peer full-history sync",
                                     b.height
                                 );
-                                // TIER 2: reconstruct the canonical chain from a seed peer
-                                // (gateway-independent body acquisition) instead of relying
-                                // solely on the gateway snapshot. No-op without a seed peer.
-                                match node_clone.sync_full_history_from_peer(false).await {
+                                // TIER 2: reconstruct the canonical chain from a seed peer —
+                                // or any CONNECTED peer (a seedless client, the common case,
+                                // previously made this a no-op and fell straight through to
+                                // "gateway bootstrap required"). Safety is source-independent:
+                                // the sync's STEP-2 signed-beacon tip probe and per-block
+                                // ingest validation gate every peer, and the single-flight
+                                // guard keeps this from overlapping the idle-loop heal.
+                                match node_clone.sync_full_history_from_peer(true).await {
                                     Converge::Converged
                                     | Converge::AtTipAhead
                                     | Converge::Progressed => {
@@ -13015,6 +13156,9 @@ impl Node {
         const MAX_FAILURES: u32 = 3;
 
         let mut interval = tokio::time::interval(PING_INTERVAL);
+        // No burst replay of slept-through pings after an OS suspend (see the
+        // beacon-watch ticker): one immediate ping, then the normal cadence.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut failures = 0;
 
         // Send initial ping to measure latency
@@ -13303,23 +13447,43 @@ impl Node {
         }
     }
 
-    /// Connected peers that report a height at or above `beacon_height`, tallest first (address as a
-    /// deterministic tiebreak) — the candidate set the boot / idle delta-sync tries when no
-    /// configured seed can serve the beacon. The reported height is only a cheap PRE-filter;
-    /// sync_full_history_from_peer independently re-verifies each candidate (verify_peer +
-    /// request_peer_height + the tip probe) before applying any block, so a lying peer that inflates
-    /// its height is filtered out there, not here.
+    /// Connected peers to try for the boot / idle / mine-prep delta-sync: peers whose RECORDED
+    /// height already covers the beacon first (tallest first), then everyone else (tallest
+    /// first; address as a deterministic tiebreak), capped at FULL_SYNC_MAX_CANDIDATES.
+    ///
+    /// The recorded height is a RANKING hint, never a filter. After an OS sleep every
+    /// PeerInfo.blocks is hours stale — uniformly BELOW the live beacon — and the old
+    /// `blocks >= beacon_height` pre-filter starved the delta-sync of every live candidate
+    /// exactly when it was the only cure (Windows wake-after-idle, 2026-07-27: "cannot mine
+    /// right now … restart to re-bootstrap" on a node whose peers could all have served the
+    /// gap). sync_full_history_from_peer independently re-verifies each candidate
+    /// (verify_peer + a FRESH request_peer_height + the signed-beacon tip probe) before
+    /// applying any block, so a stale — or lying — recorded height can cost a bounded probe,
+    /// never correctness.
     fn full_sync_candidate_peers(
         peers: &HashMap<SocketAddr, PeerInfo>,
         beacon_height: u32,
     ) -> Vec<SocketAddr> {
         let mut ranked: Vec<(SocketAddr, u32)> = peers
             .iter()
-            .filter(|(_, info)| info.blocks >= beacon_height)
             .map(|(addr, info)| (*addr, info.blocks))
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.sort_by(|a, b| {
+            let a_covers = a.1 >= beacon_height;
+            let b_covers = b.1 >= beacon_height;
+            b_covers
+                .cmp(&a_covers)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(FULL_SYNC_MAX_CANDIDATES);
         ranked.into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    /// True when a caller-imposed slice deadline has passed. None = unbounded
+    /// (background loops run the sync to completion).
+    fn full_sync_deadline_expired(deadline: Option<Instant>) -> bool {
+        deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Next GetBlocks span [start, end], bounded so (end - start) < MAX_GETBLOCKS_SPAN (the
@@ -13345,6 +13509,36 @@ impl Node {
         block_index >= verification_floor.saturating_add(1)
     }
 
+    /// Probe connected peers (ranked by full_sync_candidate_peers) for one that can serve the
+    /// signed beacon: verify_peer + a FRESH height read gate each candidate — the recorded
+    /// heights only order the attempts. Bounded by FULL_SYNC_MAX_CANDIDATES, the per-message
+    /// timeouts, and the caller's slice deadline.
+    async fn probe_full_sync_candidates(
+        &self,
+        beacon: &TipBeaconInfo,
+        deadline: Option<Instant>,
+    ) -> Option<SocketAddr> {
+        let candidates = {
+            let peers = self.peers.read().await;
+            Self::full_sync_candidate_peers(&peers, beacon.height)
+        };
+        for addr in candidates {
+            if Self::full_sync_deadline_expired(deadline) {
+                return None;
+            }
+            if self.verify_peer(addr).await.is_err() {
+                continue;
+            }
+            let Ok(peer_height) = self.request_peer_height(addr).await else {
+                continue;
+            };
+            if Self::full_sync_anchor_height(beacon.height, peer_height).is_some() {
+                return Some(addr);
+            }
+        }
+        None
+    }
+
     /// TIER-2 bootstrap fallback: reconstruct genesis..tip directly from a reachable SEED PEER
     /// over GetBlocks when the gateway snapshot is unavailable/stale — removing the heavy
     /// bootstrap zip as a single point of failure. This is BODY ACQUISITION only:
@@ -13356,6 +13550,42 @@ impl Node {
     /// a Converge outcome; touches NO state on the no-peer / no-beacon path, so every existing
     /// gateway/relay path is byte-for-byte unchanged when this cannot help.
     pub async fn sync_full_history_from_peer(&self, include_connected_peers: bool) -> Converge {
+        self.sync_full_history_from_peer_bounded(include_connected_peers, None)
+            .await
+    }
+
+    /// Deadline-sliced, single-flight variant. `deadline` bounds interactive callers
+    /// (mine-prep works inside a declared prep budget): it is checked between candidate
+    /// probes and between GetBlocks spans — never mid-block — so expiry always leaves a
+    /// consistent applied prefix and the next call resumes from the advanced tip.
+    /// `None` = run to completion (the background loops).
+    async fn sync_full_history_from_peer_bounded(
+        &self,
+        include_connected_peers: bool,
+        deadline: Option<Instant>,
+    ) -> Converge {
+        // SINGLE-FLIGHT: the idle reconcile loop, the beacon-watch loop and mine-prep can
+        // all decide to heal the same far-behind chain at once (on a wake-from-sleep they
+        // all fire together). Streaming the same span twice doubles peer load for zero
+        // benefit, so an overlapping call reports Progressed — "the tip is being advanced"
+        // — which no caller escalates on (the idle loop resets its strikes, mine-prep keeps
+        // waiting inside its budget). Drop-guard, not a tail store: the future can be
+        // cancelled at any await point and the flag must never stay latched.
+        struct InFlight<'a>(&'a AtomicBool);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .full_sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Converge::Progressed;
+        }
+        let _in_flight = InFlight(&self.full_sync_in_flight);
+
         // STEP 0: trusted anchor = the signed tip beacon (the SAME canonical (height,hash)
         // converge_to_canonical already trusts). No beacon -> no anchor -> caller falls through.
         let Some(beacon) = self.fetch_tip_beacon().await else {
@@ -13366,6 +13596,9 @@ impl Node {
         // beacon height, never the peer's self-reported height.
         let mut chosen: Option<SocketAddr> = None;
         'seed: for seed in self.configured_seed_nodes().to_vec() {
+            if Self::full_sync_deadline_expired(deadline) {
+                break;
+            }
             let Ok(addrs) = tokio::net::lookup_host(&seed).await else {
                 continue;
             };
@@ -13383,28 +13616,25 @@ impl Node {
             }
         }
         // If no configured seed served the beacon and the caller allows it (the boot / idle client
-        // path — NOT the publisher live loop), fall back to already-CONNECTED peers reporting a
-        // height at or above the beacon. Source is irrelevant to safety: the STEP-2 tip probe and
-        // the per-block PoW/hash/witness checks below reject any peer not truly on the canonical
-        // chain, so this only WIDENS who can serve the delta, never what is accepted. A seedless
-        // client (the common case) thus gets a real delta-sync path instead of the full snapshot.
+        // path — NOT the publisher live loop), fall back to already-CONNECTED peers. Source is
+        // irrelevant to safety: the STEP-2 tip probe and the per-block PoW/hash/witness checks
+        // below reject any peer not truly on the canonical chain, so this only WIDENS who can
+        // serve the delta, never what is accepted. A seedless client (the common case) thus gets
+        // a real delta-sync path instead of the full snapshot.
         if chosen.is_none() && include_connected_peers {
-            let candidates = {
-                let peers = self.peers.read().await;
-                Self::full_sync_candidate_peers(&peers, beacon.height)
-            };
-            for addr in candidates {
-                if self.verify_peer(addr).await.is_err() {
-                    continue;
-                }
-                let Ok(peer_height) = self.request_peer_height(addr).await else {
-                    continue;
-                };
-                if Self::full_sync_anchor_height(beacon.height, peer_height).is_some() {
-                    chosen = Some(addr);
-                    break;
-                }
-            }
+            chosen = self.probe_full_sync_candidates(&beacon, deadline).await;
+        }
+        // WAKE-FROM-SLEEP RECOVERY: after an OS suspend the peers map holds only half-open
+        // sockets and hours-stale recorded heights, so every probe above can fail even though
+        // the network is one dial away. Kick a bounded discovery pass (fresh dials, fresh
+        // handshake heights) and re-scan ONCE. This is what lets a woken laptop/desktop heal
+        // in place instead of falling through to the snapshot re-bootstrap escape.
+        if chosen.is_none()
+            && include_connected_peers
+            && !Self::full_sync_deadline_expired(deadline)
+        {
+            let _ = timeout(Duration::from_secs(5), self.connect_discovery_peers(8)).await;
+            chosen = self.probe_full_sync_candidates(&beacon, deadline).await;
         }
 
         let Some(peer) = chosen else {
@@ -13428,6 +13658,11 @@ impl Node {
             { self.blockchain.read().await.get_latest_block_index() as u32 }.saturating_add(1);
         loop {
             if cursor > target {
+                break;
+            }
+            // Slice expiry between spans only: the applied prefix stays consistent and a
+            // later call (same or another caller) resumes from the advanced tip.
+            if Self::full_sync_deadline_expired(deadline) {
                 break;
             }
             let (start, end) = Self::full_sync_next_span(cursor, target);
@@ -14106,12 +14341,14 @@ impl From<&Node> for Node {
 mod tests {
     use super::*;
 
-    // Change 3: connected-peer candidate selection for the boot/idle delta-sync. Peers at or above
-    // the beacon height are candidates (tallest first, deterministic); below-beacon peers are
-    // excluded. (The reported height is only a pre-filter; the real per-peer verification happens in
-    // sync_full_history_from_peer via the tip probe.)
+    // Connected-peer candidate selection for the boot/idle/mine-prep delta-sync. The recorded
+    // height RANKS candidates (covering peers first, then tallest first) but never filters them:
+    // after an OS sleep every recorded height is hours stale — uniformly below the live beacon —
+    // and a height pre-filter starved the sync of every live candidate (Windows wake-after-idle,
+    // 2026-07-27). The real per-peer verification is a fresh height read + the signed-beacon tip
+    // probe inside sync_full_history_from_peer.
     #[test]
-    fn full_sync_candidate_peers_ranks_at_or_above_beacon() {
+    fn full_sync_candidate_peers_ranks_tallest_first_never_filters() {
         use std::collections::HashMap;
         let mk = |octet: u8, blocks: u32| -> (SocketAddr, PeerInfo) {
             let addr: SocketAddr = format!("10.0.0.{}:7000", octet).parse().unwrap();
@@ -14121,31 +14358,59 @@ mod tests {
         };
         let beacon = 1000u32;
         let entries = [mk(1, 1005), mk(2, 1000), mk(3, 999), mk(4, 2000)];
-        let below = entries[2].0; // height 999
         let peers: HashMap<SocketAddr, PeerInfo> = entries.iter().cloned().collect();
 
         let ranked = Node::full_sync_candidate_peers(&peers, beacon);
-        assert!(
-            !ranked.contains(&below),
-            "a peer below the beacon must not be a candidate"
-        );
-        assert_eq!(
-            ranked.len(),
-            3,
-            "only the three at/above the beacon qualify"
-        );
-        // tallest first: 2000, 1005, 1000
         let heights: Vec<u32> = ranked
             .iter()
             .map(|a| peers.get(a).unwrap().blocks)
             .collect();
+        // Covering peers first (tallest first), then the below-beacon peer — INCLUDED, last.
         assert_eq!(
             heights,
-            vec![2000, 1005, 1000],
-            "candidates ranked tallest first"
+            vec![2000, 1005, 1000, 999],
+            "rank covering-tallest first and keep stale/below peers as fallbacks"
         );
-        // none qualify when the beacon is above every peer
-        assert!(Node::full_sync_candidate_peers(&peers, 3000).is_empty());
+
+        // The wake-after-sleep shape: every recorded height is below the live beacon. All
+        // peers must still be offered (tallest first) — this returned [] before the fix.
+        let stale_ranked = Node::full_sync_candidate_peers(&peers, 3000);
+        let stale_heights: Vec<u32> = stale_ranked
+            .iter()
+            .map(|a| peers.get(a).unwrap().blocks)
+            .collect();
+        assert_eq!(
+            stale_heights,
+            vec![2000, 1005, 1000, 999],
+            "uniformly-stale heights must never starve the candidate set"
+        );
+
+        // Probe-cost bound: candidates are capped at FULL_SYNC_MAX_CANDIDATES, keeping the
+        // tallest (a covering peer must survive the cut ahead of stale ones).
+        let mut many: HashMap<SocketAddr, PeerInfo> =
+            (1..=20u8).map(|o| mk(o, 100 + o as u32)).collect();
+        let (tall_addr, tall_info) = mk(200, 5000);
+        many.insert(tall_addr, tall_info);
+        let capped = Node::full_sync_candidate_peers(&many, 1000);
+        assert_eq!(capped.len(), FULL_SYNC_MAX_CANDIDATES, "cap bounds probes");
+        assert_eq!(
+            capped[0], tall_addr,
+            "the covering peer outranks every stale one"
+        );
+    }
+
+    // The slice deadline is a pure between-steps check: None never expires; a past instant
+    // has, a future one has not.
+    #[test]
+    fn full_sync_deadline_expiry_semantics() {
+        assert!(!Node::full_sync_deadline_expired(None));
+        let now = Instant::now();
+        assert!(Node::full_sync_deadline_expired(Some(
+            now - Duration::from_millis(1)
+        )));
+        assert!(!Node::full_sync_deadline_expired(Some(
+            now + Duration::from_secs(3600)
+        )));
     }
 
     // #11: the witness cache enforces a BYTE budget, not just an entry count. Insert many large
