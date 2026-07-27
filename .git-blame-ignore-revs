@@ -2,4 +2,5 @@
 # Enable locally with:
 #   git config blame.ignoreRevsFile .git-blame-ignore-revs
 # (GitHub honours this file automatically.)
-42c47ac587656892279a2a9a315da6b894830b4f
+# style: rustfmt the six proven layout-only files (2026-07-27)
+5ed9e058a022ed10ab078fa21a68b6088e55fa7c
