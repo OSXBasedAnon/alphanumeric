@@ -4746,6 +4746,36 @@ impl Node {
             .read()
             .await
             .block_with_full_witnesses(block);
+
+        // POISON GUARD (2026-07-27). Rehydration is best-effort: it pulls each full
+        // signature from the confirmed-witness store, which only retains
+        // WITNESS_RETENTION_BLOCKS. Past that window — or for a body this node
+        // never held witnesses for — it silently returns a witness-SHORT block, and
+        // publishing that POISONS the height: the relay is first-write-wins, so
+        // every node that later has to validate that block at its own frontier
+        // requires full witnesses, cannot get them from any peer, and WEDGES until
+        // a snapshot laps it. Measured live: two independent nodes (one on the
+        // previous release, ruling out a build regression) sat stuck ~85 minutes at
+        // block 290968, whose relay record carried 2 truncated signatures.
+        //
+        // A GAP is strictly better than poison: the snapshot and P2P GetBlocks both
+        // serve that history, the 32-block backfill re-posts continuously, and the
+        // gateway's witness-upgrade path repairs a short slot the moment ANY node
+        // that does hold the witnesses posts the same block. Skipping here is what
+        // lets that repair win instead of a truncated body squatting the slot.
+        if !Blockchain::block_witnesses_are_complete(&hydrated) {
+            warn!(
+                "Not publishing block {} to the relay: {} transaction witness(es) could not be rehydrated (older than the {}-block retention window). Leaving the slot for a node that holds them — a gap is recoverable, a witness-short record wedges fresh nodes.",
+                block.index,
+                hydrated
+                    .transactions
+                    .iter()
+                    .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+                    .count(),
+                crate::a9::blockchain::WITNESS_RETENTION_BLOCKS
+            );
+            return Ok(());
+        }
         let block_value = serde_json::to_value(&hydrated)
             .map_err(|e| NodeError::Serialization(format!("Block relay JSON error: {}", e)))?;
         let network_id = hex::encode(self.network_id);
@@ -4818,6 +4848,15 @@ impl Node {
         if limit == 0 || !Self::block_relay_publish_enabled() {
             return;
         }
+        // Never re-post deeper than the witness retention window. Beyond it the
+        // confirmed-witness store has been pruned, so every one of those bodies
+        // rehydrates SHORT — the publish path now declines them anyway (see the
+        // poison guard in post_block_relay), and walking them is pure work plus
+        // per-block warn spam. This matters because the startup "deep relay heal"
+        // defaults to 512 and is configured to 1024 on the publisher, i.e. 2-4x
+        // the retention window: before this clamp, the majority of that sweep
+        // could only ever have produced unverifiable records.
+        let limit = limit.min(crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32);
 
         let blocks = {
             let blockchain = self.blockchain.read().await;

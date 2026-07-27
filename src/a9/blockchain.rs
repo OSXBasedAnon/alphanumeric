@@ -7098,6 +7098,33 @@ impl Blockchain {
     /// a missing or truncated witness means we cannot prove the block, so we
     /// decline it rather than trust it. Coinbase (system) transactions are
     /// unsigned and exempt, so a coinbase-only block passes trivially.
+    /// SHAPE-ONLY companion to `block_signatures_fully_verified`: does every
+    /// non-system transaction carry a FULL (non-truncated) ML-DSA signature?
+    ///
+    /// This is the "can anyone else verify this body" test, and it is deliberately
+    /// cheap (no signature verification) because it gates the RELAY PUBLISH path,
+    /// which runs per block and would otherwise re-verify already-verified bodies.
+    ///
+    /// Why it exists: stored blocks keep only the truncated 64-byte receipt form,
+    /// and `block_with_full_witnesses` rehydrates from the confirmed-witness store
+    /// — which retains just WITNESS_RETENTION_BLOCKS. Past that window rehydration
+    /// silently yields a witness-SHORT body. Publishing one poisons that relay
+    /// height: nodes validating at their frontier require full witnesses, cannot
+    /// obtain them from any peer, and wedge until a snapshot laps the block
+    /// (observed 2026-07-27: two independent nodes stuck ~85 min at block 290968).
+    pub fn block_witnesses_are_complete(block: &Block) -> bool {
+        block.transactions.iter().all(|tx| {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                return true;
+            }
+            tx.signature
+                .as_deref()
+                .and_then(|sig| hex::decode(sig).ok())
+                .map(|bytes| bytes.len() > 64)
+                .unwrap_or(false)
+        })
+    }
+
     pub fn block_signatures_fully_verified(&self, block: &Block) -> bool {
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
@@ -7828,6 +7855,81 @@ mod tests {
     // (pulled from the witness store, keyed on the signature-independent tx id), and
     // dropped entirely when no full witness is available — a truncated copy could
     // never be mined and would only poison the block template until it ages out.
+    #[test]
+    fn witness_completeness_gates_the_relay_publish_shape() {
+        // The relay-publish poison guard: a body is publishable only when EVERY
+        // non-system tx carries a full (>64-byte) ML-DSA signature. A truncated
+        // receipt-form signature — what a stored block keeps once the confirmed-
+        // witness store has pruned past WITNESS_RETENTION_BLOCKS — must fail, or
+        // publishing it wedges every node that later validates that height at its
+        // own frontier (live incident 2026-07-27, block 290968).
+        let coinbase = Transaction {
+            sender: "MINING_REWARDS".to_string(),
+            recipient: "11".repeat(20),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(10.0),
+            timestamp: 1_700_000_000,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        let mut regular = Transaction {
+            sender: "a".repeat(40),
+            recipient: "b".repeat(40),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 1_700_000_000,
+            signature: Some(hex::encode(vec![7u8; mldsa::SIGNATURE_BYTES])),
+            pub_key: Some("bb".repeat(mldsa::PUBLIC_KEY_BYTES)),
+            sig_hash: Some("cc".repeat(32)),
+        };
+        let mk = |txs: Vec<Transaction>| Block {
+            index: 100,
+            previous_hash: [0u8; 32],
+            timestamp: 1_700_000_000,
+            transactions: txs,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        };
+
+        // Coinbase-only: trivially complete (system txs are unsigned by design).
+        assert!(Blockchain::block_witnesses_are_complete(&mk(vec![
+            coinbase.clone()
+        ])));
+        // Full witness present: publishable.
+        assert!(Blockchain::block_witnesses_are_complete(&mk(vec![
+            coinbase.clone(),
+            regular.clone()
+        ])));
+
+        // Truncated (64-byte receipt) signature: NOT publishable — this is the
+        // exact shape that poisoned the relay.
+        regular.signature = Some(hex::encode(vec![7u8; 64]));
+        assert!(!Blockchain::block_witnesses_are_complete(&mk(vec![
+            coinbase.clone(),
+            regular.clone()
+        ])));
+
+        // Missing signature entirely: also not publishable.
+        regular.signature = None;
+        assert!(!Blockchain::block_witnesses_are_complete(&mk(vec![
+            coinbase.clone(),
+            regular.clone()
+        ])));
+
+        // One good tx does not excuse one short tx (block 290968's exact shape:
+        // a full witness alongside truncated ones).
+        let mut good = regular.clone();
+        good.signature = Some(hex::encode(vec![9u8; mldsa::SIGNATURE_BYTES]));
+        let mut short = regular.clone();
+        short.signature = Some(hex::encode(vec![9u8; 64]));
+        assert!(!Blockchain::block_witnesses_are_complete(&mk(vec![
+            coinbase, good, short
+        ])));
+    }
+
     #[test]
     fn reorg_readmit_persists_row_that_survives_a_mempool_rebuild() {
         let bc = test_blockchain();
