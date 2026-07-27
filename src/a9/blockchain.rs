@@ -6509,6 +6509,33 @@ impl Blockchain {
         (expected_hashes / span as f64) / 1_000_000_000_000.0 // TH/s
     }
 
+    /// Seconds between each of the last `window` consecutive blocks, oldest
+    /// first. Display-only (the `info` cadence trace): a single instantaneous
+    /// "last block was Ns ago" cannot distinguish one slow block from a chain
+    /// that has been slowing for minutes, which is the question an operator
+    /// actually asks. Reads the same tip-anchored window as
+    /// calculate_network_hashrate, so it touches no block that call does not
+    /// already decode, and needs no lock of its own.
+    pub fn recent_block_intervals(&self, window: u32) -> Vec<u64> {
+        let Some(tip) = self.get_last_block() else {
+            return Vec::new();
+        };
+        let start_index = tip.index.saturating_sub(window);
+        let mut previous = match self.get_block(start_index) {
+            Ok(block) => block.timestamp,
+            Err(_) => return Vec::new(),
+        };
+        let mut intervals = Vec::with_capacity(window as usize);
+        for height in (start_index + 1)..=tip.index {
+            let Ok(block) = self.get_block(height) else {
+                continue;
+            };
+            intervals.push(block.timestamp.saturating_sub(previous));
+            previous = block.timestamp;
+        }
+        intervals
+    }
+
     pub fn get_block_reward(&self, transactions: &[Transaction]) -> f64 {
         // Create block with proper chain context
         let last_block = self.get_last_block();
