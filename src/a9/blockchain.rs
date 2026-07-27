@@ -1851,7 +1851,6 @@ impl Blockchain {
         self.db.open_tree(CONFIRMED_TX_TREE).map_err(Into::into)
     }
 
-    /// The canonical height at which `tx_id` was confirmed, or None if unseen.
     /// True if this transaction is already confirmed in a canonical block. Public
     /// wrapper over the replay registry for mempool-hygiene callers (template
     /// building, tx re-announce) — consensus paths keep using the index directly.

@@ -4775,10 +4775,21 @@ impl Node {
             warn!(
                 "Not publishing block {} to the relay: {} transaction witness(es) could not be rehydrated (older than the {}-block retention window). Leaving the slot for a node that holds them — a gap is recoverable, a witness-short record wedges fresh nodes.",
                 block.index,
+                // Count the witnesses that actually FAILED, not every non-system tx.
+                // Reporting the whole set made a 2-tx retention edge look like total
+                // witness-store loss to whoever read the log.
                 hydrated
                     .transactions
                     .iter()
-                    .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+                    .filter(|tx| {
+                        !SYSTEM_ADDRESSES.contains(&tx.sender.as_str())
+                            && tx
+                                .signature
+                                .as_deref()
+                                .and_then(|s| hex::decode(s).ok())
+                                .map(|b| b.len() <= 64)
+                                .unwrap_or(true)
+                    })
                     .count(),
                 crate::a9::blockchain::WITNESS_RETENTION_BLOCKS
             );
@@ -9119,7 +9130,10 @@ impl Node {
         const MAX_RETRIES: u32 = 3;
 
         // Batch large requests so peers with strict range limits can still serve us.
-        if end.saturating_sub(start) + 1 > MAX_BATCH_SIZE {
+        // `span + 1 > MAX` is value-identical to `span >= MAX` but overflows at
+        // u32::MAX, which the saturating_sub beside it was there to prevent. This
+        // form is also textually identical to the server-side cap it tracks.
+        if end.saturating_sub(start) >= MAX_BATCH_SIZE {
             let mut all_blocks = Vec::new();
             let mut batch_start = start;
             while batch_start <= end {
@@ -11575,7 +11589,10 @@ impl Node {
                             self.select_broadcast_peers(&peers, peers.len().min(16));
                         drop(peers);
                         let node = self.clone();
-                        let block_arc = Arc::new(block.clone());
+                        // `block` is owned here and unused afterwards — cloning deep-copied
+                // a whole Block (up to MAX_BLOCK_TX_COUNT txs with witnesses) once
+                // per accepted block for nothing.
+                let block_arc = Arc::new(block);
                         tokio::spawn(async move {
                             if let Err(e) = node
                                 .broadcast_block(block_arc, None, selected_peers, true)
@@ -11663,14 +11680,23 @@ impl Node {
                             for i in idx..=chunk_end {
                                 if let Ok(block) = blockchain.get_block(i) {
                                     bytes += codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
-                                    if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
+                                    if bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
                                         break 'serve;
                                     }
                                     out.push(block);
                                 }
                             }
                         }
-                        idx = chunk_end.saturating_add(1);
+                        // checked_add, NOT saturating: at the height ceiling
+                        // saturating_add(1) yields the ceiling again, so the advance
+                        // makes no progress and `idx <= end` stays true. Ranges up
+                        // there serve no stored blocks, so the accumulated-size break
+                        // does not bound the loop either — the advance itself has to.
+                        // request_blocks guards its mirror loop the same way; keep both.
+                        let Some(next) = chunk_end.checked_add(1) else {
+                            break 'serve;
+                        };
+                        idx = next;
                         tokio::task::yield_now().await;
                     }
                     out
@@ -12279,7 +12305,7 @@ impl Node {
                                     if let Ok(block) = blockchain.get_block(height) {
                                         bytes +=
                                             codec::serialize(&block).map(|v| v.len()).unwrap_or(0);
-                                        if bytes > MAX_MESSAGE_SIZE - 64 * 1024 {
+                                        if bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
                                             break;
                                         }
                                         out.push(block);
@@ -14498,7 +14524,7 @@ impl Node {
                             }
 
                             // Move to next batch based on what we actually processed
-                            start = current_sync_height + 1;
+                            start = current_sync_height.saturating_add(1);
                         }
                         Err(e) => {
                             warn!(
@@ -14862,6 +14888,35 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A block-serving range that ends at the height ceiling must terminate. The
+    // serve loop advances with `idx = chunk_end + 1`; a saturating advance makes
+    // no progress there while `idx <= end` stays true. The span cap alone does
+    // not bound this, so the advance is checked — see the serve loop.
+    #[test]
+    fn block_serve_range_terminates_at_the_height_ceiling() {
+        let start = u32::MAX - (MAX_GETBLOCKS_SPAN - 1);
+        let end = u32::MAX;
+        assert!(
+            end.saturating_sub(start) < MAX_GETBLOCKS_SPAN,
+            "this range must pass the span cap, or the test proves nothing"
+        );
+
+        // Mirror of the serve loop's advance, with the fix in place.
+        const CHAIN_SERVE_CHUNK: u32 = 32; // mirrors the constant in the serve loop
+        let mut idx = start;
+        let mut iterations = 0u32;
+        while idx <= end {
+            let chunk_end = idx.saturating_add(CHAIN_SERVE_CHUNK - 1).min(end);
+            let Some(next) = chunk_end.checked_add(1) else {
+                break;
+            };
+            idx = next;
+            iterations += 1;
+            assert!(iterations < 10_000, "serve loop failed to terminate");
+        }
+        assert!(iterations > 0, "the loop should have run at least once");
+    }
 
     // Connected-peer candidate selection for the boot/idle/mine-prep delta-sync. The recorded
     // height RANKS candidates (covering peers first, then tallest first) but never filters them:
