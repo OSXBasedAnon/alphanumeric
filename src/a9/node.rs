@@ -127,7 +127,7 @@ const BEACON_POLL_INTERVAL_SECS: u64 = 3;
 const BEACON_HIGH_WATER_WINDOW_SECS: u64 = 600;
 
 /// The canonical tip as advertised by the signed beacon (height, hash, version).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct TipBeaconInfo {
     height: u32,
     hash: [u8; 32],
@@ -1427,6 +1427,10 @@ pub struct Node {
     /// wake-from-sleep); overlapping calls return immediately instead of
     /// double-streaming the same span. See sync_full_history_from_peer_bounded.
     full_sync_in_flight: Arc<AtomicBool>,
+    /// ~1s TTL memo of the last successfully fetched signed tip beacon
+    /// (fetch_tip_beacon): dedups same-second fetch bursts across the many
+    /// beacon consumers without changing any staleness guarantee.
+    beacon_memo: Arc<PLMutex<Option<(Instant, TipBeaconInfo)>>>,
     /// Rolling window of recent (observed-at, height) beacon reads that positively
     /// matched our network. The mine-prep stale-tip guard consults the MAX height in
     /// the window as "the freshest network height we can trust." A ROLLING max (not a
@@ -1997,6 +2001,7 @@ impl Node {
             converge_stall_last_ms: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             full_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            beacon_memo: Arc::new(PLMutex::new(None)),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
@@ -3526,6 +3531,19 @@ impl Node {
     /// validated (PoW + linkage + signatures) on apply, so a poisoned beacon can
     /// at worst cause a wasted fetch, never a bad adoption.
     async fn fetch_tip_beacon(&self) -> Option<TipBeaconInfo> {
+        // ~1s TTL memo: bursts of callers (mine-prep rounds, the absorb wait, the
+        // beacon-watch tick, converge STEP-4) each re-fetched the same edge-cached
+        // beacon within the same second — the absorb loop alone issued up to 40
+        // GETs per mined block. One fetch per second per process is plenty; the
+        // TTL sits far under the 5s block time, so every staleness guard
+        // (ghost-block, high-water) sees the same freshness it did before.
+        // Failures are NOT memoized — the unreachable path keeps retrying live.
+        const BEACON_MEMO_TTL: Duration = Duration::from_millis(1000);
+        if let Some((at, memo)) = *self.beacon_memo.lock() {
+            if at.elapsed() < BEACON_MEMO_TTL {
+                return Some(memo);
+            }
+        }
         for url in Self::discovery_tip_urls() {
             let Ok(res) = self.http_client.get(&url).send().await else {
                 continue;
@@ -3581,11 +3599,13 @@ impl Node {
                 self.last_seen_beacon_height
                     .fetch_max(height, Ordering::AcqRel);
             }
-            return Some(TipBeaconInfo {
+            let info = TipBeaconInfo {
                 height: height as u32,
                 hash,
                 version,
-            });
+            };
+            *self.beacon_memo.lock() = Some((Instant::now(), info));
+            return Some(info);
         }
         None
     }
@@ -7049,15 +7069,24 @@ impl Node {
             peers.keys().copied().collect()
         };
 
+        // Bounded concurrency, same as every other fan-out in this file (the
+        // broadcasts cap at 10): uncapped, this opened one encrypted session per
+        // table entry simultaneously.
+        let semaphore = Arc::new(Semaphore::new(10));
         let futures: Vec<_> = addrs
             .into_iter()
-            .map(|addr| timeout(Duration::from_secs(5), self.request_peer_list(addr)))
+            .map(|addr| {
+                let semaphore = Arc::clone(&semaphore);
+                async move {
+                    let _permit = semaphore.acquire_owned().await.ok()?;
+                    timeout(Duration::from_secs(5), self.request_peer_list(addr))
+                        .await
+                        .ok()
+                        .and_then(|inner| inner.ok())
+                }
+            })
             .collect();
-        for peer_list in join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(|res| res.ok().and_then(|inner| inner.ok()))
-        {
+        for peer_list in join_all(futures).await.into_iter().flatten() {
             discovered.extend(peer_list);
         }
 
@@ -7728,6 +7757,7 @@ impl Node {
         let metrics_tx = msg_tx.clone();
         tokio::spawn(async move {
             let mut metrics_interval = interval(Duration::from_secs(15));
+            metrics_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 metrics_interval.tick().await;
                 let remaining = metrics_tx.capacity();
@@ -7863,19 +7893,13 @@ impl Node {
             }
         });
 
-        // Periodic catch-up safety net: a behind or forked node must keep converging
-        // to the network tip even if a live beacon-version tick was missed. Driven by
-        // the signed beacon (NOT p2p, which is empty across NAT), so it runs in BOTH
-        // interactive and headless modes and needs no peers. Cheap no-op at the tip.
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            let mut sync_interval = interval(Duration::from_secs(20));
-            sync_interval.tick().await; // consume immediate first tick
-            loop {
-                sync_interval.tick().await;
-                let _ = node_clone.sync_to_beacon().await;
-            }
-        });
+        // (The old standalone 20s "catch-up safety net" loop was deleted: the
+        // beacon-watch loop below already runs the identical converge on its safety
+        // tick — now every 20s for clients, matching what the deleted loop did — and
+        // the runtime reconcile loop in main.rs is the third, escalation-owning
+        // copy. Three loops fetching the same beacon to run the same converge was
+        // pure duplicate chatter: ~3 gateway GETs/min and one redundant converge
+        // pass, at zero staleness cost.)
 
         // LIVE beacon-watch sync. Poll the tiny edge-cached tip beacon every ~2s;
         // a cache HIT costs the origin/Redis nothing, so this stays O(1) at any
@@ -7898,7 +7922,10 @@ impl Node {
             } else {
                 BEACON_POLL_INTERVAL_SECS
             };
-            let safety_secs = if is_publisher { 1 } else { 30 };
+            // 20 for clients (was 30): this safety tick absorbed the deleted
+            // standalone 20s catch-up loop — same converge cadence, one fewer
+            // beacon fetch and converge pass per cycle.
+            let safety_secs = if is_publisher { 1 } else { 20 };
             spawn_logged("beacon-watch", async move {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
                 // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
@@ -8386,8 +8413,13 @@ impl Node {
         use libp2p_swarm::SwarmEvent;
 
         let mut swarm_guard = self.p2p_swarm.lock().await;
-        let mut swarm = swarm_guard
-            .take()
+        // Operate on the swarm IN PLACE (as_mut), never take() it out: the old
+        // take → loop → put-back left the slot None forever if this future was
+        // cancelled (or panicked) at any await point in between — the pump then
+        // failed every second with "Swarm not initialized" and Kademlia discovery
+        // silently died. With as_mut there is nothing to put back.
+        let swarm = swarm_guard
+            .as_mut()
             .ok_or_else(|| NodeError::Network("Swarm not initialized".to_string()))?;
 
         let event_count_limit = 200;
@@ -8412,9 +8444,6 @@ impl Node {
                 }
             }
         }
-
-        // Put the swarm back
-        *swarm_guard = Some(swarm);
 
         Ok(())
     }
@@ -8896,6 +8925,26 @@ impl Node {
         });
         self.compact_inflight
             .retain(|_, state| state.started.elapsed() < COMPACT_INFLIGHT_TTL);
+
+        // Outbound circuit breakers: an entry is created for EVERY address we ever
+        // dial (gateway candidates, PEX, seeds), but removal was keyed on peer
+        // membership — an address that failed a few dials and never became a peer
+        // leaked its entry for the process lifetime, and check_outbound_circuit
+        // read-locks this map on every outbound message. Keep breakers that are
+        // still OPEN (their verdict still matters) or belong to a current peer;
+        // a dropped closed breaker merely resets a failure count we no longer care
+        // about.
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut breakers = self.outbound_circuit_breakers.write().await;
+            breakers.retain(|addr, state| {
+                state.open_until.map_or(false, |until| until > now)
+                    || active_peers.contains(addr)
+            });
+        }
     }
 
     pub async fn request_blocks(
@@ -11469,7 +11518,10 @@ impl Node {
                 {
                     let mut channel_guard = response_channel.lock().await;
                     if let Some(sender) = channel_guard.take() {
-                        if sender.send(blocks.clone()).is_err() {
+                        // Move, don't clone: `blocks` is unused after this send, and
+                        // the clone deep-copied up to ~4 MiB of Block structs per
+                        // served request.
+                        if sender.send(blocks).is_err() {
                             warn!("Failed to send chain response through channel");
                         }
                     } else {
@@ -12711,6 +12763,14 @@ impl Node {
             // compact envelope first and the unchanged full block second on the
             // same ordered DataChannel. Older nodes ignore RawData and still see
             // the full fallback; one slow peer cannot delay another.
+            //
+            // Frames are wrapped in Bytes ONCE: the per-peer clones are refcount
+            // bumps, and send_to_bytes hands the same buffer to the DataChannel.
+            // The old per-peer Vec clones + send_to's copy_from_slice memcpy'd
+            // every frame twice per peer (~24 MiB per 1 MiB block at mesh
+            // degree 12).
+            let compact_frame = compact_frame.map(bytes::Bytes::from);
+            let full_frame = bytes::Bytes::from(full_frame);
             tokio::spawn(async move {
                 let peer_ids = mesh.connected_peers().await;
                 let sends = peer_ids.into_iter().map(|peer_id| {
@@ -12721,13 +12781,13 @@ impl Node {
                         if let Some(compact_frame) = compact_frame {
                             let _ = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                mesh.send_to(&peer_id, &compact_frame),
+                                mesh.send_to_bytes(&peer_id, &compact_frame),
                             )
                             .await;
                         }
                         let _ = tokio::time::timeout(
                             Duration::from_secs(5),
-                            mesh.send_to(&peer_id, &full_frame),
+                            mesh.send_to_bytes(&peer_id, &full_frame),
                         )
                         .await;
                     }

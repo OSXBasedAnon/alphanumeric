@@ -928,7 +928,19 @@ impl VelocityManager {
 
     pub fn start_request_processor(self: Arc<Self>) {
         tokio::spawn(async move {
-            while let Ok(request) = self.request_rx.recv() {
+            loop {
+                // The crossbeam recv() is BLOCKING, not a future: parked directly in
+                // an async task it would pin a whole runtime worker forever (the
+                // 2026-07-16 publisher-park class). Hop the wait onto the blocking
+                // pool; only ready requests touch the async workers. (Velocity is
+                // disabled today — this de-traps it for whenever it turns on.)
+                let mgr = Arc::clone(&self);
+                let request =
+                    match tokio::task::spawn_blocking(move || mgr.request_rx.recv()).await {
+                        Ok(Ok(request)) => request,
+                        // Channel closed, or the blocking task was cancelled.
+                        _ => return,
+                    };
                 if let Err(e) = self.process_shred_request(request).await {
                     warn!("Error processing shred request: {}", e);
                 }
