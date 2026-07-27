@@ -30,6 +30,20 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
 - Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
   block you mined gets reorged out.
 
+### Interface
+- One display language across every screen — balances, wallets, mining,
+  transactions and `info` now share the same layout, colours and spacing.
+- Addresses and transaction ids render in your terminal's own foreground colour,
+  so they're readable on light backgrounds too.
+- Payment / whisper / reorg notices are aligned keyword lines with no symbols.
+- Whisper send no longer claims "visible to everyone" — nothing displays whispers
+  anywhere; the accurate caveat stays on the help screen.
+
+### On alphanumeric.blue
+- The hashrate beside the chart and the one in the metrics row now always agree
+  (they were computed differently and could sit a spike apart). The chart still
+  plots the raw per-sample series.
+
 ### Download (macOS, Apple Silicon)
 Standard: `alphanumeric-v7.9.1-macos-arm64.zip`
 GPU: `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
