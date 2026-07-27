@@ -1635,6 +1635,19 @@ struct OutboundConnection {
     stream: TcpStream,
     shared_secret: Vec<u8>,
     last_used: Instant,
+    /// Wall-clock twin of `last_used`. `Instant` does not advance across an OS
+    /// suspend (macOS/Linux), so after a sleep the idle sweep saw only the
+    /// pre-sleep age and kept every half-open socket alive; the wall clock
+    /// jumps across the gap and lets the sweep catch them.
+    last_used_wall: SystemTime,
+    /// True from just before a request frame is written until its response is
+    /// fully read. A request/response exchange that was CANCELLED in between
+    /// (caller-side timeout dropping the future) leaves an unconsumed response
+    /// in the socket; the next exchange would read that stale frame and return
+    /// the wrong message forever after ("unexpected response type"). The next
+    /// holder that observes `exchange_armed == true` must discard the
+    /// connection instead of using it.
+    exchange_armed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -8844,6 +8857,11 @@ impl Node {
                     return Ok(valid_blocks);
                 }
                 Ok(_) => {
+                    // A wrong-typed response means this pooled stream is desynced
+                    // (a cancelled earlier exchange shifted its framing) — retrying
+                    // on the same connection returns garbage forever. Drop it so
+                    // the retry redials fresh.
+                    self.remove_outbound_connection(addr).await;
                     retries += 1;
                     tokio::time::sleep(Duration::from_millis(500 * retries as u64)).await;
                 }
@@ -8904,6 +8922,29 @@ impl Node {
         self.outbound_connections.write().await.remove(&addr);
     }
 
+    /// Drop every pooled outbound connection and forget every circuit-breaker
+    /// verdict. For wake-from-suspend recovery: after a sleep the pool holds only
+    /// half-open sockets (each worth a full response-timeout stall) and the
+    /// breakers hold pre-sleep verdicts about peers that may be fine now.
+    /// Dropping a TcpStream closes it; the next use simply redials. Worst case
+    /// cost is one extra handshake per peer — always cheaper than probing a dead
+    /// socket.
+    pub async fn reset_connection_pool(&self) {
+        let dropped = {
+            let mut pool = self.outbound_connections.write().await;
+            let n = pool.len();
+            pool.clear();
+            n
+        };
+        self.outbound_circuit_breakers.write().await.clear();
+        if dropped > 0 {
+            info!(
+                "Reset outbound connection pool after suspend ({} stale connections dropped)",
+                dropped
+            );
+        }
+    }
+
     async fn check_outbound_circuit(&self, addr: SocketAddr) -> Result<(), NodeError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8951,12 +8992,26 @@ impl Node {
         };
 
         let now = Instant::now();
+        let now_wall = SystemTime::now();
         let idle = Duration::from_secs(OUTBOUND_POOL_IDLE_SECS);
         let mut remove_addrs = Vec::new();
 
         for (addr, conn) in pool_snapshot {
-            let conn_guard = conn.lock().await;
-            if now.duration_since(conn_guard.last_used) > idle {
+            // try_lock, not lock: a connection mid-exchange is by definition in use
+            // (not idle), and awaiting its mutex here serialized this sweep — and the
+            // whole maintenance loop behind it — on a possibly-30s response read.
+            let Ok(conn_guard) = conn.try_lock() else {
+                continue;
+            };
+            // Idle by monotonic age, OR by wall-clock age: Instant freezes across an
+            // OS suspend (macOS/Linux), so post-sleep half-open sockets looked
+            // freshly-used forever. duration_since fails only on clock regression —
+            // treat that as "not stale" (fail-open).
+            let wall_stale = now_wall
+                .duration_since(conn_guard.last_used_wall)
+                .map(|d| d > idle)
+                .unwrap_or(false);
+            if now.duration_since(conn_guard.last_used) > idle || wall_stale {
                 remove_addrs.push(addr);
             }
         }
@@ -8979,7 +9034,13 @@ impl Node {
 
         let mut lru: Option<(SocketAddr, Instant)> = None;
         for (addr, conn) in snapshot {
-            let conn_guard = conn.lock().await;
+            // try_lock: a connection mid-exchange is in use — recently used by
+            // definition, so it can't be the LRU victim; awaiting it here stalled
+            // every NEW outbound connection (this runs on the create path) for up
+            // to a full response timeout.
+            let Ok(conn_guard) = conn.try_lock() else {
+                continue;
+            };
             match lru {
                 Some((_, oldest)) if conn_guard.last_used >= oldest => {}
                 _ => {
@@ -9008,6 +9069,18 @@ impl Node {
             .await
             .map_err(|_| NodeError::Network(format!("Connection timeout to {}", addr)))??;
         stream.set_nodelay(true)?;
+        // Keepalive on the OUTBOUND pool too (the inbound path has always had it,
+        // handle_connection): without probes a silently-dead NAT/suspend path lingers
+        // until a write forces the error; with them the kernel retires it on its own.
+        {
+            let std_stream = stream.into_std()?;
+            let socket = Socket::from(std_stream);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(60))
+                .with_interval(Duration::from_secs(15));
+            socket.set_tcp_keepalive(&keepalive)?;
+            stream = TcpStream::from_std(socket.into())?;
+        }
 
         let (peer_info, shared_secret) = tokio::time::timeout(
             Duration::from_secs(5),
@@ -9053,6 +9126,8 @@ impl Node {
             stream,
             shared_secret,
             last_used: Instant::now(),
+            last_used_wall: SystemTime::now(),
+            exchange_armed: false,
         }));
         let max_pool_size = (self
             .max_connections
@@ -9087,6 +9162,17 @@ impl Node {
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
         const MAX_ATTEMPTS: u32 = 2;
+        // Response budget by request class: bulk block transfers legitimately take a
+        // while, but small control messages (height, peers, ping) answer in one frame —
+        // waiting the full 30s on those just pins recovery paths to dead or half-open
+        // sockets (post-suspend wake is the main producer of these).
+        let response_timeout = if matches!(message, NetworkMessage::GetBlocks { .. })
+            || Self::is_tcp_compact_extension(message)
+        {
+            RESPONSE_TIMEOUT
+        } else {
+            Duration::from_secs(8)
+        };
 
         if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(message) {
             return Err(NodeError::Network(
@@ -9118,6 +9204,22 @@ impl Node {
             };
 
             let mut stream_guard = conn.lock().await;
+            // DESYNC GUARD: a previous exchange on this pooled connection was cancelled
+            // between arming and disarming (a caller-side timeout dropped the future
+            // mid-request/response), so the socket may hold an unconsumed response
+            // frame. Using it would return the WRONG message — the stream is shifted
+            // by one frame from then on. Discard and redial on the next attempt. Not a
+            // peer fault: no circuit-breaker strike.
+            if stream_guard.exchange_armed {
+                drop(stream_guard);
+                self.remove_outbound_connection(addr).await;
+                last_error = Some(NodeError::Network(format!(
+                    "Discarded desynced pooled connection to {}",
+                    addr
+                )));
+                continue;
+            }
+            stream_guard.exchange_armed = true;
             let result: Result<NetworkMessage, NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
                 let data = self.encrypt_message(message, &shared_secret)?;
@@ -9144,7 +9246,7 @@ impl Node {
 
                 let mut len_bytes = [0u8; 4];
                 tokio::time::timeout(
-                    RESPONSE_TIMEOUT,
+                    response_timeout,
                     stream_guard.stream.read_exact(&mut len_bytes),
                 )
                 .await
@@ -9160,7 +9262,7 @@ impl Node {
 
                 let mut response_data = vec![0u8; len];
                 tokio::time::timeout(
-                    RESPONSE_TIMEOUT,
+                    response_timeout,
                     stream_guard.stream.read_exact(&mut response_data),
                 )
                 .await
@@ -9172,7 +9274,11 @@ impl Node {
                 Ok(response)
             }
             .await;
+            // The exchange future COMPLETED (was not cancelled): the socket is either
+            // clean (Ok) or about to be evicted (Err) — safe to disarm either way.
+            stream_guard.exchange_armed = false;
             stream_guard.last_used = Instant::now();
+            stream_guard.last_used_wall = SystemTime::now();
             drop(stream_guard);
 
             match result {
@@ -10860,6 +10966,19 @@ impl Node {
             };
 
             let mut stream_guard = conn.lock().await;
+            // Same desync guard as send_message_with_response: a cancelled prior
+            // exchange (or cancelled partial write) leaves this socket's framing in an
+            // unknown state — discard instead of stacking a fresh frame onto it.
+            if stream_guard.exchange_armed {
+                drop(stream_guard);
+                self.remove_outbound_connection(addr).await;
+                last_error = Some(NodeError::Network(format!(
+                    "Discarded desynced pooled connection to {}",
+                    addr
+                )));
+                continue;
+            }
+            stream_guard.exchange_armed = true;
             let result: Result<(), NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
                 let data = self.encrypt_message(message, &shared_secret)?;
@@ -10886,7 +11005,11 @@ impl Node {
                 .map_err(NodeError::from)
             }
             .await;
+            // Completed (not cancelled): the frame either went out whole (Ok) or the
+            // connection is about to be evicted (Err) — disarm either way.
+            stream_guard.exchange_armed = false;
             stream_guard.last_used = Instant::now();
+            stream_guard.last_used_wall = SystemTime::now();
             drop(stream_guard);
 
             match result {
@@ -12971,10 +13094,15 @@ impl Node {
             .await
             .insert(peer_addr, shared_secret.clone());
 
-        // Notify peer join
-        tx.send(NetworkEvent::PeerJoin(peer_addr))
-            .await
-            .map_err(|e| NodeError::Network(format!("Failed to send join event: {}", e)))?;
+        // Notify peer join. try_send, never send().await: these events are advisory
+        // (peer bookkeeping), and awaiting a FULL bounded queue here pinned this
+        // connection task — and its accept-semaphore permit — forever if the event
+        // pump ever died. Losing one advisory event under backpressure is strictly
+        // better than wedging the listener (the permit leak cascaded to "node stops
+        // accepting connections entirely").
+        if let Err(e) = tx.try_send(NetworkEvent::PeerJoin(peer_addr)) {
+            warn!("Dropped PeerJoin event for {}: {}", peer_addr, e);
+        }
 
         // Message handling loop
         let (mut reader, mut writer) = tokio::io::split(stream);
@@ -13143,10 +13271,10 @@ impl Node {
             .remove(&peer_addr);
         self.compact_capable_peers.remove(&peer_addr);
 
-        // Notify disconnect
-        tx.send(NetworkEvent::PeerLeave(peer_addr))
-            .await
-            .map_err(|e| NodeError::Network(format!("Failed to send leave event: {}", e)))?;
+        // Notify disconnect. Same rationale as the PeerJoin try_send above.
+        if let Err(e) = tx.try_send(NetworkEvent::PeerLeave(peer_addr)) {
+            warn!("Dropped PeerLeave event for {}: {}", peer_addr, e);
+        }
 
         Ok(())
     }
