@@ -472,6 +472,21 @@ fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
 /// a thread with an explicit stack. Reserve is address space, not committed
 /// memory, so generous is free; this also makes every platform/toolchain behave
 /// identically (no MSVC vs GNU linker-flag games).
+/// Lines the `mine --continuous` stop-reader swallowed AFTER mining had already
+/// ended, handed back to the REPL instead of being lost.
+///
+/// The stop-reader is a detached thread parked in a blocking `stdin().read_line`,
+/// and nothing can cancel a blocking read. When mining exits any way OTHER than
+/// the user pressing Enter (a prep failure, an error cap, Ctrl-C), that thread is
+/// still sitting on stdin — so the operator's NEXT command went to the zombie
+/// instead of the prompt and came back as "invalid command" with the cursor in
+/// the wrong place. The reader now checks whether mining is still running: if it
+/// is, the line means "stop"; if it is not, the line was a command and is queued
+/// here for the REPL to run on its next turn. Nothing is swallowed either way.
+static PENDING_INPUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// True while a `mine --continuous` session is still listening for its stop line.
+static MINING_READING_STDIN: AtomicBool = AtomicBool::new(false);
+
 const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// Tokio worker stacks (default 2MB) get the same debug-frame headroom.
 const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -1689,7 +1704,20 @@ async fn async_main() -> Result<()> {
             if shutdown_requested.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let mut command = if line_editor.is_some() {
+            // Run anything the mining stop-reader swallowed after mining had already
+            // finished. Without this the operator's next command vanished into that
+            // parked thread and the prompt looked wedged (see PENDING_INPUT).
+            let handed_back = PENDING_INPUT.lock().ok().and_then(|mut q| {
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            });
+            let mut command = if let Some(line) = handed_back {
+                println!("a#: {}", line);
+                line
+            } else if line_editor.is_some() {
                 // Run the blocking readline on the blocking pool so this LocalSet thread keeps
                 // driving the spawn_local node monitor (health/discovery/wake-recovery) while the
                 // user sits at the prompt — a synchronous readline on this thread froze it. The
@@ -2588,10 +2616,24 @@ println!("Wallet renamed successfully");
                         );
                         println!("Press Enter at any time to stop.");
                         let stop = Arc::clone(&stop_flag);
+                        MINING_READING_STDIN.store(true, Ordering::SeqCst);
                         std::thread::spawn(move || {
                             let mut buf = String::new();
                             let _ = std::io::stdin().read_line(&mut buf);
-                            stop.store(true, Ordering::SeqCst);
+                            if MINING_READING_STDIN.swap(false, Ordering::SeqCst) {
+                                // Mining was still running: this line means "stop".
+                                stop.store(true, Ordering::SeqCst);
+                            } else {
+                                // Mining already ended by another route, so this was a
+                                // COMMAND meant for the prompt. Hand it back rather
+                                // than eating it.
+                                let line = buf.trim().to_string();
+                                if !line.is_empty() {
+                                    if let Ok(mut q) = PENDING_INPUT.lock() {
+                                        q.push(line);
+                                    }
+                                }
+                            }
                         });
                     } else {
                         // Single-shot grinds one block, which solo can take a
@@ -2670,20 +2712,25 @@ println!("Wallet renamed successfully");
                                 let local_tip =
                                     { hb_blockchain.read().await.get_latest_block_index() };
                                 let known_tip = hb_node.beacon_high_water_height() as u64;
+                                // ONE line that rewrites itself (\r, no newline) —
+                                // this used to print a fresh line every 5s and bury
+                                // the screen while a long catch-up ran.
+                                use std::io::Write as _;
                                 if known_tip > local_tip {
-                                    println!(
-                                        "  …syncing: local tip {}, network ~{} ({} behind; {}s elapsed — bounded, will report)",
+                                    print!(
+                                        "\r\x1b[2K  syncing… {} of {} ({} behind, {}s)",
                                         local_tip,
                                         known_tip,
                                         known_tip - local_tip,
                                         started.elapsed().as_secs()
                                     );
                                 } else {
-                                    println!(
-                                        "  …still syncing to the network tip ({}s elapsed — bounded, will report)",
+                                    print!(
+                                        "\r\x1b[2K  syncing… {}s",
                                         started.elapsed().as_secs()
                                     );
                                 }
+                                let _ = std::io::stdout().flush();
                             }
                         });
                         // ONE continuous prep budget (was 3 fixed 8s attempts with 2s
@@ -2729,7 +2776,10 @@ println!("Wallet renamed successfully");
                                         // heights ("network has reached X but we are
                                         // at Y…") — print it instead of a bare
                                         // attempt counter.
-                                        println!("Still catching up: {}", reason);
+                                        // The heartbeat above already owns the
+                                        // status line; keep the detailed reason for
+                                        // the log rather than scrolling the screen.
+                                        debug!("mine-prep still catching up: {}", reason);
                                         tokio::time::sleep(Duration::from_secs(2)).await;
                                     } else {
                                         break;
@@ -2746,6 +2796,13 @@ println!("Wallet renamed successfully");
                             }
                         }
                         prep_heartbeat.abort();
+                        {
+                            // Erase the in-place status line before anything else
+                            // prints, or the next message lands on top of it.
+                            use std::io::Write as _;
+                            print!("\r\x1b[2K");
+                            let _ = std::io::stdout().flush();
+                        }
                         if let Some(reason) = prep_stop {
                             println!("Cannot mine right now: {}", reason);
                             break 'mining;
@@ -2967,6 +3024,11 @@ println!("Wallet renamed successfully");
                         }
                     }
                     signal_bridge.abort();
+                    // Mining is over: from here a line typed at the terminal is a
+                    // COMMAND, not a stop signal. Clearing this makes the parked
+                    // stop-reader hand its line back to the prompt instead of eating
+                    // it (see PENDING_INPUT).
+                    MINING_READING_STDIN.store(false, Ordering::SeqCst);
                     if continuous {
                         if stop_flag.load(Ordering::SeqCst) {
                             println!(
