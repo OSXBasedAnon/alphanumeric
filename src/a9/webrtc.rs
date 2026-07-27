@@ -973,9 +973,16 @@ impl WebRtcMesh {
 
     /// Send bytes to one peer over its DataChannel. Returns false if not connected.
     pub async fn send_to(&self, peer_id: &str, data: &[u8]) -> bool {
+        self.send_to_bytes(peer_id, &Bytes::copy_from_slice(data))
+            .await
+    }
+
+    /// Zero-copy variant: the caller wraps the frame in `Bytes` once and every
+    /// per-peer send is a refcount bump (same pattern `broadcast` has always used).
+    pub async fn send_to_bytes(&self, peer_id: &str, data: &Bytes) -> bool {
         let dc = self.channels.lock().await.get(peer_id).cloned();
         if let Some(dc) = dc {
-            dc.send(&Bytes::copy_from_slice(data)).await.is_ok()
+            dc.send(data).await.is_ok()
         } else {
             false
         }
