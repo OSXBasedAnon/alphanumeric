@@ -5440,6 +5440,28 @@ impl Node {
                                 backoff = (backoff * 2).min(Duration::from_secs(5));
                                 continue;
                             }
+                            // BEHIND is not DIVERGED. A node that is simply far behind
+                            // — the client someone reopens after hours away — reaches
+                            // here whenever the gap cannot be closed inside one prep
+                            // budget, e.g. peers have not finished connecting yet at
+                            // startup. Reporting that as ConsensusFailure was wrong
+                            // twice over: it HARD-STOPPED mining ("cannot mine right
+                            // now") instead of waiting, and it dropped a
+                            // force-rebootstrap marker that threw away a perfectly good
+                            // local chain on the next launch. Retryable instead: the
+                            // caller keeps waiting, the background converge/delta-sync
+                            // keep pulling us forward, and mining starts by itself the
+                            // moment we arrive. Only a SMALL-gap NeedsBootstrap is a
+                            // genuine divergence worth the marker and the hard stop.
+                            let local_tip =
+                                self.blockchain.read().await.get_latest_block_index() as u32;
+                            let behind = beacon.height.saturating_sub(local_tip);
+                            if behind > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN {
+                                return Err(NodeError::Retryable(format!(
+                                    "still catching up — {} blocks behind ({} of {}); mining starts automatically once the chain is current",
+                                    behind, local_tip, beacon.height
+                                )));
+                            }
                             let scheduled = self.schedule_force_rebootstrap_hard(
                                 "mine-prep: diverged below finality and no peer could serve the gap",
                             );
