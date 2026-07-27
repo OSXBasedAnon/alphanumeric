@@ -1640,7 +1640,7 @@ impl CompactFullBlockCache {
 /// maintenance, no watchdog — depending on which loop died). The supervisor
 /// makes the panic loud and re-arms the loop with exponential backoff (2s..32s).
 /// A body that returns cleanly is an intentional exit (shutdown) — not restarted.
-fn spawn_supervised<F, Fut>(name: &'static str, mut body: F)
+pub fn spawn_supervised<F, Fut>(name: &'static str, mut body: F)
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1674,7 +1674,7 @@ where
 /// (they own a non-recreatable resource, e.g. the TCP listener): the task stays
 /// down after a panic, but the operator is told instead of the node silently
 /// degrading.
-fn spawn_logged<Fut>(name: &'static str, fut: Fut)
+pub fn spawn_logged<Fut>(name: &'static str, fut: Fut)
 where
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -3175,7 +3175,16 @@ impl Node {
             return false;
         }
         let marker = force_rebootstrap_marker_path(dir);
-        match std::fs::write(&marker, format!("{}\n", reason)) {
+        // Durable write (fsync): this marker is control state that decides whether
+        // the NEXT boot re-bootstraps — it exists precisely to break crash loops,
+        // so it must survive the power cut / kernel panic that may follow.
+        let write_result = std::fs::write(&marker, format!("{}\n", reason)).and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&marker)
+                .and_then(|f| f.sync_all())
+        });
+        match write_result {
             Ok(()) => {
                 warn!(
                     "Force re-bootstrap scheduled ({}): {}",

@@ -472,6 +472,23 @@ fn main() -> Result<()> {
     // is the same `ring` provider the DTLS mesh uses; install_default is idempotent, so
     // the mesh's later call is a harmless no-op.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // Panic VISIBILITY: with panic = "unwind" and ~40 detached background tasks, a
+    // panic unwound into an unread JoinError — the node kept running visibly "up"
+    // with the panicked subsystem silently gone. The supervised spawns re-arm the
+    // load-bearing loops; this hook makes every panic loud (stderr survives even
+    // when the log stack is filtered) and names the thread it happened on.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            eprintln!(
+                "PANIC on thread '{}': {} — the node may be degraded; please report this.",
+                thread.name().unwrap_or("<unnamed>"),
+                info
+            );
+            default_hook(info);
+        }));
+    }
     let app = std::thread::Builder::new()
         .name("alphanumeric-main".to_string())
         .stack_size(MAIN_THREAD_STACK_BYTES)
@@ -705,6 +722,7 @@ async fn async_main() -> Result<()> {
             let db_for_flush = db.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     interval.tick().await;
                     // Flush on the blocking pool, never a runtime worker: a synchronous sled
@@ -904,6 +922,12 @@ async fn async_main() -> Result<()> {
             tokio::task::spawn_local(async move {
                 let mut sync_interval = tokio::time::interval(Duration::from_millis(SYNC_CHECK_INTERVAL));
                 let mut health_interval = tokio::time::interval(Duration::from_millis(HEALTH_CHECK_INTERVAL));
+                // Wake-from-sleep: this monitor DETECTS the suspend, so its own
+                // tickers must not Burst-replay the slept-through backlog (a 12h
+                // sleep = ~21k sync ticks + ~43k health ticks fired back-to-back
+                // at the exact moment recovery starts).
+                sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut block_times = VecDeque::with_capacity(50);
                 let mut sync_attempts: u32 = 0;
                 let mut discovery_failures: u32 = 0;
@@ -929,6 +953,14 @@ async fn async_main() -> Result<()> {
                                 sync_attempts = 0;
                                 discovery_failures = 0;
                                 block_times.clear();
+
+                                // Drop the pooled sockets + circuit-breaker verdicts
+                                // BEFORE rediscovery: after a suspend the pool holds
+                                // only half-open sockets (each worth a full
+                                // response-timeout stall) and the breakers hold
+                                // pre-sleep verdicts. "Resetting network state"
+                                // previously reset counters, not sockets.
+                                node.reset_connection_pool().await;
 
                                 // Attempt immediate network recovery
                                 if let Err(e) = node.discover_network_nodes().await {
@@ -971,7 +1003,22 @@ async fn async_main() -> Result<()> {
                             };
 
                             if active_peers > 0 {
+                                // P2P height fan-out ONLY when the gateway beacon is
+                                // dark: with a live beacon the converge loops already
+                                // own catch-up, and this arm burned a GetBlockHeight
+                                // round-trip per eligible peer every 2s (~240 RPC/min
+                                // at the tip) with 50-500ms timeouts — the main
+                                // producer of cancelled mid-exchange requests. A
+                                // beacon observed within the rolling window means the
+                                // gateway path is alive; this fan-out is the
+                                // gateway-outage fallback, its one unique job.
+                                let beacon_dark = node.beacon_high_water_height() == 0;
                                 if !available_peers.is_empty() {
+                                    if !beacon_dark {
+                                        // Beacon alive: nothing for this arm to do —
+                                        // and no discovery either (peers are fine).
+                                        continue;
+                                    }
                                     // Check chain state with safe conversion
                                     let local_height = {
                                         let blockchain = node.blockchain.read().await;
@@ -1191,10 +1238,18 @@ async fn async_main() -> Result<()> {
         // polling, no server state, no per-wallet index; it rides the delta the
         // node already pulled. This is what makes an incoming payment show up
         // instantly without restarting or refreshing.
+        // Session-mined blocks (height, hash, reward): the tip-signal task below
+        // re-checks these on every applied block and reports a reorg that orphaned
+        // one — the miner otherwise never learns; the maturing reward just
+        // silently vanishes from `balance` and the end-of-run summary overstates
+        // earnings.
+        let session_mined: Arc<tokio::sync::Mutex<Vec<(u32, [u8; 32], f64)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         {
             let wallet_addresses = wallet_addresses.clone();
             let blockchain = blockchain.clone();
             let whisper_module = whisper_module.clone();
+            let session_mined_watch = Arc::clone(&session_mined);
             tokio::spawn(async move {
                 let mut rx = { blockchain.read().await.subscribe_tip_changes() };
                 let mut last_scanned: u32 =
@@ -1245,6 +1300,33 @@ async fn async_main() -> Result<()> {
                             }
                         }
                     }
+                    // Session-mined blocks: report a reorg that orphaned one.
+                    // Judged only for heights the current tip has reached;
+                    // still-canonical entries stop being tracked once buried
+                    // beyond reorg reach.
+                    let snapshot: Vec<(u32, [u8; 32], f64)> =
+                        { session_mined_watch.lock().await.clone() };
+                    if !snapshot.is_empty() {
+                        let mut orphaned: Vec<u32> = Vec::new();
+                        for (h, expected_hash, reward) in &snapshot {
+                            if *h > height {
+                                continue; // judged when the tip re-reaches it
+                            }
+                            let stored =
+                                { blockchain.read().await.get_block(*h).ok().map(|b| b.hash) };
+                            if stored != Some(*expected_hash) {
+                                orphaned.push(*h);
+                                println!(
+                                    "\n\x1b[1;91m✖ Block #{} was reorged out\x1b[0m — its {:.8} ♦ reward is no longer on the canonical chain.",
+                                    h, reward
+                                );
+                            }
+                        }
+                        let mut mined = session_mined_watch.lock().await;
+                        mined.retain(|(h, _, _)| {
+                            !orphaned.contains(h) && height.saturating_sub(*h) < 1024
+                        });
+                    }
                     last_scanned = height;
                 }
             });
@@ -1287,7 +1369,9 @@ async fn async_main() -> Result<()> {
             let node_recon = node.clone();
             let shutdown_recon = shutdown_requested.clone();
             let db_path_recon = db_path.clone();
-            tokio::spawn(async move {
+            // spawn_logged: a panic in this loop previously died silently — the node
+            // kept running with no background reconciliation at all.
+            alphanumeric::a9::node::spawn_logged("runtime-reconcile", async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(20));
                 // Wake-from-sleep: where Instant advances across an OS suspend
                 // (Windows), the default Burst behavior replays every slept-through
@@ -1493,7 +1577,17 @@ async fn async_main() -> Result<()> {
                                 // — the live loop has PROVEN convergence is impossible,
                                 // which outranks any boot-time guess.
                                 let marker = force_rebootstrap_marker_path(&db_path_recon);
-                                if let Err(e) = std::fs::write(&marker, b"runtime too-far-behind exit\n") {
+                                // Durable (fsync'd): this marker exists to break a
+                                // crash loop, so it must survive the power cut /
+                                // kernel panic that may follow the exit below.
+                                if let Err(e) = std::fs::write(&marker, b"runtime too-far-behind exit\n")
+                                    .and_then(|()| {
+                                        std::fs::OpenOptions::new()
+                                            .read(true)
+                                            .open(&marker)
+                                            .and_then(|f| f.sync_all())
+                                    })
+                                {
                                     eprintln!(
                                         "Warning: could not write re-bootstrap marker {}: {}",
                                         marker.display(),
@@ -1579,6 +1673,11 @@ async fn async_main() -> Result<()> {
                     }
                     Err(_) => {
                         // The blocking read task panicked; clean up and exit gracefully.
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // ~1s of sled writes.
+                        let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
                         return Ok(());
@@ -1587,6 +1686,11 @@ async fn async_main() -> Result<()> {
                 match read_result {
                     Ok(line) => line.trim().to_string(),
                     Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // ~1s of sled writes.
+                        let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
                         return Ok(());
@@ -1618,6 +1722,11 @@ async fn async_main() -> Result<()> {
                 {
                     Ok(v) => v,
                     Err(_) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // ~1s of sled writes.
+                        let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
                         return Ok(());
@@ -1625,6 +1734,11 @@ async fn async_main() -> Result<()> {
                 };
                 match read_res {
                     Ok(0) => {
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // ~1s of sled writes.
+                        let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
                         return Ok(());
@@ -1632,6 +1746,11 @@ async fn async_main() -> Result<()> {
                     Ok(_) => command.trim().to_string(),
                     Err(e) => {
                         warn!("Input loop interrupted: {}", e);
+                        // Flush before exit: the signal-handler flush never runs on
+                        // these paths (rustyline consumes ^C itself and returns
+                        // Interrupted), and exiting without it discards the last
+                        // ~1s of sled writes.
+                        let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
                         return Ok(());
@@ -2088,10 +2207,19 @@ println!("Wallet renamed successfully");
                         });
                     }
 
-                    // Sleep in short slices so Enter stops continuous mode promptly.
-                    async fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
+                    // Sleep in short slices so Enter stops continuous mode promptly —
+                    // and so Ctrl-C/SIGTERM does too: shutdown used to be ignored for
+                    // the whole backoff (up to 60s), absorb wait and jitter phases.
+                    async fn sleep_interruptible(
+                        total: Duration,
+                        stop: &AtomicBool,
+                        shutdown: &AtomicBool,
+                    ) {
                         let mut remaining = total;
-                        while remaining > Duration::ZERO && !stop.load(Ordering::SeqCst) {
+                        while remaining > Duration::ZERO
+                            && !stop.load(Ordering::SeqCst)
+                            && !shutdown.load(Ordering::Acquire)
+                        {
                             let slice = remaining.min(Duration::from_millis(250));
                             tokio::time::sleep(slice).await;
                             remaining = remaining.saturating_sub(slice);
@@ -2176,7 +2304,9 @@ println!("Wallet renamed successfully");
                         loop {
                             // Enter-to-stop must work during prep too, not only
                             // once mining starts.
-                            if continuous && stop_flag.load(Ordering::SeqCst) {
+                            if (continuous && stop_flag.load(Ordering::SeqCst))
+                                || shutdown_requested.load(Ordering::Acquire)
+                            {
                                 break;
                             }
                             let remaining =
@@ -2228,7 +2358,8 @@ println!("Wallet renamed successfully");
                                     "Network tip still syncing; waiting {}s before the next attempt…",
                                     backoff.as_secs()
                                 );
-                                sleep_interruptible(backoff, &stop_flag).await;
+                                sleep_interruptible(backoff, &stop_flag, &shutdown_requested)
+                                    .await;
                                 backoff = (backoff * 2).min(Duration::from_secs(60));
                                 continue 'mining;
                             }
@@ -2253,6 +2384,20 @@ println!("Wallet renamed successfully");
                                 consecutive_mine_errors = 0;
                                 mined_count += 1;
                                 let mined_height = mined_block.index;
+                                {
+                                    // Track for the reorged-out notifier (the
+                                    // tip-signal task re-checks these per block).
+                                    let reward = mined_block
+                                        .transactions
+                                        .iter()
+                                        .find(|t| t.sender == "MINING_REWARDS")
+                                        .map(|t| t.amount())
+                                        .unwrap_or(0.0);
+                                    session_mined
+                                        .lock()
+                                        .await
+                                        .push((mined_height, mined_block.hash, reward));
+                                }
                                 let publish_node = Arc::clone(&node);
                                 tokio::spawn(async move {
                                     const MAX_PUBLISH_ATTEMPTS: u32 = 4;
@@ -2276,6 +2421,14 @@ println!("Wallet renamed successfully");
                                                 warn!(
                                                     "Failed to publish mined block after {} attempts: {}",
                                                     MAX_PUBLISH_ATTEMPTS, e
+                                                );
+                                                // Say it on the CONSOLE: a block that
+                                                // never left this machine looks like a
+                                                // normal success otherwise, then
+                                                // silently orphans.
+                                                println!(
+                                                    "\n⚠ Block #{} could not be published to the network ({} attempts). It is saved locally, but until connectivity recovers other miners may overtake it — check your connection.",
+                                                    mined_height, MAX_PUBLISH_ATTEMPTS
                                                 );
                                             }
                                         }
@@ -2318,6 +2471,7 @@ println!("Wallet renamed successfully");
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)
+                                        || shutdown_requested.load(Ordering::Acquire)
                                         || Instant::now() >= absorb_deadline
                                     {
                                         break;
@@ -2327,6 +2481,7 @@ println!("Wallet renamed successfully");
                                         _ => sleep_interruptible(
                                             Duration::from_millis(500),
                                             &stop_flag,
+                                            &shutdown_requested,
                                         )
                                         .await,
                                     }
@@ -2340,6 +2495,7 @@ println!("Wallet renamed successfully");
                                 sleep_interruptible(
                                     Duration::from_millis(jitter_ms),
                                     &stop_flag,
+                                    &shutdown_requested,
                                 )
                                 .await;
                             }
@@ -2377,6 +2533,7 @@ println!("Wallet renamed successfully");
                                     sleep_interruptible(
                                         Duration::from_millis(jitter_ms),
                                         &stop_flag,
+                                        &shutdown_requested,
                                     )
                                     .await;
                                     continue 'mining;
@@ -2407,7 +2564,8 @@ println!("Wallet renamed successfully");
                                     "Backing off {}s before the next attempt…",
                                     backoff.as_secs()
                                 );
-                                sleep_interruptible(backoff, &stop_flag).await;
+                                sleep_interruptible(backoff, &stop_flag, &shutdown_requested)
+                                    .await;
                                 backoff = (backoff * 2).min(Duration::from_secs(60));
                             }
                         }
@@ -3533,19 +3691,25 @@ fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
                 if !is_process_alive(pid) {
                     let _ = std::fs::remove_file(lock_path);
                 } else {
-                    return Err(std::io::Error::other(
-                        "Database lock exists. Another instance may be running.",
-                    ));
+                    // Name the file, the PID, and the escape hatch: the old
+                    // one-size message left the operator of a SIGKILLed node
+                    // with nothing to act on.
+                    return Err(std::io::Error::other(format!(
+                        "Another instance appears to be running (pid {} holds {}). If that process is NOT alphanumeric (PID reuse after a crash), delete the lock file or set {}=true.",
+                        pid, lock_path, ignore_env
+                    )));
                 }
             } else {
-                return Err(std::io::Error::other(
-                    "Database lock exists. Another instance may be running.",
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Lock file {} exists but holds no readable PID. If no other instance is running, delete it or set {}=true.",
+                    lock_path, ignore_env
+                )));
             }
         } else {
-            return Err(std::io::Error::other(
-                "Database lock exists. Another instance may be running.",
-            ));
+            return Err(std::io::Error::other(format!(
+                "Lock file {} exists but could not be read. If no other instance is running, delete it or set {}=true.",
+                lock_path, ignore_env
+            )));
         }
     }
 
@@ -4456,7 +4620,15 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         // Stamp the cooldown into the FRESH db dir: if this chain diverges again
         // immediately (shattered network), the divergence exit stays up and keeps
         // retrying converge instead of looping snapshot downloads.
-        let _ = std::fs::write(rebootstrap_cooldown_path(db_path), b"");
+        // Durable (fsync'd): losing this cooldown stamp to a power cut restores
+        // the snapshot-download loop it exists to prevent.
+        let cooldown = rebootstrap_cooldown_path(db_path);
+        let _ = std::fs::write(&cooldown, b"").and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&cooldown)
+                .and_then(|f| f.sync_all())
+        });
     }
     Ok(())
 }
