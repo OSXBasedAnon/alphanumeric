@@ -1224,6 +1224,10 @@ pub struct Blockchain {
     mempool: Arc<RwLock<Mempool>>,
     pub chain_sentinel: Arc<ChainSentinel>,
     signature_cache: Arc<PLMutex<LruCache<String, bool>>>,
+    /// Last successfully-read trusted checkpoint. Guards against a transient
+    /// meta-tree read error silently degrading finality to 0 (see
+    /// trusted_checkpoint_height).
+    last_known_checkpoint: Arc<AtomicU64>,
     /// Genesis timestamp memo (genesis is immutable): calculate_block_reward used
     /// to do a sled get + full block deserialize on EVERY call — and the template
     /// packer calls it 4x per admitted candidate.
@@ -1762,11 +1766,32 @@ impl Blockchain {
     /// blocks above it — the unfinalized frontier — MUST pass full ML-DSA
     /// verification to be adopted from a peer or the relay. 0 if never seeded.
     pub fn trusted_checkpoint_height(&self) -> u32 {
-        self.open_chain_meta_tree()
+        // A read error must NOT degrade to 0. Zero disables finality outright:
+        // deep reorgs stop being rejected, and verification_floor() collapses so
+        // the node demands full witnesses for hundreds of thousands of buried
+        // blocks. Fall back to the last value we successfully read instead, and
+        // say so — a LOWER checkpoint is never the safe direction to fail in.
+        match self
+            .open_chain_meta_tree()
             .ok()
             .and_then(|tree| tree.get(TRUSTED_CHECKPOINT_KEY).ok().flatten())
             .and_then(|raw| codec::deserialize::<u32>(&raw).ok())
-            .unwrap_or(0)
+        {
+            Some(height) => {
+                self.last_known_checkpoint.store(height as u64, Ordering::Release);
+                height
+            }
+            None => {
+                let cached = self.last_known_checkpoint.load(Ordering::Acquire) as u32;
+                if cached > 0 {
+                    warn!(
+                        "Could not read the trusted checkpoint; holding the last known value {} rather than degrading finality to 0",
+                        cached
+                    );
+                }
+                cached
+            }
+        }
     }
 
     /// The height at/below which blocks are receipt-trusted and above which they
@@ -4481,6 +4506,7 @@ impl Blockchain {
             chain_sentinel,
             signature_cache,
             genesis_timestamp: Arc::new(std::sync::OnceLock::new()),
+            last_known_checkpoint: Arc::new(AtomicU64::new(0)),
             state_mutation_lock: Arc::new(Mutex::new(())),
             pending_rules_gate: Arc::new(Mutex::new(())),
             pending_rules_complete: Arc::new(AtomicBool::new(false)),
@@ -6964,10 +6990,24 @@ impl Blockchain {
                         let mut full_tx = tx.clone();
                         full_tx.signature = Some(hex::encode(&sig));
                         if let Ok(bytes) = codec::serialize(&full_tx) {
-                            let _ = cw_tree.insert(tx_id.as_bytes(), bytes);
+                            // Do NOT swallow these. If witness retention fails
+                            // (disk full, transient sled error) the node keeps
+                            // accepting blocks while quietly becoming unable to
+                            // serve witnesses to peers — and a peer that cannot
+                            // obtain them cannot advance its verification floor,
+                            // which is exactly the multi-minute freeze the beacon
+                            // escape has to rescue. That cause was invisible.
+                            if let Err(e) = cw_tree.insert(tx_id.as_bytes(), bytes) {
+                                warn!(
+                                    "Could not retain confirmed witness for {} — peers may be unable to verify near-tip blocks from us: {}",
+                                    tx_id, e
+                                );
+                            }
                             let mut idx_key = confirm_height.to_be_bytes().to_vec();
                             idx_key.extend_from_slice(tx_id.as_bytes());
-                            let _ = cw_index.insert(idx_key, b"" as &[u8]);
+                            if let Err(e) = cw_index.insert(idx_key, b"" as &[u8]) {
+                                warn!("Could not index confirmed witness for {}: {}", tx_id, e);
+                            }
                         }
                     }
                     pending_tree.remove(tx_id.as_bytes())?;

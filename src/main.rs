@@ -1449,6 +1449,7 @@ async fn async_main() -> Result<()> {
             let node_recon = node.clone();
             let shutdown_recon = shutdown_requested.clone();
             let db_path_recon = db_path.clone();
+            let db_for_recon = db.clone();
             // spawn_logged: a panic in this loop previously died silently — the node
             // kept running with no background reconciliation at all.
             alphanumeric::a9::node::spawn_logged("runtime-reconcile", async move {
@@ -1672,6 +1673,11 @@ async fn async_main() -> Result<()> {
                                     "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
                                     alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                 );
+                                // Flush before exit like every other exit path:
+                                // sled buffers ~1s of writes, and discarding them
+                                // here costs a derived-state rebuild on the next
+                                // boot — on the very path whose job is recovery.
+                                let _ = db_for_recon.flush();
                                 // Nonzero: this exit exists to BE re-launched (the marker written
                                 // above makes the next boot re-bootstrap). exit(0) reads as success,
                                 // so systemd Restart=on-failure / docker restart:on-failure would
