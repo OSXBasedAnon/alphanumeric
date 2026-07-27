@@ -1,30 +1,48 @@
-**Alphanumeric v7.9.0 — witness-resolution hardening + DoS resilience**
+**Alphanumeric v7.9.1 — nodes can no longer get permanently stuck**
 
-This is a security hardening release for witness handling. No consensus rule,
-wire format, or network compatibility changes.
+Reliability release. No change to block validity rules, wire format, or network
+compatibility — 7.9.1 and 7.9.0 nodes stay on the same chain and can be upgraded
+in any order. **Recommended for every node.**
 
-### Key fixes
-- Block witness fetches are now bounded by both wall-clock deadline and a per-block
-  request budget.
-- Each witness fetch uses a fixed timeout cap so slow peers cannot monopolize
-  frontier verification.
-- If witnesses are not available in time, blocks are deferred for later re-check
-  rather than being permanently poisoned.
-- Hardened on both tracks: `main` + `gpu-mining`.
+### The main fix
+A node only stops re-verifying a block's full witnesses once that block falls
+below its verification floor — and that floor only advances when the node
+*applies* a block. So a node that couldn't apply one specific block (its
+witnesses unobtainable from any peer) deadlocked: it needed to apply the block to
+advance the floor, and needed the floor to advance to apply the block. In the
+wild that looked like a node frozen at one height for 80+ minutes while the
+network moved on.
+
+It now breaks out using the signed tip beacon — the same key that signs the
+bootstrap manifest every node already trusts — and recovers on its own in about
+90 seconds to 5 minutes. Finality can't move nearer the tip than the normal reorg
+margin, can't regress, and PoW/hash/linkage checks all still apply.
+
+### Also fixed
+- Nodes no longer publish witness-short blocks that poison a relay height for
+  everyone else.
+- Waking a client after a long idle no longer says "restart this node" — it heals
+  in place.
+- Timed-out peer requests can no longer desync a pooled connection.
+- Background tasks survive panics instead of vanishing silently.
+- Faster catch-up and start-up; ~13x fewer database flushes per block.
+- Payments returned to the mempool by a reorg are no longer lost on restart.
+- Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
+  block you mined gets reorged out.
 
 ### Download (macOS, Apple Silicon)
-Standard: `alphanumeric-v7.9.0-macos-arm64.zip`
-GPU: `alphanumeric-v7.9.0-gpu-macos-arm64.zip`
+Standard: `alphanumeric-v7.9.1-macos-arm64.zip`
+GPU: `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
 
 ### Artifacts + checksums
-- `alphanumeric-v7.9.0-macos-arm64.zip`
-  - `c64dc39c6e36d52a5c99c267cec2746f68a7ed0b350d36c0e97423fa1d15d405`
-- `alphanumeric-v7.9.0-gpu-macos-arm64.zip`
-  - `09dcc3fa5a3a30ffae7e340458f23086745b919b8494471c33aaee53b5fd8bf2`
+- `alphanumeric-v7.9.1-macos-arm64.zip`
+  - `73d254f8ffc9218beba0381d25f892034102e037c6bb360241130a60ca2d8e1d`
+- `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
+  - `6b2d810a158db54b9e1398a06465aae4e957e04c8d002cf24abcf72a8132e036`
 
-No known consensus impact. Source build commands:
+Source build commands:
 - Standard: `git checkout main && cargo build --release`
 - GPU: `git checkout gpu-mining && cargo build --release --features gpu_miner`
 
 GitHub tag placeholder:
-https://github.com/OSXBasedAnon/alphanumeric/releases/tag/v7.9.0
+https://github.com/OSXBasedAnon/alphanumeric/releases/tag/v7.9.1
