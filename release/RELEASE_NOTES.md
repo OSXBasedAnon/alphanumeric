@@ -57,6 +57,29 @@ seconds to 5 minutes instead of never.
   vanishing.
 - **Faster start-up:** boot no longer rescans the whole chain to find its tip.
 
+## Interface
+- **One display language across every screen.** Balances, wallets, mining,
+  transactions, `info` and the boot sequence now share a single layout system —
+  consistent columns, consistent colour meaning, consistent spacing — instead of
+  each screen having grown its own conventions.
+- **Readable on any terminal.** Anything you might retype or compare — addresses,
+  transaction ids — now renders in your terminal's own foreground colour rather
+  than a fixed grey that was unreadable on a light background.
+- **Chain-event notices rewritten.** Incoming payments, whispers and reorg
+  notices are now aligned keyword lines (`received`, `whisper`, `reorged`) with
+  no symbols, so they line up and read the same as the rest of the client.
+- **A block you mined that gets reorged out is now reported**, instead of the
+  maturing reward quietly disappearing from your balance.
+- **Whisper send no longer claims "visible to everyone."** Nothing displays
+  whispers anywhere; the accurate caveat (decodable from the ledger by someone
+  looking, so don't put anything sensitive in one) stays on the help screen.
+
+## On alphanumeric.blue
+- The hashrate shown beside the chart and the hashrate in the metrics row above
+  it now always agree. They were computed differently — one showed the newest raw
+  sample, the other a median of the recent window — so they could sit a spike
+  apart. The chart itself still plots the raw per-sample series, bursts included.
+
 ## Install / verify
 - **Standard**: use `alphanumeric-v7.9.1-macos-arm64.zip`
 - **GPU mining (opt-in)**: use `alphanumeric-v7.9.1-gpu-macos-arm64.zip`
