@@ -2302,15 +2302,17 @@ impl Node {
     }
 
     fn stats_server_explicitly_enabled() -> bool {
-        std::env::var("ALPHANUMERIC_STATS_ENABLED")
-            .map(|v| !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false)
+        // Honour the whole falsy set (0/false/no/off), not just the literal
+        // "false": ALPHANUMERIC_STATS_ENABLED=0 used to ENABLE this, which is
+        // the opposite of what an operator typing 0 intends.
+        Self::env_flag_enabled("ALPHANUMERIC_STATS_ENABLED")
     }
 
     fn upnp_explicitly_enabled() -> bool {
-        std::env::var("ALPHANUMERIC_ENABLE_UPNP")
-            .map(|v| !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false)
+        // Honour the whole falsy set (0/false/no/off), not just the literal
+        // "false": ALPHANUMERIC_ENABLE_UPNP=0 used to ENABLE this, which is
+        // the opposite of what an operator typing 0 intends.
+        Self::env_flag_enabled("ALPHANUMERIC_ENABLE_UPNP")
     }
 
     fn is_expected_startup_sync_gap(error: &NodeError) -> bool {
