@@ -6152,8 +6152,7 @@ impl Blockchain {
             }
             template_bytes = template_bytes.saturating_add(tx_bytes);
             included += 1;
-            min_included_fee =
-                Some(min_included_fee.map_or(tx.fee_units, |m| m.min(tx.fee_units)));
+            min_included_fee = Some(min_included_fee.map_or(tx.fee_units, |m| m.min(tx.fee_units)));
         }
 
         // Headroom for the transaction this estimate is FOR: if the caller's
@@ -10248,13 +10247,27 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(
+                    &mut h,
+                    &ta,
+                    1u64 << 26,
+                    "miner_a".to_string(),
+                    false,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(
+                    &mut h,
+                    &tb,
+                    1u64 << 26,
+                    "miner_b".to_string(),
+                    false,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
                 .await
         });
 
@@ -10315,13 +10328,27 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(
+                    &mut h,
+                    &txs_a,
+                    1u64 << 26,
+                    "miner_a".to_string(),
+                    false,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), false, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .mine_block(
+                    &mut h,
+                    &txs_b,
+                    1u64 << 26,
+                    "miner_b".to_string(),
+                    false,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
                 .await
         });
 
