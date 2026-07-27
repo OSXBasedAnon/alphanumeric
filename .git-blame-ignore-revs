@@ -1,0 +1,6 @@
+# Revisions to skip in `git blame` — formatting-only, no behaviour change.
+# Enable locally: git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub honours this file automatically.)
+
+# style: rustfmt the six proven layout-only files (2026-07-27, gpu-mining)
+7252441cbd75914ed4e1860a8103afa3c3dfc06a
