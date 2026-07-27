@@ -8004,7 +8004,14 @@ impl Node {
             // standalone 20s catch-up loop — same converge cadence, one fewer
             // beacon fetch and converge pass per cycle.
             let safety_secs = if is_publisher { 1 } else { 20 };
-            spawn_logged("beacon-watch", async move {
+            // SUPERVISED, not merely logged: this loop owns the frozen-tip escape
+            // (the only way out of the verification-floor deadlock), so if it dies
+            // the node keeps reporting healthy — locks fine, heartbeat ticking —
+            // while never syncing again. It captures only a node handle and
+            // loop-local state, so restarting it is safe.
+            spawn_supervised("beacon-watch", move || {
+                let node_clone = node_clone.clone();
+                async move {
                 let mut ticker = interval(Duration::from_secs(tick_secs));
                 // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
                 // the default Burst behavior replays every slept-through tick back-to-back
@@ -8286,6 +8293,7 @@ impl Node {
                             }
                         }
                     }
+                }
                 }
             });
         }
@@ -11450,7 +11458,14 @@ impl Node {
             NetworkEvent::NewTransaction(tx) => {
                 // Deduplicate transactions using bloom filter
                 let tx_bytes = codec::serialize(&tx)?;
-                if !self.network_bloom.insert(&tx_bytes) {
+                // READ-ONLY until admission succeeds — the same rule the NewBlock
+                // arm below documents. Inserting first meant a tx dropped for a
+                // TRANSIENT reason (a stale balances index during catch-up makes
+                // validate_transaction report InsufficientFunds) still marked the
+                // hash as seen, so every later re-gossip of that same transaction
+                // was silently swallowed at this gate until the bloom rotated. The
+                // retry mechanism was defeated by the poison it created.
+                if self.network_bloom.check(&tx_bytes) {
                     return Ok(());
                 }
 
