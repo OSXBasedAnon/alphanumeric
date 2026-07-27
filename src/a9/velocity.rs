@@ -489,7 +489,13 @@ impl VelocityManager {
                 // Deserialize the block
                 let reconstructed_block: Block = codec::deserialize(&data)
                     .map_err(|e| VelocityError::DeserializationError(e.to_string()))?;
-                if reconstructed_block.calculate_hash_for_block() != *block_hash {
+                // Check the block's OWN hash field too, not just the computed one
+                // against the key we asked for — otherwise a reconstructed block
+                // could travel downstream carrying an arbitrary .hash. The direct
+                // shred path already checks both; this one did not.
+                if reconstructed_block.calculate_hash_for_block() != *block_hash
+                    || reconstructed_block.hash != *block_hash
+                {
                     return Err(VelocityError::HashMismatch);
                 }
                 return Ok(reconstructed_block);
@@ -811,6 +817,11 @@ impl VelocityManager {
         // Check if we can reconstruct the block
         if let Some(block) = self.try_reconstruct_block(&shred.block_hash).await? {
             self.metrics.record_block_reconstructed();
+            // The block is whole, so there is nothing left to re-request. Without
+            // this the entry stayed forever: removal only happened on the
+            // re-request path, so every block that reconstructed on the first
+            // try leaked one map entry for the process lifetime.
+            self.pending_requests.remove(&shred.block_hash);
             return Ok(Some(block));
         }
 

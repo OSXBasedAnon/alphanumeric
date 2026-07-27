@@ -71,8 +71,11 @@ impl NetworkConfig {
 
         if let Ok(port) = env::var("ALPHANUMERIC_PORT") {
             match port.trim().parse::<u16>() {
+                // This arm does NOT assign, so the default port stands. Say that,
+                // rather than claiming an ephemeral bind that never happens.
                 Ok(0) => eprintln!(
-                    "WARNING: ALPHANUMERIC_PORT='0' was provided; binding to an ephemeral port."
+                    "WARNING: ALPHANUMERIC_PORT='0' is not a usable listen port; ignoring it and using {}.",
+                    config.port
                 ),
                 Ok(p) => config.port = p,
                 // Mirror BIND_IP below: warn loudly instead of silently swallowing a bad value,
