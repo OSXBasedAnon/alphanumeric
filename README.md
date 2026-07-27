@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
 https://www.alphanumeric.blue/
+
 Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
 
 `alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.0`.
