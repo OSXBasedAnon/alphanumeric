@@ -6,6 +6,7 @@ pub mod mgmt;
 pub mod mldsa;
 pub mod node;
 pub mod oracle;
+pub mod ui;
 pub mod miner;
 pub mod velocity;
 pub mod wallet;

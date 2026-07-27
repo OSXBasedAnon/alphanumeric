@@ -15,7 +15,14 @@ use tokio::fs;
 use tokio::sync::RwLock;
 
 use crate::a9::blockchain::{
-    is_canonical_user_address, MIN_RELAY_FEE_UNITS, WALLET_FEE_SAFETY_LIMIT_UNITS,
+    is_canonical_user_address, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES,
+    WALLET_FEE_SAFETY_LIMIT_UNITS,
+};
+use crate::a9::ui::{
+    ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg,
+    ui_text,
+    ui_thousands,
+    UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
 };
 use crate::a9::{
     blockchain::{
@@ -1242,7 +1249,9 @@ impl Mgmt {
         blockchain: &Arc<RwLock<Blockchain>>,
         wallets: &HashMap<String, Wallet>,
     ) -> Result<()> {
-        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+        // Auto, not Always: `account <addr> | grep` was receiving raw ANSI
+        // escapes. The sibling load_wallets already uses Auto.
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         let address = args.split_whitespace().nth(1);
 
         match address {
@@ -1321,231 +1330,695 @@ impl Mgmt {
                 // Print account information. All styled output goes THROUGH the termcolor
                 // `stdout` stream (writeln!/write!), never println!/print!: mixing the two puts
                 // the color/bold attribute on one handle and the text on another, so headers
-                // rendered bold only on Windows (Console API) and plain on Unix. Section headers
-                // are explicitly bold so they look identical on both platforms.
-                stdout.set_color(
-                    ColorSpec::new()
-                        .set_fg(Some(Color::Rgb(40, 204, 217)))
-                        .set_bold(true),
+                // rendered bold only on Windows (Console API) and plain on Unix. Weight is set
+                // explicitly on every run (ui_seg) so nothing inherits a stale bold flag.
+                let spec = &mut ColorSpec::new();
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // ── banner: identity, then a balance that RECONCILES ───────────
+                // spendable + maturing + pending_debit = confirmed. The old screen
+                // printed spendable under a bare "Balance:" label and put the
+                // pending figure in its own section four lines away, so the two
+                // could not be related by eye.
+                let maturing_total: f64 =
+                    breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                writeln!(stdout)?;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_CYAN, true, "Account")?;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                ui_text(&mut stdout, spec, false, addr)?;
+                writeln!(stdout)?;
+
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                let seen = history.as_ref().map_or(false, |s| s.tx_count > 0);
+                if seen {
+                    ui_seg(&mut stdout, spec, UI_GREEN, false, "✓ ACTIVE")?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "○ UNSEEN")?;
+                }
+                ui_pad(&mut stdout, spec, 9, 17)?;
+                // Local-wallet match against wallet ADDRESSES. The old check was
+                // `wallets.contains_key(addr)`, but the map is keyed by wallet
+                // NAME — so "Local Wallet" only ever fired for a wallet literally
+                // named after its own address.
+                let local = wallets
+                    .iter()
+                    .find(|(_, wallet)| wallet.address == addr)
+                    .map(|(name, _)| name.clone());
+                let mut col = 17usize;
+                if let Some(name) = local.as_ref() {
+                    ui_seg(&mut stdout, spec, UI_CYAN, false, "● local")?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
+                    ui_seg(&mut stdout, spec, UI_CYAN, false, name)?;
+                    col += 10 + name.chars().count();
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "○ not local")?;
+                    col += 11;
+                }
+                // A long wallet name (default_wallet) reaches the tx column and
+                // used to butt straight into it — "default_wallet16 txs". The
+                // next field always starts at least two spaces clear.
+                let tx_count = history.as_ref().map_or(0, |s| s.tx_count);
+                let tx_text = format!("{} txs", tx_count);
+                let tx_col = 41usize.max(col + 2);
+                ui_pad(&mut stdout, spec, col, tx_col)?;
+                ui_seg(&mut stdout, spec, UI_BLUE, false, &tx_text)?;
+                col = tx_col + tx_text.chars().count();
+                ui_pad(&mut stdout, spec, col, 57usize.max(col + 2))?;
+                ui_seg(&mut stdout, spec, UI_DIM, false, "tip ")?;
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_BLUE,
+                    false,
+                    &ui_thousands(breakdown.as_of_height),
                 )?;
-                writeln!(stdout, "\n Account Information")?;
-                stdout.reset()?;
-                writeln!(stdout, "───────────────────")?;
+                writeln!(stdout)?;
 
-                // Address
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))?;
-                write!(stdout, "Address: ")?;
-                stdout.reset()?;
-                writeln!(stdout, "{}", addr)?;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_CYAN, false, &ui_money(balance, 4))?;
+                ui_seg(&mut stdout, spec, UI_DIM, false, " spendable")?;
+                ui_pad(&mut stdout, spec, 1 + 15 + 10, 41)?;
+                if maturing_total > 0.0 {
+                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &ui_money(maturing_total, 4))?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        &format!(" maturing · {}", breakdown.maturing.len()),
+                    )?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, "no maturing rewards")?;
+                }
+                writeln!(stdout)?;
 
-                // Wallet Status
-                if wallets.contains_key(addr) {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
-                    write!(stdout, "Status: ")?;
-                    stdout.reset()?;
-                    writeln!(stdout, "Local Wallet")?;
+                if pending_stats.0 > 0 || pending_stats.1 > 0 {
+                    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &ui_money(pending_stats.2, 4))?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        &format!(" pending out · {}", pending_stats.0),
+                    )?;
+                    ui_pad(&mut stdout, spec, 1 + 15 + 16 + pending_stats.0.to_string().len(), 41)?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_CYAN,
+                        false,
+                        &ui_money(breakdown.confirmed, 4),
+                    )?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, " = confirmed")?;
+                    writeln!(stdout)?;
                 }
 
-                // Balance
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))?;
-                write!(stdout, "Balance: ")?;
-                stdout.reset()?;
+                ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+                writeln!(stdout)?;
 
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)))?;
-                write!(stdout, "{:.8}", balance)?;
-                stdout.reset()?;
-                stdout
-                    .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(237, 124, 51))))
-                    .ok();
-                writeln!(stdout, " ♦")?;
-                stdout.reset()?;
-
-                // M06: coinbases still inside the maturity window are credited on-chain
-                // but excluded from the spendable figure above — show them or a freshly
-                // mined reward reads as missing.
-                if !breakdown.maturing.is_empty() {
-                    let maturing_total: f64 =
-                        breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                // ── Maturing Rewards │ History ─────────────────────────────────
+                // The per-reward (height, amount) detail is already decoded by
+                // immature_coinbase_details; the old screen collapsed it to a sum
+                // and threw the rest away.
+                ui_grid_header(
+                    &mut stdout,
+                    spec,
+                    "Maturing Rewards",
+                    UI_CYAN,
+                    "History",
+                    UI_BLUE,
+                )?;
+                let stats = history.clone().unwrap_or_default();
+                let right_rows: Vec<(String, Vec<(Color, String)>)> = vec![
+                    (
+                        "Received:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.received_units), 4),
+                        )],
+                    ),
+                    (
+                        "Sent:".to_string(),
+                        vec![(UI_BLUE, ui_money(Transaction::from_units(stats.sent_units), 4))],
+                    ),
+                    (
+                        "Fees Paid:".to_string(),
+                        vec![(UI_BLUE, ui_money(Transaction::from_units(stats.fees_units), 4))],
+                    ),
+                    (
+                        "First Activity:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            stats.first_height.map_or_else(
+                                || "—".to_string(),
+                                |h| format!("block {}", ui_thousands(h as u64)),
+                            ),
+                        )],
+                    ),
+                    (
+                        "Last Activity:".to_string(),
+                        vec![(
+                            UI_BLUE,
+                            stats.last_height.map_or_else(
+                                || "—".to_string(),
+                                |h| format!("block {}", ui_thousands(h as u64)),
+                            ),
+                        )],
+                    ),
+                ];
+                let mut left_rows: Vec<(String, Vec<(Color, String)>)> = breakdown
+                    .maturing
+                    .iter()
+                    .map(|(height, amount)| {
+                        (
+                            format!("block {}:", ui_thousands(*height as u64)),
+                            vec![
+                                (UI_CYAN, format!("{:.8} ♦", amount)),
+                                (
+                                    UI_ORANGE,
+                                    format!(
+                                        "  {} blk",
+                                        blocks_until_mature(*height, breakdown.as_of_height)
+                                    ),
+                                ),
+                            ],
+                        )
+                    })
+                    .collect();
+                if left_rows.is_empty() {
+                    left_rows.push((
+                        "Maturing:".to_string(),
+                        vec![(UI_DIM, "none".to_string())],
+                    ));
+                } else {
                     let next_left = breakdown
                         .maturing
                         .iter()
                         .map(|(height, _)| blocks_until_mature(*height, breakdown.as_of_height))
                         .min()
                         .unwrap_or(0);
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))
-                        .ok();
-                    writeln!(
-                        stdout,
-                        "  + {:.8} ♦ maturing ({} reward{}; next spendable in {})",
-                        maturing_total,
-                        breakdown.maturing.len(),
-                        if breakdown.maturing.len() == 1 { "" } else { "s" },
-                        format_maturity_eta(next_left)
-                    )?;
-                    stdout.reset()?;
+                    left_rows.push((
+                        "Next spendable:".to_string(),
+                        vec![
+                            (UI_ORANGE, format!("{} blk", next_left)),
+                            (UI_DIM, format!(" · {}", format_maturity_eta(next_left))),
+                        ],
+                    ));
                 }
-
-                // Pending Transactions Section
-                if pending_stats.0 > 0 || pending_stats.1 > 0 {
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
-                    writeln!(stdout, "\n Pending Transactions")?;
-                    stdout.reset()?;
-                    writeln!(stdout, "───────────────────")?;
-                    writeln!(
-                        stdout,
-                        "Outgoing: {} (Total: {:.8})",
-                        pending_stats.0, pending_stats.2
-                    )?;
-                    writeln!(
-                        stdout,
-                        "Incoming: {} (Total: {:.8})",
-                        pending_stats.1, pending_stats.3
-                    )?;
-                }
-
-                // Transaction History Section
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
-                writeln!(stdout, "\n Transaction History")?;
-                stdout.reset()?;
-                writeln!(stdout, "───────────────────")?;
-                match &history {
-                    Some(stats) => {
-                        writeln!(stdout, "Total Transactions: {}", stats.tx_count)?;
-                        writeln!(
-                            stdout,
-                            "Volume Sent: {:.8}",
-                            Transaction::from_units(stats.sent_units)
-                        )?;
-                        writeln!(
-                            stdout,
-                            "Volume Received: {:.8}",
-                            Transaction::from_units(stats.received_units)
-                        )?;
-                        writeln!(
-                            stdout,
-                            "Total Fees Paid: {:.8}",
-                            Transaction::from_units(stats.fees_units)
-                        )?;
-                        if let (Some(first), Some(last)) = (stats.first_height, stats.last_height)
-                        {
-                            writeln!(stdout, "First Activity: block {}", first)?;
-                            writeln!(stdout, "Last Activity: block {}", last)?;
-                        }
-
-                        // Recent Transactions — a fixed last-N list off the same address
-                        // index (O(N), no block decodes), materialized ABOVE before the
-                        // guard was dropped. Rendered only inside this Some(stats) arm so
-                        // it appears only when the index is READY: address_recent_txs
-                        // returns an empty Vec both when the index is unbuilt AND when the
-                        // address is inactive, so gating on the index-backed summary avoids
-                        // a misleading empty "Recent Transactions".
-                        {
-                            if !recent.is_empty() {
-                                stdout.set_color(
-                                    ColorSpec::new()
-                                        .set_fg(Some(Color::Blue))
-                                        .set_bold(true),
-                                )?;
-                                writeln!(
-                                    stdout,
-                                    "\n Recent Transactions (last {})",
-                                    RECENT_TX_LIMIT
-                                )?;
-                                stdout.reset()?;
-                                writeln!(stdout, "───────────────────")?;
-                                for entry in &recent {
-                                    if entry.is_sender() {
-                                        stdout.set_color(
-                                            ColorSpec::new()
-                                                .set_fg(Some(Color::Rgb(255, 84, 73)))
-                                                .set_bold(true),
-                                        )?;
-                                        write!(stdout, "SENT    ")?;
-                                    } else {
-                                        stdout.set_color(
-                                            ColorSpec::new()
-                                                .set_fg(Some(Color::Rgb(59, 242, 173)))
-                                                .set_bold(true),
-                                        )?;
-                                        write!(stdout, "RECEIVED")?;
-                                    }
-                                    stdout.reset()?;
-                                    write!(
-                                        stdout,
-                                        "  {:.8} ♦  {} {}",
-                                        Transaction::from_units(entry.amount_units),
-                                        if entry.is_sender() { "to  " } else { "from" },
-                                        entry.counterparty
-                                    )?;
-                                    stdout.set_color(
-                                        ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))),
-                                    )?;
-                                    writeln!(stdout, "  (block {})", entry.height)?;
-                                    stdout.reset()?;
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-                        writeln!(
-                            stdout,
-                            "History index unavailable — it builds at startup; restart the node if this persists."
-                        )?;
-                        stdout.reset()?;
-                    }
-                }
-
-                // Network Statistics Section. Circulating supply = sum of positive
-                // confirmed balances; the old per-transaction sum double-counted
-                // every onward transfer and decoded the whole chain to do it.
-                // (Materialized above, before the guard was dropped.)
+                // Supply share rides the right pane rather than owning a section
+                // with a header, a rule and one number.
+                let mut right_rows = right_rows;
                 if let Some(total_supply_units) = total_supply_units {
                     let total_supply = Transaction::from_units(total_supply_units);
                     if total_supply > 0.0 {
-                        // Confirmed (not spendable) over confirmed supply — same units on
-                        // both sides; the old spendable numerator under-read the share of
-                        // any address holding maturing coinbases or pending debits.
-                        let network_share = (breakdown.confirmed / total_supply) * 100.0;
-                        stdout
-                            .set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
-                        writeln!(stdout, "\n Network Statistics")?;
-                        stdout.reset()?;
-                        writeln!(stdout, "───────────────────")?;
-                        writeln!(stdout, "Network Share: {:.4}% \n", network_share)?;
+                        right_rows.push((
+                            "Supply Share:".to_string(),
+                            vec![(
+                                UI_BLUE,
+                                format!("{:.4}%", (breakdown.confirmed / total_supply) * 100.0),
+                            )],
+                        ));
                     }
                 }
+                for index in 0..left_rows.len().max(right_rows.len()) {
+                    let left = left_rows
+                        .get(index)
+                        .map(|(label, runs)| (label.as_str(), runs.as_slice()));
+                    let right = right_rows
+                        .get(index)
+                        .map(|(label, runs)| (label.as_str(), runs.as_slice()));
+                    ui_grid_row(&mut stdout, spec, left, right)?;
+                }
+
+                ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+                writeln!(stdout)?;
+
+                // ── Recent Activity ───────────────────────────────────────────
+                const SHOWN: usize = 8;
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                ui_seg(&mut stdout, spec, UI_BLUE, true, "Recent Activity")?;
+                match &history {
+                    Some(stats) => {
+                        let shown = recent.len().min(SHOWN);
+                        let note = format!("last {} of {}", shown, stats.tx_count);
+                        ui_pad(&mut stdout, spec, 16, 78 - note.chars().count())?;
+                        ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+                        writeln!(stdout)?;
+                        if recent.is_empty() {
+                            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                            ui_seg(
+                                &mut stdout,
+                                spec,
+                                UI_DIM,
+                                false,
+                                "no confirmed transactions — this address has never appeared in a block",
+                            )?;
+                            writeln!(stdout)?;
+                        } else {
+                            // Column right edges. Every cell is right-aligned to
+                            // one of these, so an over-wide value can never shove
+                            // the columns after it.
+                            const PARTY: usize = 9;
+                            const AMOUNT_END: usize = 46;
+                            const AGE_END: usize = 53;
+                            const HEIGHT_END: usize = 63;
+                            const CONF_END: usize = 71;
+
+                            ui_pad(&mut stdout, spec, 0, PARTY)?;
+                            ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+                            let mut col = PARTY + 12;
+                            col = ui_right(&mut stdout, spec, col, AMOUNT_END, UI_DIM, false, "amount")?;
+                            col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, "age")?;
+                            col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "height")?;
+                            ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, "conf")?;
+                            writeln!(stdout)?;
+
+                            for entry in recent.iter().take(SHOWN) {
+                                // A coinbase indexes with the system address as the
+                                // counterparty, so it used to render as an ordinary
+                                // "RECEIVED ... from MINING_REWARDS". It gets its own
+                                // token and hue.
+                                let coinbase = entry.is_recipient()
+                                    && SYSTEM_ADDRESSES.contains(&entry.counterparty.as_str());
+                                let (token, hue, sign) = if coinbase {
+                                    ("▾ mine", UI_LAVENDER, "+")
+                                } else if entry.is_sender() {
+                                    ("▴ out ", UI_PINK, "-")
+                                } else {
+                                    ("▾ in  ", UI_GREEN, "+")
+                                };
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                                ui_seg(&mut stdout, spec, hue, false, token)?;
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, "  ")?;
+                                let party = ui_address(&entry.counterparty);
+                                ui_text(&mut stdout, spec, false, &party)?;
+                                let mut col = PARTY + party.chars().count();
+                                // int_digits 5: the widest coin amount the column
+                                // must hold without eating the gap to `age`.
+                                let amount = format!(
+                                    "{}{}",
+                                    sign,
+                                    ui_money(Transaction::from_units(entry.amount_units), 5)
+                                );
+                                col = ui_right(&mut stdout, spec, col, AMOUNT_END, hue, false, &amount)?;
+                                let age = ui_age(now_secs.saturating_sub(entry.timestamp));
+                                col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
+                                let height = ui_thousands(entry.height as u64);
+                                col =
+                                    ui_right(&mut stdout, spec, col, HEIGHT_END, UI_BLUE, false, &height)?;
+                                // Depth from the SAME height the balance was read at,
+                                // so confirmations can never disagree with the figures
+                                // in the banner above.
+                                let conf = ui_thousands(
+                                    breakdown
+                                        .as_of_height
+                                        .saturating_sub(entry.height as u64)
+                                        .saturating_add(1),
+                                );
+                                ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, &conf)?;
+                                // The locked marker is membership in the SAME Vec the
+                                // spendable figure was computed from, so the row and
+                                // the balance can never drift apart.
+                                if coinbase
+                                    && breakdown
+                                        .maturing
+                                        .iter()
+                                        .any(|(height, _)| *height == entry.height)
+                                {
+                                    ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                                    ui_seg(&mut stdout, spec, UI_ORANGE, false, "locked")?;
+                                }
+                                writeln!(stdout)?;
+                            }
+                        }
+                    }
+                    // address_recent_txs returns an empty Vec for BOTH "no activity"
+                    // and "index not built yet" — only the index-backed summary
+                    // separates them, so the two cases finally say different things.
+                    None => {
+                        ui_pad(&mut stdout, spec, 16, 64)?;
+                        ui_seg(&mut stdout, spec, UI_ORANGE, false, "index building")?;
+                        writeln!(stdout)?;
+                        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                        ui_seg(
+                            &mut stdout,
+                            spec,
+                            UI_ORANGE,
+                            false,
+                            "history unavailable — the address index is still building; retry shortly",
+                        )?;
+                        writeln!(stdout)?;
+                    }
+                }
+                writeln!(stdout)?;
+                stdout.reset()?;
             }
         }
         Ok(())
     }
 
-    pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>) {
-        let mut stdout = StandardStream::stdout(ColorChoice::Always);
+    /// The wallet ledger: every wallet's spendable / locked / outbound split,
+    /// footed against a total that reconciles.
+    ///
+    /// Colour states spendability and nothing else — cyan is movable money,
+    /// warm hues are money you cannot spend yet (orange still maturing, pink
+    /// already leaving), green is the derived confirmed sum. A zero balance
+    /// renders dim, because a zero is not money.
 
-        // Header + divider are written THROUGH the termcolor stream (writeln!(stdout,…)),
-        // never println!. Mixing the two left the text on std stdout while the color/bold
-        // attribute lived on the termcolor handle — on Unix the ANSI escape leaked through
-        // and colored it (no bold), on Windows the Console-API attribute made it render
-        // intense/bold. Same code, different look per platform. Set the style explicitly and
-        // emit the text on the same stream so it renders identically everywhere.
-        stdout
-            .set_color(
-                ColorSpec::new()
-                    .set_fg(Some(Color::Rgb(242, 237, 161)))
-                    .set_bold(true),
+    /// Recent activity across every loaded wallet, newest first.
+    ///
+    /// Reads the address index directly rather than going through the whisper
+    /// module: `whisper::get_recent_transactions` flattened `AddressTxEntry`
+    /// into a 5-field struct that discarded height, position and the
+    /// sender/recipient flag bits — so direction had to be re-inferred by
+    /// string comparison and confirmations could not be shown at all. Every
+    /// column here is already decoded by the index.
+    pub async fn handle_history_command(
+        &self,
+        args: &str,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        wallets: &HashMap<String, Wallet>,
+    ) -> Result<()> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+
+        // `history 200` and `history <addr>` used to be silently ignored.
+        let mut rows_wanted = 12usize;
+        if let Some(arg) = args.split_whitespace().nth(1) {
+            match arg.parse::<usize>() {
+                Ok(n) if (1..=50).contains(&n) => rows_wanted = n,
+                _ => {
+                    ui_seg(&mut stdout, spec, UI_DIM, false,
+                        " Usage: history [rows]   rows 1-50, default 12   ·   one address: account <address>\n")?;
+                    stdout.reset()?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let Ok(guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
+        else {
+            ui_seg(&mut stdout, spec, UI_ORANGE, false,
+                " chain busy (syncing/reorg in progress) — try history again shortly\n")?;
+            stdout.reset()?;
+            return Ok(());
+        };
+
+        struct Entry {
+            wallet: String,
+            counterparty: String,
+            amount_units: i128,
+            fee_units: i128,
+            is_out: bool,
+            is_self: bool,
+            coinbase: bool,
+            height: Option<u32>,
+            position: u32,
+            timestamp: u64,
+        }
+
+        let tip = guard.get_latest_block_index();
+        let index_ready = guard.address_index_ready();
+        let mut entries: Vec<Entry> = Vec::new();
+
+        if index_ready {
+            for (name, wallet) in wallets {
+                let recent = guard
+                    .address_recent_txs(&wallet.address, 50, None)
+                    .unwrap_or_default();
+                for e in recent {
+                    // Read every flag BEFORE moving the counterparty string out.
+                    let (sender, recipient) = (e.is_sender(), e.is_recipient());
+                    let coinbase =
+                        recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
+                    entries.push(Entry {
+                        wallet: name.clone(),
+                        counterparty: e.counterparty,
+                        amount_units: e.amount_units,
+                        fee_units: e.fee_units,
+                        is_out: sender && !recipient,
+                        is_self: sender && recipient,
+                        coinbase,
+                        height: Some(e.height),
+                        position: e.position,
+                        timestamp: e.timestamp,
+                    });
+                }
+            }
+        }
+
+        // Mempool rows. get_mempool_transactions is a prune + clone; the old
+        // code called get_pending_transactions ONCE PER WALLET, and each call
+        // ran sync_mempool_with_sled — state_mutation_lock, full signature
+        // re-verification of every pending tx, two sled flushes and a
+        // pending-debits rebuild. A read-only screen was doing N mempool
+        // rebuilds under the chain guard.
+        let mempool = guard.get_mempool_transactions().await.unwrap_or_default();
+        for tx in mempool {
+            for (name, wallet) in wallets {
+                let is_sender = tx.sender == wallet.address;
+                let is_recipient = tx.recipient == wallet.address;
+                if !is_sender && !is_recipient {
+                    continue;
+                }
+                entries.push(Entry {
+                    wallet: name.clone(),
+                    counterparty: if is_sender {
+                        tx.recipient.clone()
+                    } else {
+                        tx.sender.clone()
+                    },
+                    amount_units: tx.amount_units,
+                    fee_units: tx.fee_units,
+                    is_out: is_sender && !is_recipient,
+                    is_self: is_sender && is_recipient,
+                    coinbase: false,
+                    height: None,
+                    position: 0,
+                    timestamp: tx.timestamp,
+                });
+            }
+        }
+        drop(guard);
+
+        // Identity is (height, position) — the old dedup keyed on
+        // (timestamp, from, to, |Δamount| < f64::EPSILON), which cannot see
+        // identity because the exact units had already been discarded.
+        entries.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| b.position.cmp(&a.position))
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+        entries.dedup_by(|a, b| {
+            a.wallet == b.wallet && a.height == b.height && a.position == b.position
+                && a.height.is_some()
+        });
+        // Pending first, then confirmed newest-first.
+        entries.sort_by(|a, b| {
+            a.height
+                .is_some()
+                .cmp(&b.height.is_some())
+                .then_with(|| b.height.cmp(&a.height))
+                .then_with(|| b.position.cmp(&a.position))
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+
+        let total = entries.len();
+        let pending = entries.iter().filter(|e| e.height.is_none()).count();
+        let shown = entries.len().min(rows_wanted);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_BLUE, true, "History")?;
+        let note = if !index_ready {
+            format!(
+                "{} wallets · tip {} · index building",
+                wallets.len(),
+                ui_thousands(tip)
             )
-            .ok();
-        let _ = writeln!(stdout, "\n Wallet Balances and Addresses:");
-        let _ = stdout.reset();
+        } else if pending > 0 {
+            format!(
+                "{} wallets · {} pending · tip {}",
+                wallets.len(),
+                pending,
+                ui_thousands(tip)
+            )
+        } else {
+            format!("{} wallets · tip {}", wallets.len(), ui_thousands(tip))
+        };
+        ui_pad(&mut stdout, spec, 8, 78usize.saturating_sub(note.chars().count()))?;
+        ui_seg(
+            &mut stdout,
+            spec,
+            if index_ready { UI_DIM } else { UI_ORANGE },
+            false,
+            &note,
+        )?;
+        writeln!(stdout)?;
 
-        stdout
-            .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(51, 43, 23))))
-            .ok();
-        let _ = writeln!(stdout, "────────────────────");
-        let _ = stdout.reset();
+        if index_ready && total > 0 {
+            let net: i128 = entries
+                .iter()
+                .map(|e| {
+                    if e.is_self {
+                        0
+                    } else if e.is_out {
+                        -(e.amount_units + e.fee_units)
+                    } else {
+                        e.amount_units
+                    }
+                })
+                .sum();
+            ui_seg(&mut stdout, spec, UI_DIM, false, " confirmed  ")?;
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_BLUE,
+                false,
+                &format!("{} of {}", shown, total),
+            )?;
+            ui_pad(&mut stdout, spec, 12 + format!("{} of {}", shown, total).chars().count(), 30)?;
+            ui_seg(&mut stdout, spec, UI_DIM, false, "net  ")?;
+            ui_seg(
+                &mut stdout,
+                spec,
+                if net < 0 { UI_PINK } else { UI_GREEN },
+                false,
+                &format!(
+                    "{}{:.8} ♦",
+                    if net < 0 { "-" } else { "+" },
+                    Transaction::from_units(net.abs())
+                ),
+            )?;
+            writeln!(stdout)?;
+        }
+        ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(stdout)?;
+
+        if !index_ready {
+            ui_seg(&mut stdout, spec, UI_ORANGE, false,
+                " history unavailable — the address index is still building; retry shortly")?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+        if total == 0 {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_DIM,
+                false,
+                &format!(
+                    " no activity — none of your {} wallet{} appears in a block or in the mempool",
+                    wallets.len(),
+                    if wallets.len() == 1 { "" } else { "s" }
+                ),
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+
+        // Column right edges, sharing the account table's geometry so the two
+        // screens read as one system.
+        const PARTY: usize = 9;
+        const AMOUNT_END: usize = 46;
+        const AGE_END: usize = 53;
+        const HEIGHT_END: usize = 62;
+        const CONF_END: usize = 70;
+        const WALLET_AT: usize = 72;
+
+        ui_pad(&mut stdout, spec, 0, PARTY)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+        let mut col = PARTY + 12;
+        col = ui_right(&mut stdout, spec, col, AMOUNT_END, UI_DIM, false, "amount")?;
+        col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, "age")?;
+        col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "height")?;
+        col = ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, "conf")?;
+        ui_pad(&mut stdout, spec, col, WALLET_AT)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "wallet")?;
+        writeln!(stdout)?;
+
+        for e in entries.iter().take(shown) {
+            let (token, hue, sign) = if e.coinbase {
+                ("▾ mine", UI_LAVENDER, "+")
+            } else if e.is_self {
+                ("↔ self", UI_BLUE, " ")
+            } else if e.is_out {
+                ("▴ out ", UI_PINK, "-")
+            } else {
+                ("▾ in  ", UI_GREEN, "+")
+            };
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, hue, false, token)?;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "  ")?;
+            let party = ui_address(&e.counterparty);
+            ui_text(&mut stdout, spec, false, &party)?;
+            let mut col = PARTY + party.chars().count();
+            let amount = format!(
+                "{}{:.8} ♦",
+                sign,
+                Transaction::from_units(e.amount_units)
+            );
+            col = ui_right(&mut stdout, spec, col, AMOUNT_END, hue, true, &amount)?;
+            let age = ui_age(now.saturating_sub(e.timestamp));
+            col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
+            match e.height {
+                Some(h) => {
+                    let height = ui_thousands(h as u64);
+                    col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_BLUE, false, &height)?;
+                    let conf = tip.saturating_sub(h as u64).saturating_add(1);
+                    // A coinbase inside the maturity window shows its progress
+                    // toward spendable instead of a bare depth.
+                    let conf_text = if e.coinbase && conf < MINING_REWARD_MATURITY as u64 {
+                        format!("{}/{}", conf, MINING_REWARD_MATURITY)
+                    } else {
+                        ui_thousands(conf)
+                    };
+                    let conf_hue = if e.coinbase && conf < MINING_REWARD_MATURITY as u64 {
+                        UI_ORANGE
+                    } else {
+                        UI_DIM
+                    };
+                    col = ui_right(&mut stdout, spec, col, CONF_END, conf_hue, false, &conf_text)?;
+                }
+                None => {
+                    col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "—")?;
+                    col = ui_right(&mut stdout, spec, col, CONF_END, UI_ORANGE, false, "pending")?;
+                }
+            }
+            ui_pad(&mut stdout, spec, col, WALLET_AT)?;
+            let name: String = if e.wallet.chars().count() > 8 {
+                format!("{}…", e.wallet.chars().take(7).collect::<String>())
+            } else {
+                e.wallet.clone()
+            };
+            ui_seg(&mut stdout, spec, UI_LAVENDER, false, &name)?;
+            writeln!(stdout)?;
+        }
+
+        writeln!(stdout)?;
+        stdout.reset()?;
+        Ok(())
+    }
+
+    pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>) {
+        // Auto, not Always: `balance | grep` was receiving raw ANSI escapes.
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
 
         // Time-boxed: after a re-bootstrap/deep sync the chain lock can be held by
         // block application for a long stretch, and an unbounded read here made
@@ -1553,84 +2026,264 @@ impl Mgmt {
         let Ok(blockchain_guard) =
             tokio::time::timeout(std::time::Duration::from_secs(3), self.blockchain.read()).await
         else {
-            let _ = writeln!(stdout, "Chain busy (syncing/reorg in progress) — try `balance` again shortly.");
+            let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false,
+                "\nChain busy (syncing/reorg in progress) — try `balance` again shortly.\n");
+            let _ = stdout.reset();
             return;
         };
 
+        // Materialise EVERYTHING, then DROP the guard BEFORE the first styled
+        // write. The old code held this read across the whole render while
+        // paying ~100 uncached block decodes per wallet inside it; a blocked
+        // console (Windows QuickEdit / Ctrl-S) would park the guard and the
+        // write-preferring chain lock would halt block ingest node-wide — the
+        // 2026-07-16 publisher-park class that `account` already avoids.
+        struct Row {
+            name: String,
+            address: String,
+            spendable: f64,
+            maturing: f64,
+            maturing_count: usize,
+            next_unlock: u64,
+            pending: f64,
+            confirmed: f64,
+            error: Option<String>,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(wallets.len());
+        let mut tip = 0u64;
         for (name, wallet) in wallets {
             match blockchain_guard
                 .get_wallet_balance_breakdown(&wallet.address)
                 .await
             {
                 Ok(breakdown) => {
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))
-                        .ok();
-                    let _ = writeln!(stdout, "Wallet Name: {}", name);
-                    let _ = stdout.reset();
-
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(100, 149, 237))))
-                        .ok();
-                    let _ = write!(stdout, "Address: ");
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White)))
-                        .ok();
-                    let _ = writeln!(stdout, "{}", wallet.address);
-                    let _ = stdout.reset();
-
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(135, 206, 250))))
-                        .ok();
-                    let _ = write!(stdout, "Balance: ");
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::White)).set_bold(true))
-                        .ok();
-                    let _ = write!(stdout, "{}", breakdown.spendable);
-                    stdout
-                        .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(88, 240, 181))))
-                        .ok();
-                    let _ = writeln!(stdout, " ♦");
-
-                    // M06: the spendable figure above excludes coinbases still inside the
-                    // MINING_REWARD_MATURITY window. Show that portion — sourced from the
-                    // SAME overlay the affordability gates enforce (the old 12-block hint
-                    // under-scanned the 100-block window and claimed the balance
-                    // "includes" rewards the spendable figure actually excludes).
-                    // Display-only; spendability/consensus are unchanged.
-                    if !breakdown.maturing.is_empty() {
-                        let maturing_total: f64 =
-                            breakdown.maturing.iter().map(|(_, amount)| amount).sum();
-                        let next_left = breakdown
-                            .maturing
-                            .iter()
-                            .map(|(height, _)| {
-                                blocks_until_mature(*height, breakdown.as_of_height)
-                            })
-                            .min()
-                            .unwrap_or(0);
-                        stdout
-                            .set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))
-                            .ok();
-                        let _ = writeln!(
-                            stdout,
-                            "  + {:.8} ♦ maturing ({} reward{}; next spendable in {})",
-                            maturing_total,
-                            breakdown.maturing.len(),
-                            if breakdown.maturing.len() == 1 { "" } else { "s" },
-                            format_maturity_eta(next_left)
-                        );
-                    }
-
-                    let _ = stdout.reset();
-                    let _ = writeln!(stdout, "-------------------");
+                    tip = tip.max(breakdown.as_of_height);
+                    let maturing: f64 = breakdown.maturing.iter().map(|(_, a)| a).sum();
+                    let next_unlock = breakdown
+                        .maturing
+                        .iter()
+                        .map(|(h, _)| blocks_until_mature(*h, breakdown.as_of_height))
+                        .min()
+                        .unwrap_or(0);
+                    rows.push(Row {
+                        name: name.clone(),
+                        address: wallet.address.clone(),
+                        spendable: breakdown.spendable,
+                        maturing,
+                        maturing_count: breakdown.maturing.len(),
+                        next_unlock,
+                        pending: breakdown.pending_debit,
+                        confirmed: breakdown.confirmed,
+                        error: None,
+                    });
                 }
-                Err(e) => {
-                    let _ = writeln!(stdout, "Failed to get balance for wallet {}: {}", name, e);
-                }
+                Err(e) => rows.push(Row {
+                    name: name.clone(),
+                    address: wallet.address.clone(),
+                    spendable: 0.0,
+                    maturing: 0.0,
+                    maturing_count: 0,
+                    next_unlock: 0,
+                    pending: 0.0,
+                    confirmed: 0.0,
+                    error: Some(e.to_string()),
+                }),
             }
         }
+        drop(blockchain_guard);
+
+        // Deterministic order. The old screen iterated the HashMap directly, so
+        // the wallet order changed between two runs of the same command.
+        rows.sort_by(|a, b| {
+            b.spendable
+                .partial_cmp(&a.spendable)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let total_spendable: f64 = rows.iter().map(|r| r.spendable).sum();
+        let total_maturing: f64 = rows.iter().map(|r| r.maturing).sum();
+        let total_pending: f64 = rows.iter().map(|r| r.pending).sum();
+        let total_confirmed: f64 = rows.iter().map(|r| r.confirmed).sum();
+        let funded = rows.iter().filter(|r| r.spendable > 0.0).count();
+
+        // Amount column: every figure right-aligned to one edge so the decimal
+        // points share a column across wallets AND the totals block.
+        const AMOUNT_END: usize = 61;
+        const GAUGE: usize = 8;
+
+        // A macro, not a closure: a closure capturing `stdout` holds the only
+        // mutable borrow for its whole lifetime, which locks out every other
+        // write in this function.
+        macro_rules! out {
+            ($left:expr, $amount:expr, $hue:expr, $bold:expr, $trail:expr) => {{
+                let left: &str = $left;
+                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, left);
+                let text = ui_money($amount, 5);
+                // Weight marks what a reader is actually here for: the money
+                // they can move now, and the totals. Locked and outbound stay
+                // regular so the spendable figure is the one that pops.
+                let _ = ui_right(
+                    &mut stdout,
+                    spec,
+                    left.chars().count(),
+                    AMOUNT_END,
+                    $hue,
+                    $bold,
+                    &text,
+                );
+                for (color, t) in $trail.iter() {
+                    let _ = ui_seg(&mut stdout, spec, *color, false, t);
+                }
+                let _ = writeln!(stdout);
+            }};
+        }
+
         let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+        let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, true, "◈");
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, true, "WALLET LEDGER");
+        let head = format!(
+            "{} wallet{} · {} funded · tip ",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            funded
+        );
+        let tip_text = ui_thousands(tip);
+        let _ = ui_pad(&mut stdout, spec, 16, 78 - head.chars().count() - tip_text.chars().count());
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &head);
+        let _ = ui_seg(&mut stdout, spec, UI_BLUE, false, &tip_text);
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE);
+        let _ = writeln!(stdout);
+
+        for row in &rows {
+            let empty = row.spendable <= 0.0 && row.maturing <= 0.0 && row.pending <= 0.0;
+            let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+            let _ = ui_seg(
+                &mut stdout,
+                spec,
+                if empty { UI_DIM } else { UI_LAVENDER },
+                !empty,
+                if empty { "◇" } else { "◈" },
+            );
+            let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+            let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, false, &row.name);
+            let _ = ui_pad(&mut stdout, spec, 3 + row.name.chars().count(), 22);
+            let _ = ui_text(&mut stdout, spec, false, &row.address);
+            let _ = writeln!(stdout);
+
+            // A wallet whose balance could not be read keeps the row shape
+            // instead of falling out of the layout, and is excluded from the
+            // totals — which then say how many wallets they cover.
+            if let Some(err) = &row.error {
+                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "   ⟩ ");
+                let _ = ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_ORANGE,
+                    false,
+                    &format!("unavailable — {}", err),
+                );
+                let _ = writeln!(stdout);
+                continue;
+            }
+
+            // Share gauge: this wallet's slice of total spendable.
+            let share = if total_spendable > 0.0 {
+                row.spendable / total_spendable
+            } else {
+                0.0
+            };
+            let filled = (share * GAUGE as f64).round() as usize;
+            let mut trail: Vec<(Color, String)> = vec![(UI_DIM, "  ".to_string())];
+            trail.push((UI_CYAN, "▰".repeat(filled.min(GAUGE))));
+            trail.push((UI_DIM, "▱".repeat(GAUGE.saturating_sub(filled))));
+            trail.push((
+                UI_BLUE,
+                if row.spendable > 0.0 {
+                    format!(" {:>5.1}%", share * 100.0)
+                } else {
+                    "     —".to_string()
+                },
+            ));
+            out!(
+                "   ⟩ spendable",
+                row.spendable,
+                if row.spendable > 0.0 { UI_CYAN } else { UI_DIM },
+                row.spendable > 0.0,
+                &trail
+            );
+
+            if row.maturing > 0.0 {
+                out!("   ⟩ locked", row.maturing, UI_ORANGE, false, &[
+                        (UI_DIM, "  ".to_string()),
+                        (
+                            UI_DIM,
+                            format!(
+                                "{} reward{} · next {}",
+                                row.maturing_count,
+                                if row.maturing_count == 1 { "" } else { "s" },
+                                format_maturity_eta(row.next_unlock)
+                            ),
+                        ),
+                    ]);
+            }
+            if row.pending > 0.0 {
+                out!("   ⟩ outbound", row.pending, UI_PINK, false, &[(UI_DIM, "  in mempool".to_string())]);
+            }
+            // The identity only earns a line when there is something to add up.
+            if row.maturing > 0.0 || row.pending > 0.0 {
+                let _ = ui_pad(&mut stdout, spec, 0, AMOUNT_END - 15);
+                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "───────────────");
+                let _ = writeln!(stdout);
+                out!("   = confirmed", row.confirmed, UI_GREEN, true, &[] as &[(Color, String)]);
+            }
+        }
+
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE);
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+        let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, true, "◈");
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
+        let _ = ui_seg(&mut stdout, spec, UI_LABEL, true, "TOTAL");
+        let covered = rows.iter().filter(|r| r.error.is_none()).count();
+        let _ = ui_pad(&mut stdout, spec, 8, 22);
+        let _ = ui_seg(
+            &mut stdout,
+            spec,
+            UI_DIM,
+            false,
+            &if covered == rows.len() {
+                format!("sum of {} wallets", rows.len())
+            } else {
+                format!("sum of {} of {} wallets", covered, rows.len())
+            },
+        );
+        let _ = writeln!(stdout);
+
+        let pct = |v: f64| {
+            if total_confirmed > 0.0 {
+                format!("{:>6.1}%", v / total_confirmed * 100.0)
+            } else {
+                "     —".to_string()
+            }
+        };
+        out!("   ⟩ spendable", total_spendable, UI_CYAN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_spendable))]);
+        if total_maturing > 0.0 {
+            out!("   ⟩ locked", total_maturing, UI_ORANGE, false, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_maturing))]);
+        }
+        if total_pending > 0.0 {
+            out!("   ⟩ outbound", total_pending, UI_PINK, false, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_pending))]);
+        }
+        let _ = ui_pad(&mut stdout, spec, 0, AMOUNT_END - 15);
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "───────────────");
+        let _ = writeln!(stdout);
+        out!("   = confirmed", total_confirmed, UI_GREEN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_confirmed))]);
+
+        let _ = writeln!(stdout);
+        let _ = stdout.reset();
         let _ = stdout.flush();
     }
 }
