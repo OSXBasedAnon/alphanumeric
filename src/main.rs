@@ -28,10 +28,14 @@ use alphanumeric::a9::{
         Block, Blockchain, RateLimiter, Transaction, CONSENSUS_HEADER_RULES_VERSION,
         FEE_ACCOUNTING_RULES_VERSION, FEE_ESTIMATE_ANCHOR_UNITS, FEE_SYSTEM_ACTIVATION_HEIGHT,
         LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES,
-        MINT_CLIP, NETWORK_FEE, TARGET_BLOCK_TIME,
+        MINT_CLIP, MIN_RELAY_FEE_UNITS, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
+    ui::{
+        ui_grid_header, ui_grid_row, ui_pad, ui_seg, ui_text, ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
+        UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
+    },
     node::{
         force_rebootstrap_marker_path, rebootstrap_cooldown_path,
         rebootstrap_hard_cooldown_active,
@@ -108,6 +112,13 @@ struct BootstrapManifestPointer {
 struct GatewayOverview {
     peers: Option<u64>,
     height: Option<u64>,
+    /// Parsed from the beacon but no longer displayed. It was only ever
+    /// `height.map(|_| true)` — i.e. "the gateway's height field parsed", not
+    /// any cryptographic check — so a row labelled "Network Verified: yes" read
+    /// as a security assurance it never was. The sync verdict in the Overview
+    /// banner carries the real information. Kept so the field stays part of the
+    /// parsed shape if a genuine verification signal ever lands here.
+    #[allow(dead_code)]
     verified: Option<bool>,
 }
 
@@ -1845,72 +1856,9 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Wallet Summary
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "\n Wallet Status ")?;
-    color_spec.set_fg(Some(Color::Rgb(20, 51, 36)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "───────────────────")?;
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Total Wallets:   {}", processed_wallets)?;
-    color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Total Balance:   {:.8} ♦", total_balance)?;
-    // M06: freshly mined coinbases are credited but not yet spendable; without this
-    // line a miner's info screen under-reads their holdings for ~8 minutes per reward.
-    if total_maturing > 0.0 {
-        color_spec.set_fg(Some(Color::Rgb(128, 128, 128)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Maturing:        {:.8} ♦ (mining rewards, not yet spendable)", total_maturing)?;
-    }
-    stdout.reset()?;
-
-    // Node Status
+    // Node metrics (validators only) — gathered here, printed after the grid.
     let sentinel = staking_node.read().await;
-    {
-        let node_id = node.id().to_string();
-        if let Ok(metrics) = sentinel.get_node_metrics(&node_id).await {
-            color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "\n Node Status ")?;
-            color_spec.set_fg(Some(Color::Rgb(51, 43, 23)));
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "───────────────────")?;
-            color_spec.set_fg(Some(match metrics.current_tier {
-                ValidatorTier::RedDiamond => Color::Rgb(136, 0, 21),
-                ValidatorTier::Diamond => Color::Rgb(40, 204, 217),
-                ValidatorTier::Emerald => Color::Rgb(141, 203, 129),
-                ValidatorTier::Gold => Color::Rgb(237, 124, 51),
-                ValidatorTier::Silver => Color::Rgb(230, 230, 230),
-                ValidatorTier::Inactive => Color::Rgb(128, 128, 128),
-            })).set_bold(true);
-            stdout.set_color(&color_spec)?;
-            write!(stdout, "Node Tier:       {:?}", metrics.current_tier)?;
-            color_spec.set_fg(Some(Color::Rgb(128, 128, 128))).set_bold(false);
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, " ({:.1}% performance)", metrics.performance_score * 100.0)?;
-            color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "Blocks Verified: {}", metrics.blocks_verified)?;
-            color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "Success Rate:    {:.1}%", metrics.success_rate)?;
-            color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "Response Time:   {}ms", metrics.response_time)?;
-            stdout.reset()?;
-        }
-    }
-
-    // Network Status  
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "\n Network Status ")?;
-    color_spec.set_fg(Some(Color::Rgb(237, 124, 51)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "───────────────────")?;
+    let node_metrics = sentinel.get_node_metrics(&node.id().to_string()).await.ok();
 
     // Time-boxed: get_network_metrics reads a lock whose writer used to be held
     // across slow chain reads for the length of a reorg — the "info prints the
@@ -1925,207 +1873,517 @@ async fn async_main() -> Result<()> {
     .await
     .ok()
     .flatten();
-    if network_snapshot.is_none() {
-        color_spec.set_fg(Some(Color::Rgb(128, 128, 128)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Unavailable while the node syncs — try again shortly.")?;
-        stdout.reset()?;
-    }
-    if let Some((health, active_peers, mesh_links)) = network_snapshot {
-        let gateway_peers = gateway_overview
-            .as_ref()
-            .and_then(|overview| overview.peers)
-            .and_then(|count| usize::try_from(count).ok())
-            .unwrap_or(0);
-        let active_nodes = health.active_nodes.max(active_peers).max(gateway_peers);
 
-        color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Active Nodes:    {}", active_nodes)?;
-        if gateway_peers > 0 {
-            color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
-            stdout.set_color(&color_spec)?;
-            writeln!(stdout, "Network Peers:   {}", gateway_peers)?;
-        }
-        color_spec.set_fg(Some(Color::Rgb(167, 165, 198)));
-        stdout.set_color(&color_spec)?;
-        // LOCAL connectivity, distinct from the gateway roster above: during a
-        // gateway outage the roster reads 0 while these links keep gossiping
-        // (2026-07-10 incident: "every node lost its peer list" was the roster
-        // display, not real connections). 0 TCP is normal for NAT'd nodes — the
-        // mesh is their direct-link layer.
-        if active_peers == 0 && mesh_links == 0 {
-            writeln!(stdout, "Direct P2P:      0 (relay mode)")?;
-        } else {
-            writeln!(
-                stdout,
-                "Direct P2P:      {} TCP + {} mesh link(s)",
-                active_peers, mesh_links
-            )?;
-        }
-        color_spec.set_fg(Some(Color::Rgb(247, 111, 142)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Network Load:    {:.1}%", health.network_load * 100.0)?; 
-        color_spec.set_fg(Some(Color::Rgb(247, 111, 142)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Fork Count:      {}", health.fork_count)?;
-        stdout.reset()?;
-        color_spec.set_fg(Some(Color::Rgb(242, 237, 161)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Avg Response:    {}ms", health.average_response_time)?;
-    }
-
-    // Chain Status. Time-boxed: a long reorg/branch adoption holds the chain WRITE
+    // Chain read. Time-boxed: a long reorg/branch adoption holds the chain WRITE
     // lock for its whole validation pass, and an unbounded read here parked the
     // console behind it (the "info hangs mid-print, restart the client" bug).
     let Ok(blockchain_guard) =
         tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await
     else {
-        color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "\n Chain Status ")?;
-        color_spec.set_fg(Some(Color::Rgb(128, 128, 128))).set_bold(false);
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "───────────────────")?;
-        writeln!(stdout, "Chain busy (sync/reorg in progress) — try again shortly.")?;
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, true, "\n Chain busy")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_DIM,
+            false,
+            "  (sync or reorg in progress — try again shortly)\n",
+        )?;
         stdout.reset()?;
         continue;
     };
+
     let current_height = blockchain_guard.get_latest_block_index();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "\n Chain Status ")?;
-    color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "───────────────────")?; 
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
-    stdout.set_color(&color_spec)?;
-    writeln!(
-        stdout,
-        "Height:            {}",
-        current_height
-    )?;
-    if let Some(network_height) = gateway_overview.as_ref().and_then(|overview| overview.height) {
-        color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Network Height:    {}", network_height)?;
-    }
-    if let Some(verified) = gateway_overview
+    let network_height = gateway_overview
         .as_ref()
-        .and_then(|overview| overview.verified)
-    {
-        color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
-        stdout.set_color(&color_spec)?;
-        writeln!(
-            stdout,
-            "Network Verified:  {}",
-            if verified { "yes" } else { "pending" }
-        )?;
-    }
-    color_spec.set_fg(Some(Color::Rgb(59, 242, 173)));
-    stdout.set_color(&color_spec)?;
+        .and_then(|overview| overview.height);
     let tip_difficulty = blockchain_guard.get_tip_difficulty().await;
     let next_difficulty = blockchain_guard.get_current_difficulty().await;
-    writeln!(stdout, "Difficulty:        {}", tip_difficulty)?;
-    if next_difficulty != tip_difficulty {
-        writeln!(stdout, "Next Difficulty:   {}", next_difficulty)?;
-    }
-    color_spec.set_fg(Some(Color::Rgb(137, 207, 211)));
-    stdout.set_color(&color_spec)?;
-    // Auto-scale: a CPU-mined BLAKE3 network's hashrate lives in MH/s-GH/s, and a
-    // fixed TH/s display read "0.00" even while difficulty climbed past 550.
-    let hashrate_ths = blockchain_guard.calculate_network_hashrate().await;
-    let hashrate_hs = hashrate_ths * 1e12;
-    let (hr_value, hr_unit) = if hashrate_hs >= 1e12 {
-        (hashrate_hs / 1e12, "TH/s")
-    } else if hashrate_hs >= 1e9 {
-        (hashrate_hs / 1e9, "GH/s")
-    } else if hashrate_hs >= 1e6 {
-        (hashrate_hs / 1e6, "MH/s")
-    } else if hashrate_hs >= 1e3 {
-        (hashrate_hs / 1e3, "kH/s")
-    } else {
-        (hashrate_hs, "H/s")
+    let (hr_value, hr_unit) = ui_hashrate(blockchain_guard.calculate_network_hashrate().await);
+    let block_target = blockchain_guard.block_time;
+    let block_age = blockchain_guard
+        .get_last_block()
+        .map(|block| now.saturating_sub(block.timestamp));
+    let intervals = blockchain_guard.recent_block_intervals(32);
+    let (cadence, cadence_peak) = ui_cadence(&intervals);
+    let fee_estimate = blockchain_guard.try_fee_estimate();
+    let fee_units = fee_estimate
+        .as_ref()
+        .map_or(FEE_ESTIMATE_ANCHOR_UNITS, |e| e.recommended_units);
+    let fee_floor_units = fee_estimate.as_ref().map_or(MIN_RELAY_FEE_UNITS, |e| e.floor_units);
+    let fee_note = match fee_estimate.as_ref() {
+        Some(e) if e.congested => "(auto · congested)",
+        Some(_) => "(auto)",
+        None => "(auto · anchor)",
     };
-    writeln!(stdout, "Hashrate:          {:.2} {}", hr_value, hr_unit)?;
-    color_spec.set_fg(Some(Color::Rgb(40, 204, 217)));
-    stdout.set_color(&color_spec)?;
-    // Wallet auto fee — what `create` attaches when --fee is absent, priced off
-    // the live mempool (Blockchain::fee_estimate). try_: the info path must not
-    // await while holding the chain guard; a momentarily contended mempool
-    // (miner mid-template) falls back to displaying the quiet-network anchor.
-    match blockchain_guard.try_fee_estimate() {
-        Some(estimate) => writeln!(
-            stdout,
-            "Default Fee:       {:.8}{}",
-            Transaction::from_units(estimate.recommended_units),
-            if estimate.congested {
-                " (auto · congested)"
-            } else {
-                " (auto)"
-            }
-        )?,
-        // Mempool momentarily write-locked (miner mid-template). Say so rather
-        // than printing the anchor as if it were a live reading — contention
-        // correlates with load, i.e. exactly when the real figure may be higher.
-        None => writeln!(
-            stdout,
-            "Default Fee:       {:.8} (auto · anchor, mempool busy)",
-            Transaction::from_units(FEE_ESTIMATE_ANCHOR_UNITS)
-        )?,
-    }
-    writeln!(
-        stdout,
-        "Whisper Compat:    {:.8}%",
-        blockchain_guard.transaction_fee * 100.0
-    )?;
-    writeln!(stdout, "Block Time Target: {}s", blockchain_guard.block_time)?;
-
-    if let Some(last_block) = blockchain_guard.get_last_block() {
-        color_spec.set_fg(Some(Color::Rgb(237, 124, 51)));
-        stdout.set_color(&color_spec)?;
-        let age = now.saturating_sub(last_block.timestamp);
-        // Past a minute the raw-seconds age is the "am I stalled?" signal but reads
-        // as an unparseable wall of digits (11506s); annotate it human-readably.
-        if age >= 60 {
-            writeln!(stdout, "Last Block Time:   {}s ({} ago)", age, human_duration_secs(age))?;
-        } else {
-            writeln!(stdout, "Last Block Time:   {}s", age)?;
-        }
-    }
-    stdout.reset()?;
-
-    // Memory Pool
+    let fee_rate = blockchain_guard.transaction_fee * 100.0;
     let pending_txs = blockchain_guard.get_pending_transactions().await?;
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230))).set_bold(true);
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "\n Memory Pool ")?;
-    color_spec.set_fg(Some(Color::Rgb(237, 124, 51)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "───────────────────")?;
-    color_spec.set_fg(Some(Color::Rgb(230, 230, 230)));
-    stdout.set_color(&color_spec)?;
-    writeln!(stdout, "Pending Txs:        {}\n", pending_txs.len())?;
-
     let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount()).sum();
-    let pending_fees: f64 = pending_txs.iter().map(|tx| tx.fee()).sum();
 
-    if !pending_txs.is_empty() {
-        color_spec.set_fg(Some(Color::Rgb(88, 240, 181)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Total Value:        {:.8} ♦", pending_value)?;
+    let gateway_peers = gateway_overview
+        .as_ref()
+        .and_then(|overview| overview.peers)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    let (health, active_peers, mesh_links) = match network_snapshot.as_ref() {
+        Some((health, peers, mesh)) => (Some(health), *peers, *mesh),
+        None => (None, 0, 0),
+    };
+    let active_nodes = health
+        .map(|h| h.active_nodes.max(active_peers).max(gateway_peers))
+        .unwrap_or(gateway_peers.max(active_peers));
 
-        color_spec.set_fg(Some(Color::Rgb(180, 219, 210)));
-        stdout.set_color(&color_spec)?;
-        writeln!(stdout, "Total Pending Fees: {:.8} ♦\n", pending_fees)?;
+    // Off-nominal is a single, explicit judgement made once and reused: orange
+    // is the only hue allowed to cross pane boundaries, so a slow chain stays
+    // louder than the zoning around it.
+    let block_target_secs = u64::from(block_target);
+    let stale = block_age.map_or(false, |age| age > block_target_secs.saturating_mul(2));
+    let age_multiple = block_age
+        .filter(|_| block_target_secs > 0)
+        .map(|age| age / block_target_secs)
+        .unwrap_or(0);
+
+    // ── Overview ───────────────────────────────────────────────────────────
+    let synced = network_height.map_or(true, |net| current_height + 1 >= net);
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, "\n ")?;
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, true, "Overview")?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    if synced {
+        ui_seg(&mut stdout, &mut color_spec, UI_GREEN, false, "✓ SYNCED")?;
+        ui_pad(&mut stdout, &mut color_spec, 9, 17)?;
+    } else {
+        ui_seg(&mut stdout, &mut color_spec, UI_ORANGE, false, "▸ SYNCING")?;
+        ui_pad(&mut stdout, &mut color_spec, 10, 17)?;
+    }
+    let local_text = ui_thousands(current_height as u64);
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &local_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " / ")?;
+    let net_text = network_height.map_or_else(|| "unknown".to_string(), |h| ui_thousands(h as u64));
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &net_text)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + local_text.chars().count() + 3 + net_text.chars().count(),
+        48,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "diff ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &tip_difficulty.to_string(),
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " ▸ ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &next_difficulty.to_string(),
+    )?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    let balance_text = format!("{:.8} ♦", total_balance);
+    ui_seg(&mut stdout, &mut color_spec, UI_CYAN, false, &balance_text)?;
+    ui_pad(&mut stdout, &mut color_spec, 1 + balance_text.chars().count(), 17)?;
+    let hr_text = format!("{:.2}", hr_value);
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &hr_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " ")?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, hr_unit)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + hr_text.chars().count() + 1 + hr_unit.chars().count(),
+        41,
+    )?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_BLUE,
+        false,
+        &active_nodes.to_string(),
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " peers")?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        41 + active_nodes.to_string().chars().count() + 6,
+        57,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "fee ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_CYAN,
+        false,
+        &format!("{:.8} ♦", Transaction::from_units(fee_units)),
+    )?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    let forks = health.map_or(0, |h| h.fork_count);
+    let fork_color = if forks == 0 { UI_GREEN } else { UI_ORANGE };
+    ui_seg(&mut stdout, &mut color_spec, fork_color, false, "●")?;
+    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        fork_color,
+        false,
+        &forks.to_string(),
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " forks")?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        3 + forks.to_string().chars().count() + 6,
+        17,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "load ")?;
+    let load_text = format!("{:.1}%", health.map_or(0.0, |h| h.network_load * 100.0));
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &load_text)?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        17 + 5 + load_text.chars().count(),
+        41,
+    )?;
+    let pending_text = pending_txs.len().to_string();
+    ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &pending_text)?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " pending tx")?;
+    ui_pad(
+        &mut stdout,
+        &mut color_spec,
+        41 + pending_text.chars().count() + 11,
+        57,
+    )?;
+    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "block ")?;
+    match block_age {
+        Some(age) => {
+            ui_seg(
+                &mut stdout,
+                &mut color_spec,
+                if stale { UI_ORANGE } else { UI_BLUE },
+                false,
+                &format!("{}s", age),
+            )?;
+            if stale {
+                ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " · ")?;
+                ui_seg(
+                    &mut stdout,
+                    &mut color_spec,
+                    UI_ORANGE,
+                    false,
+                    &format!("{}x", age_multiple),
+                )?;
+            }
+        }
+        None => ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "unknown")?,
+    }
+    writeln!(stdout)?;
+
+    if !cadence.is_empty() {
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "Cadence")?;
+        ui_pad(&mut stdout, &mut color_spec, 8, 17)?;
+        // The peak bar is the excursion, wherever it falls in the window —
+        // colouring the LAST bar instead would disagree with "peak" on any
+        // window whose worst interval is not the most recent block.
+        for (index, bar) in cadence.chars().enumerate() {
+            let color = if Some(index) == cadence_peak && stale {
+                UI_ORANGE
+            } else {
+                UI_BLUE
+            };
+            ui_seg(&mut stdout, &mut color_spec, color, false, &bar.to_string())?;
+        }
+        ui_pad(
+            &mut stdout,
+            &mut color_spec,
+            17 + cadence.chars().count(),
+            57,
+        )?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_BLUE,
+            false,
+            &intervals.len().to_string(),
+        )?;
+        ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " blk · peak ")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_BLUE,
+            false,
+            &format!("{}s", intervals.iter().copied().max().unwrap_or(0)),
+        )?;
+        writeln!(stdout)?;
     }
 
+    ui_seg(
+        &mut stdout,
+        &mut color_spec,
+        UI_DIM,
+        false,
+        UI_RULE,
+    )?;
+    writeln!(stdout)?;
 
+    // ── Wallet │ Network ───────────────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Wallet",
+        UI_CYAN,
+        "Network",
+        UI_BLUE,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Total Wallets:",
+            &[(UI_CYAN, processed_wallets.to_string())],
+        )),
+        Some(("Active Nodes:", &[(UI_BLUE, active_nodes.to_string())])),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Total Balance:",
+            &[(UI_CYAN, format!("{:.8} ♦", total_balance))],
+        )),
+        Some((
+            "Network Peers:",
+            &[
+                (UI_BLUE, gateway_peers.to_string()),
+                (UI_DIM, "  (gateway roster)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Maturing:",
+            &[if total_maturing > 0.0 {
+                (UI_CYAN, format!("{:.8} ♦", total_maturing))
+            } else {
+                (UI_DIM, "none".to_string())
+            }],
+        )),
+        Some((
+            "Direct P2P:",
+            &[
+                (UI_BLUE, active_peers.to_string()),
+                (UI_DIM, " TCP · ".to_string()),
+                (UI_BLUE, mesh_links.to_string()),
+                (UI_DIM, " mesh".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(&mut stdout, &mut color_spec, None, None)?;
+
+    // ── Chain │ Status ─────────────────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Chain",
+        UI_GREEN,
+        "Status",
+        UI_PINK,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Height:",
+            &[(UI_GREEN, ui_thousands(current_height as u64))],
+        )),
+        Some((
+            "Fork Count:",
+            &[
+                (UI_PINK, "●".to_string()),
+                (UI_LABEL, " ".to_string()),
+                (UI_PINK, forks.to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Network Height:",
+            &[
+                (
+                    UI_GREEN,
+                    network_height.map_or_else(|| "unknown".to_string(), |h| ui_thousands(h as u64)),
+                ),
+                (UI_DIM, "  (gateway)".to_string()),
+            ],
+        )),
+        Some((
+            "Network Load:",
+            &[
+                (
+                    UI_PINK,
+                    format!("{:.1}%", health.map_or(0.0, |h| h.network_load * 100.0)),
+                ),
+                (UI_DIM, "  (mempool fill)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Difficulty:",
+            &[
+                (UI_GREEN, tip_difficulty.to_string()),
+                (UI_DIM, " ▸ ".to_string()),
+                (UI_GREEN, next_difficulty.to_string()),
+            ],
+        )),
+        Some((
+            "Last Block:",
+            &[
+                (
+                    if stale { UI_ORANGE } else { UI_PINK },
+                    block_age.map_or_else(|| "unknown".to_string(), |age| format!("{}s", age)),
+                ),
+                (
+                    UI_ORANGE,
+                    match block_age {
+                        // Past a minute the raw seconds are the "am I stalled?"
+                        // signal but read as a wall of digits (11506s), so the
+                        // multiple gains a human-readable span beside it.
+                        Some(age) if stale && age >= 60 => {
+                            format!("  ({}x · {})", age_multiple, human_duration_secs(age))
+                        }
+                        Some(_) if stale => format!("  ({}x target)", age_multiple),
+                        _ => String::new(),
+                    },
+                ),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Hashrate:",
+            &[
+                (UI_GREEN, format!("{:.2}", hr_value)),
+                (UI_DIM, format!(" {}", hr_unit)),
+            ],
+        )),
+        Some((
+            "Avg Response:",
+            &[match health.map(|h| h.average_response_time) {
+                Some(ms) if ms > 0 => (UI_PINK, format!("{}ms", ms)),
+                _ => (UI_DIM, "not sampled".to_string()),
+            }],
+        )),
+    )?;
+    ui_grid_row(&mut stdout, &mut color_spec, None, None)?;
+
+    // ── Memory Pool │ Fees & Timing ────────────────────────────────────────
+    ui_grid_header(
+        &mut stdout,
+        &mut color_spec,
+        "Memory Pool",
+        UI_LAVENDER,
+        "Fees & Timing",
+        UI_CYAN,
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Pending Txs:",
+            &[(UI_LAVENDER, pending_txs.len().to_string())],
+        )),
+        Some((
+            "Default Fee:",
+            &[
+                (
+                    UI_CYAN,
+                    format!("{:.8} ♦", Transaction::from_units(fee_units)),
+                ),
+                (UI_DIM, format!("  {}", fee_note)),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some((
+            "Mempool Value:",
+            &[
+                (UI_LAVENDER, format!("{:.8}", pending_value)),
+                (UI_CYAN, " ♦".to_string()),
+            ],
+        )),
+        Some((
+            "Fee Floor:",
+            &[
+                (
+                    UI_CYAN,
+                    format!("{:.8} ♦", Transaction::from_units(fee_floor_units)),
+                ),
+                (UI_DIM, "  (min)".to_string()),
+            ],
+        )),
+    )?;
+    ui_grid_row(
+        &mut stdout,
+        &mut color_spec,
+        Some(("Block Target:", &[(UI_LAVENDER, format!("{}s", block_target))])),
+        Some(("Fee Rate:", &[(UI_CYAN, format!("{:.8}%", fee_rate))])),
+    )?;
+
+    // Validator metrics, when this node has them — one line, so the grid above
+    // stays the shape of the screen.
+    if let Some(metrics) = node_metrics {
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            match metrics.current_tier {
+                ValidatorTier::RedDiamond => Color::Rgb(136, 0, 21),
+                ValidatorTier::Diamond => UI_CYAN,
+                ValidatorTier::Emerald => Color::Rgb(141, 203, 129),
+                ValidatorTier::Gold => UI_ORANGE,
+                ValidatorTier::Silver => UI_LABEL,
+                ValidatorTier::Inactive => UI_DIM,
+            },
+            true,
+            &format!("{:?}", metrics.current_tier),
+        )?;
+        ui_seg(
+            &mut stdout,
+            &mut color_spec,
+            UI_DIM,
+            false,
+            &format!(
+                "  ·  {} verified  ·  {:.1}% success  ·  {:.1}% performance",
+                metrics.blocks_verified, metrics.success_rate, metrics.performance_score * 100.0
+            ),
+        )?;
+        writeln!(stdout)?;
+    }
+
+    writeln!(stdout)?;
     stdout.reset()?;
 },
 
@@ -2179,22 +2437,25 @@ println!("Wallet renamed successfully");
                 }
                 Some("mine") => {
                     let parts: Vec<&str> = command.split_whitespace().collect();
-                    if parts.len() < 2 {
-                        println!("Usage: mine <miner_wallet_name> [--continuous] [--gpu|--cpu]");
-                        continue;
-                    }
-                    // Order-independent flags after the wallet name: --continuous/-c,
-                    // --gpu / --cpu can appear in any order. Anything else is an error.
+                    // Order-independent flags, and the wallet name is OPTIONAL:
+                    // a bare `mine` (or `mine -c --gpu`) mines to the default
+                    // wallet, since naming it every time is pure friction for the
+                    // common single-wallet case.
+                    //
                     // A GPU build (feature gpu_miner) mines on the GPU by DEFAULT —
-                    // that is the whole point of that binary — so `mine <wallet>` uses
-                    // the GPU with no flag; `--cpu` forces CPU. A default (CPU-only)
-                    // build defaults to CPU and refuses `--gpu` below. (GPU never runs
-                    // the CPU grind alongside it; CPU is only the fallback if the GPU
-                    // dies mid-session — see miner.rs.)
+                    // that is the whole point of that binary — so `mine <wallet>`
+                    // uses the GPU with no flag; `--cpu` forces CPU. A default
+                    // (CPU-only) build defaults to CPU and refuses `--gpu` below.
+                    // (GPU never runs the CPU grind alongside it; CPU is only the
+                    // fallback if the GPU dies mid-session — see miner.rs.)
+                    let is_flag = |s: &str| {
+                        matches!(s, "--continuous" | "-c" | "--gpu" | "--cpu")
+                    };
+                    let named = parts.get(1).filter(|part| !is_flag(part)).copied();
                     let mut continuous = false;
                     let mut use_gpu = cfg!(feature = "gpu_miner");
                     let mut bad_flag: Option<&str> = None;
-                    for flag in &parts[2..] {
+                    for flag in parts.iter().skip(1 + usize::from(named.is_some())) {
                         match *flag {
                             "--continuous" | "-c" => continuous = true,
                             "--gpu" => use_gpu = true,
@@ -2203,7 +2464,7 @@ println!("Wallet renamed successfully");
                         }
                     }
                     if let Some(f) = bad_flag {
-                        println!("Unknown mine flag '{}'. Usage: mine <miner_wallet_name> [--continuous] [--gpu|--cpu]", f);
+                        println!("Unknown mine flag '{}'. Usage: mine [miner_wallet_name] [--continuous] [--gpu|--cpu]", f);
                         continue;
                     }
                     // --gpu only does something in a binary built with the gpu_miner
@@ -2219,13 +2480,55 @@ println!("Wallet renamed successfully");
                             "This binary was built without GPU support, so `--gpu` cannot work. \
                              Rebuild with `cargo build --release --features \
                              bootstrap_publisher,webrtc_mesh,gpu_miner` (or use the GPU beta \
-                             build), or run `mine {}` without --gpu for CPU mining.",
-                            parts[1]
+                             build), or run `mine` without --gpu for CPU mining."
                         );
                         continue;
                     }
-                    // Normalized args for the handler regardless of flags.
-                    let mine_parts: Vec<&str> = vec![parts[0], parts[1]];
+                    let miner_wallet = match named {
+                        Some(name) => {
+                            // Fail a typo NOW: an unknown name used to surface only
+                            // inside handle_mine_command — after discovery spin-up
+                            // and up to the full 24s sync prep (and in continuous
+                            // mode it then backed off and re-prepped for minutes).
+                            let known = wallets.contains_key(name)
+                                || wallets.values().any(|w| w.address == name);
+                            if !known {
+                                let mut names: Vec<&str> =
+                                    wallets.keys().map(|s| s.as_str()).collect();
+                                names.sort_unstable();
+                                println!(
+                                    "No wallet found with name or address: {} (available: {})",
+                                    name,
+                                    names.join(", ")
+                                );
+                                continue;
+                            }
+                            name.to_string()
+                        }
+                        None => match resolve_default_wallet(&wallets, &blockchain).await {
+                            // Name it: rewards landing in a wallet the operator
+                            // forgot about is the failure this guards against.
+                            Some((name, address)) => {
+                                println!("Mining to {} ({})", name, address);
+                                name
+                            }
+                            // Unreachable on a normal start (create_default_wallet
+                            // runs on first launch), but load_wallets returns Ok with
+                            // an empty map when every wallet fails to decrypt — so the
+                            // message must not tell someone whose funds are intact to
+                            // make a new wallet.
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                continue;
+                            }
+                        },
+                    };
+                    // Normalized args for the handler regardless of trailing flags.
+                    let mine_parts: Vec<&str> = vec![parts[0], miner_wallet.as_str()];
 
                     // Enter-to-stop for continuous mode: one detached reader consumes a
                     // single stdin line and flips the flag; the mining loop checks it
@@ -2916,6 +3219,118 @@ match whisper.create_whisper_transaction(
 Ok(whisper_tx) => {
     // Drop blockchain guard before getting write lock
     drop(blockchain_guard);
+
+    // PREVIEW BEFORE BROADCAST. The message rides in the FEE, and the encoder
+    // silently normalises it: characters outside a-z are dropped, and a code
+    // shorter than MAX_WHISPER_CHARS has its empty slots filled by the decoder
+    // — so `c4fe` lands on chain as CFEM and `hey` reads back as HEYM. The old
+    // flow printed the string the USER typed, after broadcasting, so nobody
+    // ever saw what the chain would actually carry. Decode the signed fee and
+    // show the round-trip while it can still be cancelled.
+    {
+        let amount = whisper_tx.amount();
+        let total_fee = whisper_tx.fee();
+        let network_fee = amount * alphanumeric::a9::blockchain::FEE_PERCENTAGE;
+        let code_fee = total_fee - network_fee;
+        let reads_back = whisper
+            .decode_message_from_fee(total_fee, whisper_tx.timestamp, amount)
+            .unwrap_or_default()
+            .to_uppercase();
+        let typed = message.trim().to_lowercase();
+        let round_trip_ok = reads_back.eq_ignore_ascii_case(&typed);
+
+        let mut out = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut out, spec, UI_CYAN, true, "Whisper")?;
+        ui_pad(&mut out, spec, 8, 64)?;
+        ui_seg(&mut out, spec, UI_ORANGE, false, "draft · not sent")?;
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_DIM, false, " to    ")?;
+        ui_text(&mut out, spec, false, recipient)?;
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(out)?;
+
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((" Typed:", &[(UI_LABEL, typed.clone())])),
+            Some(("Amount:", &[(UI_CYAN, format!("{:.8} ♦", amount))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((
+                " Reads back:",
+                &[(
+                    if round_trip_ok { UI_GREEN } else { UI_ORANGE },
+                    if reads_back.is_empty() {
+                        "(undecodable)".to_string()
+                    } else {
+                        reads_back.clone()
+                    },
+                )],
+            )),
+            Some(("Network fee:", &[(UI_DIM, format!("{:.8} ♦", network_fee))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((
+                " Round-trip:",
+                &[if round_trip_ok {
+                    (UI_GREEN, "matches".to_string())
+                } else {
+                    (UI_ORANGE, "CHANGED".to_string())
+                }],
+            )),
+            Some(("Code fee:", &[(UI_CYAN, format!("{:.8} ♦", code_fee))])),
+        )?;
+        ui_grid_row(
+            &mut out,
+            spec,
+            Some((" Visible to:", &[(UI_DIM, "everyone".to_string())])),
+            Some((
+                "Total:",
+                &[(UI_CYAN, format!("{:.8} ♦", amount + total_fee))],
+            )),
+        )?;
+        ui_seg(&mut out, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(out)?;
+        if !round_trip_ok {
+            ui_seg(&mut out, spec, UI_ORANGE, false, " ")?;
+            ui_seg(
+                &mut out,
+                spec,
+                UI_ORANGE,
+                false,
+                &format!(
+                    "the chain will carry {} — only a-z survives, and short codes get padded",
+                    if reads_back.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        reads_back.clone()
+                    }
+                ),
+            )?;
+            writeln!(out)?;
+        }
+        ui_seg(&mut out, spec, UI_DIM, false,
+            " the message IS the fee — a plain payment of this amount would cost only the network fee\n")?;
+        writeln!(out)?;
+        ui_seg(&mut out, spec, UI_LABEL, false, " send?  ")?;
+        ui_seg(&mut out, spec, UI_DIM, false, "y signs and broadcasts · anything else cancels: ")?;
+        out.flush()?;
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        out.reset()?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled — nothing was broadcast.");
+            continue;
+        }
+    }
     // Scope the WRITE guard to the submit itself: the success arm below does console
     // IO and (since v7.6.8) network gossip, and holding a chain write guard across
     // awaits is the known wedge class.
@@ -2980,123 +3395,14 @@ stdout.reset()?;
 },
 
 Some("history") => {
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let whisper = whisper_module.read().await;
-    // Time-boxed like `balance`/`account`: an unbounded read here sat silently
-    // through converge write-holds (a 128-block adoption validates under the
-    // write lock) and read as "client hung".
-    let Ok(blockchain_guard) =
-        tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
-    else {
-        println!("Chain busy (syncing/reorg in progress) — try `history` again shortly.");
-        continue;
-    };
-
-    let mut title_style = ColorSpec::new();
-    title_style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(true);
-    stdout.set_color(&title_style)?;
-    writeln!(&mut stdout, "\n Transaction History (Last 50)")?;
-    stdout.reset()?;
-        writeln!(&mut stdout, "───────────────────")?;
-
-    // Collect the most recent transactions across all wallets. Fixed last-N (not a
-    // 7-day window) so a wallet quiet for a week still shows its latest activity;
-    // each call reads at most N index entries (no block decodes).
-    const RECENT_TX_LIMIT: usize = 50;
-    let mut all_transactions = Vec::new();
-    let index_ready = blockchain_guard.address_index_ready();
-    if index_ready {
-        for wallet in wallets.values() {
-            let wallet_transactions = whisper
-                .get_recent_transactions(&blockchain_guard, &wallet.address, RECENT_TX_LIMIT)
-                .await;
-            all_transactions.extend(wallet_transactions);
-        }
-    }
-    // Everything below renders from owned data: drop the chain guard (and the
-    // whisper guard) BEFORE the styled dump so a blocked console can never park
-    // a read guard under the write-preferring chain lock (2026-07-16 class).
-    drop(blockchain_guard);
-    drop(whisper);
-    if !index_ready {
-        // Parity with the `account` command: while the address index is still
-        // building, say so instead of rendering an empty list under the header.
-        let mut note = ColorSpec::new();
-        note.set_fg(Some(Color::Yellow));
-        stdout.set_color(&note)?;
-        writeln!(
-            &mut stdout,
-            "History index unavailable — it builds at startup; restart the node if this persists."
-        )?;
-        stdout.reset()?;
-    }
-
-    // Sort all transactions by timestamp (oldest first)
-    all_transactions.sort_by(|a, b| {
-        // First compare timestamps
-        let time_cmp = a.timestamp.cmp(&b.timestamp);
-        if time_cmp == std::cmp::Ordering::Equal {
-            // If timestamps are equal, use other fields for consistent ordering
-            match (a.from.as_str(), b.from.as_str()) {
-                ("MINING_REWARDS", "MINING_REWARDS") => std::cmp::Ordering::Equal,
-                ("MINING_REWARDS", _) => std::cmp::Ordering::Less,
-                (_, "MINING_REWARDS") => std::cmp::Ordering::Greater,
-                _ => a.from.cmp(&b.from) // Sort by sender address as final tiebreaker
-            }
-        } else {
-            time_cmp
-        }
-    });
-
-    // Deduplicate transactions while preserving order
-    all_transactions.dedup_by(|a, b| {
-        a.timestamp == b.timestamp &&
-        a.from == b.from &&
-        a.to == b.to &&
-        (a.amount - b.amount).abs() < f64::EPSILON
-    });
-
-    // Keep only the newest N across all wallets (sorted oldest-first above, so the
-    // most recent are at the tail).
-    if all_transactions.len() > RECENT_TX_LIMIT {
-        let drop = all_transactions.len() - RECENT_TX_LIMIT;
-        all_transactions.drain(0..drop);
-    }
-
-    for tx in all_transactions {
-        let wallet_is_sender = wallets.values().any(|w| w.address == tx.from);
-
-        let mut sent_received_style = ColorSpec::new();
-        if wallet_is_sender {
-            sent_received_style.set_fg(Some(Color::Rgb(255, 84, 73))).set_bold(true);
-            stdout.set_color(&sent_received_style)?;
-            write!(&mut stdout, "SENT")?;
-        } else {
-            sent_received_style.set_fg(Some(Color::Rgb(59, 242, 173))).set_bold(true);
-            stdout.set_color(&sent_received_style)?;
-            write!(&mut stdout, "RECEIVED")?;
-        }
-        stdout.reset()?;
-
-        let mut time_style = ColorSpec::new();
-        time_style.set_fg(Some(Color::Rgb(169, 169, 169))).set_bold(true);
-        stdout.set_color(&time_style)?;
-        writeln!(&mut stdout, " {}", WhisperModule::format_message_time(tx.timestamp))?;
-
-        writeln!(&mut stdout, "  Amount: {:.8} ", tx.amount)?;
-
-        let mut fee_style = ColorSpec::new();
-        fee_style.set_fg(Some(Color::Rgb(192, 192, 192)));
-        stdout.set_color(&fee_style)?;
-        writeln!(&mut stdout, "  Fee: {:.8} ", tx.fee)?;
-        stdout.reset()?;
-
-        if wallet_is_sender {
-            writeln!(&mut stdout, "  To: {}", tx.to)?;
-        } else {
-            writeln!(&mut stdout, "  From: {}", tx.from)?;
-        }
-        writeln!(&mut stdout, "-------------------")?;
+    // Moved out of the REPL: the inline version reached through the whisper
+    // module, which flattened away height, position and the direction flag
+    // bits the address index had already decoded.
+    if let Err(e) = mgmt
+        .handle_history_command(&command, &blockchain, &wallets)
+        .await
+    {
+        println!("Error: {}", e);
     }
 },
     Some(cmd) if cmd.starts_with("--") => {
@@ -3143,40 +3449,142 @@ Some("debug") | Some("diagnostics") | Some("diag") => {
 },
 
 Some("help") => {
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let mut header_style = ColorSpec::new();
-    header_style.set_fg(Some(Color::Rgb(40, 204, 217)))
-        .set_bold(true);
+    // Task-first cheatsheet: rows are indexed by the goal you arrive with
+    // ("what I hold", "send coins"), not by command name, so you find your line
+    // without already knowing the verb. Every run goes through the termcolor
+    // handle — the old arm mixed println! with set_color, which puts the colour
+    // attribute on one handle and the text on another (bold rendered on Windows
+    // only). Weight is set explicitly on every run.
+    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+    let spec = &mut ColorSpec::new();
+    // Column where every command keyword starts.
+    const CMD: usize = 17;
 
-    stdout.set_color(&header_style)?;
-    writeln!(stdout, "\n Available Commands")?;
-    stdout.reset()?;
-    println!("───────────────────");
-    println!(
-        "create <sender> <recipient> <amount> [--fee <ALPHA>]  - Create a new transaction"
-    );
-    println!("  explicit reference-wallet fees are limited to 0.01 ALPHA");
-    println!("whisper <address> <msg>               - Send a whisper message (amount optional)");
-    println!("balance                               - Show all wallet balances");
-    println!("new [wallet_name]                     - Create a new wallet");
-    println!("account <address>                     - Show account information");
-    println!("history                               - Show transaction history");
-    println!("mine <wallet_name>                    - Mine a new block");
-    println!("rename <wallet_name> <new_wallet>     - Rename wallet");
-    println!("info                                  - Show blockchain information");
-    println!("debug                                 - Show dynamic network diagnostics");
+    macro_rules! row {
+        ($goal:expr, $hue:expr, $cmd:expr, $args:expr) => {{
+            let goal: &str = $goal;
+            ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
+            // max(): a goal as long as the column ("  mine to a wallet") must
+            // still be pushed clear of the keyword, or the two run together.
+            ui_pad(
+                &mut stdout,
+                spec,
+                goal.chars().count(),
+                CMD.max(goal.chars().count() + 2),
+            )?;
+            ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
+            let args: &str = $args;
+            if !args.is_empty() {
+                ui_seg(&mut stdout, spec, UI_DIM, false, args)?;
+            }
+            writeln!(stdout)?;
+        }};
+    }
 
-    // For Network Commands header
-    stdout.set_color(&header_style)?;
-    println!("\n Network Commands");
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_CYAN, true, "Help")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference")?;
+    ui_pad(&mut stdout, spec, 39, 56)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "↑ recalls previous")?;
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    // Colour the COUNT, never part of the word: splitting "wallet" from its
+    // plural "s" put a colour boundary mid-word and read as a rendering fault.
+    ui_seg(&mut stdout, spec, UI_CYAN, false, &wallets.len().to_string())?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        if wallets.len() == 1 {
+            " wallet loaded"
+        } else {
+            " wallets loaded"
+        },
+    )?;
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_CYAN, true, "Wallet")?;
+    ui_pad(&mut stdout, spec, 7, 68)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "account overview")?;
+    writeln!(stdout)?;
+    row!(" balances", UI_CYAN, "balance", "");
+    row!(" address lookup", UI_CYAN, "account ", "<address>");
+    row!(" transactions", UI_CYAN, "history", "");
+    row!(" new wallet", UI_CYAN, "new ", "[name]");
+    row!(" rename wallet", UI_CYAN, "rename ", "<name> <new name>");
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_BLUE, true, "Transfers")?;
+    ui_pad(&mut stdout, spec, 10, 39)?;
+    // The constraint that actually breaks a first send: create validates
+    // 40-hex addresses and rejects wallet names outright.
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_ORANGE,
+        false,
+        "addresses are 40-hex, not wallet names",
+    )?;
+    writeln!(stdout)?;
+    row!(" transfer", UI_BLUE, "create ", "<from> <to> <amount> [--fee <ALPHA>]");
+    row!(" quick transfer", UI_BLUE, "<to> <amount>", "   from default wallet");
+    row!(" send message", UI_BLUE, "whisper ", "<address> \"<message>\"");
+    ui_pad(&mut stdout, spec, 0, CMD)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        "fees are priced automatically; --fee overrides",
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_GREEN, true, "Mining")?;
+    ui_pad(&mut stdout, spec, 7, 46)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_ORANGE,
+        false,
+        "rewards mature after 100 blocks",
+    )?;
+    writeln!(stdout)?;
+    row!(" begin mining", UI_GREEN, "mine", "   default wallet");
+    row!(" mine to wallet", UI_GREEN, "mine ", "<wallet name>");
+    writeln!(stdout)?;
+
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_LAVENDER, true, "Network")?;
+    ui_pad(&mut stdout, spec, 8, 58)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "node and peer status")?;
+    writeln!(stdout)?;
+    row!(" network status", UI_LAVENDER, "info", "");
+    row!(" connectivity", UI_LAVENDER, "--status", "   (-s)");
+    row!(" peer discovery", UI_LAVENDER, "--getpeers", "   ·   --discover");
+    row!(" add peer", UI_LAVENDER, "--connect ", "<ip:port>");
+    row!(" resynchronise", UI_LAVENDER, "--sync", "");
+    row!(" diagnostics", UI_LAVENDER, "debug", "");
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+
+    // Aliases and the bare-address shorthand are reachable in the match arms
+    // but appeared on no surface, so nobody could discover them.
+    row!(" aliases", UI_PINK, "create = send = transfer", " · balance = wallet");
+    ui_pad(&mut stdout, spec, 0, CMD)?;
+    ui_seg(&mut stdout, spec, UI_PINK, false, "debug = diagnostics = diag")?;
+    writeln!(stdout)?;
+    row!(" shorthand", UI_PINK, "<from> <to> <amount>", "   also initiates a transfer");
+    row!(" end session", UI_PINK, "exit", "");
+    writeln!(stdout)?;
     stdout.reset()?;
-    println!("───────────────────");
-    println!("--status    (-s)      - Show network status");
-    println!("--sync              - Attempt normal sync");
-    println!("--sync --force      - Force full resync");
-    println!("--connect <ip:port> - Connect to specific node");
-    println!("--getpeers          - List available peers");
-    println!("--discover          - Search for new nodes\n");
 }
 
 Some("version") => {
@@ -3202,12 +3610,48 @@ Some(_) => {
                     let parts: Vec<&str> = command.split_whitespace().collect();
                     let is_addr =
                         |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
-                    if parts.len() == 3
+                    let is_amount =
+                        |s: &str| s.parse::<f64>().map(|a| a > 0.0).unwrap_or(false);
+                    // Two forms, both unambiguous because a 40-hex string followed
+                    // by a positive number has no other meaning:
+                    //   <from> <to> <amount>   explicit sender
+                    //   <to> <amount>          sender is the default wallet
+                    let quick = parts.len() == 2 && is_addr(parts[0]) && is_amount(parts[1]);
+                    let sender = if quick {
+                        match resolve_default_wallet(&wallets, &blockchain).await {
+                            // Always name the wallet being spent from. The
+                            // shorthand's whole risk is sending from one you did
+                            // not mean, so the choice is never silent.
+                            Some((name, address)) => {
+                                println!("Sending from {} ({})", name, address);
+                                Some(address)
+                            }
+                            // Unreachable on a normal start (create_default_wallet
+                            // runs on first launch), but load_wallets returns Ok with
+                            // an empty map when every wallet fails to decrypt — so the
+                            // message must not tell someone whose funds are intact to
+                            // make a new wallet.
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if quick || (parts.len() == 3
                         && is_addr(parts[0])
                         && is_addr(parts[1])
-                        && parts[2].parse::<f64>().map(|a| a > 0.0).unwrap_or(false)
+                        && is_amount(parts[2]))
                     {
-                        let synthesized = format!("create {} {} {}", parts[0], parts[1], parts[2]);
+                        let synthesized = match sender.as_deref() {
+                            Some(from) => format!("create {} {} {}", from, parts[0], parts[1]),
+                            None => format!("create {} {} {}", parts[0], parts[1], parts[2]),
+                        };
                         match mgmt
                             .handle_create_transaction(
                                 &synthesized,
@@ -4770,6 +5214,104 @@ fn local_block_hash_at(db_path: &str, height: u32) -> Option<String> {
     let raw = db.get(format!("block_{}", height).as_bytes()).ok()??;
     let block = Block::from_bytes(raw.as_ref()).ok()?;
     Some(hex::encode(block.hash))
+}
+
+/// Block-interval trace for the Overview banner, plus the index of the worst
+/// interval so the caller can colour that one bar off-nominal. Scaled to the
+/// window's own peak: the shape of the cadence is the signal, not its absolute
+/// height.
+fn ui_cadence(intervals: &[u64]) -> (String, Option<usize>) {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if intervals.is_empty() {
+        return (String::new(), None);
+    }
+    let peak = intervals.iter().copied().max().unwrap_or(0);
+    let peak_at = intervals.iter().rposition(|value| *value == peak);
+    let bars = intervals
+        .iter()
+        .map(|value| {
+            if peak == 0 {
+                BARS[0]
+            } else {
+                let scaled = (*value as f64 / peak as f64) * (BARS.len() - 1) as f64;
+                BARS[(scaled.round() as usize).min(BARS.len() - 1)]
+            }
+        })
+        .collect();
+    (bars, peak_at)
+}
+
+/// Auto-scaled hashrate: a CPU-mined BLAKE3 network lives in MH/s-GH/s, and a
+/// fixed TH/s display read "0.00" even while difficulty climbed past 550.
+fn ui_hashrate(hashrate_ths: f64) -> (f64, &'static str) {
+    let hs = hashrate_ths * 1e12;
+    if hs >= 1e12 {
+        (hs / 1e12, "TH/s")
+    } else if hs >= 1e9 {
+        (hs / 1e9, "GH/s")
+    } else if hs >= 1e6 {
+        (hs / 1e6, "MH/s")
+    } else if hs >= 1e3 {
+        (hs / 1e3, "kH/s")
+    } else {
+        (hs, "H/s")
+    }
+}
+
+/// The wallet a bare `mine` or a two-argument send should act as.
+///
+/// Resolution order, chosen so the fallback can never land on a wallet the
+/// operator has forgotten about:
+///   1. the wallet named `default_wallet` (what `create_default_wallet` makes),
+///   2. the only wallet, when exactly one is loaded,
+///   3. otherwise the wallet holding the LARGEST confirmed balance, ties broken
+///      by name so the answer is identical on every run.
+///
+/// Step 3 matters: an arbitrary pick (say, whatever the HashMap yielded first)
+/// could mine rewards into an empty side wallet, or fail a send from one — the
+/// balance ranking lands on the wallet actually in use. The caller always
+/// announces which wallet was chosen; a silent default is what makes a wrong
+/// guess dangerous, not the guess itself.
+///
+/// Ranking reads one balances-tree entry per wallet — no block decodes — and is
+/// time-boxed, degrading to the name-ordered first wallet if the chain lock is
+/// busy rather than blocking the console.
+async fn resolve_default_wallet(
+    wallets: &std::collections::HashMap<String, alphanumeric::a9::wallet::Wallet>,
+    blockchain: &Arc<RwLock<Blockchain>>,
+) -> Option<(String, String)> {
+    if let Some((name, wallet)) = wallets.get_key_value("default_wallet") {
+        return Some((name.clone(), wallet.address.clone()));
+    }
+    if wallets.len() <= 1 {
+        return wallets
+            .iter()
+            .next()
+            .map(|(name, wallet)| (name.clone(), wallet.address.clone()));
+    }
+
+    let mut ordered: Vec<(&String, &alphanumeric::a9::wallet::Wallet)> = wallets.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Ok(guard) = tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await {
+        let mut best: Option<(i128, String, String)> = None;
+        for (name, wallet) in &ordered {
+            let units = guard
+                .get_confirmed_balance_units(&wallet.address)
+                .await
+                .unwrap_or(0);
+            if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
+                best = Some((units, (*name).clone(), wallet.address.clone()));
+            }
+        }
+        if let Some((_, name, address)) = best {
+            return Some((name, address));
+        }
+    }
+
+    ordered
+        .first()
+        .map(|(name, wallet)| ((*name).clone(), wallet.address.clone()))
 }
 
 /// Compact human-readable duration for status display, e.g. 11506 -> "3h 11m".
