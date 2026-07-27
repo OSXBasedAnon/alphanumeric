@@ -95,20 +95,24 @@ floor, so choose it deliberately:
   transaction whose fee is below 0.0001 coins (`400 … below the relay floor`
   from submit-tx). This is relay policy, not consensus — but a below-floor
   transaction will not propagate, so treat it as a hard minimum.
-- **Recommended bounded policy:** calculate in atomic units (100,000,000 units
-  per coin), round `amount_units / 1776` to the nearest unit with positive exact
-  halves rounded upward, then clamp the result to `10,000–50,000` units
-  (`0.0001–0.0005` coins). In integer arithmetic:
+- **Recommended policy:** query `GET /explorer/fee-estimate` on any node you
+  already talk to and put its `recommended_fee` into the transaction's `fee`
+  field — the identical recommendation the reference wallet resolves when
+  `create` runs without `--fee`. **The `fee` field on the wire is a decimal
+  coin amount** (`"fee": 0.0002`); the `*_units` integers in the response are
+  for exact accounting only (1 coin = 100,000,000 units), and putting `20000`
+  in the `fee` field would sign a 20,000-coin fee. The estimate prices
+  next-block inclusion off the live mempool: a flat `0.0002` anchor
+  (`20,000` units, 2x the relay floor) on a quiet network, one unit above the
+  marginal next-block fee under congestion, always clamped to the automatic
+  ceiling of `0.001` (`100,000` units). Offline or estimator-unreachable
+  fallback: use the `0.0002` anchor.
 
-      raw_fee_units = amount_units / 1776
-      if amount_units % 1776 >= 888: raw_fee_units += 1
-      fee_units = clamp(raw_fee_units, 10_000, 50_000)
-
-  This is the reference wallet default. Exchanges and payout processors may
-  choose an explicit absolute fee for their batching policy. Explicit fees remain
-  subject to current node admission and block-accounting policy; acceptance of
-  one value does not imply that every larger value is accepted, nor does a larger
-  fee guarantee a particular confirmation time.
+  Exchanges and payout processors may instead choose an explicit absolute fee
+  for their batching policy. Explicit fees remain subject to current node
+  admission and block-accounting policy; acceptance of one value does not imply
+  that every larger value is accepted, nor does a larger fee guarantee a
+  particular confirmation time.
 - Whisper uses a separate historical, amount-dependent application encoding in
   the fee field. It is not regular-payment fee guidance, and numerical overlap
   with an ordinary fee is not by itself a message marker.

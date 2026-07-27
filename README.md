@@ -157,8 +157,11 @@ If you are integrating against this repository, pin a commit hash and validate b
 
 ### Runtime Parameters (Current Code)
 
-- Reference-wallet fee: exact `amount / 1776`, rounded to the nearest atomic
-  unit and bounded to `0.0001–0.0005`
+- Reference-wallet fee: automatic, priced off the live mempool
+  (`Blockchain::fee_estimate`): a flat `0.0002` anchor (2x the relay floor) on
+  a quiet network, one unit above the marginal next-block fee under
+  congestion, always capped at `0.001` for an automatic fee (`0.01` remains the
+  ceiling for an explicitly chosen `--fee`)
 - `FEE_PERCENTAGE = 0.000563063063` remains the Whisper encoding constant; it is
   not the regular-wallet fee policy
 - Reward constants: `MIN_BLOCK_REWARD = 1.0`, launch
@@ -293,13 +296,17 @@ Interactive command loop examples:
 - `info`
 - `diagnostics`
 
-With no `--fee`, the wallet applies its bounded default in exact eight-decimal
-atomic units. Exchanges and other automated operators can select an absolute
-fee with `--fee`; values must meet the `0.0001` relay floor. The CLI refuses an
-explicit fee above `0.01` as a hard safety ceiling. This is reference-wallet
-policy, not a universal network limit; externally signed integrations retain
-control of their fee policy subject to current node admission and block-accounting
-rules.
+With no `--fee`, the wallet prices the fee automatically off the live mempool
+(the `info` screen shows the current value as `Default Fee`, and `create`
+prints the resolved `Auto fee` before signing): a flat `0.0002` anchor when the
+network is quiet, one unit above the marginal next-block fee under congestion,
+never above `0.001` for an automatic fee. Exchanges and other
+automated operators can select an absolute fee with `--fee`; values must meet
+the `0.0001` relay floor. The CLI refuses an explicit fee above `0.01` as a
+hard safety ceiling. This is reference-wallet policy, not a universal network
+limit; externally signed integrations retain control of their fee policy
+subject to current node admission and block-accounting rules (integrators can
+query `GET /explorer/fee-estimate` for the same recommendation).
 
 Process flags/network commands:
 

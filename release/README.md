@@ -146,7 +146,10 @@ Example:
 create <your_40_hex_sender_address> 84dab431b53e6522fe2e74914eec99f17758f4e3 1.25
 ```
 
-The wallet selects a bounded `0.0001–0.0005` fee by default. Exchanges and
+The wallet prices the fee automatically by default — `0.0002` on a quiet
+network, rising only when blocks are actually contested, never above `0.001`
+for an automatic fee. `create` prints the resolved `Auto fee` before signing,
+and `info` shows the current value as `Default Fee`. Exchanges and
 advanced operators can set an exact absolute fee, for example
 `--fee 0.001`. The reference CLI rejects explicit fees above `0.01`, preventing
 unattended scripts from overpaying because of a misplaced decimal. That ceiling

@@ -14,7 +14,9 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
 use tokio::sync::RwLock;
 
-use crate::a9::blockchain::{is_canonical_user_address, MIN_RELAY_FEE_UNITS};
+use crate::a9::blockchain::{
+    is_canonical_user_address, MIN_RELAY_FEE_UNITS, WALLET_FEE_SAFETY_LIMIT_UNITS,
+};
 use crate::a9::{
     blockchain::{
         Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
@@ -26,15 +28,19 @@ use crate::a9::{
 
 const KEY_FILE_PATH: &str = "private.key";
 const MINING_NONCE_WINDOW: u64 = 67_108_864;
-/// Reference-wallet fee policy. These are wallet defaults, not consensus rules:
-/// externally signed transactions may choose their own fee subject to current
-/// relay admission and block-accounting policy.
-const DEFAULT_WALLET_FEE_DIVISOR: i128 = 1_776;
-const DEFAULT_WALLET_FEE_CAP_UNITS: i128 = 50_000; // 0.0005 ALPHA
-/// Hard safety ceiling for the reference wallet's explicit-fee path. This is
-/// wallet policy, not a universal network limit; externally signed integrations
-/// retain control subject to current admission and block-accounting policy.
-const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = 1_000_000; // 0.01 ALPHA
+/// Reference-wallet fee policy. Wallet POLICY, not consensus rules: externally
+/// signed transactions may choose their own fee subject to current relay
+/// admission and block-accounting policy. The wallet's default fee is no longer
+/// a fixed amount ratio — `create` without --fee resolves through the live
+/// mempool fee estimator (Blockchain::fee_estimate): the flat anchor
+/// (FEE_ESTIMATE_ANCHOR_UNITS, 2x the relay floor) on a quiet network, one
+/// unit above the marginal next-block fee under congestion, always clamped to
+/// the safety ceiling below.
+///
+/// Hard safety ceiling for ANY wallet fee (explicit --fee or auto). Anchored to
+/// the single source in blockchain.rs so the estimator and the --fee guard can
+/// never disagree.
+const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = WALLET_FEE_SAFETY_LIMIT_UNITS; // 0.01 ALPHA
 const CREATE_TRANSACTION_USAGE: &str =
     "Usage: create <sender_address> <recipient_address> <amount> [--fee <ALPHA>]";
 
@@ -72,7 +78,11 @@ struct CreateTransactionArgs {
     sender_address: String,
     recipient_address: String,
     amount_units: i128,
-    fee_units: i128,
+    /// Some = explicit --fee (validated against floor and safety ceiling at
+    /// parse time). None = auto: the handler resolves it through the live
+    /// mempool fee estimator (Blockchain::fee_estimate) — parsing stays a pure
+    /// string function with no chain access.
+    fee_units: Option<i128>,
 }
 
 /// Parse a CLI coin amount without routing user input through `f64`. Transaction
@@ -130,16 +140,6 @@ fn parse_coin_units(value: &str, field: &str) -> std::result::Result<i128, Strin
         .ok_or_else(|| format!("{} is too large", field))
 }
 
-/// Round a positive integer ratio to the nearest atomic unit, with exact halves
-/// rounded upward (matching the reference wallet's historical positive-value
-/// rounding), then apply the wallet policy bounds.
-fn default_wallet_fee_units(amount_units: i128) -> i128 {
-    let quotient = amount_units / DEFAULT_WALLET_FEE_DIVISOR;
-    let remainder = amount_units % DEFAULT_WALLET_FEE_DIVISOR;
-    let rounded = quotient + i128::from(remainder >= (DEFAULT_WALLET_FEE_DIVISOR + 1) / 2);
-    rounded.clamp(MIN_RELAY_FEE_UNITS, DEFAULT_WALLET_FEE_CAP_UNITS)
-}
-
 fn ensure_wire_exact(units: i128, field: &str) -> std::result::Result<(), String> {
     if Transaction::to_units(Transaction::from_units(units)) != units {
         return Err(format!(
@@ -195,35 +195,36 @@ fn parse_create_transaction_command(
         index += 1;
     }
 
-    let fee_units = match explicit_fee_units {
-        Some(fee_units) => {
-            ensure_wire_exact(fee_units, "fee")?;
-            if fee_units < MIN_RELAY_FEE_UNITS {
-                return Err(format!(
-                    "fee is below the relay floor of {:.8} ALPHA",
-                    Transaction::from_units(MIN_RELAY_FEE_UNITS)
-                ));
-            }
-            if fee_units > EXPLICIT_FEE_SAFETY_LIMIT_UNITS {
-                return Err(format!(
-                    "fee exceeds the reference wallet safety limit of {:.8} ALPHA",
-                    Transaction::from_units(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
-                ));
-            }
-            fee_units
+    // Explicit --fee is fully validated here at parse time; the auto default is
+    // deliberately NOT resolved here — parsing stays a pure string function, and
+    // the handler prices the fee off the live mempool (Blockchain::fee_estimate)
+    // at send time. The estimator's output is clamped to the same
+    // [relay floor, safety ceiling] band by construction, so both paths obey
+    // the identical policy bounds.
+    if let Some(fee_units) = explicit_fee_units {
+        ensure_wire_exact(fee_units, "fee")?;
+        if fee_units < MIN_RELAY_FEE_UNITS {
+            return Err(format!(
+                "fee is below the relay floor of {:.8} ALPHA",
+                Transaction::from_units(MIN_RELAY_FEE_UNITS)
+            ));
         }
-        None => default_wallet_fee_units(amount_units),
-    };
-
-    amount_units
-        .checked_add(fee_units)
-        .ok_or_else(|| "amount plus fee is too large".to_string())?;
+        if fee_units > EXPLICIT_FEE_SAFETY_LIMIT_UNITS {
+            return Err(format!(
+                "fee exceeds the reference wallet safety limit of {:.8} ALPHA",
+                Transaction::from_units(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
+            ));
+        }
+        amount_units
+            .checked_add(fee_units)
+            .ok_or_else(|| "amount plus fee is too large".to_string())?;
+    }
 
     Ok(CreateTransactionArgs {
         sender_address: parts[1].to_string(),
         recipient_address: parts[2].to_string(),
         amount_units,
-        fee_units,
+        fee_units: explicit_fee_units,
     })
 }
 
@@ -997,7 +998,32 @@ impl Mgmt {
         let sender_address = parsed.sender_address;
         let recipient_address = parsed.recipient_address;
         let amount_units = parsed.amount_units;
-        let fee_units = parsed.fee_units;
+        // Auto fee (no --fee given): price next-block inclusion off the live
+        // mempool (Blockchain::fee_estimate) at send time — the flat anchor on
+        // a quiet network, one unit above the marginal next-block fee under
+        // congestion, clamped to the wallet safety ceiling by construction. The
+        // brief chain read guard here only reaches the mempool and is released
+        // before the send flow's own guard below.
+        let fee_units = match parsed.fee_units {
+            Some(units) => units,
+            None => {
+                let estimate = blockchain.read().await.fee_estimate().await;
+                // Show the auto fee BEFORE signing and submitting: the user
+                // never typed this number, so it must not first appear in the
+                // success summary (and never at all on the error path).
+                writeln!(
+                    stdout,
+                    "  Auto fee: {:.8} ({})",
+                    Transaction::from_units(estimate.recommended_units),
+                    if estimate.congested {
+                        "next-block price, network contended"
+                    } else {
+                        "network quiet"
+                    }
+                )?;
+                estimate.recommended_units
+            }
+        };
         let amount = Transaction::from_units(amount_units);
         let fee = Transaction::from_units(fee_units);
 
@@ -1634,53 +1660,40 @@ mod tests {
     }
 
     #[test]
-    fn default_wallet_fee_is_exact_rounded_ratio_with_floor_and_cap() {
-        assert_eq!(
-            default_wallet_fee_units(parse_coin_units("0.1", "amount").unwrap()),
-            MIN_RELAY_FEE_UNITS
-        );
-        assert_eq!(
-            default_wallet_fee_units(parse_coin_units("0.5", "amount").unwrap()),
-            28_153
-        );
-        assert_eq!(
-            default_wallet_fee_units(parse_coin_units("0.888", "amount").unwrap()),
-            DEFAULT_WALLET_FEE_CAP_UNITS
-        );
-        assert_eq!(
-            default_wallet_fee_units(parse_coin_units("1000000", "amount").unwrap()),
-            DEFAULT_WALLET_FEE_CAP_UNITS
-        );
+    fn create_without_fee_defers_to_the_live_estimator() {
+        // No --fee no longer resolves to the historical amount/1776 ratio at
+        // parse time: the parser stays a pure string function and returns None,
+        // and the handler prices the fee off the live mempool at send time
+        // (Blockchain::fee_estimate — anchor on a quiet network, marginal+1
+        // under congestion, clamped to the safety ceiling by construction).
+        let auto = parse_create_transaction_command("create sender recipient 0.5").unwrap();
+        assert_eq!(auto.amount_units, 50_000_000);
+        assert_eq!(auto.fee_units, None, "auto fee is resolved by the handler");
 
-        let exact_half = 20_000 * DEFAULT_WALLET_FEE_DIVISOR
-            + DEFAULT_WALLET_FEE_DIVISOR / 2;
-        assert_eq!(
-            default_wallet_fee_units(exact_half),
-            20_001,
-            "an exact half atomic unit rounds upward"
-        );
+        let large = parse_create_transaction_command("create sender recipient 1000000").unwrap();
+        assert_eq!(large.fee_units, None, "no amount-proportional default remains");
     }
 
     #[test]
     fn create_command_keeps_existing_syntax_and_accepts_exact_fee_override() {
         let existing = parse_create_transaction_command("create sender recipient 0.5").unwrap();
         assert_eq!(existing.amount_units, 50_000_000);
-        assert_eq!(existing.fee_units, 28_153);
+        assert_eq!(existing.fee_units, None, "no --fee = auto (estimator)");
 
         let explicit =
             parse_create_transaction_command("create sender recipient 2 --fee 0.001").unwrap();
         assert_eq!(explicit.amount_units, 200_000_000);
-        assert_eq!(explicit.fee_units, 100_000);
+        assert_eq!(explicit.fee_units, Some(100_000));
 
         let equals =
             parse_create_transaction_command("create sender recipient 2 --fee=0.0005").unwrap();
-        assert_eq!(equals.fee_units, 50_000);
+        assert_eq!(equals.fee_units, Some(50_000));
 
         for alias in ["send", "transfer"] {
             let command = format!("{alias} sender recipient 2 --fee 0.001");
             let parsed = parse_create_transaction_command(&command).unwrap();
             assert_eq!(parsed.amount_units, 200_000_000);
-            assert_eq!(parsed.fee_units, 100_000);
+            assert_eq!(parsed.fee_units, Some(100_000));
         }
     }
 
@@ -1732,11 +1745,11 @@ mod tests {
     fn create_command_fee_guards_are_deterministic_for_automation() {
         let floor =
             parse_create_transaction_command("create sender recipient 1 --fee 0.0001").unwrap();
-        assert_eq!(floor.fee_units, MIN_RELAY_FEE_UNITS);
+        assert_eq!(floor.fee_units, Some(MIN_RELAY_FEE_UNITS));
 
         let safety_limit =
             parse_create_transaction_command("create sender recipient 1 --fee 0.01").unwrap();
-        assert_eq!(safety_limit.fee_units, EXPLICIT_FEE_SAFETY_LIMIT_UNITS);
+        assert_eq!(safety_limit.fee_units, Some(EXPLICIT_FEE_SAFETY_LIMIT_UNITS));
 
         assert!(
             parse_create_transaction_command("create sender recipient 1 --fee 0.00009999")

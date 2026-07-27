@@ -29,6 +29,7 @@ and a per-sender mempool rate limit, but a public deployment should add its own.
 | `/explorer/tx?id={tx_id}` | track one transaction by id: `confirmed` (with height, position, block_hash, confirmations, `final`, body), `pending` (in mempool), or 404 |
 | `/explorer/address/{address}` | confirmed **balance** + paginated tx **history** |
 | `/explorer/supply` | total confirmed positive balances, including immature mining rewards |
+| `/explorer/fee-estimate` | advisory next-block fee recommendation priced off this node's live mempool (see Fees below) |
 
 `/explorer/address/{address}` query params: `limit` (1–200, default 50) and a
 `before_height` + `before_pos` cursor (pass both) for pagination. Response
@@ -87,18 +88,37 @@ shape explicitly:
 ```
 
 The `fee` is a priority signal with a **relay floor of 0.0001 coins** — lower
-fees are rejected at admission (`400 … below the relay floor`). The bounded
-reference-wallet policy is recommended for ordinary payments:
+fees are rejected at admission (`400 … below the relay floor`). For ordinary
+payments, query **`GET /explorer/fee-estimate`** and put its **`recommended_fee`**
+value in the transaction's `fee` field — the same recommendation the reference
+wallet uses when `create` is run without `--fee`.
 
-    raw_fee_units = round(amount_units / 1776)
-    fee_units = clamp(raw_fee_units, 10_000, 50_000)
+> **The wire `fee` field is a decimal coin amount, not units.** Send
+> `"fee": 0.0002`. The `*_units` integers in the estimate response are for exact
+> accounting only (1 coin = 100,000,000 units); putting `20000` in the `fee`
+> field would sign a **20,000-coin** fee.
 
-Here one coin is 100,000,000 units and positive exact halves round upward. This
-is a `0.0001–0.0005` fee; exchange withdrawal systems may instead choose an
-absolute fee appropriate to their batching and service policy, subject to
-current node admission and block-accounting rules. Miners can use fees to
-prioritize transactions when blocks are contested, but paying far above the
-reference range does not guarantee a particular confirmation time.
+The estimate prices next-block inclusion off the node's live mempool against the
+exact template-selection rules:
+
+- quiet network (capacity absorbs the backlog *and* your transaction): a flat
+  anchor of `0.0002` coins (`20,000` units, 2x the relay floor — strictly ahead
+  of floor-paying bulk templates);
+- congested: one unit above the weakest fee that still fits the next block;
+- always clamped to the automatic ceiling of `0.001` coins (`100,000` units).
+  Only an explicitly chosen fee may exceed it, up to the reference wallet's
+  `0.01` explicit ceiling.
+
+Response fields: `recommended_fee`/`recommended_fee_units`,
+`anchor_fee`/`anchor_fee_units`, `floor_fee`/`floor_fee_units`,
+`auto_cap_fee`/`auto_cap_fee_units`, `explicit_cap_fee`/`explicit_cap_fee_units`,
+`congested`, `pending_candidates`, `next_block_fits`, and `basis` (`"quiet"` or
+`"next-block"`). Offline fallback: use the `0.0002` anchor. Exchange withdrawal
+systems may instead choose an absolute fee appropriate to their batching and
+service policy, subject to current node admission and block-accounting rules.
+Miners can use fees to prioritize transactions when blocks are contested, but
+paying far above the recommendation does not guarantee a particular confirmation
+time.
 
 Submission is idempotent: retrying the identical signed transaction cannot
 create a second payment, and a processed duplicate is reported explicitly.
