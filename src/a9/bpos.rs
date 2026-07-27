@@ -29,9 +29,9 @@ pub enum ActionType {
 // Performance and reward constants
 const SENTINEL_CHECK_INTERVAL: u64 = 300; // Check network health
 const MAX_HEADER_CACHE_SIZE: usize = 5000; // Reduced to prevent memory exhaustion attacks
-// Upper bound on headers accepted in one HeaderSync batch. The broadcaster sends at most 100
-// headers per push (its ranged window), so this leaves 10x headroom while bounding the work an
-// attacker can force in one message; the 4 MiB wire frame alone would otherwise admit ~55k.
+                                           // Upper bound on headers accepted in one HeaderSync batch. The broadcaster sends at most 100
+                                           // headers per push (its ranged window), so this leaves 10x headroom while bounding the work an
+                                           // attacker can force in one message; the 4 MiB wire frame alone would otherwise admit ~55k.
 const MAX_HEADER_SYNC_BATCH: usize = 1000;
 const CHAIN_VERIFICATION_INTERVAL: u64 = 300; // Verify chain every 5 minutes
 const MLDSA_BINDING_CONTEXT: &[u8] = b"ALPHANUMERIC_MLDSA87_BIND_V2";
@@ -1618,7 +1618,6 @@ impl BPoSSentinel {
             .map(|(_, (_, block))| block)
             .ok_or_else(|| "No consensus block found".to_string())
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -2476,9 +2475,7 @@ impl HeaderSentinel {
     /// (verify_headers_batch), or fresh-hash announces (add_verified_header).
     /// manage_header_cache only age-prunes (24h), so a count cap is still required.
     fn evict_oldest_verification_if_full(&self, hash: &[u8; 32]) {
-        if !self.verifications.contains_key(hash)
-            && self.verifications.len() >= MAX_VERIFICATIONS
-        {
+        if !self.verifications.contains_key(hash) && self.verifications.len() >= MAX_VERIFICATIONS {
             if let Some(oldest) = self
                 .verifications
                 .iter()
@@ -2831,9 +2828,15 @@ mod tests {
             vec![tx_with(10, 1)]
         )));
         // Genesis (index 0) is allowed to be empty.
-        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(0, vec![])));
+        assert!(BPoSSentinel::block_passes_basic_checks(&block_with(
+            0,
+            vec![]
+        )));
         // An empty NON-genesis block is rejected.
-        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(5, vec![])));
+        assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
+            5,
+            vec![]
+        )));
         // Negative amount or fee is rejected.
         assert!(!BPoSSentinel::block_passes_basic_checks(&block_with(
             5,
@@ -2978,11 +2981,19 @@ mod tests {
     async fn header_quorum_counts_distinct_ips_not_keys() {
         let sentinel = HeaderSentinel::new();
         // Three eligible source IPs -> the required threshold is 3 (ceil(3 * 0.67)).
-        sentinel.peer_mldsa_keys.insert("n1".to_string(), reg_key(1, 1));
-        sentinel.peer_mldsa_keys.insert("n2".to_string(), reg_key(2, 2));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n1".to_string(), reg_key(1, 1));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n2".to_string(), reg_key(2, 2));
         // Two distinct keys, SAME source IP (10.0.0.3): allowed, but one Sybil identity.
-        sentinel.peer_mldsa_keys.insert("n3a".to_string(), reg_key(3, 3));
-        sentinel.peer_mldsa_keys.insert("n3b".to_string(), reg_key(4, 3));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3a".to_string(), reg_key(3, 3));
+        sentinel
+            .peer_mldsa_keys
+            .insert("n3b".to_string(), reg_key(4, 3));
         assert_eq!(sentinel.registered_verifier_ip_count(), 3);
         assert_eq!(sentinel.required_verifier_count(3), 3);
 

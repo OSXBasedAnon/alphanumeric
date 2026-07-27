@@ -372,7 +372,8 @@ impl Mempool {
             self.transactions.remove_if(&tx.sender, |_, v| v.is_empty());
         }
         self.total_count.fetch_sub(removed, AtomicOrdering::SeqCst);
-        self.total_size.fetch_sub(removed_size, AtomicOrdering::SeqCst);
+        self.total_size
+            .fetch_sub(removed_size, AtomicOrdering::SeqCst);
         self.decrement_address_count(&tx.sender, removed);
     }
 
@@ -437,27 +438,28 @@ impl Mempool {
             // Compute removals under the transactions guard, then DROP it before
             // touching address_counts (never hold two DashMap guards; never remove a
             // key on a DashMap whose RefMut is alive — that deadlocks the node).
-            let (removed_here, became_empty) = if let Some(mut txs) = self.transactions.get_mut(&addr) {
-                let mut removed_here = 0usize;
-                let mut removed_size = 0usize;
-                txs.retain(|entry| {
-                    let keep = !expired_ids.contains(&entry.tx_id);
-                    if !keep {
-                        removed_here += 1;
-                        removed_size += entry.size;
+            let (removed_here, became_empty) =
+                if let Some(mut txs) = self.transactions.get_mut(&addr) {
+                    let mut removed_here = 0usize;
+                    let mut removed_size = 0usize;
+                    txs.retain(|entry| {
+                        let keep = !expired_ids.contains(&entry.tx_id);
+                        if !keep {
+                            removed_here += 1;
+                            removed_size += entry.size;
+                        }
+                        keep
+                    });
+                    if removed_here > 0 {
+                        self.total_count
+                            .fetch_sub(removed_here, AtomicOrdering::SeqCst);
+                        self.total_size
+                            .fetch_sub(removed_size, AtomicOrdering::SeqCst);
                     }
-                    keep
-                });
-                if removed_here > 0 {
-                    self.total_count
-                        .fetch_sub(removed_here, AtomicOrdering::SeqCst);
-                    self.total_size
-                        .fetch_sub(removed_size, AtomicOrdering::SeqCst);
-                }
-                (removed_here, txs.is_empty())
-            } else {
-                (0, false)
-            };
+                    (removed_here, txs.is_empty())
+                } else {
+                    (0, false)
+                };
             // Guard dropped above; reclaim the now-empty bucket (see clear_transaction).
             if became_empty {
                 self.transactions.remove_if(&addr, |_, v| v.is_empty());
@@ -543,27 +545,28 @@ impl Mempool {
             // Compute removals under the transactions guard, then DROP it before
             // touching address_counts (never hold two DashMap guards; never remove a
             // key on a DashMap whose RefMut is alive — that deadlocks the node).
-            let (removed_here, became_empty) = if let Some(mut txs) = self.transactions.get_mut(&addr) {
-                let mut removed_here = 0usize;
-                let mut removed_size = 0usize;
-                txs.retain(|entry| {
-                    let keep = !tx_ids.contains(&entry.tx_id);
-                    if !keep {
-                        removed_here += 1;
-                        removed_size += entry.size;
+            let (removed_here, became_empty) =
+                if let Some(mut txs) = self.transactions.get_mut(&addr) {
+                    let mut removed_here = 0usize;
+                    let mut removed_size = 0usize;
+                    txs.retain(|entry| {
+                        let keep = !tx_ids.contains(&entry.tx_id);
+                        if !keep {
+                            removed_here += 1;
+                            removed_size += entry.size;
+                        }
+                        keep
+                    });
+                    if removed_here > 0 {
+                        self.total_size
+                            .fetch_sub(removed_size, AtomicOrdering::SeqCst);
+                        self.total_count
+                            .fetch_sub(removed_here, AtomicOrdering::SeqCst);
                     }
-                    keep
-                });
-                if removed_here > 0 {
-                    self.total_size
-                        .fetch_sub(removed_size, AtomicOrdering::SeqCst);
-                    self.total_count
-                        .fetch_sub(removed_here, AtomicOrdering::SeqCst);
-                }
-                (removed_here, txs.is_empty())
-            } else {
-                (0, false)
-            };
+                    (removed_here, txs.is_empty())
+                } else {
+                    (0, false)
+                };
             // Guard dropped above; reclaim the now-empty bucket (see clear_transaction).
             if became_empty {
                 self.transactions.remove_if(&addr, |_, v| v.is_empty());
@@ -611,7 +614,14 @@ mod tests {
     // Mempool admission does not verify signatures (that is the blockchain layer's job), so a
     // bare unsigned tx is a faithful mempool input. Distinct timestamps => distinct tx_ids.
     fn tx_with(sender: &str, ts: u64, amount: f64, fee: f64) -> Transaction {
-        Transaction::new(sender.to_string(), "recipient".to_string(), amount, fee, ts, None)
+        Transaction::new(
+            sender.to_string(),
+            "recipient".to_string(),
+            amount,
+            fee,
+            ts,
+            None,
+        )
     }
 
     // M1: a transaction that is about to be rejected (sender at the per-address cap) must NOT
@@ -684,7 +694,8 @@ mod tests {
         let mut mp = Mempool::new();
         let high = tx_with("rich", 1, 1.0, 100.0);
         let high_id = high.get_tx_id();
-        mp.add_transaction(high).expect("high-fee resident admitted");
+        mp.add_transaction(high)
+            .expect("high-fee resident admitted");
         mp.total_count
             .store(MEMPOOL_MAX_TRANSACTIONS, AtomicOrdering::SeqCst);
         let low = tx_with("poor", 2, 1.0, 0.001);
@@ -873,7 +884,11 @@ mod tests {
         let high = tx_with("rich", 2, 1.0, 100.0);
         let high_id = high.get_tx_id();
         let res = mp.add_transaction(high);
-        assert!(res.is_ok(), "high-fee tx should displace a cheaper resident: {:?}", res);
+        assert!(
+            res.is_ok(),
+            "high-fee tx should displace a cheaper resident: {:?}",
+            res
+        );
         assert!(mp.find_transaction_by_id(&high_id).is_some());
         assert!(
             mp.find_transaction_by_id(&low_id).is_none(),

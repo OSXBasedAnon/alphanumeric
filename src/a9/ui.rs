@@ -85,7 +85,13 @@ pub fn ui_pad(
     from: usize,
     to: usize,
 ) -> std::io::Result<()> {
-    ui_seg(out, spec, UI_LABEL, false, &" ".repeat(to.saturating_sub(from)))
+    ui_seg(
+        out,
+        spec,
+        UI_LABEL,
+        false,
+        &" ".repeat(to.saturating_sub(from)),
+    )
 }
 
 /// A pane-header row: two bold headers in their pane hues, split by the rail.
@@ -284,10 +290,7 @@ mod tests {
             );
             let before_height = col;
             col = advance(col, HEIGHT_END, "283,444");
-            assert!(
-                col - 7 > before_height,
-                "height must keep a space from age"
-            );
+            assert!(col - 7 > before_height, "height must keep a space from age");
         }
     }
 
