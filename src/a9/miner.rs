@@ -13,9 +13,8 @@ use tokio::time::interval;
 
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
-    set_finalize_stage,
-    BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES,
-    MAX_TEMPLATE_TX_BYTES, NETWORK_FEE,
+    set_finalize_stage, BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT,
+    MAX_BLOCK_WEIGHT_BYTES, MAX_TEMPLATE_TX_BYTES, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
@@ -337,28 +336,26 @@ impl MiningManager {
                 blockchain_lock
                     .ensure_pending_rules_for_next_block()
                     .await?;
-                let live_transactions: Vec<Transaction> = if blockchain_lock
-                    .mempool_is_empty()
-                    .await
-                {
-                    Vec::new()
-                } else {
-                    let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
-                    // Template-time is the candidate clock (NOT wall time): the
-                    // shared predicate re-applies the relay floor, freshness (with
-                    // the template margin), future-bound and full-witness checks.
-                    // Blockchain::is_template_candidate is THE single source for
-                    // these rules — the fee estimator replays it, so wallet fee
-                    // recommendations always price the same competition this
-                    // selection sees.
-                    let now_secs = template_timestamp;
-                    blockchain_lock
-                        .get_transactions_for_block()
-                        .await
-                        .into_iter()
-                        .filter(|tx| blockchain_lock.is_template_candidate(tx, now_secs))
-                        .collect()
-                };
+                let live_transactions: Vec<Transaction> =
+                    if blockchain_lock.mempool_is_empty().await {
+                        Vec::new()
+                    } else {
+                        let _ = blockchain_lock.drop_confirmed_mempool_txs().await;
+                        // Template-time is the candidate clock (NOT wall time): the
+                        // shared predicate re-applies the relay floor, freshness (with
+                        // the template margin), future-bound and full-witness checks.
+                        // Blockchain::is_template_candidate is THE single source for
+                        // these rules — the fee estimator replays it, so wallet fee
+                        // recommendations always price the same competition this
+                        // selection sees.
+                        let now_secs = template_timestamp;
+                        blockchain_lock
+                            .get_transactions_for_block()
+                            .await
+                            .into_iter()
+                            .filter(|tx| blockchain_lock.is_template_candidate(tx, now_secs))
+                            .collect()
+                    };
 
                 // Reserve one slot for the coinbase so the finalized block never exceeds
                 // the consensus per-block transaction cap. Without this bound, a mempool
@@ -549,9 +546,8 @@ impl MiningManager {
                 let hashes_done = Arc::clone(&hashes_done);
                 let header = header.clone();
                 match tokio::task::spawn_blocking(move || {
-                    (0..num_threads as u64)
-                        .into_par_iter()
-                        .try_for_each(|thread_id| -> Result<(), MiningError> {
+                    (0..num_threads as u64).into_par_iter().try_for_each(
+                        |thread_id| -> Result<(), MiningError> {
                             let mut local_header = header.clone();
                             local_header.merkle_root = merkle_root;
                             let range_end = current_nonce.saturating_add(max_nonce);
@@ -640,8 +636,7 @@ impl MiningManager {
                                         .copy_from_slice(&cached_difficulty.to_le_bytes());
                                     offset += 8;
 
-                                    header_data[offset..offset + 32]
-                                        .copy_from_slice(&merkle_root);
+                                    header_data[offset..offset + 32].copy_from_slice(&merkle_root);
 
                                     *blake3::hash(&header_data).as_bytes()
                                 };
@@ -663,15 +658,13 @@ impl MiningManager {
                                     if tip_change_counter_check.load(Ordering::Acquire)
                                         != template_tip_version
                                     {
-                                        abort_for_tip_change_check
-                                            .store(true, Ordering::Release);
+                                        abort_for_tip_change_check.store(true, Ordering::Release);
                                         return Ok(());
                                     }
                                 }
 
                                 if nonce % DB_TIP_CONFIRM_INTERVAL == 0 {
-                                    if let Ok(blockchain) = blockchain_for_tip_checks.try_read()
-                                    {
+                                    if let Ok(blockchain) = blockchain_for_tip_checks.try_read() {
                                         if let Some(tip) = blockchain.get_last_block() {
                                             if tip.index != expected_parent_index
                                                 || tip.hash != previous_block_hash
@@ -696,8 +689,7 @@ impl MiningManager {
                                     if let Ok(pb) = progress_bar.try_lock() {
                                         pb.set_position(total);
                                         let hash_hex = hex::encode(hash);
-                                        let secs =
-                                            grind_started.elapsed().as_secs_f64().max(0.001);
+                                        let secs = grind_started.elapsed().as_secs_f64().max(0.001);
                                         pb.set_message(format!(
                                             "Hash: {} (Difficulty: {}) · {:.2} MH/s",
                                             &hash_hex[..16],
@@ -711,7 +703,8 @@ impl MiningManager {
                                 }
                             }
                             Ok(())
-                        })
+                        },
+                    )
                 })
                 .await
                 {
@@ -799,9 +792,7 @@ impl MiningManager {
                     if let Ok(pb) = progress_bar.lock() {
                         pb.reset();
                         pb.set_prefix(format!("Block #{}", header.number));
-                        pb.set_message(
-                            "Reward schedule advanced; rebuilding block template...",
-                        );
+                        pb.set_message("Reward schedule advanced; rebuilding block template...");
                     }
                     continue;
                 }
@@ -964,12 +955,7 @@ impl Miner {
         miner_address: String,
     ) -> Result<(u64, String, Block), MiningError> {
         self.manager
-            .mine_block(
-                header,
-                transactions,
-                max_nonce,
-                miner_address,
-            )
+            .mine_block(header, transactions, max_nonce, miner_address)
             .await
             .map_err(|e| MiningError::MiningFailed(e.to_string()))
     }
@@ -993,8 +979,8 @@ pub struct BlockHeader {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_timestamp, coinbase_matches_reward_schedule, Block, Blockchain,
-        Transaction, NETWORK_FEE,
+        candidate_timestamp, coinbase_matches_reward_schedule, Block, Blockchain, Transaction,
+        NETWORK_FEE,
     };
     use crate::a9::blockchain::RateLimiter;
     use std::sync::Arc;
@@ -1014,9 +1000,18 @@ mod tests {
 
         // Monotonicity holds for arbitrary inputs, and the difficulty input (candidate - parent)
         // floors at 0 exactly when now < parent (the benign, self-correcting nudge).
-        for (now, parent) in [(0u64, 0u64), (1, 300), (300, 1), (u64::MAX, 5), (5, u64::MAX)] {
+        for (now, parent) in [
+            (0u64, 0u64),
+            (1, 300),
+            (300, 1),
+            (u64::MAX, 5),
+            (5, u64::MAX),
+        ] {
             let ts = candidate_timestamp(now, parent);
-            assert!(ts >= parent, "candidate {ts} must never be below parent {parent}");
+            assert!(
+                ts >= parent,
+                "candidate {ts} must never be below parent {parent}"
+            );
             if now < parent {
                 assert_eq!(
                     ts.saturating_sub(parent),

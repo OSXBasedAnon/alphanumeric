@@ -6152,8 +6152,7 @@ impl Blockchain {
             }
             template_bytes = template_bytes.saturating_add(tx_bytes);
             included += 1;
-            min_included_fee =
-                Some(min_included_fee.map_or(tx.fee_units, |m| m.min(tx.fee_units)));
+            min_included_fee = Some(min_included_fee.map_or(tx.fee_units, |m| m.min(tx.fee_units)));
         }
 
         // Headroom for the transaction this estimate is FOR: if the caller's
