@@ -950,7 +950,7 @@ impl Mgmt {
                         breakdown.maturing.iter().map(|(_, amount)| amount).sum();
                     writeln!(
                         stdout,
-                        "Mining reward: {} ♦ — credited, spendable in {}",
+                        "Mining reward: {:.8} ♦ — credited, spendable in {}",
                         mining_reward, eta
                     )?;
                     writeln!(stdout, "Spendable balance: {}", breakdown.spendable)?;
