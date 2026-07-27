@@ -2566,16 +2566,20 @@ impl Node {
     }
 
     async fn mark_block_relayed(&self, block: &Block) {
+        self.mark_block_relayed_key(block.index, block.hash).await;
+    }
+
+    /// Key-only variant: the relay tip marker never needs the block body, so bulk
+    /// callers can pass (index, hash) instead of cloning whole blocks.
+    async fn mark_block_relayed_key(&self, index: u32, hash: [u8; 32]) {
         let mut public_tip = self.public_relay_tip.write().await;
         let should_update = public_tip
-            .map(|tip| {
-                block.index > tip.height || (block.index == tip.height && block.hash == tip.hash)
-            })
+            .map(|tip| index > tip.height || (index == tip.height && hash == tip.hash))
             .unwrap_or(true);
         if should_update {
             *public_tip = Some(RelayTipState {
-                height: block.index,
-                hash: block.hash,
+                height: index,
+                hash,
             });
         }
     }
@@ -3903,8 +3907,12 @@ impl Node {
                     // same branch every tick while the site froze (2026-07-09). The
                     // orphan machinery is for reorgs (branch roots at/below tip) and
                     // still handles the divergent path below.
+                    // Floor hoisted out of the loop: it cannot move mid-append (and a
+                    // stale-low floor only ever demands MORE verification, never
+                    // less). The per-block re-read plus a second guard acquisition
+                    // was 2 RwLock hits per block on a lock contended by ingest.
+                    let floor = self.blockchain.read().await.verification_floor();
                     for block in branch {
-                        let floor = self.blockchain.read().await.verification_floor();
                         if block.index > floor
                             && !self
                                 .blockchain
@@ -4980,7 +4988,12 @@ impl Node {
         let mut accepted_any = false;
 
         for _ in 0..max_rounds {
-            let start = cursor;
+            // 64-align the window (same grid as the ancestor walk): aligned ranges
+            // mean every node issues IDENTICAL relay URLs and the CDN coalesces N
+            // nodes' scans into one origin read per window; per-node unaligned
+            // starts defeated the cache entirely. Blocks below our tip inside the
+            // widened window are already-stored no-ops.
+            let start = cursor - (cursor % RELAY_BATCH_SIZE);
             let end = start.saturating_add(RELAY_BATCH_SIZE.saturating_sub(1));
             let blocks = self.fetch_relay_blocks(start, end).await?;
             if blocks.is_empty() {
@@ -5027,14 +5040,17 @@ impl Node {
                 // decline them. Blocks at/below the checkpoint were vouched for by a
                 // verified signed snapshot and are receipt-trusted, which is what lets
                 // catch-up over witness-pruned history proceed.
-                let floor = self.blockchain.read().await.verification_floor();
-                if block.index > floor
-                    && !self
-                        .blockchain
-                        .read()
-                        .await
-                        .block_signatures_fully_verified(&block)
-                {
+                // Snapshot the floor per block WITHOUT a second guard acquisition
+                // (it can advance mid-batch via the checkpoint trail below; a
+                // stale-low read only demands MORE verification, never less).
+                let (floor, sigs_ok) = {
+                    let bc = self.blockchain.read().await;
+                    let floor = bc.verification_floor();
+                    let sigs_ok = block.index <= floor
+                        || bc.block_signatures_fully_verified(&block);
+                    (floor, sigs_ok)
+                };
+                if !sigs_ok {
                     warn!(
                         "Rejected relayed frontier block {} (> floor {}): signatures not fully verifiable",
                         block.index, floor
@@ -5057,7 +5073,9 @@ impl Node {
 
                 match save_result {
                     (Ok(()), before, after) => {
-                        relay_confirmed_blocks.push(block.clone());
+                        // The relay marker only needs (index, hash) — cloning the
+                        // whole block (every tx + signature) here was pure waste.
+                        relay_confirmed_blocks.push((block.index, block.hash));
                         accepted_any = true;
                         if after > before {
                             total_saved += after.saturating_sub(before) as usize;
@@ -5081,8 +5099,8 @@ impl Node {
                 let blockchain = self.blockchain.read().await;
                 blockchain.get_latest_block_index() as u32
             };
-            for block in relay_confirmed_blocks {
-                self.mark_block_relayed(&block).await;
+            for (index, hash) in relay_confirmed_blocks {
+                self.mark_block_relayed_key(index, hash).await;
             }
             if after_batch > end {
                 cursor = after_batch.saturating_add(1);
@@ -8988,9 +9006,14 @@ impl Node {
                 Ok(NetworkMessage::Blocks(blocks)) => {
                     let mut valid_blocks = Vec::with_capacity(blocks.len());
                     for block in blocks {
+                        // Hash AND PoW-floor here, once: every caller filtered on
+                        // both anyway, and the third recompute (merkle+header hash
+                        // over the full tx set) tripled catch-up CPU for nothing.
+                        // Full witness/linkage validation still happens on ingest.
                         if block.index >= start
                             && block.index <= end
                             && block.calculate_hash_for_block() == block.hash
+                            && block.verify_pow_meets_floor()
                         {
                             valid_blocks.push(block);
                         }
@@ -13797,10 +13820,15 @@ impl Node {
             if Self::full_sync_deadline_expired(deadline) {
                 return None;
             }
-            if self.verify_peer(addr).await.is_err() {
-                continue;
-            }
-            let Ok(peer_height) = self.request_peer_height(addr).await else {
+            // No verify_peer here: connected candidates already passed the full
+            // handshake at connect time (and a pool miss re-handshakes inside the
+            // send anyway) — re-dialing cost ~15s per dead candidate on the wake
+            // path. The fresh height read (bounded tight: post-suspend half-open
+            // sockets are the common failure) plus the STEP-2 signed-beacon tip
+            // probe are the real gates; the exchange guard makes the cancel safe.
+            let Ok(Ok(peer_height)) =
+                timeout(Duration::from_secs(5), self.request_peer_height(addr)).await
+            else {
                 continue;
             };
             if Self::full_sync_anchor_height(beacon.height, peer_height).is_some() {
@@ -13942,12 +13970,9 @@ impl Node {
             };
             let mut candidates: Vec<_> = blocks
                 .into_iter()
-                .filter(|b| {
-                    b.index >= start
-                        && b.index <= end
-                        && b.calculate_hash_for_block() == b.hash
-                        && b.verify_pow_meets_floor()
-                })
+                // Hash + PoW-floor already verified inside request_blocks (batch
+                // filter) — re-hashing every block here doubled catch-up CPU.
+                .filter(|b| b.index >= start && b.index <= end)
                 .collect();
             candidates.sort_by_key(|b| b.index);
 
@@ -14005,7 +14030,11 @@ impl Node {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_MS: u64 = 1000;
         const PEER_TIMEOUT_MS: u64 = 5000;
-        const MAX_BATCH_SIZE: u32 = 50; // More reasonable batch size
+        // Full server span: GetBlocks serving caps at MAX_GETBLOCKS_SPAN and
+        // request_blocks re-batches at the same size, so asking for less (the old
+        // 50) just multiplied round-trips 5x on every p2p catch-up. Short replies
+        // are already handled (the cursor advances by what actually applied).
+        const MAX_BATCH_SIZE: u32 = MAX_GETBLOCKS_SPAN;
 
         // 1. Get current blockchain state
         let current_height = {
@@ -14155,11 +14184,11 @@ impl Node {
                         Ok(blocks) => {
                             let mut candidate_blocks: Vec<_> = blocks
                                 .into_iter()
+                                // Hash + PoW-floor already verified inside
+                                // request_blocks (batch filter) — no re-hash here.
                                 .filter(|block| {
                                     block.index >= start
                                         && block.index <= end
-                                        && block.calculate_hash_for_block() == block.hash
-                                        && block.verify_pow_meets_floor()
                                 })
                                 .collect();
                             candidate_blocks.sort_by_key(|block| block.index);
