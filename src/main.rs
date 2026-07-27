@@ -487,6 +487,34 @@ static PENDING_INPUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec:
 /// True while a `mine --continuous` session is still listening for its stop line.
 static MINING_READING_STDIN: AtomicBool = AtomicBool::new(false);
 
+/// rustyline's line editor owns the terminal while a prompt is displayed: it
+/// tracks where the cursor is so it can redraw the input line. A background task
+/// that writes with plain `println!` therefore corrupts that model — the text
+/// lands on top of the prompt, rustyline's idea of the cursor no longer matches
+/// reality, and the next thing typed overwrites the `a#:` prompt and comes back
+/// as an invalid command. Reported live: a client several hours behind, where the
+/// reconcile loop's "Behind the network tip" notice fires on its own timer.
+///
+/// rustyline provides exactly one safe way to do this: an ExternalPrinter, which
+/// erases the prompt line, writes the message, and redraws the prompt. Every
+/// background notice goes through `notify()` so it uses that when a prompt is
+/// live, and falls back to println! for headless runs where there is no editor.
+static EXTERNAL_PRINTER: std::sync::Mutex<
+    Option<Box<dyn rustyline::ExternalPrinter + Send>>,
+> = std::sync::Mutex::new(None);
+
+/// Print a line from a BACKGROUND task without corrupting a live prompt.
+fn notify(msg: String) {
+    if let Ok(mut guard) = EXTERNAL_PRINTER.lock() {
+        if let Some(p) = guard.as_mut() {
+            if p.print(format!("{}\n", msg)).is_ok() {
+                return;
+            }
+        }
+    }
+    println!("{}", msg);
+}
+
 const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// Tokio worker stacks (default 2MB) get the same debug-frame headroom.
 const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -1325,7 +1353,7 @@ async fn async_main() -> Result<()> {
                             // message. Otherwise it is a plain payment.
                             let whisper = { whisper_module.read().await.decode_whisper_in_tx(tx) };
                             if let Some(message) = whisper {
-                                println!(
+                                notify(format!(
                                     "\n{}whisper{}   from {}…  {}block {}{}\n            {}",
                                     EV_WHISPER,
                                     EV_OFF,
@@ -1334,11 +1362,11 @@ async fn async_main() -> Result<()> {
                                     block.index,
                                     EV_OFF,
                                     message
-                                );
+                                ));
                             } else {
                                 let amount = Transaction::from_units(tx.amount_units);
                                 let to_short = &tx.recipient[..tx.recipient.len().min(10)];
-                                println!(
+                                notify(format!(
                                     "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
                                     EV_RECEIVED,
                                     EV_OFF,
@@ -1348,7 +1376,7 @@ async fn async_main() -> Result<()> {
                                     EV_DIM,
                                     block.index,
                                     EV_OFF
-                                );
+                                ));
                             }
                         }
                     }
@@ -1368,10 +1396,10 @@ async fn async_main() -> Result<()> {
                                 { blockchain.read().await.get_block(*h).ok().map(|b| b.hash) };
                             if stored != Some(*expected_hash) {
                                 orphaned.push(*h);
-                                println!(
+                                notify(format!(
                                     "\n{}reorged{}   block {} lost the race — its {:.8} ♦ reward is no longer on the canonical chain",
                                     EV_REORG, EV_OFF, h, reward
-                                );
+                                ));
                             }
                         }
                         let mut mined = session_mined_watch.lock().await;
@@ -1554,9 +1582,7 @@ async fn async_main() -> Result<()> {
                             if !genuinely_too_far {
                                 strikes = 0;
                                 if !behind_logged {
-                                    println!(
-                                        "Behind the network tip; catching up in the background. The node stays up and keeps serving."
-                                    );
+                                    notify("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string());
                                     behind_logged = true;
                                 }
                                 continue;
@@ -1587,9 +1613,7 @@ async fn async_main() -> Result<()> {
                                     | Converge::Progressed => {
                                         strikes = 0;
                                         if !behind_logged {
-                                            println!(
-                                                "Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving."
-                                            );
+                                            notify("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string());
                                             behind_logged = true;
                                         }
                                         continue;
@@ -1612,9 +1636,7 @@ async fn async_main() -> Result<()> {
                                 // same eventual recovery, bounded cost.
                                 if rebootstrap_hard_cooldown_active(&db_path_recon) {
                                     if !cooldown_logged {
-                                        println!(
-                                            "Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes"
-                                        );
+                                        notify("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string());
                                         cooldown_logged = true;
                                     }
                                     strikes = 0;
@@ -1690,6 +1712,17 @@ async fn async_main() -> Result<()> {
         let mut line_editor = match DefaultEditor::with_config(editor_config) {
             Ok(mut editor) => {
                 editor.set_helper(Some(()));
+                // Hand background tasks a safe way to write to this terminal.
+                // Without it their output lands on top of the prompt and
+                // desynchronizes rustyline's cursor tracking (see notify()).
+                match editor.create_external_printer() {
+                    Ok(printer) => {
+                        if let Ok(mut guard) = EXTERNAL_PRINTER.lock() {
+                            *guard = Some(Box::new(printer));
+                        }
+                    }
+                    Err(e) => debug!("External printer unavailable: {}", e),
+                }
                 Some(editor)
             }
             Err(e) => {
