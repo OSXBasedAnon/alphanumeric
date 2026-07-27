@@ -1249,6 +1249,19 @@ async fn async_main() -> Result<()> {
         // polling, no server state, no per-wallet index; it rides the delta the
         // node already pulled. This is what makes an incoming payment show up
         // instantly without restarting or refreshing.
+        // Chain-event notifications (received / whisper / reorged). These print
+        // from a BACKGROUND task, so they use inline ANSI rather than the ui.rs
+        // StandardStream helpers: interleaving println! with set_color from
+        // another task corrupts both streams (the long-standing rule in this
+        // client). The colours mirror the ui.rs palette so the language matches
+        // every other screen, and the meaning is carried by a left-aligned
+        // keyword rather than a symbol.
+        const EV_RECEIVED: &str = "\x1b[38;2;59;242;173m"; // UI_GREEN — value in
+        const EV_WHISPER: &str = "\x1b[38;2;167;165;198m"; // UI_LAVENDER — message
+        const EV_REORG: &str = "\x1b[38;2;237;124;51m"; // UI_ORANGE — attention, not alarm
+        const EV_DIM: &str = "\x1b[38;2;128;128;128m"; // UI_DIM — block refs
+        const EV_OFF: &str = "\x1b[0m";
+
         // Session-mined blocks (height, hash, reward): the tip-signal task below
         // re-checks these on every applied block and reports a reorg that orphaned
         // one — the miner otherwise never learns; the maturing reward just
@@ -1298,15 +1311,28 @@ async fn async_main() -> Result<()> {
                             let whisper = { whisper_module.read().await.decode_whisper_in_tx(tx) };
                             if let Some(message) = whisper {
                                 println!(
-                                    "\n\x1b[1;95m✉ Whisper\x1b[0m from {}…  (block {}):\n  {}",
-                                    from_short, block.index, message
+                                    "\n{}whisper{}   from {}…  {}block {}{}\n            {}",
+                                    EV_WHISPER,
+                                    EV_OFF,
+                                    from_short,
+                                    EV_DIM,
+                                    block.index,
+                                    EV_OFF,
+                                    message
                                 );
                             } else {
                                 let amount = Transaction::from_units(tx.amount_units);
                                 let to_short = &tx.recipient[..tx.recipient.len().min(10)];
                                 println!(
-                                    "\n\x1b[1;96m◆ Received {:.8} ♦\x1b[0m  to {}…  from {}…  (block {})",
-                                    amount, to_short, from_short, block.index
+                                    "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
+                                    EV_RECEIVED,
+                                    EV_OFF,
+                                    amount,
+                                    to_short,
+                                    from_short,
+                                    EV_DIM,
+                                    block.index,
+                                    EV_OFF
                                 );
                             }
                         }
@@ -1328,8 +1354,8 @@ async fn async_main() -> Result<()> {
                             if stored != Some(*expected_hash) {
                                 orphaned.push(*h);
                                 println!(
-                                    "\n\x1b[1;91m✖ Block #{} was reorged out\x1b[0m — its {:.8} ♦ reward is no longer on the canonical chain.",
-                                    h, reward
+                                    "\n{}reorged{}   block {} lost the race — its {:.8} ♦ reward is no longer on the canonical chain",
+                                    EV_REORG, EV_OFF, h, reward
                                 );
                             }
                         }
