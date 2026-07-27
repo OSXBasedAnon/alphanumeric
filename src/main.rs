@@ -3252,7 +3252,7 @@ Ok(whisper_tx) => {
         ui_grid_row(
             &mut out,
             spec,
-            Some((" Visible to:", &[(UI_DIM, "everyone".to_string())])),
+            None,
             Some((
                 "Total:",
                 &[(UI_CYAN, format!("{:.8} ♦", amount + total_fee))],
