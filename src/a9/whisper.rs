@@ -12,7 +12,6 @@ use crate::a9::wallet::Wallet;
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
 pub const MAX_FEE: f64 = 0.01;
 pub const MESSAGE_HISTORY_HOURS: i64 = 48;
-pub const MAX_MESSAGE_BYTES: usize = 128;
 /// The whisper payload is a <=4-letter code: encode_message_as_fee takes only the first 4
 /// chars and decode reads exactly 4, so anything longer is silently dropped. Gate sends on
 /// this so the contract matches the encoder instead of accepting a 128-byte message and

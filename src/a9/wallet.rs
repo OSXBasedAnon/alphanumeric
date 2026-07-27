@@ -221,7 +221,11 @@ impl Wallet {
         let keypair = self.keypair.as_ref()?;
         let keypair = keypair.lock().await;
 
+        // Log rather than discard: a corrupt seed and "no keypair loaded" both
+        // surfaced as a bare None, so a signing failure was indistinguishable
+        // from having no wallet. verify_signature already logs the same way.
         mldsa::sign(transaction_data, &keypair.mldsa_secret_key_bytes)
+            .map_err(|e| debug!("ML-DSA signing failed: {}", e))
             .ok()
             .map(hex::encode)
     }
