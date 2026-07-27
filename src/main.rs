@@ -39,7 +39,7 @@ use alphanumeric::a9::{
     node::{
         force_rebootstrap_marker_path, rebootstrap_cooldown_path,
         rebootstrap_hard_cooldown_active,
-        Converge, Node, NodeError, NodeRuntimeConfig, DEFAULT_PORT,
+        Converge, Node, NodeError, NodeRuntimeConfig,
     },
     oracle::DifficultyOracle,
     miner::{Miner, MiningManager},
@@ -3787,7 +3787,6 @@ Some(_) => {
                                 node.gossip_transaction(&tx).await;
                             }
                             Err(e) => {
-                                println!("Error: {}", e);
                                 println!("Failed to create transaction: {}", e);
                             }
                         }
@@ -3903,7 +3902,10 @@ async fn handle_network_commands(
             );
             println!("Connected Peers: {}", peers.len());
             println!("Node Address: {}", node.get_public_key());
-            println!("P2P Port: {}", DEFAULT_PORT);
+            // The port actually BOUND, not the compile-time default — this line
+            // is read while debugging NAT/firewall issues, which is exactly when an
+            // overridden ALPHANUMERIC_PORT made the old constant actively misleading.
+            println!("P2P Port: {}", node.bind_addr.port());
             println!(
                 "Uptime: {}d {}h {}m",
                 uptime_days, uptime_hours, uptime_minutes
@@ -4179,7 +4181,6 @@ async fn handle_network_commands(
             println!("Available commands:");
             println!("--status    (-s)      Show network status");
             println!("--sync              Start blockchain sync");
-            println!("--sync --force      Force full resync");
             println!("--connect <ip:port> Connect to specific node");
             println!("--getpeers          List connected peers");
             println!("--discover          Search for nodes");

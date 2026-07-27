@@ -985,7 +985,11 @@ impl fmt::Display for BlockchainError {
                 )
             }
             BlockchainError::FeeBelowRelayFloor => {
-                write!(f, "Transaction fee below the relay floor (min 0.0001)")
+                write!(
+                    f,
+                    "Transaction fee below the relay floor (min {:.8})",
+                    Transaction::from_units(MIN_RELAY_FEE_UNITS)
+                )
             }
             BlockchainError::BatchValidationFailed(errors) => {
                 write!(f, "Batch validation failed with {} errors", errors.len())

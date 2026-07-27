@@ -939,7 +939,7 @@ impl Mgmt {
 
                 if breakdown.maturing.is_empty() {
                     // Below the M06 activation height the reward is spendable at once.
-                    writeln!(stdout, "Mining reward: {} ♦", mining_reward)?;
+                    writeln!(stdout, "Mining reward: {:.8} ♦", mining_reward)?;
                     writeln!(stdout, "New balance: {}", breakdown.spendable)?;
                 } else {
                     // M06: the coinbase is credited on-chain immediately but withheld from
@@ -978,10 +978,11 @@ impl Mgmt {
                 Err(Box::new(crate::a9::miner::MiningError::Stopped))
             }
             Err(e) => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
-                write!(stdout, "error")?;
-                stdout.reset()?;
-                writeln!(stdout, ": {}", e)?;
+                // Deliberately silent: the CALLER classifies this error and prints the
+                // right thing. Printing a red "error:" here meant a routine lost block
+                // race showed a fault line and THEN "Lost the race for this block…",
+                // and pressing Enter to stop printed "error: Mining failed: Mining
+                // cancelled". Neither is an error; both are normal outcomes.
                 Err(Box::new(e))
             }
         }
@@ -1229,7 +1230,7 @@ impl Mgmt {
                         .set_fg(Some(Color::Rgb(59, 242, 173)))
                         .set_bold(true),
                 )?;
-                writeln!(stdout, "\nTransaction completed successfully")?;
+                writeln!(stdout, "\nTransaction submitted — pending confirmation")?;
                 stdout.reset()?;
 
                 // Transaction summary
