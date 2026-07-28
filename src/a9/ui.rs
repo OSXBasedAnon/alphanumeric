@@ -33,6 +33,15 @@ pub const UI_GREEN: Color = Color::Rgb(59, 242, 173);
 pub const UI_ORANGE: Color = Color::Rgb(237, 124, 51);
 pub const UI_PINK: Color = Color::Rgb(247, 111, 142);
 pub const UI_LAVENDER: Color = Color::Rgb(167, 165, 198);
+/// Pure white, reserved for FIGURES — the numbers a reader opened the screen for.
+/// Brighter than `UI_LABEL` on purpose: a value must always outrank the label
+/// naming it, so hue is free to describe the CATEGORY rather than the money.
+pub const UI_VALUE: Color = Color::Rgb(255, 255, 255);
+/// One step below `UI_DIM`. For text that must stay readable but must never
+/// compete: addresses you would copy rather than read, and share percentages.
+pub const UI_FAINT: Color = Color::Rgb(90, 97, 105);
+/// Rules and separators. Structure should be visible without being an element.
+pub const UI_HAIRLINE: Color = Color::Rgb(58, 64, 72);
 
 // ─── grid geometry, in 0-based columns ─────────────────────────────────────
 // Every glyph these screens draw is single-width, so character counts are
