@@ -2399,7 +2399,12 @@ impl Mgmt {
         // "Total" occupies the wallet-name column, so what follows it belongs in the
         // ADDRESS column — the same slot a wallet's address takes on its own row.
         // Bracketed because it qualifies the Total rather than being a value.
-        let _ = ui_pad(&mut stdout, spec, NAME_COL + 5, ADDR_COL);
+        //
+        // The bracket HANGS one column into the gutter so the first letter, not the
+        // punctuation, lands on ADDR_COL. Starting the "(" itself at ADDR_COL is
+        // arithmetically aligned but reads as indented, because every address below
+        // begins with a glyph that fills its cell and "(" does not.
+        let _ = ui_pad(&mut stdout, spec, NAME_COL + 5, ADDR_COL.saturating_sub(1));
         let _ = ui_seg(
             &mut stdout,
             spec,
