@@ -3569,6 +3569,17 @@ Some("help") => {
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
 
+    // Column legend. Every row below reads "goal, then the thing you type", and
+    // with the typed token on the RIGHT there was nothing saying so — the left
+    // column reads like a command list until you notice it isn't.
+    {
+        let legend = " what you want";
+        ui_seg(&mut stdout, spec, UI_DIM, false, legend)?;
+        ui_pad(&mut stdout, spec, legend.chars().count(), CMD)?;
+        ui_seg(&mut stdout, spec, UI_ORANGE, false, "what you type")?;
+        writeln!(stdout)?;
+    }
+
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
     ui_seg(&mut stdout, spec, UI_CYAN, true, "Wallet")?;
     ui_pad(&mut stdout, spec, 7, 68)?;
@@ -3576,7 +3587,9 @@ Some("help") => {
     writeln!(stdout)?;
     row!(" balances", UI_CYAN, "balance", "");
     row!(" address lookup", UI_CYAN, "account ", "<address>");
-    row!(" transactions", UI_CYAN, "history", "");
+    // `history 50` already worked and was documented nowhere, so the default 12
+    // rows read as the whole ledger.
+    row!(" transactions", UI_CYAN, "history ", "[rows]   1-50, default 12");
     row!(" new wallet", UI_CYAN, "new ", "[name]");
     row!(" rename wallet", UI_CYAN, "rename ", "<name> <new name>");
     writeln!(stdout)?;
