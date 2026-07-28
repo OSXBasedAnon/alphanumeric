@@ -14,7 +14,7 @@ use tokio::time::interval;
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
     set_finalize_stage, BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT_BYTES, MAX_TEMPLATE_TX_BYTES, NETWORK_FEE,
+    MAX_BLOCK_WEIGHT_BYTES, MAX_TEMPLATE_TX_BYTES, NETWORK_FEE, TemplateFeeAccounting,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
@@ -517,6 +517,16 @@ impl MiningManager {
                 } else {
                     0
                 };
+                // Running fee-accounting totals for this template. The previous form
+                // re-derived them from the whole selected prefix for every candidate,
+                // so selection cost grew with the square of the template size once the
+                // activated rule was live. Admissibility is unchanged — the running
+                // totals are the same left-to-right fold, appended in selection order.
+                let mut fee_accounting = TemplateFeeAccounting::new(
+                    &blockchain_lock,
+                    header.number,
+                    template_timestamp,
+                )?;
 
                 for transaction in ordered {
                     if selected_regular.len() >= regular_cap {
@@ -572,15 +582,14 @@ impl MiningManager {
                         } else {
                             None
                         };
-                        selected_regular.push(transaction.clone());
-                        if !blockchain_lock.template_fee_accounting_is_admissible(
-                            header.number,
-                            template_timestamp,
-                            &selected_regular,
-                        )? {
-                            selected_regular.pop();
+                        // Tested BEFORE the clone: the old form cloned a full
+                        // transaction (ML-DSA witness included) only to pop it again
+                        // when the set turned out to be inadmissible.
+                        if !fee_accounting.admits(&blockchain_lock, transaction)? {
                             continue;
                         }
+                        selected_regular.push(transaction.clone());
+                        fee_accounting.commit(transaction)?;
                         template_bytes += tx_bytes;
                         if let Some(next_weight) = next_consensus_weight {
                             consensus_template_weight = next_weight;
