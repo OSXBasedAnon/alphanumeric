@@ -57,6 +57,16 @@ with the amount sent. Ordinary whispers are nowhere near this.
 - The prompt no longer swallows the command you type after mining ends.
 - Sync status is one updating line, not a wall of text.
 
+### Wallet
+- An incoming payment now shows in `balance`, not only in `history` — reported
+  below the confirmed line and never added into it, since an unmined credit is
+  not yours yet.
+- `history [rows]` (1-50) is now documented; the default 12 read as the whole
+  ledger. `help` also labels its columns, so it is clear which side you type.
+- Inbound notices stop flooding a busy node: a person sees exactly what they saw
+  before, while a pool or exchange gets one digest line per block instead of one
+  per payment. Whispers are never folded in.
+
 ### Interface
 - One display language across every screen — balances, wallets, mining,
   transactions and `info` now share the same layout, colours and spacing.
@@ -77,9 +87,9 @@ GPU: `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
 
 ### Artifacts + checksums
 - `alphanumeric-v7.9.2-macos-arm64.zip`
-  - `65ca4372eb0f1b5318774308d94a66f6b57dffe24b5c02acc1398970334bbe26`
+  - `4684396880ea63a66f8ef20862554febbad660e45a0be6a98f9dd419a98b8307`
 - `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
-  - `7407c3de4ba1f9fd2afbcd4be237dfd6cb69ce7210d0ad8e98a1fd935f1cde6a`
+  - `97a4d6391185a3c2b07f33876486d1399a63fbef73e3dddb9adb88fe508e1259`
 
 Source build commands:
 - Standard: `git checkout main && cargo build --release`
