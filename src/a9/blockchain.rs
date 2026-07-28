@@ -300,6 +300,119 @@ pub struct FeeEstimate {
     pub next_block_fits: usize,
 }
 
+/// Running fee-accounting state for ONE template build.
+///
+/// The activated rule admits a transaction set iff
+/// `reward(count, fees) - fee_units <= baseline`, and every one of those inputs
+/// is an aggregate. Carrying them forward turns the per-candidate cost from
+/// O(selected) into O(1): the packer no longer rebuilds a synthetic block and
+/// re-folds the entire selected prefix for each candidate it considers.
+///
+/// `admits` is deliberately TENTATIVE — it derives the totals the set *would*
+/// have and never mutates. Committing is a separate call, and there is no
+/// "uncommit". That asymmetry is load-bearing: a rollback would have to subtract
+/// an f64 it had previously added, and f64 addition is not exactly invertible
+/// (`(fees + f) - f != fees` in general), so a push/pop design would silently
+/// drift from the block-form result. Totals only ever move forward, by append,
+/// in selection order — which is precisely the fold `calculate_block_reward`
+/// performs, hence bit-identical results rather than merely close ones.
+pub struct TemplateFeeAccounting {
+    activated: bool,
+    block_index: u32,
+    block_timestamp: u64,
+    baseline_units: i128,
+    tx_count: usize,
+    total_fees: f64,
+    total_fee_units: i128,
+}
+
+impl TemplateFeeAccounting {
+    /// Baseline is resolved once here; it depends only on (height, timestamp).
+    pub fn new_at(
+        blockchain: &Blockchain,
+        block_index: u32,
+        block_timestamp: u64,
+        activation_height: u32,
+    ) -> Result<Self, BlockchainError> {
+        let activated = block_index >= activation_height;
+        let baseline_units = if activated {
+            blockchain.scheduled_baseline_units_at(block_index, block_timestamp)?
+        } else {
+            0
+        };
+        Ok(Self {
+            activated,
+            block_index,
+            block_timestamp,
+            baseline_units,
+            tx_count: 0,
+            total_fees: 0.0,
+            total_fee_units: 0,
+        })
+    }
+
+    pub fn new(
+        blockchain: &Blockchain,
+        block_index: u32,
+        block_timestamp: u64,
+    ) -> Result<Self, BlockchainError> {
+        Self::new_at(
+            blockchain,
+            block_index,
+            block_timestamp,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+        )
+    }
+
+    /// Totals the set would have with `tx` appended. Mirrors the negative-fee
+    /// rejection and checked accumulation of `aggregate_regular_fee_units`.
+    fn totals_with(&self, tx: &Transaction) -> Result<(usize, f64, i128), BlockchainError> {
+        if tx.fee_units < 0 {
+            return Err(BlockchainError::InvalidTransactionAmount);
+        }
+        let total_fee_units = self
+            .total_fee_units
+            .checked_add(tx.fee_units)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
+        Ok((
+            self.tx_count.saturating_add(1),
+            self.total_fees + tx.fee(),
+            total_fee_units,
+        ))
+    }
+
+    /// Would the selected set still be admissible with `tx` appended? Pure.
+    pub fn admits(
+        &self,
+        blockchain: &Blockchain,
+        tx: &Transaction,
+    ) -> Result<bool, BlockchainError> {
+        if !self.activated {
+            return Ok(true);
+        }
+        let (tx_count, total_fees, total_fee_units) = self.totals_with(tx)?;
+        let reward_units = Transaction::to_units(blockchain.block_reward_from_totals(
+            self.block_index,
+            self.block_timestamp,
+            tx_count,
+            total_fees,
+        )?);
+        let net_issuance_units = reward_units
+            .checked_sub(total_fee_units)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
+        Ok(net_issuance_units <= self.baseline_units)
+    }
+
+    /// Fold `tx` into the running totals. Only call after `admits` returned true.
+    pub fn commit(&mut self, tx: &Transaction) -> Result<(), BlockchainError> {
+        let (tx_count, total_fees, total_fee_units) = self.totals_with(tx)?;
+        self.tx_count = tx_count;
+        self.total_fees = total_fees;
+        self.total_fee_units = total_fee_units;
+        Ok(())
+    }
+}
+
 impl FeeEstimate {
     /// Stable label for displays and the explorer API: what priced the
     /// recommendation.
@@ -6247,42 +6360,41 @@ impl Blockchain {
     /// Delegating all vectors to the unchanged reward calculation preserves every
     /// six-month and long-horizon rounding boundary while keeping normal batched
     /// low-fee traffic continuously mineable.
-    fn scheduled_fee_accounting_baseline_units(
+    /// Every vector here is a fixed synthetic shape, so the baseline depends only
+    /// on (height, timestamp) and NOT on the candidate transaction set — which is
+    /// what lets a template packer compute it once per template rather than once
+    /// per candidate. The three probes are the same ones the block form used: an
+    /// empty block (0 txs, 0 fees), a zero-fee nonempty block (1 tx, 0 fees), and
+    /// the low-fee compatibility envelope (1 tx carrying the envelope fee).
+    fn scheduled_baseline_units_at(
         &self,
-        block: &Block,
+        block_index: u32,
+        block_timestamp: u64,
     ) -> Result<i128, BlockchainError> {
-        if block.index == 0 {
+        if block_index == 0 {
             return Ok(Transaction::to_units(GENESIS_LAUNCH_AMOUNT));
         }
-        let empty = Block {
-            index: block.index,
-            previous_hash: block.previous_hash,
-            timestamp: block.timestamp,
-            transactions: Vec::new(),
-            nonce: block.nonce,
-            difficulty: block.difficulty,
-            hash: block.hash,
-            merkle_root: block.merkle_root,
-        };
-        let empty_units = Transaction::to_units(self.calculate_block_reward(&empty)?);
+        let empty_units = Transaction::to_units(self.block_reward_from_totals(
+            block_index,
+            block_timestamp,
+            0,
+            0.0,
+        )?);
+        let nonempty_floor_units = Transaction::to_units(self.block_reward_from_totals(
+            block_index,
+            block_timestamp,
+            1,
+            0.0,
+        )?);
 
-        let mut nonempty_floor = empty;
-        nonempty_floor.transactions.push(Transaction {
-            sender: "0".repeat(40),
-            recipient: "1".repeat(40),
-            fee_units: 0,
-            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
-            timestamp: block.timestamp,
-            signature: None,
-            pub_key: None,
-            sig_hash: None,
-        });
-        let nonempty_floor_units =
-            Transaction::to_units(self.calculate_block_reward(&nonempty_floor)?);
-
-        nonempty_floor.transactions[0].fee_units = LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS;
-        let compatibility_reward_units =
-            Transaction::to_units(self.calculate_block_reward(&nonempty_floor)?);
+        // `tx.fee()` on the envelope probe is exactly from_units(ENVELOPE_UNITS).
+        let envelope_fee = Transaction::from_units(LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS);
+        let compatibility_reward_units = Transaction::to_units(self.block_reward_from_totals(
+            block_index,
+            block_timestamp,
+            1,
+            envelope_fee,
+        )?);
         let compatibility_net_units = compatibility_reward_units
             .checked_sub(LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS)
             .ok_or(BlockchainError::InvalidTransactionAmount)?;
@@ -6290,6 +6402,13 @@ impl Blockchain {
         Ok(empty_units
             .max(nonempty_floor_units)
             .max(compatibility_net_units))
+    }
+
+    fn scheduled_fee_accounting_baseline_units(
+        &self,
+        block: &Block,
+    ) -> Result<i128, BlockchainError> {
+        self.scheduled_baseline_units_at(block.index, block.timestamp)
     }
 
     fn fee_accounting_is_admissible_for_block(
@@ -6439,11 +6558,26 @@ impl Blockchain {
         )
     }
 
-    pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
+    /// The transaction set enters the reward formula through EXACTLY two values:
+    /// the regular transaction count and the summed regular fees. Exposing that
+    /// core lets the template packer carry running totals instead of rebuilding a
+    /// synthetic block and re-folding the whole selected prefix once per candidate
+    /// — which made template selection O(k^2) the moment the activated rule starts
+    /// running. `calculate_block_reward` derives the same two values with the same
+    /// left-to-right fold and then calls straight through to here, so the two paths
+    /// are bit-identical, not merely close; the equivalence is pinned by
+    /// `block_reward_from_totals_matches_the_block_form`.
+    pub fn block_reward_from_totals(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        tx_count: usize,
+        total_fees: f64,
+    ) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
         const REDUCTION_RATE: f64 = 0.83; // 17% reduction = multiply by 0.83
 
-        if block.index == 0 {
+        if block_index == 0 {
             return Ok(GENESIS_LAUNCH_AMOUNT);
         }
 
@@ -6459,20 +6593,11 @@ impl Blockchain {
                 ts
             }
         };
-        let time_since_genesis = block.timestamp.saturating_sub(genesis_ts);
+        let time_since_genesis = block_timestamp.saturating_sub(genesis_ts);
         let periods = time_since_genesis / SECONDS_IN_SIX_MONTHS;
 
         // Apply reduction rate for each period to max reward
         let current_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods as i32);
-
-        // Get transaction metrics and sum fees in a single pass (excluding mining rewards)
-        let (tx_count, _total_volume, total_fees) = block
-            .transactions
-            .iter()
-            .filter(|tx| tx.sender != "MINING_REWARDS")
-            .fold((0usize, 0.0, 0.0), |(count, volume, fees), tx| {
-                (count + 1, volume + tx.amount(), fees + tx.fee())
-            });
 
         // Fee-weighted reward to avoid incentivizing spammy tx counts.
         let fee_target = (current_max * 0.05).max(0.0001);
@@ -6505,6 +6630,24 @@ impl Blockchain {
         );
 
         Ok(final_reward)
+    }
+
+    pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
+        if block.index == 0 {
+            return Ok(GENESIS_LAUNCH_AMOUNT);
+        }
+
+        // Single pass, excluding mining rewards. The volume this used to accumulate
+        // alongside was never read by the formula.
+        let (tx_count, total_fees) = block
+            .transactions
+            .iter()
+            .filter(|tx| tx.sender != "MINING_REWARDS")
+            .fold((0usize, 0.0f64), |(count, fees), tx| {
+                (count + 1, fees + tx.fee())
+            });
+
+        self.block_reward_from_totals(block.index, block.timestamp, tx_count, total_fees)
     }
 
     // Network hashrate
@@ -7703,6 +7846,178 @@ mod tests {
             Arc::new(Mutex::new(321)),
         )
     }
+
+    // Fee-accounting probes: a regular (non-coinbase) transaction carrying `fee`.
+    fn fee_tx(fee: f64, ts: u64) -> Transaction {
+        Transaction {
+            sender: "a".repeat(40),
+            recipient: "b".repeat(40),
+            fee_units: Transaction::to_units(fee),
+            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
+            timestamp: ts,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    // The template packer carries running (count, fees) instead of re-folding the
+    // selected prefix per candidate. That is only safe if the aggregate form is
+    // EXACTLY the block form — f64 addition is neither associative nor invertible,
+    // so "close enough" would silently drift the reward, and the reward is consensus.
+    // Compared on raw bits, not with an epsilon.
+    #[test]
+    fn block_reward_from_totals_matches_the_block_form() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_700_000_000u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+
+        let fee_sets: Vec<Vec<f64>> = vec![
+            vec![],
+            vec![0.0],
+            vec![0.0001],
+            vec![0.0002; 7],
+            vec![0.0001, 0.0005, 0.00123, 0.07, 0.3],
+            vec![0.005; 200],
+            vec![0.056_306_306_3; 13],
+            // Straddles fee_factor saturation and the admissible-band edge.
+            vec![0.726_392],
+            vec![1.0, 2.5, 0.75],
+            vec![0.0001; 4095],
+        ];
+        // Pre-activation, activation edge, post-activation; and reward periods
+        // 0 / 1 / 3 so the halving branch is exercised too.
+        let heights = [1u32, FEE_SYSTEM_ACTIVATION_HEIGHT - 1, FEE_SYSTEM_ACTIVATION_HEIGHT, 900_000];
+        let stamps = [
+            genesis_ts,
+            genesis_ts + 15_768_000,
+            genesis_ts + 3 * 15_768_000,
+        ];
+
+        let mut compared = 0usize;
+        for fees in &fee_sets {
+            for &height in &heights {
+                for &ts in &stamps {
+                    let txs: Vec<Transaction> = fees.iter().map(|f| fee_tx(*f, ts)).collect();
+                    let block = Block {
+                        index: height,
+                        previous_hash: [0u8; 32],
+                        timestamp: ts,
+                        transactions: txs.clone(),
+                        nonce: 0,
+                        difficulty: 0,
+                        hash: [0u8; 32],
+                        merkle_root: [0u8; 32],
+                    };
+                    let via_block = bc.calculate_block_reward(&block).unwrap();
+
+                    // Appended in selection order, exactly as the packer accumulates.
+                    let mut tx_count = 0usize;
+                    let mut total_fees = 0.0f64;
+                    for tx in &txs {
+                        tx_count += 1;
+                        total_fees += tx.fee();
+                    }
+                    let via_totals = bc
+                        .block_reward_from_totals(height, ts, tx_count, total_fees)
+                        .unwrap();
+
+                    assert_eq!(
+                        via_block.to_bits(),
+                        via_totals.to_bits(),
+                        "reward diverged at height {} ts {} with {} txs: {} vs {}",
+                        height,
+                        ts,
+                        txs.len(),
+                        via_block,
+                        via_totals
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 120, "every shape/height/period combination must be compared");
+    }
+
+    // The packer's running accountant must admit and reject EXACTLY the set the
+    // whole-prefix block form did, including at the boundary where net issuance
+    // crosses the baseline.
+    #[test]
+    fn template_fee_accounting_admits_exactly_what_the_block_form_admits() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_700_000_000u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let height = FEE_SYSTEM_ACTIVATION_HEIGHT;
+        let ts = genesis_ts + 1_000;
+
+        // A rising fee ladder: the running total walks up to the admissible ceiling
+        // and past it, so both verdicts are exercised.
+        let candidates: Vec<Transaction> = (0..400)
+            .map(|i| fee_tx(0.002 + (i as f64) * 0.000_01, ts))
+            .collect();
+
+        let mut accounting =
+            TemplateFeeAccounting::new_at(&bc, height, ts, FEE_SYSTEM_ACTIVATION_HEIGHT).unwrap();
+        let mut prefix: Vec<Transaction> = Vec::new();
+        let (mut admitted, mut rejected) = (0usize, 0usize);
+
+        for (idx, tx) in candidates.iter().enumerate() {
+            // Reference: the block form over the whole prefix, push/pop as before.
+            prefix.push(tx.clone());
+            let reference = bc
+                .template_fee_accounting_is_admissible_at(
+                    height,
+                    ts,
+                    &prefix,
+                    FEE_SYSTEM_ACTIVATION_HEIGHT,
+                )
+                .unwrap();
+            let running = accounting.admits(&bc, tx).unwrap();
+
+            assert_eq!(
+                reference, running,
+                "verdict diverged at candidate {} (fee {})",
+                idx,
+                tx.fee()
+            );
+
+            if running {
+                accounting.commit(tx).unwrap();
+                admitted += 1;
+            } else {
+                prefix.pop();
+                rejected += 1;
+            }
+        }
+
+        assert!(
+            admitted > 0 && rejected > 0,
+            "ladder must exercise BOTH outcomes, got {} admitted / {} rejected",
+            admitted,
+            rejected
+        );
+    }
+
+    // Below activation the rule is dormant, so the accountant must admit anything
+    // — including a set the activated rule would refuse.
+    #[test]
+    fn template_fee_accounting_is_inert_below_activation() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_700_000_000u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let ts = genesis_ts + 1_000;
+        let height = FEE_SYSTEM_ACTIVATION_HEIGHT - 1;
+
+        let mut accounting =
+            TemplateFeeAccounting::new_at(&bc, height, ts, FEE_SYSTEM_ACTIVATION_HEIGHT).unwrap();
+        // Far above the activated ceiling.
+        let fat = fee_tx(5.0, ts);
+        for _ in 0..8 {
+            assert!(accounting.admits(&bc, &fat).unwrap());
+            accounting.commit(&fat).unwrap();
+        }
+    }
+
 
     #[test]
     fn confirmed_witness_retention_prunes_below_window_and_serves_recent() {
