@@ -20,6 +20,7 @@ use crate::a9::blockchain::{
 };
 use crate::a9::whisper::max_non_whisper_fee_units;
 use crate::a9::ui::{
+    UI_MUTED,
     ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg,
     ui_text,
     ui_thousands,
@@ -1758,7 +1759,10 @@ impl Mgmt {
                 Ok(n) if (1..=50).contains(&n) => rows_wanted = n,
                 _ => {
                     ui_seg(&mut stdout, spec, UI_DIM, false,
-                        " Usage: history [rows]   rows 1-50, default 12   ·   one address: account <address>\n")?;
+                        " Usage: history [rows]   ")?;
+                    ui_seg(&mut stdout, spec, UI_MUTED, false, "rows 1-50, default 12")?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false,
+                        "   ·   one address: account <address>\n")?;
                     stdout.reset()?;
                     return Ok(());
                 }
