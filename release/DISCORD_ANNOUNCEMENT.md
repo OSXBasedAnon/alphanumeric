@@ -28,6 +28,12 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
 - Background tasks survive panics instead of vanishing silently.
 - Faster catch-up and start-up; ~13x fewer database flushes per block.
 - Payments returned to the mempool by a reorg are no longer lost on restart.
+- **A client closed for hours now catches up instead of giving up.** Deep
+  catch-up was demanding witnesses that no longer exist on any peer, so it
+  crawled, stalled, and eventually closed the client — leaving "delete the chain
+  and start over" as the only real fix. Those spans are now pulled in one piece
+  and verified end-to-end against the signed tip beacon before anything is
+  applied.
 - Peer block-range request handling is bounded in one more place — no behaviour
   change for normal peers, but a reason to take this release.
 - Building a full block template is ~800x faster (62ms -> 74us at 4,000
@@ -71,9 +77,9 @@ GPU: `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
 
 ### Artifacts + checksums
 - `alphanumeric-v7.9.2-macos-arm64.zip`
-  - `c645259c4ec75356893dcd98750051e3af84ba312c572ab5131f2856a204806a`
+  - `65ca4372eb0f1b5318774308d94a66f6b57dffe24b5c02acc1398970334bbe26`
 - `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
-  - `1602758c75aec67d4046e7e6a7bdb47f1219558ae32be781d841a0b1bbbf4878`
+  - `7407c3de4ba1f9fd2afbcd4be237dfd6cb69ce7210d0ad8e98a1fd935f1cde6a`
 
 Source build commands:
 - Standard: `git checkout main && cargo build --release`
