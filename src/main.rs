@@ -33,7 +33,8 @@ use alphanumeric::a9::{
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{Mgmt, WalletKeyData},
     ui::{
-        ui_grid_header, ui_grid_row, ui_pad, ui_seg, ui_text, ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
+        ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
+        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
         UI_MUTED,
         UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
     },
@@ -3181,101 +3182,146 @@ Some("whisper") => {
     };
 
 if parts.len() == 1 {
-    let mut header_style = ColorSpec::new();
-    header_style.set_fg(Some(Color::Rgb(247, 111, 142))).set_bold(true);
-    stdout.set_color(&header_style)?;
-    println!("\n Whisper Messages (Last 48 Hours)");
-    stdout.reset()?;
-    writeln!(stdout, "───────────────────")?;
-
-let mut all_messages = Vec::new();
-
-for wallet in wallets.values() {
-    // Short-lived per-wallet read guard (mirrors the whisper sync loop and the `info`
-    // handler). scan_blockchain_for_messages walks tip->cutoff with a get_block per height
-    // (~tens of thousands of reads over the 48h window), repeated for every wallet. Holding
-    // ONE guard across the whole batch would park a queued block-save writer — and then every
-    // reader behind it — on tokio's write-preferring RwLock for the entire scan.
-    let blockchain_guard = blockchain.read().await;
-
-    // Get confirmed messages from blockchain
-    let blockchain_messages = whisper.scan_blockchain_for_messages(&blockchain_guard, &wallet.address).await;
-    all_messages.extend(blockchain_messages);
-
-    // Get pending messages but mark them as unconfirmed
-    let pending_messages = whisper.get_unconfirmed_messages(&blockchain_guard, &wallet.address).await;
-    all_messages.extend(pending_messages);
-}
-
-// Sort by timestamp and remove duplicates
-all_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-all_messages.dedup_by(|a, b| a.tx_hash == b.tx_hash);
-
-if !all_messages.is_empty() {
-    // Sort messages with most recent at the bottom
-    let mut messages = all_messages;
-    messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-
-    for msg in messages {
-        let wallet_addresses: Vec<_> = wallets.values().map(|w| &w.address).collect();
-        let is_sender = wallet_addresses.contains(&&msg.from);
-
-        if is_sender {
-            // Grey header for sent messages
-            let mut header_style = ColorSpec::new();
-            header_style.set_fg(Some(Color::Rgb(106, 160, 163))).set_bold(true);
-            stdout.set_color(&header_style)?;
-            println!("SENT:");
-            stdout.reset()?;
-
-            // Grey recipient address
-            let mut to_style = ColorSpec::new();
-            to_style.set_fg(Some(Color::Rgb(132, 132, 132))).set_bold(false);
-            stdout.set_color(&to_style)?;
-            println!("  {}", msg.to);
-        } else {
-            // Received
-let mut header_style = ColorSpec::new();
-header_style.set_fg(Some(Color::Rgb(88, 240, 181))).set_bold(true);
-stdout.set_color(&header_style)?;
-println!("RECEIVED:");
-stdout.reset()?;
-
-            // Blue sender address
-            let mut from_style = ColorSpec::new();
-            from_style.set_fg(Some(Color::Cyan)).set_bold(true);
-            stdout.set_color(&from_style)?;
-            println!("  {}", msg.from);
-        }
-
-let mut amount_style = ColorSpec::new();
-amount_style.set_fg(Some(Color::Rgb(255, 255, 255))).set_bold(false);
-stdout.set_color(&amount_style)?; // Borrow stdout
-writeln!(&mut stdout,"  Amount: {:.8} Fee: {:.8}", msg.amount, msg.fee)?;
-
-        let mut content_style = ColorSpec::new();
-        content_style.set_fg(Some(Color::Rgb(169, 169, 169))).set_bold(true);
-        stdout.set_color(&content_style)?;
-        print!("  Time: ");
-        println!("{}", WhisperModule::format_message_time(msg.timestamp));
-
-        let mut content_style = ColorSpec::new();
-        content_style.set_fg(Some(Color::Rgb(180, 219, 210))).set_bold(true);
-        stdout.set_color(&content_style)?;
-        print!("  Message: ");
-
-        if msg.content.starts_with("[PENDING]") {
-            let mut pending_style = ColorSpec::new();
-            pending_style.set_fg(Some(Color::Yellow)).set_bold(true);
-            stdout.set_color(&pending_style)?;
-        }
-        stdout.reset()?;
-        println!("{}", msg.content);
-        println!("-------------------");
+    // Whisper ledger. Same table grammar as `account` and `history`: a glyph+word
+    // direction token, middle-truncated counterparty, decimal-aligned value, age,
+    // height and depth. The old screen printed a five-line vertical block per
+    // message with a "SENT:"/"RECEIVED:" banner, showed the sender's fee on rows
+    // the recipient never paid, and carried pending status inside the message text
+    // as a literal "[PENDING] " prefix.
+    let mut all_messages = Vec::new();
+    let mut tip = 0u64;
+    for wallet in wallets.values() {
+        // Short-lived per-wallet read guard (mirrors the whisper sync loop and the `info`
+        // handler). scan_blockchain_for_messages walks tip->cutoff with a get_block per height
+        // (~tens of thousands of reads over the 48h window), repeated for every wallet. Holding
+        // ONE guard across the whole batch would park a queued block-save writer — and then every
+        // reader behind it — on tokio's write-preferring RwLock for the entire scan.
+        let blockchain_guard = blockchain.read().await;
+        tip = tip.max(blockchain_guard.get_latest_block_index());
+        let blockchain_messages = whisper
+            .scan_blockchain_for_messages(&blockchain_guard, &wallet.address)
+            .await;
+        all_messages.extend(blockchain_messages);
+        let pending_messages = whisper
+            .get_unconfirmed_messages(&blockchain_guard, &wallet.address)
+            .await;
+        all_messages.extend(pending_messages);
     }
-} else {
-    println!("No messages in the last 48 hours.\n");
-}
+    drop(whisper);
+
+    all_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    all_messages.dedup_by(|a, b| a.tx_hash == b.tx_hash);
+
+    let mine: Vec<&String> = wallets.values().map(|w| &w.address).collect();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let spec = &mut ColorSpec::new();
+
+    let sent = all_messages.iter().filter(|m| mine.contains(&&m.from)).count();
+    let received = all_messages.len().saturating_sub(sent);
+    let pending = all_messages
+        .iter()
+        .filter(|m| m.content.starts_with("[PENDING]"))
+        .count();
+
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_PINK, true, "Whispers")?;
+    let note = format!("last 48h · tip {}", ui_thousands(tip));
+    ui_pad(&mut stdout, spec, 9, 78usize.saturating_sub(note.chars().count()))?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+    writeln!(stdout)?;
+    if !all_messages.is_empty() {
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_GREEN, false, &format!("▾ {} in", received))?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+        ui_seg(&mut stdout, spec, UI_PINK, false, &format!("▴ {} out", sent))?;
+        if pending > 0 {
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+            ui_seg(&mut stdout, spec, UI_ORANGE, false, &format!("{} pending", pending))?;
+        }
+        writeln!(stdout)?;
+    }
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+
+    if all_messages.is_empty() {
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false,
+            "no whispers in the last 48 hours — send one with  whisper <address> \"<code>\"")?;
+        writeln!(stdout)?;
+        writeln!(stdout)?;
+        stdout.reset()?;
+        continue;
+    }
+
+    // Column right edges, shared with the account/history tables.
+    const W_PARTY: usize = 16;
+    const W_VALUE_END: usize = 48;
+    const W_AGE_END: usize = 55;
+    // Status, not height: WhisperMessage carries no block height, so claiming a
+    // height column would mean inventing one. 66 keeps a two-space gutter after
+    // the age column for the widest word ("confirmed").
+    const W_STATUS_END: usize = 66;
+
+    ui_pad(&mut stdout, spec, 0, 9)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "code")?;
+    ui_pad(&mut stdout, spec, 13, W_PARTY)?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
+    let mut col = W_PARTY + 12;
+    col = ui_right(&mut stdout, spec, col, W_VALUE_END, UI_DIM, false, "value")?;
+    col = ui_right(&mut stdout, spec, col, W_AGE_END, UI_DIM, false, "age")?;
+    ui_right(&mut stdout, spec, col, W_STATUS_END, UI_DIM, false, "status")?;
+    writeln!(stdout)?;
+
+    // Oldest first so the newest sits nearest the prompt.
+    all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    for msg in &all_messages {
+        let is_sender = mine.contains(&&msg.from);
+        let is_pending = msg.content.starts_with("[PENDING]");
+        let code = msg.content.trim_start_matches("[PENDING]").trim().to_uppercase();
+        let (token, hue) = if is_sender {
+            ("▴ out", UI_PINK)
+        } else {
+            ("▾ in ", UI_GREEN)
+        };
+        // What actually moved for THIS wallet: an inbound whisper credits the
+        // amount, an outbound one debits amount + fee. The old screen printed the
+        // sender's fee on received rows too, so a recipient read money they never
+        // spent.
+        let value = if is_sender { -(msg.amount + msg.fee) } else { msg.amount };
+
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, hue, false, token)?;
+        ui_pad(&mut stdout, spec, 6, 9)?;
+        ui_seg(&mut stdout, spec, UI_CYAN, true, &code)?;
+        let party = ui_address(if is_sender { &msg.to } else { &msg.from });
+        ui_pad(&mut stdout, spec, 9 + code.chars().count(), W_PARTY)?;
+        ui_text(&mut stdout, spec, false, &party)?;
+        let mut col = W_PARTY + party.chars().count();
+        let value_text = format!("{}{:.8} ♦", if value < 0.0 { "-" } else { "+" }, value.abs());
+        col = ui_right(&mut stdout, spec, col, W_VALUE_END, hue, false, &value_text)?;
+        let age = ui_age(now_secs.saturating_sub(msg.timestamp));
+        col = ui_right(&mut stdout, spec, col, W_AGE_END, UI_DIM, false, &age)?;
+        let (status, status_hue) = if is_pending {
+            ("pending", UI_ORANGE)
+        } else {
+            ("confirmed", UI_BLUE)
+        };
+        ui_right(&mut stdout, spec, col, W_STATUS_END, status_hue, false, status)?;
+        writeln!(stdout)?;
+    }
+
+    ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+    writeln!(stdout)?;
+    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false,
+        "the code IS the fee — anyone can decode it straight off the public ledger")?;
+    writeln!(stdout)?;
+    writeln!(stdout)?;
+    stdout.reset()?;
     continue;
 
     } else {
