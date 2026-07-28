@@ -164,6 +164,10 @@ const GENESIS_LAUNCH_NONCE: u64 = 7_377;
 pub const FEE_PERCENTAGE: f64 = 0.000563063063; // 0.0563063063%
 pub const MIN_BLOCK_REWARD: f64 = 1.0;
 pub const MAX_BLOCK_REWARD: f64 = 50.0;
+/// Per-period issuance decay (17% reduction). Module scope so the reward formula
+/// and `reduction_factor` read the SAME constant — two copies of a consensus
+/// number are two chances for them to drift apart.
+pub const REDUCTION_RATE: f64 = 0.83;
 /// Coordinated activation for the deterministic fee-accounting and block-shape
 /// rules below: at the pinned activation height + 241,920 blocks after the
 /// release reference, a soft-hard-fork boundary where the stricter accounting,
@@ -6573,6 +6577,53 @@ impl Blockchain {
     /// left-to-right fold and then calls straight through to here, so the two paths
     /// are bit-identical, not merely close; the equivalence is pinned by
     /// `block_reward_from_totals_matches_the_block_form`.
+    /// `0.83^periods`, written as explicit IEEE-754 multiplication instead of
+    /// `f64::powi`.
+    ///
+    /// WHY THIS IS NOT `powi`. The coinbase is validated by EXACT equality, so
+    /// every node has to arrive at the same f64 BITS — agreeing on the value is
+    /// not enough. Rust deliberately does not specify how `powi` rounds: "It
+    /// might have a different sequence of rounding operations than `powf`, so
+    /// the results are not guaranteed to agree." In practice every target lowers
+    /// it to exactly the binary-exponentiation chain written out below, and that
+    /// was verified bit-identical for n in 0..=200 before this replaced it — so
+    /// this is a no-op TODAY and emphatically not a consensus change. What it
+    /// buys is removing the dependency on an unspecified lowering, which matters
+    /// because Linux and Windows users build from source on whatever toolchain
+    /// they happen to have. Plain multiplication is identical on every IEEE-754
+    /// platform by definition rather than by current-behaviour-happens-to-agree.
+    ///
+    /// The loop must keep this exact shape — squaring the base only when another
+    /// bit remains — because that is the operation ORDER `powi` performs, and a
+    /// different order would round differently and change the reward.
+    ///
+    /// WHY `periods` IS CLAMPED. It arrives as u64 and was passed as
+    /// `periods as i32`; integer `as` casts in Rust WRAP rather than saturate,
+    /// so a period count past `i32::MAX` would have gone negative and turned
+    /// `powi` into `1 / 0.83^n` — decay becoming explosive growth. Unreachable
+    /// while block timestamps are bounded, but the cast made it silent instead
+    /// of impossible. The clamp is a strict no-op: `0.83^n` reaches exactly 0.0
+    /// at n = 4000 and stays there, so every n at or above the bound yields 0.0
+    /// with or without it.
+    fn reduction_factor(periods: u64) -> f64 {
+        /// Far beyond the 4000 at which the factor is already exactly 0.0.
+        const MAX_REDUCTION_PERIODS: u64 = 8192;
+
+        let mut result = 1.0f64;
+        let mut base = REDUCTION_RATE;
+        let mut n = periods.min(MAX_REDUCTION_PERIODS);
+        while n > 0 {
+            if n & 1 == 1 {
+                result *= base;
+            }
+            n >>= 1;
+            if n > 0 {
+                base *= base;
+            }
+        }
+        result
+    }
+
     pub fn block_reward_from_totals(
         &self,
         block_index: u32,
@@ -6581,7 +6632,6 @@ impl Blockchain {
         total_fees: f64,
     ) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
-        const REDUCTION_RATE: f64 = 0.83; // 17% reduction = multiply by 0.83
 
         if block_index == 0 {
             return Ok(GENESIS_LAUNCH_AMOUNT);
@@ -6603,7 +6653,7 @@ impl Blockchain {
         let periods = time_since_genesis / SECONDS_IN_SIX_MONTHS;
 
         // Apply reduction rate for each period to max reward
-        let current_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods as i32);
+        let current_max = MAX_BLOCK_REWARD * Self::reduction_factor(periods);
 
         // Fee-weighted reward to avoid incentivizing spammy tx counts.
         let fee_target = (current_max * 0.05).max(0.0001);
@@ -8028,6 +8078,77 @@ mod tests {
         }
     }
 
+
+    // `reduction_factor` REPLACED `f64::powi` in the coinbase formula. The coinbase
+    // is validated by exact equality, so if the two ever disagreed by a single bit
+    // the swap would itself be the chain split it exists to prevent. Compared on
+    // raw bits, not values.
+    #[test]
+    fn reduction_factor_is_bit_identical_to_powi() {
+        for periods in 0u64..=512 {
+            let via_powi = REDUCTION_RATE.powi(periods as i32);
+            let via_loop = Blockchain::reduction_factor(periods);
+            assert_eq!(
+                via_powi.to_bits(),
+                via_loop.to_bits(),
+                "diverged at {} periods: powi={:e} loop={:e}",
+                periods,
+                via_powi,
+                via_loop
+            );
+        }
+    }
+
+    // The whole chain lifetime lives in the first handful of periods, so pin the
+    // exact issuance ceiling each one produces. A change here is a change to what
+    // every node computes as the correct coinbase.
+    #[test]
+    fn reduction_factor_pins_the_emission_schedule() {
+        // (periods, ceiling) — MAX_BLOCK_REWARD * 0.83^periods
+        let expected: [(u64, f64); 5] = [
+            (0, 50.0),
+            (1, 41.5),
+            (2, 34.445),
+            (3, 28.58935),
+            (4, 23.7291605),
+        ];
+        for (periods, ceiling) in expected {
+            let got = MAX_BLOCK_REWARD * Blockchain::reduction_factor(periods);
+            assert!(
+                (got - ceiling).abs() < 1e-9,
+                "period {} ceiling drifted: got {} want {}",
+                periods,
+                got,
+                ceiling
+            );
+        }
+        // Monotonic decay, never negative — the property the old `as i32` cast
+        // could have broken by wrapping a large period count negative.
+        let mut prev = f64::INFINITY;
+        for periods in 0u64..=64 {
+            let f = Blockchain::reduction_factor(periods);
+            assert!(f >= 0.0 && f <= 1.0, "factor out of range at {}", periods);
+            assert!(f <= prev, "factor increased at {}", periods);
+            prev = f;
+        }
+    }
+
+    // The u64 -> i32 cast this replaced WRAPPED rather than saturated, so a period
+    // count past i32::MAX went negative and turned decay into 1/0.83^n. The clamp
+    // must be a strict no-op: the factor is exactly 0.0 from n = 4000 onward, so
+    // everything at or above the bound agrees regardless.
+    #[test]
+    fn reduction_factor_saturates_instead_of_wrapping() {
+        assert_eq!(Blockchain::reduction_factor(4000), 0.0);
+        for periods in [8192u64, 100_000, 1 << 31, 1 << 40, u64::MAX] {
+            let f = Blockchain::reduction_factor(periods);
+            assert_eq!(f, 0.0, "absurd period {} must decay to zero, got {}", periods, f);
+            assert!(f.is_finite(), "period {} produced a non-finite factor", periods);
+        }
+        // And the reward path stays sane rather than exploding.
+        let ceiling = MAX_BLOCK_REWARD * Blockchain::reduction_factor(u64::MAX);
+        assert_eq!(ceiling, 0.0);
+    }
 
     #[test]
     fn confirmed_witness_retention_prunes_below_window_and_serves_recent() {
