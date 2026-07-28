@@ -22,7 +22,8 @@ use crate::a9::ui::{
     ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg,
     ui_text,
     ui_thousands,
-    UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
+    UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_HAIRLINE, UI_LABEL, UI_LAVENDER, UI_ORANGE,
+    UI_PINK, UI_RULE, UI_VALUE,
 };
 use crate::a9::{
     blockchain::{
@@ -2117,50 +2118,85 @@ impl Mgmt {
 
         // Amount column: every figure right-aligned to one edge so the decimal
         // points share a column across wallets AND the totals block.
-        const AMOUNT_END: usize = 61;
+        // ── E4 "contrast" geometry ──────────────────────────────────────────
+        // Wallet name and its FULL 40-hex address own the wallet line (19 + 40 =
+        // 59 cells); State / Amount / Share are the columns beneath. They never
+        // needed to share a row — that requirement is the only thing that would
+        // force an address to be truncated, and an address you cannot copy or
+        // verify is worth less than the column it saves.
+        const NAME_COL: usize = 1;
+        const ADDR_COL: usize = 19;
+        const STATE_COL: usize = 21;
+        const AMOUNT_END: usize = 58;
+        const SHARE_END: usize = 71;
+        const SUBRULE_END: usize = 60;
         const GAUGE: usize = 8;
 
         // A macro, not a closure: a closure capturing `stdout` holds the only
         // mutable borrow for its whole lifetime, which locks out every other
         // write in this function.
+        //
+        // Colour names the CATEGORY, never the money: every settled figure is
+        // UI_VALUE white and the brightest thing on the row, while hue sits on
+        // the state label. Outbound and incoming keep their hue on the figure
+        // too, because those are the two states where the number itself is the
+        // exception worth seeing.
         macro_rules! out {
-            ($left:expr, $amount:expr, $hue:expr, $bold:expr, $trail:expr) => {{
-                let left: &str = $left;
-                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, left);
-                let text = ui_money($amount, 5);
-                // Weight marks what a reader is actually here for: the money
-                // they can move now, and the totals. Locked and outbound stay
-                // regular so the spendable figure is the one that pops.
-                let _ = ui_right(
+            ($label:expr, $lhue:expr, $amount:expr, $hue:expr, $bold:expr, $share:expr, $note:expr) => {{
+                let label: &str = $label;
+                let _ = ui_pad(&mut stdout, spec, 0, STATE_COL);
+                let _ = ui_seg(&mut stdout, spec, $lhue, false, label);
+                // ui_money bakes in the unit mark; the figure and the ♦ need
+                // different hues here, so the number is formatted alone.
+                let text = format!("{:.8}", $amount);
+                let mut col = ui_right(
                     &mut stdout,
                     spec,
-                    left.chars().count(),
+                    STATE_COL + label.chars().count(),
                     AMOUNT_END,
                     $hue,
                     $bold,
                     &text,
-                );
-                for (color, t) in $trail.iter() {
-                    let _ = ui_seg(&mut stdout, spec, *color, false, t);
+                )
+                .unwrap_or(AMOUNT_END);
+                let _ = ui_seg(&mut stdout, spec, $hue, false, " ♦");
+                col += 2;
+                let share: Option<String> = $share;
+                if let Some(s) = share {
+                    col = ui_right(&mut stdout, spec, col, SHARE_END, UI_FAINT, false, &s)
+                        .unwrap_or(col);
                 }
+                let note: &str = $note;
+                if !note.is_empty() {
+                    let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  ");
+                    let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, note);
+                }
+                let _ = col;
+                let _ = writeln!(stdout);
+            }};
+        }
+
+        // Subtotal rule, sized and placed to sit under the amount column.
+        macro_rules! subrule {
+            () => {{
+                let _ = ui_pad(&mut stdout, spec, 0, SUBRULE_END - 15);
+                let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "───────────────");
                 let _ = writeln!(stdout);
             }};
         }
 
         let _ = writeln!(stdout);
         let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-        let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, true, "◈");
-        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-        let _ = ui_seg(&mut stdout, spec, UI_LABEL, true, "WALLET LEDGER");
+        let _ = ui_seg(&mut stdout, spec, UI_VALUE, true, "Wallet Ledger");
         let head = format!(
             "{} wallet{} · {} funded · ",
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
             funded
         );
-        // A balance is only as current as the chain it was read from. A bare height
-        // is a number the reader cannot judge, so say whether it is up to date
-        // instead. Mirrors `info`'s rule: within one block counts as synced.
+        // A balance is only as current as the chain it was read from. A bare
+        // height is a number the reader cannot judge, so say whether it is up to
+        // date instead. Mirrors `info`'s rule: within one block counts as synced.
         let behind = network_tip.saturating_sub(tip as u32);
         let (status_text, status_hue) = if network_tip == 0 {
             (format!("tip {}", ui_thousands(tip)), UI_BLUE)
@@ -2175,39 +2211,51 @@ impl Mgmt {
         let _ = ui_pad(
             &mut stdout,
             spec,
-            16,
-            78 - head.chars().count() - status_text.chars().count(),
+            14,
+            78usize
+                .saturating_sub(head.chars().count() + status_text.chars().count())
+                .max(15),
         );
         let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &head);
         let _ = ui_seg(&mut stdout, spec, status_hue, false, &status_text);
         let _ = writeln!(stdout);
-        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE);
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
+        let _ = writeln!(stdout);
+
+        // Column headers. Bold + faint rather than shouted capitals: the reader
+        // needs to know which column they are in, not to be addressed by it.
+        let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_FAINT, true, "Wallet");
+        let _ = ui_pad(&mut stdout, spec, NAME_COL + 6, ADDR_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_FAINT, true, "Address");
+        let col = ui_right(
+            &mut stdout,
+            spec,
+            ADDR_COL + 7,
+            AMOUNT_END,
+            UI_FAINT,
+            true,
+            "Amount",
+        )
+        .unwrap_or(AMOUNT_END);
+        let _ = ui_right(&mut stdout, spec, col, SHARE_END, UI_FAINT, true, "Share");
+        let _ = writeln!(stdout);
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
         let _ = writeln!(stdout);
 
         for row in &rows {
-            let empty = row.spendable <= 0.0
-                && row.maturing <= 0.0
-                && row.pending <= 0.0
-                && row.incoming <= 0.0;
-            let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-            let _ = ui_seg(
-                &mut stdout,
-                spec,
-                if empty { UI_DIM } else { UI_LAVENDER },
-                !empty,
-                if empty { "◇" } else { "◈" },
-            );
-            let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-            let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, false, &row.name);
-            let _ = ui_pad(&mut stdout, spec, 3 + row.name.chars().count(), 22);
-            let _ = ui_text(&mut stdout, spec, false, &row.address);
+            let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+            let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &row.name);
+            let name_end = NAME_COL + row.name.chars().count();
+            let _ = ui_pad(&mut stdout, spec, name_end, ADDR_COL.max(name_end + 2));
+            let _ = ui_seg(&mut stdout, spec, UI_VALUE, false, &row.address);
             let _ = writeln!(stdout);
 
             // A wallet whose balance could not be read keeps the row shape
             // instead of falling out of the layout, and is excluded from the
             // totals — which then say how many wallets they cover.
             if let Some(err) = &row.error {
-                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "   ⟩ ");
+                let _ = ui_pad(&mut stdout, spec, 0, STATE_COL);
                 let _ = ui_seg(
                     &mut stdout,
                     spec,
@@ -2219,82 +2267,103 @@ impl Mgmt {
                 continue;
             }
 
-            // Share gauge: this wallet's slice of total spendable.
             let share = if total_spendable > 0.0 {
                 row.spendable / total_spendable
             } else {
                 0.0
             };
-            let filled = (share * GAUGE as f64).round() as usize;
-            let mut trail: Vec<(Color, String)> = vec![(UI_DIM, "  ".to_string())];
-            trail.push((UI_CYAN, "▰".repeat(filled.min(GAUGE))));
-            trail.push((UI_DIM, "▱".repeat(GAUGE.saturating_sub(filled))));
-            trail.push((
-                UI_BLUE,
-                if row.spendable > 0.0 {
-                    format!(" {:>5.1}%", share * 100.0)
-                } else {
-                    "     —".to_string()
-                },
-            ));
             out!(
-                "   ⟩ spendable",
+                "spendable",
+                UI_DIM,
                 row.spendable,
-                if row.spendable > 0.0 { UI_CYAN } else { UI_DIM },
+                if row.spendable > 0.0 { UI_CYAN } else { UI_FAINT },
                 row.spendable > 0.0,
-                &trail
+                Some(if row.spendable > 0.0 {
+                    format!("{:>5.1}%", share * 100.0)
+                } else {
+                    "    —".to_string()
+                }),
+                ""
             );
+            let _ = GAUGE;
 
             if row.maturing > 0.0 {
-                out!("   ⟩ locked", row.maturing, UI_ORANGE, false, &[
-                        (UI_DIM, "  ".to_string()),
-                        (
-                            UI_DIM,
-                            format!(
-                                "{} reward{} · next {}",
-                                row.maturing_count,
-                                if row.maturing_count == 1 { "" } else { "s" },
-                                format_maturity_eta(row.next_unlock)
-                            ),
-                        ),
-                    ]);
+                out!(
+                    "locked",
+                    UI_DIM,
+                    row.maturing,
+                    UI_ORANGE,
+                    false,
+                    None,
+                    &format!(
+                        "{} reward{} · next {}",
+                        row.maturing_count,
+                        if row.maturing_count == 1 { "" } else { "s" },
+                        format_maturity_eta(row.next_unlock)
+                    )
+                );
             }
             if row.pending > 0.0 {
-                out!("   ⟩ outbound", row.pending, UI_PINK, false, &[(UI_DIM, "  in mempool".to_string())]);
-            }
-            // Money on its way IN. It sits BELOW the confirmed identity rather than
-            // inside it: an unmined credit is not yours yet, so folding it into the
-            // total would overstate the balance. Previously it appeared only in
-            // `history`, which read as the wallet screen having lost it.
-            if row.incoming > 0.0 {
-                out!("   ⟩ incoming", row.incoming, UI_GREEN, false, &[(UI_DIM, "  in mempool, not yet spendable".to_string())]);
+                out!("outbound", UI_DIM, row.pending, UI_PINK, false, None, "in mempool");
             }
             // The identity only earns a line when there is something to add up.
             if row.maturing > 0.0 || row.pending > 0.0 {
-                let _ = ui_pad(&mut stdout, spec, 0, AMOUNT_END - 15);
-                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "───────────────");
+                subrule!();
+                out!(
+                    "= confirmed",
+                    UI_DIM,
+                    row.confirmed,
+                    UI_GREEN,
+                    true,
+                    None,
+                    ""
+                );
+            }
+            // Money on its way IN, placed BELOW the confirmed identity and marked
+            // three separate ways — outdented past every other component, behind a
+            // dashed tick, and tagged `excluded`. An unmined credit is not yours,
+            // so no reading of this row should suggest it is in the total.
+            if row.incoming > 0.0 {
+                let _ = ui_pad(&mut stdout, spec, 0, ADDR_COL);
+                let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "╌ ");
+                let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "incoming");
+                let text = format!("{:.8}", row.incoming);
+                let col = ui_right(
+                    &mut stdout,
+                    spec,
+                    ADDR_COL + 10,
+                    AMOUNT_END,
+                    UI_ORANGE,
+                    false,
+                    &text,
+                )
+                .unwrap_or(AMOUNT_END);
+                let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false, " ♦");
+                let _ = col;
+                let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  excluded");
                 let _ = writeln!(stdout);
-                out!("   = confirmed", row.confirmed, UI_GREEN, true, &[] as &[(Color, String)]);
             }
         }
 
-        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE);
+        let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, UI_RULE);
         let _ = writeln!(stdout);
-        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-        let _ = ui_seg(&mut stdout, spec, UI_LAVENDER, true, "◈");
-        let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
-        let _ = ui_seg(&mut stdout, spec, UI_LABEL, true, "TOTAL");
+        let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
+        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "Total");
         let covered = rows.iter().filter(|r| r.error.is_none()).count();
-        let _ = ui_pad(&mut stdout, spec, 8, 22);
+        // Qualifies the word beside it, so it sits against "Total".
         let _ = ui_seg(
             &mut stdout,
             spec,
-            UI_DIM,
+            UI_FAINT,
             false,
             &if covered == rows.len() {
-                format!("sum of {} wallets", rows.len())
+                format!(
+                    " (sum of {} wallet{})",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }
+                )
             } else {
-                format!("sum of {} of {} wallets", covered, rows.len())
+                format!(" (sum of {} of {} wallets)", covered, rows.len())
             },
         );
         let _ = writeln!(stdout);
@@ -2307,32 +2376,82 @@ impl Mgmt {
         // not zero never claims to be.
         let pct = |v: f64| {
             if total_confirmed <= 0.0 {
-                return "     —".to_string();
+                return "    —".to_string();
             }
             let p = v / total_confirmed * 100.0;
             if p > 0.0 && p < 0.05 {
-                "  <0.1%".to_string()
+                " <0.1%".to_string()
             } else if p < 100.0 && p >= 99.95 {
-                " >99.9%".to_string()
+                ">99.9%".to_string()
             } else {
-                format!("{:>6.1}%", p)
+                format!("{:>5.1}%", p)
             }
         };
-        out!("   ⟩ spendable", total_spendable, UI_CYAN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_spendable))]);
+        out!(
+            "spendable",
+            UI_DIM,
+            total_spendable,
+            UI_CYAN,
+            true,
+            Some(pct(total_spendable)),
+            ""
+        );
         if total_maturing > 0.0 {
-            out!("   ⟩ locked", total_maturing, UI_ORANGE, false, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_maturing))]);
+            out!(
+                "locked",
+                UI_DIM,
+                total_maturing,
+                UI_ORANGE,
+                false,
+                Some(pct(total_maturing)),
+                ""
+            );
         }
         if total_pending > 0.0 {
-            out!("   ⟩ outbound", total_pending, UI_PINK, false, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_pending))]);
+            out!(
+                "outbound",
+                UI_DIM,
+                total_pending,
+                UI_PINK,
+                false,
+                Some(pct(total_pending)),
+                ""
+            );
         }
-        let _ = ui_pad(&mut stdout, spec, 0, AMOUNT_END - 15);
-        let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "───────────────");
-        let _ = writeln!(stdout);
-        out!("   = confirmed", total_confirmed, UI_GREEN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_confirmed))]);
+        // Only draw the identity when there is something to add up. With nothing
+        // locked, outbound or arriving, confirmed IS spendable, and printing it
+        // again under a rule reads as a mistake rather than a subtotal.
+        if total_maturing > 0.0 || total_pending > 0.0 {
+            subrule!();
+            out!(
+                "= confirmed",
+                UI_DIM,
+                total_confirmed,
+                UI_GREEN,
+                true,
+                Some(pct(total_confirmed)),
+                ""
+            );
+        }
         // Below the identity on purpose: not yet confirmed, so it is reported but
         // never summed into the total.
         if total_incoming > 0.0 {
-            out!("   ⟩ incoming", total_incoming, UI_GREEN, false, &[(UI_DIM, "  in mempool, not yet spendable".to_string())]);
+            let _ = ui_pad(&mut stdout, spec, 0, ADDR_COL);
+            let _ = ui_seg(&mut stdout, spec, UI_HAIRLINE, false, "╌ ");
+            let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "incoming");
+            let text = format!("{:.8}", total_incoming);
+            let _ = ui_right(
+                &mut stdout,
+                spec,
+                ADDR_COL + 10,
+                AMOUNT_END,
+                UI_ORANGE,
+                false,
+                &text,
+            );
+            let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false, " ♦");
+            let _ = ui_seg(&mut stdout, spec, UI_FAINT, false, "  excluded");
+            let _ = writeln!(stdout);
         }
 
         let _ = writeln!(stdout);
