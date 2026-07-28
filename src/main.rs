@@ -2170,23 +2170,12 @@ async fn async_main() -> Result<()> {
 
     ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
     let forks = health.map_or(0, |h| h.fork_count);
-    let fork_color = if forks == 0 { UI_GREEN } else { UI_ORANGE };
-    ui_seg(&mut stdout, &mut color_spec, fork_color, false, "●")?;
-    ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, " ")?;
-    ui_seg(
-        &mut stdout,
-        &mut color_spec,
-        fork_color,
-        false,
-        &forks.to_string(),
-    )?;
-    ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " forks")?;
-    ui_pad(
-        &mut stdout,
-        &mut color_spec,
-        3 + forks.to_string().chars().count() + 6,
-        17,
-    )?;
+    // Fork count is reported once, in the Status grid below. Repeating it here spent
+    // the most prominent slot on the screen — top-left, the first thing read — on a
+    // figure the reader meets again a few lines down, and on a healthy node it is
+    // always zero. The column is left empty so `load`, `pending tx` and `block` keep
+    // exactly the positions they had.
+    ui_pad(&mut stdout, &mut color_spec, 1, 17)?;
     ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, "load ")?;
     let load_text = format!("{:.1}%", health.map_or(0.0, |h| h.network_load * 100.0));
     ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &load_text)?;
