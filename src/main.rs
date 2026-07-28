@@ -2077,7 +2077,15 @@ async fn async_main() -> Result<()> {
     // is the only hue allowed to cross pane boundaries, so a slow chain stays
     // louder than the zoning around it.
     let block_target_secs = u64::from(block_target);
-    let stale = block_age.is_some_and(|age| age > block_target_secs.saturating_mul(2));
+    // Proof-of-work block intervals are exponentially distributed, so on a HEALTHY
+    // chain an age past 2x target happens ~13.5% of the time (e^-2) and past 5x
+    // still ~0.7%. Treating that as "stale" meant a fully synced node kept flipping
+    // between calm and warning while nothing was wrong — colour that changes without
+    // meaning trains you to ignore it. 12x is ~6e-6 per block: it effectively never
+    // fires by chance, so when it does the chain has genuinely stopped.
+    const STALL_TARGET_MULTIPLE: u64 = 12;
+    let stale =
+        block_age.is_some_and(|age| age > block_target_secs.saturating_mul(STALL_TARGET_MULTIPLE));
     let age_multiple = block_age
         .filter(|_| block_target_secs > 0)
         .map(|age| age / block_target_secs)
@@ -2207,7 +2215,10 @@ async fn async_main() -> Result<()> {
             ui_seg(
                 &mut stdout,
                 &mut color_spec,
-                if stale { UI_ORANGE } else { UI_BLUE },
+                // Steady hue: the AGE itself never signals. The multiplier
+                // annotation beside it appears only on a real stall, so nothing
+                // here changes colour on a healthy chain.
+                UI_BLUE,
                 false,
                 &format!("{}s", age),
             )?;
@@ -2394,7 +2405,13 @@ async fn async_main() -> Result<()> {
             "Last Block:",
             &[
                 (
-                    if stale { UI_ORANGE } else { UI_PINK },
+                    // Same rule as the overview line above, which this used to
+                    // contradict: a HEALTHY age rendered UI_PINK — the outflow /
+                    // attention hue `outbound` uses — so a node that had just caught
+                    // up turned red, and the identical figure was blue at the top of
+                    // the same screen. Steady hue in both places now: the age
+                    // never signals, only the stall annotation does.
+                    UI_BLUE,
                     block_age.map_or_else(|| "unknown".to_string(), |age| format!("{}s", age)),
                 ),
                 (
@@ -2524,7 +2541,11 @@ async fn async_main() -> Result<()> {
     stdout.reset()?;
 },
 
-Some("balance") | Some("wallet") => mgmt.show_balances(&wallets).await,
+Some("balance") | Some("bal") | Some("wallet") => {
+    // Local atomic read of the node's beacon high-water — 0 when no beacon has
+    // been seen. Never a network call, so `balance` stays instant.
+    mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+},
 Some("new") => {
 let wallet_name = command.split_whitespace().nth(1).map(|s| s.to_string());
 if let Err(e) = mgmt
@@ -3651,16 +3672,18 @@ Some("help") => {
         "addresses are 40-hex, not wallet names",
     )?;
     writeln!(stdout)?;
-    row!(" transfer", UI_BLUE, "create ", "<from> <to> <amount> [--fee <ALPHA>]");
-    row!(" quick transfer", UI_BLUE, "<to> <amount>", "   from default wallet");
-    row!(" send message", UI_BLUE, "whisper ", "<address> \"<message>\"");
+    row!(" transfer", UI_BLUE, "create ", "<from> <to> <amount> [--fee <amount>]");
+    row!(" quick transfer", UI_BLUE, "<to> <amount>", "   sends from your default wallet");
+    // The 4-character cap is the single thing people get wrong: anything longer is
+    // REJECTED, not truncated, and only a-z survives the encoding.
+    row!(" send a whisper", UI_BLUE, "whisper ", "<address> <code>   max 4 letters");
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(
         &mut stdout,
         spec,
         UI_DIM,
         false,
-        "fees are priced automatically; --fee overrides",
+        "fees are automatic; --fee overrides. A whisper rides in its fee, so it costs more.",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
@@ -3676,8 +3699,20 @@ Some("help") => {
         "rewards mature after 100 blocks",
     )?;
     writeln!(stdout)?;
-    row!(" begin mining", UI_GREEN, "mine", "   default wallet");
-    row!(" mine to wallet", UI_GREEN, "mine ", "<wallet name>");
+    // `mine` took --continuous all along and help never said so, so the only
+    // documented form was the one that stops after a single block.
+    row!(" start mining", UI_GREEN, "mine", "   rewards go to your default wallet");
+    row!(" mine to a wallet", UI_GREEN, "mine ", "<wallet name>");
+    row!(" keep mining", UI_GREEN, "mine ", "[wallet] --continuous   (-c)");
+    ui_pad(&mut stdout, spec, 0, CMD)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        "without --continuous it stops after one block. Enter stops it.",
+    )?;
+    writeln!(stdout)?;
     writeln!(stdout)?;
 
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
@@ -3696,10 +3731,12 @@ Some("help") => {
 
     // Aliases and the bare-address shorthand are reachable in the match arms
     // but appeared on no surface, so nobody could discover them.
-    row!(" aliases", UI_PINK, "create = send = transfer", " · balance = wallet");
+    row!(" aliases", UI_PINK, "create = send = transfer", " · balance = bal = wallet");
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(&mut stdout, spec, UI_PINK, false, "debug = diagnostics = diag")?;
     writeln!(stdout)?;
+    // Pasting an address is the most natural thing a newcomer does with one.
+    row!(" paste an address", UI_PINK, "<address>", "   on its own, looks it up");
     row!(" shorthand", UI_PINK, "<from> <to> <amount>", "   also initiates a transfer");
     row!(" end session", UI_PINK, "exit", "");
     writeln!(stdout)?;
@@ -3731,6 +3768,26 @@ Some(_) => {
                         |s: &str| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
                     let is_amount =
                         |s: &str| s.parse::<f64>().map(|a| a > 0.0).unwrap_or(false);
+                    // A pasted address on its own is a LOOKUP. One 40-hex token can be
+                    // nothing else — no command is 40 hex characters, and every transfer
+                    // form needs at least an amount beside it — so this is unambiguous.
+                    // It resolves to `account`, which is READ-ONLY: the shorthand that
+                    // moves money still requires an explicit amount, and no amount can be
+                    // inferred from a bare address. Handled before the transfer forms
+                    // below so the two can never interact.
+                    if parts.len() == 1 && is_addr(parts[0]) {
+                        if let Err(e) = mgmt
+                            .handle_account_command(
+                                &format!("account {}", parts[0]),
+                                &blockchain,
+                                &wallets,
+                            )
+                            .await
+                        {
+                            println!("Error: {}", e);
+                        }
+                        continue;
+                    }
                     // Two forms, both unambiguous because a 40-hex string followed
                     // by a positive number has no other meaning:
                     //   <from> <to> <amount>   explicit sender
