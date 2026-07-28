@@ -38,6 +38,8 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
   change for normal peers, but a reason to take this release.
 - Building a full block template is ~800x faster (62ms -> 74us at 4,000
   transactions). Same transactions chosen; the equivalence is tested bit-for-bit.
+- Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
+  block you mined gets reorged out.
 
 ### Before block 517,583 (~9 August)
 The already-scheduled fee-accounting activation starts at that height. Nothing
@@ -47,8 +49,6 @@ software can produce a block upgraded nodes reject, which is the only thing that
 would split the network. One note: a whisper on a very large transfer (~1,290
 coins or more) will stop sending from that height, because a whisper's fee scales
 with the amount sent. Ordinary whispers are nowhere near this.
-- Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
-  block you mined gets reorged out.
 
 ### Also fixed after 7.9.1
 - Reopening a client after hours away no longer says "cannot mine" — it reports
@@ -80,6 +80,9 @@ with the amount sent. Ordinary whispers are nowhere near this.
 - The hashrate beside the chart and the one in the metrics row now always agree
   (they were computed differently and could sit a spike apart). The chart still
   plots the raw per-sample series.
+- The chart no longer re-animates while you scroll on a phone. Mobile Safari
+  fires a resize whenever the address bar hides or reappears; it now redraws only
+  when the width genuinely changes. Rotating still works, animation unchanged.
 
 ### Download (macOS, Apple Silicon)
 Standard: `alphanumeric-v7.9.2-macos-arm64.zip`

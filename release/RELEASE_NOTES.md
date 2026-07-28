@@ -108,7 +108,7 @@ seconds to 5 minutes instead of never.
   width genuinely changes, so rotating still works and the animation is
   unchanged.
 
-## Wallet and interface
+## Wallet
 - **An incoming payment now appears in `balance`, not only in `history`.** The
   wallet screen tracked money leaving but had no line at all for money arriving,
   so a transfer on its way in was visible in one place and invisible in the
