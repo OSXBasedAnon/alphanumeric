@@ -2025,7 +2025,10 @@ impl Mgmt {
         Ok(())
     }
 
-    pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>) {
+    /// `network_tip` is the node's beacon high-water height — a local read, never a
+    /// network call. 0 means no beacon has been seen yet, in which case the header
+    /// makes no claim rather than guessing.
+    pub async fn show_balances(&self, wallets: &HashMap<String, Wallet>, network_tip: u32) {
         // Auto, not Always: `balance | grep` was receiving raw ANSI escapes.
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         let spec = &mut ColorSpec::new();
@@ -2159,15 +2162,33 @@ impl Mgmt {
         let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
         let _ = ui_seg(&mut stdout, spec, UI_LABEL, true, "WALLET LEDGER");
         let head = format!(
-            "{} wallet{} · {} funded · tip ",
+            "{} wallet{} · {} funded · ",
             rows.len(),
             if rows.len() == 1 { "" } else { "s" },
             funded
         );
-        let tip_text = ui_thousands(tip);
-        let _ = ui_pad(&mut stdout, spec, 16, 78 - head.chars().count() - tip_text.chars().count());
+        // A balance is only as current as the chain it was read from. A bare height
+        // is a number the reader cannot judge, so say whether it is up to date
+        // instead. Mirrors `info`'s rule: within one block counts as synced.
+        let behind = network_tip.saturating_sub(tip as u32);
+        let (status_text, status_hue) = if network_tip == 0 {
+            (format!("tip {}", ui_thousands(tip)), UI_BLUE)
+        } else if behind <= 1 {
+            (format!("synced · {}", ui_thousands(tip)), UI_GREEN)
+        } else {
+            (
+                format!("{} behind · {}", ui_thousands(behind as u64), ui_thousands(tip)),
+                UI_ORANGE,
+            )
+        };
+        let _ = ui_pad(
+            &mut stdout,
+            spec,
+            16,
+            78 - head.chars().count() - status_text.chars().count(),
+        );
         let _ = ui_seg(&mut stdout, spec, UI_DIM, false, &head);
-        let _ = ui_seg(&mut stdout, spec, UI_BLUE, false, &tip_text);
+        let _ = ui_seg(&mut stdout, spec, status_hue, false, &status_text);
         let _ = writeln!(stdout);
         let _ = ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE);
         let _ = writeln!(stdout);
@@ -2287,11 +2308,23 @@ impl Mgmt {
         );
         let _ = writeln!(stdout);
 
+        // One decimal place silently lied at both ends: a spendable total that is
+        // 99.983% of confirmed printed "100.0%" — indistinguishable from the
+        // confirmed line's true 100% — and an outbound of 0.017% printed "0.0%",
+        // which reads as nothing at all. Saturate instead of rounding through:
+        // a value that is not the whole never claims to be, and a value that is
+        // not zero never claims to be.
         let pct = |v: f64| {
-            if total_confirmed > 0.0 {
-                format!("{:>6.1}%", v / total_confirmed * 100.0)
+            if total_confirmed <= 0.0 {
+                return "     —".to_string();
+            }
+            let p = v / total_confirmed * 100.0;
+            if p > 0.0 && p < 0.05 {
+                "  <0.1%".to_string()
+            } else if p < 100.0 && p >= 99.95 {
+                " >99.9%".to_string()
             } else {
-                "     —".to_string()
+                format!("{:>6.1}%", p)
             }
         };
         out!("   ⟩ spendable", total_spendable, UI_CYAN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_spendable))]);
