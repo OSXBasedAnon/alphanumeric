@@ -62,6 +62,13 @@ seconds to 5 minutes instead of never.
   bounded in one more place. No behaviour change for normal peers, and no change
   to what any node accepts as valid — but it is a reason to take this release
   rather than stay where you are.
+- **Block template building no longer slows down as the block fills.** Selecting
+  transactions re-checked the whole selected set for every further candidate, so
+  the cost grew with the square of the template size. It now carries running
+  totals: assembling a 4,000-transaction template drops from ~62 ms to ~74 µs.
+  The transactions chosen are unchanged — the equivalence is pinned by tests that
+  compare the two paths bit-for-bit rather than approximately. This matters from
+  block 517,583, where that check starts running.
 
 ## Interface
 - **One display language across every screen.** Balances, wallets, mining,
@@ -102,6 +109,24 @@ seconds to 5 minutes instead of never.
   to the prompt and run normally.
 - **Sync status is a single updating line** instead of a new line every few
   seconds burying the screen during a long catch-up.
+
+## Heads-up for block 517,583 (~9 August)
+
+Nothing below changes now, and nothing in this release changes it — this is what
+the already-scheduled fee-accounting activation does when the chain reaches that
+height. It is here because 7.9.2 is what most nodes will be running by then.
+
+- **Upgrade before that height.** From 517,583 a block's *total* fees must stay
+  within the scheduled allowance. An upgraded miner simply builds a slightly
+  smaller block and is never affected. A miner still on older software can build
+  a block that upgraded nodes reject — that, and only that, is what would split
+  the network. Every node agreeing on the rule means no split at all.
+- **A whisper on a very large transfer will stop sending.** A whisper carries its
+  message in the fee, and that fee includes a component proportional to the
+  amount sent, so a whisper on roughly 1,290 coins or more exceeds the per-block
+  allowance on its own and is declined at submission. Ordinary whispers are far
+  below this and are unaffected. Splitting a large transfer, or sending it
+  without a whisper, both work normally.
 
 ## Install / verify
 - **Standard**: use `alphanumeric-v7.9.2-macos-arm64.zip`
