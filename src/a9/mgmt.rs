@@ -2047,6 +2047,7 @@ impl Mgmt {
             maturing_count: usize,
             next_unlock: u64,
             pending: f64,
+            incoming: f64,
             confirmed: f64,
             error: Option<String>,
         }
@@ -2074,6 +2075,7 @@ impl Mgmt {
                         maturing_count: breakdown.maturing.len(),
                         next_unlock,
                         pending: breakdown.pending_debit,
+                        incoming: breakdown.pending_credit,
                         confirmed: breakdown.confirmed,
                         error: None,
                     });
@@ -2086,6 +2088,7 @@ impl Mgmt {
                     maturing_count: 0,
                     next_unlock: 0,
                     pending: 0.0,
+                    incoming: 0.0,
                     confirmed: 0.0,
                     error: Some(e.to_string()),
                 }),
@@ -2105,6 +2108,7 @@ impl Mgmt {
         let total_spendable: f64 = rows.iter().map(|r| r.spendable).sum();
         let total_maturing: f64 = rows.iter().map(|r| r.maturing).sum();
         let total_pending: f64 = rows.iter().map(|r| r.pending).sum();
+        let total_incoming: f64 = rows.iter().map(|r| r.incoming).sum();
         let total_confirmed: f64 = rows.iter().map(|r| r.confirmed).sum();
         let funded = rows.iter().filter(|r| r.spendable > 0.0).count();
 
@@ -2160,7 +2164,10 @@ impl Mgmt {
         let _ = writeln!(stdout);
 
         for row in &rows {
-            let empty = row.spendable <= 0.0 && row.maturing <= 0.0 && row.pending <= 0.0;
+            let empty = row.spendable <= 0.0
+                && row.maturing <= 0.0
+                && row.pending <= 0.0
+                && row.incoming <= 0.0;
             let _ = ui_seg(&mut stdout, spec, UI_LABEL, false, " ");
             let _ = ui_seg(
                 &mut stdout,
@@ -2234,6 +2241,13 @@ impl Mgmt {
             if row.pending > 0.0 {
                 out!("   ⟩ outbound", row.pending, UI_PINK, false, &[(UI_DIM, "  in mempool".to_string())]);
             }
+            // Money on its way IN. It sits BELOW the confirmed identity rather than
+            // inside it: an unmined credit is not yours yet, so folding it into the
+            // total would overstate the balance. Previously it appeared only in
+            // `history`, which read as the wallet screen having lost it.
+            if row.incoming > 0.0 {
+                out!("   ⟩ incoming", row.incoming, UI_GREEN, false, &[(UI_DIM, "  in mempool, not yet spendable".to_string())]);
+            }
             // The identity only earns a line when there is something to add up.
             if row.maturing > 0.0 || row.pending > 0.0 {
                 let _ = ui_pad(&mut stdout, spec, 0, AMOUNT_END - 15);
@@ -2282,6 +2296,11 @@ impl Mgmt {
         let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "───────────────");
         let _ = writeln!(stdout);
         out!("   = confirmed", total_confirmed, UI_GREEN, true, &[(UI_DIM, "   ".to_string()), (UI_BLUE, pct(total_confirmed))]);
+        // Below the identity on purpose: not yet confirmed, so it is reported but
+        // never summed into the total.
+        if total_incoming > 0.0 {
+            out!("   ⟩ incoming", total_incoming, UI_GREEN, false, &[(UI_DIM, "  in mempool, not yet spendable".to_string())]);
+        }
 
         let _ = writeln!(stdout);
         let _ = stdout.reset();
