@@ -1321,6 +1321,8 @@ async fn async_main() -> Result<()> {
                 let mut rx = { blockchain.read().await.subscribe_tip_changes() };
                 let mut last_scanned: u32 =
                     { blockchain.read().await.get_latest_block_index() as u32 };
+                // Per-session, owned by this task alone — no lock on the notice path.
+                let mut receipt_rate = ReceiptRate::new();
                 loop {
                     if rx.changed().await.is_err() {
                         break;
@@ -1341,6 +1343,10 @@ async fn async_main() -> Result<()> {
                     for h in from..=height {
                         let block = { blockchain.read().await.get_block(h).ok() };
                         let Some(block) = block else { continue };
+                        // Classify the whole block BEFORE printing anything: the
+                        // digest decision needs this block's total, and a line
+                        // already written to the terminal cannot be taken back.
+                        let mut payments: Vec<(f64, String, String)> = Vec::new();
                         for tx in &block.transactions {
                             if tx.sender == "MINING_REWARDS" {
                                 continue; // mining rewards are reported by the miner
@@ -1348,11 +1354,16 @@ async fn async_main() -> Result<()> {
                             if !addresses.contains(&tx.recipient) {
                                 continue;
                             }
-                            let from_short = &tx.sender[..tx.sender.len().min(10)];
+                            let from_short = tx.sender[..tx.sender.len().min(10)].to_string();
                             // A whisper carries its message in the fee; show the
                             // message. Otherwise it is a plain payment.
                             let whisper = { whisper_module.read().await.decode_whisper_in_tx(tx) };
                             if let Some(message) = whisper {
+                                // Whispers are never folded into the digest and never
+                                // feed the rate: the message text IS the payload, so a
+                                // count would discard the only thing worth reading,
+                                // and letting them trip the payment threshold would
+                                // suppress unrelated payment lines.
                                 notify(format!(
                                     "\n{}whisper{}   from {}…  {}block {}{}\n            {}",
                                     EV_WHISPER,
@@ -1364,19 +1375,52 @@ async fn async_main() -> Result<()> {
                                     message
                                 ));
                             } else {
-                                let amount = Transaction::from_units(tx.amount_units);
-                                let to_short = &tx.recipient[..tx.recipient.len().min(10)];
+                                payments.push((
+                                    Transaction::from_units(tx.amount_units),
+                                    tx.recipient[..tx.recipient.len().min(10)].to_string(),
+                                    from_short,
+                                ));
+                            }
+                        }
+
+                        if !payments.is_empty() {
+                            let now = Instant::now();
+                            let recent = receipt_rate.recent(now);
+                            let digest = should_digest_receipts(payments.len(), recent);
+                            // Record before emitting, and record the payment count
+                            // even when digesting — see ReceiptRate.
+                            receipt_rate.record(now, payments.len());
+
+                            if digest {
+                                let total: f64 = payments.iter().map(|(amount, ..)| amount).sum();
+                                let wallets: std::collections::HashSet<&str> =
+                                    payments.iter().map(|(_, to, _)| to.as_str()).collect();
                                 notify(format!(
-                                    "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
+                                    "\n{}received{}  {} payments  +{:.8} ♦  to {} wallet{}  {}block {} · history for detail{}",
                                     EV_RECEIVED,
                                     EV_OFF,
-                                    amount,
-                                    to_short,
-                                    from_short,
+                                    payments.len(),
+                                    total,
+                                    wallets.len(),
+                                    if wallets.len() == 1 { "" } else { "s" },
                                     EV_DIM,
                                     block.index,
                                     EV_OFF
                                 ));
+                            } else {
+                                for (amount, to_short, from_short) in &payments {
+                                    notify(format!(
+                                        "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
+                                        EV_RECEIVED,
+                                        EV_OFF,
+                                        amount,
+                                        to_short,
+                                        from_short,
+                                        EV_DIM,
+                                        block.index,
+                                        EV_OFF
+                                    ));
+                                }
                             }
                         }
                     }
@@ -6626,9 +6670,155 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
     Ok(())
 }
 
+/// Inbound payments in ONE block above which that block collapses to a single
+/// digest line. An ordinary wallet never reaches it; four separate payments in
+/// the same five-second block is already unusual for a person.
+const RECEIPT_BURST_LINES: usize = 4;
+/// Payments seen inside `RECEIPT_RATE_WINDOW` above which we stay collapsed even
+/// when no single block is bursty — the sustained-drip shape a mining pool or an
+/// exchange produces. 20/min is ~1.7 per block, well past personal use.
+const RECEIPT_SUSTAINED_LINES: usize = 20;
+const RECEIPT_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Rolling count of inbound payments, so a high-volume operator gets a digest
+/// instead of a per-payment firehose while an ordinary wallet keeps the exact
+/// output it has today.
+///
+/// Counts PAYMENTS OBSERVED, never lines printed. Counting lines would let
+/// coalescing erase the very signal that triggered it: one digest line would
+/// read as "volume is low", the next block would print individually again, and
+/// the display would oscillate between the two modes under steady load.
+///
+/// Entries are (instant, count) per block rather than one per payment, so a
+/// block carrying thousands of deposits costs one entry, and the deque is
+/// bounded by the window regardless of volume.
+struct ReceiptRate {
+    seen: std::collections::VecDeque<(Instant, usize)>,
+}
+
+impl ReceiptRate {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Payments observed within the window ending at `now`, dropping older ones.
+    fn recent(&mut self, now: Instant) -> usize {
+        while let Some(&(at, _)) = self.seen.front() {
+            // saturating: a non-monotonic `now` must not panic a display path.
+            if now.saturating_duration_since(at) > RECEIPT_RATE_WINDOW {
+                self.seen.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.seen.iter().map(|(_, n)| *n).sum()
+    }
+
+    fn record(&mut self, now: Instant, count: usize) {
+        if count > 0 {
+            self.seen.push_back((now, count));
+        }
+    }
+}
+
+/// Whether this block's payments collapse into one digest line. Pure so the
+/// policy is testable without a clock, a chain or a terminal.
+fn should_digest_receipts(in_block: usize, recent: usize) -> bool {
+    in_block > RECEIPT_BURST_LINES || recent > RECEIPT_SUSTAINED_LINES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An ordinary wallet must keep the per-payment lines it has today. This is
+    // the half of the behaviour that is NOT allowed to change.
+    #[test]
+    fn ordinary_wallet_volume_never_digests() {
+        assert!(!should_digest_receipts(1, 0), "a single payment stays verbose");
+        assert!(
+            !should_digest_receipts(RECEIPT_BURST_LINES, RECEIPT_SUSTAINED_LINES),
+            "sitting exactly ON both thresholds is still ordinary use"
+        );
+    }
+
+    // Either shape of high volume collapses: a bursty block, or a sustained drip
+    // that never makes any single block bursty.
+    #[test]
+    fn burst_or_sustained_volume_digests() {
+        assert!(
+            should_digest_receipts(RECEIPT_BURST_LINES + 1, 0),
+            "one bursty block digests even with no history"
+        );
+        assert!(
+            should_digest_receipts(1, RECEIPT_SUSTAINED_LINES + 1),
+            "a steady drip digests even though no single block is bursty"
+        );
+    }
+
+    #[test]
+    fn receipt_rate_only_counts_inside_the_window() {
+        let mut rate = ReceiptRate::new();
+        let t0 = Instant::now();
+        rate.record(t0, 5);
+        assert_eq!(rate.recent(t0), 5);
+
+        // Still inside the window.
+        let inside = t0 + RECEIPT_RATE_WINDOW;
+        rate.record(inside, 3);
+        assert_eq!(rate.recent(inside), 8);
+
+        // Past it: the first entry ages out, the second survives.
+        let outside = t0 + RECEIPT_RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(rate.recent(outside), 3);
+
+        // Long idle — an ordinary wallet returning after a quiet spell must be
+        // back to verbose, not stuck in digest mode.
+        let much_later = outside + RECEIPT_RATE_WINDOW * 10;
+        assert_eq!(rate.recent(much_later), 0);
+        assert!(!should_digest_receipts(1, rate.recent(much_later)));
+    }
+
+    // The reason the counter tracks payments rather than printed lines: under
+    // steady load, counting lines would let one digest read as "volume is low"
+    // and flip the display back to verbose, oscillating every block.
+    #[test]
+    fn sustained_load_stays_digested_rather_than_oscillating() {
+        let mut rate = ReceiptRate::new();
+        let mut now = Instant::now();
+        let per_block = RECEIPT_BURST_LINES + 1; // bursty enough to digest on its own
+
+        // First block digests on the burst rule alone.
+        assert!(should_digest_receipts(per_block, rate.recent(now)));
+        rate.record(now, per_block);
+
+        // Ten more blocks at the same rate: each must STAY digested. Had the
+        // counter recorded one line per digest, `recent` would sit near zero and
+        // these would flip back to per-payment output.
+        for _ in 0..10 {
+            now += Duration::from_secs(5); // one block apart
+            let recent = rate.recent(now);
+            assert!(
+                should_digest_receipts(per_block, recent),
+                "sustained load must stay digested (recent={})",
+                recent
+            );
+            rate.record(now, per_block);
+        }
+    }
+
+    // A block carrying thousands of deposits must cost one deque entry, not one
+    // per payment, or the tracker itself becomes the memory problem.
+    #[test]
+    fn receipt_rate_is_bounded_by_blocks_not_payments() {
+        let mut rate = ReceiptRate::new();
+        let now = Instant::now();
+        rate.record(now, 10_000);
+        assert_eq!(rate.seen.len(), 1);
+        assert_eq!(rate.recent(now), 10_000);
+    }
 
     #[test]
     fn consensus_fingerprint_commits_activated_fee_and_weight_rules() {
