@@ -8184,6 +8184,193 @@ mod tests {
         assert_eq!(compared, 61 * 4 * 8);
     }
 
+    // ADVERSARIAL: hammer the reward path with values a well-behaved chain never
+    // produces — timestamps before genesis and at the u64 ceiling, exact period
+    // boundaries and one second either side, the clamp crossover where the ceiling
+    // falls under MIN_BLOCK_REWARD, empty and maximally full blocks, and fees from
+    // one unit to absurd. Nothing here may panic, produce a non-finite value, go
+    // negative, exceed its own ceiling, or diverge from what the previous code
+    // computed. A panic in this function halts every node at once.
+    #[test]
+    fn reward_survives_adversarial_inputs_and_never_diverges() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        const SIX_MONTHS: u64 = 15_768_000;
+
+        fn old_reward(current_max: f64, tx_count: usize, total_fees: f64) -> f64 {
+            let fee_target = (current_max * 0.05).max(0.0001);
+            let effective_fees = total_fees * (1.0 - MINT_CLIP);
+            let fee_factor = (effective_fees / fee_target).clamp(0.0, 1.0);
+            let base_reward = if tx_count == 0 {
+                current_max * 0.2
+            } else {
+                MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
+            };
+            let reward_floor = MIN_BLOCK_REWARD.min(current_max);
+            Transaction::round_amount((base_reward + effective_fees).clamp(reward_floor, current_max))
+        }
+
+        // Timestamps: before genesis (saturating_sub floors the age at 0), the
+        // genesis instant, exact period boundaries and one second either side of
+        // them, the clamp crossover near period 21, and the u64 ceiling.
+        let mut stamps: Vec<u64> = vec![0, 1, genesis_ts - 1, genesis_ts, u64::MAX];
+        for p in [0u64, 1, 2, 20, 21, 22, 60, 200, 4000] {
+            let boundary = genesis_ts.saturating_add(p.saturating_mul(SIX_MONTHS));
+            stamps.push(boundary.saturating_sub(1));
+            stamps.push(boundary);
+            stamps.push(boundary.saturating_add(1));
+        }
+
+        let fee_shapes = [
+            0.0f64,
+            1e-8,                 // one unit
+            0.726_392,            // the admissible-band edge
+            3.846,                // fee_factor saturation point
+            40.0,
+            1e6,
+            1e18,                 // absurd but finite
+        ];
+        let counts = [0usize, 1, MAX_BLOCK_TX_COUNT - 1, MAX_BLOCK_TX_COUNT];
+
+        let mut checked = 0usize;
+        for &ts in &stamps {
+            let periods = ts.saturating_sub(genesis_ts) / SIX_MONTHS;
+            let factor = Blockchain::reduction_factor(periods);
+            let current_max = MAX_BLOCK_REWARD * factor;
+            assert!(factor.is_finite() && (0.0..=1.0).contains(&factor),
+                "decay factor out of range at ts {}: {}", ts, factor);
+
+            for &n in &counts {
+                for &fees in &fee_shapes {
+                    // must not panic
+                    let got = bc
+                        .block_reward_from_totals(1_000, ts, n, fees)
+                        .expect("reward must compute for every input");
+
+                    assert!(got.is_finite(), "non-finite reward at ts {} n {} fees {}", ts, n, fees);
+                    assert!(got >= 0.0, "negative reward at ts {} n {} fees {}", ts, n, fees);
+                    // The ceiling invariant, with the one tolerance the formula
+                    // genuinely needs: the clamp to current_max runs BEFORE the
+                    // 8-decimal rounding, so rounding can carry the result up to
+                    // HALF A UNIT (5e-9 coins) past the ceiling. Observed at
+                    // period 21, where the ceiling is 0.999102266610733 and the
+                    // reward rounds to 0.99910227 — 0.34 units over. Deterministic
+                    // and identical on old and new nodes, so it is a rounding
+                    // artefact rather than an issuance leak; reordering the clamp
+                    // and the rounding WOULD change computed rewards and is
+                    // therefore a consensus change. Do not "fix" it.
+                    assert!(
+                        got <= current_max + 1e-8,
+                        "reward {} exceeded ceiling {} by more than a unit at ts {} n {} fees {}",
+                        got, current_max, ts, n, fees
+                    );
+                    // and it must convert to units without trapping
+                    let units = Transaction::to_units(got);
+                    assert!(units >= 0, "negative units at ts {} n {} fees {}", ts, n, fees);
+
+                    // and it must be what an un-upgraded node computes
+                    let old_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods.min(8192) as i32);
+                    assert_eq!(
+                        old_reward(old_max, n, fees).to_bits(),
+                        got.to_bits(),
+                        "DIVERGED at ts {} periods {} n {} fees {}", ts, periods, n, fees
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 800, "expected a broad sweep, only checked {}", checked);
+    }
+
+    // ADVERSARIAL: the activation boundary itself. An off-by-one here splits the
+    // chain at a known height, so the transition is pinned exactly — inert at
+    // 517,582, live at 517,583 — and the fee rule is exercised at its own edges
+    // (empty, one unit, either side of the admissible band, and past the point
+    // where fee_factor saturates).
+    #[test]
+    fn activation_boundary_is_exact_and_survives_edge_fees() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let ts = genesis_ts + 3_000_000; // still period 0, as at the real activation
+
+        let edge_fees = [
+            0.0f64, 1e-8, 0.0001, 0.0002,
+            0.726_391, 0.726_392, 0.726_393,   // either side of the band edge
+            3.846, 40.0, 1e6,
+        ];
+
+        for &fees in &edge_fees {
+            for &n in &[0usize, 1, 4095] {
+                // The reward itself must not depend on the activation height at all
+                // — activation narrows which fee combinations are ADMISSIBLE, it
+                // does not change the coinbase formula.
+                let below = bc
+                    .block_reward_from_totals(FEE_SYSTEM_ACTIVATION_HEIGHT - 1, ts, n, fees)
+                    .unwrap();
+                let at = bc
+                    .block_reward_from_totals(FEE_SYSTEM_ACTIVATION_HEIGHT, ts, n, fees)
+                    .unwrap();
+                let above = bc
+                    .block_reward_from_totals(FEE_SYSTEM_ACTIVATION_HEIGHT + 1, ts, n, fees)
+                    .unwrap();
+                assert_eq!(below.to_bits(), at.to_bits(),
+                    "coinbase changed across activation at fees {} n {}", fees, n);
+                assert_eq!(at.to_bits(), above.to_bits(),
+                    "coinbase changed after activation at fees {} n {}", fees, n);
+            }
+        }
+
+        // The ADMISSIBILITY rule is what flips, and exactly at the pinned height.
+        let tx = |fee: f64| Transaction {
+            sender: "a".repeat(40),
+            recipient: "b".repeat(40),
+            fee_units: Transaction::to_units(fee),
+            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
+            timestamp: ts,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        // A fee well past the band: refused once activated, allowed before.
+        let over = vec![tx(5.0)];
+        assert!(
+            bc.template_fee_accounting_is_admissible_at(
+                FEE_SYSTEM_ACTIVATION_HEIGHT - 1, ts, &over, FEE_SYSTEM_ACTIVATION_HEIGHT
+            ).unwrap(),
+            "the rule must be inert one block BEFORE activation"
+        );
+        assert!(
+            !bc.template_fee_accounting_is_admissible_at(
+                FEE_SYSTEM_ACTIVATION_HEIGHT, ts, &over, FEE_SYSTEM_ACTIVATION_HEIGHT
+            ).unwrap(),
+            "the rule must be live exactly AT the activation height"
+        );
+        // An ordinary fee stays admissible on both sides — the rule must not be a
+        // blanket reject.
+        let ordinary = vec![tx(0.0002)];
+        for h in [FEE_SYSTEM_ACTIVATION_HEIGHT - 1, FEE_SYSTEM_ACTIVATION_HEIGHT, FEE_SYSTEM_ACTIVATION_HEIGHT + 1] {
+            assert!(
+                bc.template_fee_accounting_is_admissible_at(h, ts, &ordinary, FEE_SYSTEM_ACTIVATION_HEIGHT).unwrap(),
+                "an ordinary default-fee transaction must stay mineable at height {}", h
+            );
+        }
+    }
+
+    // The genesis block is its own rule and must stay so regardless of inputs.
+    #[test]
+    fn genesis_reward_is_fixed_and_ignores_fees() {
+        let bc = test_blockchain();
+        let _ = bc.genesis_timestamp.set(1_783_191_900);
+        for fees in [0.0f64, 1.0, 1e12] {
+            for n in [0usize, 1, 4095] {
+                let got = bc.block_reward_from_totals(0, 1_783_191_900, n, fees).unwrap();
+                assert_eq!(got, GENESIS_LAUNCH_AMOUNT, "genesis reward moved");
+            }
+        }
+    }
+
     // Where the chain actually is. Both the fee activation and the whole of 2026
     // sit inside period 0, where the decay factor is exactly 1.0 on any
     // implementation — so nothing can diverge before the first halving.
