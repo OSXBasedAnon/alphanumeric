@@ -101,6 +101,33 @@ seconds to 5 minutes instead of never.
   it now always agree. They were computed differently — one showed the newest raw
   sample, the other a median of the recent window — so they could sit a spike
   apart. The chart itself still plots the raw per-sample series, bursts included.
+- The chart no longer re-animates while you scroll on a phone. Mobile Safari
+  fires a resize every time the address bar hides or reappears, and each one
+  redrew a chart whose dimensions come purely from its width — so the trace
+  replayed its draw several times before settling. It now redraws only when the
+  width genuinely changes, so rotating still works and the animation is
+  unchanged.
+
+## Wallet and interface
+- **An incoming payment now appears in `balance`, not only in `history`.** The
+  wallet screen tracked money leaving but had no line at all for money arriving,
+  so a transfer on its way in was visible in one place and invisible in the
+  other. It is reported per wallet and in the total, deliberately *below* the
+  confirmed line and never added into it — an unmined credit is not yet yours,
+  and folding it into the total would overstate what you hold.
+- **`history` takes a row count.** `history 50` always worked and was documented
+  nowhere, so the default twelve rows read as the whole ledger. `help` now shows
+  `history [rows]` with its 1–50 range. (`account` takes an address only.)
+- **`help` labels its columns.** Every row reads "what you want, then what you
+  type", but with the typed command on the right nothing said so, and the left
+  column reads like a command list until you notice it isn't.
+- **Inbound notices no longer flood a busy node.** Every payment printed its own
+  line with no ceiling — right for a person, unusable for a pool or an exchange,
+  where it scrolls the screen away. Volume now picks the shape by itself: below
+  the thresholds the output is exactly what it has always been; above them a
+  block collapses to one line (`received 47 payments +12904.11000000 ♦ to 3
+  wallets`). Nothing to configure. Whispers are never folded in — the message is
+  the point of a whisper, and a count would throw it away.
 
 ## Fixed after 7.9.1 (this release)
 - **Reopening a client after hours away no longer refuses to mine.** If catch-up
@@ -146,8 +173,8 @@ height. It is here because 7.9.2 is what most nodes will be running by then.
 ## Artifacts
 | file | sha256 |
 |---|---|
-| alphanumeric-v7.9.2-macos-arm64.zip | `65ca4372eb0f1b5318774308d94a66f6b57dffe24b5c02acc1398970334bbe26` |
-| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `7407c3de4ba1f9fd2afbcd4be237dfd6cb69ce7210d0ad8e98a1fd935f1cde6a` |
+| alphanumeric-v7.9.2-macos-arm64.zip | `4684396880ea63a66f8ef20862554febbad660e45a0be6a98f9dd419a98b8307` |
+| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `97a4d6391185a3c2b07f33876486d1399a63fbef73e3dddb9adb88fe508e1259` |
 
 ## Notes
 - Build verification source: `cargo build --release` on `main`, and
