@@ -1409,10 +1409,22 @@ impl Mgmt {
                 )?;
                 writeln!(stdout)?;
 
+                // MEASURE the money field, never assume its width. `ui_money(x, 4)`
+                // right-pads the whole part to 4 digits, so it is 15 columns up to
+                // 9999.99999999 and WIDER above it — the hardcoded 15 this replaces
+                // drifted the right-hand column one cell per extra digit (one at
+                // 10k, two at 100k, four at 33M). chars(), not len(): the ♦ is three
+                // bytes and one column.
+                let spendable_text = ui_money(balance, 4);
                 ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-                ui_seg(&mut stdout, spec, UI_CYAN, false, &ui_money(balance, 4))?;
+                ui_seg(&mut stdout, spec, UI_CYAN, false, &spendable_text)?;
                 ui_seg(&mut stdout, spec, UI_DIM, false, " spendable")?;
-                ui_pad(&mut stdout, spec, 1 + 15 + 10, 41)?;
+                ui_pad(
+                    &mut stdout,
+                    spec,
+                    1 + spendable_text.chars().count() + " spendable".chars().count(),
+                    41,
+                )?;
                 if maturing_total > 0.0 {
                     ui_seg(&mut stdout, spec, UI_ORANGE, false, &ui_money(maturing_total, 4))?;
                     ui_seg(
@@ -1428,16 +1440,20 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 if pending_stats.0 > 0 || pending_stats.1 > 0 {
+                    let pending_text = ui_money(pending_stats.2, 4);
+                    let pending_label = format!(" pending out · {}", pending_stats.0);
                     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &ui_money(pending_stats.2, 4))?;
-                    ui_seg(
+                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &pending_text)?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, &pending_label)?;
+                    // Same measured form. The label carries a "·" (two bytes, one
+                    // column) as well as the money field's ♦, so byte length would
+                    // over-count both.
+                    ui_pad(
                         &mut stdout,
                         spec,
-                        UI_DIM,
-                        false,
-                        &format!(" pending out · {}", pending_stats.0),
+                        1 + pending_text.chars().count() + pending_label.chars().count(),
+                        41,
                     )?;
-                    ui_pad(&mut stdout, spec, 1 + 15 + 16 + pending_stats.0.to_string().len(), 41)?;
                     ui_seg(
                         &mut stdout,
                         spec,
@@ -2477,6 +2493,23 @@ mod tests {
     use super::*;
     use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    // `ui_money(x, 4)` is 15 columns only while the whole part fits 4 digits. The
+    // account screen used to pad with a hardcoded 15, so every extra digit shoved
+    // its right-hand column one cell — a real drift at 10,000 coins, which is
+    // ordinary mining territory. Pin the widths the layout now measures.
+    #[test]
+    fn ui_money_width_grows_past_four_whole_digits() {
+        // chars(), not len(): the ♦ is three bytes and one display column.
+        assert_eq!(ui_money(0.0, 4).chars().count(), 15);
+        assert_eq!(ui_money(9_999.999_999_99, 4).chars().count(), 15);
+        assert_eq!(ui_money(10_000.0, 4).chars().count(), 16, "10k adds a column");
+        assert_eq!(ui_money(123_456.789, 4).chars().count(), 17);
+        assert_eq!(ui_money(33_554_432.0, 4).chars().count(), 19);
+        // byte length would over-count the ♦ by two and mis-place every column.
+        assert_eq!(ui_money(0.0, 4).len(), 17);
+        assert_ne!(ui_money(0.0, 4).len(), ui_money(0.0, 4).chars().count());
+    }
 
     #[test]
     fn wallet_coin_parser_is_exact_and_never_silently_rounds() {
