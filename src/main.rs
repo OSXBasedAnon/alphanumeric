@@ -1923,7 +1923,9 @@ async fn async_main() -> Result<()> {
             }
 
             if command.is_empty() {
-                println!("Please enter a command.");
+                // A bare Enter is the most common way a newcomer probes a REPL,
+                // so it should point somewhere instead of scolding them.
+                println!("Type `help` for the command list.");
                 continue;
             }
 
@@ -3581,6 +3583,12 @@ Some("help") => {
     // address") overflowed their own column and shoved their command two cells
     // right, so the command column was ragged wherever a label ran long.
     const CMD: usize = 19;
+    // Where a description sits when a row has one. 41 is UI_RIGHT_LABEL, the
+    // column the status grids put their right-hand pane on, and it is also the
+    // first column that clears the longest command on a described row
+    // ("<from> <to> <amount>") — so every description shares one column instead
+    // of breaking wherever its command happened to end.
+    const NOTE: usize = 41;
 
     macro_rules! row {
         ($goal:expr, $hue:expr, $cmd:expr, $args:expr) => {{
@@ -3595,9 +3603,24 @@ Some("help") => {
                 CMD.max(goal.chars().count() + 2),
             )?;
             ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
+            let cmd_end = CMD.max(goal.chars().count() + 2) + $cmd.chars().count();
             let args: &str = $args;
             if !args.is_empty() {
-                ui_seg(&mut stdout, spec, UI_DIM, false, args)?;
+                // Two kinds of trailing text, told apart by a leading space:
+                //   "account " + "<address>"        syntax — part of the command
+                //   "mine"     + "   rewards go…"   a description of it
+                // Syntax must stay welded to the keyword, but a description is a
+                // second column and has to line up like one. Emitting both the
+                // same way left every description hanging at whatever column its
+                // command happened to end on — "mine" broke at 21, the row under
+                // it at 22, `--getpeers` at 27 — which reads as ragged spacing
+                // rather than a table.
+                if args.starts_with(' ') {
+                    ui_pad(&mut stdout, spec, cmd_end, NOTE.max(cmd_end + 2))?;
+                    ui_seg(&mut stdout, spec, UI_DIM, false, args.trim_start())?;
+                } else {
+                    ui_seg(&mut stdout, spec, UI_DIM, false, args)?;
+                }
             }
             writeln!(stdout)?;
         }};
@@ -3868,10 +3891,10 @@ Some(_) => {
                             }
                         }
                     } else {
-                        println!("Invalid command. Type 'help' for command list or 'info' for blockchain details.");
+                        println!("Unknown command. Type `help` for the command list, or `info` for chain status.");
                     }
                 }
-None => println!("Please enter a command."),
+None => println!("Type `help` for the command list."),
 }
 }
 // Ensure this block properly closes the `async move {` scope
