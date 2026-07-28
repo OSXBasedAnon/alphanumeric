@@ -2779,7 +2779,7 @@ impl From<BlockchainError> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     // A registered key from a DISTINCT source IP (octet), so N such entries count as N
     // distinct eligible verifiers under the anti-Sybil distinct-IP quorum count.
