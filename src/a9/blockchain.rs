@@ -1449,6 +1449,12 @@ pub struct WalletBalanceBreakdown {
     pub confirmed: f64,
     /// In-flight mempool debits against this address.
     pub pending_debit: f64,
+    /// In-flight mempool credits TO this address — a payment on its way in.
+    /// Informational ONLY: it is deliberately absent from `confirmed` and
+    /// `spendable`, because an unmined credit is not money you hold yet. The
+    /// wallet screen showed nothing at all for it, so an incoming transfer was
+    /// visible in `history` but invisible in `balance`.
+    pub pending_credit: f64,
     /// confirmed − pending_debit − immature: what the address can spend right now.
     pub spendable: f64,
     /// Still-immature MINING_REWARDS credits as (reward_height, amount), ascending by
@@ -7488,9 +7494,13 @@ impl Blockchain {
             .checked_sub(pending_debit_units)
             .and_then(|value| value.checked_sub(immature_units))
             .ok_or(BlockchainError::InvalidTransactionAmount)?;
+        // Read-only extra: never feeds spendable/confirmed, so a failure here must
+        // not fail the balance. Absent => nothing incoming to report.
+        let pending_credit_units = self.get_pending_credit_units(address).await.unwrap_or(0);
         Ok(WalletBalanceBreakdown {
             confirmed: Transaction::from_units(confirmed_units),
             pending_debit: Transaction::from_units(pending_debit_units),
+            pending_credit: Transaction::from_units(pending_credit_units),
             spendable: Transaction::from_units(spendable_units),
             maturing: maturing_units
                 .into_iter()
