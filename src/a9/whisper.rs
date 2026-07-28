@@ -67,16 +67,13 @@ impl WhisperModule {
         let mut out = Vec::new();
         let mut idx = tip as i64;
         while idx >= 0 && out.len() < Self::MAX_WINDOW_BLOCKS {
-            match blockchain.get_block(idx as u32) {
-                Ok(block) => {
-                    if block.timestamp < cutoff_secs {
-                        break;
-                    }
-                    out.push(block);
+            // A transient/missing height is tolerated (matches get_blocks' filter_map)
+            // rather than aborting the window walk.
+            if let Ok(block) = blockchain.get_block(idx as u32) {
+                if block.timestamp < cutoff_secs {
+                    break;
                 }
-                // Tolerate a transient/missing height (matches get_blocks' filter_map)
-                // without aborting the window walk.
-                Err(_) => {}
+                out.push(block);
             }
             idx -= 1;
         }

@@ -1363,7 +1363,7 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-                let seen = history.as_ref().map_or(false, |s| s.tx_count > 0);
+                let seen = history.as_ref().is_some_and(|s| s.tx_count > 0);
                 if seen {
                     ui_seg(&mut stdout, spec, UI_GREEN, false, "✓ ACTIVE")?;
                 } else {

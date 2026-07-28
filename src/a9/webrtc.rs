@@ -552,7 +552,7 @@ impl WebRtcMesh {
     async fn forget_if_current(&self, peer_id: &str, pc: &Arc<RTCPeerConnection>) -> bool {
         let removed = {
             let mut conns = self.conns.lock().await;
-            if conns.get(peer_id).map_or(false, |c| Arc::ptr_eq(&c.pc, pc)) {
+            if conns.get(peer_id).is_some_and(|c| Arc::ptr_eq(&c.pc, pc)) {
                 conns.remove(peer_id);
                 true
             } else {

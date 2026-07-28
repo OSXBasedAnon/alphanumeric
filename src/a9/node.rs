@@ -3339,7 +3339,7 @@ impl Node {
         // attention) peaks. If the tip has advanced >= 8 blocks since the last
         // snapshot, post now; a 5s burst floor still bounds the POST rate during
         // storms, and a quiet chain keeps the old 30s cadence untouched.
-        let tip_now = { self.blockchain.read().await.get_latest_block_index() as u64 };
+        let tip_now = { self.blockchain.read().await.get_latest_block_index() };
         let last_h = self.last_header_snapshot_height.load(Ordering::Acquire);
         let last_at = self.last_header_snapshot_at.load(Ordering::Acquire);
         // Burst floor 7s: the gateway allows 10 header POSTs/min per IP, so the
@@ -9107,7 +9107,7 @@ impl Node {
                 .as_secs();
             let mut breakers = self.outbound_circuit_breakers.write().await;
             breakers.retain(|addr, state| {
-                state.open_until.map_or(false, |until| until > now)
+                state.open_until.is_some_and(|until| until > now)
                     || active_peers.contains(addr)
             });
         }
@@ -9150,7 +9150,11 @@ impl Node {
                 match highest {
                     // Empty reply: the peer can't serve this range — stop rather than spin.
                     None => break,
-                    Some(h) if h >= u32::MAX => break,
+                    // At the ceiling there is no next height to advance to; `>=` here
+                    // read as a range guard but can only ever be equality, which made
+                    // clippy's absurd_extreme_comparisons deny fire and blocked the
+                    // lint from running over the rest of the crate.
+                    Some(h) if h == u32::MAX => break,
                     Some(h) => batch_start = h.saturating_add(1),
                 }
             }
@@ -10057,7 +10061,7 @@ impl Node {
             if full_tx
                 .sig_hash
                 .as_ref()
-                .map_or(false, |claimed| claimed != &derived)
+                .is_some_and(|claimed| claimed != &derived)
             {
                 return false;
             }
