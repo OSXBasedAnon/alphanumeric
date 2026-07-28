@@ -27,6 +27,12 @@ use termcolor::{Color, ColorSpec, StandardStream, WriteColor};
 // ─── palette ───────────────────────────────────────────────────────────────
 pub const UI_LABEL: Color = Color::Rgb(230, 230, 230);
 pub const UI_DIM: Color = Color::Rgb(128, 128, 128);
+/// One step brighter than UI_DIM, for secondary text that still has to be READ
+/// rather than merely sensed — argument ranges, defaults, units. UI_DIM is
+/// correct for labels the eye skips past, but the same grey on something a user
+/// must actually parse (`1-50, default 12`) reads as unavailable rather than
+/// quiet.
+pub const UI_MUTED: Color = Color::Rgb(170, 170, 170);
 pub const UI_CYAN: Color = Color::Rgb(40, 204, 217);
 pub const UI_BLUE: Color = Color::Rgb(137, 207, 211);
 pub const UI_GREEN: Color = Color::Rgb(59, 242, 173);
