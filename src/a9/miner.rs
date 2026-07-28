@@ -25,8 +25,11 @@ use crate::a9::codec;
 // Constants for ProgPOW
 const PROGPOW_LANES: usize = 16;
 const PROGPOW_REGS: usize = 32;
-const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {msg}";
-const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {msg}";
+// {wide_msg}: indicatif never truncates a plain {msg}, so a long status line
+// WRAPS and the single moving bar becomes a flickering two-row block on an
+// 80-col terminal; wide_msg clips the message to the remaining row instead.
+const MINING_PROGRESS_TEMPLATE: &str = "{prefix} {bar:37.cyan/blue} {pos:>7}/{len:7} {wide_msg}";
+const MINING_SUCCESS_TEMPLATE: &str = "{prefix} {bar:36.cyan/blue}> {pos:>7}/{len:7} {wide_msg}";
 /// How often (in nonces, per thread) the hot loop polls the ATOMIC tip-change
 /// counter. One Acquire load — cheap enough to keep tight so a solved block
 /// elsewhere aborts wasted work within microseconds.
