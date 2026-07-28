@@ -58,6 +58,15 @@ seconds to 5 minutes instead of never.
   block that gets reorged out is reported instead of the reward quietly
   vanishing.
 - **Faster start-up:** boot no longer rescans the whole chain to find its tip.
+- **A client closed for hours now catches up instead of giving up.** Peers keep
+  full witnesses only for the most recent stretch of chain, but deep catch-up was
+  demanding them for every block — including thousands whose witnesses no longer
+  exist anywhere. It crawled through empty blocks, stalled on the first block
+  containing a payment, and eventually closed the client outright, so the only
+  practical fix was deleting the chain and starting over. Such spans are now
+  pulled in one proven piece, verified end-to-end against the signed tip beacon
+  down to the block you already hold, and applied the same way a fresh snapshot
+  is. Nothing is applied until the whole span checks out.
 - **Peer request handling hardened.** Block-range requests from peers are
   bounded in one more place. No behaviour change for normal peers, and no change
   to what any node accepts as valid — but it is a reason to take this release
@@ -137,8 +146,8 @@ height. It is here because 7.9.2 is what most nodes will be running by then.
 ## Artifacts
 | file | sha256 |
 |---|---|
-| alphanumeric-v7.9.2-macos-arm64.zip | `c645259c4ec75356893dcd98750051e3af84ba312c572ab5131f2856a204806a` |
-| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `1602758c75aec67d4046e7e6a7bdb47f1219558ae32be781d841a0b1bbbf4878` |
+| alphanumeric-v7.9.2-macos-arm64.zip | `65ca4372eb0f1b5318774308d94a66f6b57dffe24b5c02acc1398970334bbe26` |
+| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `7407c3de4ba1f9fd2afbcd4be237dfd6cb69ce7210d0ad8e98a1fd935f1cde6a` |
 
 ## Notes
 - Build verification source: `cargo build --release` on `main`, and
