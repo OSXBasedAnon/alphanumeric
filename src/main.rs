@@ -3784,13 +3784,16 @@ Some("help") => {
         false,
         "one block unless --continuous; Enter stops it.",
     )?;
+    // The newline this line is missing let the two notes run together into one
+    // over-long line that wrapped off the right edge of the screen.
+    writeln!(stdout)?;
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(
         &mut stdout,
         spec,
         UI_DIM,
         false,
-        "this is the GPU build; --gpu is the default here, --cpu forces the CPU miner.",
+        "--gpu is default on this build; --cpu forces the CPU miner",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
