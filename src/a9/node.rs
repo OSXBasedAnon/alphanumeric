@@ -110,6 +110,14 @@ const DEFAULT_HEADER_SNAPSHOT_INTERVAL_SECS: u64 = 30;
 // negative-cached) rather than letting resolution run for an unbounded stretch.
 const WITNESS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 const WITNESS_RESOLVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Ceiling on a beacon-committed catch-up span, in blocks and in buffered bytes.
+/// The span is held in memory until the whole chain is proven against the signed
+/// beacon (that proof is what makes it safe), so it must be bounded. A gap past
+/// either bound falls through to the snapshot bootstrap, which is the cheaper
+/// recovery at that depth anyway. 8192 blocks is ~11 hours of chain at the 5s
+/// target, so an overnight-idle client heals in place.
+const COMMITTED_SPAN_MAX_BLOCKS: u32 = 8192;
+const COMMITTED_SPAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
 /// origin/Redis nothing, so this stays O(1) in client count; a version change is
 /// the ONLY thing that triggers a block fetch, so there is no redundant pulling.
@@ -14041,6 +14049,107 @@ impl Node {
         (cursor, end)
     }
 
+    /// One link of the backward commitment walk: this block must BE the hash the block above
+    /// it demanded, and its header must actually hash to that value. Substitution, reordering
+    /// and omission all fail here, which is what makes the span self-proving. Split out from
+    /// the PoW check so the commitment rule itself stays unit-testable without mining.
+    fn committed_link_ok(block: &Block, demanded_hash: [u8; 32]) -> bool {
+        block.hash == demanded_hash && block.calculate_hash_for_block() == block.hash
+    }
+
+    /// Pull [local_tip+1 ..= beacon.height] and prove the whole span against the signed
+    /// beacon BEFORE any of it is applied.
+    ///
+    /// Why this exists: peers retain full ML-DSA witnesses for only WITNESS_RETENTION_BLOCKS
+    /// past confirmation. A client that was closed for hours comes back needing thousands of
+    /// blocks whose witnesses no longer exist ANYWHERE, so routing them through
+    /// verify_block_with_witness cannot succeed — it inches through coinbase-only blocks and
+    /// stalls on the first block carrying a real transaction. The receipt path is the correct
+    /// path for witness-pruned history (that is what it is for); the only thing it needs is
+    /// proof that the span is canonical.
+    ///
+    /// The proof is self-contained and does NOT trust the serving peer. Walking DOWNWARD from
+    /// the gateway-signed beacon hash, each block's `previous_hash` dictates the hash the next
+    /// block down must have, so every block is transitively committed by a signature the node
+    /// already trusts for bootstrap manifests. The walk terminates by requiring the bottom of
+    /// the span to chain into THIS node's own current tip hash — so the result is strictly
+    /// stronger than a snapshot, which is committed by the same key but anchored to nothing we
+    /// hold. A peer that substitutes, reorders, omits or forges any block breaks the chain and
+    /// gets None, and the caller falls through to today's behaviour.
+    ///
+    /// Returns the span ASCENDING, ready to apply in order.
+    async fn fetch_beacon_committed_span(
+        &self,
+        peer: SocketAddr,
+        beacon: &TipBeaconInfo,
+        local_tip: u32,
+        local_tip_hash: [u8; 32],
+        deadline: Option<Instant>,
+    ) -> Option<Vec<Block>> {
+        if beacon.height <= local_tip {
+            return None;
+        }
+        if beacon.height.saturating_sub(local_tip) > COMMITTED_SPAN_MAX_BLOCKS {
+            return None;
+        }
+
+        let mut expected_hash = beacon.hash;
+        let mut needed = beacon.height;
+        let mut collected: Vec<Block> = Vec::new();
+        let mut buffered_bytes = 0usize;
+
+        while needed > local_tip {
+            if Self::full_sync_deadline_expired(deadline) {
+                return None;
+            }
+            let window_start = needed
+                .saturating_sub(MAX_GETBLOCKS_SPAN.saturating_sub(1))
+                .max(local_tip.saturating_add(1));
+            let blocks = self.request_blocks(peer, window_start, needed).await.ok()?;
+            let mut by_height: std::collections::HashMap<u32, Block> = blocks
+                .into_iter()
+                .filter(|b| b.index >= window_start && b.index <= needed)
+                .map(|b| (b.index, b))
+                .collect();
+
+            let progressed_from = needed;
+            while needed > local_tip {
+                let Some(block) = by_height.remove(&needed) else {
+                    break;
+                };
+                // The hash this block MUST have was fixed by the block above it (and the
+                // topmost by the signed beacon). PoW is checked alongside, so a peer cannot
+                // hand back a cheaply-forged body under a demanded hash.
+                if !Self::committed_link_ok(&block, expected_hash) || !block.verify_pow_meets_floor()
+                {
+                    return None;
+                }
+                buffered_bytes = buffered_bytes.saturating_add(
+                    codec::serialize(&block).map(|v| v.len()).unwrap_or(0),
+                );
+                if buffered_bytes > COMMITTED_SPAN_MAX_BYTES {
+                    return None;
+                }
+                expected_hash = block.previous_hash;
+                needed = needed.saturating_sub(1);
+                collected.push(block);
+            }
+            // A window that advanced nothing means this peer cannot serve the span.
+            if needed == progressed_from {
+                return None;
+            }
+        }
+
+        // The span must attach to history WE already hold; otherwise it is a foreign
+        // chain that merely happens to end at the beacon.
+        if expected_hash != local_tip_hash {
+            return None;
+        }
+
+        collected.reverse();
+        Some(collected)
+    }
+
     /// Loop guard: continue only while below the target AND the last batch advanced the tip.
     /// A no-progress batch (empty / all-orphaned / non-linking) terminates the sync — this is
     /// what guarantees termination against a stalling peer.
@@ -14201,6 +14310,53 @@ impl Node {
             .any(|b| b.index == target && b.hash == beacon.hash && b.calculate_hash_for_block() == b.hash));
         if !probe_ok {
             return Converge::NeedsBootstrap;
+        }
+
+        // STEP 2b: DEEP gap — past the witness retention window the per-block witness path
+        // below cannot succeed, because those witnesses no longer exist on any peer. Prove the
+        // whole span against the signed beacon first, then apply it through the receipt path
+        // (the path witness-pruned history is meant to take). Purely additive: if the span
+        // cannot be proven, or is too deep to buffer, this yields nothing and STEP 3 runs
+        // exactly as before.
+        {
+            let (local_tip, local_tip_hash) = {
+                let bc = self.blockchain.read().await;
+                let tip = bc.get_latest_block_index() as u32;
+                (tip, bc.get_block(tip).ok().map(|b| b.hash))
+            };
+            let gap = target.saturating_sub(local_tip);
+            if gap > crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32 {
+                if let Some(tip_hash) = local_tip_hash {
+                    if let Some(span) = self
+                        .fetch_beacon_committed_span(peer, &beacon, local_tip, tip_hash, deadline)
+                        .await
+                    {
+                        info!(
+                            "peer full-sync: applying {} beacon-committed blocks ({}..={})",
+                            span.len(),
+                            local_tip.saturating_add(1),
+                            target
+                        );
+                        for block in &span {
+                            if let Err(e) = self
+                                .blockchain
+                                .write()
+                                .await
+                                .save_receipt_verified_block(block)
+                                .await
+                            {
+                                // Stop at the first refusal: the rest cannot link past a gap,
+                                // and STEP 3 will resume from wherever the tip actually got to.
+                                warn!(
+                                    "peer full-sync: committed block {} rejected: {}",
+                                    block.index, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // STEP 3: bulk-pull [local_tip+1 .. target] ascending, applying each block through the
@@ -14892,6 +15048,130 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A self-consistent block at `index` whose parent is `previous_hash`. PoW is not mined —
+    // these exercise the COMMITMENT rule, which is what stands between us and a hostile peer;
+    // proof-of-work is enforced separately by verify_pow_meets_floor at the call site.
+    fn linked_block(index: u32, previous_hash: [u8; 32], nonce: u64) -> Block {
+        let mut b = Block {
+            index,
+            previous_hash,
+            timestamp: 1_700_000_000 + index as u64,
+            transactions: Vec::new(),
+            nonce,
+            difficulty: 464,
+            hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+        };
+        b.hash = b.calculate_hash_for_block();
+        b
+    }
+
+    // Builds `len` blocks ascending from `root`, each chaining to the previous.
+    fn linked_chain(root: [u8; 32], start_index: u32, len: u32) -> Vec<Block> {
+        let mut out = Vec::new();
+        let mut parent = root;
+        for i in 0..len {
+            let b = linked_block(start_index + i, parent, i as u64);
+            parent = b.hash;
+            out.push(b);
+        }
+        out
+    }
+
+    // Walk the chain downward exactly as fetch_beacon_committed_span does, and report the
+    // parent hash the span bottoms out on (the value that must equal our own tip hash).
+    fn walk_down(chain: &[Block], beacon_hash: [u8; 32]) -> Option<[u8; 32]> {
+        let mut expected = beacon_hash;
+        for block in chain.iter().rev() {
+            if !Node::committed_link_ok(block, expected) {
+                return None;
+            }
+            expected = block.previous_hash;
+        }
+        Some(expected)
+    }
+
+    // The span is only safe because it is self-proving: starting from the gateway-signed
+    // beacon hash, every block down to our own tip is pinned by the block above it.
+    #[test]
+    fn committed_span_walks_from_the_beacon_down_to_our_own_tip() {
+        let our_tip_hash = [7u8; 32];
+        let chain = linked_chain(our_tip_hash, 101, 40);
+        let beacon_hash = chain.last().unwrap().hash;
+
+        assert_eq!(
+            walk_down(&chain, beacon_hash),
+            Some(our_tip_hash),
+            "an honest span must bottom out on the tip we already hold"
+        );
+    }
+
+    // A peer that swaps in a different block anywhere in the span breaks the chain of
+    // demanded hashes. This is the property that lets us skip witness verification safely.
+    #[test]
+    fn committed_span_rejects_substitution_reorder_and_omission() {
+        let our_tip_hash = [7u8; 32];
+        let chain = linked_chain(our_tip_hash, 101, 40);
+        let beacon_hash = chain.last().unwrap().hash;
+
+        // SUBSTITUTION: a foreign block spliced into the middle.
+        let mut swapped = chain.clone();
+        swapped[20] = linked_block(121, [9u8; 32], 999);
+        assert!(
+            walk_down(&swapped, beacon_hash).is_none(),
+            "a substituted block must break the commitment"
+        );
+
+        // TAMPERING: right hash claimed, contents changed — header no longer hashes to it.
+        let mut tampered = chain.clone();
+        tampered[20].timestamp += 1;
+        assert!(
+            walk_down(&tampered, beacon_hash).is_none(),
+            "a body that does not hash to its claimed hash must be rejected"
+        );
+
+        // REORDER: two adjacent blocks transposed.
+        let mut reordered = chain.clone();
+        reordered.swap(20, 21);
+        assert!(
+            walk_down(&reordered, beacon_hash).is_none(),
+            "reordering must break the commitment"
+        );
+
+        // OMISSION: a block dropped from the middle.
+        let mut omitted = chain.clone();
+        omitted.remove(20);
+        assert!(
+            walk_down(&omitted, beacon_hash).is_none(),
+            "omitting a block must break the commitment"
+        );
+
+        // FOREIGN CHAIN: internally valid, ends at the beacon, but does not attach to us.
+        let foreign = linked_chain([42u8; 32], 101, 40);
+        let foreign_beacon = foreign.last().unwrap().hash;
+        assert_eq!(
+            walk_down(&foreign, foreign_beacon),
+            Some([42u8; 32]),
+            "a foreign chain walks cleanly but bottoms out somewhere we do not hold"
+        );
+        assert_ne!(
+            walk_down(&foreign, foreign_beacon),
+            Some(our_tip_hash),
+            "which is exactly what the bottom-anchor check catches"
+        );
+    }
+
+    // A span claiming to end at the beacon must actually END there.
+    #[test]
+    fn committed_span_requires_the_top_to_be_the_beacon_hash() {
+        let our_tip_hash = [7u8; 32];
+        let chain = linked_chain(our_tip_hash, 101, 40);
+        assert!(
+            walk_down(&chain, [0xABu8; 32]).is_none(),
+            "a top block that is not the signed beacon hash must be rejected"
+        );
+    }
 
     // A block-serving range that ends at the height ceiling must terminate. The
     // serve loop advances with `idx = chunk_end + 1`; a saturating advance makes
