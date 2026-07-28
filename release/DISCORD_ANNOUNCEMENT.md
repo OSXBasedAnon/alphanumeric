@@ -71,9 +71,9 @@ GPU: `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
 
 ### Artifacts + checksums
 - `alphanumeric-v7.9.2-macos-arm64.zip`
-  - `73d254f8ffc9218beba0381d25f892034102e037c6bb360241130a60ca2d8e1d`
+  - `c645259c4ec75356893dcd98750051e3af84ba312c572ab5131f2856a204806a`
 - `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
-  - `6b2d810a158db54b9e1398a06465aae4e957e04c8d002cf24abcf72a8132e036`
+  - `1602758c75aec67d4046e7e6a7bdb47f1219558ae32be781d841a0b1bbbf4878`
 
 Source build commands:
 - Standard: `git checkout main && cargo build --release`
