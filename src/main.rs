@@ -1,6 +1,6 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
@@ -1345,7 +1345,7 @@ async fn async_main() -> Result<()> {
                             if tx.sender == "MINING_REWARDS" {
                                 continue; // mining rewards are reported by the miner
                             }
-                            if !addresses.iter().any(|a| *a == tx.recipient) {
+                            if !addresses.contains(&tx.recipient) {
                                 continue;
                             }
                             let from_short = &tx.sender[..tx.sender.len().min(10)];
@@ -1951,7 +1951,7 @@ async fn async_main() -> Result<()> {
 
     // Node metrics (validators only) — gathered here, printed after the grid.
     let sentinel = staking_node.read().await;
-    let node_metrics = sentinel.get_node_metrics(&node.id().to_string()).await.ok();
+    let node_metrics = sentinel.get_node_metrics(node.id()).await.ok();
 
     // Time-boxed: get_network_metrics reads a lock whose writer used to be held
     // across slow chain reads for the length of a reorg — the "info prints the
@@ -2033,7 +2033,7 @@ async fn async_main() -> Result<()> {
     // is the only hue allowed to cross pane boundaries, so a slow chain stays
     // louder than the zoning around it.
     let block_target_secs = u64::from(block_target);
-    let stale = block_age.map_or(false, |age| age > block_target_secs.saturating_mul(2));
+    let stale = block_age.is_some_and(|age| age > block_target_secs.saturating_mul(2));
     let age_multiple = block_age
         .filter(|_| block_target_secs > 0)
         .map(|age| age / block_target_secs)
@@ -6290,7 +6290,7 @@ async fn publish_bootstrap_snapshot(
         {
             Ok(r) if r.status().is_success() => match r.json::<BlobPutResponse>().await {
                 Ok(b) if !b.url.trim().is_empty() => {
-                    info!(
+                    log::info!(
                         "bootstrap snapshot uploaded directly to blob ({} bytes): {}",
                         compressed_bytes, b.url
                     );

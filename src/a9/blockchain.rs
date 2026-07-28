@@ -1717,6 +1717,7 @@ impl Blockchain {
     ///   4. address history index is display-only — fail open.
     ///   5. clear the dirty marker LAST, so any earlier failure leaves it set and the next apply
     ///      (or startup) retries recovery.
+    ///
     /// This is the SAME body `initialize()` runs at startup, factored out so live and startup
     /// recovery cannot drift.
     async fn recover_dirty_chain_state(
@@ -5164,7 +5165,7 @@ impl Blockchain {
         // already covered by gate (1) / the finalize inline check, so it stays 0 here.
         let immature = match block {
             None => {
-                let h = self.get_latest_block_index() as u64 + 1;
+                let h = self.get_latest_block_index() + 1;
                 self.immature_reward_units_scan(&tx.sender, h, &[])
             }
             Some(_) => 0,
@@ -5899,7 +5900,7 @@ impl Blockchain {
         // M06 (advisory): don't admit a tx that spends an immature reward at the next height.
         let immature = self.immature_reward_units_scan(
             &transaction.sender,
-            self.get_latest_block_index() as u64 + 1,
+            self.get_latest_block_index() + 1,
             &[],
         );
         let available_balance = confirmed_units - pending_units - immature;
@@ -6106,7 +6107,7 @@ impl Blockchain {
         // filter is not (a confirmed-index lookup plus a witness hex decode per
         // transaction), so the bounded walk below pays the expensive check only
         // for the transactions that actually compete for the next block.
-        candidates.sort_by(|a, b| Self::template_candidate_order(a, b));
+        candidates.sort_by(Self::template_candidate_order);
 
         let next_height = self.next_block_index();
         let activated = next_height >= FEE_SYSTEM_ACTIVATION_HEIGHT;
@@ -7294,7 +7295,7 @@ impl Blockchain {
     ) -> Result<(i128, i128, Vec<(u32, i128)>, u64), BlockchainError> {
         let confirmed_units = self.get_confirmed_balance_units(address).await?;
         let pending_debit_units = self.get_pending_debit_units(address).await?;
-        let as_of_height = self.get_latest_block_index() as u64;
+        let as_of_height = self.get_latest_block_index();
         let maturing_units =
             self.immature_coinbase_details(address, as_of_height.saturating_add(1), &[]);
         Ok((

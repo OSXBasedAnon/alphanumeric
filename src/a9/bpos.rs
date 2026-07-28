@@ -1440,7 +1440,7 @@ impl BPoSSentinel {
         // plain parallel map over the slice.
         let results: Vec<bool> = blocks
             .into_par_iter()
-            .map(|block| Self::block_passes_basic_checks(block))
+            .map(Self::block_passes_basic_checks)
             .collect();
 
         Ok(results)
@@ -2480,7 +2480,7 @@ impl HeaderSentinel {
                 .verifications
                 .iter()
                 .min_by_key(|e| e.value().timestamp)
-                .map(|e| e.key().clone())
+                .map(|e| *e.key())
             {
                 self.verifications.remove(&oldest);
             }
