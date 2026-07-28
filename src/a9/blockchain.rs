@@ -5892,6 +5892,37 @@ impl Blockchain {
             return Err(BlockchainError::SelfTransferNotAllowed);
         }
 
+        // RELAY-POLICY recipient format. Same discipline as the two guards above:
+        // mempool-admission ONLY. Block validation does not check this before the
+        // activation height, so a mined block carrying a non-canonical recipient
+        // stays fully valid and this can never fork the chain. Enforcing it in
+        // validation would be a soft fork AND would reject history, since any such
+        // transaction already confirmed would retroactively become invalid.
+        //
+        // Worth guarding because a recipient is bound to NOTHING. A sender cannot
+        // be forged — signature verification derives it from the public key — but
+        // there is no key on the receiving side, so until activation a recipient
+        // can be any string at all. Three consequences: junk is written on-chain
+        // permanently; every surface that renders a recipient (notably the gateway,
+        // which serves it as JSON to a web page) is handed arbitrary bytes; and
+        // because supply accounting SKIPS balances keyed by a system address,
+        // coins sent to "MINING_REWARDS" silently drop out of the circulating
+        // supply figure while still existing in the ledger.
+        //
+        // This matches what the reference wallet already refuses in
+        // `validate_wallet_transaction_addresses`, so no honest client is affected;
+        // it closes the API and custom-client paths that skipped it. Rejecting
+        // system addresses too is deliberate — `add_transaction` returns early on a
+        // MINING_REWARDS *sender*, so it only ever sees regular transactions, and a
+        // system address is never a legitimate recipient for one.
+        //
+        // Reverted transactions re-queued by a reorg never reach here (they go
+        // straight to persist_readmitted_pending_tx), so a transaction that was
+        // consensus-valid in a mined block can never be refused re-entry by this.
+        if !is_canonical_user_address(&transaction.recipient) {
+            return Err(BlockchainError::NonCanonicalTransaction);
+        }
+
         // Reject reserved-key collisions at mempool admission (L53): a real address is
         // 40 lowercase hex chars, so it can never begin with the "__" prefix used for
         // internal balances-tree markers (e.g. BALANCES_HEIGHT_KEY = "__height"). A tx
@@ -8271,7 +8302,7 @@ mod tests {
 
         // An incoming block's tx: fully signed AND carrying its committed sig_hash, never gossiped
         // to this node (so PENDING_FULL_SIGNATURES_TREE has no copy).
-        let mut tx = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        let mut tx = signed_transfer(&wallet, &"ee".repeat(20), 10.0, ts).await;
         let sig_bytes = hex::decode(tx.signature.as_ref().unwrap()).unwrap();
         tx.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
         let tx_id = tx.get_tx_id();
@@ -10284,7 +10315,7 @@ mod tests {
         let other = Wallet::new(None).expect("second wallet builds");
         let ts = 1_700_000_000u64;
 
-        let genuine = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        let genuine = signed_transfer(&wallet, &"ee".repeat(20), 10.0, ts).await;
         assert!(
             bc.verify_transaction_signature(&genuine).is_ok(),
             "a correctly-signed witness must verify — honest blocks are unaffected"
@@ -10694,7 +10725,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let tx = signed_transfer(&wallet, "recipient_addr_for_test", 120.0, now).await;
+        let tx = signed_transfer(&wallet, &"ee".repeat(20), 120.0, now).await;
         {
             let g = blockchain.read().await;
             g.add_transaction(tx.clone())
@@ -10899,7 +10930,7 @@ mod tests {
         let ts = 1_700_000_000u64;
 
         // Genuine tx with a correct (bound) sig_hash — verifying it WARMS the cache.
-        let mut genuine = signed_transfer(&wallet, "recipient_addr_for_test", 10.0, ts).await;
+        let mut genuine = signed_transfer(&wallet, &"ee".repeat(20), 10.0, ts).await;
         let sig_bytes = hex::decode(genuine.signature.as_ref().unwrap()).unwrap();
         genuine.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
         assert!(
@@ -10946,7 +10977,7 @@ mod tests {
         );
 
         // A tx with NO claimed sig_hash must still verify (the new `if let Some` guard skips None).
-        let mut no_hash = signed_transfer(&wallet, "recipient_addr_for_test", 11.0, ts).await;
+        let mut no_hash = signed_transfer(&wallet, &"ee".repeat(20), 11.0, ts).await;
         no_hash.sig_hash = None;
         assert!(
             bc.verify_transaction_signature(&no_hash).is_ok(),
@@ -11481,7 +11512,7 @@ mod tests {
     async fn duplicate_transaction_admission_is_idempotent() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, "bob", 1.0, 10_000).await;
+        let tx = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_000).await;
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
 
         blockchain
@@ -11510,8 +11541,8 @@ mod tests {
     async fn concurrent_same_sender_admission_respects_pending_debits() {
         let blockchain = Arc::new(test_blockchain());
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx1 = signed_transfer(&wallet, "bob", 1.0, 10_001).await;
-        let tx2 = signed_transfer(&wallet, "carol", 1.0, 10_002).await;
+        let tx1 = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_001).await;
+        let tx2 = signed_transfer(&wallet, &"cc".repeat(20), 1.0, 10_002).await;
         set_confirmed_balance(&blockchain, &wallet.address, tx1.total_debit_units());
 
         let chain1 = Arc::clone(&blockchain);
@@ -11549,8 +11580,8 @@ mod tests {
         // Asymmetric amounts (delta_a < delta_b) so the pre-fix double-subtract lands on a specific
         // non-saturated value (delta_b - delta_a), not merely the saturating floor of 0 — the debit
         // assertion then pins "cleared exactly once" precisely.
-        let tx_a = signed_transfer(&wallet, "bob", 1.0, 20_001).await;
-        let tx_b = signed_transfer(&wallet, "carol", 2.0, 20_002).await;
+        let tx_a = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 20_001).await;
+        let tx_b = signed_transfer(&wallet, &"cc".repeat(20), 2.0, 20_002).await;
         let delta_a = tx_a.total_debit_units();
         let delta_b = tx_b.total_debit_units();
 
@@ -11644,7 +11675,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let tx = signed_transfer(&wallet, "bob", 1.0, now).await;
+        let tx = signed_transfer(&wallet, &"bb".repeat(20), 1.0, now).await;
         let full_sig_len = hex::decode(tx.signature.as_ref().unwrap()).unwrap().len();
         assert!(
             full_sig_len > 64,
@@ -12675,7 +12706,7 @@ mod tests {
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
 
         // amount 0.01 -> percentage fee 0.00000563 (563 units), under the 10_000-unit floor.
-        let low = signed_transfer(&wallet, "bob", 0.01, 10_000).await;
+        let low = signed_transfer(&wallet, &"bb".repeat(20), 0.01, 10_000).await;
         assert!(low.fee_units < MIN_RELAY_FEE_UNITS);
         let err = blockchain
             .add_transaction(low)
@@ -12684,7 +12715,7 @@ mod tests {
         assert!(matches!(err, BlockchainError::FeeBelowRelayFloor));
 
         // amount 1.0 -> percentage fee 0.000563 (56_306 units) clears the floor.
-        let ok = signed_transfer(&wallet, "bob", 1.0, 10_001).await;
+        let ok = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_001).await;
         assert!(ok.fee_units >= MIN_RELAY_FEE_UNITS);
         blockchain
             .add_transaction(ok)
@@ -12930,9 +12961,29 @@ mod tests {
         tx.pub_key = wallet.get_public_key_hex().await;
         let tx_id = tx.get_tx_id();
 
-        bc.add_transaction(tx)
-            .await
-            .expect("pre-activation pending shape should stage");
+        // Staged DIRECTLY into sled rather than through add_transaction, because
+        // admission now refuses a non-canonical recipient as relay policy. That
+        // guard does not cover the case this test exists for: a transaction
+        // admitted by an OLDER node version, still sitting in the sled pending
+        // tree when the operator upgrades. sync_mempool_with_sled rebuilds the
+        // mempool from that tree without passing through admission, so the
+        // activation-time eviction below is what actually removes it. Writing the
+        // row directly reproduces that state exactly.
+        bc.persist_readmitted_pending_tx(&tx)
+            .expect("pre-activation pending row should stage");
+        let debits = bc
+            .open_pending_debits_tree()
+            .expect("pending debits tree should open");
+        Blockchain::set_pending_debit_for(
+            &debits,
+            &wallet.address,
+            tx.total_debit_units(),
+        )
+        .expect("pending debit should reserve");
+        assert!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap() > 0,
+            "the debit must be reserved before eviction, or the assertion below is vacuous"
+        );
         bc.sync_mempool_with_sled_at(1)
             .await
             .expect("activation revalidation should complete");
@@ -13022,6 +13073,92 @@ mod tests {
         let bc = test_blockchain();
         let tx = user_tx(&"11".repeat(20), &"22".repeat(20), 1.0, 1);
         assert_send(bc.add_transaction(tx));
+    }
+
+    // ANTI-SOFT-FORK REGRESSION, twin of the fee-floor test below. The recipient
+    // format guard is mempool POLICY only. A mined block carrying a non-canonical
+    // recipient must never be rejected FOR THAT REASON before the activation
+    // height: enforcing it in block validation would be a soft fork against
+    // non-upgraded miners, and would retroactively invalidate any such transaction
+    // already in chain history. If this ever fails with NonCanonicalTransaction,
+    // the guard has leaked out of admission and into consensus — revert the leak.
+    #[tokio::test]
+    async fn block_with_non_canonical_recipient_is_not_rejected_for_its_recipient() {
+        let bc = test_blockchain();
+        // Not 40 lowercase hex: uppercase, short, and outright junk.
+        for recipient in ["NOT_AN_ADDRESS", "ZZZZ", &"AB".repeat(20), "MINING_REWARDS"] {
+            let odd = user_tx("alice", recipient, 1.0, 4321);
+            let txs = vec![odd];
+            let merkle_root = Blockchain::calculate_merkle_root(&txs).unwrap();
+            let mut block = Block {
+                index: 9,
+                previous_hash: [0u8; 32],
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                transactions: txs,
+                nonce: 0,
+                difficulty: 0,
+                hash: [0u8; 32],
+                merkle_root,
+            };
+            block.hash = block.calculate_hash_for_block();
+
+            // The block may fail for OTHER reasons (no coinbase, dummy signature,
+            // parent linkage) — what it must never fail with is the format guard.
+            let res = bc.validate_block(&block).await;
+            assert!(
+                !matches!(res, Err(BlockchainError::NonCanonicalTransaction)),
+                "validate_block must never enforce the recipient guard (soft fork) for {:?}, got {:?}",
+                recipient,
+                res
+            );
+            let res_new = bc.validate_new_block(&block).await;
+            assert!(
+                !matches!(res_new, Err(BlockchainError::NonCanonicalTransaction)),
+                "validate_new_block must never enforce the recipient guard (soft fork) for {:?}, got {:?}",
+                recipient,
+                res_new
+            );
+        }
+    }
+
+    // The other half: admission MUST refuse them, or the guard does nothing.
+    #[tokio::test]
+    async fn admission_refuses_a_non_canonical_recipient() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(100.0));
+        // Current timestamp, and an amount whose derived fee clears the relay floor
+        // — otherwise admission would reject for age or fee FIRST and the guard
+        // would never be exercised.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for recipient in ["NOT_AN_ADDRESS", "ZZZZ", &"AB".repeat(20), "MINING_REWARDS"] {
+            let tx = signed_transfer(&wallet, recipient, 1.0, now).await;
+            let err = bc.add_transaction(tx).await.expect_err(
+                "a non-canonical recipient must not enter the mempool",
+            );
+            assert!(
+                matches!(err, BlockchainError::NonCanonicalTransaction),
+                "expected NonCanonicalTransaction for {:?}, got {:?}",
+                recipient,
+                err
+            );
+        }
+        // A canonical recipient still goes through — the guard must not be a
+        // blanket reject.
+        let ok = signed_transfer(&wallet, &"ab".repeat(20), 1.0, now).await;
+        assert!(
+            !matches!(
+                bc.add_transaction(ok).await,
+                Err(BlockchainError::NonCanonicalTransaction)
+            ),
+            "a canonical 40-hex recipient must still be admitted"
+        );
     }
 
     // ANTI-SOFT-FORK REGRESSION: the relay fee floor is mempool POLICY only. A
