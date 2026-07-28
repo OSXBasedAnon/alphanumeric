@@ -18,6 +18,34 @@ pub const MESSAGE_HISTORY_HOURS: i64 = 48;
 /// truncating it without warning.
 pub const MAX_WHISPER_CHARS: usize = 4;
 
+/// The largest fee a transaction of `amount_units` may carry while still being
+/// read as an ordinary payment rather than a whisper.
+///
+/// Whisper classification is a fee-BAND test (see `decode_message_from_fee`):
+/// any fee at or above `amount * FEE_PERCENTAGE + WHISPER_MIN_AMOUNT` decodes to
+/// a 4-letter code. That cannot be tightened on the reading side — the 26^4 =
+/// 456,976 codes are spread over the 990,000 units between WHISPER_MIN_AMOUNT
+/// and MAX_FEE, i.e. ~2.2 units per code, so essentially EVERY in-band fee is
+/// some code's exact encoding. There is no "this was not a whisper" signal left
+/// in the number to recover.
+///
+/// So the invariant has to hold at the sending end: a wallet that did not mean
+/// to whisper must not emit a fee in the band. Historically this held by luck —
+/// the old amount/1776 default sat at the relay floor for small payments, just
+/// under the band — until a flat auto fee pushed every payment of <= 0.1776
+/// coins into it, announcing ordinary receipts as whispers with meaningless
+/// codes AND suppressing their amounts.
+///
+/// Returns the inclusive maximum, never below the relay floor: at amounts small
+/// enough that the band starts at the floor itself, the floor is still safe
+/// (the normalized position is negative for any positive amount).
+pub fn max_non_whisper_fee_units(amount_units: i128) -> i128 {
+    let band_start = Transaction::to_units(
+        Transaction::from_units(amount_units) * FEE_PERCENTAGE + WHISPER_MIN_AMOUNT,
+    );
+    band_start.saturating_sub(1)
+}
+
 const PRIME_TABLE: &[u64] = &[
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
 ];
@@ -499,6 +527,146 @@ impl Default for WhisperModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE REGRESSION. A wallet's automatic fee must never be readable as a
+    /// whisper. Classification is a fee-band test that cannot be tightened when
+    /// decoding (26^4 codes over 990,000 units is ~2.2 units per code, so almost
+    /// every in-band fee IS some code's exact encoding) — so the invariant has to
+    /// hold at the sending end. When it did not, every payment of <= 0.1776 coins
+    /// at the flat 0.0002 auto fee was announced to the recipient as a whisper
+    /// with a meaningless code, and its amount was never displayed at all.
+    #[test]
+    fn a_clamped_auto_fee_is_never_read_as_a_whisper() {
+        let w = WhisperModule::new();
+        // The three fees the estimator can emit, unclamped: floor, quiet anchor,
+        // congested auto cap.
+        for raw_fee_units in [10_000i128, 20_000, 200_000] {
+            for amount in [
+                0.00001f64, 0.0001, 0.001, 0.01, 0.05, 0.1, 0.1776, 0.2, 1.0, 25.0, 1000.0,
+            ] {
+                let amount_units = Transaction::to_units(amount);
+                let ceiling = max_non_whisper_fee_units(amount_units);
+                // Exactly what handle_create_transaction now emits.
+                let sent = raw_fee_units.min(ceiling).max(10_000);
+                assert_eq!(
+                    w.decode_message_from_fee(
+                        Transaction::from_units(sent),
+                        0,
+                        amount
+                    ),
+                    None,
+                    "auto fee {} units on a {} coin payment decoded as a whisper",
+                    sent,
+                    amount
+                );
+            }
+        }
+    }
+
+    /// The clamp must not break the feature it protects: a real whisper's fee is
+    /// chosen by the encoder, not the estimator, so it stays above the ceiling and
+    /// still decodes to exactly the code that was sent.
+    #[test]
+    fn clamping_payments_does_not_disturb_real_whispers() {
+        let w = WhisperModule::new();
+        for code in ["test", "heym", "abcd", "zzzz", "node"] {
+            for amount in [0.0001f64, 0.05, 1.0, 25.0] {
+                let fee = w.encode_message_as_fee(code, 0, amount);
+                assert_eq!(
+                    w.decode_message_from_fee(fee, 0, amount),
+                    Some(code.to_uppercase()),
+                    "whisper {:?} at {} coins stopped decoding",
+                    code,
+                    amount
+                );
+                assert!(
+                    Transaction::to_units(fee) > max_non_whisper_fee_units(Transaction::to_units(amount)),
+                    "whisper {:?} at {} coins should sit above the payment ceiling",
+                    code,
+                    amount
+                );
+            }
+        }
+    }
+
+    /// The ceiling is only ever a REDUCTION, and never below the relay floor —
+    /// so clamping can never produce a fee the mempool would reject.
+    #[test]
+    fn the_whisper_ceiling_never_forces_a_sub_floor_fee() {
+        for amount in [0.0f64, 0.00000001, 0.00001, 0.001, 1.0, 1_000_000.0] {
+            let amount_units = Transaction::to_units(amount);
+            let sent = 20_000i128
+                .min(max_non_whisper_fee_units(amount_units))
+                .max(10_000);
+            assert!(
+                sent >= 10_000,
+                "clamped fee {} for amount {} fell below the relay floor",
+                sent,
+                amount
+            );
+        }
+    }
+
+    // PROOF, against the real decode path rather than a replica: an ORDINARY
+    // payment carrying the reference wallet's default fee is misread as a whisper.
+    //
+    // decode_message_from_fee subtracts only the PERCENTAGE fee
+    // (amount * FEE_PERCENTAGE) before testing the remainder against the whisper
+    // band. But the wallet no longer prices the default fee as a percentage — it
+    // is a flat FEE_ESTIMATE_ANCHOR_UNITS (0.0002). So for any small payment the
+    // leftover lands inside [WHISPER_MIN_AMOUNT, MAX_FEE] and decodes to four
+    // letters, which decode_whisper_in_tx reports as a message.
+    #[test]
+    fn ordinary_small_payment_is_misread_as_a_whisper() {
+        let whisper = WhisperModule::new();
+        let default_fee = 0.0002_f64; // FEE_ESTIMATE_ANCHOR_UNITS in coins
+
+        // A plain transfer. No whisper was ever encoded into this fee.
+        let mut misread = Vec::new();
+        for amount in [0.00001_f64, 0.001, 0.01, 0.05, 0.1, 0.15] {
+            let tx = Transaction {
+                sender: "a".repeat(40),
+                recipient: "b".repeat(40),
+                amount_units: Transaction::to_units(amount),
+                fee_units: Transaction::to_units(default_fee),
+                timestamp: 1_783_600_000,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            };
+            if let Some(code) = whisper.decode_whisper_in_tx(&tx) {
+                misread.push((amount, code));
+            }
+        }
+        assert!(
+            !misread.is_empty(),
+            "expected the default-fee payments to be misread; got none"
+        );
+        // Every one of them, not just an unlucky value.
+        assert_eq!(
+            misread.len(),
+            6,
+            "all six ordinary payments should misdecode, got {:?}",
+            misread
+        );
+
+        // Above the crossover the misreading stops, which confirms the cause is
+        // the flat fee and not something incidental.
+        let big = Transaction {
+            sender: "a".repeat(40),
+            recipient: "b".repeat(40),
+            amount_units: Transaction::to_units(1.0),
+            fee_units: Transaction::to_units(default_fee),
+            timestamp: 1_783_600_000,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        };
+        assert!(
+            whisper.decode_whisper_in_tx(&big).is_none(),
+            "a 1-coin payment at the same fee must NOT decode as a whisper"
+        );
+    }
 
     #[tokio::test]
     async fn whisper_creation_does_not_double_count_previous_local_send() {

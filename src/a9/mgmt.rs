@@ -18,6 +18,7 @@ use crate::a9::blockchain::{
     is_canonical_user_address, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES,
     WALLET_FEE_SAFETY_LIMIT_UNITS,
 };
+use crate::a9::whisper::max_non_whisper_fee_units;
 use crate::a9::ui::{
     ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg,
     ui_text,
@@ -1026,20 +1027,36 @@ impl Mgmt {
             Some(units) => units,
             None => {
                 let estimate = blockchain.read().await.fee_estimate().await;
+                // Never emit a fee that would be READ as a whisper. Classification
+                // is a fee-band test and the code space saturates the band, so this
+                // cannot be fixed when decoding — an ordinary payment whose fee
+                // lands in the band is announced to the recipient as a whisper
+                // carrying a meaningless code, and its amount is not shown at all.
+                // The estimator is amount-independent, so the clamp belongs here,
+                // where the amount is known. Lowering a fee is always safe: the
+                // relay floor is the only hard requirement, and the band opens
+                // strictly above it for any positive amount.
+                let ceiling = max_non_whisper_fee_units(amount_units);
+                let recommended = estimate
+                    .recommended_units
+                    .min(ceiling)
+                    .max(MIN_RELAY_FEE_UNITS);
                 // Show the auto fee BEFORE signing and submitting: the user
                 // never typed this number, so it must not first appear in the
                 // success summary (and never at all on the error path).
                 writeln!(
                     stdout,
                     "  Auto fee: {:.8} ({})",
-                    Transaction::from_units(estimate.recommended_units),
-                    if estimate.congested {
+                    Transaction::from_units(recommended),
+                    if recommended < estimate.recommended_units {
+                        "capped below the whisper band"
+                    } else if estimate.congested {
                         "next-block price, network contended"
                     } else {
                         "network quiet"
                     }
                 )?;
-                estimate.recommended_units
+                recommended
             }
         };
         let amount = Transaction::from_units(amount_units);
