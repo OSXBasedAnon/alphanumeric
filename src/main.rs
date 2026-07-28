@@ -3770,6 +3770,10 @@ Some("help") => {
     row!(" start mining", UI_GREEN, "mine", "   rewards go to your default wallet");
     row!(" mine to a wallet", UI_GREEN, "mine ", "<wallet name>");
     row!(" keep mining", UI_GREEN, "mine ", "[wallet] --continuous   (-c)");
+    // GPU build only — the flags do not exist on the standard binary, so this row
+    // lives on this branch alone rather than being cfg'd into a help screen that
+    // would then advertise a flag `main` rejects.
+    row!(" choose a backend", UI_GREEN, "mine ", "[wallet] --gpu   ·   --cpu");
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(
         &mut stdout,
@@ -3777,6 +3781,14 @@ Some("help") => {
         UI_DIM,
         false,
         "without --continuous it stops after one block. Enter stops it.",
+    )?;
+    ui_pad(&mut stdout, spec, 0, CMD)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        "this is the GPU build; --gpu is the default here, --cpu forces the CPU miner.",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
