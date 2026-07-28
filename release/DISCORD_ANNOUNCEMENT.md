@@ -28,6 +28,8 @@ margin, can't regress, and PoW/hash/linkage checks all still apply.
 - Background tasks survive panics instead of vanishing silently.
 - Faster catch-up and start-up; ~13x fewer database flushes per block.
 - Payments returned to the mempool by a reorg are no longer lost on restart.
+- Peer block-range request handling is bounded in one more place — no behaviour
+  change for normal peers, but a reason to take this release.
 - Mining: faster hash loop, real MH/s in the progress bar, and you're told when a
   block you mined gets reorged out.
 

@@ -58,6 +58,10 @@ seconds to 5 minutes instead of never.
   block that gets reorged out is reported instead of the reward quietly
   vanishing.
 - **Faster start-up:** boot no longer rescans the whole chain to find its tip.
+- **Peer request handling hardened.** Block-range requests from peers are
+  bounded in one more place. No behaviour change for normal peers, and no change
+  to what any node accepts as valid — but it is a reason to take this release
+  rather than stay where you are.
 
 ## Interface
 - **One display language across every screen.** Balances, wallets, mining,
