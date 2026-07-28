@@ -8130,6 +8130,80 @@ mod tests {
         }
     }
 
+    // THE SHIPPING QUESTION: can a node running this code and a node running the
+    // PREVIOUS code ever disagree on a coinbase? They validate it by exact
+    // equality, so a single differing bit is a chain split.
+    //
+    // This replicates the old formula verbatim — powi and all — and drives both
+    // through the full reward path across the entire emission timeline and a
+    // spread of fee shapes. Any divergence fails here rather than on the network.
+    #[test]
+    fn old_and_new_reward_paths_agree_bit_for_bit() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64; // the live chain's genesis
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+
+        // Verbatim copy of the pre-change formula, as an un-upgraded node runs it.
+        fn old_reward(current_max: f64, tx_count: usize, total_fees: f64) -> f64 {
+            let fee_target = (current_max * 0.05).max(0.0001);
+            let effective_fees = total_fees * (1.0 - MINT_CLIP);
+            let fee_factor = (effective_fees / fee_target).clamp(0.0, 1.0);
+            let base_reward = if tx_count == 0 {
+                current_max * 0.2
+            } else {
+                MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
+            };
+            let reward_floor = MIN_BLOCK_REWARD.min(current_max);
+            Transaction::round_amount((base_reward + effective_fees).clamp(reward_floor, current_max))
+        }
+
+        const SIX_MONTHS: u64 = 15_768_000;
+        let mut compared = 0usize;
+        // 0..=60 periods is 30 years — well past the ~10.5 years at which the
+        // ceiling crosses MIN_BLOCK_REWARD and the clamp changes shape.
+        for periods in 0u64..=60 {
+            // OLD: powi, with the u64 -> i32 cast the old code performed.
+            let old_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods as i32);
+            for tx_count in [0usize, 1, 7, 4095] {
+                for total_fees in [0.0f64, 0.0001, 0.0002, 0.726_392, 1.0, 3.846, 40.0, 1_000.0] {
+                    let ts = genesis_ts + periods * SIX_MONTHS;
+                    let new = bc
+                        .block_reward_from_totals(1_000, ts, tx_count, total_fees)
+                        .expect("reward must compute");
+                    let old = old_reward(old_max, tx_count, total_fees);
+                    assert_eq!(
+                        old.to_bits(),
+                        new.to_bits(),
+                        "coinbase DIVERGED at periods={} tx_count={} fees={}: old={:.17} new={:.17}",
+                        periods, tx_count, total_fees, old, new
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 61 * 4 * 8);
+    }
+
+    // Where the chain actually is. Both the fee activation and the whole of 2026
+    // sit inside period 0, where the decay factor is exactly 1.0 on any
+    // implementation — so nothing can diverge before the first halving.
+    #[test]
+    fn emission_period_is_zero_through_activation_and_into_2027() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let genesis = 1_783_191_900u64; // 2026-07-04
+        let period_at = |unix: u64| (unix.saturating_sub(genesis)) / SIX_MONTHS;
+
+        // today, the fee activation (~2026-08-09), and the day before the halving
+        assert_eq!(period_at(1_785_265_500), 0, "2026-07-28");
+        assert_eq!(period_at(1_786_300_000), 0, "~2026-08-09, fee activation");
+        assert_eq!(period_at(genesis + SIX_MONTHS - 1), 0, "instant before halving");
+        assert_eq!(period_at(genesis + SIX_MONTHS), 1, "first halving");
+
+        // period 0 is exactly 1.0 — the identity, on every implementation.
+        assert_eq!(Blockchain::reduction_factor(0).to_bits(), 1.0f64.to_bits());
+        assert_eq!(REDUCTION_RATE.powi(0).to_bits(), 1.0f64.to_bits());
+    }
+
     // The whole chain lifetime lives in the first handful of periods, so pin the
     // exact issuance ceiling each one produces. A change here is a change to what
     // every node computes as the correct coinbase.
