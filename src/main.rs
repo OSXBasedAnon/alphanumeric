@@ -3154,8 +3154,18 @@ if parts.len() == 1 {
         .as_secs();
     let spec = &mut ColorSpec::new();
 
-    let sent = all_messages.iter().filter(|m| mine.contains(&&m.from)).count();
-    let received = all_messages.len().saturating_sub(sent);
+    let selfed = all_messages
+        .iter()
+        .filter(|m| mine.contains(&&m.from) && mine.contains(&&m.to))
+        .count();
+    let sent = all_messages
+        .iter()
+        .filter(|m| mine.contains(&&m.from) && !mine.contains(&&m.to))
+        .count();
+    let received = all_messages
+        .iter()
+        .filter(|m| !mine.contains(&&m.from))
+        .count();
     let pending = all_messages
         .iter()
         .filter(|m| m.content.starts_with("[PENDING]"))
@@ -3173,6 +3183,10 @@ if parts.len() == 1 {
         ui_seg(&mut stdout, spec, UI_GREEN, false, &format!("▾ {} in", received))?;
         ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
         ui_seg(&mut stdout, spec, UI_PINK, false, &format!("▴ {} out", sent))?;
+        if selfed > 0 {
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &format!("↔ {} self", selfed))?;
+        }
         if pending > 0 {
             ui_seg(&mut stdout, spec, UI_LABEL, false, "    ")?;
             ui_seg(&mut stdout, spec, UI_ORANGE, false, &format!("{} pending", pending))?;
@@ -3215,18 +3229,32 @@ if parts.len() == 1 {
     all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     for msg in &all_messages {
         let is_sender = mine.contains(&&msg.from);
+        let is_recipient = mine.contains(&&msg.to);
+        // Whispering yourself is the natural way to test the feature, and it is
+        // neither in nor out: the amount leaves and returns to the same wallet.
+        let is_self = is_sender && is_recipient;
         let is_pending = msg.content.starts_with("[PENDING]");
         let code = msg.content.trim_start_matches("[PENDING]").trim().to_uppercase();
-        let (token, hue) = if is_sender {
-            ("▴ out", UI_PINK)
+        let (token, hue) = if is_self {
+            ("↔ self", UI_BLUE)
+        } else if is_sender {
+            ("▴ out ", UI_PINK)
         } else {
-            ("▾ in ", UI_GREEN)
+            ("▾ in  ", UI_GREEN)
         };
-        // What actually moved for THIS wallet: an inbound whisper credits the
-        // amount, an outbound one debits amount + fee. The old screen printed the
-        // sender's fee on received rows too, so a recipient read money they never
-        // spent.
-        let value = if is_sender { -(msg.amount + msg.fee) } else { msg.amount };
+        // What actually moved for THIS wallet. An inbound whisper credits the
+        // amount; an outbound one debits amount plus fee. A SELF whisper debits
+        // the fee alone — the amount lands back in the same wallet, so charging
+        // it too overstated the cost of every self-test by the amount sent.
+        // (The old screen printed the sender's fee on received rows as well, so
+        // a recipient read money they never spent.)
+        let value = if is_self {
+            -msg.fee
+        } else if is_sender {
+            -(msg.amount + msg.fee)
+        } else {
+            msg.amount
+        };
 
         ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
         ui_seg(&mut stdout, spec, hue, false, token)?;
