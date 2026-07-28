@@ -3055,9 +3055,21 @@ println!("Wallet renamed successfully");
                                 // handle_mine_command already printed "Mining
                                 // stopped."; just leave the loop without the
                                 // error path or backoff.
-                                if stop_flag.load(Ordering::SeqCst)
-                                    || e.to_string().contains("stopped by user")
-                                {
+                                // Match the TYPE, not the message. This used to test
+                                // `e.to_string().contains("stopped by user")`, which
+                                // couples clean-exit detection to the #[error(...)]
+                                // text on MiningError::Stopped — so rewording a
+                                // user-facing string, the most innocuous edit there
+                                // is, would silently send a deliberate stop down the
+                                // fault path with backoff and error counting toward
+                                // the permanent-error stop. mgmt.rs boxes the real
+                                // variant, so it survives the Box<dyn Error>.
+                                let user_stopped = e
+                                    .downcast_ref::<alphanumeric::a9::miner::MiningError>()
+                                    .is_some_and(|err| {
+                                        matches!(err, alphanumeric::a9::miner::MiningError::Stopped)
+                                    });
+                                if stop_flag.load(Ordering::SeqCst) || user_stopped {
                                     break 'mining;
                                 }
                                 // LOST RACE, not a fault: we solved a height, but the

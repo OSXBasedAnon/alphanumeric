@@ -13806,4 +13806,140 @@ mod tests {
             .unwrap();
         assert_eq!(bc.confirmed_balance_units_readonly("alice").unwrap(), 123);
     }
+    // Backport validation (2026-07-25): PROVE the CPU miner — after the
+    // block-template / random-nonce-base / retarget backport from gpu-mining —
+    // produces a REAL, consensus-VALID block end to end, not just one that
+    // compiles and passes unit tests. We mine block #1 on a fresh genesis chain
+    // at the lowest difficulty a block can carry and still validate:
+    // NETWORK_MIN_DIFFICULTY (464). The miner derives difficulty from
+    // consensus_next_difficulty, and because genesis (difficulty 0, timestamp
+    // 2026-07-04) sits far behind the wall clock, the child's timestamp_diff is
+    // huge, so the retarget floors at 464 with no hand-pinning. mine_block
+    // itself runs the CANONICAL accept path (validate_new_block THEN
+    // finalize_block), so an Ok return already means the block validated AND was
+    // committed; we then independently re-check the floor+PoW and that the tip
+    // advanced onto exactly this block.
+    //   cargo test --release mines_a_valid_block_at_min_difficulty -- --ignored --nocapture
+    // Ported back from main after it was dropped here for a signature change,
+    // not a decision: this branch adds a SECOND block-proposal path (the GPU),
+    // so it is the branch that can least afford to lose the one test proving
+    // mine_block still yields a block the chain accepts and commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "real ProgPoW mining at the 464 floor (~2^29 hashes, tens of seconds); run with --ignored"]
+    async fn mines_a_valid_block_at_min_difficulty() {
+        use crate::a9::miner::{BlockHeader, MiningManager, ProgPowTransaction};
+        use std::time::{Duration, Instant};
+
+        // (a) fresh genesis chain.
+        let blockchain = Arc::new(RwLock::new(test_blockchain()));
+        let genesis = Blockchain::genesis_launch_block().expect("genesis builds");
+        {
+            let g = blockchain.read().await;
+            insert_raw_block(&g, &genesis);
+        }
+
+        // (b) MiningManager + a block #1 header over the genesis tip. The header's
+        // timestamp/difficulty fields are advisory only — mine_block recomputes
+        // both from the live tip + wall clock every pass, so the mined block's
+        // difficulty is whatever consensus dictates (the 464 floor here).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert!(
+            now > genesis.timestamp,
+            "this proof needs a wall clock past the genesis timestamp ({}) so the \
+             retarget floors difficulty at NETWORK_MIN_DIFFICULTY; clock reads {}",
+            genesis.timestamp,
+            now
+        );
+
+        let mut header = BlockHeader {
+            number: 1,
+            parent_hash: genesis.hash,
+            timestamp: now,
+            merkle_root: [0u8; 32],
+            difficulty: NETWORK_MIN_DIFFICULTY,
+        };
+        let manager = MiningManager::new(Arc::clone(&blockchain));
+
+        // (c) coinbase-only template (empty mempool). The PRIMARY gate is "mines a
+        // valid accepted block"; the live-mempool template path (freshness filter,
+        // confirmed_cache) is already covered by
+        // racing_miners_with_pending_tx_both_complete above.
+        let no_txs: Vec<ProgPowTransaction> = Vec::new();
+
+        // (d) grind. mine_block loops passes internally until it solves; bound the
+        // whole thing so a stall fails loudly instead of hanging.
+        let started = Instant::now();
+        let (nonce, hash_string, block) = tokio::time::timeout(
+            Duration::from_secs(180),
+            manager.mine_block(
+                &mut header,
+                &no_txs,
+                1u64 << 27,
+                "miner_proof".to_string(),
+                // CPU path: this test proves the CANONICAL accept path, and the
+                // GPU is only a nonce proposer feeding that same path.
+                false,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        )
+        .await
+        .expect("mining did not finish within 180s at the 464 floor")
+        .expect("mine_block must return a solved, validated, finalized block");
+        let elapsed = started.elapsed();
+
+        // (e) genuine validity.
+        // e1: correct height + pinned to the 464 floor.
+        assert_eq!(block.index, 1, "mined block must be #1");
+        assert_eq!(
+            block.difficulty, NETWORK_MIN_DIFFICULTY,
+            "mined block must carry the NETWORK_MIN_DIFFICULTY floor (464)"
+        );
+        // e2: PoW meets the floor AND the hash re-derived from the block's own
+        // header fields is <= target (verify_pow_meets_floor recomputes the hash
+        // from index/prev/timestamp/nonce/difficulty/merkle_root).
+        assert!(
+            block.verify_pow_meets_floor(),
+            "mined block PoW must satisfy verify_pow_meets_floor (hash <= target AND difficulty >= floor)"
+        );
+        // e3: explicit numeric hash <= target, independent of the returned string.
+        let target = pow_target_from_difficulty(block.difficulty);
+        let hash_int = BigUint::from_bytes_be(&block.hash);
+        assert!(
+            hash_int <= target,
+            "mined hash must be numerically <= the difficulty-464 target"
+        );
+        // e4: the returned hash string matches the block's committed hash bytes.
+        assert_eq!(
+            hash_string,
+            hex::encode(block.hash),
+            "returned hash string must match the block's committed hash"
+        );
+        // e5: CANONICAL ACCEPT — mine_block finalized the block onto the chain, so
+        // the tip must now BE this block. (mine_block already ran validate_new_block
+        // + finalize_block internally; an Ok return is proof both passed, and this
+        // confirms it is the committed tip, not merely a valid candidate.)
+        {
+            let g = blockchain.read().await;
+            let tip = g.get_last_block().expect("chain has a tip after mining");
+            assert_eq!(tip.index, 1, "chain tip must have advanced to block #1");
+            assert_eq!(
+                tip.hash, block.hash,
+                "committed tip must be exactly the mined block"
+            );
+        }
+
+        println!(
+            "ACCEPTED: block #{} mined & finalized at difficulty {} in {:.1}s\n  nonce  = {}\n  hash   = {}\n  target = {}",
+            block.index,
+            block.difficulty,
+            elapsed.as_secs_f64(),
+            nonce,
+            hash_string,
+            hex::encode(pow_target_bytes(&target)),
+        );
+    }
+
 }

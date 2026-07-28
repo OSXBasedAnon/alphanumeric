@@ -1,14 +1,14 @@
 # alphanumeric
 
-Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
-
-https://www.alphanumeric.blue/
-
-![Screenshot_2025-01-04_213726](https://github.com/user-attachments/assets/0b5c747c-53f7-4e09-82c8-0e9bfbd8cd89)
+<img width="862" height="696" alt="Screenshot 2026-07-27 at 8 18 50 AM" src="https://github.com/user-attachments/assets/24268ad5-2547-4c90-828f-c40242e490c5" />
 
 [![Rust](https://img.shields.io/badge/Rust-stable-orange)](#build-and-run)
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
+
+https://www.alphanumeric.blue/
+
+Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
 
 `alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.2`.
 
@@ -22,6 +22,7 @@ https://www.alphanumeric.blue/
 - [Bootstrap and Storage](#bootstrap-and-storage)
 - [Configuration via Environment Variables](#configuration-via-environment-variables)
 - [CLI Surface](#cli-surface)
+- [GPU Mining](docs/GPU_MINING.md)
 - [Security Posture](#security-posture)
 
 ## System Goals
