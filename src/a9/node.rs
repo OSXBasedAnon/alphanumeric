@@ -8813,10 +8813,21 @@ impl Node {
         // a wedged peers lock into a wedged health lock (info's network section).
         let average_response_time = {
             let peers = self.peers.read().await;
-            if peers.is_empty() {
+            // Average only peers actually TIMED. Dividing by every peer counted the
+            // roster entries that were never measured as 0ms, so a few real samples
+            // among ~30 peers floored to 0 and `info` reported "not sampled" while
+            // responses were in fact being measured. 0 now genuinely means "nothing
+            // sampled yet" rather than "sampled, then diluted away".
+            let (total, measured) = peers
+                .values()
+                .filter(|p| p.latency > 0)
+                .fold((0u64, 0u64), |(sum, n), p| {
+                    (sum.saturating_add(p.latency), n + 1)
+                });
+            if measured == 0 {
                 0
             } else {
-                peers.values().map(|p| p.latency).sum::<u64>() / peers.len() as u64
+                total / measured
             }
         };
         {

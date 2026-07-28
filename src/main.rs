@@ -2077,15 +2077,11 @@ async fn async_main() -> Result<()> {
     // is the only hue allowed to cross pane boundaries, so a slow chain stays
     // louder than the zoning around it.
     let block_target_secs = u64::from(block_target);
-    // Proof-of-work block intervals are exponentially distributed, so on a HEALTHY
-    // chain an age past 2x target happens ~13.5% of the time (e^-2) and past 5x
-    // still ~0.7%. Treating that as "stale" meant a fully synced node kept flipping
-    // between calm and warning while nothing was wrong — colour that changes without
-    // meaning trains you to ignore it. 12x is ~6e-6 per block: it effectively never
-    // fires by chance, so when it does the chain has genuinely stopped.
-    const STALL_TARGET_MULTIPLE: u64 = 12;
-    let stale =
-        block_age.is_some_and(|age| age > block_target_secs.saturating_mul(STALL_TARGET_MULTIPLE));
+    // Gates the "Nx" multiplier annotation only — never the colour of the age
+    // itself. Proof-of-work intervals are exponentially distributed, so past 2x
+    // target is ordinary (~13.5%, e^-2); the multiple is useful context to show,
+    // it just must not repaint the figure as if something were wrong.
+    let stale = block_age.is_some_and(|age| age > block_target_secs.saturating_mul(2));
     let age_multiple = block_age
         .filter(|_| block_target_secs > 0)
         .map(|age| age / block_target_secs)
@@ -2245,7 +2241,12 @@ async fn async_main() -> Result<()> {
         // colouring the LAST bar instead would disagree with "peak" on any
         // window whose worst interval is not the most recent block.
         for (index, bar) in cadence.chars().enumerate() {
-            let color = if Some(index) == cadence_peak && stale {
+            // ALWAYS mark the peak. It used to be gated on `stale`, so on a healthy
+            // chain every bar was the same colour and the "peak 24s" label beside the
+            // graph pointed at nothing. The marker is a locator, not a warning — it
+            // says WHERE the widest interval sits in the window, which is exactly as
+            // useful when the chain is behaving as when it is not.
+            let color = if Some(index) == cadence_peak {
                 UI_ORANGE
             } else {
                 UI_BLUE
