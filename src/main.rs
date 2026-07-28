@@ -34,6 +34,7 @@ use alphanumeric::a9::{
     mgmt::{Mgmt, WalletKeyData},
     ui::{
         ui_grid_header, ui_grid_row, ui_pad, ui_seg, ui_text, ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
+        UI_MUTED,
         UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
     },
     node::{
@@ -3536,7 +3537,7 @@ Some("history") => {
         }
     },
 
-Some("debug") | Some("diagnostics") | Some("diag") => {
+Some("debug") => {
     let blockchain_guard = blockchain.read().await;
     let oracle = DifficultyOracle::new();
 
@@ -3648,7 +3649,14 @@ Some("help") => {
     row!(" address lookup", UI_CYAN, "account ", "<address>");
     // `history 50` already worked and was documented nowhere, so the default 12
     // rows read as the whole ledger.
-    row!(" transactions", UI_CYAN, "history ", "[rows]   1-50, default 12");
+    // The range and default are read, not skimmed — UI_DIM made them look
+    // unavailable rather than merely secondary.
+    ui_seg(&mut stdout, spec, UI_DIM, false, " transactions")?;
+    ui_pad(&mut stdout, spec, 13, CMD)?;
+    ui_seg(&mut stdout, spec, UI_CYAN, false, "history ")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "[rows]")?;
+    ui_seg(&mut stdout, spec, UI_MUTED, false, "   1-50, default 12")?;
+    writeln!(stdout)?;
     row!(" new wallet", UI_CYAN, "new ", "[name]");
     row!(" rename wallet", UI_CYAN, "rename ", "<name> <new name>");
     writeln!(stdout)?;
@@ -3746,9 +3754,6 @@ Some("help") => {
         ui_seg(&mut stdout, spec, UI_BLUE, false, "create = send = transfer")?;
         ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
         ui_seg(&mut stdout, spec, UI_CYAN, false, "balance = bal = wallet")?;
-        writeln!(stdout)?;
-        ui_pad(&mut stdout, spec, 0, CMD)?;
-        ui_seg(&mut stdout, spec, UI_LAVENDER, false, "debug = diagnostics = diag")?;
         writeln!(stdout)?;
     }
     // Pasting an address is the most natural thing a newcomer does with one. It
