@@ -2350,7 +2350,10 @@ impl Mgmt {
         let _ = ui_pad(&mut stdout, spec, 0, NAME_COL);
         let _ = ui_seg(&mut stdout, spec, UI_DIM, false, "Total");
         let covered = rows.iter().filter(|r| r.error.is_none()).count();
-        // Qualifies the word beside it, so it sits against "Total".
+        // "Total" occupies the wallet-name column, so what follows it belongs in the
+        // ADDRESS column — the same slot a wallet's address takes on its own row.
+        // Bracketed because it qualifies the Total rather than being a value.
+        let _ = ui_pad(&mut stdout, spec, NAME_COL + 5, ADDR_COL);
         let _ = ui_seg(
             &mut stdout,
             spec,
@@ -2358,12 +2361,12 @@ impl Mgmt {
             false,
             &if covered == rows.len() {
                 format!(
-                    " (sum of {} wallet{})",
+                    "(sum of {} wallet{})",
                     rows.len(),
                     if rows.len() == 1 { "" } else { "s" }
                 )
             } else {
-                format!(" (sum of {} of {} wallets)", covered, rows.len())
+                format!("(sum of {} of {} wallets)", covered, rows.len())
             },
         );
         let _ = writeln!(stdout);
