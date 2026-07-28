@@ -3640,7 +3640,11 @@ Some("help") => {
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
     let spec = &mut ColorSpec::new();
     // Column where every command keyword starts.
-    const CMD: usize = 17;
+    // Wide enough for the LONGEST label plus its two-space gutter. At 17 the three
+    // 17-character labels ("mine to a wallet", "choose a backend", "paste an
+    // address") overflowed their own column and shoved their command two cells
+    // right, so the command column was ragged wherever a label ran long.
+    const CMD: usize = 19;
 
     macro_rules! row {
         ($goal:expr, $hue:expr, $cmd:expr, $args:expr) => {{
@@ -3738,7 +3742,16 @@ Some("help") => {
         spec,
         UI_DIM,
         false,
-        "fees are automatic; --fee overrides. A whisper rides in its fee, so it costs more.",
+        "fees are automatic; --fee overrides",
+    )?;
+    writeln!(stdout)?;
+    ui_pad(&mut stdout, spec, 0, CMD)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_DIM,
+        false,
+        "a whisper rides in its fee, so it costs more",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
@@ -3769,7 +3782,7 @@ Some("help") => {
         spec,
         UI_DIM,
         false,
-        "without --continuous it stops after one block. Enter stops it.",
+        "one block unless --continuous; Enter stops it.",
     )?;
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(
@@ -3798,13 +3811,27 @@ Some("help") => {
 
     // Aliases and the bare-address shorthand are reachable in the match arms
     // but appeared on no surface, so nobody could discover them.
-    row!(" aliases", UI_PINK, "create = send = transfer", " · balance = bal = wallet");
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(&mut stdout, spec, UI_PINK, false, "debug = diagnostics = diag")?;
-    writeln!(stdout)?;
-    // Pasting an address is the most natural thing a newcomer does with one.
-    row!(" paste an address", UI_PINK, "<address>", "   on its own, looks it up");
-    row!(" shorthand", UI_PINK, "<from> <to> <amount>", "   also initiates a transfer");
+    //
+    // Each group keeps the hue of the SECTION its command belongs to, rather than
+    // the whole block sharing one colour. Painting them all pink broke the rule the
+    // rest of the screen runs on — that hue answers "which section is this from"
+    // — so `balance` was cyan under Wallet and pink again down here.
+    {
+        let goal = " aliases";
+        ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
+        ui_pad(&mut stdout, spec, goal.chars().count(), CMD)?;
+        ui_seg(&mut stdout, spec, UI_BLUE, false, "create = send = transfer")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
+        ui_seg(&mut stdout, spec, UI_CYAN, false, "balance = bal = wallet")?;
+        writeln!(stdout)?;
+        ui_pad(&mut stdout, spec, 0, CMD)?;
+        ui_seg(&mut stdout, spec, UI_LAVENDER, false, "debug = diagnostics = diag")?;
+        writeln!(stdout)?;
+    }
+    // Pasting an address is the most natural thing a newcomer does with one. It
+    // resolves to `account`, so it takes the Wallet hue.
+    row!(" paste an address", UI_CYAN, "<address>", "   on its own, looks it up");
+    row!(" shorthand", UI_BLUE, "<from> <to> <amount>", "   also initiates a transfer");
     row!(" end session", UI_PINK, "exit", "");
     writeln!(stdout)?;
     stdout.reset()?;
