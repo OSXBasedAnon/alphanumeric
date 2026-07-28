@@ -731,4 +731,25 @@ mod relay_floor_tests {
             }
         }
     }
+
+    /// The notice line and the digest both budget a whisper code as FOUR
+    /// COLUMNS. That is only safe while the alphabet is single ASCII letters:
+    /// `decode_message_from_fee` gates on `message.len() == 4`, which is a BYTE
+    /// count, and `to_uppercase` can lengthen a char (ß -> SS). A future edit to
+    /// `letter_frequencies` that added a digit, an accent or a multi-byte char
+    /// would silently break the column budget instead of failing here.
+    #[test]
+    fn whisper_codes_are_always_four_ascii_uppercase() {
+        let module = WhisperModule::new();
+        for ch in module.frequency_map.keys() {
+            assert!(
+                ch.is_ascii_lowercase(),
+                "alphabet char {ch:?} is not a single ASCII lowercase letter; the \
+                 4-column width assumed by the notice/digest lines no longer holds"
+            );
+            let upper: Vec<char> = ch.to_uppercase().collect();
+            assert_eq!(upper.len(), 1, "{ch:?} changes length when uppercased");
+            assert!(upper[0].is_ascii_uppercase());
+        }
+    }
 }
