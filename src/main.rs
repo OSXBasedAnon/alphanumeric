@@ -1294,19 +1294,6 @@ async fn async_main() -> Result<()> {
         // polling, no server state, no per-wallet index; it rides the delta the
         // node already pulled. This is what makes an incoming payment show up
         // instantly without restarting or refreshing.
-        // Chain-event notifications (received / whisper / reorged). These print
-        // from a BACKGROUND task, so they use inline ANSI rather than the ui.rs
-        // StandardStream helpers: interleaving println! with set_color from
-        // another task corrupts both streams (the long-standing rule in this
-        // client). The colours mirror the ui.rs palette so the language matches
-        // every other screen, and the meaning is carried by a left-aligned
-        // keyword rather than a symbol.
-        const EV_RECEIVED: &str = "\x1b[38;2;59;242;173m"; // UI_GREEN — value in
-        const EV_WHISPER: &str = "\x1b[38;2;167;165;198m"; // UI_LAVENDER — message
-        const EV_REORG: &str = "\x1b[38;2;237;124;51m"; // UI_ORANGE — attention, not alarm
-        const EV_DIM: &str = "\x1b[38;2;128;128;128m"; // UI_DIM — block refs
-        const EV_OFF: &str = "\x1b[0m";
-
         // Session-mined blocks (height, hash, reward): the tip-signal task below
         // re-checks these on every applied block and reports a reorg that orphaned
         // one — the miner otherwise never learns; the maturing reward just
@@ -1324,7 +1311,14 @@ async fn async_main() -> Result<()> {
                 let mut last_scanned: u32 =
                     { blockchain.read().await.get_latest_block_index() as u32 };
                 // Per-session, owned by this task alone — no lock on the notice path.
-                let mut receipt_rate = ReceiptRate::new();
+                // Payments and whispers get SEPARATE budgets: the payment digest is
+                // lossy (it drops per-payment amounts and senders), so a shared budget
+                // would let whisper spam — the cheapest traffic on the chain — collapse
+                // the credit lines an exchange actually needs to see.
+                let mut receipt_rate = NoticeRate::new();
+                let mut whisper_rate = NoticeRate::new();
+                let mut whisper_accum = WhisperAccum::new();
+                let mut whisper_last_emit: Option<Instant> = None;
                 loop {
                     if rx.changed().await.is_err() {
                         break;
@@ -1349,48 +1343,83 @@ async fn async_main() -> Result<()> {
                         // digest decision needs this block's total, and a line
                         // already written to the terminal cannot be taken back.
                         let mut payments: Vec<(f64, String, String)> = Vec::new();
-                        for tx in &block.transactions {
-                            if tx.sender == "MINING_REWARDS" {
-                                continue; // mining rewards are reported by the miner
-                            }
-                            if !addresses.contains(&tx.recipient) {
-                                continue;
-                            }
-                            let from_short = tx.sender[..tx.sender.len().min(10)].to_string();
-                            // A whisper carries its message in the fee; show the
-                            // message. Otherwise it is a plain payment.
-                            let whisper = { whisper_module.read().await.decode_whisper_in_tx(tx) };
-                            if let Some(message) = whisper {
-                                // Whispers are never folded into the digest and never
-                                // feed the rate: the message text IS the payload, so a
-                                // count would discard the only thing worth reading,
-                                // and letting them trip the payment threshold would
-                                // suppress unrelated payment lines.
-                                notify(format!(
-                                    "\n{}whisper{}   from {}…  {}block {}{}\n            {}",
-                                    EV_WHISPER,
-                                    EV_OFF,
-                                    from_short,
-                                    EV_DIM,
-                                    block.index,
-                                    EV_OFF,
-                                    message
-                                ));
-                            } else {
-                                payments.push((
-                                    Transaction::from_units(tx.amount_units),
-                                    tx.recipient[..tx.recipient.len().min(10)].to_string(),
-                                    from_short,
-                                ));
+                        let mut whispers: Vec<(String, String, f64)> = Vec::new();
+                        {
+                            // ONE read guard for the whole block. The whisper module is
+                            // never written after construction, and taking it per
+                            // transaction cost an acquisition per candidate. The guard is
+                            // scoped so it is provably dropped before any output — the
+                            // publisher-park rule (never hold a guard across a print).
+                            let whisper_module = whisper_module.read().await;
+                            for tx in &block.transactions {
+                                if tx.sender == "MINING_REWARDS" {
+                                    continue; // mining rewards are reported by the miner
+                                }
+                                if !addresses.contains(&tx.recipient) {
+                                    continue;
+                                }
+                                let from_short = short_addr(&tx.sender);
+                                let amount = Transaction::from_units(tx.amount_units);
+                                // A whisper carries a message in its fee. It is still a
+                                // payment: the amount travels with it and is reported
+                                // either way, because the fee band is not an exclusive
+                                // signal — an ordinary payment at a flat fee schedule
+                                // lands in it too (a 1 ♦ payment at a 0.001 fee decodes
+                                // as some code). Reporting the code without the value
+                                // would hide real money behind a novelty.
+                                match whisper_module.decode_whisper_in_tx(tx) {
+                                    Some(code) => whispers.push((from_short, code, amount)),
+                                    None => payments.push((
+                                        amount,
+                                        short_addr(&tx.recipient),
+                                        from_short,
+                                    )),
+                                }
                             }
                         }
 
+                        // Whispers first, then payments: with collapsing in play the
+                        // reading order has to be fixed, not transaction order.
+                        let now = Instant::now();
+                        if !whispers.is_empty() {
+                            let recent = whisper_rate.recent(now);
+                            // Count whispers OBSERVED, never lines printed — see NoticeRate.
+                            whisper_rate.record(now, whispers.len());
+                            if whisper_action(whispers.len(), recent, !whisper_accum.is_empty())
+                                == WhisperAction::Verbose
+                            {
+                                for (from_short, code, amount) in &whispers {
+                                    notify(format!(
+                                        "\n{}whisper{}   {}{}{}  {:.8} ♦  from {}…  {}block {}{}",
+                                        EV_WHISPER,
+                                        EV_OFF,
+                                        EV_CODE,
+                                        code,
+                                        EV_OFF,
+                                        amount,
+                                        from_short,
+                                        EV_DIM,
+                                        block.index,
+                                        EV_OFF
+                                    ));
+                                }
+                            } else {
+                                whisper_accum.merge(block.index, &whispers);
+                            }
+                        }
+                        // Runs even on a block with no whispers, so a rollup left
+                        // pending when the flood stops still flushes.
+                        if !whisper_accum.is_empty() && whisper_rollup_due(whisper_last_emit, now) {
+                            notify(whisper_accum.render());
+                            whisper_accum.clear();
+                            whisper_last_emit = Some(now);
+                        }
+
                         if !payments.is_empty() {
-                            let now = Instant::now();
                             let recent = receipt_rate.recent(now);
                             let digest = should_digest_receipts(payments.len(), recent);
                             // Record before emitting, and record the payment count
-                            // even when digesting — see ReceiptRate.
+                            // even when digesting — see NoticeRate.
                             receipt_rate.record(now, payments.len());
 
                             if digest {
@@ -6846,6 +6875,30 @@ async fn handle_push_command(db_path: &str, blockchain: &Arc<RwLock<Blockchain>>
     Ok(())
 }
 
+// Chain-event notifications (received / whisper / reorged). These print from a
+// BACKGROUND task, so they use inline ANSI rather than the ui.rs StandardStream
+// helpers: interleaving println! with set_color from another task corrupts both
+// streams (the long-standing rule in this client). The colours mirror the ui.rs
+// palette so the language matches every other screen, and the meaning is carried
+// by a left-aligned keyword rather than a symbol.
+const EV_RECEIVED: &str = "\x1b[38;2;59;242;173m"; // UI_GREEN — value in
+const EV_WHISPER: &str = "\x1b[38;2;167;165;198m"; // UI_LAVENDER — message
+const EV_REORG: &str = "\x1b[38;2;237;124;51m"; // UI_ORANGE — attention, not alarm
+const EV_DIM: &str = "\x1b[38;2;128;128;128m"; // UI_DIM — block refs
+const EV_CODE: &str = "\x1b[38;2;40;204;217m"; // UI_CYAN — the code, as in `whisper`
+const EV_OFF: &str = "\x1b[0m";
+
+/// First 10 characters of an address, for the notice lines.
+///
+/// CHARACTERS, not bytes. Chain-sourced strings reach this on a background task
+/// whose panic would silently kill every later notice for the session, and a
+/// byte range that lands mid-codepoint panics. Validated addresses are ASCII
+/// hex, so this is belt-and-braces — but it costs one call and removes the
+/// class.
+fn short_addr(addr: &str) -> String {
+    addr.chars().take(10).collect()
+}
+
 /// Inbound payments in ONE block above which that block collapses to a single
 /// digest line. An ordinary wallet never reaches it; four separate payments in
 /// the same five-second block is already unusual for a person.
@@ -6856,45 +6909,53 @@ const RECEIPT_BURST_LINES: usize = 4;
 const RECEIPT_SUSTAINED_LINES: usize = 20;
 const RECEIPT_RATE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Rolling count of inbound payments, so a high-volume operator gets a digest
-/// instead of a per-payment firehose while an ordinary wallet keeps the exact
-/// output it has today.
+/// Rolling count of inbound notices of ONE class, so a high-volume operator gets
+/// a digest instead of a firehose while an ordinary wallet keeps the exact output
+/// it has today. Instantiated once per class (payments, whispers) — the classes
+/// never share a budget, so neither can silence the other.
 ///
-/// Counts PAYMENTS OBSERVED, never lines printed. Counting lines would let
+/// Counts EVENTS OBSERVED, never lines printed. Counting lines would let
 /// coalescing erase the very signal that triggered it: one digest line would
 /// read as "volume is low", the next block would print individually again, and
 /// the display would oscillate between the two modes under steady load.
 ///
-/// Entries are (instant, count) per block rather than one per payment, so a
-/// block carrying thousands of deposits costs one entry, and the deque is
-/// bounded by the window regardless of volume.
-struct ReceiptRate {
+/// Entries are (instant, count) per block rather than one per event, so a block
+/// carrying thousands of deposits costs one entry, and the deque is bounded by
+/// the window regardless of volume.
+struct NoticeRate {
     seen: std::collections::VecDeque<(Instant, usize)>,
+    /// Running sum of `seen`, maintained on insert and eviction. Summing the
+    /// deque per call is O(len), and a catch-up scan puts every scanned block in
+    /// the same window — quadratic over a bootstrap-length replay.
+    total: usize,
 }
 
-impl ReceiptRate {
+impl NoticeRate {
     fn new() -> Self {
         Self {
             seen: std::collections::VecDeque::new(),
+            total: 0,
         }
     }
 
-    /// Payments observed within the window ending at `now`, dropping older ones.
+    /// Events observed within the window ending at `now`, dropping older ones.
     fn recent(&mut self, now: Instant) -> usize {
-        while let Some(&(at, _)) = self.seen.front() {
+        while let Some(&(at, n)) = self.seen.front() {
             // saturating: a non-monotonic `now` must not panic a display path.
             if now.saturating_duration_since(at) > RECEIPT_RATE_WINDOW {
                 self.seen.pop_front();
+                self.total = self.total.saturating_sub(n);
             } else {
                 break;
             }
         }
-        self.seen.iter().map(|(_, n)| *n).sum()
+        self.total
     }
 
     fn record(&mut self, now: Instant, count: usize) {
         if count > 0 {
             self.seen.push_back((now, count));
+            self.total = self.total.saturating_add(count);
         }
     }
 }
@@ -6903,6 +6964,271 @@ impl ReceiptRate {
 /// policy is testable without a clock, a chain or a terminal.
 fn should_digest_receipts(in_block: usize, recent: usize) -> bool {
     in_block > RECEIPT_BURST_LINES || recent > RECEIPT_SUSTAINED_LINES
+}
+
+/// Whispers in ONE block above which they collapse. Lower than the payment
+/// threshold because a whisper is the noisier line of the two and because the
+/// most whispers ever carried by a single block on this chain is two — so a
+/// person's real traffic sits below this with room to spare.
+const WHISPER_BURST_LINES: usize = 2;
+/// Whispers inside `RECEIPT_RATE_WINDOW` above which we stay collapsed even when
+/// no single block is bursty — the sustained drip a spammer produces. Blocks
+/// arrive every ~5.5s, so a 1-per-block drip reaches this inside the window;
+/// setting it at or above the blocks-per-window count would let that drip age
+/// out faster than it accumulates and never collapse at all.
+const WHISPER_SUSTAINED_LINES: usize = 8;
+/// Minimum spacing between rollup lines under a sustained flood. Past the burst
+/// threshold an attacker gains nothing by spending more, so there is no cost
+/// gradient to lean on: without this, one digest line per block is a prompt
+/// repaint every ~5s forever, which is a usability denial rather than noise.
+const WHISPER_ROLLUP_INTERVAL: Duration = Duration::from_secs(30);
+/// The client's line budget, shared by every screen.
+const NOTICE_WIDTH_COLS: usize = 80;
+/// Column budget for the code list, which sits on its own indented line under
+/// the 10-column keyword gutter.
+const WHISPER_CODE_BUDGET_COLS: usize = NOTICE_WIDTH_COLS - 10;
+/// Distinct codes / senders the accumulator will hold. Ordinary traffic never
+/// approaches this; a catch-up scan replays thousands of blocks inside one
+/// wall-clock rollup window, and the code space is 26^4, so the fold needs a
+/// ceiling that does not depend on how far behind the client was.
+const WHISPER_ACCUM_MAX_KEYS: usize = 512;
+
+/// Whether a rollup may be emitted now. `None` means nothing has been emitted
+/// yet, so the first one is due immediately.
+fn whisper_rollup_due(last_emit: Option<Instant>, now: Instant) -> bool {
+    // map_or, not is_none_or: the latter is 1.82 and this crate holds an MSRV
+    // floor of 1.70.
+    last_emit.map_or(true, |t| {
+        now.saturating_duration_since(t) >= WHISPER_ROLLUP_INTERVAL
+    })
+}
+
+/// Whether this block's whispers collapse. Pure, like `should_digest_receipts`.
+fn should_digest_whispers(in_block: usize, recent: usize) -> bool {
+    in_block > WHISPER_BURST_LINES || recent > WHISPER_SUSTAINED_LINES
+}
+
+/// What to do with the whispers in one block.
+#[derive(Debug, PartialEq, Eq)]
+enum WhisperAction {
+    /// Print each one with its code and amount — the ordinary case.
+    Verbose,
+    /// Add to the pending rollup instead of printing now.
+    Fold,
+}
+
+/// Pure per-block decision, so the state machine is testable without a clock,
+/// a chain or a terminal.
+///
+/// `rollup_pending` is why this is not just `should_digest_whispers`: once a
+/// rollup is waiting to be emitted, a later quiet block must join it rather than
+/// print. Printing it would report the same traffic twice — once verbatim now,
+/// once inside the rollup — and out of order, because the rollup covers blocks
+/// that came first.
+fn whisper_action(in_block: usize, recent: usize, rollup_pending: bool) -> WhisperAction {
+    if rollup_pending || should_digest_whispers(in_block, recent) {
+        WhisperAction::Fold
+    } else {
+        WhisperAction::Verbose
+    }
+}
+
+/// Render `tokens` into at most `budget` COLUMNS, returning the rendered tokens
+/// and how many WHISPERS they do not account for.
+///
+/// The tail is counted in whispers, the same unit as the header's total, and
+/// `total_whispers` is the accumulator's full count — including any whose code
+/// never made it into the map because the key cap was already reached. Counting
+/// distinct codes instead would mix two units and, worse, let the caller print a
+/// wider number than the one this function reserved room for.
+///
+/// Columns, not bytes: `×` is two bytes and one column, so byte length
+/// over-counts and would truncate a line that fits. At least one token is always
+/// returned — a bare "+N more" tells the reader nothing.
+fn fit_code_tokens(
+    tokens: &[(String, usize)],
+    budget: usize,
+    total_whispers: usize,
+) -> (Vec<String>, usize) {
+    const SEP: usize = 2;
+    let render = |(code, n): &(String, usize)| -> String {
+        if *n > 1 {
+            format!("{code} ×{n}")
+        } else {
+            code.clone()
+        }
+    };
+    let width = |s: &str| s.chars().count();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut shown_whispers = 0usize;
+    for tok in tokens {
+        let text = render(tok);
+        let sep = if out.is_empty() { 0 } else { SEP };
+        // Reserve room for the tail admitting this token would leave behind. The
+        // tail only shrinks as more tokens are admitted, so the worst case after
+        // taking this one is "everything this token does not cover" — reserving
+        // against that is what stops the line overflowing by admitting a token
+        // and then discovering the "+N more" no longer fits.
+        let after = total_whispers.saturating_sub(shown_whispers + tok.1);
+        let tail = if after > 0 {
+            SEP + width(&format!("+{after} more"))
+        } else {
+            0
+        };
+        if !out.is_empty() && used + sep + width(&text) + tail > budget {
+            break;
+        }
+        used += sep + width(&text);
+        shown_whispers += tok.1;
+        out.push(text);
+    }
+    let unshown = total_whispers.saturating_sub(shown_whispers);
+    (out, unshown)
+}
+
+/// Whispers folded across one or more blocks, awaiting a single notice.
+///
+/// Holds the payload (the codes) rather than a count, because for a whisper the
+/// code IS the message — collapsing to "12 whispers" would discard the only
+/// thing worth reading. Amounts are totalled for the same reason the individual
+/// lines carry them: a whisper is also a payment.
+struct WhisperAccum {
+    count: usize,
+    total: f64,
+    codes: std::collections::BTreeMap<String, usize>,
+    senders: std::collections::BTreeSet<String>,
+    /// Set independently by each cap: conflating them would let a code-space
+    /// flood report an exact sender count as a lower bound, which is the
+    /// canonical spam shape (one address, many distinct codes) reading as many
+    /// attackers.
+    codes_saturated: bool,
+    senders_saturated: bool,
+    first_block: u32,
+    last_block: u32,
+}
+
+impl WhisperAccum {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            total: 0.0,
+            codes: std::collections::BTreeMap::new(),
+            senders: std::collections::BTreeSet::new(),
+            codes_saturated: false,
+            senders_saturated: false,
+            first_block: 0,
+            last_block: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    fn merge(&mut self, block: u32, whispers: &[(String, String, f64)]) {
+        // min/max rather than "first wins, last wins": the tip signal re-scans
+        // the tip on a reorg, so a block at or below one already folded can
+        // arrive second. Ordering the span here keeps it readable whatever
+        // order the heights land in.
+        if self.is_empty() {
+            self.first_block = block;
+            self.last_block = block;
+        } else {
+            self.first_block = self.first_block.min(block);
+            self.last_block = self.last_block.max(block);
+        }
+        for (from, code, amount) in whispers {
+            self.count += 1;
+            self.total += *amount;
+            if self.codes.len() < WHISPER_ACCUM_MAX_KEYS || self.codes.contains_key(code) {
+                *self.codes.entry(code.clone()).or_insert(0) += 1;
+            } else {
+                self.codes_saturated = true;
+            }
+            if self.senders.len() < WHISPER_ACCUM_MAX_KEYS {
+                self.senders.insert(from.clone());
+            } else if !self.senders.contains(from) {
+                self.senders_saturated = true;
+            }
+        }
+    }
+
+    /// Codes ordered by count descending, then code ascending. Total and
+    /// deterministic: the order must not depend on hash iteration or arrival.
+    fn ordered_codes(&self) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self
+            .codes
+            .iter()
+            .map(|(c, n)| (c.clone(), *n))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    fn render(&self) -> String {
+        // The tail is whispers, not codes — the same unit as the header count,
+        // and the same number the fitter reserved room for.
+        let (shown, unshown) = fit_code_tokens(
+            &self.ordered_codes(),
+            WHISPER_CODE_BUDGET_COLS,
+            self.count,
+        );
+        let mut codes = shown.join("  ");
+        if unshown > 0 {
+            codes.push_str(&format!("  +{unshown} more"));
+        }
+        let senders = if self.senders_saturated {
+            format!("{}+ senders", self.senders.len())
+        } else if self.senders.len() == 1 {
+            "1 sender".to_string()
+        } else {
+            format!("{} senders", self.senders.len())
+        };
+        let range = if self.first_block == self.last_block {
+            format!("block {}", self.first_block)
+        } else {
+            format!("blocks {}-{}", self.first_block, self.last_block)
+        };
+        // Counts and money are never abbreviated — this line exists so a flood
+        // cannot hide value. When the header would overrun the 80-column budget,
+        // the block SPAN gives way first, then the pointer, in that order: the
+        // pointer is the retrievability guarantee and the span is recoverable
+        // from `whisper` itself.
+        let head = format!(
+            "whispers  {} from {}  +{:.8} ♦  ",
+            self.count, senders, self.total
+        );
+        let last = format!("block {}", self.last_block);
+        let tail = [
+            format!("{range} · whisper"),
+            format!("{last} · whisper"),
+            last,
+        ]
+        .into_iter()
+        .find(|t| head.chars().count() + t.chars().count() <= NOTICE_WIDTH_COLS)
+        .unwrap_or_else(|| format!("block {}", self.last_block));
+
+        format!(
+            "\n{}whispers{}  {} from {}  +{:.8} ♦  {}{}{}\n          {}{}{}",
+            EV_WHISPER,
+            EV_OFF,
+            self.count,
+            senders,
+            self.total,
+            EV_DIM,
+            tail,
+            EV_OFF,
+            EV_CODE,
+            codes,
+            EV_OFF
+        )
+    }
 }
 
 #[cfg(test)]
@@ -6936,7 +7262,7 @@ mod tests {
 
     #[test]
     fn receipt_rate_only_counts_inside_the_window() {
-        let mut rate = ReceiptRate::new();
+        let mut rate = NoticeRate::new();
         let t0 = Instant::now();
         rate.record(t0, 5);
         assert_eq!(rate.recent(t0), 5);
@@ -6962,7 +7288,7 @@ mod tests {
     // and flip the display back to verbose, oscillating every block.
     #[test]
     fn sustained_load_stays_digested_rather_than_oscillating() {
-        let mut rate = ReceiptRate::new();
+        let mut rate = NoticeRate::new();
         let mut now = Instant::now();
         let per_block = RECEIPT_BURST_LINES + 1; // bursty enough to digest on its own
 
@@ -6989,11 +7315,431 @@ mod tests {
     // per payment, or the tracker itself becomes the memory problem.
     #[test]
     fn receipt_rate_is_bounded_by_blocks_not_payments() {
-        let mut rate = ReceiptRate::new();
+        let mut rate = NoticeRate::new();
         let now = Instant::now();
         rate.record(now, 10_000);
         assert_eq!(rate.seen.len(), 1);
         assert_eq!(rate.recent(now), 10_000);
+    }
+
+    // The running total is an optimisation; if it ever disagrees with the deque
+    // the whole policy silently reads the wrong number.
+    #[test]
+    fn notice_rate_running_total_matches_the_deque_after_eviction() {
+        let mut rate = NoticeRate::new();
+        let t0 = Instant::now();
+        for i in 0..40u64 {
+            let at = t0 + Duration::from_secs(i * 5);
+            rate.record(at, (i as usize % 7) + 1);
+            let observed = rate.recent(at);
+            let summed: usize = rate.seen.iter().map(|(_, n)| *n).sum();
+            assert_eq!(observed, summed, "running total drifted at step {i}");
+        }
+    }
+
+    // ---- whisper flood control -------------------------------------------
+    //
+    // The half that is NOT allowed to change: the whisper is a product feature,
+    // so ordinary use keeps the full per-whisper line with its code.
+
+    #[test]
+    fn a_single_whisper_never_digests() {
+        assert!(!should_digest_whispers(1, 0));
+    }
+
+    #[test]
+    fn sitting_exactly_on_both_whisper_thresholds_is_still_verbose() {
+        assert!(
+            !should_digest_whispers(WHISPER_BURST_LINES, WHISPER_SUSTAINED_LINES),
+            "both comparisons must stay strictly greater-than"
+        );
+    }
+
+    #[test]
+    fn a_bursty_block_of_whispers_digests() {
+        assert!(should_digest_whispers(WHISPER_BURST_LINES + 1, 0));
+    }
+
+    // A drip that never makes any single block bursty still has to collapse —
+    // and the threshold has to be reachable at the real block cadence. Blocks
+    // land every ~5.5s, so ~10 fall inside the 60s window; a threshold at or
+    // above that would let a 1-per-block drip age out as fast as it accrues and
+    // never digest at all.
+    #[test]
+    fn a_sustained_drip_digests_without_any_bursty_block() {
+        assert!(should_digest_whispers(1, WHISPER_SUSTAINED_LINES + 1));
+        let blocks_per_window = RECEIPT_RATE_WINDOW.as_secs_f64() / 5.5;
+        assert!(
+            (WHISPER_SUSTAINED_LINES as f64) < blocks_per_window,
+            "threshold {} is unreachable by a 1-per-block drip ({:.1} blocks/window)",
+            WHISPER_SUSTAINED_LINES,
+            blocks_per_window
+        );
+    }
+
+    // The reason the two classes get separate counters: whisper spam is the
+    // cheapest traffic on the chain, and the payment digest is lossy. If one
+    // budget were shared, a flood of 0.0001 ♦ messages would collapse the credit
+    // lines an exchange needs to see.
+    #[test]
+    fn whisper_and_payment_budgets_are_independent() {
+        let whisper_flood = WHISPER_SUSTAINED_LINES + 1;
+        assert!(should_digest_whispers(1, whisper_flood));
+        assert!(
+            !should_digest_receipts(1, whisper_flood),
+            "whisper volume must never collapse payment lines"
+        );
+        let payment_flood = RECEIPT_BURST_LINES + 1;
+        assert!(
+            !should_digest_whispers(0, 0) && !should_digest_whispers(payment_flood.min(2), 0),
+            "payment volume must never collapse whisper lines"
+        );
+    }
+
+    #[test]
+    fn rollup_is_immediate_when_nothing_was_emitted_yet() {
+        assert!(whisper_rollup_due(None, Instant::now()));
+    }
+
+    #[test]
+    fn rollup_emits_at_most_once_per_interval() {
+        let t0 = Instant::now();
+        assert!(!whisper_rollup_due(
+            Some(t0),
+            t0 + WHISPER_ROLLUP_INTERVAL - Duration::from_secs(1)
+        ));
+        assert!(whisper_rollup_due(Some(t0), t0 + WHISPER_ROLLUP_INTERVAL));
+    }
+
+    fn accum_of(items: &[(&str, &str, f64)]) -> WhisperAccum {
+        let mut a = WhisperAccum::new();
+        let v: Vec<(String, String, f64)> = items
+            .iter()
+            .map(|(f, c, amt)| (f.to_string(), c.to_string(), *amt))
+            .collect();
+        a.merge(1000, &v);
+        a
+    }
+
+    #[test]
+    fn fold_groups_by_code_and_orders_by_count_then_alphabetically() {
+        let a = accum_of(&[
+            ("aa", "ZQQL", 0.1),
+            ("bb", "MSGM", 0.1),
+            ("cc", "BAIT", 0.1),
+            ("dd", "MSGM", 0.1),
+            ("ee", "BAIT", 0.1),
+            ("ff", "MSGM", 0.1),
+        ]);
+        let ordered: Vec<String> = a.ordered_codes().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(ordered, vec!["MSGM", "BAIT", "ZQQL"]);
+    }
+
+    // A digest that shows codes but loses the value would hide real money: the
+    // fee band is not exclusive, so ordinary payments land in it.
+    #[test]
+    fn fold_totals_the_value_so_a_digest_never_hides_money() {
+        let a = accum_of(&[("aa", "ABCD", 1.5), ("bb", "ABCD", 2.25), ("cc", "EFGH", 0.25)]);
+        assert_eq!(a.count, 3);
+        assert_eq!(a.senders.len(), 3);
+        assert!((a.total - 4.0).abs() < 1e-9, "total was {}", a.total);
+        assert!(a.render().contains("4.00000000 ♦"));
+    }
+
+    #[test]
+    fn fold_is_deterministic_regardless_of_input_order() {
+        let forward = accum_of(&[("aa", "ABCD", 0.1), ("bb", "EFGH", 0.1), ("cc", "ABCD", 0.1)]);
+        let reverse = accum_of(&[("cc", "ABCD", 0.1), ("bb", "EFGH", 0.1), ("aa", "ABCD", 0.1)]);
+        assert_eq!(forward.ordered_codes(), reverse.ordered_codes());
+        assert_eq!(forward.render(), reverse.render());
+    }
+
+    #[test]
+    fn fit_never_exceeds_the_budget_and_accounts_for_the_more_tail() {
+        let tokens: Vec<(String, usize)> = (0..40)
+            .map(|i| (format!("C{:03}", i), (i % 5) + 1))
+            .collect();
+        let total: usize = tokens.iter().map(|(_, n)| *n).sum();
+        for budget in 10..=WHISPER_CODE_BUDGET_COLS {
+            let (shown, unshown) = fit_code_tokens(&tokens, budget, total);
+            let mut line = shown.join("  ");
+            if unshown > 0 {
+                line.push_str(&format!("  +{unshown} more"));
+            }
+            assert!(
+                line.chars().count() <= budget || shown.len() == 1,
+                "budget {budget} overflowed: {:?} ({} cols)",
+                line,
+                line.chars().count()
+            );
+        }
+    }
+
+    // The tail counts WHISPERS, the same unit as the header. Mixing units (some
+    // codes omitted by the fitter, some whispers dropped at the key cap) gives a
+    // number that corresponds to no real quantity — and one the fitter never
+    // reserved room for.
+    #[test]
+    fn fit_tail_is_whispers_and_always_reconciles_with_the_total() {
+        let tokens: Vec<(String, usize)> = (0..40)
+            .map(|i| (format!("C{:03}", i), (i % 7) + 1))
+            .collect();
+        let listed: usize = tokens.iter().map(|(_, n)| *n).sum();
+        // 9_000 whispers whose codes never reached the map, as after the key cap.
+        let total = listed + 9_000;
+        for budget in 10..=WHISPER_CODE_BUDGET_COLS {
+            let (shown, unshown) = fit_code_tokens(&tokens, budget, total);
+            let shown_whispers: usize = shown
+                .iter()
+                .map(|s| {
+                    s.split_once(" ×")
+                        .map_or(1, |(_, n)| n.parse::<usize>().unwrap())
+                })
+                .sum();
+            assert_eq!(
+                shown_whispers + unshown,
+                total,
+                "budget {budget}: tail does not reconcile"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_always_shows_at_least_one_code() {
+        let tokens = vec![("ABCD".to_string(), 3), ("EFGH".to_string(), 1)];
+        let (shown, unshown) = fit_code_tokens(&tokens, 1, 4);
+        assert_eq!(shown.len(), 1, "never emit a bare +N more");
+        assert_eq!(unshown, 1);
+    }
+
+    // `×` is two bytes and one column. Measuring bytes would truncate a line
+    // that actually fits.
+    #[test]
+    fn fit_measures_columns_not_bytes() {
+        let tokens = vec![("ABCD".to_string(), 12), ("EFGH".to_string(), 34)];
+        // "ABCD ×12" + "  " + "EFGH ×34" = 18 columns but 20 bytes.
+        let (shown, unshown) = fit_code_tokens(&tokens, 18, 46);
+        assert_eq!(unshown, 0, "both tokens fit in 18 columns and must be shown");
+        let line = shown.join("  ");
+        assert_eq!(line.chars().count(), 18);
+        assert_eq!(line.len(), 20, "…even though they are 20 BYTES");
+    }
+
+    // One address emitting many distinct codes is the canonical spam shape. The
+    // sender count is EXACT there, and must not be reported as a lower bound —
+    // that would read as many attackers instead of one.
+    #[test]
+    fn a_code_space_flood_from_one_sender_still_reports_one_sender() {
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..WHISPER_ACCUM_MAX_KEYS * 4)
+            .map(|i| ("ff9662e312".to_string(), format!("{i:04}"), 0.001))
+            .collect();
+        a.merge(700, &many);
+        assert!(a.codes_saturated, "the code map must be saturated");
+        assert!(!a.senders_saturated, "one sender never saturates the sender cap");
+        let line = a.render();
+        assert!(line.contains("from 1 sender "), "got: {line}");
+        assert!(!line.contains("1+ sender"), "exact count reported as a bound");
+    }
+
+    // The tip signal re-scans the tip on a reorg, so a height at or below one
+    // already folded can arrive second. The span must stay readable.
+    #[test]
+    fn the_rollup_span_is_ordered_however_the_heights_arrive() {
+        let mut a = WhisperAccum::new();
+        a.merge(512, &[("aa".into(), "ABCD".into(), 0.1)]);
+        a.merge(500, &[("bb".into(), "EFGH".into(), 0.1)]);
+        assert_eq!((a.first_block, a.last_block), (500, 512));
+        assert!(a.render().contains("blocks 500-512"));
+    }
+
+    // A catch-up scan replays thousands of blocks inside one rollup window and
+    // the code space is 26^4, so the fold needs a ceiling that does not depend
+    // on how far behind the client was. Nothing may be double counted.
+    #[test]
+    fn accumulator_is_bounded_but_still_counts_everything() {
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..5_000)
+            .map(|i| (format!("s{i}"), format!("{:04}", i), 0.001))
+            .collect();
+        a.merge(1, &many);
+        assert_eq!(a.count, 5_000, "every whisper stays counted");
+        assert!(a.codes.len() <= WHISPER_ACCUM_MAX_KEYS);
+        assert!(a.senders.len() <= WHISPER_ACCUM_MAX_KEYS);
+        assert!((a.total - 5.0).abs() < 1e-6);
+        assert!(a.render().contains("+ senders"), "saturation must be visible");
+    }
+
+    // The rollup anchor names a range once it spans blocks, so a reader can find
+    // the traffic in `history`/`whisper`.
+    #[test]
+    fn rollup_anchor_names_the_block_span() {
+        let mut a = WhisperAccum::new();
+        a.merge(500, &[("aa".into(), "ABCD".into(), 0.1)]);
+        assert!(a.render().contains("block 500"));
+        a.merge(512, &[("bb".into(), "EFGH".into(), 0.1)]);
+        assert!(a.render().contains("blocks 500-512"));
+    }
+
+    // Every notice line lives in the same 80-column budget as the rest of the
+    // client. ANSI runs are zero-width, so they are stripped before measuring.
+    #[test]
+    fn every_whisper_notice_line_fits_eighty_columns() {
+        fn plain(s: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for line in s.split('\n') {
+                let mut clean = String::new();
+                let mut chars = line.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for e in chars.by_ref() {
+                            if e == 'm' {
+                                break;
+                            }
+                        }
+                    } else {
+                        clean.push(c);
+                    }
+                }
+                out.push(clean);
+            }
+            out
+        }
+
+        // Several saturated shapes. The one that used to overflow is a flood
+        // whose unlisted tail has MORE DIGITS than anything the code map holds —
+        // the reservation and the printed number must be the same quantity.
+        let mut wide_tail = WhisperAccum::new();
+        for round in 0..40u32 {
+            let batch: Vec<(String, String, f64)> = (0..5_000)
+                .map(|i| {
+                    (
+                        format!("sender{i}"),
+                        format!("{:04}", i + round as usize * 5_000),
+                        9.87654321,
+                    )
+                })
+                .collect();
+            wide_tail.merge(291_044 + round, &batch);
+        }
+        // Narrow vocabulary, huge counts — every shown token carries "×N".
+        let mut wide_counts = WhisperAccum::new();
+        let batch: Vec<(String, String, f64)> = (0..60_000)
+            .map(|i| (format!("s{}", i % 3), format!("{:04}", i % 900), 0.001))
+            .collect();
+        wide_counts.merge(1, &batch);
+        wide_counts.merge(9_999_999, &batch);
+
+        // Worst case: a saturated rollup at maximum plausible width.
+        let mut a = WhisperAccum::new();
+        let many: Vec<(String, String, f64)> = (0..3_000)
+            .map(|i| (format!("sender{i}"), format!("{:04}", i), 9.87654321))
+            .collect();
+        a.merge(291_044, &many);
+        a.merge(999_999, &many);
+
+        for (label, rendered) in [
+            ("wide tail", wide_tail.render()),
+            ("wide counts", wide_counts.render()),
+            (
+                "single",
+                format!(
+                    "\n{}whisper{}   {}XKQF{}  {:.8} ♦  from {}…  {}block {}{}",
+                    EV_WHISPER, EV_OFF, EV_CODE, EV_OFF, 12345.6789, "c3d4e5f6a7", EV_DIM,
+                    999_999, EV_OFF
+                ),
+            ),
+            ("rollup", a.render()),
+        ] {
+            for line in plain(&rendered) {
+                assert!(
+                    line.chars().count() <= 80,
+                    "{label} line is {} columns: {:?}",
+                    line.chars().count(),
+                    line
+                );
+            }
+        }
+    }
+
+    // Drives the exact sequence the notice task runs, over a flood that starts,
+    // sustains and stops. Locks the three properties the whole feature exists
+    // for: nothing is printed twice, nothing is lost, and a sustained flood
+    // cannot pin the terminal at one notice per block.
+    #[test]
+    fn a_flood_is_bounded_then_flushes_and_loses_nothing() {
+        let mut rate = NoticeRate::new();
+        let mut accum = WhisperAccum::new();
+        let mut last_emit: Option<Instant> = None;
+        let mut now = Instant::now();
+
+        let mut verbose_printed = 0usize;
+        let mut rollups = 0usize;
+        let mut reported = 0usize; // whispers accounted for in some output
+        let mut offered = 0usize;
+
+        // 60 blocks: 2 quiet, then 40 flooded at 25/block, then 18 quiet.
+        for block in 0u32..60 {
+            let n = match block {
+                0..=1 => 1,
+                2..=41 => 25,
+                _ => 0,
+            };
+            offered += n;
+            let batch: Vec<(String, String, f64)> = (0..n)
+                .map(|i| (format!("s{i}"), format!("C{:03}", i % 97), 0.001))
+                .collect();
+
+            if n > 0 {
+                let recent = rate.recent(now);
+                rate.record(now, n);
+                if whisper_action(n, recent, !accum.is_empty()) == WhisperAction::Verbose {
+                    verbose_printed += n;
+                    reported += n;
+                } else {
+                    accum.merge(block, &batch);
+                }
+            }
+            if !accum.is_empty() && whisper_rollup_due(last_emit, now) {
+                reported += accum.count;
+                rollups += 1;
+                accum.clear();
+                last_emit = Some(now);
+            }
+            now += Duration::from_secs(5); // one block
+        }
+
+        assert_eq!(verbose_printed, 2, "the two quiet blocks stay verbose");
+        assert!(accum.is_empty(), "the rollup must flush once the flood stops");
+        assert_eq!(reported, offered, "every whisper is accounted for exactly once");
+
+        // 40 flooded blocks span 200s. Without the cooldown that is 40 notices;
+        // with a 30s interval it must be far fewer, and never more than one per
+        // interval.
+        assert!(
+            rollups <= 200 / WHISPER_ROLLUP_INTERVAL.as_secs() as usize + 2,
+            "flood produced {rollups} notices — cooldown is not bounding output"
+        );
+        assert!(rollups >= 2, "a 200s flood must still report more than once");
+    }
+
+    // The rule that keeps a rollup from being reported twice: once one is
+    // pending, a quiet block joins it instead of printing ahead of it.
+    #[test]
+    fn a_pending_rollup_absorbs_a_later_quiet_block() {
+        assert_eq!(whisper_action(1, 0, false), WhisperAction::Verbose);
+        assert_eq!(
+            whisper_action(1, 0, true),
+            WhisperAction::Fold,
+            "a quiet block must not print ahead of an older pending rollup"
+        );
+    }
+
+    #[test]
+    fn short_addr_never_panics_on_non_ascii() {
+        assert_eq!(short_addr("ff9662e312afb7e14103"), "ff9662e312");
+        assert_eq!(short_addr("é".repeat(40).as_str()).chars().count(), 10);
+        assert_eq!(short_addr("ab"), "ab");
     }
 
     #[test]
