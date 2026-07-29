@@ -2503,8 +2503,8 @@ impl HeaderSentinel {
         // Gate on the CEILING, trim down to the low-water mark. Gating on the mark instead
         // would make every insert in the band between the two pay a full collect-and-select
         // pass — precisely the per-insert cost this exists to remove, leaving the amortisation
-        // in name only. (The validation cache in node.rs has the correct shape: its caller
-        // gates on MAX_ENTRIES and passes the trim target down.)
+        // in name only. (The validation cache in node.rs shares this shape: its prune owns
+        // the ceiling gate and trims to the mark, for every caller alike.)
         if self.verifications.len().saturating_add(incoming) <= MAX_VERIFICATIONS {
             return;
         }
