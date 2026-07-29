@@ -339,6 +339,10 @@ const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
 const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
+/// Level the validation cache is pruned back to once it crosses its ceiling. The gap is what
+/// makes eviction amortised: pruning to the ceiling itself meant every insert past saturation
+/// paid a full scan, clone and ordering pass to reclaim a single entry.
+const VALIDATION_CACHE_TRIM_TARGET: usize = VALIDATION_CACHE_MAX_ENTRIES * 9 / 10;
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 /// Capability marker carried in the existing Ping/Pong `node_id` field. Older
 /// peers already ignore that field after the authenticated handshake, so this
@@ -525,7 +529,22 @@ pub struct SubnetGroup {
 }
 
 impl SubnetGroup {
+    /// Group `ip` into its diversity bucket.
+    ///
+    /// An IPv4-mapped IPv6 address (::ffff:a.b.c.d) is folded to real IPv4 FIRST, so it is
+    /// capped as an IPv4 /24 rather than counted as a distinct IPv6 group — otherwise an
+    /// attacker reaching a dual-stack listener could vary the mapped form freely and walk
+    /// straight past the subnet-diversity cap. The fold lives here, in the one function every
+    /// caller goes through, because it used to live in PeerInfo::new alone and the two
+    /// handshake sites that build a PeerInfo literal bypassed it.
     fn from_ip(ip: IpAddr, mask_v4: u8, mask_v6: u8) -> Self {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            v4 => v4,
+        };
         match ip {
             IpAddr::V4(ipv4) => {
                 let mut data = [0u8; 16];
@@ -593,20 +612,8 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     pub fn new(addr: SocketAddr) -> Self {
-        // Normalize an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to real IPv4 before
-        // grouping, so it is capped as IPv4 /24 rather than treated as a distinct IPv6
-        // group an attacker could trivially vary to dodge the subnet-diversity cap.
-        let ip = match addr.ip() {
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(v6)),
-            v4 => v4,
-        };
-        let subnet_group = match ip {
-            IpAddr::V4(_) => SubnetGroup::from_ip(ip, SUBNET_MASK_IPV4, 0),
-            IpAddr::V6(_) => SubnetGroup::from_ip(ip, 0, SUBNET_MASK_IPV6),
-        };
+        // Normalization and mask selection both live in SubnetGroup::from_ip.
+        let subnet_group = SubnetGroup::from_ip(addr.ip(), SUBNET_MASK_IPV4, SUBNET_MASK_IPV6);
 
         Self {
             address: addr,
@@ -623,10 +630,7 @@ impl PeerInfo {
 
     // Added method to get subnet from IP
     pub fn get_subnet(&self, ip: IpAddr) -> Option<SubnetGroup> {
-        match ip {
-            IpAddr::V4(_) => Some(SubnetGroup::from_ip(ip, SUBNET_MASK_IPV4, 0)),
-            IpAddr::V6(_) => Some(SubnetGroup::from_ip(ip, 0, SUBNET_MASK_IPV6)),
-        }
+        Some(SubnetGroup::from_ip(ip, SUBNET_MASK_IPV4, SUBNET_MASK_IPV6))
     }
 }
 
@@ -11375,9 +11379,15 @@ impl Node {
                 (entry.key().clone(), timestamp)
             })
             .collect();
-        entries.sort_unstable_by_key(|(_, timestamp)| *timestamp);
-
-        for (key, _) in entries.into_iter().take(len.saturating_sub(max_entries)) {
+        // Only the oldest `excess` are wanted and their order among themselves does not
+        // matter, so partition rather than sort. The count comes from what was actually
+        // collected rather than the earlier length read, which concurrent inserts and
+        // removals can already have invalidated.
+        let excess = entries.len().saturating_sub(max_entries);
+        if excess < entries.len() {
+            entries.select_nth_unstable_by_key(excess, |(_, timestamp)| *timestamp);
+        }
+        for (key, _) in entries.into_iter().take(excess) {
             cache.remove(&key);
         }
     }
@@ -11387,7 +11397,7 @@ impl Node {
             &self.validation_cache,
             SystemTime::now(),
             VALIDATION_CACHE_TTL_SECS,
-            VALIDATION_CACHE_MAX_ENTRIES,
+            VALIDATION_CACHE_TRIM_TARGET,
         );
     }
 
@@ -13552,11 +13562,15 @@ impl Node {
                 .as_secs();
             let mut attempts = self.inbound_attempts.write().await;
             let entry = attempts.entry(socket_addr.ip()).or_insert((0, now));
+            // The timestamp marks when this window OPENED, and is written only by the reset
+            // below. Refreshing it per attempt turned the window into a quiet-period cooldown:
+            // a peer that kept retrying pushed the start forward with every rejected attempt,
+            // so its counter never aged out and it stayed blocked until it went fully silent
+            // for the whole window — long after whatever caused the burst had cleared.
             if now.saturating_sub(entry.1) > INBOUND_ATTEMPT_WINDOW {
                 *entry = (0, now);
             }
             entry.0 = entry.0.saturating_add(1);
-            entry.1 = now;
             if entry.0 > MAX_INBOUND_ATTEMPTS_PER_IP {
                 return Err(NodeError::RateLimit("Too many inbound attempts".into()));
             }
@@ -17307,6 +17321,39 @@ mod tests {
         let group = SubnetGroup::from_ip("172.16.255.255".parse().unwrap(), 17, 64);
         assert_eq!(group.len, 17);
         assert_eq!(&group.data[0..4], &[172, 16, 128, 0]);
+    }
+
+    // A dual-stack listener sees an IPv4 peer as ::ffff:a.b.c.d. It must land in the SAME
+    // bucket as the plain IPv4 form, or the mapped spelling is a free way around the
+    // subnet-diversity cap. Grouping and mask selection both belong to from_ip, so every
+    // caller — including the handshake sites that build a PeerInfo literal — gets this.
+    #[test]
+    fn subnet_group_folds_ipv4_mapped_ipv6_onto_plain_ipv4() {
+        let plain = SubnetGroup::from_ip(
+            "192.168.42.99".parse().unwrap(),
+            SUBNET_MASK_IPV4,
+            SUBNET_MASK_IPV6,
+        );
+        let mapped = SubnetGroup::from_ip(
+            "::ffff:192.168.42.99".parse().unwrap(),
+            SUBNET_MASK_IPV4,
+            SUBNET_MASK_IPV6,
+        );
+        assert_eq!(mapped, plain, "the mapped form must not be its own group");
+        assert_eq!(mapped.len, SUBNET_MASK_IPV4, "and it is capped as IPv4");
+
+        // Every entry point agrees, including the one the handshake path used to bypass.
+        let via_peer_info =
+            PeerInfo::new("[::ffff:192.168.42.99]:8333".parse().unwrap()).subnet_group;
+        assert_eq!(via_peer_info, plain);
+
+        // A genuine IPv6 address is untouched by the fold.
+        let real_v6 = SubnetGroup::from_ip(
+            "2001:db8::1".parse().unwrap(),
+            SUBNET_MASK_IPV4,
+            SUBNET_MASK_IPV6,
+        );
+        assert_eq!(real_v6.len, SUBNET_MASK_IPV6);
     }
 
     #[test]

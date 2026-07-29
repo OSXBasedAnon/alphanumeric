@@ -478,21 +478,39 @@ pub fn set_finalize_stage(stage: usize) {
     FINALIZE_STAGE.store(stage, Ordering::Release);
 }
 
+/// Names for the finalize-stage counter — read off a wedged node to see where it is stuck.
+///
+/// EACH NAME DESCRIBES WHAT RUNS WHILE THE COUNTER HOLDS THAT VALUE, i.e. the code between
+/// its `set_finalize_stage` call and the next one. That is the only reading an operator can
+/// act on, and it is easy to get wrong in a specific way: the `trace_step` sitting beside
+/// each set is NOT the name of that stage. `trace_step` reports elapsed time since the
+/// previous call, so its label describes the interval that just ENDED — take those labels as
+/// stage names and the whole table shifts by one.
+///
+/// Derived by walking `finalize_block` between consecutive set points:
+///   0  miner.rs, blocking on `blockchain.write().await`
+///   1  validate_block_strict, replay check, confirmed-balance prefetch
+///   2  immature-reward lookup and the per-transaction semantic checks
+///   3  mark_chain_state_dirty + process_transactions_batch
+///   4  to_storage_block, serialize, db.insert of the block
+///   5  write_chain_tip_metadata
+///   6  db.flush and the mempool/replay-registry side effects
+///
+/// The table this replaces had been left behind by a refactor and still described a
+/// reward-signing sequence that no longer exists, so every non-zero stage was mislabelled
+/// and four entries named stages that are never set.
+const FINALIZE_STAGES: [&str; 7] = [
+    "waiting_lock",
+    "prevalidate",
+    "validate_txs",
+    "apply_batch",
+    "db_insert",
+    "tip_metadata",
+    "flush",
+];
+
 pub fn finalize_stage_name(stage: usize) -> &'static str {
-    match stage {
-        0 => "waiting_lock",
-        1 => "derive_keys",
-        2 => "calc_reward",
-        3 => "sign_reward",
-        4 => "insert_reward",
-        5 => "merkle",
-        6 => "prefetch_balances",
-        7 => "validate_batch",
-        8 => "apply_batch",
-        9 => "db_insert",
-        10 => "balances_height",
-        _ => "unknown",
-    }
+    FINALIZE_STAGES.get(stage).copied().unwrap_or("unknown")
 }
 
 #[derive(Eq, PartialEq)]
