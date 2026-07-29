@@ -1,4 +1,5 @@
 pub mod blockchain;
+pub mod blocknotify;
 pub mod bpos;
 pub mod codec;
 pub mod mempool;

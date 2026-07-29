@@ -1304,6 +1304,13 @@ async fn async_main() -> Result<()> {
             wallets.values().map(|w| w.address.clone()).collect(),
         ));
 
+        // Push the tip to an external hook (Bitcoin's -blocknotify contract) for
+        // Stratum pools, which otherwise poll and hand out work on a dead parent.
+        // Unconditional by design: a pool runs headless, so gating this on the
+        // interactive path would disable it for its only audience. No-op unless
+        // ALPHANUMERIC_BLOCKNOTIFY is set; see a9::blocknotify.
+        alphanumeric::a9::blocknotify::spawn(blockchain.clone());
+
         // Instant received-funds notification. Subscribes to the in-process tip
         // signal (fired by the live beacon-watch sync on every applied block) and
         // scans the newly-applied block(s) for credits to a local wallet — no
