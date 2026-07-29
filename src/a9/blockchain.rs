@@ -15,7 +15,7 @@ use std::error::Error as StdError;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, RwLock};
@@ -1368,6 +1368,11 @@ pub struct Blockchain {
     /// packer calls it 4x per admitted candidate.
     genesis_timestamp: Arc<std::sync::OnceLock<u64>>,
     state_mutation_lock: Arc<Mutex<()>>,
+    /// Open catch-up apply window (batched durability), if any. Read by the
+    /// marker/flush helpers under `state_mutation_lock`; begin/commit also
+    /// mutate it only under that lock, so depth transitions never race an
+    /// in-flight apply.
+    apply_batch: Arc<ApplyBatchState>,
     /// Single-flight gate for the one-time pending-set transition at the
     /// coordinated fee-system height. Lock order is this gate ->
     /// state_mutation_lock; callers must invoke the public ensure method without
@@ -1461,6 +1466,58 @@ struct ChainStateDirty {
     block_index: u32,
     reason: String,
     marked_at: u64,
+}
+
+/// Shared state for an open catch-up apply window (see `begin_receipt_batch`).
+/// `depth` composes overlapping windows (relay drain inside converge, or two
+/// independent sync tasks). `marked` records whether the window's durable
+/// marker has been written — it is written LAZILY by the first in-window
+/// mark_chain_state_dirty (still strictly before that apply's mutations, so
+/// the marker-durable-before-mutations invariant holds), which makes a window
+/// that applies nothing cost zero fsyncs. `unbalanced_marks` counts per-apply
+/// mark/clear pairs that never closed — an apply that failed AFTER its
+/// mutation point leaves its pair open; the next in-window reconcile heals it
+/// immediately (same next-apply semantics as outside a window), and a nonzero
+/// count at commit (failure on the window's LAST apply) leaves the marker set.
+/// The counter is also the durable clear's backstop: a cancelled window's
+/// lock-free Drop can flip `depth` to 0 mid-apply, routing that apply's clear
+/// to the durable path — the backstop refuses to remove a marker while the
+/// counter shows an unclosed pair, so a torn teardown can never discard the
+/// only recovery signal.
+#[derive(Debug, Default)]
+struct ApplyBatchState {
+    depth: AtomicU64,
+    marked: AtomicBool,
+    unbalanced_marks: AtomicI64,
+}
+
+/// RAII handle for one catch-up apply window. Obtained from
+/// `begin_receipt_batch`, closed by `commit_receipt_batch`. Dropping it
+/// without commit (task cancellation) leaves the durable dirty marker set, so
+/// the next apply's reconcile heals via full recovery — the safe direction.
+pub struct ReceiptApplyBatch {
+    state: Arc<ApplyBatchState>,
+    closed: bool,
+}
+
+impl Drop for ReceiptApplyBatch {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Runs lock-free at future-cancellation time (converge rounds are
+            // timeout-wrapped), so this decrement CAN race an in-flight apply
+            // that read depth>0 at its mark: that apply's clear then takes the
+            // durable path, where the unbalanced_marks backstop refuses to
+            // remove a marker still covering an unclosed pair. Any marker this
+            // window wrote therefore survives teardown in every interleaving,
+            // and the next windowless reconcile pays one full recovery.
+            let prev = self.state.depth.fetch_sub(1, Ordering::AcqRel);
+            if prev <= 1 && self.state.marked.load(Ordering::Acquire) {
+                warn!(
+                    "Catch-up apply window dropped without commit; dirty marker left set for recovery"
+                );
+            }
+        }
+    }
 }
 
 /// Display breakdown of get_wallet_balance: the same numbers it nets together, returned
@@ -1845,11 +1902,44 @@ impl Blockchain {
         }
     }
 
+    /// True while a catch-up apply window is open. The marker/reconcile/flush
+    /// helpers read this under `state_mutation_lock` (which begin/commit also
+    /// hold), so per-apply bookkeeping never observes a window half-opened or
+    /// half-committed. `raise_trusted_checkpoint` reads it OUTSIDE that lock;
+    /// that race is benign in both directions — a stale `true` merely defers
+    /// the raise's durability to the window's commit flush (a lost raise
+    /// re-arrives lower, the safe direction), a stale `false` costs one
+    /// harmless extra fsync.
+    fn apply_batch_open(&self) -> bool {
+        self.apply_batch.depth.load(Ordering::Acquire) > 0
+    }
+
     fn mark_chain_state_dirty(
         &self,
         block_index: u32,
         reason: &str,
     ) -> Result<(), BlockchainError> {
+        // Inside an open window, the window's ONE durable marker covers every
+        // apply; per-apply bookkeeping is the pair counter. The marker itself
+        // is written lazily by the FIRST in-window mark — still strictly
+        // before that apply's mutations run, so the marker is durable before
+        // any window mutation can persist, and a window that never applies
+        // costs zero fsyncs. The counter increment comes LAST: if the marker
+        // write fails, no pair is left open.
+        if self.apply_batch_open() {
+            if !self.apply_batch.marked.load(Ordering::Acquire) {
+                self.write_dirty_marker(block_index, "receipt_batch")?;
+                self.apply_batch.marked.store(true, Ordering::Release);
+            }
+            self.apply_batch
+                .unbalanced_marks
+                .fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
+        self.write_dirty_marker(block_index, reason)
+    }
+
+    fn write_dirty_marker(&self, block_index: u32, reason: &str) -> Result<(), BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
         let marker = ChainStateDirty {
             block_index,
@@ -1862,9 +1952,119 @@ impl Blockchain {
     }
 
     fn clear_chain_state_dirty(&self) -> Result<(), BlockchainError> {
+        if self.apply_batch_open() {
+            self.apply_batch
+                .unbalanced_marks
+                .fetch_sub(1, Ordering::AcqRel);
+            return Ok(());
+        }
+        // BACKSTOP against a torn window teardown: a cancelled window's Drop
+        // decrements depth lock-free, so an apply that marked INTO the window
+        // (counter path, no marker write of its own) can reach this durable
+        // path for its clear. Removing the marker here would discard the only
+        // recovery signal for the window's unflushed applies — and this apply
+        // completed, so its own full flush below the persist gate has already
+        // made everything durable-consistent when the counter is balanced.
+        // While the counter shows an unclosed pair, refuse: the marker stays,
+        // and the next windowless reconcile pays one full recovery instead of
+        // risking silent H4-class poison. recover_dirty_chain_state discharges
+        // the counter before its own clear, so recovery always passes here.
+        if self
+            .apply_batch
+            .unbalanced_marks
+            .load(Ordering::Acquire)
+            != 0
+        {
+            warn!(
+                "Durable dirty-marker clear refused: an apply window's pair count is unbalanced; leaving marker for recovery"
+            );
+            return Ok(());
+        }
         let meta_tree = self.open_chain_meta_tree()?;
         meta_tree.remove(CHAIN_STATE_DIRTY_KEY)?;
         meta_tree.flush()?;
+        Ok(())
+    }
+
+    /// Open a catch-up apply window: ONE durable dirty marker (written lazily
+    /// by the window's first apply, still strictly before that apply's
+    /// mutations) + one commit-time full flush cover every apply until
+    /// `commit_receipt_batch`, instead of the 4-5 full-DB fsyncs each block
+    /// pays outside a window (the 11-13 blk/s catch-up ceiling). Inside the
+    /// window the per-apply helpers (mark/clear/reconcile, the persist flush
+    /// block, the checkpoint-raise flush) become in-memory bookkeeping, with
+    /// sled's background flush cadence bounding mid-window loss; a window
+    /// that applies nothing costs zero fsyncs. Correctness under a mid-window
+    /// crash is unchanged: the marker is durable BEFORE any window mutation
+    /// can persist, so startup/next-apply recovery runs the same full rebuild
+    /// it runs today. An apply that fails after its mutation point is healed
+    /// by the very next in-window reconcile (same next-apply H4/M1 semantics
+    /// as outside a window), not deferred to commit.
+    ///
+    /// Windows compose by depth (relay drain inside converge, overlapping sync
+    /// tasks): only the outermost commit closes the window. Callers MUST
+    /// commit on every exit path — a dropped marked window leaves the marker
+    /// set and the next apply pays a full recovery (cancellation-safe, not
+    /// free). The unbalanced-pair backstop in clear_chain_state_dirty keeps a
+    /// torn teardown (lock-free Drop racing an in-flight apply) from ever
+    /// discarding a marker that still covers unhealed dirt.
+    pub async fn begin_receipt_batch(&self) -> Result<ReceiptApplyBatch, BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
+        if !self.apply_batch_open() {
+            // Heal any PRIOR failed apply first, under the same serialization
+            // as the applies themselves — once the window is open, a
+            // pre-existing marker would be indistinguishable from the
+            // window's own (lazily written) one.
+            let dirty = self.chain_state_dirty()?;
+            if let Some(marker) = dirty {
+                self.recover_dirty_chain_state(&marker).await?;
+            }
+            self.apply_batch.marked.store(false, Ordering::Release);
+            self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+        }
+        self.apply_batch.depth.fetch_add(1, Ordering::AcqRel);
+        Ok(ReceiptApplyBatch {
+            state: Arc::clone(&self.apply_batch),
+            closed: false,
+        })
+    }
+
+    /// Close a catch-up apply window: one full-DB flush makes every apply in
+    /// the window durable, then the dirty marker is cleared — UNLESS an apply
+    /// inside the window failed after its mutation point (unbalanced
+    /// mark/clear pair), in which case the marker stays set so the next
+    /// apply's reconcile performs the same full recovery an unbatched failure
+    /// gets today. A flush error also leaves the marker set.
+    pub async fn commit_receipt_batch(
+        &self,
+        mut batch: ReceiptApplyBatch,
+    ) -> Result<(), BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
+        batch.closed = true;
+        let prev = self.apply_batch.depth.fetch_sub(1, Ordering::AcqRel);
+        if prev != 1 {
+            return Ok(());
+        }
+        // A window that never marked applied nothing marker-covered: nothing
+        // to flush or clear (zero-fsync fast path for all-duplicate rounds).
+        if !self.apply_batch.marked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.db
+            .flush()
+            .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
+        let unbalanced = self.apply_batch.unbalanced_marks.load(Ordering::Acquire);
+        if unbalanced == 0 {
+            self.clear_chain_state_dirty()?;
+        } else {
+            // Failure on the window's LAST apply — no later in-window
+            // reconcile got to heal it. Leave the marker; the next windowless
+            // reconcile runs the full recovery.
+            warn!(
+                "Catch-up apply window closed with {} unhealed apply(s); dirty marker left set for recovery",
+                unbalanced
+            );
+        }
         Ok(())
     }
 
@@ -1912,6 +2112,10 @@ impl Blockchain {
                 e
             );
         }
+        // Everything the pair counter guarded is now healed from the
+        // canonical store — discharge it BEFORE the clear, so the durable
+        // clear's unbalanced backstop never blocks recovery's own close.
+        self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
         self.clear_chain_state_dirty()?; // (5) clear LAST
         Ok(())
     }
@@ -1925,6 +2129,27 @@ impl Blockchain {
     /// (`state_mutation_lock` for tip extensions, the outer `RwLock` write guard for the external
     /// reorg) guarantees a marker seen here reflects a PRIOR failed apply, never an in-flight one.
     async fn reconcile_chain_state_if_dirty(&self) -> Result<(), BlockchainError> {
+        // Inside an open catch-up window with a BALANCED pair count, the
+        // marker on disk (if any) is the window's own lazily-written one
+        // (begin healed any prior dirt under this same serialization) —
+        // recovering would misread it as a prior failure. But an UNBALANCED
+        // count means an in-window apply failed after its mutation point:
+        // heal that NOW, exactly like the next-apply heal outside a window
+        // (H4/M1) — deferring it to commit would let every later apply in the
+        // window run against poisoned balances / a half-written registry. The
+        // heal reads only the canonical store; its internal clear is
+        // depth-gated, so the window marker stays on disk for the applies
+        // that follow, and the discharged counter is reset below.
+        if self.apply_batch_open() {
+            if self.apply_batch.unbalanced_marks.load(Ordering::Acquire) != 0 {
+                let dirty = self.chain_state_dirty()?;
+                if let Some(marker) = dirty {
+                    self.recover_dirty_chain_state(&marker).await?;
+                }
+                self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+            }
+            return Ok(());
+        }
         // Resolve the `?` (which threads a !Send ControlFlow<Result<_, BlockchainError>>) to a plain
         // Option BEFORE the await, so no BlockchainError-carrying temporary is held across it — the
         // project-wide !Send rule (BlockchainError is a boxed dyn Error). `marker` is all-Send.
@@ -1995,7 +2220,14 @@ impl Blockchain {
                 old.map(|o| o.to_vec())
             }
         })?;
-        meta_tree.flush()?;
+        // Inside an open catch-up window, defer durability to the window's
+        // commit flush: the raise is written AFTER the blocks it trails, and
+        // the commit flush persists both together, so a durable checkpoint can
+        // never outrun its underlying blocks. A raise lost with its window
+        // comes back LOWER — the safe direction (more verification demanded).
+        if !self.apply_batch_open() {
+            meta_tree.flush()?;
+        }
         Ok(())
     }
 
@@ -4069,16 +4301,22 @@ impl Blockchain {
         // inside process_transactions_batch's apply batch — and tip metadata is
         // written only after it, so a reader that can see the new tip can never
         // observe a lagging marker (the window that used to trigger stampeding
-        // full rebuilds on every block). The tree is opened here only to flush.
-        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        // full rebuilds on every block).
         self.write_chain_tip_metadata(block)?;
 
-        // Ensure all changes are persisted
-        self.db
-            .flush()
-            .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
-        balances_tree.flush()?;
-        self.open_chain_meta_tree()?.flush()?;
+        // Ensure all changes are persisted. Inside an open catch-up window the
+        // per-block fsyncs are the amortized cost the window removes (the
+        // 11-13 blk/s ceiling was ~4 full-DB fsyncs per applied block);
+        // durability is the window's begin-marker + commit flush, and the
+        // gated clear below only balances the window's mark/clear pair.
+        if !self.apply_batch_open() {
+            self.db
+                .flush()
+                .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
+            // Tree opened only to flush.
+            self.db.open_tree(BALANCES_TREE)?.flush()?;
+            self.open_chain_meta_tree()?.flush()?;
+        }
         self.clear_chain_state_dirty()?;
         self.notify_tip_changed(block);
 
@@ -4789,6 +5027,7 @@ impl Blockchain {
             genesis_timestamp: Arc::new(std::sync::OnceLock::new()),
             last_known_checkpoint: Arc::new(AtomicU64::new(0)),
             state_mutation_lock: Arc::new(Mutex::new(())),
+            apply_batch: Arc::new(ApplyBatchState::default()),
             pending_rules_gate: Arc::new(Mutex::new(())),
             pending_rules_complete: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -12704,6 +12943,249 @@ mod tests {
             5.0,
             "phantom second coinbase erased; credited exactly once"
         );
+    }
+
+    // Catch-up apply window: one durable marker + one commit flush replaces the per-block
+    // fsyncs, and the marker must survive every balanced per-block mark/clear pair inside
+    // the window — a mid-window crash has to find it set, or the H4/M1 recovery never runs.
+    // (Drives the same helper sequence persist_validated_block_with_mode drives; the
+    // harness blocks cannot pass consensus difficulty linkage, so a full validated apply
+    // is not constructible here — and the window deliberately changes nothing above the
+    // marker/flush layer.)
+    #[tokio::test]
+    async fn receipt_batch_amortizes_marker_and_clears_on_commit() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let batch = bc.begin_receipt_batch().await.expect("window opens");
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "lazy marker: an empty window has written nothing yet"
+        );
+
+        for i in 1..=3u32 {
+            // The exact pair every successful apply runs: mark, then the balancing clear.
+            bc.mark_chain_state_dirty(i, "persist_block").unwrap();
+            assert_eq!(
+                bc.chain_state_dirty().unwrap().map(|m| m.reason),
+                Some("receipt_batch".to_string()),
+                "first in-window mark writes the window's durable marker"
+            );
+            bc.clear_chain_state_dirty().unwrap();
+            assert_eq!(
+                bc.chain_state_dirty().unwrap().map(|m| m.reason),
+                Some("receipt_batch".to_string()),
+                "balanced per-block pairs must not remove the window marker"
+            );
+        }
+
+        // The real entry point also runs under the window without disturbing it: an
+        // unattached block parks as an orphan (no marker interaction), window intact.
+        let mut unattached_parent = [0x42u8; 32];
+        unattached_parent[0] = 0x99;
+        let future = metadata_test_block(7, unattached_parent, "miner7", 1.0);
+        bc.save_receipt_verified_block(&future)
+            .await
+            .expect("orphan park inside the window");
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "window marker survives a save_receipt_verified_block call"
+        );
+
+        bc.commit_receipt_batch(batch)
+            .await
+            .expect("commit flushes and clears");
+        assert_eq!(bc.chain_state_dirty().unwrap(), None, "window closed clean");
+    }
+
+    // An apply that fails AFTER its mutation point leaves its mark/clear pair open; commit
+    // must then keep the marker so the next windowless reconcile runs the same recovery an
+    // unbatched failure gets.
+    #[tokio::test]
+    async fn receipt_batch_unbalanced_apply_leaves_marker_and_reconcile_heals() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let batch = bc.begin_receipt_batch().await.expect("window opens");
+        // Simulate persist failing after mark_chain_state_dirty: the mark is counted, the
+        // balancing clear never happens (the exact "dirty marker remains for startup
+        // recovery" shape, inside a window).
+        bc.mark_chain_state_dirty(1, "persist_block").unwrap();
+        bc.commit_receipt_batch(batch)
+            .await
+            .expect("commit itself succeeds");
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "unbalanced window must leave the marker for recovery"
+        );
+
+        bc.reconcile_chain_state_if_dirty()
+            .await
+            .expect("windowless reconcile heals");
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+    }
+
+    // A marked window dropped without commit (task cancellation) leaves the marker set —
+    // the safe direction — and the next windowless reconcile heals it. An UNMARKED window
+    // costs nothing and leaves nothing.
+    #[tokio::test]
+    async fn receipt_batch_drop_without_commit_leaves_marker_then_heals() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        // Empty window: drop leaves no trace.
+        {
+            let _batch = bc.begin_receipt_batch().await.expect("window opens");
+        }
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "an unmarked window leaves nothing behind"
+        );
+
+        // Marked window (one balanced apply happened), then dropped.
+        {
+            let _batch = bc.begin_receipt_batch().await.expect("window opens");
+            bc.mark_chain_state_dirty(1, "persist_block").unwrap();
+            bc.clear_chain_state_dirty().unwrap();
+        }
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "dropped marked window leaves the marker set"
+        );
+        bc.reconcile_chain_state_if_dirty().await.expect("heals");
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+    }
+
+    // Windows compose by depth (relay drain inside converge): only the outermost commit
+    // closes the marker.
+    #[tokio::test]
+    async fn receipt_batch_windows_compose_by_depth() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let outer = bc.begin_receipt_batch().await.unwrap();
+        let inner = bc.begin_receipt_batch().await.unwrap();
+        bc.mark_chain_state_dirty(1, "persist_block").unwrap();
+        bc.clear_chain_state_dirty().unwrap();
+        bc.commit_receipt_batch(inner).await.unwrap();
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "inner commit must not close the outer window"
+        );
+        bc.commit_receipt_batch(outer).await.unwrap();
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+    }
+
+    // Fix for the in-window heal deferral: an apply that failed after its mutation point
+    // (unbalanced pair) must be healed by the NEXT in-window reconcile — not deferred to
+    // commit past further applies — while the window marker stays on disk for the applies
+    // that follow.
+    #[tokio::test]
+    async fn receipt_batch_in_window_reconcile_heals_unbalanced_immediately() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let batch = bc.begin_receipt_batch().await.expect("window opens");
+        // Failed apply: mark with no balancing clear.
+        bc.mark_chain_state_dirty(1, "persist_block").unwrap();
+        // Next apply's entry reconcile — inside the window — must heal now.
+        bc.reconcile_chain_state_if_dirty()
+            .await
+            .expect("in-window heal");
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "window marker survives the in-window heal for the applies that follow"
+        );
+        // Subsequent balanced apply, then a clean commit.
+        bc.mark_chain_state_dirty(2, "persist_block").unwrap();
+        bc.clear_chain_state_dirty().unwrap();
+        bc.commit_receipt_batch(batch)
+            .await
+            .expect("commit closes clean after the heal");
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "healed window commits clean"
+        );
+    }
+
+    // Fix for the torn-teardown race: a cancelled window's Drop flips depth to 0 lock-free,
+    // so a straddling apply's clear reaches the DURABLE path while its own mark only bumped
+    // the window counter. The durable clear's backstop must refuse to remove the marker
+    // while the pair count is unbalanced — the marker is the only recovery signal left.
+    #[tokio::test]
+    async fn receipt_batch_torn_drop_cannot_clear_marker_over_unbalanced_pairs() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&bc, &block0);
+        bc.rebuild_chain_tip_metadata().unwrap();
+
+        let batch = bc.begin_receipt_batch().await.expect("window opens");
+        // Straddler's mark lands inside the window (counter path, marker written lazily)...
+        bc.mark_chain_state_dirty(1, "persist_block").unwrap();
+        // ...then the window owner is cancelled: Drop, lock-free, depth -> 0.
+        drop(batch);
+        // The straddler's clear now takes the durable path. It must NOT remove the marker.
+        bc.clear_chain_state_dirty().unwrap();
+        assert!(
+            bc.chain_state_dirty().unwrap().is_some(),
+            "backstop keeps the marker while the pair count is unbalanced"
+        );
+        // The next windowless reconcile pays one full recovery and closes it.
+        bc.reconcile_chain_state_if_dirty()
+            .await
+            .expect("recovery discharges the counter and clears");
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+    }
+
+    // begin must heal PRIOR dirt before writing its own marker — once the window is open, a
+    // pre-existing marker would be indistinguishable from the window's.
+    #[tokio::test]
+    async fn receipt_batch_begin_heals_prior_dirt_first() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let block1 = metadata_test_block(1, block0.hash, "minerx", 5.0);
+        insert_raw_block(&bc, &block0);
+        insert_raw_block(&bc, &block1);
+        bc.write_chain_tip_metadata(&block1).unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        // Same marker-ahead poison as the H4 test: phantom double coinbase, marker at 2.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert(
+                "minerx".as_bytes(),
+                codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+            )
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 2).unwrap();
+        bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
+
+        let batch = bc.begin_receipt_batch().await.expect("begin heals then opens");
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "prior marker healed; the window's own marker is written lazily on first mark"
+        );
+        assert_eq!(
+            bc.get_confirmed_balance("minerx").await.unwrap(),
+            5.0,
+            "H4 poison healed BEFORE the window opened"
+        );
+        bc.commit_receipt_batch(batch).await.unwrap();
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
     }
 
     // T2 (M1, DECISIVE): recovery must re-anchor the tip (rebuild_chain_tip_metadata FIRST) before

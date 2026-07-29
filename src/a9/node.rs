@@ -3961,6 +3961,23 @@ impl Node {
                     // less). The per-block re-read plus a second guard acquisition
                     // was 2 RwLock hits per block on a lock contended by ingest.
                     let floor = self.blockchain.read().await.verification_floor();
+                    // One dirty window per adopted chunk (≤CONVERGE_CHUNK):
+                    // amortizes the per-block fsyncs. The loop's early exits
+                    // are collected into `early` and returned only AFTER the
+                    // window commits, so no exit path leaves it open.
+                    let batch = {
+                        let bc = self.blockchain.read().await;
+                        bc.begin_receipt_batch()
+                            .await
+                            .map_err(|e| {
+                                warn!(
+                                    "converge: apply window unavailable, using per-block durability: {}",
+                                    e
+                                )
+                            })
+                            .ok()
+                    };
+                    let mut early: Option<Converge> = None;
                     for block in branch {
                         if block.index > floor
                             && !self
@@ -3973,7 +3990,8 @@ impl Node {
                                 "Rejected forward block {} (> floor {}): signatures not fully verifiable",
                                 block.index, floor
                             );
-                            return Converge::BranchInvalid;
+                            early = Some(Converge::BranchInvalid);
+                            break;
                         }
                         let saved = {
                             let bc = self.blockchain.write().await;
@@ -4015,12 +4033,31 @@ impl Node {
                                 // here gets memoized lineage-dead and PROPAGATES to every
                                 // child, so one sled hiccup mid-append would sideline our
                                 // own live lineage for the whole 300s cooldown.
-                                if e.contains("Database error") || e.contains("Serialization") {
-                                    return Converge::BeaconStale;
-                                }
-                                return Converge::BranchInvalid;
+                                early = Some(
+                                    if e.contains("Database error") || e.contains("Serialization")
+                                    {
+                                        Converge::BeaconStale
+                                    } else {
+                                        Converge::BranchInvalid
+                                    },
+                                );
+                                break;
                             }
                         }
+                    }
+                    if let Some(batch) = batch {
+                        if let Err(e) = {
+                            let bc = self.blockchain.read().await;
+                            bc.commit_receipt_batch(batch).await
+                        } {
+                            warn!(
+                                "converge: apply window commit failed; dirty marker left for recovery: {}",
+                                e
+                            );
+                        }
+                    }
+                    if let Some(outcome) = early {
+                        return outcome;
                     }
                 }
             } else {
@@ -5131,6 +5168,20 @@ impl Node {
                     .then_with(|| a.hash.cmp(&b.hash))
             });
 
+            // One dirty window per relay round (≤64 blocks): amortizes the
+            // per-block fsyncs. Non-fatal if unavailable.
+            let batch = {
+                let bc = self.blockchain.read().await;
+                bc.begin_receipt_batch()
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            "relay sync: apply window unavailable, using per-block durability: {}",
+                            e
+                        )
+                    })
+                    .ok()
+            };
             for block in blocks {
                 // Checkpoint-anchored verification (S-01). Blocks ABOVE the trusted
                 // checkpoint are the unfinalized frontier: a relay-only node cannot
@@ -5191,6 +5242,17 @@ impl Node {
                         }
                     }
                     (Err(e), _, _) => warn!("Failed to save relayed block {}: {}", block.index, e),
+                }
+            }
+            if let Some(batch) = batch {
+                if let Err(e) = {
+                    let bc = self.blockchain.read().await;
+                    bc.commit_receipt_batch(batch).await
+                } {
+                    warn!(
+                        "relay sync: apply window commit failed; dirty marker left for recovery: {}",
+                        e
+                    );
                 }
             }
 
@@ -14472,6 +14534,23 @@ impl Node {
                             local_tip.saturating_add(1),
                             target
                         );
+                        // Amortize durability across the span: one dirty
+                        // window instead of 4-5 full-DB fsyncs per block (the
+                        // 11-13 blk/s catch-up ceiling). Failure to open is
+                        // non-fatal — the loop then runs with today's
+                        // per-block durability.
+                        let batch = {
+                            let bc = self.blockchain.read().await;
+                            bc.begin_receipt_batch()
+                                .await
+                                .map_err(|e| {
+                                    warn!(
+                                        "peer full-sync: apply window unavailable, using per-block durability: {}",
+                                        e
+                                    )
+                                })
+                                .ok()
+                        };
                         for block in &span {
                             // Same slice contract as the GetBlocks loop in STEP 3: expiry
                             // between block applies, never mid-block. A proven span can run
@@ -14496,6 +14575,17 @@ impl Node {
                                     block.index, e
                                 );
                                 break;
+                            }
+                        }
+                        if let Some(batch) = batch {
+                            if let Err(e) = {
+                                let bc = self.blockchain.read().await;
+                                bc.commit_receipt_batch(batch).await
+                            } {
+                                warn!(
+                                    "peer full-sync: apply window commit failed; dirty marker left for recovery: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -14530,6 +14620,21 @@ impl Node {
 
             let before_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
             let floor = { self.blockchain.read().await.verification_floor() };
+            // One dirty window per span: amortizes the per-block fsyncs for
+            // both the receipt path and the witness path (they funnel into the
+            // same persist). Non-fatal if unavailable.
+            let batch = {
+                let bc = self.blockchain.read().await;
+                bc.begin_receipt_batch()
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            "peer full-sync: apply window unavailable, using per-block durability: {}",
+                            e
+                        )
+                    })
+                    .ok()
+            };
             for block in candidates {
                 let res = if Self::routes_via_witness(block.index, floor) {
                     self.accept_peer_block(&block, Some(peer)).await
@@ -14543,6 +14648,17 @@ impl Node {
                 };
                 if let Err(e) = res {
                     warn!("peer full-sync: block {} rejected: {}", block.index, e);
+                }
+            }
+            if let Some(batch) = batch {
+                if let Err(e) = {
+                    let bc = self.blockchain.read().await;
+                    bc.commit_receipt_batch(batch).await
+                } {
+                    warn!(
+                        "peer full-sync: apply window commit failed; dirty marker left for recovery: {}",
+                        e
+                    );
                 }
             }
             let after_tip = { self.blockchain.read().await.get_latest_block_index() as u32 };
@@ -14763,6 +14879,21 @@ impl Node {
                                 let verify_from =
                                     { self.blockchain.read().await.verification_floor() }
                                         .saturating_add(1);
+                                // One dirty window per batch: amortizes the
+                                // per-block fsyncs (the 11-13 blk/s catch-up
+                                // ceiling). Non-fatal if unavailable.
+                                let batch = {
+                                    let bc = self.blockchain.read().await;
+                                    bc.begin_receipt_batch()
+                                        .await
+                                        .map_err(|e| {
+                                            warn!(
+                                                "sync: apply window unavailable, using per-block durability: {}",
+                                                e
+                                            )
+                                        })
+                                        .ok()
+                                };
                                 for block in candidate_blocks {
                                     let before = {
                                         self.blockchain.read().await.get_latest_block_index() as u32
@@ -14805,6 +14936,17 @@ impl Node {
                                         Err(e) => {
                                             warn!("Failed to accept block {}: {}", block.index, e)
                                         }
+                                    }
+                                }
+                                if let Some(batch) = batch {
+                                    if let Err(e) = {
+                                        let bc = self.blockchain.read().await;
+                                        bc.commit_receipt_batch(batch).await
+                                    } {
+                                        warn!(
+                                            "sync: apply window commit failed; dirty marker left for recovery: {}",
+                                            e
+                                        );
                                     }
                                 }
 
