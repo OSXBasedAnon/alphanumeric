@@ -832,6 +832,13 @@ impl Mgmt {
         }
     }
 
+    /// Mine one block.
+    ///
+    /// `announce` is called the moment the block is finalized, before any of the reporting
+    /// that follows. It exists so the network hears about a block as early as this code can
+    /// possibly say it — see the call site for why that ordering matters. It must only hand
+    /// the block off (spawn, queue); anything that blocks or awaits inside it is stalling a
+    /// freshly-mined block against the clock that decides whether it orphans.
     pub async fn handle_mine_command(
         &self,
         command: &[&str],
@@ -841,6 +848,7 @@ impl Mgmt {
         _db_arc: &Arc<RwLock<Db>>,
         use_gpu: bool,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        announce: &dyn Fn(&Block),
     ) -> Result<Block> {
         if command.len() < 2 {
             return Err("Usage: mine <wallet_name_or_address>".into());
@@ -915,6 +923,20 @@ impl Mgmt {
             .await
         {
             Ok((_nonce, _hash, mined_block)) => {
+                // ANNOUNCE FIRST. mine_block has returned, so the block is validated and
+                // durably committed — there is nothing left to learn about it, and every
+                // instant it stays on this machine is time a competitor's block spends
+                // propagating instead. What follows is display work, and the balance
+                // breakdown below takes a fresh chain READ guard: tokio's RwLock is
+                // write-preferring, so right after finalize releases the write guard that
+                // read queues behind any block already waiting to be applied. Under load —
+                // exactly when blocks are contested — that is tens of milliseconds of
+                // silence bought for a console line.
+                //
+                // The hook only hands the block off (it spawns, it does not send), so this
+                // holds no lock and cannot block the miner.
+                announce(&mined_block);
+
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Blue)).set_bold(true))?;
                 writeln!(stdout, "\n Mining successful")?;
                 stdout.reset()?;
