@@ -2930,8 +2930,60 @@ println!("Wallet renamed successfully");
                             stop_flag.clone(),
                         );
                         let miner = Miner::new(blockchain.clone(), mining_manager);
+                        // Announce a freshly-mined block the INSTANT it is finalized, ahead
+                        // of the reporting that follows it inside handle_mine_command. Hands
+                        // the block to a task and returns immediately: the miner is blocked
+                        // on this call, so anything that waited here would be spent standing
+                        // between a solved block and the network.
+                        let announce_node = Arc::clone(&node);
+                        let announce = move |block: &Block| {
+                            let publish_node = Arc::clone(&announce_node);
+                            let mined_block = block.clone();
+                            let mined_height = mined_block.index;
+                            tokio::spawn(async move {
+                                const MAX_PUBLISH_ATTEMPTS: u32 = 4;
+                                for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
+                                    match publish_node
+                                        .publish_block(mined_block.clone(), "Post-mine")
+                                        .await
+                                    {
+                                        Ok(()) => return,
+                                        Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
+                                            warn!(
+                                                "Failed to publish mined block (attempt {}/{}): {}",
+                                                attempt, MAX_PUBLISH_ATTEMPTS, e
+                                            );
+                                            tokio::time::sleep(Duration::from_secs(
+                                                2 * attempt as u64,
+                                            ))
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to publish mined block after {} attempts: {}",
+                                                MAX_PUBLISH_ATTEMPTS, e
+                                            );
+                                            // Say it on the CONSOLE: a block that never left
+                                            // this machine looks like a normal success
+                                            // otherwise, then silently orphans.
+                                            println!(
+                                                "\n⚠ Block #{} could not be published to the network ({} attempts). It is saved locally, but until connectivity recovers other miners may overtake it — check your connection.",
+                                                mined_height, MAX_PUBLISH_ATTEMPTS
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        };
                         match mgmt
-                            .handle_mine_command(&mine_parts, &miner, &mut wallets, &blockchain, &db_arc)
+                            .handle_mine_command(
+                                &mine_parts,
+                                &miner,
+                                &mut wallets,
+                                &blockchain,
+                                &db_arc,
+                                &announce,
+                            )
                             .await
                         {
                             Ok(mined_block) => {
@@ -2953,43 +3005,6 @@ println!("Wallet renamed successfully");
                                         .await
                                         .push((mined_height, mined_block.hash, reward));
                                 }
-                                let publish_node = Arc::clone(&node);
-                                tokio::spawn(async move {
-                                    const MAX_PUBLISH_ATTEMPTS: u32 = 4;
-                                    for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
-                                        match publish_node
-                                            .publish_block(mined_block.clone(), "Post-mine")
-                                            .await
-                                        {
-                                            Ok(()) => return,
-                                            Err(e) if attempt < MAX_PUBLISH_ATTEMPTS => {
-                                                warn!(
-                                                    "Failed to publish mined block (attempt {}/{}): {}",
-                                                    attempt, MAX_PUBLISH_ATTEMPTS, e
-                                                );
-                                                tokio::time::sleep(Duration::from_secs(
-                                                    2 * attempt as u64,
-                                                ))
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to publish mined block after {} attempts: {}",
-                                                    MAX_PUBLISH_ATTEMPTS, e
-                                                );
-                                                // Say it on the CONSOLE: a block that
-                                                // never left this machine looks like a
-                                                // normal success otherwise, then
-                                                // silently orphans.
-                                                println!(
-                                                    "\n⚠ Block #{} could not be published to the network ({} attempts). It is saved locally, but until connectivity recovers other miners may overtake it — check your connection.",
-                                                    mined_height, MAX_PUBLISH_ATTEMPTS
-                                                );
-                                            }
-                                        }
-                                    }
-                                });
-
                                 if !continuous {
                                     break 'mining;
                                 }
