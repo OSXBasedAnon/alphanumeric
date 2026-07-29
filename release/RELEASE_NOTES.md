@@ -1,183 +1,143 @@
-# alphanumeric v7.9.2
+# alphanumeric v7.9.3
 
-Reliability release, and it **supersedes v7.9.1** — same day, three further
-client fixes found immediately after tagging. If you grabbed 7.9.1, take this
-instead. **No change to block validity rules** — nothing about which blocks are
-valid changes, so 7.9.2, 7.9.1 and 7.9.0 nodes stay on the same chain and can be
-upgraded in any order. macOS (Apple Silicon) prebuilt below; Linux/Windows/
-other platforms build from source.
+Security and hardening release, following a full audit of the node. **No change
+to block validity rules** — nothing about which blocks or transactions are valid
+changes, so 7.9.3, 7.9.2, 7.9.1 and 7.9.0 nodes stay on the same chain and can be
+upgraded in any order. macOS (Apple Silicon) prebuilt below; Linux/Windows/other
+platforms build from source.
 
-**Recommended for every node.** The headline fix ends a state in which a node
-could stop following the chain until it was manually restarted.
+**Recommended for every node**, and the sooner the better: the headline fix
+closes a way for one message to silence another, and it protects a node from the
+moment that node upgrades — it does not need anyone else to upgrade first.
 
-## The main fix: a node could get permanently stuck
+## The main fix: a verdict could answer for something it never saw
 
-A node verifies recent blocks against full ML-DSA witnesses and only stops doing
-so once a block falls below its *verification floor*. That floor comes from the
-node's own trusted checkpoint — which only advances when the node **applies** a
-block. So a node that could not apply one particular block, because that block's
-witnesses were unobtainable from any peer, deadlocked: the block stayed above its
-floor forever, so it kept demanding witnesses for it forever, long after the rest
-of the network had buried it. It needed to apply the block to advance the floor,
-and needed the floor to advance to apply the block. Seen in the wild as a node
-frozen at a single height for 80+ minutes while the network ran on without it.
+The node remembers whether it has already judged a block or a transaction, so a
+second copy of the same thing costs nothing to dismiss. Those memories were filed
+under an identifier that does not pin the contents: two different messages could
+share one, and the verdict recorded for the first could then be handed back for
+the second.
 
-7.9.2 breaks the cycle with the signed tip beacon: if the local tip has not moved
-for 90 seconds and the beacon is more than the reorg margin ahead, the node
-advances its checkpoint from the beacon and applies the blocked block from its
-receipt — exactly as it already trusts the history inside a bootstrap snapshot.
-This grants no new authority: the beacon is signed by the same key as the
-bootstrap manifest every node already receipt-trusts. It can never bring finality
-nearer the tip than the normal reorg margin, checkpoint advancement stays
-monotonic so finality cannot regress, and proof-of-work, hash, parent-linkage and
-genesis pinning are all still enforced. Recovery is automatic in roughly 90
-seconds to 5 minutes instead of never.
+Both directions were wrong. A rejected copy could stand in for the legitimate
+message sharing its identifier and suppress it for up to an hour — a block
+stalling on that node, or a payment quietly dropped before it was ever examined.
+In the other direction, an acceptance could wave through bytes nothing had
+verified.
+
+Verdicts are now filed under what they actually attest to, so an entry can only
+be retrieved by the message that earned it. Repeat copies still short-circuit, so
+the protection the cache exists for is unchanged.
+
+This is local bookkeeping. It touches no hash, no merkle root, no balance and
+nothing on the wire — which is why an upgraded node agrees with every older node
+about exactly which blocks and transactions are valid, and why upgrading is worth
+doing immediately rather than waiting for the rest of the network.
 
 ## Also fixed
-- **The relay no longer gets poisoned with unverifiable blocks.** A node whose
-  stored copy of a block had lost its full witnesses would still publish that
-  witness-short body to the relay, where it squatted the height (first write
-  wins) and wedged every node that later had to verify it. Nodes now decline to
-  publish in that case — a gap is recoverable, a poisoned height is not.
-- **Waking from sleep no longer demands a restart.** A client left idle past the
-  reorg window used to answer `mine` with "chain diverged … restart this node".
-  It now heals in place by pulling the gap from a peer.
-- **Peer requests are cancellation-safe.** A timed-out request could leave a
-  pooled connection out of step so later requests read the previous reply — the
-  source of stray "unexpected response type" failures.
-- **Background tasks survive panics.** Load-bearing loops are supervised and
-  restart; the rest report loudly instead of disappearing silently.
-- **Faster catch-up, lighter steady state:** larger block batches, no redundant
-  re-hashing of downloaded blocks, fewer duplicate beacon fetches, and one
-  database flush per applied block instead of roughly thirteen.
-- **Reorg-reverted payments survive.** A transaction returned to the mempool by a
-  reorg is now persisted, so it is no longer lost on the next restart or wallet
-  command.
-- **Mining:** the per-nonce clock call is gone from the hash loop (free
-  throughput), the progress bar reports true aggregate hashrate in MH/s, and a
-  block that gets reorged out is reported instead of the reward quietly
-  vanishing.
-- **Faster start-up:** boot no longer rescans the whole chain to find its tip.
-- **A client closed for hours now catches up instead of giving up.** Peers keep
-  full witnesses only for the most recent stretch of chain, but deep catch-up was
-  demanding them for every block — including thousands whose witnesses no longer
-  exist anywhere. It crawled through empty blocks, stalled on the first block
-  containing a payment, and eventually closed the client outright, so the only
-  practical fix was deleting the chain and starting over. Such spans are now
-  pulled in one proven piece, verified end-to-end against the signed tip beacon
-  down to the block you already hold, and applied the same way a fresh snapshot
-  is. Nothing is applied until the whole span checks out.
-- **Peer request handling hardened.** Block-range requests from peers are
-  bounded in one more place. No behaviour change for normal peers, and no change
-  to what any node accepts as valid — but it is a reason to take this release
-  rather than stay where you are.
-- **Block template building no longer slows down as the block fills.** Selecting
-  transactions re-checked the whole selected set for every further candidate, so
-  the cost grew with the square of the template size. It now carries running
-  totals: assembling a 4,000-transaction template drops from ~62 ms to ~74 µs.
-  The transactions chosen are unchanged — the equivalence is pinned by tests that
-  compare the two paths bit-for-bit rather than approximately. This matters from
-  block 517,583, where that check starts running.
+
+- **Witnesses survive a reorg.** A height reached by adopting a branch was served
+  witness-short, so peers stalled their verification floor on it. Worse: because
+  reverted payments are restored from that same store, a second reorg away from
+  the branch dropped those payments with only a debug line. Both block-application
+  paths now retain witnesses identically.
+- **A retained witness must match what the block committed.** One of the two
+  sources was accepted on length alone instead of being bound to the transaction's
+  committed signature hash. An unbound witness is exactly the record a peer cannot
+  verify against the root. Both sources now go through one check.
+- **An unreadable database is set aside, not deleted.** Every failure to open the
+  chain — a lock still held by another instance, a transient I/O error, a genuinely
+  corrupt page — took the same irreversible action. The directory is now renamed
+  for diagnosis and the node re-bootstraps as before. At most one copy is kept, so
+  a node that fails repeatedly cannot fill its own disk.
+- **Orphan pruning stopped opening every block it was deciding about.** It
+  deserialized up to ten thousand stored blocks to read three small fields, on a
+  path that runs for every applied block, under the chain write lock.
+- **A peer's peer list is capped** the way the gateway's already was — the trusted
+  source was bounded and the unauthenticated one was not.
+- **Header-verification eviction is amortised** and no longer runs inside the
+  headers write guard, where a peer streaming long header chains charged block
+  ingestion for it.
+- **`info` releases the chain lock before drawing**, instead of holding it across
+  several hundred lines of output.
+- Assorted smaller fixes: an inbound-attempt window that rolls instead of acting
+  as a silence-gated lockout; IPv4-mapped addresses grouped with their real IPv4
+  subnet everywhere rather than only on some paths; temp directories from an
+  interrupted bootstrap swept instead of accumulating; background notices no
+  longer able to park a runtime worker on a stalled terminal; and the finalize
+  stage names corrected — every non-zero one had been mislabelled by an earlier
+  refactor, which matters exactly when they are read, during a stall.
+
+## Whispers
+
+- **A whisper now shows its amount.** The fee band that carries a whisper is not
+  exclusive: an ordinary payment at a flat fee can land in it. Such a payment was
+  reported as a valueless message and left out of the received total — an inbound
+  credit that looked like a novelty. The amount now travels on every whisper line
+  and in every digest total.
+- **Whispers can no longer flood the console.** They collapse under volume the way
+  payments already did, but the digest **keeps the codes** — for a whisper the code
+  is the payload, so a bare count would discard the only part worth reading. A
+  single whisper still prints in full, now on one line instead of two.
+- A whisper sent to yourself is no longer counted as both sent and received.
+
+## For miners
+
+- **A solved block is announced before it is reported.** It used to wait while the
+  client assembled a console summary, including a balance query that takes a fresh
+  chain read lock — which, immediately after a block is applied, queues behind any
+  block already waiting to be applied. That is time a competitor's block spends
+  propagating. Nothing is skipped to get there: the block is validated, has won
+  the tip check, and is on disk before it is announced.
+- **An external block-notify hook** for pool operators, following Bitcoin's
+  `-blocknotify` contract, so a Stratum pool is told the tip moved instead of
+  polling and handing out work on a dead parent. No-op unless
+  `ALPHANUMERIC_BLOCKNOTIFY` is set.
+- The CPU progress bar no longer flickers on an 80-column terminal.
 
 ## Interface
-- **One display language across every screen.** Balances, wallets, mining,
-  transactions, `info` and the boot sequence now share a single layout system —
-  consistent columns, consistent colour meaning, consistent spacing — instead of
-  each screen having grown its own conventions.
-- **Readable on any terminal.** Anything you might retype or compare — addresses,
-  transaction ids — now renders in your terminal's own foreground colour rather
-  than a fixed grey that was unreadable on a light background.
-- **Chain-event notices rewritten.** Incoming payments, whispers and reorg
-  notices are now aligned keyword lines (`received`, `whisper`, `reorged`) with
-  no symbols, so they line up and read the same as the rest of the client.
-- **A block you mined that gets reorged out is now reported**, instead of the
-  maturing reward quietly disappearing from your balance.
-- **Whisper send no longer claims "visible to everyone."** Nothing displays
-  whispers anywhere; the accurate caveat (decodable from the ledger by someone
-  looking, so don't put anything sensitive in one) stays on the help screen.
 
-## On alphanumeric.blue
-- The hashrate shown beside the chart and the hashrate in the metrics row above
-  it now always agree. They were computed differently — one showed the newest raw
-  sample, the other a median of the recent window — so they could sit a spike
-  apart. The chart itself still plots the raw per-sample series, bursts included.
-- The chart no longer re-animates while you scroll on a phone. Mobile Safari
-  fires a resize every time the address bar hides or reappears, and each one
-  redrew a chart whose dimensions come purely from its width — so the trace
-  replayed its draw several times before settling. It now redraws only when the
-  width genuinely changes, so rotating still works and the animation is
-  unchanged.
+- The wallet ledger is a table, with colour naming the kind of money and the
+  spendable and total figures in bold — the two numbers people actually read.
+- `help` is two aligned columns, with aliases coloured by section.
+- A bare Enter points at `help` instead of only complaining.
+- `account`, `history` and `whisper` render in the same display language as the
+  rest of the client; the whisper list is a ledger rather than a dump.
+- An address on its own looks it up; `bal` works as an alias for `balance`.
+- `debug` no longer advertises `diagnostics`/`diag` aliases that dispatch never
+  routed, and `--status` no longer advertises one either.
 
-## Wallet
-- **An incoming payment now appears in `balance`, not only in `history`.** The
-  wallet screen tracked money leaving but had no line at all for money arriving,
-  so a transfer on its way in was visible in one place and invisible in the
-  other. It is reported per wallet and in the total, deliberately *below* the
-  confirmed line and never added into it — an unmined credit is not yet yours,
-  and folding it into the total would overstate what you hold.
-- **`history` takes a row count.** `history 50` always worked and was documented
-  nowhere, so the default twelve rows read as the whole ledger. `help` now shows
-  `history [rows]` with its 1–50 range. (`account` takes an address only.)
-- **`help` labels its columns.** Every row reads "what you want, then what you
-  type", but with the typed command on the right nothing said so, and the left
-  column reads like a command list until you notice it isn't.
-- **Inbound notices no longer flood a busy node.** Every payment printed its own
-  line with no ceiling — right for a person, unusable for a pool or an exchange,
-  where it scrolls the screen away. Volume now picks the shape by itself: below
-  the thresholds the output is exactly what it has always been; above them a
-  block collapses to one line (`received 47 payments +12904.11000000 ♦ to 3
-  wallets`). Nothing to configure. Whispers are never folded in — the message is
-  the point of a whisper, and a count would throw it away.
+## Heads-up for block 517,583 (~10 August)
 
-## Fixed after 7.9.1 (this release)
-- **Reopening a client after hours away no longer refuses to mine.** If catch-up
-  could not finish inside one prep window — the normal case for a client that has
-  been closed a while, or at startup before peers finish connecting — `mine`
-  reported "cannot mine right now" and stopped, *and* scheduled a re-bootstrap
-  that discarded a perfectly good local chain on the next launch. Being behind is
-  not being diverged: it now reports how far behind it is and starts mining by
-  itself once the chain is current.
-- **The prompt no longer swallows your next command.** `mine --continuous` parks
-  a thread on stdin for its Enter-to-stop, and when mining ended any other way
-  that thread was still holding the terminal — so the next command went to it
-  instead of the prompt and came back as "invalid command" with the cursor
-  misplaced, needing a restart. Lines typed after mining ends are now handed back
-  to the prompt and run normally.
-- **Sync status is a single updating line** instead of a new line every few
-  seconds burying the screen during a long catch-up.
-
-## Heads-up for block 517,583 (~9 August)
-
-Nothing below changes now, and nothing in this release changes it — this is what
-the already-scheduled fee-accounting activation does when the chain reaches that
-height. It is here because 7.9.2 is what most nodes will be running by then.
+Unchanged by this release — this is the already-scheduled fee-accounting
+activation, repeated here because 7.9.3 is what most nodes should be running by
+then.
 
 - **Upgrade before that height.** From 517,583 a block's *total* fees must stay
-  within the scheduled allowance. An upgraded miner simply builds a slightly
-  smaller block and is never affected. A miner still on older software can build
-  a block that upgraded nodes reject — that, and only that, is what would split
-  the network. Every node agreeing on the rule means no split at all.
+  within the scheduled allowance. An upgraded miner builds a slightly smaller
+  block and is never affected. A miner still on older software can build a block
+  that upgraded nodes reject — that, and only that, is what would split the
+  network. Every node agreeing on the rule means no split at all.
 - **A whisper on a very large transfer will stop sending.** A whisper carries its
-  message in the fee, and that fee includes a component proportional to the
-  amount sent, so a whisper on roughly 1,290 coins or more exceeds the per-block
-  allowance on its own and is declined at submission. Ordinary whispers are far
-  below this and are unaffected. Splitting a large transfer, or sending it
-  without a whisper, both work normally.
+  message in the fee, and that fee includes a component proportional to the amount
+  sent, so a whisper on roughly 1,290 coins or more exceeds the per-block allowance
+  on its own and is declined at submission. Ordinary whispers are far below this
+  and are unaffected. Splitting a large transfer, or sending it without a whisper,
+  both work normally.
 
 ## Install / verify
-- **Standard**: use `alphanumeric-v7.9.2-macos-arm64.zip`
-- **GPU mining (opt-in)**: use `alphanumeric-v7.9.2-gpu-macos-arm64.zip`
+- **Standard**: use `alphanumeric-v7.9.3-macos-arm64.zip`
+- **GPU mining (opt-in)**: use `alphanumeric-v7.9.3-gpu-macos-arm64.zip`
 - **Signature model / protocol** unchanged; no protocol migration.
 - Upgrading is a drop-in binary replacement: no database migration, no resync.
 
 ## Artifacts
 | file | sha256 |
 |---|---|
-| alphanumeric-v7.9.2-macos-arm64.zip | `4684396880ea63a66f8ef20862554febbad660e45a0be6a98f9dd419a98b8307` |
-| alphanumeric-v7.9.2-gpu-macos-arm64.zip (opt-in GPU mining) | `97a4d6391185a3c2b07f33876486d1399a63fbef73e3dddb9adb88fe508e1259` |
+| alphanumeric-v7.9.3-macos-arm64.zip | `__SHA_CPU__` |
+| alphanumeric-v7.9.3-gpu-macos-arm64.zip (opt-in GPU mining) | `__SHA_GPU__` |
 
 ## Notes
-- Build verification source: `cargo build --release` on `main`, and
-  `cargo build --release --features gpu_miner` on `gpu-mining`.
-- Version in this repo is `7.9.2`; this release uses the existing macOS packaging
-  layout from prior releases.
+- Build verification source: `cargo build --release --features bootstrap_publisher`
+  on `main`, and the same plus `,gpu_miner` on `gpu-mining`.
+- Linux and Windows build from source; the mesh is a default feature, so a plain
+  `cargo build --release` produces a mesh-capable binary.
