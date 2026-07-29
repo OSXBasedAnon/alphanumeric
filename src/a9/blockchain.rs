@@ -1489,6 +1489,11 @@ struct ApplyBatchState {
     depth: AtomicU64,
     marked: AtomicBool,
     unbalanced_marks: AtomicI64,
+    /// True once any window has been opened in THIS process. Gates the cheap
+    /// close of a dropped-but-balanced window marker: a `receipt_batch` marker
+    /// found at boot (this flag false) belongs to a crashed prior run whose
+    /// pair accounting died with it — that one must take the full recovery.
+    opened_this_process: AtomicBool,
 }
 
 /// RAII handle for one catch-up apply window. Obtained from
@@ -1512,7 +1517,10 @@ impl Drop for ReceiptApplyBatch {
             // and the next windowless reconcile pays one full recovery.
             let prev = self.state.depth.fetch_sub(1, Ordering::AcqRel);
             if prev <= 1 && self.state.marked.load(Ordering::Acquire) {
-                warn!(
+                // error-level deliberately: the default field log filter is
+                // Error, and this line is the trigger half of diagnosing a
+                // wedged/orphaned-miner report — it must be visible there.
+                error!(
                     "Catch-up apply window dropped without commit; dirty marker left set for recovery"
                 );
             }
@@ -1975,7 +1983,7 @@ impl Blockchain {
             .load(Ordering::Acquire)
             != 0
         {
-            warn!(
+            error!(
                 "Durable dirty-marker clear refused: an apply window's pair count is unbalanced; leaving marker for recovery"
             );
             return Ok(());
@@ -2014,13 +2022,15 @@ impl Blockchain {
             // Heal any PRIOR failed apply first, under the same serialization
             // as the applies themselves — once the window is open, a
             // pre-existing marker would be indistinguishable from the
-            // window's own (lazily written) one.
-            let dirty = self.chain_state_dirty()?;
-            if let Some(marker) = dirty {
-                self.recover_dirty_chain_state(&marker).await?;
-            }
+            // window's own (lazily written) one. Routed through reconcile so
+            // a marker left by a cleanly-dropped earlier window takes the
+            // cheap flush+clear close instead of a full rebuild.
+            self.reconcile_chain_state_if_dirty().await?;
             self.apply_batch.marked.store(false, Ordering::Release);
             self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+            self.apply_batch
+                .opened_this_process
+                .store(true, Ordering::Release);
         }
         self.apply_batch.depth.fetch_add(1, Ordering::AcqRel);
         Ok(ReceiptApplyBatch {
@@ -2098,7 +2108,10 @@ impl Blockchain {
         &self,
         marker: &ChainStateDirty,
     ) -> Result<(), BlockchainError> {
-        warn!(
+        // error-level: this is a multi-minute O(chain) wedge on a live node —
+        // the single most diagnostic line in a stalled-miner report, and the
+        // default field log filter (Error) must not hide it.
+        error!(
             "Recovering derived chain state after interrupted {} at block {}",
             marker.reason, marker.block_index
         );
@@ -2155,6 +2168,27 @@ impl Blockchain {
         // project-wide !Send rule (BlockchainError is a boxed dyn Error). `marker` is all-Send.
         let dirty = self.chain_state_dirty()?;
         if let Some(marker) = dirty {
+            // CHEAP CLOSE for a dropped-but-clean window: a `receipt_batch`
+            // marker whose window was opened by THIS process and whose
+            // mark/clear pairs all balanced covers state that is consistent,
+            // merely unflushed — a cancelled catch-up future dropped the
+            // window before commit. One flush + clear closes it. Paying the
+            // full O(chain) rebuild here wedged a mining node for minutes
+            // (solved block unannounced, GPU grinding a frozen template)
+            // every time mine-prep's round cap cancelled a converge
+            // mid-window. The full recovery still runs when the marker is
+            // from a crashed prior run (flag false at boot — its pair
+            // accounting died with it) or when any pair is unbalanced.
+            if marker.reason == "receipt_batch"
+                && self.apply_batch.opened_this_process.load(Ordering::Acquire)
+                && self.apply_batch.unbalanced_marks.load(Ordering::Acquire) == 0
+            {
+                self.db
+                    .flush()
+                    .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
+                self.clear_chain_state_dirty()?;
+                return Ok(());
+            }
             self.recover_dirty_chain_state(&marker).await?;
         }
         Ok(())
@@ -13148,6 +13182,90 @@ mod tests {
             .await
             .expect("recovery discharges the counter and clears");
         assert_eq!(bc.chain_state_dirty().unwrap(), None);
+    }
+
+    // A `receipt_batch` marker from a CRASHED PRIOR RUN (no window opened in this
+    // process) must take the FULL recovery — the pair accounting died with the old
+    // process, so consistency cannot be assumed. Proven by planting the H4 poison
+    // under such a marker and requiring the heal to erase it.
+    #[tokio::test]
+    async fn receipt_batch_prior_run_marker_takes_full_recovery() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let block1 = metadata_test_block(1, block0.hash, "minerx", 5.0);
+        insert_raw_block(&bc, &block0);
+        insert_raw_block(&bc, &block1);
+        bc.write_chain_tip_metadata(&block1).unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        // Crashed-run shape: receipt_batch marker on disk, no window ever opened
+        // in this process, plus marker-ahead poison.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert(
+                "minerx".as_bytes(),
+                codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+            )
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 2).unwrap();
+        bc.write_dirty_marker(2, "receipt_batch").unwrap();
+
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+        assert_eq!(
+            bc.get_confirmed_balance("minerx").await.unwrap(),
+            5.0,
+            "prior-run marker must trigger the full heal, never the cheap close"
+        );
+    }
+
+    // A dropped window with a BALANCED pair count closes cheaply (flush + clear) —
+    // while an UNBALANCED dropped window must still take the full recovery.
+    #[tokio::test]
+    async fn receipt_batch_dropped_window_cheap_close_vs_unbalanced_recovery() {
+        let bc = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let block1 = metadata_test_block(1, block0.hash, "minerx", 5.0);
+        insert_raw_block(&bc, &block0);
+        insert_raw_block(&bc, &block1);
+        bc.write_chain_tip_metadata(&block1).unwrap();
+        bc.ensure_balances_index().await.unwrap();
+
+        // Clean drop: balanced pairs -> cheap close clears the marker.
+        {
+            let _b = bc.begin_receipt_batch().await.unwrap();
+            bc.mark_chain_state_dirty(2, "persist_block").unwrap();
+            bc.clear_chain_state_dirty().unwrap();
+        }
+        assert!(bc.chain_state_dirty().unwrap().is_some());
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+        assert_eq!(
+            bc.chain_state_dirty().unwrap(),
+            None,
+            "balanced dropped window closes with flush+clear"
+        );
+
+        // Unbalanced drop over real poison: full recovery must run and heal it.
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert(
+                "minerx".as_bytes(),
+                codec::serialize(&Transaction::to_units(10.0)).unwrap(),
+            )
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 2).unwrap();
+        {
+            let _b = bc.begin_receipt_batch().await.unwrap();
+            bc.mark_chain_state_dirty(2, "persist_block").unwrap();
+            // no balancing clear: the apply "failed after its mutation point"
+        }
+        bc.reconcile_chain_state_if_dirty().await.unwrap();
+        assert_eq!(bc.chain_state_dirty().unwrap(), None);
+        assert_eq!(
+            bc.get_confirmed_balance("minerx").await.unwrap(),
+            5.0,
+            "unbalanced dropped window must take the full heal"
+        );
     }
 
     // begin must heal PRIOR dirt before writing its own marker — once the window is open, a
