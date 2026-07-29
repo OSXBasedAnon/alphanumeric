@@ -3589,6 +3589,25 @@ impl Blockchain {
         }
         self.write_chain_tip_metadata(&branch_tip)?;
         let _ = self.get_network_difficulty().await?;
+
+        // Retain servable witnesses for the branch we just adopted, exactly as the
+        // tip-extension path does. Without this a reorg-adopted height is served
+        // witness-short — peers stall their verification floor on it — and, because
+        // rehydrate_reverted_tx reads this same store, a SECOND reorg away from this branch
+        // drops its payments with only a debug line. Inside the dirty window so the single
+        // flush below covers it; failures are logged per transaction, never fatal, because a
+        // missing witness must not abort an otherwise-valid adoption.
+        for b in &branch {
+            if let Err(e) =
+                self.retain_confirmed_witnesses(&b.transactions, b.index as u64, true)
+            {
+                warn!(
+                    "Reorg: could not retain witnesses for adopted block {}: {}",
+                    b.index, e
+                );
+            }
+        }
+
         // ONE flush closes the dirty window: Tree::flush() is the same full-DB
         // pagecache fsync as db.flush(), so the two tree flushes that followed
         // were pure repeats.
@@ -7195,51 +7214,16 @@ impl Blockchain {
             context,
             TransactionContext::BlockValidation | TransactionContext::ReceiptValidation
         ) {
-            let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
-            let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
+            // Retain servable witnesses BEFORE the loop below purges the pending copies it
+            // reads from. Local-only; see retain_confirmed_witnesses.
+            self.retain_confirmed_witnesses(
+                transactions,
+                confirm_height,
+                matches!(context, TransactionContext::BlockValidation),
+            )?;
             for tx in transactions {
                 if tx.sender != "MINING_REWARDS" {
                     let tx_id = tx.get_tx_id();
-                    // Retain the full witness for a bounded window (before purging the pending
-                    // copy) so peers can serve it for near-tip verification during sync.
-                    // Local-only: no effect on block hashes, merkle roots, or validity. Sourced
-                    // from the local mempool sidecar if we gossiped the tx, else from the incoming
-                    // block's OWN just-verified signature (witness_to_retain enforces full-sig +
-                    // sig_hash binding + BlockValidation-only), so a tx first seen inside this
-                    // block is retained instead of lost.
-                    let sidecar_sig = full_sigs_tree
-                        .get(tx_id.as_bytes())
-                        .ok()
-                        .flatten()
-                        .map(|s| s.to_vec());
-                    if let Some(sig) = Self::witness_to_retain(
-                        tx,
-                        sidecar_sig,
-                        matches!(context, TransactionContext::BlockValidation),
-                    ) {
-                        let mut full_tx = tx.clone();
-                        full_tx.signature = Some(hex::encode(&sig));
-                        if let Ok(bytes) = codec::serialize(&full_tx) {
-                            // Do NOT swallow these. If witness retention fails
-                            // (disk full, transient sled error) the node keeps
-                            // accepting blocks while quietly becoming unable to
-                            // serve witnesses to peers — and a peer that cannot
-                            // obtain them cannot advance its verification floor,
-                            // which is exactly the multi-minute freeze the beacon
-                            // escape has to rescue. That cause was invisible.
-                            if let Err(e) = cw_tree.insert(tx_id.as_bytes(), bytes) {
-                                warn!(
-                                    "Could not retain confirmed witness for {} — peers may be unable to verify near-tip blocks from us: {}",
-                                    tx_id, e
-                                );
-                            }
-                            let mut idx_key = confirm_height.to_be_bytes().to_vec();
-                            idx_key.extend_from_slice(tx_id.as_bytes());
-                            if let Err(e) = cw_index.insert(idx_key, b"" as &[u8]) {
-                                warn!("Could not index confirmed witness for {}: {}", tx_id, e);
-                            }
-                        }
-                    }
                     pending_tree.remove(tx_id.as_bytes())?;
                     let _ = full_sigs_tree.remove(tx_id.as_bytes());
                     let current_debit = self.get_pending_debit_units(&tx.sender).await?;
@@ -7265,44 +7249,126 @@ impl Blockchain {
         Ok(())
     }
 
+    /// The retention guard, in one place: a witness is servable only if it is a FULL
+    /// signature that reproduces the `sig_hash` this transaction committed.
+    ///
+    /// Both halves matter. A truncated signature is exactly a 64-byte prefix, and serving
+    /// one makes peers defer honest blocks (the 2026-07-23 pathology). And the sig_hash
+    /// bind is what ties the bytes to THIS transaction: `sig_hash` is committed into the
+    /// merkle root, so a signature reproducing it is the one the block actually attested,
+    /// and any other — however well-formed — reconstructs a leaf that will not rebuild the
+    /// committed root on the peer we serve it to.
+    fn witness_binds(tx: &Transaction, sig: &[u8]) -> bool {
+        sig.len() > 64
+            && tx.sig_hash.as_deref() == Some(Transaction::signature_hash_hex(sig).as_str())
+    }
+
     /// Decide which full signature (if any) to retain as a servable witness for `tx`.
     /// Prefers the local mempool sidecar copy (`sidecar_sig`, present only if this node gossiped
-    /// the tx); otherwise — under BlockValidation ONLY — falls back to the incoming block's own
-    /// signature, which was just verified upstream. That fallback preserves a tx first seen inside
-    /// a mined block (never gossiped to this node) so it can still be served to peers and
-    /// rehydrated on reorg instead of dropped.
+    /// the tx); otherwise — under BlockValidation ONLY — falls back to the block's own signature,
+    /// which was verified upstream. That fallback preserves a tx first seen inside a block (never
+    /// gossiped to this node) so it can still be served to peers and rehydrated on reorg instead
+    /// of dropped.
     ///
-    /// GUARD (money-chain safety): only a FULL signature (>64 bytes — a truncated sig is exactly a
-    /// 64-byte prefix) whose SHA-256 hash equals the tx's committed `sig_hash` is retained. sig_hash
-    /// is committed into the merkle root, so the bind is exact; and ReceiptValidation (historical
-    /// sync) carries TRUNCATED sigs, which must never enter the store — a served truncated witness
-    /// makes peers defer honest blocks (the 2026-07-23 truncated-witness pathology). A poisoned
-    /// witness cannot split the chain regardless (every consumer re-derives sig_hash in
-    /// block_signatures_fully_verified and defers on mismatch); this preserves the store's
-    /// invariant that it holds only full, binding witnesses.
+    /// GUARD (money-chain safety): both sources go through `witness_binds`, so only a FULL
+    /// signature whose SHA-256 hash equals the tx's committed `sig_hash` is retained.
+    /// ReceiptValidation (historical sync) carries TRUNCATED sigs, which the length half keeps
+    /// out. A poisoned witness cannot split the chain regardless (every consumer re-derives
+    /// sig_hash in block_signatures_fully_verified and defers on mismatch); this preserves the
+    /// store's invariant that it holds only full, binding witnesses.
     fn witness_to_retain(
         tx: &Transaction,
         sidecar_sig: Option<Vec<u8>>,
         is_block_validation: bool,
     ) -> Option<Vec<u8>> {
-        // The sidecar only ever holds gossip-verified full signatures; the >64 check is
-        // defense-in-depth against a corrupt entry, never a filter on a real one.
-        if let Some(sig) = sidecar_sig {
-            if sig.len() > 64 {
-                return Some(sig);
-            }
+        // The sidecar is keyed by tx_id, which is the ENVELOPE
+        // (sender:recipient:amount:fee:timestamp) and pins no signature at all — so an entry
+        // filed under one signing of that envelope is readable for another. It gets the same
+        // bind as the in-block signature below rather than being trusted on length: an
+        // unbound witness is precisely the merkle-mismatched record peers cannot verify
+        // against the committed root. On a non-binding sidecar entry we fall through to the
+        // block's own signature, which is the copy that provably matches.
+        if let Some(sig) = sidecar_sig.filter(|sig| Self::witness_binds(tx, sig)) {
+            return Some(sig);
         }
         if is_block_validation {
             if let Some(sig) = tx.signature.as_ref().and_then(|s| hex::decode(s).ok()) {
-                if sig.len() > 64
-                    && tx.sig_hash.as_deref()
-                        == Some(Transaction::signature_hash_hex(&sig).as_str())
-                {
+                if Self::witness_binds(tx, &sig) {
                     return Some(sig);
                 }
             }
         }
         None
+    }
+
+    /// Retain the servable full witness for every non-coinbase transaction in
+    /// `transactions`, and index it at `confirm_height` so the retention window can prune it.
+    ///
+    /// Local-only: touches no hash, merkle root, balance, validity predicate or wire format.
+    ///
+    /// Called from BOTH block-application paths, and that symmetry is the point. A height
+    /// reached by adopting a branch is served exactly like one extended onto the tip; and
+    /// because `rehydrate_reverted_tx` reads this same store, a later reorg away from that
+    /// branch can restore its payments instead of dropping them with a debug line.
+    ///
+    /// `is_block_validation` is LOAD-BEARING on the adoption path, not a formality. It is
+    /// tempting to reason that a branch validated as `AllowTruncatedStored` carries only 64-byte
+    /// prefixes, so the in-block fallback cannot matter there and the flag could be `false`.
+    /// That is wrong: the mode governs what the structural validator TOLERATES, not what the
+    /// bodies contain. Adoption is gated on `block_signatures_fully_verified` for every
+    /// above-floor block and defers the whole branch otherwise, so a branch that reaches
+    /// retention carries full, verified signatures. The fallback is in fact the PRIMARY source
+    /// there — the sidecar copy of a tx that already confirmed once has been purged — so passing
+    /// `false` would quietly restore the witness-short reorg heights this exists to prevent.
+    ///
+    /// It can still only retain a signature the node actually holds: a below-floor branch block
+    /// carrying truncated bodies, with no sidecar entry, has no full signature anywhere locally
+    /// and is retained by nothing here.
+    fn retain_confirmed_witnesses(
+        &self,
+        transactions: &[Transaction],
+        confirm_height: u64,
+        is_block_validation: bool,
+    ) -> Result<(), BlockchainError> {
+        let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
+        let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
+        for tx in transactions {
+            if tx.sender == "MINING_REWARDS" {
+                continue;
+            }
+            let tx_id = tx.get_tx_id();
+            let sidecar_sig = full_sigs_tree
+                .get(tx_id.as_bytes())
+                .ok()
+                .flatten()
+                .map(|s| s.to_vec());
+            let Some(sig) = Self::witness_to_retain(tx, sidecar_sig, is_block_validation) else {
+                continue;
+            };
+            let mut full_tx = tx.clone();
+            full_tx.signature = Some(hex::encode(&sig));
+            let Ok(bytes) = codec::serialize(&full_tx) else {
+                continue;
+            };
+            // Do NOT swallow these. If witness retention fails (disk full, transient sled
+            // error) the node keeps accepting blocks while quietly becoming unable to serve
+            // witnesses to peers — and a peer that cannot obtain them cannot advance its
+            // verification floor, which is exactly the multi-minute freeze the beacon escape
+            // has to rescue. That cause was invisible.
+            if let Err(e) = cw_tree.insert(tx_id.as_bytes(), bytes) {
+                warn!(
+                    "Could not retain confirmed witness for {} — peers may be unable to verify near-tip blocks from us: {}",
+                    tx_id, e
+                );
+            }
+            let mut idx_key = confirm_height.to_be_bytes().to_vec();
+            idx_key.extend_from_slice(tx_id.as_bytes());
+            if let Err(e) = cw_index.insert(idx_key, b"" as &[u8]) {
+                warn!("Could not index confirmed witness for {}: {}", tx_id, e);
+            }
+        }
+        Ok(())
     }
 
     /// Remove retained confirmed-transaction witnesses older than the retention
@@ -8544,11 +8610,34 @@ mod tests {
             "a full signature with no committed sig_hash must not be retained"
         );
 
-        // A present full sidecar witness is retained regardless of context (existing behavior).
+        // A sidecar witness that BINDS is retained in either context — the sidecar is the only
+        // source available on the adoption path, where the block's own copy is truncated.
+        tx.sig_hash = Some(Transaction::signature_hash_hex(&full_sig));
         assert_eq!(
             Blockchain::witness_to_retain(&tx, Some(full_sig.clone()), false),
+            Some(full_sig.clone()),
+            "a binding sidecar witness is retained regardless of context"
+        );
+
+        // A sidecar witness that does NOT bind is rejected, not trusted on length. The sidecar is
+        // keyed by tx_id — the envelope alone — so an entry filed under one signing of that
+        // envelope is readable for another; retaining it would store a witness that rebuilds a
+        // different leaf than the block committed, which is the merkle-mismatched record peers
+        // cannot verify against the root.
+        let foreign_sig = vec![3u8; 200];
+        assert_ne!(foreign_sig, full_sig, "the two signings must differ");
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, Some(foreign_sig.clone()), false),
+            None,
+            "a sidecar witness that does not reproduce the committed sig_hash must be rejected"
+        );
+
+        // ...and when the block's own copy DOES bind, a non-binding sidecar entry must not
+        // shadow it: we fall through to the copy that provably matches.
+        assert_eq!(
+            Blockchain::witness_to_retain(&tx, Some(foreign_sig), true),
             Some(full_sig),
-            "a present full sidecar witness is retained regardless of context"
+            "a non-binding sidecar must fall through to the block's own binding signature"
         );
     }
 
@@ -8633,6 +8722,78 @@ mod tests {
     }
 
     // A transaction reverted by a reorg must be re-queued with its FULL signature
+    // The ADOPTION path, exercised through the one input shape where the sidecar is the ONLY
+    // possible source: a body whose signature is a 64-byte prefix. (Adoption normally hands
+    // retention FULL bodies — it defers any branch whose above-floor blocks fail
+    // block_signatures_fully_verified — so this is the harder half, not the typical one.)
+    // Retaining here is what keeps a reorg-adopted height serve-able, and because
+    // rehydrate_reverted_tx reads the same store, what lets a SECOND reorg give the payment back
+    // instead of dropping it with a debug line.
+    //
+    // SCOPE, stated so nobody reads more into a green run than it earns: this drives
+    // retain_confirmed_witnesses directly and pins both outcomes for a truncated body. It does
+    // NOT prove adopt_branch_if_valid calls it — that rests on the single call site, inside the
+    // same dirty window as the tip path. Every reorg test in this file simulates the adoption
+    // sequence rather than invoking it (their fixtures carry `signature: None` and unmined
+    // hashes), so an end-to-end reorg here would need real PoW and real signatures; that harness
+    // does not exist yet.
+    #[tokio::test]
+    async fn adoption_retains_a_witness_from_the_sidecar_and_rehydrate_gets_it_back() {
+        let ts = 1_700_000_000u64;
+        let wallet = Wallet::new(None).expect("wallet builds");
+        let full = signed_transfer(&wallet, &"ee".repeat(20), 10.0, ts).await;
+        let sig_bytes = hex::decode(full.signature.as_ref().unwrap()).unwrap();
+        let sig_hash = Transaction::signature_hash_hex(&sig_bytes);
+        let tx_id = full.get_tx_id();
+
+        // What an adopted branch block actually carries: the truncated storage form.
+        let stored = full.with_truncated_signature(sig_hash.clone());
+        assert_eq!(
+            hex::decode(stored.signature.as_ref().unwrap()).unwrap().len(),
+            64,
+            "precondition: a branch block's copy is a 64-byte prefix"
+        );
+
+        // A truncated body with no sidecar entry: no full signature exists anywhere locally, so
+        // nothing can be retained. This is the below-floor corner, not the normal adoption case.
+        let bc = test_blockchain();
+        bc.retain_confirmed_witnesses(std::slice::from_ref(&stored), 7, true)
+            .expect("retention runs");
+        assert!(
+            bc.get_confirmed_witness_tx(&tx_id).is_none(),
+            "a truncated body with no sidecar entry has no full signature to retain"
+        );
+
+        // With the sidecar populated — the tx was gossiped to us before the reorg — adoption
+        // retains the full witness.
+        bc.db
+            .open_tree(PENDING_FULL_SIGNATURES_TREE)
+            .unwrap()
+            .insert(tx_id.as_bytes(), sig_bytes.clone())
+            .unwrap();
+        bc.retain_confirmed_witnesses(std::slice::from_ref(&stored), 7, true)
+            .expect("retention runs");
+        let served = bc
+            .get_confirmed_witness_tx(&tx_id)
+            .expect("an adopted block's witness must be retained");
+        assert_eq!(
+            hex::decode(served.signature.as_ref().unwrap()).unwrap(),
+            sig_bytes,
+            "the retained witness is the exact full signature"
+        );
+
+        // The consequence that makes it money-safe: a later reorg away from this branch can
+        // rehydrate the payment instead of dropping it with a debug line.
+        let restored = bc
+            .rehydrate_reverted_tx(&stored)
+            .expect("a reverted tx must be recoverable from the retained witness");
+        assert_eq!(
+            hex::decode(restored.signature.as_ref().unwrap()).unwrap(),
+            sig_bytes,
+            "the rehydrated tx carries the full signature, so it can be re-mined"
+        );
+    }
+
     // (pulled from the witness store, keyed on the signature-independent tx id), and
     // dropped entirely when no full witness is available — a truncated copy could
     // never be mined and would only poison the block template until it ages out.
