@@ -11307,7 +11307,11 @@ impl Node {
             }
         }
         let bodies = hasher.finalize();
-        format!("{}:{}", hex::encode(block.hash), &bodies.to_hex()[..32])
+        // Domain-tagged: block and transaction verdicts share one map, and without
+        // the tag their key shapes are format-identical (64-hex, colon, 32-hex).
+        // A cross-domain collision would need a 128-bit prefix match on distinct
+        // content — astronomically unlikely; the byte makes it impossible instead.
+        format!("b:{}:{}", hex::encode(block.hash), &bodies.to_hex()[..32])
     }
 
     /// Cache key for a transaction's validation verdict.
@@ -11334,7 +11338,9 @@ impl Node {
             hasher.update(&(bytes.len() as u64).to_le_bytes());
             hasher.update(bytes);
         }
-        format!("{}:{}", tx.create_hash(), &hasher.finalize().to_hex()[..32])
+        // Domain-tagged for the same reason the block key is: one map, two kinds
+        // of verdict, and a tag byte that keeps them structurally disjoint.
+        format!("t:{}:{}", tx.create_hash(), &hasher.finalize().to_hex()[..32])
     }
 
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
@@ -11775,10 +11781,6 @@ impl Node {
                 self.outbound_connections.write().await.remove(&addr);
                 self.outbound_circuit_breakers.write().await.remove(&addr);
                 self.compact_capable_peers.remove(&addr);
-
-                // Clear from validation cache
-                let peer_key = format!("peer_{}", addr);
-                self.validation_cache.remove(&peer_key);
 
                 // If peer count too low, trigger discovery
                 let peer_count = self.peers.read().await.len();
@@ -15374,6 +15376,19 @@ mod tests {
             Node::validation_cache_key(&divergent),
             "the envelope must be in the key, or a losing body files against the honest one"
         );
+    }
+
+    // Block and transaction verdicts share one map, and without the tags their key
+    // shapes are format-identical: 64 hex chars, a colon, 32 hex chars. The tag makes
+    // the two key spaces structurally disjoint instead of collision-resistant, and
+    // this pins the tags so a reformat cannot silently merge them again.
+    #[test]
+    fn block_and_transaction_verdicts_key_into_disjoint_spaces() {
+        let sig = "ab".repeat(80);
+        let block_key = Node::validation_cache_key(&block_carrying(tx_with_signature(&sig)));
+        let tx_key = Node::transaction_cache_key(&tx_with_signature(&sig));
+        assert!(block_key.starts_with("b:"), "block verdicts carry the b: tag");
+        assert!(tx_key.starts_with("t:"), "transaction verdicts carry the t: tag");
     }
 
     // Replay protection is the reason the cache exists; keying on the body must not cost it.
