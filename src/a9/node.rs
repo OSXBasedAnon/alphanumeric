@@ -12785,18 +12785,47 @@ impl Node {
         0
     }
 
-    /// Build + spawn the WebRTC mesh (opt-in via ALPHANUMERIC_WEBRTC_MESH): signaling poll, topology
-    /// dialer, and inbound processor. The node's own handshake key gives the mesh its real identity,
-    /// so the gateway accepts its signaling exactly like its announce.
+    /// Bring up the WebRTC mesh, retrying until it succeeds. The three init
+    /// steps inside try_spawn_webrtc_mesh can fail transiently (TLS/client
+    /// construction, API build); before this supervisor, ONE such failure at
+    /// boot silently disabled the mesh for the whole process lifetime — the
+    /// node ran TCP/relay-only with nothing but an invisible-at-default-filter
+    /// warn to say why. Now a failed bring-up logs at error level (the default
+    /// field filter shows it) and retries with backoff; success ends the loop.
     #[cfg(feature = "webrtc_mesh")]
     fn spawn_webrtc_mesh(&self) {
+        if !Self::webrtc_mesh_enabled() {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(60);
+            loop {
+                match node.try_spawn_webrtc_mesh() {
+                    Ok(()) => return,
+                    Err(e) => {
+                        error!(
+                            "WebRTC mesh bring-up failed ({}); retrying in {}s — running TCP/relay-only until it succeeds",
+                            e,
+                            delay.as_secs()
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(600));
+                    }
+                }
+            }
+        });
+    }
+
+    /// One mesh bring-up attempt: build transport + API + mesh state, then spawn the signaling
+    /// poll, topology dialer, and inbound processor. The node's own handshake key gives the mesh
+    /// its real identity, so the gateway accepts its signaling exactly like its announce.
+    #[cfg(feature = "webrtc_mesh")]
+    fn try_spawn_webrtc_mesh(&self) -> Result<(), String> {
         use crate::a9::webrtc::{
             build_api, default_stun_urls, HttpSignalTransport, SignalTransport, WebRtcMesh,
         };
         const MESH_DEGREE: usize = 12;
-        if !Self::webrtc_mesh_enabled() {
-            return;
-        }
         let gateway_base = Self::discovery_bases()
             .into_iter()
             .next()
@@ -12805,24 +12834,15 @@ impl Node {
             match HttpSignalTransport::new(self.handshake_key_bytes.as_ref().clone(), gateway_base)
             {
                 Ok(t) => Arc::new(t),
-                Err(e) => {
-                    warn!("WebRTC mesh: transport init failed: {}", e);
-                    return;
-                }
+                Err(e) => return Err(format!("transport init failed: {}", e)),
             };
         let api = match build_api(false) {
             Ok(a) => Arc::new(a),
-            Err(e) => {
-                warn!("WebRTC mesh: API init failed: {}", e);
-                return;
-            }
+            Err(e) => return Err(format!("API init failed: {}", e)),
         };
         let (mesh, mut inbound_rx) = match WebRtcMesh::new(transport, api, default_stun_urls()) {
             Ok(x) => x,
-            Err(e) => {
-                warn!("WebRTC mesh: init failed: {}", e);
-                return;
-            }
+            Err(e) => return Err(format!("init failed: {}", e)),
         };
         info!(
             "WebRTC mesh enabled — gossiping blocks over direct DataChannels ({}…)",
@@ -12851,8 +12871,10 @@ impl Node {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     // Fail-safe: only an explicit gateway `mesh_enabled: false` disables the mesh.
                     if !node.fetch_mesh_enabled().await {
-                        warn!(
-                            "WebRTC mesh disabled by gateway kill switch — shutting the mesh down"
+                        // error-level: this permanently disables the mesh for the
+                        // process lifetime, and the default field filter must show it.
+                        error!(
+                            "WebRTC mesh disabled by gateway kill switch — shutting the mesh down (restart the node to re-enable)"
                         );
                         enabled.store(false, std::sync::atomic::Ordering::Relaxed);
                         *store.write().await = None; // stop mesh_gossip immediately
@@ -12979,6 +13001,7 @@ impl Node {
                 }
             });
         }
+        Ok(())
     }
 
     /// Inbound mesh bytes -> validated processing. Transport-only: no consensus change.
