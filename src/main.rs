@@ -506,6 +506,12 @@ static EXTERNAL_PRINTER: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 /// Print a line from a BACKGROUND task without corrupting a live prompt.
+///
+/// BLOCKING, by nature: rustyline's ExternalPrinter hands the line to the editor over a
+/// depth-1 channel, and this takes the process-global printer mutex to do it. Callers on the
+/// async runtime must therefore not invoke it directly — a wedged or unread terminal parks
+/// the calling worker, and with the printer mutex held it serializes every other notifier
+/// behind it. Use `notify_async` from a task; this stays for synchronous callers.
 fn notify(msg: String) {
     if let Ok(mut guard) = EXTERNAL_PRINTER.lock() {
         if let Some(p) = guard.as_mut() {
@@ -515,6 +521,16 @@ fn notify(msg: String) {
         }
     }
     println!("{}", msg);
+}
+
+/// `notify` for async callers: performs the blocking write on the blocking pool so a stalled
+/// terminal cannot park a runtime worker, and cannot hold the global printer mutex across a
+/// scheduling point that other notifiers are queued behind.
+async fn notify_async(msg: String) {
+    if tokio::task::spawn_blocking(move || notify(msg)).await.is_err() {
+        // The blocking pool is gone (runtime shutting down); the notice is not worth
+        // resurrecting a path for at that point.
+    }
 }
 
 const MAIN_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
@@ -1319,6 +1335,7 @@ async fn async_main() -> Result<()> {
                 let mut whisper_rate = NoticeRate::new();
                 let mut whisper_accum = WhisperAccum::new();
                 let mut whisper_last_emit: Option<Instant> = None;
+                let mut announced = AnnouncedCredits::new();
                 loop {
                     if rx.changed().await.is_err() {
                         break;
@@ -1358,6 +1375,14 @@ async fn async_main() -> Result<()> {
                                 if !addresses.contains(&tx.recipient) {
                                     continue;
                                 }
+                                // A reorg re-scans the tip, so the same credit can arrive
+                                // here twice. Report each one once — by identity, not by
+                                // height, because a reorg can just as easily bring a
+                                // DIFFERENT set of transactions to the same height and those
+                                // must still be announced.
+                                if !announced.first_sighting(tx) {
+                                    continue;
+                                }
                                 let from_short = short_addr(&tx.sender);
                                 let amount = Transaction::from_units(tx.amount_units);
                                 // A whisper carries a message in its fee. It is still a
@@ -1389,7 +1414,7 @@ async fn async_main() -> Result<()> {
                                 == WhisperAction::Verbose
                             {
                                 for (from_short, code, amount) in &whispers {
-                                    notify(format!(
+                                    notify_async(format!(
                                         "\n{}whisper{}   {}{}{}  {:.8} ♦  from {}…  {}block {}{}",
                                         EV_WHISPER,
                                         EV_OFF,
@@ -1401,7 +1426,7 @@ async fn async_main() -> Result<()> {
                                         EV_DIM,
                                         block.index,
                                         EV_OFF
-                                    ));
+                                    )).await;
                                 }
                             } else {
                                 whisper_accum.merge(block.index, &whispers);
@@ -1410,7 +1435,7 @@ async fn async_main() -> Result<()> {
                         // Runs even on a block with no whispers, so a rollup left
                         // pending when the flood stops still flushes.
                         if !whisper_accum.is_empty() && whisper_rollup_due(whisper_last_emit, now) {
-                            notify(whisper_accum.render());
+                            notify_async(whisper_accum.render()).await;
                             whisper_accum.clear();
                             whisper_last_emit = Some(now);
                         }
@@ -1426,7 +1451,7 @@ async fn async_main() -> Result<()> {
                                 let total: f64 = payments.iter().map(|(amount, ..)| amount).sum();
                                 let wallets: std::collections::HashSet<&str> =
                                     payments.iter().map(|(_, to, _)| to.as_str()).collect();
-                                notify(format!(
+                                notify_async(format!(
                                     "\n{}received{}  {} payments  +{:.8} ♦  to {} wallet{}  {}block {} · history for detail{}",
                                     EV_RECEIVED,
                                     EV_OFF,
@@ -1437,10 +1462,10 @@ async fn async_main() -> Result<()> {
                                     EV_DIM,
                                     block.index,
                                     EV_OFF
-                                ));
+                                )).await;
                             } else {
                                 for (amount, to_short, from_short) in &payments {
-                                    notify(format!(
+                                    notify_async(format!(
                                         "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
                                         EV_RECEIVED,
                                         EV_OFF,
@@ -1450,7 +1475,7 @@ async fn async_main() -> Result<()> {
                                         EV_DIM,
                                         block.index,
                                         EV_OFF
-                                    ));
+                                    )).await;
                                 }
                             }
                         }
@@ -1471,10 +1496,10 @@ async fn async_main() -> Result<()> {
                                 { blockchain.read().await.get_block(*h).ok().map(|b| b.hash) };
                             if stored != Some(*expected_hash) {
                                 orphaned.push(*h);
-                                notify(format!(
+                                notify_async(format!(
                                     "\n{}reorged{}   block {} lost the race — its {:.8} ♦ reward is no longer on the canonical chain",
                                     EV_REORG, EV_OFF, h, reward
-                                ));
+                                )).await;
                             }
                         }
                         let mut mined = session_mined_watch.lock().await;
@@ -1658,7 +1683,7 @@ async fn async_main() -> Result<()> {
                             if !genuinely_too_far {
                                 strikes = 0;
                                 if !behind_logged {
-                                    notify("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string());
+                                    notify_async("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string()).await;
                                     behind_logged = true;
                                 }
                                 continue;
@@ -1689,7 +1714,7 @@ async fn async_main() -> Result<()> {
                                     | Converge::Progressed => {
                                         strikes = 0;
                                         if !behind_logged {
-                                            notify("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string());
+                                            notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
                                             behind_logged = true;
                                         }
                                         continue;
@@ -1712,7 +1737,7 @@ async fn async_main() -> Result<()> {
                                 // same eventual recovery, bounded cost.
                                 if rebootstrap_hard_cooldown_active(&db_path_recon) {
                                     if !cooldown_logged {
-                                        notify("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string());
+                                        notify_async("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string()).await;
                                         cooldown_logged = true;
                                     }
                                     strikes = 0;
@@ -5422,8 +5447,34 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         .unwrap_or_default()
         .as_secs();
     let temp_extract_path = format!("{}.bootstrap_tmp_{}", db_path, bootstrap_ts);
-    if std::path::Path::new(&temp_extract_path).exists() {
-        let _ = std::fs::remove_dir_all(&temp_extract_path);
+    // Sweep temp directories left by an interrupted bootstrap, not just the one about to be
+    // created. The path above carries a fresh timestamp, so an existence check on it can only
+    // ever match itself — a run killed mid-extract left its directory behind permanently, and
+    // every retry added another.
+    //
+    // Matched on the bootstrap_tmp prefix alone: `.corrupt.<ts>` siblings are deliberate
+    // forensic retention and must survive this.
+    {
+        let db = std::path::Path::new(db_path);
+        let parent = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if let (Some(base), Ok(entries)) = (
+            db.file_name().and_then(|n| n.to_str()),
+            std::fs::read_dir(parent),
+        ) {
+            let prefix = format!("{}.bootstrap_tmp_", base);
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
     }
 
     let extract_path = temp_extract_path.clone();
@@ -7029,6 +7080,52 @@ const RECEIPT_BURST_LINES: usize = 4;
 const RECEIPT_SUSTAINED_LINES: usize = 20;
 const RECEIPT_RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Credits already reported this session, so a reorg re-scan does not announce the same
+/// payment twice.
+///
+/// Bounded and FIFO. Forgetting an old entry can only cost a duplicate line for something
+/// long past; it can never suppress a new credit, which is the direction that would matter.
+/// Identity is the envelope plus the committed sig_hash: the envelope alone is shared by
+/// distinct signings, and two genuinely separate payments differ in it anyway (it carries the
+/// timestamp).
+struct AnnouncedCredits {
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+/// How many credits back the notice task remembers. A reorg re-scan only ever revisits the
+/// blocks around the tip, so this is orders of magnitude more history than it needs.
+const ANNOUNCED_CREDIT_MEMORY: usize = 4096;
+
+impl AnnouncedCredits {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// True the first time a given credit is offered, false on every repeat.
+    fn first_sighting(&mut self, tx: &Transaction) -> bool {
+        let id = format!(
+            "{}:{}",
+            tx.get_tx_id(),
+            tx.sig_hash.as_deref().unwrap_or_default()
+        );
+        if self.seen.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= ANNOUNCED_CREDIT_MEMORY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.order.push_back(id.clone());
+        self.seen.insert(id);
+        true
+    }
+}
+
 /// Rolling count of inbound notices of ONE class, so a high-volume operator gets
 /// a digest instead of a firehose while an ordinary wallet keeps the exact output
 /// it has today. Instantiated once per class (payments, whispers) — the classes
@@ -7461,6 +7558,68 @@ mod tests {
     //
     // The half that is NOT allowed to change: the whisper is a product feature,
     // so ordinary use keeps the full per-whisper line with its code.
+
+    // A reorg re-scans the tip, so the notice task sees the same credit twice. It must report
+    // it once — while still reporting a DIFFERENT transaction that arrives at the same height,
+    // which is equally possible after a reorg.
+    #[test]
+    fn a_credit_is_announced_once_across_a_reorg_rescan() {
+        let mut announced = AnnouncedCredits::new();
+        let tx = tx_with_sig_hash("aa", "bb", 100, "sig-one");
+
+        assert!(announced.first_sighting(&tx), "first sighting reports");
+        assert!(!announced.first_sighting(&tx), "the re-scan must not report it again");
+
+        // Same envelope, different signing: a distinct message, still reported.
+        let resigned = tx_with_sig_hash("aa", "bb", 100, "sig-two");
+        assert!(
+            announced.first_sighting(&resigned),
+            "a different signing is a different credit"
+        );
+
+        // A different payment entirely.
+        let other = tx_with_sig_hash("aa", "bb", 101, "sig-one");
+        assert!(announced.first_sighting(&other), "a distinct payment reports");
+    }
+
+    // The memory is bounded, and it forgets in the safe direction: an evicted entry may print
+    // twice, but a fresh credit is never suppressed.
+    #[test]
+    fn announced_credit_memory_is_bounded_and_forgets_oldest_first() {
+        let mut announced = AnnouncedCredits::new();
+        for i in 0..ANNOUNCED_CREDIT_MEMORY + 64 {
+            let tx = tx_with_sig_hash("aa", "bb", i as u64, "sig");
+            assert!(announced.first_sighting(&tx), "every distinct credit reports");
+        }
+        assert!(
+            announced.order.len() <= ANNOUNCED_CREDIT_MEMORY,
+            "the queue must stay bounded"
+        );
+        assert_eq!(
+            announced.seen.len(),
+            announced.order.len(),
+            "the set and the queue must not drift apart"
+        );
+        // The newest are still remembered.
+        let newest = tx_with_sig_hash("aa", "bb", (ANNOUNCED_CREDIT_MEMORY + 63) as u64, "sig");
+        assert!(
+            !announced.first_sighting(&newest),
+            "the most recent credit must still be remembered"
+        );
+    }
+
+    fn tx_with_sig_hash(from: &str, to: &str, timestamp: u64, sig_hash: &str) -> Transaction {
+        Transaction {
+            sender: from.to_string(),
+            recipient: to.to_string(),
+            fee_units: 10_000,
+            amount_units: 100_000_000,
+            timestamp,
+            signature: Some("ab".repeat(80)),
+            pub_key: Some("cd".repeat(32)),
+            sig_hash: Some(sig_hash.to_string()),
+        }
+    }
 
     #[test]
     fn a_single_whisper_never_digests() {
