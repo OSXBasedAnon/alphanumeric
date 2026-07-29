@@ -308,11 +308,10 @@ limit; externally signed integrations retain control of their fee policy
 subject to current node admission and block-accounting rules (integrators can
 query `GET /explorer/fee-estimate` for the same recommendation).
 
-Process flags/network commands:
+Network commands (at the REPL prompt):
 
-- `--status` or `-s`
+- `--status`
 - `--sync`
-- `--sync --force`
 - `--connect <ip:port>`
 - `--getpeers`
 - `--discover`
