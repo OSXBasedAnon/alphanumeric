@@ -76,7 +76,13 @@ const RELAY_POST_RATE_LIMITED: &str = "Block relay post rate-limited";
 /// node per process in practice). Overlapping runs re-post the same recent window and
 /// only burn POST budget — the newest run supersedes the older one's purpose.
 static RELAY_BACKFILL_INFLIGHT: AtomicBool = AtomicBool::new(false);
-const MIN_PEERS: usize = 3;
+// Maintained TCP peer floor. 5, not 3: at degree 3 the loss of two neighbors
+// during a gateway outage partitions the node from gap-recovery (mesh gossip
+// has no range-fetch), and every acquisition trigger gates on this floor — it
+// is the de-facto degree. Roster poverty is self-limiting: discovery's
+// exponential backoff (60s→900s) engages whenever the network cannot supply
+// this many, so raising the floor cannot create a dial-churn loop.
+const MIN_PEERS: usize = 5;
 const MAX_PEERS_PER_SUBNET: usize = 3;
 // Max span a single GetBlocks request may ask for (and the client's batch size, kept in
 // lockstep). Bounds the per-request disk reads on the event loop and the reply size. 256 =
@@ -6778,7 +6784,10 @@ impl Node {
     async fn discover_network_nodes_with_retry(&self, retry_count: u32) -> Result<(), NodeError> {
         const MAX_DISCOVERY_RETRIES: u32 = 1;
         const MAX_TARGET_PEERS: usize = 12;
-        const MIN_TARGET_PEERS: usize = 3;
+        // Kept in step with MIN_PEERS: below this, discovery enriches its
+        // candidate set from the persisted address book and configured seeds,
+        // so a node at 3-4 peers actually finds the dials to reach the floor.
+        const MIN_TARGET_PEERS: usize = MIN_PEERS;
         const VERIFY_BATCH_SIZE: usize = 8;
         const VERIFY_CONCURRENCY: usize = 3;
 
