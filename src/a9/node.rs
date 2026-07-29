@@ -9717,8 +9717,37 @@ impl Node {
         block: &Block,
         peer: Option<SocketAddr>,
     ) -> Result<bool, NodeError> {
-        let block_hash = hex::encode(block.hash);
+        // Cheap structural checks run FIRST — before the cache key, before any validation permit
+        // or fetch — so a garbage block (bad hash / sub-floor PoW / over the tx-count limit) costs
+        // nothing scarce to reject. The key covers the transaction signature material, which makes
+        // deriving it proportional to block size (hundreds of microseconds on a full block); doing
+        // that ahead of these checks would hand an attacker that work for the price of one
+        // malformed block.
+        //
+        // A block's CLAIMED hash (block.hash, attacker-controlled off the wire) must equal its COMPUTED
+        // hash. If it lies, reject it WITHOUT negative-caching — the cache is keyed on the claimed hash,
+        // so caching a false verdict under an attacker-chosen hash would let a garbage block suppress the
+        // REAL block that legitimately has that hash (a low-cost valid-block censorship on every path).
+        if block.calculate_hash_for_block() != block.hash {
+            return Ok(false);
+        }
+        // Correct hash but PoW below floor -> definitively invalid. NOT negative-cached: the verdict
+        // depends only on the header, so re-deriving it costs a single header hash and a compare —
+        // strictly less than building the cache key needed to file it.
+        if !block.verify_pow_meets_floor() {
+            return Ok(false);
+        }
 
+        // A block exceeding the ledger's transaction-count limit is already invalid; rejecting it
+        // here, before any witness resolution runs, uses the same bound validate_block enforces.
+        if !Self::witness_count_within_limit(block.transactions.len()) {
+            return Ok(false);
+        }
+
+        // Past the cheap rejects, so the block has earned the cost of a real key. Everything below
+        // is witness resolution and full signature verification — orders of magnitude more than
+        // deriving this — so a hit still pays for itself many times over.
+        let block_hash = Self::validation_cache_key(block);
         if let Some(entry) = self
             .validation_cache
             .get(&block_hash)
@@ -9730,34 +9759,6 @@ impl Node {
             self.validation_cache.remove(&block_hash);
         }
 
-        // Cheap structural checks run before any validation permit or fetch, so a garbage block
-        // (bad hash / sub-floor PoW / over the tx-count limit) costs nothing scarce to reject.
-        //
-        // A block's CLAIMED hash (block.hash, attacker-controlled off the wire) must equal its COMPUTED
-        // hash. If it lies, reject it WITHOUT negative-caching — the cache is keyed by the claimed hash,
-        // so caching a false verdict under an attacker-chosen hash would let a garbage block suppress the
-        // REAL block that legitimately has that hash (a low-cost valid-block censorship on every path).
-        if block.calculate_hash_for_block() != block.hash {
-            return Ok(false);
-        }
-        // Correct hash but PoW below floor -> definitively invalid; safe to negative-cache under its
-        // OWN (now verified-correct) hash so replays short-circuit.
-        if !block.verify_pow_meets_floor() {
-            self.validation_cache.insert(
-                block_hash,
-                ValidationCacheEntry {
-                    valid: false,
-                    timestamp: SystemTime::now(),
-                },
-            );
-            return Ok(false);
-        }
-
-        // A block exceeding the ledger's transaction-count limit is already invalid; rejecting it
-        // here, before any witness resolution runs, uses the same bound validate_block enforces.
-        if !Self::witness_count_within_limit(block.transactions.len()) {
-            return Ok(false);
-        }
         // ---- Phase 1: resolve every transaction's witness. This is the network-bound phase and it
         // holds NO validation permit, so a peer that answers witness fetches slowly can never occupy
         // the scarce validation pool. Fetches draw from their own bounded pool inside
@@ -11238,6 +11239,86 @@ impl Node {
             .remove_if(block_hash, |_, current| current.started == started);
     }
 
+    /// Cache key for a block's validation verdict.
+    ///
+    /// `block.hash` identifies a block; it does not determine the transaction
+    /// bytes that were validated to produce a verdict about it. The merkle leaf
+    /// is built through `with_truncated_signature`, which normalises and shortens
+    /// the per-transaction signature material, so the committed root — and hence
+    /// the hash — is not a function of all of it. Filing a verdict under the bare
+    /// hash therefore describes bytes the next block bearing that hash need not
+    /// have, and that is unsound in both directions.
+    ///
+    /// Nor does the header pin the bodies at all: it carries the merkle_root as
+    /// a CLAIMED field, so a block can present an honest header over transactions
+    /// that do not reproduce it. The key therefore folds in every transaction
+    /// field, not merely the authenticating ones — a body that fails to
+    /// reproduce its claimed root is precisely the sort that loses validation,
+    /// and its verdict must not be filed against the block that legitimately
+    /// owns that header.
+    ///
+    /// The result is the property this cache assumed it already had: an entry
+    /// describes exactly the bytes that earned it, and identical bytes still
+    /// short-circuit, so the replay protection the cache exists for is kept.
+    ///
+    /// Local only — this key never leaves the process, so a node running it
+    /// agrees with every older node on exactly which blocks are valid.
+    fn validation_cache_key(block: &Block) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for tx in &block.transactions {
+            // EVERY field, not only the authenticating ones. `block.hash` covers a
+            // 92-byte header carrying the CLAIMED merkle_root, and nothing forces
+            // that claim to describe the transactions actually attached — a body
+            // whose root does not reproduce is exactly the kind that fails
+            // validation, and it must not file its verdict against the honest
+            // block that legitimately owns the header.
+            hasher.update(&tx.fee_units.to_le_bytes());
+            hasher.update(&tx.amount_units.to_le_bytes());
+            hasher.update(&tx.timestamp.to_le_bytes());
+            // Length-prefixed so ("ab","") and ("a","b") cannot collide.
+            for field in [
+                Some(tx.sender.as_str()),
+                Some(tx.recipient.as_str()),
+                tx.signature.as_deref(),
+                tx.pub_key.as_deref(),
+                tx.sig_hash.as_deref(),
+            ] {
+                let bytes = field.unwrap_or("").as_bytes();
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        let bodies = hasher.finalize();
+        format!("{}:{}", hex::encode(block.hash), &bodies.to_hex()[..32])
+    }
+
+    /// Cache key for a transaction's validation verdict.
+    ///
+    /// A cached verdict must be retrievable only by the message that earned it.
+    /// `create_hash()` covers the envelope — sender, recipient, amount, fee,
+    /// timestamp — and none of the fields that authenticate it, so it is an
+    /// identifier, not a key: distinct messages share one. Folding the
+    /// authenticating fields in restores the property this cache assumed it
+    /// already had, in both directions — a verdict can neither answer for a
+    /// message it never saw, nor let one short-circuit to a re-broadcast on the
+    /// strength of another's result.
+    ///
+    /// Local only; this key never reaches the wire, so it changes nothing about
+    /// which transactions any node considers valid.
+    fn transaction_cache_key(tx: &Transaction) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for field in [
+            tx.signature.as_deref(),
+            tx.pub_key.as_deref(),
+            tx.sig_hash.as_deref(),
+        ] {
+            let bytes = field.unwrap_or("").as_bytes();
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        format!("{}:{}", tx.create_hash(), &hasher.finalize().to_hex()[..32])
+    }
+
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
         now.duration_since(entry.timestamp)
             .map(|age| age.as_secs() < VALIDATION_CACHE_TTL_SECS)
@@ -11862,7 +11943,7 @@ impl Node {
                 if tx_ref.fee_units < MIN_RELAY_FEE_UNITS {
                     return Ok(None);
                 }
-                let tx_hash = tx_ref.create_hash();
+                let tx_hash = Self::transaction_cache_key(&tx_ref);
 
                 // Check validation cache
                 if let Some(cached) = self
@@ -15088,6 +15169,184 @@ mod tests {
             out.push(b);
         }
         out
+    }
+
+    // A transaction whose signature is `sig`, with a FIXED sig_hash so the merkle leaf is
+    // pinned to that value rather than derived from the signature bytes.
+    fn tx_with_signature(sig: &str) -> Transaction {
+        Transaction {
+            sender: "aa11bb22cc33dd44ee55ff6677889900aabbccdd".to_string(),
+            recipient: "1122334455667788990011223344556677889900".to_string(),
+            fee_units: 10_000,
+            amount_units: 100_000_000,
+            timestamp: 1_700_000_000,
+            signature: Some(sig.to_string()),
+            pub_key: Some("cc".repeat(32)),
+            sig_hash: Some("dd".repeat(32)),
+        }
+    }
+
+    fn block_carrying(tx: Transaction) -> Block {
+        let mut b = linked_block(9, [7u8; 32], 1);
+        b.transactions = vec![tx];
+        b.merkle_root = Blockchain::calculate_merkle_root(&b.transactions).expect("merkle");
+        b.hash = b.calculate_hash_for_block();
+        b
+    }
+
+    // Two bodies that the merkle root does not distinguish must not share a cache entry. The
+    // root is not a function of all the per-transaction signature material, so the block hash
+    // cannot stand in for the bytes a verdict was formed over.
+    #[test]
+    fn bodies_sharing_a_block_hash_do_not_share_a_cache_entry() {
+        let honest_sig = format!("{}{}", "ab".repeat(64), "cd".repeat(40));
+        let variant_a = honest_sig.to_uppercase();
+        let variant_b = format!("{}{}", "ab".repeat(64), "ef".repeat(40));
+
+        let honest = block_carrying(tx_with_signature(&honest_sig));
+        for (label, variant_sig) in [("a", variant_a), ("b", variant_b)] {
+            let variant = block_carrying(tx_with_signature(&variant_sig));
+
+            // Premise: the committed root does not separate these two bodies.
+            assert_eq!(
+                honest.merkle_root, variant.merkle_root,
+                "{label}: premise — the root does not distinguish these bodies"
+            );
+            assert_eq!(honest.hash, variant.hash, "{label}: premise — one block hash");
+
+            // Requirement: the cache does separate them.
+            assert_ne!(
+                Node::validation_cache_key(&honest),
+                Node::validation_cache_key(&variant),
+                "{label}: one verdict must not answer for the other body"
+            );
+        }
+    }
+
+    // Replays the sequence verify_block_with_witness performs against the real cache type: one
+    // body's verdict is filed, then the other consults the cache. The identifier-only key is
+    // computed alongside and asserted to FAIL the same sequence — without that half this test
+    // would pass against the defect it exists to hold closed.
+    //
+    // A Node cannot be constructed in tests, so this drives the cache mechanism, not the whole
+    // ingress path. That the function reaches this cache with these arguments rests on the two
+    // call sites being the only ones, and on the key being used for nothing else there.
+    #[test]
+    fn a_filed_verdict_does_not_answer_for_a_different_body() {
+        let honest_sig = format!("{}{}", "ab".repeat(64), "cd".repeat(40));
+        let other_sig = format!("{}{}", "ab".repeat(64), "ef".repeat(40));
+        let honest = block_carrying(tx_with_signature(&honest_sig));
+        let other = block_carrying(tx_with_signature(&other_sig));
+
+        let filed = |k: String| {
+            let cache: DashMap<String, ValidationCacheEntry> = DashMap::new();
+            // One body fails validation; its verdict is filed.
+            cache.insert(
+                k,
+                ValidationCacheEntry {
+                    valid: false,
+                    timestamp: SystemTime::now(),
+                },
+            );
+            cache
+        };
+
+        // Identifier-only key: the second body is answered from the first's verdict.
+        let bare = |b: &Block| hex::encode(b.hash);
+        assert_eq!(bare(&honest), bare(&other), "premise: one block hash");
+        let cache = filed(bare(&other));
+        assert!(
+            matches!(cache.get(&bare(&honest)), Some(e) if !e.valid),
+            "the identifier-only key MUST reproduce this, or the test proves nothing"
+        );
+
+        // Body-aware key: it is not.
+        let cache = filed(Node::validation_cache_key(&other));
+        assert!(
+            cache.get(&Node::validation_cache_key(&honest)).is_none(),
+            "must miss and be validated on its own merits"
+        );
+    }
+
+    // The transaction half. create_hash() is an envelope identifier and authenticates nothing,
+    // so messages differing only in signature material collide under it — in both directions,
+    // since a warm entry short-circuits straight to a re-broadcast.
+    #[test]
+    fn messages_sharing_an_envelope_do_not_share_a_cache_entry() {
+        let genuine = tx_with_signature(&"ab".repeat(80));
+        let mut other = genuine.clone();
+        other.signature = Some("ff".repeat(80));
+
+        assert_eq!(
+            genuine.create_hash(),
+            other.create_hash(),
+            "premise: create_hash covers the envelope only, so these collide"
+        );
+        assert_ne!(
+            Node::transaction_cache_key(&genuine),
+            Node::transaction_cache_key(&other),
+            "one verdict must not answer for the other message"
+        );
+
+        // A different claimed pub_key over the same signature must also miss.
+        let mut swapped_key = genuine.clone();
+        swapped_key.pub_key = Some("ee".repeat(32));
+        assert_ne!(
+            Node::transaction_cache_key(&genuine),
+            Node::transaction_cache_key(&swapped_key),
+            "the key must bind pub_key, not just the signature"
+        );
+
+        // And the same message still resolves to one entry.
+        assert_eq!(
+            Node::transaction_cache_key(&genuine),
+            Node::transaction_cache_key(&genuine.clone()),
+            "identical messages must still short-circuit"
+        );
+    }
+
+    // The header carries merkle_root as a CLAIMED field, so an honest header can sit over
+    // transactions that do not reproduce it. Such a body loses validation — which is exactly why
+    // its verdict must not be filed against the block that legitimately owns the header. Folding
+    // in only the authenticating fields is NOT enough to separate them; the envelope has to be in
+    // the key too.
+    #[test]
+    fn a_body_that_does_not_reproduce_its_claimed_root_keys_apart_from_the_honest_one() {
+        let sig = "ab".repeat(80);
+        let honest = block_carrying(tx_with_signature(&sig));
+
+        // Same header, same signature material, different envelope.
+        let mut restated = tx_with_signature(&sig);
+        restated.amount_units = 999_999_999;
+        restated.recipient = "9999999999999999999999999999999999999999".to_string();
+        let mut divergent = honest.clone();
+        divergent.transactions = vec![restated];
+        // Header untouched: the claimed root and therefore the hash still stand.
+        assert_eq!(
+            divergent.calculate_hash_for_block(),
+            divergent.hash,
+            "premise: the header still self-certifies, so the cheap gates pass it through"
+        );
+        assert_eq!(honest.hash, divergent.hash, "premise: one header, one hash");
+
+        assert_ne!(
+            Node::validation_cache_key(&honest),
+            Node::validation_cache_key(&divergent),
+            "the envelope must be in the key, or a losing body files against the honest one"
+        );
+    }
+
+    // Replay protection is the reason the cache exists; keying on the body must not cost it.
+    #[test]
+    fn an_identical_body_still_resolves_to_one_cache_entry() {
+        let sig = "ab".repeat(80);
+        let a = block_carrying(tx_with_signature(&sig));
+        let b = block_carrying(tx_with_signature(&sig));
+        assert_eq!(
+            Node::validation_cache_key(&a),
+            Node::validation_cache_key(&b),
+            "the same bytes must still short-circuit on replay"
+        );
     }
 
     // Walk the chain downward exactly as fetch_beacon_committed_span does, and report the
