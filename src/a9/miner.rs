@@ -259,6 +259,11 @@ impl MiningManager {
             // Stop promptly on Ctrl-C / SIGTERM or Enter-to-stop BEFORE building another
             // template — otherwise the command grinds template-after-template and never returns.
             if self.shutdown.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
+                // Clear the bar first: indicatif's drop stops the tick but leaves
+                // the drawn line, so a bare return strands a dead bar above the prompt.
+                if let Ok(pb) = progress_bar.lock() {
+                    pb.finish_and_clear();
+                }
                 return Err(MiningError::Cancelled);
             }
             let (
@@ -897,7 +902,7 @@ impl MiningManager {
                                                 pb.reset();
                                                 pb.set_prefix(format!("Block #{}", header.number));
                                                 pb.set_message(
-                                                    "Solved a stale height (another miner's block was adopted — no reward); mining the new tip...",
+                                                    "Lost the race for this height — retargeting the new tip...",
                                                 );
                                             }
                                             continue 'mining;
