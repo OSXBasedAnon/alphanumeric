@@ -2501,19 +2501,25 @@ impl HeaderSentinel {
     /// themselves is irrelevant, so a full sort would be wasted work.
     fn trim_verifications(&self, incoming: usize) {
         let target = VERIFICATION_TRIM_TARGET.min(MAX_VERIFICATIONS.saturating_sub(incoming));
-        let len = self.verifications.len();
-        if len <= target {
+        if self.verifications.len() <= target {
             return;
         }
-        let excess = len - target;
         let mut aged: Vec<([u8; 32], u64)> = self
             .verifications
             .iter()
             .map(|e| (*e.key(), e.value().timestamp))
             .collect();
+        // Size the cut from what was actually collected, not from a length read before it.
+        // Other tasks insert and remove concurrently, so the two can disagree — and deriving
+        // the count from the stale figure would over-evict by the difference.
+        let excess = aged.len().saturating_sub(target);
+        if excess == 0 {
+            return;
+        }
         if excess >= aged.len() {
-            aged.clear();
-            self.verifications.clear();
+            for (hash, _) in aged {
+                self.verifications.remove(&hash);
+            }
             return;
         }
         aged.select_nth_unstable_by_key(excess, |(_, timestamp)| *timestamp);
