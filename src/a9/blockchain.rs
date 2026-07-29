@@ -1569,6 +1569,35 @@ impl Blockchain {
         key_str.rsplit(':').next().map(|s| s.to_string())
     }
 
+    /// `(height, hash_hex)` from an orphan index key, which is
+    /// `{prev_hash}:{index}:{hash}`. Everything the retention policy decides on is already
+    /// here, which is why pruning never has to open a block body.
+    fn parse_orphan_index_entry(key: &[u8]) -> Option<(u32, String)> {
+        let key_str = std::str::from_utf8(key).ok()?;
+        let mut parts = key_str.rsplit(':');
+        let hash_hex = parts.next()?.to_string();
+        let index = parts.next()?.parse::<u32>().ok()?;
+        Some((index, hash_hex))
+    }
+
+    /// Arrival time carried in the orphan index VALUE.
+    ///
+    /// The slot used to be empty. Putting the timestamp there is what lets `prune_orphans`
+    /// reach its verdict from the index alone: height and hash come from the key, age from
+    /// here, and the block body — up to a megabyte of it — is never decoded.
+    ///
+    /// Entries written before this existed have an empty value and decode to None; the
+    /// caller falls back to reading that one block and rewrites the value, so the pool heals
+    /// itself as it turns over rather than needing a migration.
+    fn orphan_index_value(received_at: u64) -> [u8; 8] {
+        received_at.to_be_bytes()
+    }
+
+    fn parse_orphan_index_received_at(value: &[u8]) -> Option<u64> {
+        let bytes: [u8; 8] = value.try_into().ok()?;
+        Some(u64::from_be_bytes(bytes))
+    }
+
     fn open_orphan_blocks_tree(&self) -> Result<sled::Tree, BlockchainError> {
         self.db.open_tree(ORPHAN_BLOCKS_TREE).map_err(Into::into)
     }
@@ -2750,16 +2779,22 @@ impl Blockchain {
             return Ok(());
         }
 
+        let received_at = Self::now_unix_secs();
         let orphan_entry = OrphanStoredBlock {
             block: block.clone(),
-            received_at: Self::now_unix_secs(),
+            received_at,
         };
 
-        orphan_blocks.insert(hash_key.as_bytes(), codec::serialize(&orphan_entry)?)?;
+        // INDEX FIRST, body second. The two trees cannot be written atomically, so the order
+        // decides which way a crash between them can leave the pool. This way the survivor is
+        // an index entry with no body — which the dangling sweep in prune_orphans already
+        // collects. The reverse would leave a body no index references, and since pruning now
+        // reaches its verdict from the index alone, nothing would ever reclaim it.
         orphan_index.insert(
             Self::orphan_index_key(&block.previous_hash, block.index, &block.hash).as_bytes(),
-            &[] as &[u8],
+            &Self::orphan_index_value(received_at),
         )?;
+        orphan_blocks.insert(hash_key.as_bytes(), codec::serialize(&orphan_entry)?)?;
         orphan_blocks.flush()?;
         orphan_index.flush()?;
         self.prune_orphans()?;
@@ -3696,14 +3731,45 @@ impl Blockchain {
         let tip = self.highest_block_index();
         let mut remove_hashes: Vec<[u8; 32]> = Vec::new();
 
-        let mut retained: Vec<OrphanStoredBlock> = Vec::new();
+        // Decide from the INDEX, not the bodies. Height and hash are in the key and arrival
+        // time is in the value, so the whole retention policy resolves without decoding a
+        // single stored block — this used to deserialize every one of them (up to
+        // ORPHAN_MAX_COUNT megabyte-scale blocks) to read three small fields, on a path that
+        // runs per applied block and per stored orphan, under the chain write lock.
+        let mut retained: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut backfill: Vec<(sled::IVec, u64)> = Vec::new();
         let checkpoint = self.trusted_checkpoint_height();
-        for item in orphan_blocks.iter() {
-            let (_, raw) = item?;
-            if let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) {
-                let expired = now.saturating_sub(entry.received_at) > ORPHAN_TTL_SECS;
+        for item in orphan_index.iter() {
+            let (key, value) = item?;
+            let Some((index, hash_hex)) = Self::parse_orphan_index_entry(&key) else {
+                continue;
+            };
+            let Some(hash) = hex::decode(&hash_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            else {
+                continue;
+            };
+            // Pre-existing entries carry an empty value. Read that one body to recover its
+            // arrival time and queue the value for rewrite, so the pool converges on the
+            // cheap path as it turns over instead of needing a migration.
+            let received_at = match Self::parse_orphan_index_received_at(&value) {
+                Some(ts) => ts,
+                None => {
+                    let Some(raw) = orphan_blocks.get(hash_hex.as_bytes())? else {
+                        continue; // dangling; the sweep below removes it
+                    };
+                    let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) else {
+                        continue;
+                    };
+                    backfill.push((key.clone(), entry.received_at));
+                    entry.received_at
+                }
+            };
+            {
+                let expired = now.saturating_sub(received_at) > ORPHAN_TTL_SECS;
                 let stale_height = tip
-                    .map(|t| entry.block.index.saturating_add(ORPHAN_REORG_DEPTH) < t)
+                    .map(|t| index.saturating_add(ORPHAN_REORG_DEPTH) < t)
                     .unwrap_or(false);
                 // Finality invariant applied to the pool: no adoptable branch may
                 // fork at/below the trusted checkpoint (branch[0].index must be
@@ -3714,20 +3780,28 @@ impl Blockchain {
                 // incompatible-client branch) so it stops re-assembling at all.
                 // The checkpoint never regresses, so this can never discard a
                 // block a future reorg could want.
-                let finalized_below = checkpoint > 0 && entry.block.index <= checkpoint;
+                let finalized_below = checkpoint > 0 && index <= checkpoint;
                 if expired || stale_height || finalized_below {
-                    remove_hashes.push(entry.block.hash);
+                    remove_hashes.push(hash);
                 } else {
-                    retained.push(entry);
+                    retained.push((received_at, hash));
                 }
             }
         }
 
+        // Rewrite the values recovered from bodies above, so each old entry pays that cost
+        // once rather than on every prune.
+        for (key, received_at) in backfill {
+            orphan_index.insert(key, &Self::orphan_index_value(received_at))?;
+        }
+
         if retained.len() > ORPHAN_MAX_COUNT {
-            retained.sort_by_key(|e| e.received_at);
             let overflow = retained.len().saturating_sub(ORPHAN_MAX_COUNT);
-            for entry in retained.into_iter().take(overflow) {
-                remove_hashes.push(entry.block.hash);
+            // Only the oldest `overflow` are needed and their order among themselves is
+            // irrelevant, so select rather than sort.
+            retained.select_nth_unstable_by_key(overflow, |(received_at, _)| *received_at);
+            for (_, hash) in retained.into_iter().take(overflow) {
+                remove_hashes.push(hash);
             }
         }
 
@@ -3736,6 +3810,8 @@ impl Blockchain {
         }
 
         // Best-effort cleanup for index entries that no longer have backing orphan blocks.
+        // Also collects the survivor of a crash between the two writes in store_orphan_block,
+        // which is why that one writes the index first.
         let mut dangling = Vec::new();
         for item in orphan_index.iter() {
             let (key, _) = item?;
@@ -11913,6 +11989,100 @@ mod tests {
         let parsed = Blockchain::parse_orphan_index_hash(key.as_bytes())
             .expect("should parse orphan index key");
         assert_eq!(parsed, hex::encode(hash));
+    }
+
+    // Pruning now reaches its verdict from the index alone, so the key must yield BOTH the
+    // height and the hash, and the value must yield the arrival time. If any of these stops
+    // round-tripping, the retention policy silently starts deciding on wrong inputs.
+    #[test]
+    fn orphan_index_carries_everything_pruning_decides_on() {
+        let prev = [0x11u8; 32];
+        let hash = [0x22u8; 32];
+        let key = Blockchain::orphan_index_key(&prev, 517_583, &hash);
+        let (index, hash_hex) = Blockchain::parse_orphan_index_entry(key.as_bytes())
+            .expect("index key must yield height and hash");
+        assert_eq!(index, 517_583);
+        assert_eq!(hash_hex, hex::encode(hash));
+
+        let value = Blockchain::orphan_index_value(1_700_000_042);
+        assert_eq!(
+            Blockchain::parse_orphan_index_received_at(&value),
+            Some(1_700_000_042)
+        );
+
+        // The pre-existing on-disk shape: an empty value. It must decode to None so the
+        // caller knows to recover the timestamp from the body rather than reading garbage.
+        assert_eq!(Blockchain::parse_orphan_index_received_at(&[]), None);
+        assert_eq!(Blockchain::parse_orphan_index_received_at(&[0u8; 4]), None);
+    }
+
+    // An orphan stored by an older node has an empty index value. It must still be pruned on
+    // the same schedule, and the value must be repaired so the cost is paid once.
+    #[tokio::test]
+    async fn orphan_pruning_heals_a_legacy_entry_and_still_expires_it() {
+        let bc = test_blockchain();
+        let blocks = bc.open_orphan_blocks_tree().unwrap();
+        let index_tree = bc.open_orphan_index_tree().unwrap();
+
+        // A fresh orphan, written the OLD way: empty index value.
+        let mut fresh = metadata_test_block(900_000, [9u8; 32], "miner", 10.0);
+        fresh.hash = fresh.calculate_hash_for_block();
+        let fresh_key = Blockchain::orphan_hash_key(&fresh.hash);
+        let now = Blockchain::now_unix_secs();
+        blocks
+            .insert(
+                fresh_key.as_bytes(),
+                codec::serialize(&OrphanStoredBlock {
+                    block: fresh.clone(),
+                    received_at: now,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let fresh_index_key =
+            Blockchain::orphan_index_key(&fresh.previous_hash, fresh.index, &fresh.hash);
+        index_tree
+            .insert(fresh_index_key.as_bytes(), &[] as &[u8])
+            .unwrap();
+
+        // A legacy orphan that is past its TTL and must be reclaimed.
+        let mut old = metadata_test_block(900_001, [8u8; 32], "miner", 10.0);
+        old.hash = old.calculate_hash_for_block();
+        let old_key = Blockchain::orphan_hash_key(&old.hash);
+        blocks
+            .insert(
+                old_key.as_bytes(),
+                codec::serialize(&OrphanStoredBlock {
+                    block: old.clone(),
+                    received_at: now.saturating_sub(ORPHAN_TTL_SECS * 2),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        index_tree
+            .insert(
+                Blockchain::orphan_index_key(&old.previous_hash, old.index, &old.hash).as_bytes(),
+                &[] as &[u8],
+            )
+            .unwrap();
+
+        bc.prune_orphans().expect("prune runs over legacy entries");
+
+        assert!(
+            blocks.get(old_key.as_bytes()).unwrap().is_none(),
+            "an expired legacy orphan must still be reclaimed"
+        );
+        assert!(
+            blocks.get(fresh_key.as_bytes()).unwrap().is_some(),
+            "a fresh legacy orphan must be retained"
+        );
+        // ...and its index value is repaired, so the next prune reads it without the body.
+        let healed = index_tree.get(fresh_index_key.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            Blockchain::parse_orphan_index_received_at(&healed),
+            Some(now),
+            "the survivor's arrival time must be backfilled into the index"
+        );
     }
 
     #[test]
