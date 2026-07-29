@@ -1971,6 +1971,10 @@ const MAX_MLDSA_KEYS_PER_IP: usize = 2;
 /// spamming random height-0 headers could grow this without limit (remote OOM). Bounded with
 /// oldest-first eviction; 8192 is far above any live reorg/fork-resolution window.
 const MAX_VERIFICATIONS: usize = 8192;
+/// Low-water mark the verification cache is trimmed back to once it reaches its ceiling.
+/// The gap between this and MAX_VERIFICATIONS is what makes eviction amortised: one linear
+/// pass makes room for that many inserts, instead of one full scan per insert.
+const VERIFICATION_TRIM_TARGET: usize = MAX_VERIFICATIONS * 7 / 8;
 
 #[derive(Debug)]
 pub struct HeaderSentinel {
@@ -2297,13 +2301,15 @@ impl HeaderSentinel {
 
             // Batch add verified headers
             if !verified_headers.is_empty() {
+                // Bound the verification cache BEFORE taking the headers guard, and once for
+                // the whole chunk rather than once per header. The trim is O(cache); running
+                // it under a lock that block ingestion also needs charged that cost to the
+                // wrong subsystem, and running it per header paid it up to 200 times for one
+                // batch. Chunks are capped at 200, so this reserves the exact room needed.
+                self.trim_verifications(verified_headers.len());
                 let mut header_states = self.headers.write().await;
 
                 for header in verified_headers {
-                    // Bound the verification cache on the HeaderSync path too, so a peer
-                    // streaming long header chains can't grow it without bound.
-                    self.evict_oldest_verification_if_full(&header.hash);
-
                     let mut verification =
                         self.verifications.entry(header.hash).or_insert_with(|| {
                             VerificationState {
@@ -2475,15 +2481,45 @@ impl HeaderSentinel {
     /// (verify_headers_batch), or fresh-hash announces (add_verified_header).
     /// manage_header_cache only age-prunes (24h), so a count cap is still required.
     fn evict_oldest_verification_if_full(&self, hash: &[u8; 32]) {
-        if !self.verifications.contains_key(hash) && self.verifications.len() >= MAX_VERIFICATIONS {
-            if let Some(oldest) = self
-                .verifications
-                .iter()
-                .min_by_key(|e| e.value().timestamp)
-                .map(|e| *e.key())
-            {
-                self.verifications.remove(&oldest);
-            }
+        // An update to an existing hash consumes no new slot.
+        if self.verifications.contains_key(hash) {
+            return;
+        }
+        self.trim_verifications(1);
+    }
+
+    /// Make room for `incoming` new verification entries, trimming the oldest in one pass.
+    ///
+    /// Evicting exactly one entry per insert is what made this expensive: once the cache is
+    /// saturated EVERY insert paid a full O(MAX_VERIFICATIONS) scan to remove a single entry,
+    /// and on the HeaderSync path that scan ran under the headers write guard, so it charged
+    /// block ingestion for it. Trimming down to a low-water mark instead amortises one pass
+    /// over the ~1k inserts it makes room for.
+    ///
+    /// Selection is linear: `select_nth_unstable_by_key` partitions so everything below the
+    /// pivot is at least as old, which is exactly the set to drop — their order among
+    /// themselves is irrelevant, so a full sort would be wasted work.
+    fn trim_verifications(&self, incoming: usize) {
+        let target = VERIFICATION_TRIM_TARGET.min(MAX_VERIFICATIONS.saturating_sub(incoming));
+        let len = self.verifications.len();
+        if len <= target {
+            return;
+        }
+        let excess = len - target;
+        let mut aged: Vec<([u8; 32], u64)> = self
+            .verifications
+            .iter()
+            .map(|e| (*e.key(), e.value().timestamp))
+            .collect();
+        if excess >= aged.len() {
+            aged.clear();
+            self.verifications.clear();
+            return;
+        }
+        aged.select_nth_unstable_by_key(excess, |(_, timestamp)| *timestamp);
+        aged.truncate(excess);
+        for (hash, _) in aged {
+            self.verifications.remove(&hash);
         }
     }
 
@@ -2780,6 +2816,79 @@ impl From<BlockchainError> for String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn aged_verification(timestamp: u64) -> VerificationState {
+        VerificationState {
+            timestamp,
+            verifiers: HashSet::new(),
+        }
+    }
+
+    // The cache must stay under its ceiling, and the trim must be AMORTISED: evicting one
+    // entry per insert meant a full O(MAX_VERIFICATIONS) scan on every insert once saturated,
+    // charged (on the HeaderSync path) to the headers write guard.
+    #[test]
+    fn verification_trim_bounds_the_cache_and_drops_the_oldest_first() {
+        let sentinel = HeaderSentinel::new();
+        for i in 0..MAX_VERIFICATIONS as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel.verifications.insert(hash, aged_verification(i));
+        }
+        assert_eq!(sentinel.verifications.len(), MAX_VERIFICATIONS);
+
+        // Reserving room for one entry trims to the low-water mark in a single pass.
+        sentinel.trim_verifications(1);
+        let after = sentinel.verifications.len();
+        assert!(
+            after <= VERIFICATION_TRIM_TARGET,
+            "trim must reach the low-water mark, got {after}"
+        );
+        assert!(
+            after >= VERIFICATION_TRIM_TARGET.saturating_sub(1),
+            "trim must not overshoot far past the mark, got {after}"
+        );
+
+        // It dropped the OLDEST: the surviving timestamps are the high end of the range.
+        let dropped = MAX_VERIFICATIONS - after;
+        for i in 0..dropped as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            assert!(
+                !sentinel.verifications.contains_key(&hash),
+                "entry {i} was among the oldest and must have been evicted"
+            );
+        }
+
+        // Amortisation: the next inserts up to the reclaimed headroom do no scanning at all,
+        // because the length check short-circuits before any pass is built.
+        for i in 0..dropped as u64 {
+            let mut hash = [0xffu8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel.verifications.insert(hash, aged_verification(1_000_000 + i));
+            sentinel.trim_verifications(1);
+        }
+        assert!(
+            sentinel.verifications.len() <= MAX_VERIFICATIONS,
+            "the ceiling must hold across the refill"
+        );
+    }
+
+    // A whole HeaderSync chunk reserves its room in one call; chunks are capped at 200.
+    #[test]
+    fn verification_trim_reserves_room_for_a_whole_chunk() {
+        let sentinel = HeaderSentinel::new();
+        for i in 0..MAX_VERIFICATIONS as u64 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            sentinel.verifications.insert(hash, aged_verification(i));
+        }
+        sentinel.trim_verifications(200);
+        assert!(
+            sentinel.verifications.len() + 200 <= MAX_VERIFICATIONS,
+            "after reserving for a full chunk the batch must fit under the ceiling"
+        );
+    }
 
     // A registered key from a DISTINCT source IP (octet), so N such entries count as N
     // distinct eligible verifiers under the anti-Sybil distinct-IP quorum count.
