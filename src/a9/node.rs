@@ -8951,11 +8951,25 @@ impl Node {
     }
 
     // Make peer list request helper
+    /// Ask one peer for its peer list.
+    ///
+    /// The reply is truncated to the same budget `fetch_discovery_peers` applies to the
+    /// gateway's list. The inversion it removes is stark: the TRUSTED source was capped and
+    /// the untrusted one was not. MAX_MESSAGE_SIZE bounds any single reply before it is
+    /// decoded, but the caller fans out across every peer and concatenates the results, so
+    /// without a per-reply bound the retained total scales with peer count — one cooperating
+    /// set of peers could make discovery allocate far past anything discovery can use.
+    ///
+    /// Truncation is not a fidelity loss: the caller only needs candidates to dial, and it
+    /// already has far more than it can hold connections for.
     async fn request_peer_list(&self, addr: SocketAddr) -> Result<Vec<SocketAddr>, NodeError> {
         let message = NetworkMessage::GetPeers;
 
         match self.send_message_with_response(addr, &message).await {
-            Ok(NetworkMessage::Peers(peers)) => Ok(peers),
+            Ok(NetworkMessage::Peers(mut peers)) => {
+                peers.truncate(self.max_peers.saturating_mul(4).max(32));
+                Ok(peers)
+            }
             Ok(_) => Err(NodeError::Network("Invalid response type".into())),
             Err(e) => Err(e),
         }
