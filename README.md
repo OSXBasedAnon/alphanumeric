@@ -294,7 +294,7 @@ Interactive command loop examples:
 - `rename <old_name> <new_name>`
 - `mine <wallet_name>`
 - `info`
-- `diagnostics`
+- `debug`
 
 With no `--fee`, the wallet prices the fee automatically off the live mempool
 (the `info` screen shows the current value as `Default Fee`, and `create`
