@@ -5069,11 +5069,32 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 remove_local_db(db_path).await?;
             }
             LaunchDbStatus::Unreadable(err) => {
-                boot_note(
-                    status.as_ref(),
-                    format!("replacing local database ({})", err),
-                );
-                remove_local_db(db_path).await?;
+                // SET ASIDE, don't destroy. Every sled open failure lands here — a lock held
+                // by another instance, a transient I/O error, a genuinely corrupt page — and
+                // the answer was an unconditional recursive delete of the whole chain
+                // directory. Renaming clears the path just as effectively (the node
+                // re-bootstraps either way) while keeping the bytes for diagnosis, which is
+                // the same call the reopen-failure path already makes. Nothing irreplaceable
+                // is lost either way — keys live in private.key — but "unreadable to sled
+                // right now" is not the same claim as "worthless", and only one of these two
+                // actions can be taken back.
+                //
+                // Falls back to removal if the rename itself fails, because a node that
+                // cannot clear the path cannot boot at all.
+                match quarantine_db(db_path) {
+                    Ok(()) => boot_note(
+                        status.as_ref(),
+                        format!("set aside unreadable database, re-bootstrapping ({})", err),
+                    ),
+                    Err(q_err) => {
+                        warn!("Could not set aside unreadable database: {}", q_err);
+                        boot_note(
+                            status.as_ref(),
+                            format!("replacing local database ({})", err),
+                        );
+                        remove_local_db(db_path).await?;
+                    }
+                }
             }
         }
     }
