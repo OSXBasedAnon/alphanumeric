@@ -2093,6 +2093,13 @@ async fn async_main() -> Result<()> {
     let pending_txs = blockchain_guard.get_pending_transactions().await?;
     let pending_value: f64 = pending_txs.iter().map(|tx| tx.amount()).sum();
 
+    // Everything this screen reads from the chain has been taken. Release the guard BEFORE
+    // rendering: what follows is ~470 lines of blocking styled output, and a reader held
+    // across it blocks the next writer — the publisher-park class this client has been bitten
+    // by before (see the note on background notices above). Dropping here also shortens the
+    // window the 3s acquire timeout above exists to protect.
+    drop(blockchain_guard);
+
     let gateway_peers = gateway_overview
         .as_ref()
         .and_then(|overview| overview.peers)
