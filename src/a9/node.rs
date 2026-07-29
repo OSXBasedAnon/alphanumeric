@@ -11347,7 +11347,8 @@ impl Node {
         cache: &DashMap<String, ValidationCacheEntry>,
         now: SystemTime,
         ttl_secs: u64,
-        max_entries: usize,
+        ceiling: usize,
+        trim_target: usize,
     ) {
         let expired_keys: Vec<String> = cache
             .iter()
@@ -11363,8 +11364,15 @@ impl Node {
             cache.remove(&key);
         }
 
-        let len = cache.len();
-        if len <= max_entries {
+        // Gate the size pass on the CEILING, trim down to the low-water mark — and own
+        // that gate here, so every caller pays it identically. The insert path already
+        // gated on the ceiling before calling in, but the maintenance tick called in
+        // unconditionally: any tick that found the cache in the band between the mark
+        // and the ceiling paid a full collect-and-select pass and evicted up to the
+        // whole band of still-fresh entries — the same wrong bound the bpos trim
+        // shipped with, in mirror form (the gate lived on one caller and not the
+        // other). Expiry above runs regardless; freshness has no size threshold.
+        if cache.len() <= ceiling {
             return;
         }
 
@@ -11383,7 +11391,7 @@ impl Node {
         // matter, so partition rather than sort. The count comes from what was actually
         // collected rather than the earlier length read, which concurrent inserts and
         // removals can already have invalidated.
-        let excess = entries.len().saturating_sub(max_entries);
+        let excess = entries.len().saturating_sub(trim_target);
         if excess < entries.len() {
             entries.select_nth_unstable_by_key(excess, |(_, timestamp)| *timestamp);
         }
@@ -11397,11 +11405,15 @@ impl Node {
             &self.validation_cache,
             SystemTime::now(),
             VALIDATION_CACHE_TTL_SECS,
+            VALIDATION_CACHE_MAX_ENTRIES,
             VALIDATION_CACHE_TRIM_TARGET,
         );
     }
 
     fn maybe_prune_validation_cache(&self) {
+        // Cheap short-circuit only — the authoritative gate lives inside the prune,
+        // which the maintenance tick also calls. Without this check every insert
+        // would pay the full expiry scan; with it, only inserts at the ceiling do.
         if self.validation_cache.len() > VALIDATION_CACHE_MAX_ENTRIES {
             self.prune_validation_cache();
         }
@@ -17151,7 +17163,9 @@ mod tests {
             );
         }
 
-        Node::prune_validation_cache_entries(&cache, now, 3_600, 3);
+        // Five fresh entries survive expiry; a ceiling of 4 arms the size pass,
+        // which trims to the mark of 3, dropping the two oldest.
+        Node::prune_validation_cache_entries(&cache, now, 3_600, 4, 3);
 
         assert!(cache.get("expired").is_none());
         assert_eq!(cache.len(), 3);
@@ -17160,6 +17174,51 @@ mod tests {
         assert!(cache.get("fresh-2").is_some());
         assert!(cache.get("fresh-3").is_none());
         assert!(cache.get("fresh-4").is_none());
+    }
+
+    // AMORTISATION at the maintenance tick, asserted rather than described — the
+    // node.rs mirror of the bpos trim_verifications assertion. The periodic caller
+    // now passes the same bounds as the insert path, so a pass that finds the
+    // cache anywhere in the band between the low-water mark and the ceiling must
+    // leave it alone: trimming there would evict still-fresh verdicts on every
+    // tick and force their revalidation. Crossing the ceiling is what trims, and
+    // it trims to the mark. Bounds are parameters, so the property is provable at
+    // toy scale without walking a 50,000-entry band.
+    #[test]
+    fn validation_cache_size_trim_gates_on_ceiling_not_mark() {
+        let cache = DashMap::new();
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let fresh = |age: u64| ValidationCacheEntry {
+            valid: true,
+            timestamp: now - Duration::from_secs(age),
+        };
+        let (ceiling, mark) = (10usize, 7usize);
+
+        // Fill to the mark, then walk the band up to the ceiling: no pass may trim.
+        for i in 0..ceiling as u64 {
+            cache.insert(format!("k{i}"), fresh(i));
+            if i < mark as u64 {
+                continue;
+            }
+            let before = cache.len();
+            Node::prune_validation_cache_entries(&cache, now, 3_600, ceiling, mark);
+            assert_eq!(
+                cache.len(),
+                before,
+                "a pass at {before} entries, inside the band, must not trim"
+            );
+        }
+
+        // One entry over the ceiling trims back to the mark, evicting oldest-first:
+        // the newcomer (age 0 = newest) and the youngest of the band survive.
+        cache.insert("over".to_string(), fresh(0));
+        Node::prune_validation_cache_entries(&cache, now, 3_600, ceiling, mark);
+        assert_eq!(cache.len(), mark, "crossing the ceiling trims to the mark");
+        assert!(cache.get("over").is_some());
+        assert!(
+            cache.get(&format!("k{}", ceiling - 1)).is_none(),
+            "the oldest entries are the ones evicted"
+        );
     }
 
     #[test]
