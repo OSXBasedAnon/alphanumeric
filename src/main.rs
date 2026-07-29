@@ -3897,7 +3897,7 @@ Some("help") => {
     ui_seg(&mut stdout, spec, UI_DIM, false, "node and peer status")?;
     writeln!(stdout)?;
     row!(" network status", UI_LAVENDER, "info", "");
-    row!(" connectivity", UI_LAVENDER, "--status", "   (-s)");
+    row!(" connectivity", UI_LAVENDER, "--status", "");
     row!(" peer discovery", UI_LAVENDER, "--getpeers", "   ·   --discover");
     row!(" add peer", UI_LAVENDER, "--connect ", "<ip:port>");
     row!(" resynchronise", UI_LAVENDER, "--sync", "");
@@ -4111,7 +4111,7 @@ async fn handle_network_commands(
     let cmd = parts.first().copied().unwrap_or("");
 
     match cmd {
-        "--status" | "-s" => {
+        "--status" => {
             let mut stdout = StandardStream::stdout(ColorChoice::Always);
             let mut header_style = ColorSpec::new();
             header_style.set_fg(Some(Color::Cyan)).set_bold(true);
@@ -4421,7 +4421,7 @@ async fn handle_network_commands(
 
         _ => {
             println!("Available commands:");
-            println!("--status    (-s)      Show network status");
+            println!("--status            Show network status");
             println!("--sync              Start blockchain sync");
             println!("--connect <ip:port> Connect to specific node");
             println!("--getpeers          List connected peers");
