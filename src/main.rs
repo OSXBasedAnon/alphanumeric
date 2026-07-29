@@ -2745,6 +2745,16 @@ println!("Wallet renamed successfully");
                                 }
                             }
                         });
+                    } else {
+                        // Single-shot grinds one block, which solo can take a
+                        // while. Enter-to-stop needs the continuous reader (a
+                        // stray stdin reader here would corrupt the rustyline
+                        // prompt after the block lands), so point at the two
+                        // real ways out.
+                        println!(
+                            "Mining one block (solo can take a while). Press Ctrl-C to abort, \
+                             or use `--continuous` to keep mining with Enter-to-stop."
+                        );
                     }
 
                     // Sleep in short slices so Enter stops continuous mode promptly —
