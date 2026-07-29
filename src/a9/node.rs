@@ -14350,8 +14350,9 @@ impl Node {
 
     /// Deadline-sliced, single-flight variant. `deadline` bounds interactive callers
     /// (mine-prep works inside a declared prep budget): it is checked between candidate
-    /// probes and between GetBlocks spans — never mid-block — so expiry always leaves a
-    /// consistent applied prefix and the next call resumes from the advanced tip.
+    /// probes, between committed-span block applies, and between GetBlocks spans —
+    /// never mid-block — so expiry always leaves a consistent applied prefix and the
+    /// next call resumes from the advanced tip.
     /// `None` = run to completion (the background loops).
     async fn sync_full_history_from_peer_bounded(
         &self,
@@ -14472,6 +14473,15 @@ impl Node {
                             target
                         );
                         for block in &span {
+                            // Same slice contract as the GetBlocks loop in STEP 3: expiry
+                            // between block applies, never mid-block. A proven span can run
+                            // to 8,192 sequential writes — tens of seconds a mine-prep
+                            // caller never agreed to spend. The applied prefix stays
+                            // consistent, and STEP 3 (this call's, or a later caller's)
+                            // resumes from wherever the tip actually got to.
+                            if Self::full_sync_deadline_expired(deadline) {
+                                break;
+                            }
                             if let Err(e) = self
                                 .blockchain
                                 .write()
