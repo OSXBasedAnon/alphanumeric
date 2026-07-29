@@ -4585,11 +4585,44 @@ fn cleanup_sled_snapshots(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set a database directory aside for diagnosis instead of deleting it.
+///
+/// KEEPS AT MOST ONE, and keeps the FIRST. A chain directory is gigabytes, and a node that
+/// fails to open one usually fails again on the next boot — so retaining every attempt turns
+/// a recoverable fault into a full disk, and a full disk turns a self-healing re-bootstrap
+/// into a permanent outage. Keeping the earliest copy rather than the latest is deliberate:
+/// the first failure is the one that carries the original cause, while later ones are just
+/// copies of a fresh download that failed the same way.
+///
+/// When a quarantine already exists the new directory is removed rather than kept, which is
+/// what the caller would otherwise have done anyway.
 fn quarantine_db(path: &str) -> std::io::Result<()> {
     let dir = std::path::Path::new(path);
     if !dir.exists() {
         return Ok(());
     }
+
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|base| format!("{}.corrupt.", base));
+    if let (Some(prefix), Ok(entries)) = (prefix, std::fs::read_dir(parent)) {
+        let already_held = entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        });
+        if already_held {
+            std::fs::remove_dir_all(dir)?;
+            return Ok(());
+        }
+    }
+
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

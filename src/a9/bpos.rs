@@ -2500,10 +2500,15 @@ impl HeaderSentinel {
     /// pivot is at least as old, which is exactly the set to drop — their order among
     /// themselves is irrelevant, so a full sort would be wasted work.
     fn trim_verifications(&self, incoming: usize) {
-        let target = VERIFICATION_TRIM_TARGET.min(MAX_VERIFICATIONS.saturating_sub(incoming));
-        if self.verifications.len() <= target {
+        // Gate on the CEILING, trim down to the low-water mark. Gating on the mark instead
+        // would make every insert in the band between the two pay a full collect-and-select
+        // pass — precisely the per-insert cost this exists to remove, leaving the amortisation
+        // in name only. (The validation cache in node.rs has the correct shape: its caller
+        // gates on MAX_ENTRIES and passes the trim target down.)
+        if self.verifications.len().saturating_add(incoming) <= MAX_VERIFICATIONS {
             return;
         }
+        let target = VERIFICATION_TRIM_TARGET.min(MAX_VERIFICATIONS.saturating_sub(incoming));
         let mut aged: Vec<([u8; 32], u64)> = self
             .verifications
             .iter()
@@ -2866,17 +2871,36 @@ mod tests {
             );
         }
 
-        // Amortisation: the next inserts up to the reclaimed headroom do no scanning at all,
-        // because the length check short-circuits before any pass is built.
-        for i in 0..dropped as u64 {
+        // AMORTISATION, asserted rather than described. Every insert from the low-water mark
+        // back up to the ceiling must be absorbed WITHOUT a trim firing — observable as the
+        // map growing monotonically. Gating on the mark instead of the ceiling would trim on
+        // each of these, pinning len at the mark and making the whole exercise pointless.
+        let headroom = MAX_VERIFICATIONS - after - 1;
+        for i in 0..headroom as u64 {
             let mut hash = [0xffu8; 32];
             hash[..8].copy_from_slice(&i.to_be_bytes());
             sentinel.verifications.insert(hash, aged_verification(1_000_000 + i));
+            let before_trim = sentinel.verifications.len();
             sentinel.trim_verifications(1);
+            assert_eq!(
+                sentinel.verifications.len(),
+                before_trim,
+                "insert {i} of {headroom} below the ceiling must not trigger a pass"
+            );
         }
         assert!(
             sentinel.verifications.len() <= MAX_VERIFICATIONS,
             "the ceiling must hold across the refill"
+        );
+
+        // One more insert crosses the ceiling, and THAT one trims.
+        let mut hash = [0xeeu8; 32];
+        hash[..8].copy_from_slice(&999u64.to_be_bytes());
+        sentinel.verifications.insert(hash, aged_verification(2_000_000));
+        sentinel.trim_verifications(1);
+        assert!(
+            sentinel.verifications.len() <= VERIFICATION_TRIM_TARGET,
+            "crossing the ceiling must trim back to the low-water mark"
         );
     }
 
