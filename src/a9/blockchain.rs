@@ -1410,6 +1410,10 @@ pub struct Blockchain {
     /// In-memory by design: it is live-operation state, rebuilt from the orphan
     /// pool after a restart; no persistence, no new tree, no consensus surface.
     witness_blocked: Arc<PLMutex<HashMap<[u8; 32], WitnessBlockedBranch>>>,
+    /// One-shot latch for the orphan index reconciliation in `prune_orphans`. In-memory: the
+    /// repair is idempotent and cheap to redo after a restart, and a persisted flag would be
+    /// one more piece of state to keep honest.
+    orphan_index_reconciled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Memo entry for a reorg branch the S-01 gate deferred (see `witness_blocked`).
@@ -3843,6 +3847,47 @@ impl Blockchain {
             orphan_index.remove(key)?;
         }
 
+        // The other direction, ONCE per process. Since the verdict above comes from the index
+        // alone, a body with no index entry is invisible to it — it would never expire and
+        // never be reclaimed. Going forward that state is unreachable, because
+        // store_orphan_block writes the index first. But a node upgrading from the previous
+        // write order can be carrying such bodies already, so they are reconciled at startup
+        // rather than left to sit forever.
+        //
+        // Rebuilds the missing index entry instead of deleting the body: the entry restores
+        // prunability, and the normal retention rules then decide the block's fate on the next
+        // pass, which is a strictly safer default than discarding a block a reorg might want.
+        if !self.orphan_index_reconciled
+            .swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let mut repaired = 0usize;
+            for item in orphan_blocks.iter() {
+                let (key, raw) = item?;
+                let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) else {
+                    continue;
+                };
+                let index_key = Self::orphan_index_key(
+                    &entry.block.previous_hash,
+                    entry.block.index,
+                    &entry.block.hash,
+                );
+                if orphan_index.get(index_key.as_bytes())?.is_none() {
+                    orphan_index.insert(
+                        index_key.as_bytes(),
+                        &Self::orphan_index_value(entry.received_at),
+                    )?;
+                    repaired += 1;
+                }
+                let _ = key;
+            }
+            if repaired > 0 {
+                log::info!(
+                    "Rebuilt {} orphan index entr{} left by an earlier write order; they are prunable again",
+                    repaired,
+                    if repaired == 1 { "y" } else { "ies" }
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -4754,6 +4799,7 @@ impl Blockchain {
             supply_cache: Arc::new(PLMutex::new(None)),
             tip_watch_tx,
             witness_blocked: Arc::new(PLMutex::new(HashMap::new())),
+            orphan_index_reconciled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Ensure pending tx trees exist (do not clear at startup).
@@ -12032,6 +12078,57 @@ mod tests {
         // caller knows to recover the timestamp from the body rather than reading garbage.
         assert_eq!(Blockchain::parse_orphan_index_received_at(&[]), None);
         assert_eq!(Blockchain::parse_orphan_index_received_at(&[0u8; 4]), None);
+    }
+
+    // A body with NO index entry — the residue of the previous write order — is invisible to
+    // index-driven pruning and would never expire. The startup reconciliation rebuilds its
+    // index entry so the normal retention rules can see it again.
+    #[tokio::test]
+    async fn orphan_pruning_reconciles_a_body_that_lost_its_index_entry() {
+        let bc = test_blockchain();
+        let blocks = bc.open_orphan_blocks_tree().unwrap();
+        let index_tree = bc.open_orphan_index_tree().unwrap();
+
+        let mut stranded = metadata_test_block(900_100, [4u8; 32], "miner", 10.0);
+        stranded.hash = stranded.calculate_hash_for_block();
+        let key = Blockchain::orphan_hash_key(&stranded.hash);
+        let now = Blockchain::now_unix_secs();
+        // Body only: exactly what a crash under the old body-first ordering left behind.
+        blocks
+            .insert(
+                key.as_bytes(),
+                codec::serialize(&OrphanStoredBlock {
+                    block: stranded.clone(),
+                    received_at: now,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let index_key = Blockchain::orphan_index_key(
+            &stranded.previous_hash,
+            stranded.index,
+            &stranded.hash,
+        );
+        assert!(
+            index_tree.get(index_key.as_bytes()).unwrap().is_none(),
+            "precondition: the body has no index entry"
+        );
+
+        bc.prune_orphans().expect("prune runs");
+
+        let rebuilt = index_tree
+            .get(index_key.as_bytes())
+            .unwrap()
+            .expect("the missing index entry must be rebuilt");
+        assert_eq!(
+            Blockchain::parse_orphan_index_received_at(&rebuilt),
+            Some(now),
+            "and it carries the body's real arrival time, so TTL applies correctly"
+        );
+        assert!(
+            blocks.get(key.as_bytes()).unwrap().is_some(),
+            "the body is repaired, not discarded — a reorg may still want it"
+        );
     }
 
     // An orphan stored by an older node has an empty index value. It must still be pruned on
