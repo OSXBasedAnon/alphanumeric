@@ -2631,6 +2631,10 @@ impl Blockchain {
             let mut batch = sled::Batch::default();
             let mut index_batch = sled::Batch::default();
             for h in 0..=tip {
+                // Heartbeat: this loop can hold the chain lock for a long time on a large
+                // chain, and a watchdog probing lock acquirability cannot otherwise tell
+                // that apart from a deadlock.
+                self.note_chain_progress();
                 if let Ok(block) = self.get_block(h) {
                     let idx = block.index.to_le_bytes().to_vec();
                     let ts_prefix = block.timestamp.to_be_bytes();
@@ -2853,6 +2857,10 @@ impl Blockchain {
         let mut pending = 0usize;
         let mut last_indexed: Option<(u32, [u8; 32])> = None;
         for height in 0..=tip {
+            // Heartbeat: this loop can hold the chain lock for a long time on a large
+            // chain, and a watchdog probing lock acquirability cannot otherwise tell
+            // that apart from a deadlock.
+            self.note_chain_progress();
             if let Ok(block) = self.get_block(height) {
                 for (key, value) in Self::address_index_ops(&block) {
                     batch.insert(key, value);
@@ -12879,6 +12887,46 @@ mod tests {
         assert!(
             tree.get(b"sentinel_txid").unwrap().is_some(),
             "marker short-circuits ensure; the registry is not re-derived (pre-fix would clear it)"
+        );
+    }
+
+    // The lock watchdog cannot tell BUSY from WEDGED by probing the chain lock —
+    // tokio's RwLock is write-preferring, so any long legitimate write starves the
+    // probe exactly the way a deadlock does. It asks whether the chain ADVANCED
+    // instead. An O(chain) rebuild that holds the lock while reporting nothing
+    // therefore reads as a deadlock: on 2026-07-30 a client re-open took the full
+    // recovery (prior-run dirty marker) and struck a wedge it did not have, and on a
+    // HEADLESS node two such strikes are `exit(3)`. Both whole-chain index rebuilds
+    // must report liveness. Only these two lacked it; rebuild_balances_index already
+    // had it, which is why recovery went quiet only after the balances step.
+    #[test]
+    fn whole_chain_index_rebuilds_report_liveness() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "miner0", 5.0);
+        let b1 = metadata_test_block(1, b0.hash, "miner1", 5.0);
+        insert_raw_block(&bc, &b0);
+        insert_raw_block(&bc, &b1);
+        bc.write_chain_tip_metadata(&b1)
+            .expect("tip metadata should write");
+
+        let progress = bc.chain_progress_handle();
+
+        let before = progress.load(Ordering::Relaxed);
+        bc.rebuild_confirmed_tx_index()
+            .expect("confirmed-tx rebuild should succeed");
+        assert!(
+            progress.load(Ordering::Relaxed) > before,
+            "rebuild_confirmed_tx_index scanned the chain without reporting liveness — \
+             the watchdog would read this as a wedge"
+        );
+
+        let before = progress.load(Ordering::Relaxed);
+        bc.rebuild_address_tx_index()
+            .expect("address-tx rebuild should succeed");
+        assert!(
+            progress.load(Ordering::Relaxed) > before,
+            "rebuild_address_tx_index scanned the chain without reporting liveness — \
+             the watchdog would read this as a wedge"
         );
     }
 
