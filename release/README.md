@@ -74,7 +74,7 @@ $env:ALPHANUMERIC_HEADLESS = "true"
 On Debian/Ubuntu:
 
 ```bash
-sudo apt install build-essential pkg-config libssl-dev cmake git
+sudo apt install build-essential pkg-config git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone https://github.com/OSXBasedAnon/alphanumeric
 cd alphanumeric
@@ -84,7 +84,8 @@ cd ~/Alphanumeric && ./alphanumeric
 ```
 
 Other distributions need the same things under their own package names: a C
-compiler, pkg-config, OpenSSL headers, cmake, git, and Rust via rustup.
+compiler, pkg-config, git, and Rust via rustup. TLS is rustls + ring, so there
+are no OpenSSL headers and no cmake to install.
 
 ## First Run
 
@@ -97,7 +98,7 @@ blockchain.db
 If bootstrap succeeds, the command prompt appears:
 
 ```text
-alphanumeric:
+a#:
 ```
 
 Type commands after that prompt.
@@ -285,7 +286,12 @@ If the client cannot connect to peers, leave it open for a minute, then run:
 info
 ```
 
-If the chain database gets corrupted or belongs to the wrong network, the client replaces it from the signed bootstrap at startup.
+If the chain database belongs to the wrong network, the client replaces it from the signed
+bootstrap at startup. If it merely cannot be opened — a lock still held by another copy of
+the client, a transient disk error, a damaged page — the directory is renamed to
+`blockchain.db.corrupt.<timestamp>` beside it and a fresh copy is fetched, so nothing is
+destroyed while a cause is still unknown. Only one such copy is kept. Your keys are in
+`private.key` and are never touched by any of this.
 
 If you intentionally want to force bootstrap while keeping the same folder:
 
