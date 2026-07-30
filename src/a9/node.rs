@@ -1445,11 +1445,6 @@ pub struct Node {
     /// wake-from-sleep); overlapping calls return immediately instead of
     /// double-streaming the same span. See sync_full_history_from_peer_bounded.
     full_sync_in_flight: Arc<AtomicBool>,
-    /// (Instant tip was first seen at, that tip height) — drives the frozen-tip
-    /// escape in the beacon-watch loop: a node whose own checkpoint cannot advance
-    /// because it cannot apply the next block would otherwise demand full witnesses
-    /// for it forever. See the FROZEN-TIP ESCAPE comment.
-    frozen_tip_state: Arc<PLMutex<(Instant, u32)>>,
     /// ~1s TTL memo of the last successfully fetched signed tip beacon
     /// (fetch_tip_beacon): dedups same-second fetch bursts across the many
     /// beacon consumers without changing any staleness guarantee.
@@ -2025,7 +2020,6 @@ impl Node {
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             full_sync_in_flight: Arc::new(AtomicBool::new(false)),
             beacon_memo: Arc::new(PLMutex::new(None)),
-            frozen_tip_state: Arc::new(PLMutex::new((Instant::now(), 0))),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
@@ -3967,6 +3961,27 @@ impl Node {
                     // less). The per-block re-read plus a second guard acquisition
                     // was 2 RwLock hits per block on a lock contended by ingest.
                     let floor = self.blockchain.read().await.verification_floor();
+                    // RECEIPT-TRUST CEILING. A block may skip the ML-DSA witness
+                    // re-check only when something we already trust vouches for it:
+                    //
+                    //  * at/below `floor` — our own finalized history (snapshot- or
+                    //    self-verified); the pre-existing rule, unchanged; or
+                    //  * at/below beacon.height - CHECKPOINT_REORG_MARGIN — buried
+                    //    history vouched for by the SIGNED BEACON.
+                    //
+                    // The second clause is only sound because every block in `branch`
+                    // came from find_common_ancestor, which walks DOWN from beacon.hash
+                    // taking each block's previous_hash as the hash the next one must
+                    // have, and admits a body only if it self-hashes and carries floor
+                    // PoW. Burial is therefore PROVEN per block against a signed hash,
+                    // never inferred from a height — a height alone vouches for no
+                    // particular body. The frontier (within the reorg margin of the
+                    // beacon) still demands full witnesses, preserving S-01.
+                    let receipt_trust_ceiling = floor.max(
+                        beacon
+                            .height
+                            .saturating_sub(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN),
+                    );
                     // One dirty window per adopted chunk (≤CONVERGE_CHUNK):
                     // amortizes the per-block fsyncs. The loop's early exits
                     // are collected into `early` and returned only AFTER the
@@ -3985,7 +4000,7 @@ impl Node {
                     };
                     let mut early: Option<Converge> = None;
                     for block in branch {
-                        if block.index > floor
+                        if block.index > receipt_trust_ceiling
                             && !self
                                 .blockchain
                                 .read()
@@ -3993,8 +4008,8 @@ impl Node {
                                 .block_signatures_fully_verified(&block)
                         {
                             warn!(
-                                "Rejected forward block {} (> floor {}): signatures not fully verifiable",
-                                block.index, floor
+                                "Rejected forward block {} (> receipt-trust ceiling {}): signatures not fully verifiable",
+                                block.index, receipt_trust_ceiling
                             );
                             early = Some(Converge::BranchInvalid);
                             break;
@@ -8278,75 +8293,24 @@ impl Node {
                             }
                         }
                     } else if let Some(b) = beacon {
-                        // FROZEN-TIP ESCAPE (2026-07-27). The verification floor is
-                        // derived from THIS node's own trusted checkpoint, which only
-                        // advances when it APPLIES a block. So a node that cannot apply
-                        // block H+1 — e.g. its witnesses are unobtainable from any peer
-                        // because the body it received is witness-short — deadlocks:
-                        // H+1 stays above its floor forever, therefore keeps demanding
-                        // full witnesses forever, even after the whole network has
-                        // buried it by hundreds of blocks. Observed live: the explorer
-                        // sat frozen at one height for 80 minutes, and again for 5.
+                        // FROZEN-TIP CURE. A node that cannot apply block H+1 — its
+                        // witnesses are unobtainable because the body it received is
+                        // witness-short — used to deadlock: H+1 stays above the node's
+                        // own verification floor forever, so it demands full witnesses
+                        // forever, even once the network has buried it by hundreds of
+                        // blocks. Observed live: the explorer frozen for 80 minutes.
                         //
-                        // The signed beacon is the escape. It is the SAME publisher key
-                        // that signs the bootstrap manifest whose history we already
-                        // receipt-trust, so "the network is at N" is exactly as trusted
-                        // as "the snapshot ends at N" — this grants no new authority, it
-                        // just applies the authority we already accept to a node that is
-                        // stuck instead of one that is bootstrapping.
+                        // The cure lives in converge_to_canonical, which receipt-trusts
+                        // a block only once that block is transitively committed by the
+                        // signed beacon (walked hash-by-hash down from beacon.hash) AND
+                        // buried a full reorg margin below it. Burial is proven per
+                        // block, against a hash — never inferred from the beacon HEIGHT.
+                        // Recovery is also PROMPT: it needs no stall timer, because
+                        // what makes it safe is the pinning, not the waiting.
                         //
-                        // Tightly gated: only when our tip has not moved for a while,
-                        // only up to beacon.height - CHECKPOINT_REORG_MARGIN (never
-                        // nearer the tip than normal finality), and raise_trusted_
-                        // checkpoint is monotonic so this can never lower finality.
-                        // Blocks below the floor still pass PoW, hash, linkage and
-                        // genesis pinning — only the ML-DSA witness re-check is skipped,
-                        // exactly as for snapshot history.
-                        {
-                            const TIP_FROZEN_ESCAPE: Duration = Duration::from_secs(90);
-                            let local_tip = {
-                                node_clone.blockchain.read().await.get_latest_block_index() as u32
-                            };
-                            // Decide UNDER the lock, release it, then do the async
-                            // work: a parking_lot guard must never be alive across an
-                            // await (it would make this future !Send and can deadlock).
-                            let escape_now = {
-                                let mut st = node_clone.frozen_tip_state.lock();
-                                if st.1 != local_tip {
-                                    *st = (Instant::now(), local_tip);
-                                    false
-                                } else if st.0.elapsed() >= TIP_FROZEN_ESCAPE
-                                    && b.height
-                                        > local_tip.saturating_add(
-                                            crate::a9::blockchain::CHECKPOINT_REORG_MARGIN,
-                                        )
-                                {
-                                    // Re-arm before releasing so a persistent stall
-                                    // raises the floor once per window, not per tick.
-                                    *st = (Instant::now(), local_tip);
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-                            if escape_now {
-                                let bc = node_clone.blockchain.read().await;
-                                let before = bc.verification_floor();
-                                if bc.advance_checkpoint_behind(b.height).is_ok() {
-                                    let after = bc.verification_floor();
-                                    if after > before {
-                                        warn!(
-                                            "Local tip frozen at {} for {}s while the signed beacon reached {}; trusting the beacon's buried history (verification floor {} -> {}) so the blocked block can be applied from its receipt",
-                                            local_tip,
-                                            TIP_FROZEN_ESCAPE.as_secs(),
-                                            b.height,
-                                            before,
-                                            after
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        // Nothing here advances the checkpoint. Finality trails history
+                        // this node has actually applied; a height alone never moves it
+                        // (see raise_trusted_checkpoint's tip clamp).
                         match node_clone.converge_to_canonical(&b).await {
                             Converge::Converged | Converge::AtTipAhead => {}
                             Converge::Progressed => {
