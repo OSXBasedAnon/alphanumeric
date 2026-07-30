@@ -2317,8 +2317,31 @@ impl Blockchain {
     /// ignored, so finality can never regress. The compare-and-raise runs inside
     /// sled's update_and_fetch so two concurrent sync tasks (relay + p2p) cannot
     /// race a stale read and clobber a higher committed value.
+    ///
+    /// CLAMPED TO trail OUR OWN TIP by the reorg margin. Two invariants, one clamp:
+    ///
+    /// 1. Finality describes history this node has APPLIED, so the checkpoint may
+    ///    never name a height we do not hold. verification_floor() derives from it
+    ///    and decides which blocks may skip the ML-DSA witness re-check — a skip
+    ///    that is only ever sound for history already pinned by hash. Keeping the
+    ///    checkpoint at or below our tip keeps that decision a property of what we
+    ///    have actually verified, never of what the network reports.
+    ///
+    /// 2. The checkpoint must stay a full CHECKPOINT_REORG_MARGIN behind the tip.
+    ///    Reorgs at/below it are rejected outright, so pinning it AT the tip would
+    ///    make the node refuse legitimate reorgs of its own recent blocks and
+    ///    strand it off the canonical chain.
+    ///
+    /// Every legitimate caller already trails an applied block by exactly this
+    /// margin, so the clamp is a no-op for them; it exists so the invariant holds
+    /// structurally rather than by each caller's good behaviour. It only ever
+    /// LOWERS the value — the safe direction, since a lower floor demands MORE
+    /// verification, never less.
     pub fn raise_trusted_checkpoint(&self, height: u32) -> Result<(), BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
+        let height = height.min(
+            (self.get_latest_block_index() as u32).saturating_sub(CHECKPOINT_REORG_MARGIN),
+        );
         let encoded = codec::serialize(&height)?;
         meta_tree.update_and_fetch(TRUSTED_CHECKPOINT_KEY, |old| {
             let current = old
@@ -9339,44 +9362,49 @@ mod tests {
     // dropped entirely when no full witness is available — a truncated copy could
     // never be mined and would only poison the block template until it ages out.
     #[test]
-    fn beacon_can_unfreeze_a_node_whose_own_checkpoint_cannot_advance() {
-        // The frozen-tip deadlock: verification_floor() comes from the node's OWN
-        // trusted checkpoint, which only advances when it APPLIES a block. A node
-        // that cannot apply block H+1 (unobtainable witnesses) therefore keeps H+1
-        // above its floor forever, so it keeps demanding full witnesses for it
-        // forever — even once the network has buried it. Live: 80 minutes frozen.
+    fn verification_floor_never_outruns_the_applied_tip() {
+        // THE finality invariant. verification_floor() decides which blocks may skip
+        // the ML-DSA witness re-check and take the receipt path, and the receipt path
+        // is only sound for history already pinned by hash. So the floor must remain a
+        // statement about blocks THIS node has applied: it may never name a height we
+        // do not hold, however far ahead the network reports itself to be.
         //
-        // The escape is advancing the checkpoint from the SIGNED BEACON. This pins
-        // the two properties that make that safe and effective.
-        // Mirrors Node::routes_via_witness (private to node.rs): a block AT or
-        // ABOVE floor+1 is on the unfinalized frontier and needs full witnesses.
+        // Mirrors Node::routes_via_witness (private to node.rs): a block AT or ABOVE
+        // floor+1 is on the unfinalized frontier and needs full witnesses.
         let needs_full_witness = |h: u32, floor: u32| h >= floor.saturating_add(1);
         let (bc, _genesis) = fee_accounting_test_chain();
         let stuck_tip = 292_952u32;
+        seed_tip_at(&bc, stuck_tip);
         let blocked = stuck_tip + 1;
 
-        // While the network has NOT yet buried the blocked block by the reorg
-        // margin, the beacon must NOT be able to receipt-trust it — finality is
-        // never brought nearer the tip than CHECKPOINT_REORG_MARGIN.
-        let too_soon = blocked + CHECKPOINT_REORG_MARGIN - 1;
-        bc.advance_checkpoint_behind(too_soon).unwrap();
+        // A network height far past our tip must NOT move the floor over the blocks
+        // we have not applied. The next block stays on the frontier and keeps
+        // demanding a full witness — it is un-applied, so nothing vouches for it.
+        bc.advance_checkpoint_behind(blocked + CHECKPOINT_REORG_MARGIN * 4)
+            .unwrap();
+        assert!(
+            bc.verification_floor() <= stuck_tip - CHECKPOINT_REORG_MARGIN,
+            "the floor must always trail the applied tip by the reorg margin, so a
+             network-reported height can neither outrun our history nor close the
+             window in which our own recent blocks can still be reorged"
+        );
         assert!(
             needs_full_witness(blocked, bc.verification_floor()),
-            "a block the network has not yet buried must still require full witnesses"
+            "an un-applied block must always require a full witness"
         );
 
-        // Once the beacon is a full margin past it, the floor covers it and the
-        // block routes via the receipt path — the node can move again.
-        let buried = blocked + CHECKPOINT_REORG_MARGIN;
-        bc.advance_checkpoint_behind(buried).unwrap();
-        assert!(
-            !needs_full_witness(blocked, bc.verification_floor()),
-            "once the beacon has buried the block by the reorg margin it must be receipt-trustable"
+        // Trailing an APPLIED height is the legitimate motion and still works: the
+        // checkpoint follows the tip by the reorg margin.
+        bc.advance_checkpoint_behind(stuck_tip).unwrap();
+        assert_eq!(
+            bc.trusted_checkpoint_height(),
+            stuck_tip - CHECKPOINT_REORG_MARGIN,
+            "finality must trail an applied tip by exactly the reorg margin"
         );
 
-        // Monotonic: a lower/stale beacon can never walk finality backwards.
+        // Monotonic: a lower/stale height can never walk finality backwards.
         let floor_before = bc.verification_floor();
-        bc.advance_checkpoint_behind(buried - 100).unwrap();
+        bc.advance_checkpoint_behind(stuck_tip - 100).unwrap();
         assert_eq!(
             bc.verification_floor(),
             floor_before,
@@ -9781,6 +9809,9 @@ mod tests {
         let bc = test_blockchain();
         // Unseeded reads as 0.
         assert_eq!(bc.trusted_checkpoint_height(), 0);
+        // An applied tip well above every height this test raises to, so the
+        // tip clamp in raise_trusted_checkpoint is not what is under test here.
+        seed_tip_at(&bc, 1_000);
         // raise_trusted_checkpoint only ever moves up — finality never regresses.
         bc.raise_trusted_checkpoint(100).unwrap();
         assert_eq!(bc.trusted_checkpoint_height(), 100);
@@ -9808,6 +9839,7 @@ mod tests {
         // receipt-trusts through them instead of stalling on the frontier gate.
         assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR);
         // Once the checkpoint rises above the floor, the checkpoint dominates.
+        seed_tip_at(&bc, WITNESS_LOSS_FLOOR + 100 + CHECKPOINT_REORG_MARGIN);
         bc.raise_trusted_checkpoint(WITNESS_LOSS_FLOOR + 100)
             .unwrap();
         assert_eq!(bc.verification_floor(), WITNESS_LOSS_FLOOR + 100);
@@ -9835,6 +9867,13 @@ mod tests {
             sig_hash: None,
         });
         assert!(!bc.block_signatures_fully_verified(&with_spend));
+    }
+
+    /// Give the test chain an applied tip at `height`, so checkpoint raises up to it
+    /// are legitimate (raise_trusted_checkpoint clamps to the tip we actually hold).
+    fn seed_tip_at(blockchain: &Blockchain, height: u32) {
+        let block = metadata_test_block(height, [9u8; 32], "seed", 1.0);
+        insert_raw_block(blockchain, &block);
     }
 
     fn insert_raw_block(blockchain: &Blockchain, block: &Block) {
