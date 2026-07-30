@@ -67,6 +67,30 @@ doing immediately rather than waiting for the rest of the network.
   stage names corrected — every non-zero one had been mislabelled by an earlier
   refactor, which matters exactly when they are read, during a stall.
 
+## Fewer false alarms
+
+Three things reported trouble when there was none, which is worse than saying
+nothing: a warning that fires during ordinary operation teaches you to scroll
+past the one that matters.
+
+- **The lock watchdog no longer calls a busy chain a wedged one.** It decided a
+  node was stuck by trying to take the chain lock with a timeout — but the lock
+  is write-preferring, so any long legitimate write (a balance rebuild, a
+  catch-up, a bootstrap import) starves that probe exactly the way a deadlock
+  would. A node doing its first big catch-up logged a wedge it did not have, and
+  then finished syncing normally. It now also asks whether work is getting done,
+  via a counter it can read without the lock, and only strikes when nothing is
+  progressing. A real wedge still strikes on schedule.
+- **Startup recovery stopped announcing itself as an error.** A marker left by a
+  previous run is the ordinary consequence of an unclean stop, and the rebuild it
+  triggers is usually seconds. It was reported up front, at error level, on the
+  strength of a comment calling it a multi-minute wedge — next to the passphrase
+  prompt. It is now silent when it is quick, reports the real duration when it
+  takes more than ten seconds, and says the chain was not damaged. The live case,
+  where a running node genuinely stalls, is unchanged.
+- **A mesh that fails to come up says so and retries**, instead of disabling
+  itself silently for the rest of the session.
+
 ## Whispers
 
 - **A whisper now shows its amount.** The fee band that carries a whisper is not
@@ -100,6 +124,11 @@ doing immediately rather than waiting for the rest of the network.
   spendable and total figures in bold — the two numbers people actually read.
 - `help` is two aligned columns, with aliases coloured by section.
 - A bare Enter points at `help` instead of only complaining.
+- `account` prints the three counterparties worth acting on IN FULL — the latest
+  inbound, the latest outbound, and the one seen most often — because the table
+  above them truncates every address to keep its columns. Bare `account` now
+  resolves your default wallet, and it accepts a wallet name as well as an
+  address. It still looks up any address; that is the point of it.
 - `account`, `history` and `whisper` render in the same display language as the
   rest of the client; the whisper list is a ledger rather than a dump.
 - An address on its own looks it up; `bal` works as an alias for `balance`.
@@ -124,6 +153,30 @@ then.
   and are unaffected. Splitting a large transfer, or sending it without a whisper,
   both work normally.
 
+## Documentation
+
+Every document shipped inside these archives was audited line by line against
+the code. The corrections that matter to anyone building on this:
+
+- **The signing test vector did not validate.** Its `sender` was not the address
+  its own seed derives, and because the sender is inside the signed message, the
+  message, its hex and the signature hash were wrong with it — a transaction
+  built literally from the document was rejected. It is regenerated, verified,
+  and pinned by a test so it cannot silently rot again.
+- **The automatic fee ceiling was documented at half its value** (`0.001`) in
+  three places. It is `0.002`, which is what the API has always returned.
+- **The whisper note was wrong about classification.** It is a pure fee-band
+  test, and the document's own example transaction sat inside the band. The note
+  now states the band and how a payer stays out of it.
+- **README advertised five relay environment variables that do not exist**, and
+  described relay publishing and sync as opt-in and off. Both are unconditional.
+- The user guide showed the prompt as `alphanumeric:` (it has been `a#:` since
+  7.3.7) and asked Linux builders to install OpenSSL headers and cmake, which
+  the rustls/ring pin removed.
+- GPU troubleshooting stopped recommending `WGPU_BACKEND=dx12` as a first step:
+  the miner already falls back to the same card on another backend by itself,
+  and setting that variable *restricts* it to one backend, removing the fallback.
+
 ## Install / verify
 - **Standard**: use `alphanumeric-v7.9.3-macos-arm64.zip`
 - **GPU mining (opt-in)**: use `alphanumeric-v7.9.3-gpu-macos-arm64.zip`
@@ -133,8 +186,8 @@ then.
 ## Artifacts
 | file | sha256 |
 |---|---|
-| alphanumeric-v7.9.3-macos-arm64.zip | `__SHA_CPU__` |
-| alphanumeric-v7.9.3-gpu-macos-arm64.zip (opt-in GPU mining) | `__SHA_GPU__` |
+| alphanumeric-v7.9.3-macos-arm64.zip | `e4dc58d02a6aecc7246c1ea69b475923aaec741430a17398c103707132b196db` |
+| alphanumeric-v7.9.3-gpu-macos-arm64.zip (opt-in GPU mining) | `e27a9d05152249945dc2903cac32314ff9de88bb8eb181ba24aa82cb927b1925` |
 
 ## Notes
 - Build verification source: `cargo build --release --features bootstrap_publisher`
