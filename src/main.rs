@@ -2689,7 +2689,7 @@ println!("Wallet renamed successfully");
                             }
                             name.to_string()
                         }
-                        None => match resolve_default_wallet(&wallets, &blockchain).await {
+                        None => match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
                             // Name it: rewards landing in a wallet the operator
                             // forgot about is the failure this guards against.
                             Some((name, address)) => {
@@ -4006,7 +4006,7 @@ Some(_) => {
                     //   <to> <amount>          sender is the default wallet
                     let quick = parts.len() == 2 && is_addr(parts[0]) && is_amount(parts[1]);
                     let sender = if quick {
-                        match resolve_default_wallet(&wallets, &blockchain).await {
+                        match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
                             // Always name the wallet being spent from. The
                             // shorthand's whole risk is sending from one you did
                             // not mean, so the choice is never silent.
@@ -5742,46 +5742,6 @@ fn ui_hashrate(hashrate_ths: f64) -> (f64, &'static str) {
 /// announces which wallet was chosen; a silent default is what makes a wrong
 /// guess dangerous, not the guess itself.
 ///
-/// Ranking reads one balances-tree entry per wallet — no block decodes — and is
-/// time-boxed, degrading to the name-ordered first wallet if the chain lock is
-/// busy rather than blocking the console.
-async fn resolve_default_wallet(
-    wallets: &std::collections::HashMap<String, alphanumeric::a9::wallet::Wallet>,
-    blockchain: &Arc<RwLock<Blockchain>>,
-) -> Option<(String, String)> {
-    if let Some((name, wallet)) = wallets.get_key_value("default_wallet") {
-        return Some((name.clone(), wallet.address.clone()));
-    }
-    if wallets.len() <= 1 {
-        return wallets
-            .iter()
-            .next()
-            .map(|(name, wallet)| (name.clone(), wallet.address.clone()));
-    }
-
-    let mut ordered: Vec<(&String, &alphanumeric::a9::wallet::Wallet)> = wallets.iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-
-    if let Ok(guard) = tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await {
-        let mut best: Option<(i128, String, String)> = None;
-        for (name, wallet) in &ordered {
-            let units = guard
-                .get_confirmed_balance_units(&wallet.address)
-                .await
-                .unwrap_or(0);
-            if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
-                best = Some((units, (*name).clone(), wallet.address.clone()));
-            }
-        }
-        if let Some((_, name, address)) = best {
-            return Some((name, address));
-        }
-    }
-
-    ordered
-        .first()
-        .map(|(name, wallet)| ((*name).clone(), wallet.address.clone()))
-}
 
 /// Compact human-readable duration for status display, e.g. 11506 -> "3h 11m".
 /// Display-only helper: `info` keeps the raw seconds and appends this so a
