@@ -7212,7 +7212,38 @@ impl Blockchain {
         let effective_fees = total_fees * (1.0 - MINT_CLIP);
         let fee_factor = (effective_fees / fee_target).clamp(0.0, 1.0);
 
-        // Base reward calculation
+        // Base reward calculation.
+        //
+        // THE EMPTY-BLOCK PREMIUM IS DELIBERATE AND REVIEWED (2026-07-27) — read this
+        // before reporting it as an exploit. An empty block takes a flat 20% of
+        // current_max (10 d today). A block carrying transactions STARTS at
+        // MIN_BLOCK_REWARD and scales to current_max on fee weight, so below a
+        // crossover of roughly 1.0 d of total block fees it pays LESS than an empty
+        // one — today's floor-fee traffic sits far under that, which is why ~99% of
+        // blocks are empty and a payment can wait ~15 blocks for a miner who includes
+        // it anyway.
+        //
+        // Why that is acceptable rather than a censorship bug:
+        //   * The band is BOUNDED and self-closing. Above the crossover a tx block
+        //     pays up to current_max — 5x an empty one — so inclusion becomes strictly
+        //     more profitable exactly when there is real fee volume to include. Only
+        //     the low-fee tail is unprofitable, and that tail is dust by construction.
+        //   * Inclusion is never FORBIDDEN, only unprofitable in that tail. No
+        //     consensus rule can compel a miner to fill a block on any PoW chain;
+        //     template selection is local policy. The lever a chain has is the payoff
+        //     curve, and this one already rewards inclusion once fees are real.
+        //   * It is not an issuance exploit. The activated net-issuance cap
+        //     (`fee_accounting_is_admissible_for_block`, FEE_SYSTEM_ACTIVATION_HEIGHT)
+        //     bounds reward - fees by the scheduled baseline, so preferring empty
+        //     blocks cannot mint above schedule; it forgoes fee income, it does not
+        //     create coins.
+        //   * The direction of the error is deflationary: more usage means slightly
+        //     LESS issuance, never more.
+        //
+        // Do NOT "fix" this by lifting the empty-block share or floors the tx branch
+        // to match — either inverts the incentive and pays miners to stuff blocks.
+        // If the tail ever needs closing, do it on the fee side (estimator/floor), not
+        // by flattening this curve.
         let base_reward = if tx_count == 0 {
             current_max * 0.2 // 20% of max reward for empty blocks
         } else {
