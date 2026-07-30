@@ -8419,6 +8419,10 @@ impl Node {
                 let wd = wd.clone();
                 async move {
                     let mut strikes: u32 = 0;
+                    // Taken ONCE, before anything can wedge: an Arc to the chain's liveness
+                    // counter, readable without the lock this task exists to judge.
+                    let progress = wd.blockchain.read().await.chain_progress_handle();
+                    let mut last_progress = progress.load(std::sync::atomic::Ordering::Relaxed);
                     loop {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         let chain_ok = timeout(Duration::from_secs(10), wd.blockchain.read())
@@ -8427,7 +8431,25 @@ impl Node {
                         let peers_ok = timeout(Duration::from_secs(10), wd.peers.read())
                             .await
                             .is_ok();
-                        if chain_ok && peers_ok {
+
+                        // A failed probe does NOT mean wedged. tokio's RwLock is
+                        // write-preferring, so any long legitimate write — a balance rebuild,
+                        // a catch-up, a dirty-state recovery, a bootstrap import — starves
+                        // this read exactly the way a deadlock would. The two are only
+                        // distinguishable by whether work is still getting done, so ask that
+                        // instead: if the chain advanced since the last probe, the lock is
+                        // demonstrably being taken and released and nothing is wedged.
+                        //
+                        // This can only ever SUPPRESS a strike, never invent one — a wedged
+                        // chain cannot advance the counter, so a real wedge still strikes on
+                        // schedule. Before this, a node doing its first big catch-up logged a
+                        // wedge it did not have, which is worse than useless: it teaches the
+                        // operator to ignore the one message that matters.
+                        let seen = progress.load(std::sync::atomic::Ordering::Relaxed);
+                        let chain_progressing = seen != last_progress;
+                        last_progress = seen;
+
+                        if !Self::watchdog_strikes(chain_ok, chain_progressing, peers_ok) {
                             strikes = 0;
                             continue;
                         }
@@ -11383,6 +11405,20 @@ impl Node {
         // A cross-domain collision would need a 128-bit prefix match on distinct
         // content — astronomically unlikely; the byte makes it impossible instead.
         format!("b:{}:{}", hex::encode(block.hash), &bodies.to_hex()[..32])
+    }
+
+    /// Whether a watchdog probe counts as evidence the node is wedged.
+    ///
+    /// A failed lock probe alone does not: tokio's RwLock is write-preferring, so any long
+    /// legitimate write — a balance rebuild, a catch-up, a dirty-state recovery, a bootstrap
+    /// import — starves a read probe exactly the way a deadlock would. The two are only
+    /// separable by whether work is still getting done, so chain progress excuses a failed
+    /// chain probe. It can only ever suppress a strike: a wedged chain cannot advance its
+    /// progress counter, so a real wedge still strikes on schedule.
+    ///
+    /// Pure, so the policy is testable without a clock, a lock or a chain.
+    fn watchdog_strikes(chain_ok: bool, chain_progressing: bool, peers_ok: bool) -> bool {
+        !((chain_ok || chain_progressing) && peers_ok)
     }
 
     /// Cache key for a transaction's validation verdict.
@@ -17563,6 +17599,36 @@ mod tests {
         );
 
         assert_eq!(filtered, vec![private_peer]);
+    }
+
+    // The rule the lock watchdog turns on: a failed lock probe is only evidence of a wedge
+    // when nothing is getting done. A write-preferring RwLock starves a read probe during any
+    // long legitimate write, so probe-failure alone cannot distinguish BUSY from WEDGED.
+    //
+    // Pure decision function, so the policy is testable without a clock, a lock or a chain.
+    #[test]
+    fn a_busy_chain_is_not_a_wedged_chain() {
+        use Node as watchdog;
+        let watchdog_strikes = watchdog::watchdog_strikes;
+        // The false positive that shipped: probe lost the race to a catch-up, but the chain
+        // was advancing the whole time.
+        assert!(
+            !watchdog_strikes(false, true, true),
+            "a failed probe while the chain advances must NOT strike"
+        );
+        // A genuine wedge: nothing acquires, nothing advances.
+        assert!(
+            watchdog_strikes(false, false, true),
+            "no lock and no progress is exactly the wedge this exists to catch"
+        );
+        // Progress must not paper over the OTHER lock.
+        assert!(
+            watchdog_strikes(true, true, false),
+            "a wedged peers lock still strikes regardless of chain progress"
+        );
+        // The healthy case.
+        assert!(!watchdog_strikes(true, true, true));
+        assert!(!watchdog_strikes(true, false, true), "an idle chain is not wedged");
     }
 
     #[test]

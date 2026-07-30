@@ -1392,6 +1392,18 @@ pub struct Blockchain {
     /// never held while acquiring the state lock.
     balances_index_gate: Arc<Mutex<()>>,
     tip_change_counter: Arc<AtomicU64>,
+    /// LIVENESS heartbeat, read WITHOUT the chain lock.
+    ///
+    /// Deliberately separate from `tip_change_counter`: that one means "the tip moved" and
+    /// invalidates miner templates and the tip/supply memos, so bumping it for mere progress
+    /// would throw away a miner's work every time a balance index caught up. This one means
+    /// only "the chain lock is being held by something that is still getting work done".
+    ///
+    /// It exists because a watchdog cannot tell BUSY from WEDGED by trying to take the lock:
+    /// tokio's RwLock is write-preferring, so a long legitimate write — a balance rebuild, a
+    /// catch-up, a dirty-state recovery — starves a read probe exactly the way a deadlock
+    /// does. Progress is the signal that separates them.
+    chain_progress: Arc<AtomicU64>,
     /// In-memory memo of the validated chain tip, keyed by `tip_change_counter`. Every tip change
     /// bumps that counter (persist pairs write_chain_tip_metadata with notify_tip_changed; finalize
     /// and reorg notify too), so a cached entry is valid exactly while the counter is unchanged.
@@ -1601,6 +1613,18 @@ impl Blockchain {
             .as_secs()
     }
 
+    /// Handle to the liveness heartbeat, for a watchdog that must observe progress without
+    /// ever taking the chain lock — the lock being the thing it is judging.
+    pub fn chain_progress_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.chain_progress)
+    }
+
+    /// Mark that chain work advanced. Relaxed: this is a liveness hint, and one probe of
+    /// staleness only delays a suppression by a cycle — it can never fabricate progress.
+    fn note_chain_progress(&self) {
+        self.chain_progress.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn tip_change_counter_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.tip_change_counter)
     }
@@ -1624,6 +1648,7 @@ impl Blockchain {
             // entries admitted on that lower branch are reconciled on recross.
             self.pending_rules_complete.store(false, Ordering::Release);
         }
+        self.note_chain_progress();
         let version = self.tip_change_counter.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.tip_watch_tx.send(ChainTipSignal {
             height: block.index,
@@ -4565,6 +4590,10 @@ impl Blockchain {
             std::collections::VecDeque::new();
         let seed_low = first.saturating_sub(MINING_REWARD_MATURITY as u64);
         for rh in seed_low..=from {
+            // Heartbeat: this loop can hold the chain lock for a long time on a large
+            // chain, and a watchdog probing lock acquirability cannot otherwise tell
+            // that apart from a deadlock.
+            self.note_chain_progress();
             let Ok(block) = self.get_block(rh as u32) else {
                 self.rebuild_balances_index(balances_tree).await?;
                 balances_tree.flush()?;
@@ -4579,6 +4608,10 @@ impl Blockchain {
 
         let mut balances: HashMap<String, i128> = HashMap::new();
         for h in first..=tip {
+            // Heartbeat: this loop can hold the chain lock for a long time on a large
+            // chain, and a watchdog probing lock acquirability cannot otherwise tell
+            // that apart from a deadlock.
+            self.note_chain_progress();
             let Ok(block) = self.get_block(h as u32) else {
                 self.rebuild_balances_index(balances_tree).await?;
                 balances_tree.flush()?;
@@ -4655,6 +4688,10 @@ impl Blockchain {
             let mut missing = 0u32;
             let mut first_missing = 0u32;
             for h in 0..=tip {
+                // Heartbeat: this loop can hold the chain lock for a long time on a large
+                // chain, and a watchdog probing lock acquirability cannot otherwise tell
+                // that apart from a deadlock.
+                self.note_chain_progress();
                 let Ok(block) = self.get_block(h) else {
                     // M23: blocks are never pruned, so a gap in [0, tip] is genuine on-disk
                     // corruption. Skipping it silently (as before) rebuilds WRONG balances
@@ -5068,6 +5105,7 @@ impl Blockchain {
             pending_rules_revalidation_runs: Arc::new(AtomicUsize::new(0)),
             balances_index_gate: Arc::new(Mutex::new(())),
             tip_change_counter,
+            chain_progress: Arc::new(AtomicU64::new(0)),
             chain_tip_cache: Arc::new(PLMutex::new(None)),
             supply_cache: Arc::new(PLMutex::new(None)),
             tip_watch_tx,
