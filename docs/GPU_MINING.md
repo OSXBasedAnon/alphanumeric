@@ -49,9 +49,16 @@ Press `Enter` (or Ctrl-C) to stop.
 
 ## 3. Backends & troubleshooting
 
-wgpu automatically selects the best backend for your card (Vulkan on most
-NVIDIA/AMD, Metal on macOS, DirectX 12 on Windows). You normally don't touch
-this. When GPU init fails, force a backend with the **`WGPU_BACKEND`** env var:
+The miner does **not** pick one backend and give up. It enumerates every backend
+your system offers, drops CPU/software adapters so it can never silently "mine"
+on llvmpipe, and tries the candidates in order — preferring the same card on
+another backend (a broken Vulkan discrete GPU falls back to that same GPU on
+DirectX 12) over a weak integrated one that could be slower than the CPU miner.
+
+So forcing a backend is **not** the first thing to try, and it can make things
+worse: `WGPU_BACKEND` **restricts** the miner to that one backend, removing the
+automatic fallback it would otherwise have used. Set it only to pin a specific
+backend for diagnosis:
 
 | Shell | Command (before launching the miner, in the same session) |
 |---|---|
@@ -59,14 +66,19 @@ this. When GPU init fails, force a backend with the **`WGPU_BACKEND`** env var:
 | Windows PowerShell | `$env:WGPU_BACKEND="dx12"` |
 | Linux / macOS | `WGPU_BACKEND=dx12 ./alphanumeric` |
 
-Valid values: `vulkan`, `dx12`, `gl`, `metal`.
+Valid values: `vulkan`, `dx12`, `gl`, `metal`. Unset it again to restore the
+automatic fallback.
 
 Common cases:
 
-- **`enumerate_adaptors: initialization of an object has failed`** — the card's
-  Vulkan stack is broken. Force `WGPU_BACKEND=dx12`.
+- **`enumerate_adaptors: initialization of an object has failed`** — no usable
+  adapter was found on ANY backend, so this is a driver or visibility problem,
+  not a backend choice. Forcing `WGPU_BACKEND` will not help and usually hurts.
+  Check the cases below, and confirm the GPU is visible to the OS at all
+  (`nvidia-smi` on NVIDIA; if that cannot talk to the driver, nothing will).
 - **NVIDIA CMP / mining cards** (e.g. CMP 30HX/40HX/…): their Vulkan is usually
-  crippled but **DirectX 12 works** — use `WGPU_BACKEND=dx12`.
+  crippled, and the miner already falls back to DirectX 12 on the same card by
+  itself. If it still fails, the driver is the problem, not the backend.
 - **Remote Desktop (RDP)** hides the physical GPU, so nothing enumerates. Use a
   real monitor or a **dummy HDMI/DP plug**, or a remote tool that doesn't hijack
   the GPU (AnyDesk / Parsec), or run the miner as a service.
