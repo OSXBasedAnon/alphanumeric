@@ -99,3 +99,56 @@ mod tests {
         assert!(verify(b"wrong", &signature, &public_key).is_err());
     }
 }
+
+#[cfg(test)]
+mod signing_spec_vector {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    // SIGNING_SPEC.md is what a third-party implementer builds against, so its test vector
+    // has to actually validate. It did not: the printed sender was not the address its own
+    // seed derives, and since the sender is inside the signed message, the message, its hex
+    // and the signature hash were all wrong with it. A transaction built literally from the
+    // document was rejected by the node's sender-vs-pubkey check.
+    //
+    // These are the published values. If a change to signing, encoding or address derivation
+    // moves any of them, this fails and the document gets corrected with the code — rather
+    // than going stale in a way only an outside implementer discovers.
+    #[test]
+    fn published_test_vector_still_holds() {
+        const SEED: [u8; 32] = [0x07; 32];
+        const SENDER: &str = "9e1e860361994891b3165e611dc5aefcdd37dfbf";
+        const RECIPIENT: &str = "84dab431b53e6522fe2e74914eec99f17758f4e3";
+        const PK_SHA256: &str =
+            "9e1e860361994891b3165e611dc5aefcdd37dfbf5f247943daaeb57141fe7b6e";
+        const SIG_SHA256: &str =
+            "e3b8ce82ea7c02c008d89049aff56fa86f34d3320bae82ccf000279c74144339";
+
+        let sha = |b: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(b);
+            hex::encode(h.finalize())
+        };
+        let pk = public_key_from_secret(&SEED).expect("public key from seed");
+        assert_eq!(pk.len(), 2592, "published public key length");
+        assert_eq!(sha(&pk), PK_SHA256, "published public key hash");
+
+        // The sender is DERIVED, never chosen: hex(sha256(pub_key)[..20]).
+        assert_eq!(&sha(&pk)[..40], SENDER, "sender must be the derived address");
+
+        let msg = format!(
+            "{}:{}:{:.8}:{:.8}:{}",
+            SENDER, RECIPIENT, 1.5_f64, 0.001_f64, 1_783_600_000u64
+        );
+        assert_eq!(
+            msg,
+            "9e1e860361994891b3165e611dc5aefcdd37dfbf:84dab431b53e6522fe2e74914eec99f17758f4e3:1.50000000:0.00100000:1783600000",
+            "published signed message"
+        );
+
+        let sig = sign(msg.as_bytes(), &SEED).expect("sign");
+        assert_eq!(sig.len(), 4627, "published signature length");
+        assert_eq!(sha(&sig), SIG_SHA256, "published signature hash (also sig_hash)");
+        assert!(verify(msg.as_bytes(), &sig, &pk).is_ok(), "the vector must verify");
+    }
+}
