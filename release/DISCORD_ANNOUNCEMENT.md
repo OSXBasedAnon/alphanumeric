@@ -92,7 +92,7 @@ Drop-in replacement: no database migration, no resync.
 
 ### Artifacts + checksums
 `alphanumeric-v7.9.3-macos-arm64.zip`
-`__SHA_CPU__`
+`e4dc58d02a6aecc7246c1ea69b475923aaec741430a17398c103707132b196db`
 
 `alphanumeric-v7.9.3-gpu-macos-arm64.zip`
-`__SHA_GPU__`
+`e27a9d05152249945dc2903cac32314ff9de88bb8eb181ba24aa82cb927b1925`
