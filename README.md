@@ -160,7 +160,7 @@ If you are integrating against this repository, pin a commit hash and validate b
 - Reference-wallet fee: automatic, priced off the live mempool
   (`Blockchain::fee_estimate`): a flat `0.0002` anchor (2x the relay floor) on
   a quiet network, one unit above the marginal next-block fee under
-  congestion, always capped at `0.001` for an automatic fee (`0.01` remains the
+  congestion, always capped at `0.002` for an automatic fee (`0.01` remains the
   ceiling for an explicitly chosen `--fee`)
 - `FEE_PERCENTAGE = 0.000563063063` remains the Whisper encoding constant; it is
   not the regular-wallet fee policy
@@ -262,15 +262,12 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_HEADERS_URL`
 - `ALPHANUMERIC_ANNOUNCE_INTERVAL_SECS` (default `300`, minimum `60`)
 - `ALPHANUMERIC_ENABLE_HEADER_SNAPSHOTS` (default off; enable on trusted publisher/validator nodes only)
-- `ALPHANUMERIC_HEADER_SNAPSHOT_INTERVAL_SECS` (default `300`, minimum `60`)
+- `ALPHANUMERIC_HEADER_SNAPSHOT_INTERVAL_SECS` (default `30`, minimum `15`, maximum `3600`)
 - `ALPHANUMERIC_ENABLE_STATS_SNAPSHOTS` (default off; enable on trusted publisher/validator nodes only)
 - `ALPHANUMERIC_STATS_SNAPSHOT_INTERVAL_SECS` (default `300`, minimum `60`)
-- `ALPHANUMERIC_ENABLE_BLOCK_RELAY` (default off; HTTP block relay publishing is fallback telemetry, not normal block sync)
-- `ALPHANUMERIC_ENABLE_BLOCK_RELAY_SYNC` (default off; opt in to HTTP block relay sync fallback)
-- `ALPHANUMERIC_DISABLE_BLOCK_RELAY_SYNC` (force-disable HTTP relay fallback entirely)
-- `ALPHANUMERIC_ENABLE_PERIODIC_BLOCK_RELAY_SYNC` (opt in to background HTTP relay sync; off by default)
-- `ALPHANUMERIC_RELAY_SYNC_INTERVAL_SECS` (optional periodic relay sync interval; `0` disables, minimum `60`)
-- `ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH` (default `0`; opt-in relay backfill depth, max `256`)
+- Relay publishing and relay sync are **always on** and have no toggle. They are how a node
+  reaches the chain when direct peers are unreachable, so they are not opt-in.
+- `ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH` (default `64`, the checkpoint reorg margin; max `256`)
 - `ALPHANUMERIC_RELAY_SYNC_MAX_ROUNDS` (default `4`, max `24`)
 - `ALPHANUMERIC_PUBLIC_IP`
 - `ALPHANUMERIC_ENABLE_UPNP`
@@ -289,10 +286,10 @@ Interactive command loop examples:
 - `whisper <address> <msg>` (amount can be provided depending on flow)
 - `balance`
 - `new [wallet_name]`
-- `account <address>`
+- `account [address_or_wallet_name]` (bare: your default wallet)
 - `history`
 - `rename <old_name> <new_name>`
-- `mine <wallet_name>`
+- `mine [wallet_name] [--continuous]` (bare: your default wallet; the GPU build adds `[--gpu|--cpu]`)
 - `info`
 - `debug`
 
@@ -300,7 +297,7 @@ With no `--fee`, the wallet prices the fee automatically off the live mempool
 (the `info` screen shows the current value as `Default Fee`, and `create`
 prints the resolved `Auto fee` before signing): a flat `0.0002` anchor when the
 network is quiet, one unit above the marginal next-block fee under congestion,
-never above `0.001` for an automatic fee. Exchanges and other
+never above `0.002` for an automatic fee. Exchanges and other
 automated operators can select an absolute fee with `--fee`; values must meet
 the `0.0001` relay floor. The CLI refuses an explicit fee above `0.01` as a
 hard safety ceiling. This is reference-wallet policy, not a universal network

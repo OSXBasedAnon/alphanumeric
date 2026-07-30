@@ -97,15 +97,18 @@ floor, so choose it deliberately:
   transaction will not propagate, so treat it as a hard minimum.
 - **Recommended policy:** query `GET /explorer/fee-estimate` on any node you
   already talk to and put its `recommended_fee` into the transaction's `fee`
-  field — the identical recommendation the reference wallet resolves when
-  `create` runs without `--fee`. **The `fee` field on the wire is a decimal
+  field. The reference wallet starts from the same number when `create` runs
+  without `--fee`, but then clamps it below the whisper band for that amount
+  (see the whisper note below) — so on small amounts the wallet may send
+  slightly less than `recommended_fee`. Apply the same clamp if you do not want
+  your payments displayed as messages. **The `fee` field on the wire is a decimal
   coin amount** (`"fee": 0.0002`); the `*_units` integers in the response are
   for exact accounting only (1 coin = 100,000,000 units), and putting `20000`
   in the `fee` field would sign a 20,000-coin fee. The estimate prices
   next-block inclusion off the live mempool: a flat `0.0002` anchor
   (`20,000` units, 2x the relay floor) on a quiet network, one unit above the
   marginal next-block fee under congestion, always clamped to the automatic
-  ceiling of `0.001` (`100,000` units). Offline or estimator-unreachable
+  ceiling of `0.002` (`200,000` units). Offline or estimator-unreachable
   fallback: use the `0.0002` anchor.
 
   Exchanges and payout processors may instead choose an explicit absolute fee
@@ -113,9 +116,16 @@ floor, so choose it deliberately:
   admission and block-accounting policy; acceptance of one value does not imply
   that every larger value is accepted, nor does a larger fee guarantee a
   particular confirmation time.
-- Whisper uses a separate historical, amount-dependent application encoding in
-  the fee field. It is not regular-payment fee guidance, and numerical overlap
-  with an ordinary fee is not by itself a message marker.
+- Whisper encodes a short message in the fee, and classification is **purely a
+  fee-band test** — there is no flag and no marker. A fee is read as a whisper
+  whenever `fee - amount * 0.000563063063` falls in `[0.0001, 0.01]`, and the
+  reference client then decodes and displays a four-letter code.
+  This band is wide enough to contain ordinary payments: the example transaction
+  in this document (amount `1.5`, fee `0.001`) is inside it. If you are building
+  a payer and do not want your transactions read as messages, keep the fee below
+  `amount * 0.000563063063 + 0.0001`, which is what the reference wallet clamps
+  an automatic fee to. Receivers must treat any such transaction as a payment
+  first: the amount is authoritative, the decoded code is decoration.
 
 ## Test vector (verify your implementation against this)
 
@@ -124,27 +134,32 @@ Reference deterministic mode — your bytes must match exactly.
     secret key (seed), hex:
       0707070707070707070707070707070707070707070707070707070707070707
 
-    sender:    072a2799e9cda5eab68c64a15e71246ae4d3f11e
+    sender:    9e1e860361994891b3165e611dc5aefcdd37dfbf
     recipient: 84dab431b53e6522fe2e74914eec99f17758f4e3
     amount:    1.5
     fee:       0.001
     timestamp: 1783600000
 
     signed message (exact string):
-      072a2799e9cda5eab68c64a15e71246ae4d3f11e:84dab431b53e6522fe2e74914eec99f17758f4e3:1.50000000:0.00100000:1783600000
+      9e1e860361994891b3165e611dc5aefcdd37dfbf:84dab431b53e6522fe2e74914eec99f17758f4e3:1.50000000:0.00100000:1783600000
 
     signed message, hex:
-      303732613237393965396364613565616236386336346131356537313234366165346433663131653a383464616234333162353365363532326665326537343931346565633939663137373538663465333a312e35303030303030303a302e30303130303030303a31373833363030303030
+      396531653836303336313939343839316233313635653631316463356165666364643337646662663a383464616234333162353365363532326665326537343931346565633939663137373538663465333a312e35303030303030303a302e30303130303030303a31373833363030303030
 
     expected public key:  2592 bytes; SHA-256 =
       9e1e860361994891b3165e611dc5aefcdd37dfbf5f247943daaeb57141fe7b6e
 
     expected signature:   4627 bytes; SHA-256 (this is also sig_hash) =
-      87dc974f04d6ec612bd801b6e1bfda2fd838f15c04269dc4701e954babfd91a2
+      e3b8ce82ea7c02c008d89049aff56fa86f34d3320bae82ccf000279c74144339
+
+The sender is NOT arbitrary: it is `hex(sha256(public_key)[..20])`, so it is the
+first 40 hex characters of the public-key SHA-256 above. A node re-derives it and
+rejects any transaction whose `sender` does not match its `pub_key`.
 
 To validate your signer: derive the verifying key from the seed and confirm its
-SHA-256 matches; sign the message and confirm the signature's SHA-256 matches.
-If both match, your implementation is byte-compatible with the network.
+SHA-256 matches; derive the sender from it and confirm it matches; sign the
+message and confirm the signature's SHA-256 matches. If all three match, your
+implementation is byte-compatible with the network.
 
 ## Notes
 

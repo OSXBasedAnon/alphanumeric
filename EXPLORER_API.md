@@ -105,7 +105,7 @@ exact template-selection rules:
   anchor of `0.0002` coins (`20,000` units, 2x the relay floor — strictly ahead
   of floor-paying bulk templates);
 - congested: one unit above the weakest fee that still fits the next block;
-- always clamped to the automatic ceiling of `0.001` coins (`100,000` units).
+- always clamped to the automatic ceiling of `0.002` coins (`200,000` units).
   Only an explicitly chosen fee may exceed it, up to the reference wallet's
   `0.01` explicit ceiling.
 
