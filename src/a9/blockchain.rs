@@ -2111,6 +2111,11 @@ impl Blockchain {
         Ok(Some(codec::deserialize(&raw)?))
     }
 
+    /// How long a STARTUP recovery may take before it is worth interrupting the operator
+    /// about. Below this it stays invisible: an unclean shutdown is ordinary, and so is the
+    /// rebuild that follows it. Above it, a slow start deserves a reason.
+    const SLOW_RECOVERY_NOTICE: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Recover ALL derived state from the authoritative canonical block store after an interrupted
     /// apply (a crash, OR a live mid-apply `Err` the caller caught and continued past). The order
     /// is load-bearing:
@@ -2129,17 +2134,25 @@ impl Blockchain {
     ///
     /// This is the SAME body `initialize()` runs at startup, factored out so live and startup
     /// recovery cannot drift.
+    ///
+    /// `at_startup` changes only how loudly this reports — never what it does. Keeping one
+    /// body for both is the entire reason it was factored out; if this flag ever reaches the
+    /// recovery steps themselves, that guarantee is gone.
     async fn recover_dirty_chain_state(
         &self,
         marker: &ChainStateDirty,
+        at_startup: bool,
     ) -> Result<(), BlockchainError> {
-        // error-level: this is a multi-minute O(chain) wedge on a live node —
-        // the single most diagnostic line in a stalled-miner report, and the
-        // default field log filter (Error) must not hide it.
-        error!(
-            "Recovering derived chain state after interrupted {} at block {}",
-            marker.reason, marker.block_index
-        );
+        let started = Instant::now();
+        if !at_startup {
+            // LIVE: a running node is stalling RIGHT NOW, and the operator needs that before
+            // the work finishes, not after. error-level because the default field log filter
+            // is Error and this is the single most diagnostic line in a stalled-miner report.
+            error!(
+                "Recovering derived chain state after interrupted {} at block {}",
+                marker.reason, marker.block_index
+            );
+        }
         let _ = self.rebuild_chain_tip_metadata()?; // (1) re-anchor tip; invalidate stale cache
         self.ensure_balances_index_with_force(true).await?; // (2) full rebuild from canonical slots
         self.rebuild_confirmed_tx_index()?; // (3) re-derive replay registry
@@ -2155,6 +2168,44 @@ impl Blockchain {
         // clear's unbalanced backstop never blocks recovery's own close.
         self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
         self.clear_chain_state_dirty()?; // (5) clear LAST
+
+        // STARTUP reports AFTERWARDS, and only if there was something to report.
+        //
+        // A marker from a previous run is the expected consequence of any unclean stop, and
+        // the rebuild it triggers is usually seconds — nothing is wedged, because nothing has
+        // started yet. Announcing it up front at error level made an ordinary restart look
+        // like a fault, next to the passphrase prompt, which is how an operator learns to
+        // scroll past errors.
+        //
+        // So the volume now follows the cost rather than predicting it. Past the threshold
+        // this is genuinely worth explaining — a slow start needs a reason — and error is the
+        // only level the default filter shows. Below it, silence is the honest answer.
+        if at_startup {
+            let elapsed = started.elapsed();
+            if elapsed >= Self::SLOW_RECOVERY_NOTICE {
+                error!(
+                    "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
+                     Expected after an unclean shutdown; the chain itself was not damaged.",
+                    marker.reason,
+                    marker.block_index,
+                    elapsed.as_secs_f64()
+                );
+            } else {
+                log::info!(
+                    "Rebuilt derived chain state after an interrupted {} at block {} in {:.2}s",
+                    marker.reason,
+                    marker.block_index,
+                    elapsed.as_secs_f64()
+                );
+            }
+        } else {
+            // Close the loop the opening line left open: a stalled-miner report wants the
+            // duration of the stall, not just that one happened.
+            error!(
+                "Derived chain state rebuilt in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
         Ok(())
     }
 
@@ -2182,7 +2233,7 @@ impl Blockchain {
             if self.apply_batch.unbalanced_marks.load(Ordering::Acquire) != 0 {
                 let dirty = self.chain_state_dirty()?;
                 if let Some(marker) = dirty {
-                    self.recover_dirty_chain_state(&marker).await?;
+                    self.recover_dirty_chain_state(&marker, false).await?;
                 }
                 self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
             }
@@ -2214,7 +2265,7 @@ impl Blockchain {
                 self.clear_chain_state_dirty()?;
                 return Ok(());
             }
-            self.recover_dirty_chain_state(&marker).await?;
+            self.recover_dirty_chain_state(&marker, false).await?;
         }
         Ok(())
     }
@@ -5157,7 +5208,7 @@ impl Blockchain {
         // canonical chain, and clears the marker last. Non-dirty startup just ensures the balances
         // index is current.
         match dirty_state.as_ref() {
-            Some(marker) => self.recover_dirty_chain_state(marker).await?,
+            Some(marker) => self.recover_dirty_chain_state(marker, true).await?,
             None => self.ensure_balances_index().await?,
         }
         // Build the address history index on first run under this feature, rebuild
