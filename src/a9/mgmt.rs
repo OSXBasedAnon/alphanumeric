@@ -58,6 +58,87 @@ const CREATE_TRANSACTION_USAGE: &str =
 /// until the wallet's spendable balance includes it. It drops out once the tip reaches
 /// reward_height + MINING_REWARD_MATURITY − 1 (the display's spend height is tip+1).
 /// Display-only; the enforced set comes from the breakdown itself.
+/// The three counterparties worth printing in full: the most recent inbound, the most recent
+/// outbound, and the one appearing most often.
+///
+/// `recent` is newest-first — address_recent_txs scans the height-ordered index in reverse —
+/// so the first match in each direction IS the latest one.
+///
+/// Two judgement calls live here rather than in the renderer, so they can be tested:
+///
+/// * Coinbase rows are excluded. MINING_REWARDS is not somebody anyone deals with, and on a
+///   miner it would win `frequent` outright and crowd out the answer that was wanted.
+/// * `frequent` requires more than one appearance. A single transaction is not a pattern, and
+///   calling it one would make the row noise on an address with no repeat counterparty.
+///
+/// Ties break on the address so the row is stable across runs instead of following hash order.
+#[allow(clippy::type_complexity)]
+fn notable_counterparties(
+    recent: &[crate::a9::blockchain::AddressTxEntry],
+) -> (
+    Option<&crate::a9::blockchain::AddressTxEntry>,
+    Option<&crate::a9::blockchain::AddressTxEntry>,
+    Option<(&str, usize)>,
+) {
+    let real = |party: &str| !SYSTEM_ADDRESSES.contains(&party);
+    let last_in = recent
+        .iter()
+        .find(|e| e.is_recipient() && real(&e.counterparty));
+    let last_out = recent
+        .iter()
+        .find(|e| e.is_sender() && real(&e.counterparty));
+    let mut tally: HashMap<&str, usize> = HashMap::new();
+    for e in recent.iter().filter(|e| real(&e.counterparty)) {
+        *tally.entry(e.counterparty.as_str()).or_insert(0) += 1;
+    }
+    let frequent = tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .filter(|(_, n)| *n > 1);
+    (last_in, last_out, frequent)
+}
+
+/// Ranking reads one balances-tree entry per wallet — no block decodes — and is
+/// time-boxed, degrading to the name-ordered first wallet if the chain lock is
+/// busy rather than blocking the console.
+pub async fn resolve_default_wallet(
+    wallets: &std::collections::HashMap<String, crate::a9::wallet::Wallet>,
+    blockchain: &Arc<RwLock<Blockchain>>,
+) -> Option<(String, String)> {
+    if let Some((name, wallet)) = wallets.get_key_value("default_wallet") {
+        return Some((name.clone(), wallet.address.clone()));
+    }
+    if wallets.len() <= 1 {
+        return wallets
+            .iter()
+            .next()
+            .map(|(name, wallet)| (name.clone(), wallet.address.clone()));
+    }
+
+    let mut ordered: Vec<(&String, &crate::a9::wallet::Wallet)> = wallets.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Ok(guard) = tokio::time::timeout(Duration::from_secs(3), blockchain.read()).await {
+        let mut best: Option<(i128, String, String)> = None;
+        for (name, wallet) in &ordered {
+            let units = guard
+                .get_confirmed_balance_units(&wallet.address)
+                .await
+                .unwrap_or(0);
+            if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
+                best = Some((units, (*name).clone(), wallet.address.clone()));
+            }
+        }
+        if let Some((_, name, address)) = best {
+            return Some((name, address));
+        }
+    }
+
+    ordered
+        .first()
+        .map(|(name, wallet)| ((*name).clone(), wallet.address.clone()))
+}
+
 fn blocks_until_mature(reward_height: u32, as_of_height: u64) -> u64 {
     (reward_height as u64)
         .saturating_add(MINING_REWARD_MATURITY as u64 - 1)
@@ -1303,9 +1384,29 @@ impl Mgmt {
         // Auto, not Always: `account <addr> | grep` was receiving raw ANSI
         // escapes. The sibling load_wallets already uses Auto.
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-        let address = args.split_whitespace().nth(1);
+        // `account` looks up ANY address — that is the point of it. Bare, it resolves the
+        // same default wallet `mine` and a bare send use, so the common case costs no typing;
+        // a wallet NAME resolves too, because a name is what the operator actually remembers.
+        // Anything else is passed through as a raw address.
+        let requested = args.split_whitespace().nth(1);
+        let resolved: Option<String> = match requested {
+            Some(arg) => Some(
+                wallets
+                    .get(arg)
+                    .map(|w| w.address.clone())
+                    .unwrap_or_else(|| arg.to_string()),
+            ),
+            None => match resolve_default_wallet(wallets, blockchain).await {
+                Some((name, addr)) => {
+                    ui_seg(&mut stdout, &mut ColorSpec::new(), UI_DIM, false, " ")?;
+                    writeln!(stdout, "showing {} — `account <address>` looks up any other", name)?;
+                    Some(addr)
+                }
+                None => None,
+            },
+        };
 
-        match address {
+        match resolved.as_deref() {
             None => {
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
                 writeln!(stdout, "\nUsage: account <address>")?;
@@ -1721,6 +1822,86 @@ impl Mgmt {
                                     ui_seg(&mut stdout, spec, UI_ORANGE, false, "locked")?;
                                 }
                                 writeln!(stdout)?;
+                            }
+
+                            // ── Counterparties ────────────────────────────────
+                            // The table above truncates every address to stay in its
+                            // columns, which is exactly wrong for the addresses a reader
+                            // most likely wants to act on — pay again, check, paste
+                            // somewhere. These three are printed IN FULL for that reason.
+                            //
+                            // Free: derived from `recent`, already fetched and already in
+                            // memory. No extra chain query, no extra time under the guard.
+                            //
+                            // Scoped honestly. `frequent` is the most common counterparty
+                            // WITHIN the fetched window, not all time — the header says so
+                            // rather than letting the label overclaim. Coinbase rows are
+                            // excluded: MINING_REWARDS is not a counterparty anyone deals
+                            // with, and it would win `frequent` outright on a miner.
+                            let (last_in, last_out, frequent) =
+                                notable_counterparties(&recent);
+
+                            if last_in.is_some() || last_out.is_some() || frequent.is_some()
+                            {
+                                writeln!(stdout)?;
+                                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                                ui_seg(&mut stdout, spec, UI_BLUE, true, "Counterparties")?;
+                                let note =
+                                    format!("within the last {} shown", recent.len());
+                                ui_pad(&mut stdout, spec, 16, 78 - note.chars().count())?;
+                                ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
+                                writeln!(stdout)?;
+
+                                const ADDR_AT: usize = 12;
+                                const VALUE_END: usize = 78;
+                                let mut row = |label: &str,
+                                               hue: Color,
+                                               party: &str,
+                                               value: String|
+                                 -> Result<()> {
+                                    ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+                                    ui_seg(&mut stdout, spec, hue, false, label)?;
+                                    ui_pad(&mut stdout, spec, 3 + label.chars().count(), ADDR_AT)?;
+                                    // Terminal default foreground: an address must stay
+                                    // legible on any theme.
+                                    ui_text(&mut stdout, spec, false, party)?;
+                                    ui_right(
+                                        &mut stdout,
+                                        spec,
+                                        ADDR_AT + party.chars().count(),
+                                        VALUE_END,
+                                        UI_DIM,
+                                        false,
+                                        &value,
+                                    )?;
+                                    writeln!(stdout)?;
+                                    Ok(())
+                                };
+
+                                if let Some(e) = last_in {
+                                    row(
+                                        "last in",
+                                        UI_GREEN,
+                                        &e.counterparty,
+                                        format!("+{:.8} ♦", Transaction::from_units(e.amount_units)),
+                                    )?;
+                                }
+                                if let Some(e) = last_out {
+                                    row(
+                                        "last out",
+                                        UI_PINK,
+                                        &e.counterparty,
+                                        format!("-{:.8} ♦", Transaction::from_units(e.amount_units)),
+                                    )?;
+                                }
+                                if let Some((party, n)) = frequent {
+                                    row(
+                                        "frequent",
+                                        UI_LAVENDER,
+                                        party,
+                                        format!("{} of {}", n, recent.len()),
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -2539,8 +2720,89 @@ impl Mgmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a9::blockchain::AddressTxEntry;
     use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    fn entry(counterparty: &str, height: u32, sender: bool) -> AddressTxEntry {
+        AddressTxEntry {
+            height,
+            position: 0,
+            // 1 = sender, 2 = recipient, mirroring the flag bits the index writes.
+            flags: if sender { 1 } else { 2 },
+            amount_units: 100_000_000,
+            fee_units: 50_000,
+            timestamp: 1_700_000_000 + height as u64,
+            counterparty: counterparty.to_string(),
+        }
+    }
+
+    // The account screen prints three counterparties in FULL, so which three it picks is
+    // worth pinning. `recent` arrives newest-first.
+    #[test]
+    fn counterparties_pick_the_latest_in_each_direction() {
+        let recent = vec![
+            entry("bbbb", 300, true),   // newest: outbound
+            entry("aaaa", 299, false),  // inbound
+            entry("cccc", 298, true),   // older outbound — must lose to bbbb
+            entry("aaaa", 297, false),
+        ];
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert_eq!(last_in.unwrap().counterparty, "aaaa");
+        assert_eq!(last_out.unwrap().counterparty, "bbbb", "the LATEST outbound, not the first seen");
+        assert_eq!(frequent.unwrap(), ("aaaa", 2));
+    }
+
+    // A miner's history is mostly coinbase. MINING_REWARDS is not a counterparty anyone
+    // deals with, and left in it wins `frequent` outright and hides the real answer.
+    #[test]
+    fn counterparties_ignore_the_coinbase() {
+        let mut recent: Vec<AddressTxEntry> = (0..20)
+            .map(|i| entry("MINING_REWARDS", 400 - i, false))
+            .collect();
+        recent.push(entry("dddd", 300, false));
+        recent.push(entry("dddd", 299, true));
+
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert_eq!(last_in.unwrap().counterparty, "dddd", "coinbase is not an inbound counterparty");
+        assert_eq!(last_out.unwrap().counterparty, "dddd");
+        assert_eq!(
+            frequent.unwrap(),
+            ("dddd", 2),
+            "20 coinbase rows must not outvote the real counterparty"
+        );
+    }
+
+    // One transaction is not a pattern; calling it `frequent` would make the row noise.
+    #[test]
+    fn a_single_appearance_is_not_frequent() {
+        let recent = vec![entry("aaaa", 300, false), entry("bbbb", 299, true)];
+        let (last_in, last_out, frequent) = notable_counterparties(&recent);
+        assert!(last_in.is_some() && last_out.is_some());
+        assert!(frequent.is_none(), "no repeat counterparty means no frequent row");
+    }
+
+    // Ties must not follow hash order, or the row changes between runs on identical data.
+    #[test]
+    fn a_frequency_tie_breaks_deterministically() {
+        let recent = vec![
+            entry("bbbb", 300, false),
+            entry("aaaa", 299, false),
+            entry("bbbb", 298, false),
+            entry("aaaa", 297, false),
+        ];
+        let first = notable_counterparties(&recent).2.unwrap();
+        for _ in 0..40 {
+            assert_eq!(notable_counterparties(&recent).2.unwrap(), first);
+        }
+    }
+
+    // An address with no activity yet renders no section at all.
+    #[test]
+    fn an_empty_history_yields_nothing_to_show() {
+        let (a, b, c) = notable_counterparties(&[]);
+        assert!(a.is_none() && b.is_none() && c.is_none());
+    }
 
     // `ui_money(x, 4)` is 15 columns only while the whole part fits 4 digits. The
     // account screen used to pad with a hardcoded 15, so every extra digit shoved
