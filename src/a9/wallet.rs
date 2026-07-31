@@ -1,8 +1,8 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use argon2::{password_hash::SaltString, Argon2};
+use argon2::{password_hash::SaltString, Algorithm, Argon2, Params, Version};
 use log::debug;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -70,6 +70,14 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    const WALLET_ENVELOPE_MAGIC: &'static [u8; 8] = b"ANWALLET";
+    const WALLET_ENVELOPE_VERSION: u8 = 1;
+    const KDF_ARGON2ID_V19: u8 = 1;
+    const ARGON2_M_COST: u32 = 19 * 1024;
+    const ARGON2_T_COST: u32 = 2;
+    const ARGON2_P_COST: u32 = 1;
+    const WALLET_ENVELOPE_HEADER_LEN: usize = 8 + 1 + 1 + 4 + 4 + 4;
+
     fn split_combined_key_bytes(combined_bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
         if combined_bytes.len() < MLDSA87_COMBINED_KEY_BYTES {
             return Err(format!(
@@ -113,7 +121,14 @@ impl Wallet {
 
     fn derive_aes_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
         let mut key = Zeroizing::new([0u8; 32]);
-        Argon2::default()
+        let params = Params::new(
+            Self::ARGON2_M_COST,
+            Self::ARGON2_T_COST,
+            Self::ARGON2_P_COST,
+            Some(key.len()),
+        )
+        .map_err(|e| format!("Invalid Argon2 parameters: {}", e))?;
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
             .hash_password_into(passphrase, salt, &mut *key)
             .map_err(|e| format!("Argon2 key derivation error: {}", e))?;
         Ok(key)
@@ -169,7 +184,7 @@ impl Wallet {
         // Zeroizing so the decrypted plaintext seed is wiped on drop (audit M4/L07).
         let combined_bytes = Zeroizing::new(if is_encrypted {
             let pass = passphrase.ok_or("Passphrase required for encrypted wallet")?;
-            Self::decrypt_private_key(encrypted_private_key.clone(), pass)?
+            Self::decrypt_private_key(&encrypted_private_key, pass)?
         } else {
             encrypted_private_key.clone()
         });
@@ -240,6 +255,38 @@ impl Wallet {
     }
 
     fn encrypt_private_key(private_key: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, String> {
+        let header = Self::wallet_envelope_header();
+        let payload = Self::encrypt_private_key_payload(private_key, passphrase, &header)?;
+        let mut envelope = Vec::with_capacity(header.len() + payload.len());
+        envelope.extend_from_slice(&header);
+        envelope.extend_from_slice(&payload);
+        Ok(envelope)
+    }
+
+    fn wallet_envelope_header() -> Vec<u8> {
+        let mut header = Vec::with_capacity(Self::WALLET_ENVELOPE_HEADER_LEN);
+        header.extend_from_slice(Self::WALLET_ENVELOPE_MAGIC);
+        header.push(Self::WALLET_ENVELOPE_VERSION);
+        header.push(Self::KDF_ARGON2ID_V19);
+        header.extend_from_slice(&Self::ARGON2_M_COST.to_be_bytes());
+        header.extend_from_slice(&Self::ARGON2_T_COST.to_be_bytes());
+        header.extend_from_slice(&Self::ARGON2_P_COST.to_be_bytes());
+        header
+    }
+
+    #[cfg(test)]
+    fn encrypt_private_key_legacy(
+        private_key: &[u8],
+        passphrase: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        Self::encrypt_private_key_payload(private_key, passphrase, &[])
+    }
+
+    fn encrypt_private_key_payload(
+        private_key: &[u8],
+        passphrase: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let mut salt_bytes = [0u8; 16];
         let mut rng = OsRng;
         rng.try_fill_bytes(&mut salt_bytes)
@@ -257,7 +304,13 @@ impl Wallet {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, private_key.as_ref())
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: private_key.as_ref(),
+                    aad,
+                },
+            )
             .map_err(|e| format!("Error encrypting private key: {}", e))?;
 
         let mut encrypted = nonce.to_vec();
@@ -267,7 +320,60 @@ impl Wallet {
         Ok(encrypted)
     }
 
-    fn decrypt_private_key(encrypted_data: Vec<u8>, passphrase: &[u8]) -> Result<Vec<u8>, String> {
+    fn decrypt_private_key(encrypted_data: &[u8], passphrase: &[u8]) -> Result<Vec<u8>, String> {
+        if !encrypted_data.starts_with(Self::WALLET_ENVELOPE_MAGIC) {
+            return Self::decrypt_private_key_payload(encrypted_data, passphrase, &[]);
+        }
+        if encrypted_data.len() < Self::WALLET_ENVELOPE_HEADER_LEN {
+            return Err("Invalid wallet envelope: truncated header".to_string());
+        }
+        if encrypted_data[8] != Self::WALLET_ENVELOPE_VERSION {
+            return Err(format!(
+                "Unsupported wallet envelope version: {}",
+                encrypted_data[8]
+            ));
+        }
+        if encrypted_data[9] != Self::KDF_ARGON2ID_V19 {
+            return Err(format!("Unsupported wallet KDF: {}", encrypted_data[9]));
+        }
+
+        let read_u32 = |offset: usize| {
+            u32::from_be_bytes([
+                encrypted_data[offset],
+                encrypted_data[offset + 1],
+                encrypted_data[offset + 2],
+                encrypted_data[offset + 3],
+            ])
+        };
+        let m_cost = read_u32(10);
+        let t_cost = read_u32(14);
+        let p_cost = read_u32(18);
+        if (m_cost, t_cost, p_cost)
+            != (
+                Self::ARGON2_M_COST,
+                Self::ARGON2_T_COST,
+                Self::ARGON2_P_COST,
+            )
+        {
+            return Err(format!(
+                "Unsupported wallet KDF parameters: m={}, t={}, p={}",
+                m_cost, t_cost, p_cost
+            ));
+        }
+
+        let header = &encrypted_data[..Self::WALLET_ENVELOPE_HEADER_LEN];
+        Self::decrypt_private_key_payload(
+            &encrypted_data[Self::WALLET_ENVELOPE_HEADER_LEN..],
+            passphrase,
+            header,
+        )
+    }
+
+    fn decrypt_private_key_payload(
+        encrypted_data: &[u8],
+        passphrase: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if encrypted_data.len() < 28 {
             return Err("Invalid encrypted data".to_string());
         }
@@ -283,7 +389,13 @@ impl Wallet {
             .map_err(|e| format!("Failed to initialize AES cipher: {}", e))?;
 
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| "Decryption failed. Invalid passphrase or corrupted data".to_string())
     }
 }
@@ -308,5 +420,59 @@ mod tests {
         let mut mismatched = sec_a;
         mismatched.extend_from_slice(&pub_b);
         assert!(Wallet::split_combined_key_bytes(&mismatched).is_err());
+    }
+
+    #[test]
+    fn explicit_legacy_kdf_parameters_match_argon2_0_5_3_defaults() {
+        let passphrase = b"legacy passphrase";
+        let salt = b"fixed legacy salt";
+        let mut defaults = Zeroizing::new([0u8; 32]);
+        Argon2::default()
+            .hash_password_into(passphrase, salt, &mut *defaults)
+            .unwrap();
+
+        let explicit = Wallet::derive_aes_key(passphrase, salt).unwrap();
+        assert_eq!(defaults.as_slice(), explicit.as_slice());
+    }
+
+    #[test]
+    fn wallet_envelope_round_trip_authenticates_header() {
+        let plaintext = b"wallet-secret-material";
+        let encrypted = Wallet::encrypt_private_key(plaintext, b"correct horse").unwrap();
+
+        assert!(encrypted.starts_with(Wallet::WALLET_ENVELOPE_MAGIC));
+        assert_eq!(
+            Wallet::decrypt_private_key(&encrypted, b"correct horse").unwrap(),
+            plaintext
+        );
+
+        let mut tampered = encrypted;
+        tampered[10] ^= 1;
+        assert!(Wallet::decrypt_private_key(&tampered, b"correct horse").is_err());
+    }
+
+    #[test]
+    fn legacy_wallet_payload_remains_readable() {
+        let plaintext = b"legacy-wallet-secret";
+        let encrypted =
+            Wallet::encrypt_private_key_legacy(plaintext, b"legacy passphrase").unwrap();
+
+        assert!(!encrypted.starts_with(Wallet::WALLET_ENVELOPE_MAGIC));
+        assert_eq!(
+            Wallet::decrypt_private_key(&encrypted, b"legacy passphrase").unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn wallet_envelope_rejects_unknown_version_and_wrong_passphrase() {
+        let encrypted = Wallet::encrypt_private_key(b"wallet-secret", b"right password").unwrap();
+        assert!(Wallet::decrypt_private_key(&encrypted, b"wrong password").is_err());
+
+        let mut unknown_version = encrypted;
+        unknown_version[8] = Wallet::WALLET_ENVELOPE_VERSION.saturating_add(1);
+        assert!(Wallet::decrypt_private_key(&unknown_version, b"right password")
+            .unwrap_err()
+            .contains("Unsupported wallet envelope version"));
     }
 }
