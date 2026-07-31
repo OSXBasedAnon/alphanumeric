@@ -646,26 +646,28 @@ impl Mgmt {
         std::io::stdin().read_line(&mut input)?;
 
         let (wallet_pass, is_encrypted) = if input.trim().to_lowercase() == "y" {
-            let pass = match Password::new("Enter passphrase (or press Enter for no encryption):")
-                .with_display_mode(PasswordDisplayMode::Masked)
-                .prompt()
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    // The user asked to encrypt (typed "y"); a prompt failure (non-TTY, EOF,
-                    // terminal error) must NOT silently fall through to an unencrypted,
-                    // plaintext-on-disk wallet. Abort so they can retry.
-                    return Err(format!(
-                        "passphrase prompt failed ({}); aborting so the wallet is not created \
-                         unencrypted by mistake",
-                        e
-                    )
-                    .into());
-                }
-            };
+            let pass = zeroize::Zeroizing::new(
+                match Password::new("Enter passphrase (or press Enter for no encryption):")
+                    .with_display_mode(PasswordDisplayMode::Masked)
+                    .prompt()
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // The user asked to encrypt (typed "y"); a prompt failure (non-TTY, EOF,
+                        // terminal error) must NOT silently fall through to an unencrypted,
+                        // plaintext-on-disk wallet. Abort so they can retry.
+                        return Err(format!(
+                            "passphrase prompt failed ({}); aborting so the wallet is not created \
+                             unencrypted by mistake",
+                            e
+                        )
+                        .into());
+                    }
+                },
+            );
 
             if !pass.trim().is_empty() {
-                let pass_bytes = pass.trim().as_bytes().to_vec();
+                let pass_bytes = zeroize::Zeroizing::new(pass.trim().as_bytes().to_vec());
                 println!("\nImportant Security Information: Your passphrase and the private.key file are essential for accessing your wallet. If you lose either of these, your funds will be irretrievable. Store them securely and create backups.");
                 (Some(pass_bytes), true)
             } else {
@@ -725,7 +727,9 @@ impl Mgmt {
         let wallet = {
             let pass_slice = wallet_pass.as_deref();
 
-            match tokio::time::timeout(Duration::from_secs(5), async { Wallet::new(pass_slice) })
+            match tokio::time::timeout(Duration::from_secs(5), async {
+                Wallet::new(pass_slice.map(Vec::as_slice))
+            })
                 .await
             {
                 Ok(result) => result?,
@@ -736,7 +740,7 @@ impl Mgmt {
                         "Wallet creation timed out, but proceeding with local setup..."
                     )?;
                     stdout.reset()?;
-                    Wallet::new(pass_slice)?
+                    Wallet::new(pass_slice.map(Vec::as_slice))?
                 }
             }
         };

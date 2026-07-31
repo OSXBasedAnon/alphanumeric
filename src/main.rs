@@ -1248,18 +1248,22 @@ async fn async_main() -> Result<()> {
             .and_then(|data| serde_json::from_str(data).ok())
             .unwrap_or_default();
 
-        let mut wallet_encryption_state: Option<Vec<u8>> = None;
+        let mut wallet_encryption_state: Option<zeroize::Zeroizing<Vec<u8>>> = None;
 
         if !headless && !wallet_data.is_empty() {
             println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
 
-            let passphrase = Password::new("Passphrase:")
-                .with_display_mode(PasswordDisplayMode::Masked)
-                .prompt()
-                .unwrap_or_default();
+            let passphrase = zeroize::Zeroizing::new(
+                Password::new("Passphrase:")
+                    .with_display_mode(PasswordDisplayMode::Masked)
+                    .prompt()
+                    .unwrap_or_default(),
+            );
 
             if !passphrase.trim().is_empty() {
-                wallet_encryption_state = Some(passphrase.trim().as_bytes().to_vec());
+                wallet_encryption_state = Some(zeroize::Zeroizing::new(
+                    passphrase.trim().as_bytes().to_vec(),
+                ));
             }
         }
 
@@ -1282,7 +1286,13 @@ async fn async_main() -> Result<()> {
             )
             .into());
         } else if wallet_encryption_state.is_some() {
-            mgmt.load_wallets(&db_arc, wallet_encryption_state.as_deref()).await?
+            mgmt.load_wallets(
+                &db_arc,
+                wallet_encryption_state
+                    .as_ref()
+                    .map(|passphrase| passphrase.as_slice()),
+            )
+            .await?
         } else {
             mgmt.load_wallets(&db_arc, None).await?
         };
@@ -2611,7 +2621,13 @@ Some("balance") | Some("bal") | Some("wallet") => {
 Some("new") => {
 let wallet_name = command.split_whitespace().nth(1).map(|s| s.to_string());
 if let Err(e) = mgmt
-.create_new_wallet(&mut wallets, wallet_encryption_state.as_deref(), wallet_name)
+.create_new_wallet(
+    &mut wallets,
+    wallet_encryption_state
+        .as_ref()
+        .map(|passphrase| passphrase.as_slice()),
+    wallet_name,
+)
 .await
 {
 println!("Error creating wallet: {}", e);
