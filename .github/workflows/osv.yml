@@ -12,6 +12,15 @@ permissions:
 
 jobs:
   scan:
+    # The called workflow declares these at workflow level, and a caller cannot grant
+    # a called workflow more than it holds itself. Without them the run is rejected
+    # before any step executes (startup_failure), which reads as a broken gate rather
+    # than a clean scan. Still read-only apart from security-events, and SARIF upload
+    # is off, so nothing is published.
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
     with:
       scan-args: |-
