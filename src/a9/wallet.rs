@@ -54,7 +54,7 @@ impl std::fmt::Debug for WalletKeys {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Wallet {
     #[serde(
         serialize_with = "serialize_address",
@@ -62,11 +62,38 @@ pub struct Wallet {
     )]
     pub address: String,
     pub name: String,
-    pub encrypted_private_key: Option<Vec<u8>>,
+    /// Key material as held in memory. Despite the name this is only ciphertext
+    /// when `is_encrypted` is true -- for a passphrase-less wallet it is the RAW
+    /// combined ML-DSA key, which is why it is zeroized on drop and redacted from
+    /// Debug. `Zeroizing` is transparent to serde here via `zeroizing_key_bytes`,
+    /// so the serialized form is unchanged.
+    #[serde(with = "crate::a9::mgmt::zeroizing_key_bytes")]
+    pub encrypted_private_key: Option<Zeroizing<Vec<u8>>>,
     #[serde(skip)]
     keypair: Option<Arc<Mutex<WalletKeys>>>,
     #[serde(skip)]
     pub is_encrypted: bool,
+}
+
+// Derived Debug here would print raw key bytes for every passphrase-less wallet,
+// since `encrypted_private_key` is plaintext in that case. Hand-written so no
+// future `{:?}` -- in a log, a panic backtrace, or a crash reporter -- can leak a
+// spendable key. WalletKeys already redacts its own secret; this closes the outer
+// struct that holds it.
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key_material = match &self.encrypted_private_key {
+            Some(key) => format!("<redacted {} bytes>", key.len()),
+            None => "<none>".to_string(),
+        };
+        f.debug_struct("Wallet")
+            .field("address", &self.address)
+            .field("name", &self.name)
+            .field("encrypted_private_key", &key_material)
+            .field("keypair", &self.keypair)
+            .field("is_encrypted", &self.is_encrypted)
+            .finish()
+    }
 }
 
 impl Wallet {
@@ -139,15 +166,17 @@ impl Wallet {
             mldsa_public_key_bytes: public_key_bytes,
         };
 
-        // Handle encryption if needed
-        let private_key = if let Some(pass) = passphrase {
+        // Handle encryption if needed. Zeroizing in BOTH arms: the unencrypted arm
+        // carries the raw combined key, so a plain Vec here would leave spendable
+        // key material in freed memory.
+        let private_key: Zeroizing<Vec<u8>> = if let Some(pass) = passphrase {
             if !pass.is_empty() {
-                Self::encrypt_private_key(&combined_key_bytes, pass)?
+                Zeroizing::new(Self::encrypt_private_key(&combined_key_bytes, pass)?)
             } else {
-                combined_key_bytes.to_vec()
+                combined_key_bytes.clone()
             }
         } else {
-            combined_key_bytes.to_vec()
+            combined_key_bytes.clone()
         };
 
         Ok(Self {
@@ -162,17 +191,22 @@ impl Wallet {
     pub fn from_key_bytes(
         name: String,
         wallet_address: String,
-        encrypted_private_key: Vec<u8>,
+        encrypted_private_key: Zeroizing<Vec<u8>>,
         passphrase: Option<&[u8]>,
         is_encrypted: bool,
     ) -> Result<Self, String> {
         // Zeroizing so the decrypted plaintext seed is wiped on drop (audit M4/L07).
-        let combined_bytes = Zeroizing::new(if is_encrypted {
+        // The unencrypted arm clones a Zeroizing, so the copy is protected too --
+        // in that branch the "encrypted" key IS the raw key.
+        let combined_bytes: Zeroizing<Vec<u8>> = if is_encrypted {
             let pass = passphrase.ok_or("Passphrase required for encrypted wallet")?;
-            Self::decrypt_private_key(encrypted_private_key.clone(), pass)?
+            Zeroizing::new(Self::decrypt_private_key(
+                encrypted_private_key.to_vec(),
+                pass,
+            )?)
         } else {
             encrypted_private_key.clone()
-        });
+        };
 
         let (secret_bytes, public_bytes) = Self::split_combined_key_bytes(&combined_bytes)?;
 
@@ -309,4 +343,88 @@ mod tests {
         mismatched.extend_from_slice(&pub_b);
         assert!(Wallet::split_combined_key_bytes(&mismatched).is_err());
     }
+    /// A passphrase-less wallet holds RAW key material in `encrypted_private_key`
+    /// despite the field name, so a derived Debug would print a spendable key. The
+    /// unencrypted case is the one that matters and is asserted directly: the secret
+    /// seed must not appear in Debug output in any encoding.
+    #[test]
+    fn wallet_debug_never_renders_key_material() {
+        let wallet = Wallet::new(None).expect("unencrypted wallet");
+        assert!(!wallet.is_encrypted, "this test must cover the RAW-key case");
+
+        let key_bytes = wallet
+            .encrypted_private_key
+            .as_ref()
+            .expect("wallet holds key material")
+            .clone();
+        assert!(!key_bytes.is_empty());
+
+        let rendered = format!("{:?}", wallet);
+        assert!(
+            !rendered.contains(&hex::encode(&*key_bytes)),
+            "raw key hex must not appear in Debug output"
+        );
+        // Byte-list rendering is how a derived Debug on Vec<u8> would leak it.
+        let as_debug_list = format!("{:?}", &key_bytes[..8]);
+        let inner = as_debug_list.trim_start_matches('[').trim_end_matches(']');
+        assert!(
+            !rendered.contains(inner),
+            "key bytes must not appear as a debug list: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction must be explicit rather than silent: {rendered}"
+        );
+        assert!(
+            rendered.contains(&wallet.address),
+            "non-secret fields stay legible for diagnostics"
+        );
+    }
+
+    /// The keypair holder nested inside a Wallet must redact too -- otherwise the
+    /// outer redaction is defeated by the field it contains.
+    #[test]
+    fn nested_wallet_keys_debug_is_redacted() {
+        let wallet = Wallet::new(None).expect("unencrypted wallet");
+        let rendered = format!("{:?}", wallet);
+        assert!(
+            !rendered.to_ascii_lowercase().contains("mldsa_secret_key_bytes: ["),
+            "nested secret key bytes must not be rendered: {rendered}"
+        );
+    }
+
+    /// An encrypted wallet must round-trip through the same path `load_wallets`
+    /// uses, with the key type now being Zeroizing. This guards the decrypt branch
+    /// of `from_key_bytes` against the signature change.
+    #[test]
+    fn encrypted_wallet_round_trips_through_from_key_bytes() {
+        let pass: &[u8] = b"correct horse battery staple";
+        let wallet = Wallet::new(Some(pass)).expect("encrypted wallet");
+        assert!(wallet.is_encrypted);
+        let stored = wallet
+            .encrypted_private_key
+            .as_ref()
+            .expect("ciphertext present")
+            .clone();
+
+        let restored = Wallet::from_key_bytes(
+            wallet.name.clone(),
+            wallet.address.clone(),
+            stored,
+            Some(pass),
+            true,
+        )
+        .expect("encrypted wallet must restore with the right passphrase");
+        assert_eq!(restored.address, wallet.address);
+
+        let wrong = Wallet::from_key_bytes(
+            wallet.name.clone(),
+            wallet.address.clone(),
+            wallet.encrypted_private_key.clone().expect("ciphertext"),
+            Some(b"wrong passphrase"),
+            true,
+        );
+        assert!(wrong.is_err(), "a wrong passphrase must not restore a wallet");
+    }
+
 }

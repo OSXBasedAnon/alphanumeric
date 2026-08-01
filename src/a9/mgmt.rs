@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
+use zeroize::Zeroizing;
 use tokio::sync::RwLock;
 
 use crate::a9::blockchain::{
@@ -340,17 +341,80 @@ fn validate_wallet_transaction_addresses(
 pub struct WalletKeyData {
     pub wallet_name: String,
     pub wallet_address: String,
-    pub private_key: Option<Vec<u8>>,
+    /// Key material as persisted. When `is_encrypted` is false this is the RAW
+    /// combined ML-DSA key, not ciphertext -- the field name describes the
+    /// encrypted case only. Zeroized on drop so a freed allocation does not keep
+    /// a spendable key; `Zeroizing` is a transparent wrapper, so the serialized
+    /// form is a bare byte array exactly as before (pinned by the frozen-format
+    /// fixtures in this module's tests).
+    #[serde(with = "zeroizing_key_bytes")]
+    pub private_key: Option<Zeroizing<Vec<u8>>>,
     pub last_sync_timestamp: u64,
     pub is_encrypted: bool,
     pub key_verification_hash: Vec<u8>,
+}
+
+/// Serde adapter keeping `Option<Zeroizing<Vec<u8>>>` on the wire EXACTLY as
+/// `Option<Vec<u8>>` was: a bare JSON array, or null. Written out rather than
+/// enabling zeroize's serde feature so the transparency is visible at the point
+/// it matters -- this is the field whose representation decides whether existing
+/// key files still load. Deserialization moves the buffer into `Zeroizing`
+/// instead of copying, so no unzeroized duplicate is left behind.
+pub mod zeroizing_key_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S>(
+        value: &Option<Zeroizing<Vec<u8>>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(bytes.as_slice()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Zeroizing<Vec<u8>>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<Vec<u8>>::deserialize(deserializer)?.map(Zeroizing::new))
+    }
+}
+
+// Hand-written so key material can never reach a log line, a panic backtrace or a
+// crash report. Derived Debug on a secret-bearing struct is a footgun that stays
+// dormant until someone adds a `{:?}` years later, which is precisely when it is
+// hardest to notice. Non-secret fields stay legible so the type is still useful
+// in diagnostics.
+impl std::fmt::Debug for WalletKeyData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let private_key = match &self.private_key {
+            Some(key) => format!("<redacted {} bytes>", key.len()),
+            None => "<none>".to_string(),
+        };
+        f.debug_struct("WalletKeyData")
+            .field("wallet_name", &self.wallet_name)
+            .field("wallet_address", &self.wallet_address)
+            .field("private_key", &private_key)
+            .field("last_sync_timestamp", &self.last_sync_timestamp)
+            .field("is_encrypted", &self.is_encrypted)
+            .field(
+                "key_verification_hash",
+                &format_args!("{} bytes", self.key_verification_hash.len()),
+            )
+            .finish()
+    }
 }
 
 impl WalletKeyData {
     pub fn new(
         wallet_name: String,
         wallet_address: String,
-        private_key: Option<Vec<u8>>,
+        private_key: Option<Zeroizing<Vec<u8>>>,
         is_encrypted: bool,
     ) -> Self {
         // Keep existing hash verification - it works with any key bytes
@@ -463,7 +527,10 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
 /// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
 /// on this class; this closes the corresponding write side.
 async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
-    let serialized = serde_json::to_string(key_data_vec)?;
+    // The serialized buffer contains every wallet's key material in the clear for
+    // passphrase-less wallets, so it is wiped on drop rather than left in a freed
+    // allocation. Zeroizing<String> derefs to str, so the write path is unchanged.
+    let serialized = Zeroizing::new(serde_json::to_string(key_data_vec)?);
     match tokio::time::timeout(Duration::from_secs(5), async {
         write_secret_file(key_file_path, serialized.as_ref()).await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -2754,6 +2821,133 @@ mod tests {
     use crate::a9::blockchain::AddressTxEntry;
     use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    /// ON-DISK WALLET KEY FORMAT — FROZEN.
+    ///
+    /// These bytes are what `persist_wallet_keys` writes and `load_wallets` reads.
+    /// A user's ability to spend depends on this file staying readable, so the
+    /// format is pinned literally rather than round-tripped through the same code
+    /// that produces it: a round-trip test passes even when both sides change
+    /// together, which is exactly the regression that would strand funds.
+    ///
+    /// Covers both branches, because they are structurally different on disk: an
+    /// encrypted wallet's `private_key` is ciphertext, an unencrypted wallet's is
+    /// the RAW combined key material. If a change to secret-holding types alters
+    /// either byte sequence, this fails before anyone's key file does.
+    const FROZEN_ENCRYPTED_WALLET_JSON: &str = r#"[{"wallet_name":"encrypted-fixture","wallet_address":"1111111111111111111111111111111111111111","private_key":[1,2,3,4,5,6,7,8],"last_sync_timestamp":1700000000,"is_encrypted":true,"key_verification_hash":[9,9,9,9]}]"#;
+    const FROZEN_PLAINTEXT_WALLET_JSON: &str = r#"[{"wallet_name":"plaintext-fixture","wallet_address":"2222222222222222222222222222222222222222","private_key":[254,253,252],"last_sync_timestamp":1700000001,"is_encrypted":false,"key_verification_hash":[7,7]}]"#;
+    const FROZEN_NO_KEY_WALLET_JSON: &str = r#"[{"wallet_name":"keyless-fixture","wallet_address":"3333333333333333333333333333333333333333","private_key":null,"last_sync_timestamp":1700000002,"is_encrypted":false,"key_verification_hash":[]}]"#;
+
+    /// Serializing a `WalletKeyData` must reproduce the frozen bytes EXACTLY --
+    /// field names, field order, and the JSON representation of the key bytes.
+    /// `Zeroizing<Vec<u8>>` must serialize as a bare array, not as a wrapper
+    /// object, or every existing key file becomes unreadable.
+    #[test]
+    fn wallet_key_file_serialization_is_byte_identical_to_the_frozen_format() {
+        for frozen in [
+            FROZEN_ENCRYPTED_WALLET_JSON,
+            FROZEN_PLAINTEXT_WALLET_JSON,
+            FROZEN_NO_KEY_WALLET_JSON,
+        ] {
+            let parsed: Vec<WalletKeyData> =
+                serde_json::from_str(frozen).expect("frozen wallet fixture must parse");
+            let reserialized =
+                serde_json::to_string(&parsed).expect("wallet key data must serialize");
+            assert_eq!(
+                reserialized, frozen,
+                "on-disk wallet key format changed; existing key files would break"
+            );
+        }
+    }
+
+    /// The read side must recover the key material unchanged. Byte equality is
+    /// asserted against literals, not against a value derived from the same
+    /// deserialization, so a symmetric corruption cannot pass.
+    #[test]
+    fn frozen_wallet_fixtures_read_back_with_intact_key_material() {
+        let encrypted: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_ENCRYPTED_WALLET_JSON).expect("encrypted fixture");
+        assert_eq!(encrypted.len(), 1);
+        assert_eq!(encrypted[0].wallet_name, "encrypted-fixture");
+        assert!(encrypted[0].is_encrypted);
+        assert_eq!(
+            encrypted[0].private_key.as_ref().map(|k| k.as_slice()),
+            Some([1u8, 2, 3, 4, 5, 6, 7, 8].as_slice()),
+            "ciphertext must survive the round trip byte for byte"
+        );
+        assert_eq!(encrypted[0].last_sync_timestamp, 1_700_000_000);
+        assert_eq!(encrypted[0].key_verification_hash, vec![9u8, 9, 9, 9]);
+
+        let plaintext: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_PLAINTEXT_WALLET_JSON).expect("plaintext fixture");
+        assert!(!plaintext[0].is_encrypted);
+        assert_eq!(
+            plaintext[0].private_key.as_ref().map(|k| k.as_slice()),
+            Some([254u8, 253, 252].as_slice()),
+            "raw key material must survive the round trip byte for byte"
+        );
+
+        let keyless: Vec<WalletKeyData> =
+            serde_json::from_str(FROZEN_NO_KEY_WALLET_JSON).expect("keyless fixture");
+        assert!(keyless[0].private_key.is_none());
+        assert!(keyless[0].key_verification_hash.is_empty());
+    }
+
+    /// `key_verification_hash` gates whether a loaded key is trusted, so the way
+    /// it is derived is part of the file contract: SHA-256 over the key bytes
+    /// followed by the encryption flag. A change here would reject every stored
+    /// wallet as tampered.
+    #[test]
+    fn key_verification_hash_derivation_is_stable() {
+        let key = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let data = WalletKeyData::new(
+            "hash-fixture".to_string(),
+            "1".repeat(40),
+            Some(Zeroizing::new(key.clone())),
+            true,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(&key);
+        hasher.update([1u8]);
+        assert_eq!(data.key_verification_hash, hasher.finalize().to_vec());
+
+        let empty = WalletKeyData::new("none".to_string(), "1".repeat(40), None, false);
+        assert_eq!(
+            empty.key_verification_hash,
+            vec![0u8; 32],
+            "the keyless sentinel hash is part of the format"
+        );
+    }
+
+    /// Secret-bearing wallet key data must never render its key material. This is
+    /// the type-level guarantee: a future `{:?}` in a log or a panic backtrace
+    /// cannot print the bytes.
+    #[test]
+    fn wallet_key_data_debug_redacts_key_material() {
+        let data = WalletKeyData::new(
+            "redaction-fixture".to_string(),
+            "4".repeat(40),
+            Some(Zeroizing::new(vec![0xAB, 0xCD, 0xEF])),
+            false,
+        );
+        let rendered = format!("{:?}", data);
+        assert!(
+            !rendered.contains("171") && !rendered.contains("205") && !rendered.contains("239"),
+            "key bytes must not appear in Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("abcdef"),
+            "key bytes must not appear in any encoding: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction must be visible rather than silent: {rendered}"
+        );
+        assert!(
+            rendered.contains("redaction-fixture"),
+            "non-secret fields stay legible for diagnostics: {rendered}"
+        );
+    }
 
     fn entry(counterparty: &str, height: u32, sender: bool) -> AddressTxEntry {
         AddressTxEntry {
