@@ -10,7 +10,7 @@ https://www.alphanumeric.blue/
 
 Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.3`.
+`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.4`.
 
 ## Quick Nav
 
@@ -140,6 +140,14 @@ it does not affect finality (reorgs remain bounded by the checkpoint margin) —
 target granularity is a candidate for a future coordinated protocol upgrade.
 
 If you are integrating against this repository, pin a commit hash and validate behavior at that exact revision.
+
+### Scheduled compatibility boundary
+
+Client `7.9.4` activates updated reward accounting at block `569,423`.
+Pre-activation blocks retain the existing rules. Miners, pools, public nodes, and
+other validating operators must upgrade before the activation height; older
+software may not agree on block validity after that point. The node announces an
+advisory consensus fingerprint so operators can monitor rollout compatibility.
 
 ## Tokenomics
 

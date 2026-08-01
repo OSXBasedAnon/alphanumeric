@@ -1,12 +1,20 @@
 # Alphanumeric Client User Guide
 
-This is the user guide for Alphanumeric client version 7.9.3.
+This is the user guide for Alphanumeric client version 7.9.4.
 
 The prebuilt download is for **macOS (Apple Silicon)**. On **Windows** and
 **Linux** you build from source — it takes a few minutes and one `cargo`
 command; see the setup sections below.
 
 The client stores its chain database, node identity, wallets, and lock files beside the folder you run it from unless you set a custom database path.
+
+## Required upgrade before block 569,423
+
+Version 7.9.4 contains a scheduled reward-accounting update that activates at
+block `569,423`. Miners, pools, public nodes, and other validating operators must
+upgrade before that height. Blocks below the activation height are unchanged.
+The upgrade is a drop-in binary replacement: it requires no database migration,
+wallet migration, or resync.
 
 ## Setup — macOS (prebuilt download)
 
