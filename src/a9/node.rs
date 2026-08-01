@@ -1394,6 +1394,7 @@ pub struct Node {
     // growing invalid fork costs one validation total, not one per posted block.
     // Soft entries (transient walk/gap failures) time out but never propagate —
     // a momentary relay gap must not poison the live chain's fresh tips.
+    #[allow(clippy::type_complexity)] // (height, hash) -> (retry instant, permanently rejected).
     relay_dead_targets: Arc<PLMutex<LruCache<(u32, [u8; 32]), (Instant, bool)>>>,
     // Relay-once bookkeeping for the early (pre-full-validation) block relay. DISJOINT from
     // network_bloom by construction, so early-relay accounting never touches the acceptance dedup
@@ -7803,6 +7804,8 @@ impl Node {
             announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 announce_interval.tick().await;
+                // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+                #[allow(clippy::manual_is_multiple_of)]
                 if tick % relay_every == 0 {
                     if let Err(e) = node_clone.ensure_public_tip_relayed().await {
                         debug!("Public relay tip refresh failed: {}", e);
@@ -8236,6 +8239,8 @@ impl Node {
                                 .map(|b| now.saturating_sub(b.timestamp))
                                 .unwrap_or(0)
                         };
+                        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+                        #[allow(clippy::manual_is_multiple_of)]
                         if tip_age > 120 && tick_no % 5 != 0 {
                             continue;
                         }
@@ -10194,6 +10199,8 @@ impl Node {
         Ok(None)
     }
 
+    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+    #[allow(clippy::unnecessary_map_or)]
     fn witness_matches_committed_receipt(receipt: &Transaction, candidate: &Transaction) -> bool {
         candidate.get_tx_id() == receipt.get_tx_id()
             && receipt.pub_key.as_ref().map_or(true, |expected| {

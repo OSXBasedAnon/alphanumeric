@@ -192,6 +192,8 @@ pub fn ui_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
+        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
         if index > 0 && (digits.len() - index) % 3 == 0 {
             out.push(',');
         }

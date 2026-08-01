@@ -8,6 +8,9 @@
 //! DataChannel plumbing; the gateway is only a dumb signaling relay, and every block still gets the
 //! node's full PoW + ML-DSA validation, so this is a transport-only change.
 
+// Deliberate defense in depth: the parent module is feature-gated too, while this keeps the file
+// fail-closed if its module declaration is ever moved or accidentally ungated.
+#![allow(clippy::duplicated_attributes)]
 #![cfg(feature = "webrtc_mesh")]
 
 use std::sync::Arc;
@@ -463,6 +466,7 @@ impl std::fmt::Debug for WebRtcMesh {
 impl WebRtcMesh {
     /// Build a mesh. Returns the mesh + the receiver the node drains for inbound peer messages
     /// (tagged with the sender's node_id).
+    #[allow(clippy::type_complexity)] // Mesh plus authenticated-sender-tagged inbound receiver.
     pub fn new(
         transport: Arc<dyn SignalTransport>,
         api: Arc<API>,
@@ -1134,7 +1138,7 @@ mod tests {
     // the property "hundreds of miners actually mesh" depends on.
     #[test]
     fn dial_targets_yield_one_connected_component_at_every_size() {
-        fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        fn find(parent: &mut [usize], x: usize) -> usize {
             let mut root = x;
             while parent[root] != root {
                 root = parent[root];
@@ -1178,14 +1182,14 @@ mod tests {
             }
 
             let root = find(&mut parent, 0);
-            for i in 0..n {
+            for (i, node_degree) in degree.iter().enumerate().take(n) {
                 assert_eq!(
                     find(&mut parent, i),
                     root,
                     "n={n}: node {i} is in a separate component"
                 );
                 assert!(
-                    degree[i] > 0,
+                    *node_degree > 0,
                     "n={n}: node {i} is isolated (zero mesh edges)"
                 );
             }
