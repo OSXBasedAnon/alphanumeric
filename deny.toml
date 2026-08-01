@@ -53,8 +53,22 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "OpenSSL",
+  # Boost Software License 1.0 — permissive, no binary-attribution requirement.
+  # Reaches us through clipboard-win / error-code (Windows clipboard path).
+  "BSL-1.0",
+  # Community Data License Agreement Permissive 2.0 — the licence Mozilla ships the
+  # CA root certificate DATA under, via webpki-root-certs. Data, not code.
+  "CDLA-Permissive-2.0",
+  # The bzip2 licence (BSD-style, permissive), via libbz2-rs-sys behind zip.
+  "bzip2-1.0.6",
 ]
 confidence-threshold = 0.9
+
+# Our own crate declares no `license` field and is marked `publish = false`. The gate
+# exists to police what we redistribute in the binary, which is third-party code; it
+# is not a way to assert a licence for this project. Choosing one is a separate
+# decision, and if it is ever made this exception should be removed rather than kept.
+private = { ignore = true }
 
 [bans]
 # Duplicate versions are common in a libp2p/webrtc tree and are not a security

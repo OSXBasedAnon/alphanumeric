@@ -2,6 +2,11 @@
 name = "alphanumeric"
 version = "7.9.3"
 edition = "2021"
+# The node is distributed as signed binaries, not as a crates.io package. This also
+# keeps the license gate scoped to third-party code: our own crate carries no
+# `license` field, and marking it unpublished says so explicitly rather than
+# implying a license we have not chosen.
+publish = false
 
 [dependencies]
 argon2 = "=0.5.3" # Legacy wallet envelopes depend on these exact KDF defaults.
