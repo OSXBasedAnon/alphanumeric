@@ -2060,8 +2060,22 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Initialize sentinel (idempotent; first info call only). Time-boxed so a busy
-    // node can never wedge the console — it will simply initialize on a later call.
+    // Initialize sentinel (idempotent; first info call only). Time-boxed so a busy node
+    // can never wedge the console.
+    //
+    // NOTE: a deferred/failed initialization does NOT retry here. BPoSSentinel::initialize
+    // commits its `initialized` latch BEFORE running its fallible startup work, so if that
+    // work times out or errors the latch stays set and every later call returns Ok(()) early
+    // without re-running it. The result is a latched PARTIAL initialization: background tasks
+    // spawned before the failure keep running, the rest never starts. BPoS is telemetry only,
+    // so this degrades reporting, not chain state.
+    //
+    // Do NOT "fix" the latch in isolation. Allowing retries would re-run verify_chain_state,
+    // which reaches handle_chain_anomalies -> attempt_chain_recovery -> save_block; today
+    // that path executes at most once per process. Widening it before that recovery path is
+    // retired increases exposure to code that is already known ineffective (it cannot repair
+    // a body whose stored hash is intact — save_block returns early on a hash match — yet
+    // still increments fork_count). Retire the recovery path first, then fix the latch.
     {
         let sentinel = staking_node.write().await;
         match tokio::time::timeout(Duration::from_secs(5), sentinel.initialize()).await {

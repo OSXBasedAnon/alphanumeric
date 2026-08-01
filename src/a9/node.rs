@@ -927,8 +927,20 @@ pub enum NetworkMessage {
         node_id: String,
     },
     RawData(Vec<u8>),
-    // APPEND transport extensions so existing NetworkMessage variant indexes stay
-    // byte-for-byte stable. These are sent only to capability-negotiated peers.
+    // APPEND transport extensions. NOTE: the wire contract is the variant NAME, not its
+    // position — rmp_serde (see a9::codec) encodes a data variant as a one-entry map
+    // {"VariantName": [fields]} and a unit variant as a bare string. Consequences, which
+    // are the opposite of what "keep indexes stable" implies:
+    //   - REORDERING variants is harmless.
+    //   - RENAMING one is a WIRE BREAK; peers decode by name.
+    //   - REMOVING one is a WIRE BREAK for as long as any peer still sends it: rmp_serde
+    //     errors on an unknown variant, and the connection loop treats that decode failure
+    //     as a protocol violation (record_peer_failure + drop), so a removed variant makes
+    //     new nodes repeatedly disconnect and failure-score old peers. Retire a variant by
+    //     deleting its SENDER and leaving the variant as a decode-and-ignore tombstone.
+    //   - A kept variant's FIELDS are positional arrays, so adding/removing/reordering
+    //     fields inside one is also a break.
+    // These are sent only to capability-negotiated peers.
     CompactBlockV1(CompactBlockV1),
     GetCompactTransactionsV1 {
         block_hash: [u8; 32],

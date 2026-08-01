@@ -10308,6 +10308,107 @@ mod tests {
         }
     }
 
+    /// CONSENSUS AUTHORITY INVARIANT — regression guard.
+    ///
+    /// BPoS (a9::bpos) is monitoring/finality telemetry. It holds no privileged write
+    /// path: its only route to persistent chain state is `save_block`, and every call it
+    /// makes is at a height at or below the tip (fork resolution at a fork height, anomaly
+    /// recovery at an existing height). This test pins the property that makes that safe —
+    /// a competitor offered at an existing height is routed to orphan storage and can only
+    /// become canonical by winning normal PoW fork choice.
+    ///
+    /// This is asserted at the `save_block` boundary rather than through BPoSSentinel
+    /// because constructing a sentinel requires an `Arc<Node>`; the boundary is where the
+    /// guarantee actually lives, and it covers every caller including future ones.
+    ///
+    /// Why it exists: BPoS's inertness currently rests on several incidental conditions
+    /// (a fixed [0,0] fetch range, a never-populated metrics map, an anomaly predicate
+    /// weaker than admission). Those are accidents of history and none of them is asserted
+    /// anywhere. This test pins the ONE deliberate barrier, so if a future change arms any
+    /// of the accidental ones, the guarantee is still enforced here rather than assumed.
+    #[tokio::test]
+    async fn a_competitor_at_an_existing_height_cannot_displace_canonical_without_pow() {
+        let bc = test_blockchain();
+        let miner = "11".repeat(20);
+        raw_chain_to(&bc, 6, &miner);
+
+        let canonical_tip = bc.get_block(6).expect("canonical tip");
+        let canonical_at_3 = bc.get_block(3).expect("canonical block 3");
+        let parent_of_3 = bc.get_block(2).expect("parent of 3");
+        let checkpoint_before = bc.trusted_checkpoint_height();
+
+        // A well-formed competitor at an EXISTING height: correct parent link, valid
+        // header and PoW, but a different body -- exactly the shape a peer-supplied
+        // "replacement" block takes.
+        let competitor = metadata_test_block(3, parent_of_3.hash, &"22".repeat(20), 1.0);
+        assert_ne!(
+            competitor.hash, canonical_at_3.hash,
+            "the competitor must actually differ from canonical"
+        );
+
+        bc.save_block(&competitor)
+            .await
+            .expect("a valid competing block is accepted for consideration, not rejected");
+
+        // CONSIDERED, not rejected -- without this the assertions below would also pass
+        // if save_block had simply thrown the block away, which would make this test
+        // vacuous. The competitor must be retrievable from orphan storage.
+        assert!(
+            bc.get_orphan_block_by_hash(&competitor.hash)
+                .expect("orphan lookup")
+                .is_some(),
+            "the competitor was discarded rather than routed to orphan storage; this test \
+             would then prove nothing about fork choice"
+        );
+
+        // It was CONSIDERED but not ADOPTED: one block of work cannot outweigh the
+        // canonical suffix above the fork point.
+        assert_eq!(
+            bc.get_block(3).expect("block 3 after").hash,
+            canonical_at_3.hash,
+            "canonical block was replaced without winning fork choice"
+        );
+        assert_eq!(
+            bc.get_latest_block_index(),
+            6,
+            "tip height moved on a losing competitor"
+        );
+        assert_eq!(
+            bc.get_block(6).expect("tip after").hash,
+            canonical_tip.hash,
+            "tip hash moved on a losing competitor"
+        );
+        assert_eq!(
+            bc.trusted_checkpoint_height(),
+            checkpoint_before,
+            "finality checkpoint moved on a losing competitor"
+        );
+    }
+
+    /// A resubmission of a block already stored at that height is a no-op. This is the
+    /// path a "repair" attempt takes when a stored body is corrupt but its stored hash is
+    /// intact: the peer's good copy carries the SAME hash, so save_block returns early and
+    /// nothing is replaced. Pinned so that behaviour is a known property rather than a
+    /// surprise, and so any future repair mechanism is written knowing it must not rely on
+    /// resubmission to heal a body.
+    #[tokio::test]
+    async fn resubmitting_an_identical_height_and_hash_is_a_no_op() {
+        let bc = test_blockchain();
+        let miner = "11".repeat(20);
+        raw_chain_to(&bc, 4, &miner);
+
+        let existing = bc.get_block(2).expect("block 2");
+        let tip_before = bc.get_block(4).expect("tip").hash;
+
+        bc.save_block(&existing)
+            .await
+            .expect("resubmitting an identical block must not error");
+
+        assert_eq!(bc.get_block(2).expect("block 2 after").hash, existing.hash);
+        assert_eq!(bc.get_block(4).expect("tip after").hash, tip_before);
+        assert_eq!(bc.get_latest_block_index(), 4);
+    }
+
     /// Positive control for the clean-startup gate. Without it, the tampering test
     /// above would still pass if the validator rejected every chain, and a boot-time
     /// gate that refuses intact chains would take the node down on a healthy database.
