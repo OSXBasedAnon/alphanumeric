@@ -177,6 +177,18 @@ pub const REDUCTION_RATE: f64 = 0.83;
 /// 517,583.
 pub const FEE_SYSTEM_ACTIVATION_HEIGHT: u32 = 517_583;
 pub const FEE_ACCOUNTING_RULES_VERSION: u32 = 1;
+/// Coordinated activation for the fee-backed reward curve. Blocks below this
+/// height retain the historical reward calculation bit-for-bit. Starting at
+/// this height, every block receives the scheduled empty-block subsidy and a
+/// deterministic 65% share of its regular transaction fees, capped by the
+/// existing scheduled ceiling. This is a consensus hard-fork boundary.
+pub const REWARD_CURVE_V2_ACTIVATION_HEIGHT: u32 = 569_423;
+pub const REWARD_CURVE_RULES_VERSION: u32 = 2;
+/// Integer ratio used by Reward V2. Keep this independent from the legacy f64
+/// `MINT_CLIP`: consensus fee sharing must not depend on floating-point
+/// multiplication or a derived decimal after activation.
+pub const REWARD_V2_MINER_FEE_NUMERATOR: i128 = 65;
+pub const REWARD_V2_MINER_FEE_DENOMINATOR: i128 = 100;
 /// Aggregate low-fee compatibility envelope used by the scheduled accounting
 /// baseline (500,000 atomic units = 0.005 ALPHA).
 pub const LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS: i128 = 500_000;
@@ -395,12 +407,24 @@ impl TemplateFeeAccounting {
             return Ok(true);
         }
         let (tx_count, total_fees, total_fee_units) = self.totals_with(tx)?;
-        let reward_units = Transaction::to_units(blockchain.block_reward_from_totals(
-            self.block_index,
-            self.block_timestamp,
-            tx_count,
-            total_fees,
-        )?);
+        let reward_units = if self.block_index >= REWARD_CURVE_V2_ACTIVATION_HEIGHT {
+            blockchain.block_reward_units_from_totals(
+                self.block_index,
+                self.block_timestamp,
+                tx_count,
+                total_fee_units,
+            )?
+        } else {
+            // The legacy formula folds fees as f64 in selection order. Preserve
+            // that exact operation order below Reward V2 rather than rebuilding
+            // it from the integer aggregate.
+            Transaction::to_units(blockchain.block_reward_from_totals(
+                self.block_index,
+                self.block_timestamp,
+                tx_count,
+                total_fees,
+            )?)
+        };
         let net_issuance_units = reward_units
             .checked_sub(total_fee_units)
             .ok_or(BlockchainError::InvalidTransactionAmount)?;
@@ -7110,27 +7134,18 @@ impl Blockchain {
         if block_index == 0 {
             return Ok(Transaction::to_units(GENESIS_LAUNCH_AMOUNT));
         }
-        let empty_units = Transaction::to_units(self.block_reward_from_totals(
-            block_index,
-            block_timestamp,
-            0,
-            0.0,
-        )?);
-        let nonempty_floor_units = Transaction::to_units(self.block_reward_from_totals(
-            block_index,
-            block_timestamp,
-            1,
-            0.0,
-        )?);
+        let empty_units =
+            self.block_reward_units_from_totals(block_index, block_timestamp, 0, 0)?;
+        let nonempty_floor_units =
+            self.block_reward_units_from_totals(block_index, block_timestamp, 1, 0)?;
 
         // `tx.fee()` on the envelope probe is exactly from_units(ENVELOPE_UNITS).
-        let envelope_fee = Transaction::from_units(LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS);
-        let compatibility_reward_units = Transaction::to_units(self.block_reward_from_totals(
+        let compatibility_reward_units = self.block_reward_units_from_totals(
             block_index,
             block_timestamp,
             1,
-            envelope_fee,
-        )?);
+            LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS,
+        )?;
         let compatibility_net_units = compatibility_reward_units
             .checked_sub(LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS)
             .ok_or(BlockchainError::InvalidTransactionAmount)?;
@@ -7350,18 +7365,11 @@ impl Blockchain {
         result
     }
 
-    pub fn block_reward_from_totals(
+    fn scheduled_reward_ceiling(
         &self,
-        block_index: u32,
         block_timestamp: u64,
-        tx_count: usize,
-        total_fees: f64,
     ) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
-
-        if block_index == 0 {
-            return Ok(GENESIS_LAUNCH_AMOUNT);
-        }
 
         // Calculate periods since genesis for halving. Genesis is immutable, so
         // its timestamp is memoized after the first read (this used to be a sled
@@ -7379,45 +7387,110 @@ impl Blockchain {
         let periods = time_since_genesis / SECONDS_IN_SIX_MONTHS;
 
         // Apply reduction rate for each period to max reward
-        let current_max = MAX_BLOCK_REWARD * Self::reduction_factor(periods);
+        Ok(MAX_BLOCK_REWARD * Self::reduction_factor(periods))
+    }
 
-        // Fee-weighted reward to avoid incentivizing spammy tx counts.
+    /// Exact atomic-unit Reward V2 calculation.
+    ///
+    /// Let C be the scheduled ceiling, S the historical empty-block reward, and
+    /// F the aggregate regular fees. The rule is:
+    ///
+    /// `R = min(C, S + floor(65 * F / 100))`
+    ///
+    /// This gives two consensus invariants for every non-negative F:
+    /// `R >= S` and `R - F <= S`. A transaction can therefore never reduce the
+    /// miner below the empty subsidy, while self-funded fees can never increase
+    /// net issuance above that subsidy. The remaining 35% is burned.
+    fn reward_curve_v2_units(
+        current_max: f64,
+        tx_count: usize,
+        total_fee_units: i128,
+    ) -> Result<i128, BlockchainError> {
+        if total_fee_units < 0 || (tx_count == 0 && total_fee_units != 0) {
+            return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
+        let ceiling_units = Transaction::to_units(current_max);
+        let reward_floor = MIN_BLOCK_REWARD.min(current_max);
+        // Derive S through the exact historical empty-block operation order so
+        // Reward V2 does not alter one empty block at any emission period.
+        let subsidy_units = Transaction::to_units(Transaction::round_amount(
+            (current_max * 0.2).clamp(reward_floor, current_max),
+        ));
+        let fee_units = if tx_count == 0 { 0 } else { total_fee_units };
+        let miner_fee_units = fee_units
+            .checked_mul(REWARD_V2_MINER_FEE_NUMERATOR)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?
+            / REWARD_V2_MINER_FEE_DENOMINATOR;
+        let reward_units = subsidy_units
+            .checked_add(miner_fee_units)
+            .ok_or(BlockchainError::InvalidTransactionAmount)?
+            .min(ceiling_units);
+
+        Ok(reward_units)
+    }
+
+    /// Unit-native aggregate form used by validation and template accounting.
+    /// The V2 path never round-trips aggregate fees through f64. The legacy path
+    /// remains delegated to its historical formula and operation order.
+    fn block_reward_units_from_totals(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        tx_count: usize,
+        total_fee_units: i128,
+    ) -> Result<i128, BlockchainError> {
+        if block_index == 0 {
+            return Ok(Transaction::to_units(GENESIS_LAUNCH_AMOUNT));
+        }
+        if block_index < REWARD_CURVE_V2_ACTIVATION_HEIGHT {
+            return Ok(Transaction::to_units(self.block_reward_from_totals(
+                block_index,
+                block_timestamp,
+                tx_count,
+                Transaction::from_units(total_fee_units),
+            )?));
+        }
+
+        let current_max = self.scheduled_reward_ceiling(block_timestamp)?;
+        Self::reward_curve_v2_units(current_max, tx_count, total_fee_units)
+    }
+
+    /// Internal aggregate adapter retained for the legacy f64 reward path and
+    /// equivalence testing. Miner construction and block validation both use
+    /// `calculate_block_reward`; this is intentionally not a public template API.
+    fn block_reward_from_totals(
+        &self,
+        block_index: u32,
+        block_timestamp: u64,
+        tx_count: usize,
+        total_fees: f64,
+    ) -> Result<f64, BlockchainError> {
+        if block_index == 0 {
+            return Ok(GENESIS_LAUNCH_AMOUNT);
+        }
+
+        let current_max = self.scheduled_reward_ceiling(block_timestamp)?;
+
+        if block_index >= REWARD_CURVE_V2_ACTIVATION_HEIGHT {
+            if !total_fees.is_finite() || total_fees < 0.0 {
+                return Err(BlockchainError::InvalidTransactionAmount);
+            }
+            let reward_units = Self::reward_curve_v2_units(
+                current_max,
+                tx_count,
+                Transaction::to_units(total_fees),
+            )?;
+            return Ok(Transaction::from_units(reward_units));
+        }
+
+        // LEGACY REWARD CURVE. This is deliberately frozen below the Reward V2
+        // activation height: changing its operation order would invalidate
+        // historical coinbases.
         let fee_target = (current_max * 0.05).max(0.0001);
         let effective_fees = total_fees * (1.0 - MINT_CLIP);
         let fee_factor = (effective_fees / fee_target).clamp(0.0, 1.0);
 
-        // Base reward calculation.
-        //
-        // THE EMPTY-BLOCK PREMIUM IS DELIBERATE AND REVIEWED (2026-07-27) — read this
-        // before reporting it as an exploit. An empty block takes a flat 20% of
-        // current_max (10 d today). A block carrying transactions STARTS at
-        // MIN_BLOCK_REWARD and scales to current_max on fee weight, so below a
-        // crossover of roughly 1.0 d of total block fees it pays LESS than an empty
-        // one — today's floor-fee traffic sits far under that, which is why ~99% of
-        // blocks are empty and a payment can wait ~15 blocks for a miner who includes
-        // it anyway.
-        //
-        // Why that is acceptable rather than a censorship bug:
-        //   * The band is BOUNDED and self-closing. Above the crossover a tx block
-        //     pays up to current_max — 5x an empty one — so inclusion becomes strictly
-        //     more profitable exactly when there is real fee volume to include. Only
-        //     the low-fee tail is unprofitable, and that tail is dust by construction.
-        //   * Inclusion is never FORBIDDEN, only unprofitable in that tail. No
-        //     consensus rule can compel a miner to fill a block on any PoW chain;
-        //     template selection is local policy. The lever a chain has is the payoff
-        //     curve, and this one already rewards inclusion once fees are real.
-        //   * It is not an issuance exploit. The activated net-issuance cap
-        //     (`fee_accounting_is_admissible_for_block`, FEE_SYSTEM_ACTIVATION_HEIGHT)
-        //     bounds reward - fees by the scheduled baseline, so preferring empty
-        //     blocks cannot mint above schedule; it forgoes fee income, it does not
-        //     create coins.
-        //   * The direction of the error is deflationary: more usage means slightly
-        //     LESS issuance, never more.
-        //
-        // Do NOT "fix" this by lifting the empty-block share or floors the tx branch
-        // to match — either inverts the incentive and pays miners to stuff blocks.
-        // If the tail ever needs closing, do it on the fee side (estimator/floor), not
-        // by flattening this curve.
         let base_reward = if tx_count == 0 {
             current_max * 0.2 // 20% of max reward for empty blocks
         } else {
@@ -7450,6 +7523,29 @@ impl Blockchain {
             return Ok(GENESIS_LAUNCH_AMOUNT);
         }
 
+        if block.index >= REWARD_CURVE_V2_ACTIVATION_HEIGHT {
+            let (tx_count, total_fee_units) = block
+                .transactions
+                .iter()
+                .filter(|tx| tx.sender != "MINING_REWARDS")
+                .try_fold((0usize, 0i128), |(count, fees), tx| {
+                    if tx.fee_units < 0 {
+                        return Err(BlockchainError::InvalidTransactionAmount);
+                    }
+                    let next_fees = fees
+                        .checked_add(tx.fee_units)
+                        .ok_or(BlockchainError::InvalidTransactionAmount)?;
+                    Ok((count.saturating_add(1), next_fees))
+                })?;
+            let reward_units = self.block_reward_units_from_totals(
+                block.index,
+                block.timestamp,
+                tx_count,
+                total_fee_units,
+            )?;
+            return Ok(Transaction::from_units(reward_units));
+        }
+
         // Single pass, excluding mining rewards. The volume this used to accumulate
         // alongside was never read by the formula.
         let (tx_count, total_fees) = block
@@ -7461,6 +7557,41 @@ impl Blockchain {
             });
 
         self.block_reward_from_totals(block.index, block.timestamp, tx_count, total_fees)
+    }
+
+    /// Stable diagnostic identity for every consensus input carried by this
+    /// build and chain database. This is advisory telemetry, not a validity
+    /// oracle: block validation remains the authority. Keeping construction here
+    /// lets the CLI and discovery announce publish the exact same fingerprint.
+    pub fn consensus_fingerprint(&self) -> (String, String) {
+        let genesis_hash = self
+            .get_block(0)
+            .map(|block| hex::encode(block.hash))
+            .unwrap_or_else(|_| "missing_genesis".to_string());
+        let descriptor = format!(
+            "fee={:.12};reward={:.8};adj={};block_time={};target_block_time={};network_fee={:.8};mint_clip={:.8};genesis={};hdr_rules_ver={};hdr_future={};fee_rules_ver={};fee_activation={};fee_envelope_units={};max_block_weight={};reward_rules_ver={};reward_activation={};reward_fee_share={}/{}",
+            self.transaction_fee,
+            self.mining_reward,
+            self.difficulty_adjustment_interval,
+            self.block_time,
+            TARGET_BLOCK_TIME,
+            NETWORK_FEE,
+            MINT_CLIP,
+            genesis_hash,
+            CONSENSUS_HEADER_RULES_VERSION,
+            MAX_BLOCK_FUTURE_TIME,
+            FEE_ACCOUNTING_RULES_VERSION,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+            LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS,
+            MAX_BLOCK_WEIGHT_BYTES,
+            REWARD_CURVE_RULES_VERSION,
+            REWARD_CURVE_V2_ACTIVATION_HEIGHT,
+            REWARD_V2_MINER_FEE_NUMERATOR,
+            REWARD_V2_MINER_FEE_DENOMINATOR
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(descriptor.as_bytes());
+        (descriptor, hex::encode(hasher.finalize()))
     }
 
     // Network hashrate
@@ -9201,6 +9332,181 @@ mod tests {
                 h
             );
         }
+    }
+
+    #[test]
+    fn reward_curve_v2_activation_boundary_is_exact() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let ts = genesis_ts + 3_000_000; // period 0: ceiling 50, empty subsidy 10
+        let below = REWARD_CURVE_V2_ACTIVATION_HEIGHT - 1;
+        let at = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
+
+        let legacy_empty = bc
+            .block_reward_units_from_totals(below, ts, 0, 0)
+            .unwrap();
+        let activated_empty = bc.block_reward_units_from_totals(at, ts, 0, 0).unwrap();
+        assert_eq!(legacy_empty, Transaction::to_units(10.0));
+        assert_eq!(activated_empty, legacy_empty, "empty issuance must not move");
+
+        let floor_fee_units = Transaction::to_units(0.0001);
+        let legacy_floor = bc
+            .block_reward_units_from_totals(below, ts, 1, floor_fee_units)
+            .unwrap();
+        let activated_floor = bc
+            .block_reward_units_from_totals(at, ts, 1, floor_fee_units)
+            .unwrap();
+        assert_eq!(legacy_floor, Transaction::to_units(1.001339));
+        assert_eq!(activated_floor, Transaction::to_units(10.000065));
+        assert_ne!(legacy_floor, activated_floor, "nonempty V2 must activate");
+        assert_eq!(
+            bc.block_reward_units_from_totals(at + 1, ts, 1, floor_fee_units)
+                .unwrap(),
+            activated_floor,
+            "the V2 rule must remain stable after activation"
+        );
+
+        for (fee, expected_reward) in [
+            (0.0, 10.0),
+            (0.0002, 10.00013),
+            (5.0, 13.25),
+            (40.0, 36.0),
+            (62.0, 50.0),
+        ] {
+            let got = bc
+                .block_reward_units_from_totals(at, ts, 1, Transaction::to_units(fee))
+                .unwrap();
+            assert_eq!(
+                got,
+                Transaction::to_units(expected_reward),
+                "wrong V2 activation vector for fee {fee}"
+            );
+        }
+    }
+
+    #[test]
+    fn reward_curve_v2_preserves_issuance_and_self_spam_invariants() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let height = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
+        let fee_units = [
+            0i128,
+            1,
+            10_000,
+            20_000,
+            1_000_000,
+            50_000_000,
+            100_000_000,
+            4_000_000_000,
+            6_200_000_000,
+        ];
+
+        let mut checked = 0usize;
+        for period in [0u64, 1, 3, 13, 21, 22, 60] {
+            let ts = genesis_ts + period * SIX_MONTHS;
+            let ceiling_units = Transaction::to_units(
+                MAX_BLOCK_REWARD * Blockchain::reduction_factor(period),
+            );
+            let subsidy_units = bc
+                .block_reward_units_from_totals(height, ts, 0, 0)
+                .unwrap();
+            let zero_fee_nonempty = bc
+                .block_reward_units_from_totals(height, ts, 1, 0)
+                .unwrap();
+            assert_eq!(zero_fee_nonempty, subsidy_units);
+
+            let mut previous_reward = subsidy_units;
+            for fee in fee_units {
+                let reward = bc
+                    .block_reward_units_from_totals(height, ts, 1, fee)
+                    .unwrap();
+                assert!(reward >= subsidy_units, "fee lowered miner reward");
+                assert!(reward >= previous_reward, "reward is not monotonic in fees");
+                assert!(reward <= ceiling_units, "reward exceeded scheduled ceiling");
+                assert!(
+                    reward.checked_sub(fee).unwrap() <= subsidy_units,
+                    "fee-funded block exceeded empty-block net issuance"
+                );
+                previous_reward = reward;
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 7 * fee_units.len());
+
+        assert!(matches!(
+            bc.block_reward_units_from_totals(height, genesis_ts, 1, -1),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+        assert!(matches!(
+            bc.block_reward_units_from_totals(height, genesis_ts, 0, 1),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+        assert!(matches!(
+            bc.block_reward_units_from_totals(height, genesis_ts, 1, i128::MAX),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
+    }
+
+    #[test]
+    fn reward_curve_v2_template_accounting_matches_the_block_form() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let height = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
+        let ts = genesis_ts + 3_000_000;
+        let candidates: Vec<Transaction> = [0.0001, 0.5, 5.0, 40.0, 62.0]
+            .into_iter()
+            .map(|fee| fee_tx(fee, ts))
+            .collect();
+        let mut accounting = TemplateFeeAccounting::new(&bc, height, ts).unwrap();
+        let mut prefix = Vec::new();
+
+        for tx in &candidates {
+            prefix.push(tx.clone());
+            let reference = bc
+                .template_fee_accounting_is_admissible(
+                    height,
+                    ts,
+                    &prefix,
+                )
+                .unwrap();
+            let running = accounting.admits(&bc, tx).unwrap();
+            assert_eq!(running, reference);
+            assert!(running, "Reward V2 must admit every non-negative fee aggregate");
+            accounting.commit(tx).unwrap();
+        }
+    }
+
+    #[test]
+    fn reward_curve_v2_validator_rejects_a_legacy_coinbase_at_activation() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        let ts = genesis.timestamp + 3_000_000;
+        let fee_units = Transaction::to_units(0.0001);
+        let mut activated = fee_accounting_test_block(
+            &bc,
+            REWARD_CURVE_V2_ACTIVATION_HEIGHT,
+            ts,
+            &[fee_units],
+        );
+        bc.validate_block_reward_rules_at(&activated, FEE_SYSTEM_ACTIVATION_HEIGHT)
+            .expect("the exact Reward V2 coinbase must validate at activation");
+
+        let legacy_reward = bc
+            .block_reward_units_from_totals(
+                REWARD_CURVE_V2_ACTIVATION_HEIGHT - 1,
+                ts,
+                1,
+                fee_units,
+            )
+            .unwrap();
+        activated.transactions[0].amount_units = legacy_reward;
+        assert!(matches!(
+            bc.validate_block_reward_rules_at(&activated, FEE_SYSTEM_ACTIVATION_HEIGHT),
+            Err(BlockchainError::InvalidTransactionAmount)
+        ));
     }
 
     // The genesis block is its own rule and must stay so regardless of inputs.
