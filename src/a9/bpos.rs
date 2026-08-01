@@ -2897,7 +2897,9 @@ mod tests {
         for i in 0..headroom as u64 {
             let mut hash = [0xffu8; 32];
             hash[..8].copy_from_slice(&i.to_be_bytes());
-            sentinel.verifications.insert(hash, aged_verification(1_000_000 + i));
+            sentinel
+                .verifications
+                .insert(hash, aged_verification(1_000_000 + i));
             let before_trim = sentinel.verifications.len();
             sentinel.trim_verifications(1);
             assert_eq!(
@@ -2914,7 +2916,9 @@ mod tests {
         // One more insert crosses the ceiling, and THAT one trims.
         let mut hash = [0xeeu8; 32];
         hash[..8].copy_from_slice(&999u64.to_be_bytes());
-        sentinel.verifications.insert(hash, aged_verification(2_000_000));
+        sentinel
+            .verifications
+            .insert(hash, aged_verification(2_000_000));
         sentinel.trim_verifications(1);
         assert!(
             sentinel.verifications.len() <= VERIFICATION_TRIM_TARGET,
@@ -3352,7 +3356,9 @@ mod tests {
     fn header_timestamp_checks_survive_clock_movement_in_both_directions() {
         let now = 1_700_000_000u64;
 
-        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(now, now));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now, now
+        ));
         assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
             now,
             now - BPoSSentinel::MAX_HEADER_AGE_SECS
@@ -3374,13 +3380,25 @@ mod tests {
         ));
 
         // Extreme adversarial inputs: no panic, no wrap, correct verdict.
-        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(now, u64::MAX));
-        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(now, 0));
-        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(0, u64::MAX));
-        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(0, 0));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            u64::MAX
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now, 0
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            0,
+            u64::MAX
+        ));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            0, 0
+        ));
         // A clock that jumped backwards past the header: age saturates to 0, and
         // the skew bound is what decides.
-        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(1, 1_000_000));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            1, 1_000_000
+        ));
     }
 
     /// No wall-clock difference in this module may use raw subtraction: every one
@@ -3396,5 +3414,4 @@ mod tests {
              adjustment would otherwise wrap or panic"
         );
     }
-
 }

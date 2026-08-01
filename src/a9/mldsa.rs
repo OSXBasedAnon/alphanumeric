@@ -119,10 +119,8 @@ mod signing_spec_vector {
         const SEED: [u8; 32] = [0x07; 32];
         const SENDER: &str = "9e1e860361994891b3165e611dc5aefcdd37dfbf";
         const RECIPIENT: &str = "84dab431b53e6522fe2e74914eec99f17758f4e3";
-        const PK_SHA256: &str =
-            "9e1e860361994891b3165e611dc5aefcdd37dfbf5f247943daaeb57141fe7b6e";
-        const SIG_SHA256: &str =
-            "e3b8ce82ea7c02c008d89049aff56fa86f34d3320bae82ccf000279c74144339";
+        const PK_SHA256: &str = "9e1e860361994891b3165e611dc5aefcdd37dfbf5f247943daaeb57141fe7b6e";
+        const SIG_SHA256: &str = "e3b8ce82ea7c02c008d89049aff56fa86f34d3320bae82ccf000279c74144339";
 
         let sha = |b: &[u8]| {
             let mut h = Sha256::new();
@@ -134,7 +132,11 @@ mod signing_spec_vector {
         assert_eq!(sha(&pk), PK_SHA256, "published public key hash");
 
         // The sender is DERIVED, never chosen: hex(sha256(pub_key)[..20]).
-        assert_eq!(&sha(&pk)[..40], SENDER, "sender must be the derived address");
+        assert_eq!(
+            &sha(&pk)[..40],
+            SENDER,
+            "sender must be the derived address"
+        );
 
         let msg = format!(
             "{}:{}:{:.8}:{:.8}:{}",
@@ -148,8 +150,15 @@ mod signing_spec_vector {
 
         let sig = sign(msg.as_bytes(), &SEED).expect("sign");
         assert_eq!(sig.len(), 4627, "published signature length");
-        assert_eq!(sha(&sig), SIG_SHA256, "published signature hash (also sig_hash)");
-        assert!(verify(msg.as_bytes(), &sig, &pk).is_ok(), "the vector must verify");
+        assert_eq!(
+            sha(&sig),
+            SIG_SHA256,
+            "published signature hash (also sig_hash)"
+        );
+        assert!(
+            verify(msg.as_bytes(), &sig, &pk).is_ok(),
+            "the vector must verify"
+        );
     }
 }
 
@@ -285,8 +294,15 @@ mod negative_vectors {
         for (name, mutate) in cases {
             let mut malformed = signature.clone();
             mutate(&mut malformed);
-            assert_eq!(malformed.len(), SIGNATURE_BYTES, "{name} must keep the length");
-            assert_ne!(malformed, signature, "{name} must actually change the bytes");
+            assert_eq!(
+                malformed.len(),
+                SIGNATURE_BYTES,
+                "{name} must keep the length"
+            );
+            assert_ne!(
+                malformed, signature,
+                "{name} must actually change the bytes"
+            );
 
             // Rejected at DECODE, not merely by the signature math downstream. This
             // is the sharper property and the one that matters for malleability: a
@@ -448,11 +464,13 @@ mod negative_vectors {
             verify(MESSAGE, &signature, &extended).is_err(),
             "an over-long public key must be rejected"
         );
-        assert!(validate_public_key(&vec![0u8; PUBLIC_KEY_BYTES]).is_err() || {
-            // An all-zero key that happens to decode must still not verify a
-            // signature made under a different key.
-            verify(MESSAGE, &signature, &vec![0u8; PUBLIC_KEY_BYTES]).is_err()
-        });
+        assert!(
+            validate_public_key(&vec![0u8; PUBLIC_KEY_BYTES]).is_err() || {
+                // An all-zero key that happens to decode must still not verify a
+                // signature made under a different key.
+                verify(MESSAGE, &signature, &vec![0u8; PUBLIC_KEY_BYTES]).is_err()
+            }
+        );
     }
 
     /// Signing is deterministic for a fixed seed and message in this configuration,

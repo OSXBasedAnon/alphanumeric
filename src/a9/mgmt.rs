@@ -12,26 +12,21 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::fs;
-use zeroize::Zeroizing;
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 use crate::a9::blockchain::{
-    is_canonical_user_address, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES,
-    WALLET_FEE_SAFETY_LIMIT_UNITS,
+    is_canonical_user_address, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES, WALLET_FEE_SAFETY_LIMIT_UNITS,
+};
+use crate::a9::ui::{
+    ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg, ui_text,
+    ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_HAIRLINE, UI_LABEL, UI_LAVENDER,
+    UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE, UI_VALUE,
 };
 use crate::a9::whisper::max_non_whisper_fee_units;
-use crate::a9::ui::{
-    UI_MUTED,
-    ui_address, ui_age, ui_grid_header, ui_grid_row, ui_money, ui_pad, ui_right, ui_seg,
-    ui_text,
-    ui_thousands,
-    UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_HAIRLINE, UI_LABEL, UI_LAVENDER, UI_ORANGE,
-    UI_PINK, UI_RULE, UI_VALUE,
-};
 use crate::a9::{
     blockchain::{
-        Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY,
-        TARGET_BLOCK_TIME,
+        Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY, TARGET_BLOCK_TIME,
     },
     miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
@@ -540,7 +535,9 @@ async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]
     .await
     {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("failed to persist wallet key to {}: {}", key_file_path, e).into()),
+        Ok(Err(e)) => {
+            Err(format!("failed to persist wallet key to {}: {}", key_file_path, e).into())
+        }
         Err(_) => Err(format!("timed out persisting wallet key to {}", key_file_path).into()),
     }
 }
@@ -807,7 +804,7 @@ impl Mgmt {
             match tokio::time::timeout(Duration::from_secs(5), async {
                 Wallet::new(pass_slice.map(Vec::as_slice))
             })
-                .await
+            .await
             {
                 Ok(result) => result?,
                 Err(_) => {
@@ -1150,7 +1147,11 @@ impl Mgmt {
                         "Maturing: {:.8} ♦ ({} reward{} on the way)",
                         maturing_total,
                         breakdown.maturing.len(),
-                        if breakdown.maturing.len() == 1 { "" } else { "s" }
+                        if breakdown.maturing.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
                     )?;
                     stdout.reset()?;
                 }
@@ -1439,7 +1440,10 @@ impl Mgmt {
                 Ok(CreateTransactionOutcome::Submitted(transaction))
             }
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
-                writeln!(stdout, "Not submitted: an identical transaction is already pending.")?;
+                writeln!(
+                    stdout,
+                    "Not submitted: an identical transaction is already pending."
+                )?;
                 writeln!(
                     stdout,
                     "To make a distinct payment, change the amount or fee, or retry in the next second."
@@ -1493,7 +1497,11 @@ impl Mgmt {
             None => match resolve_default_wallet(wallets, blockchain).await {
                 Some((name, addr)) => {
                     ui_seg(&mut stdout, &mut ColorSpec::new(), UI_DIM, false, " ")?;
-                    writeln!(stdout, "showing {} — `account <address>` looks up any other", name)?;
+                    writeln!(
+                        stdout,
+                        "showing {} — `account <address>` looks up any other",
+                        name
+                    )?;
                     Some(addr)
                 }
                 None => None,
@@ -1589,8 +1597,7 @@ impl Mgmt {
                 // printed spendable under a bare "Balance:" label and put the
                 // pending figure in its own section four lines away, so the two
                 // could not be related by eye.
-                let maturing_total: f64 =
-                    breakdown.maturing.iter().map(|(_, amount)| amount).sum();
+                let maturing_total: f64 = breakdown.maturing.iter().map(|(_, amount)| amount).sum();
                 writeln!(stdout)?;
                 ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
                 ui_seg(&mut stdout, spec, UI_CYAN, true, "Account")?;
@@ -1661,7 +1668,13 @@ impl Mgmt {
                     41,
                 )?;
                 if maturing_total > 0.0 {
-                    ui_seg(&mut stdout, spec, UI_ORANGE, false, &ui_money(maturing_total, 4))?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_ORANGE,
+                        false,
+                        &ui_money(maturing_total, 4),
+                    )?;
                     ui_seg(
                         &mut stdout,
                         spec,
@@ -1726,11 +1739,17 @@ impl Mgmt {
                     ),
                     (
                         "Sent:".to_string(),
-                        vec![(UI_BLUE, ui_money(Transaction::from_units(stats.sent_units), 4))],
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.sent_units), 4),
+                        )],
                     ),
                     (
                         "Fees Paid:".to_string(),
-                        vec![(UI_BLUE, ui_money(Transaction::from_units(stats.fees_units), 4))],
+                        vec![(
+                            UI_BLUE,
+                            ui_money(Transaction::from_units(stats.fees_units), 4),
+                        )],
                     ),
                     (
                         "First Activity:".to_string(),
@@ -1773,10 +1792,7 @@ impl Mgmt {
                     })
                     .collect();
                 if left_rows.is_empty() {
-                    left_rows.push((
-                        "Maturing:".to_string(),
-                        vec![(UI_DIM, "none".to_string())],
-                    ));
+                    left_rows.push(("Maturing:".to_string(), vec![(UI_DIM, "none".to_string())]));
                 } else {
                     let next_left = breakdown
                         .maturing
@@ -1854,9 +1870,25 @@ impl Mgmt {
                             ui_pad(&mut stdout, spec, 0, PARTY)?;
                             ui_seg(&mut stdout, spec, UI_DIM, false, "counterparty")?;
                             let mut col = PARTY + 12;
-                            col = ui_right(&mut stdout, spec, col, AMOUNT_END, UI_DIM, false, "amount")?;
+                            col = ui_right(
+                                &mut stdout,
+                                spec,
+                                col,
+                                AMOUNT_END,
+                                UI_DIM,
+                                false,
+                                "amount",
+                            )?;
                             col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, "age")?;
-                            col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "height")?;
+                            col = ui_right(
+                                &mut stdout,
+                                spec,
+                                col,
+                                HEIGHT_END,
+                                UI_DIM,
+                                false,
+                                "height",
+                            )?;
                             ui_right(&mut stdout, spec, col, CONF_END, UI_DIM, false, "conf")?;
                             writeln!(stdout)?;
 
@@ -1887,12 +1919,28 @@ impl Mgmt {
                                     sign,
                                     ui_money(Transaction::from_units(entry.amount_units), 5)
                                 );
-                                col = ui_right(&mut stdout, spec, col, AMOUNT_END, hue, false, &amount)?;
+                                col = ui_right(
+                                    &mut stdout,
+                                    spec,
+                                    col,
+                                    AMOUNT_END,
+                                    hue,
+                                    false,
+                                    &amount,
+                                )?;
                                 let age = ui_age(now_secs.saturating_sub(entry.timestamp));
-                                col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
-                                let height = ui_thousands(entry.height as u64);
                                 col =
-                                    ui_right(&mut stdout, spec, col, HEIGHT_END, UI_BLUE, false, &height)?;
+                                    ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
+                                let height = ui_thousands(entry.height as u64);
+                                col = ui_right(
+                                    &mut stdout,
+                                    spec,
+                                    col,
+                                    HEIGHT_END,
+                                    UI_BLUE,
+                                    false,
+                                    &height,
+                                )?;
                                 // Depth from the SAME height the balance was read at,
                                 // so confirmations can never disagree with the figures
                                 // in the banner above.
@@ -1932,16 +1980,13 @@ impl Mgmt {
                             // rather than letting the label overclaim. Coinbase rows are
                             // excluded: MINING_REWARDS is not a counterparty anyone deals
                             // with, and it would win `frequent` outright on a miner.
-                            let (last_in, last_out, frequent) =
-                                notable_counterparties(&recent);
+                            let (last_in, last_out, frequent) = notable_counterparties(&recent);
 
-                            if last_in.is_some() || last_out.is_some() || frequent.is_some()
-                            {
+                            if last_in.is_some() || last_out.is_some() || frequent.is_some() {
                                 writeln!(stdout)?;
                                 ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
                                 ui_seg(&mut stdout, spec, UI_BLUE, true, "Counterparties")?;
-                                let note =
-                                    format!("within the last {} shown", recent.len());
+                                let note = format!("within the last {} shown", recent.len());
                                 ui_pad(&mut stdout, spec, 16, 78 - note.chars().count())?;
                                 ui_seg(&mut stdout, spec, UI_DIM, false, &note)?;
                                 writeln!(stdout)?;
@@ -1977,7 +2022,10 @@ impl Mgmt {
                                         "last in",
                                         UI_GREEN,
                                         &e.counterparty,
-                                        format!("+{:.8} ♦", Transaction::from_units(e.amount_units)),
+                                        format!(
+                                            "+{:.8} ♦",
+                                            Transaction::from_units(e.amount_units)
+                                        ),
                                     )?;
                                 }
                                 if let Some(e) = last_out {
@@ -1985,7 +2033,10 @@ impl Mgmt {
                                         "last out",
                                         UI_PINK,
                                         &e.counterparty,
-                                        format!("-{:.8} ♦", Transaction::from_units(e.amount_units)),
+                                        format!(
+                                            "-{:.8} ♦",
+                                            Transaction::from_units(e.amount_units)
+                                        ),
                                     )?;
                                 }
                                 if let Some((party, n)) = frequent {
@@ -2055,11 +2106,21 @@ impl Mgmt {
             match arg.parse::<usize>() {
                 Ok(n) if (1..=50).contains(&n) => rows_wanted = n,
                 _ => {
-                    ui_seg(&mut stdout, spec, UI_DIM, false,
-                        " Usage: history [rows]   ")?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        " Usage: history [rows]   ",
+                    )?;
                     ui_seg(&mut stdout, spec, UI_MUTED, false, "rows 1-50, default 12")?;
-                    ui_seg(&mut stdout, spec, UI_DIM, false,
-                        "   ·   one address: account <address>\n")?;
+                    ui_seg(
+                        &mut stdout,
+                        spec,
+                        UI_DIM,
+                        false,
+                        "   ·   one address: account <address>\n",
+                    )?;
                     stdout.reset()?;
                     return Ok(());
                 }
@@ -2069,8 +2130,13 @@ impl Mgmt {
         let Ok(guard) =
             tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
         else {
-            ui_seg(&mut stdout, spec, UI_ORANGE, false,
-                " chain busy (syncing/reorg in progress) — try history again shortly\n")?;
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " chain busy (syncing/reorg in progress) — try history again shortly\n",
+            )?;
             stdout.reset()?;
             return Ok(());
         };
@@ -2100,8 +2166,7 @@ impl Mgmt {
                 for e in recent {
                     // Read every flag BEFORE moving the counterparty string out.
                     let (sender, recipient) = (e.is_sender(), e.is_recipient());
-                    let coinbase =
-                        recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
+                    let coinbase = recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
                     entries.push(Entry {
                         wallet: name.clone(),
                         counterparty: e.counterparty,
@@ -2162,7 +2227,9 @@ impl Mgmt {
                 .then_with(|| b.timestamp.cmp(&a.timestamp))
         });
         entries.dedup_by(|a, b| {
-            a.wallet == b.wallet && a.height == b.height && a.position == b.position
+            a.wallet == b.wallet
+                && a.height == b.height
+                && a.position == b.position
                 && a.height.is_some()
         });
         // Pending first, then confirmed newest-first.
@@ -2202,7 +2269,12 @@ impl Mgmt {
         } else {
             format!("{} wallets · tip {}", wallets.len(), ui_thousands(tip))
         };
-        ui_pad(&mut stdout, spec, 8, 78usize.saturating_sub(note.chars().count()))?;
+        ui_pad(
+            &mut stdout,
+            spec,
+            8,
+            78usize.saturating_sub(note.chars().count()),
+        )?;
         ui_seg(
             &mut stdout,
             spec,
@@ -2233,7 +2305,12 @@ impl Mgmt {
                 false,
                 &format!("{} of {}", shown, total),
             )?;
-            ui_pad(&mut stdout, spec, 12 + format!("{} of {}", shown, total).chars().count(), 30)?;
+            ui_pad(
+                &mut stdout,
+                spec,
+                12 + format!("{} of {}", shown, total).chars().count(),
+                30,
+            )?;
             ui_seg(&mut stdout, spec, UI_DIM, false, "net  ")?;
             ui_seg(
                 &mut stdout,
@@ -2252,8 +2329,13 @@ impl Mgmt {
         writeln!(stdout)?;
 
         if !index_ready {
-            ui_seg(&mut stdout, spec, UI_ORANGE, false,
-                " history unavailable — the address index is still building; retry shortly")?;
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " history unavailable — the address index is still building; retry shortly",
+            )?;
             writeln!(stdout)?;
             writeln!(stdout)?;
             stdout.reset()?;
@@ -2313,11 +2395,7 @@ impl Mgmt {
             let party = ui_address(&e.counterparty);
             ui_text(&mut stdout, spec, false, &party)?;
             let mut col = PARTY + party.chars().count();
-            let amount = format!(
-                "{}{:.8} ♦",
-                sign,
-                Transaction::from_units(e.amount_units)
-            );
+            let amount = format!("{}{:.8} ♦", sign, Transaction::from_units(e.amount_units));
             col = ui_right(&mut stdout, spec, col, AMOUNT_END, hue, true, &amount)?;
             let age = ui_age(now.saturating_sub(e.timestamp));
             col = ui_right(&mut stdout, spec, col, AGE_END, UI_DIM, false, &age)?;
@@ -2338,11 +2416,27 @@ impl Mgmt {
                     } else {
                         UI_DIM
                     };
-                    col = ui_right(&mut stdout, spec, col, CONF_END, conf_hue, false, &conf_text)?;
+                    col = ui_right(
+                        &mut stdout,
+                        spec,
+                        col,
+                        CONF_END,
+                        conf_hue,
+                        false,
+                        &conf_text,
+                    )?;
                 }
                 None => {
                     col = ui_right(&mut stdout, spec, col, HEIGHT_END, UI_DIM, false, "—")?;
-                    col = ui_right(&mut stdout, spec, col, CONF_END, UI_ORANGE, false, "pending")?;
+                    col = ui_right(
+                        &mut stdout,
+                        spec,
+                        col,
+                        CONF_END,
+                        UI_ORANGE,
+                        false,
+                        "pending",
+                    )?;
                 }
             }
             ui_pad(&mut stdout, spec, col, WALLET_AT)?;
@@ -2374,8 +2468,13 @@ impl Mgmt {
         let Ok(blockchain_guard) =
             tokio::time::timeout(std::time::Duration::from_secs(3), self.blockchain.read()).await
         else {
-            let _ = ui_seg(&mut stdout, spec, UI_ORANGE, false,
-                "\nChain busy (syncing/reorg in progress) — try `balance` again shortly.\n");
+            let _ = ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                "\nChain busy (syncing/reorg in progress) — try `balance` again shortly.\n",
+            );
             let _ = stdout.reset();
             return;
         };
@@ -2547,7 +2646,11 @@ impl Mgmt {
             (format!("synced · {}", ui_thousands(tip)), UI_GREEN)
         } else {
             (
-                format!("{} behind · {}", ui_thousands(behind as u64), ui_thousands(tip)),
+                format!(
+                    "{} behind · {}",
+                    ui_thousands(behind as u64),
+                    ui_thousands(tip)
+                ),
                 UI_ORANGE,
             )
         };
@@ -2619,7 +2722,11 @@ impl Mgmt {
                 "spendable",
                 UI_DIM,
                 row.spendable,
-                if row.spendable > 0.0 { UI_CYAN } else { UI_FAINT },
+                if row.spendable > 0.0 {
+                    UI_CYAN
+                } else {
+                    UI_FAINT
+                },
                 row.spendable > 0.0,
                 Some(if row.spendable > 0.0 {
                     format!("{:>5.1}%", share * 100.0)
@@ -2647,7 +2754,15 @@ impl Mgmt {
                 );
             }
             if row.pending > 0.0 {
-                out!("outbound", UI_DIM, row.pending, UI_PINK, false, None, "in mempool");
+                out!(
+                    "outbound",
+                    UI_DIM,
+                    row.pending,
+                    UI_PINK,
+                    false,
+                    None,
+                    "in mempool"
+                );
             }
             // The identity only earns a line when there is something to add up.
             if row.maturing > 0.0 || row.pending > 0.0 {
@@ -2963,14 +3078,18 @@ mod tests {
     #[test]
     fn counterparties_pick_the_latest_in_each_direction() {
         let recent = vec![
-            entry("bbbb", 300, true),   // newest: outbound
-            entry("aaaa", 299, false),  // inbound
-            entry("cccc", 298, true),   // older outbound — must lose to bbbb
+            entry("bbbb", 300, true),  // newest: outbound
+            entry("aaaa", 299, false), // inbound
+            entry("cccc", 298, true),  // older outbound — must lose to bbbb
             entry("aaaa", 297, false),
         ];
         let (last_in, last_out, frequent) = notable_counterparties(&recent);
         assert_eq!(last_in.unwrap().counterparty, "aaaa");
-        assert_eq!(last_out.unwrap().counterparty, "bbbb", "the LATEST outbound, not the first seen");
+        assert_eq!(
+            last_out.unwrap().counterparty,
+            "bbbb",
+            "the LATEST outbound, not the first seen"
+        );
         assert_eq!(frequent.unwrap(), ("aaaa", 2));
     }
 
@@ -2985,7 +3104,11 @@ mod tests {
         recent.push(entry("dddd", 299, true));
 
         let (last_in, last_out, frequent) = notable_counterparties(&recent);
-        assert_eq!(last_in.unwrap().counterparty, "dddd", "coinbase is not an inbound counterparty");
+        assert_eq!(
+            last_in.unwrap().counterparty,
+            "dddd",
+            "coinbase is not an inbound counterparty"
+        );
         assert_eq!(last_out.unwrap().counterparty, "dddd");
         assert_eq!(
             frequent.unwrap(),
@@ -3000,7 +3123,10 @@ mod tests {
         let recent = vec![entry("aaaa", 300, false), entry("bbbb", 299, true)];
         let (last_in, last_out, frequent) = notable_counterparties(&recent);
         assert!(last_in.is_some() && last_out.is_some());
-        assert!(frequent.is_none(), "no repeat counterparty means no frequent row");
+        assert!(
+            frequent.is_none(),
+            "no repeat counterparty means no frequent row"
+        );
     }
 
     // Ties must not follow hash order, or the row changes between runs on identical data.
@@ -3034,7 +3160,11 @@ mod tests {
         // chars(), not len(): the ♦ is three bytes and one display column.
         assert_eq!(ui_money(0.0, 4).chars().count(), 15);
         assert_eq!(ui_money(9_999.999_999_99, 4).chars().count(), 15);
-        assert_eq!(ui_money(10_000.0, 4).chars().count(), 16, "10k adds a column");
+        assert_eq!(
+            ui_money(10_000.0, 4).chars().count(),
+            16,
+            "10k adds a column"
+        );
         assert_eq!(ui_money(123_456.789, 4).chars().count(), 17);
         assert_eq!(ui_money(33_554_432.0, 4).chars().count(), 19);
         // byte length would over-count the ♦ by two and mis-place every column.
@@ -3072,7 +3202,10 @@ mod tests {
         assert_eq!(auto.fee_units, None, "auto fee is resolved by the handler");
 
         let large = parse_create_transaction_command("create sender recipient 1000000").unwrap();
-        assert_eq!(large.fee_units, None, "no amount-proportional default remains");
+        assert_eq!(
+            large.fee_units, None,
+            "no amount-proportional default remains"
+        );
     }
 
     #[test]
@@ -3150,7 +3283,10 @@ mod tests {
 
         let safety_limit =
             parse_create_transaction_command("create sender recipient 1 --fee 0.01").unwrap();
-        assert_eq!(safety_limit.fee_units, Some(EXPLICIT_FEE_SAFETY_LIMIT_UNITS));
+        assert_eq!(
+            safety_limit.fee_units,
+            Some(EXPLICIT_FEE_SAFETY_LIMIT_UNITS)
+        );
 
         assert!(
             parse_create_transaction_command("create sender recipient 1 --fee 0.00009999")
@@ -3205,7 +3341,9 @@ mod tests {
     fn only_notfound_read_error_is_first_run() {
         assert!(load_error_is_first_run(&Error::from(ErrorKind::NotFound)));
 
-        assert!(!load_error_is_first_run(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!load_error_is_first_run(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
         assert!(!load_error_is_first_run(&Error::new(
             ErrorKind::InvalidData,
             "non-utf8 key file"
@@ -3232,7 +3370,8 @@ mod tests {
         assert!(!std::path::Path::new(bad_path).exists());
 
         // SUCCESS: a writable path persists the key set and returns Ok.
-        let ok_path = std::env::temp_dir().join(format!("a9-persist-ok-{}.key", std::process::id()));
+        let ok_path =
+            std::env::temp_dir().join(format!("a9-persist-ok-{}.key", std::process::id()));
         let ok_path_str = ok_path.to_str().expect("temp path is valid utf-8");
         assert!(
             persist_wallet_keys(ok_path_str, &[]).await.is_ok(),

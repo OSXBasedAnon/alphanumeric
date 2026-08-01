@@ -1075,7 +1075,10 @@ pub enum BlockchainError {
     FeeBelowRelayFloor,
     /// A canonical row in [0, tip] is absent, undecodable, or fails structural
     /// authentication. Derived indexes must never be published from such a chain.
-    CanonicalCorruption { height: u32, reason: String },
+    CanonicalCorruption {
+        height: u32,
+        reason: String,
+    },
     BatchValidationFailed(Vec<usize>),
 }
 
@@ -2028,12 +2031,7 @@ impl Blockchain {
         // and the next windowless reconcile pays one full recovery instead of
         // risking silent H4-class poison. recover_dirty_chain_state discharges
         // the counter before its own clear, so recovery always passes here.
-        if self
-            .apply_batch
-            .unbalanced_marks
-            .load(Ordering::Acquire)
-            != 0
-        {
+        if self.apply_batch.unbalanced_marks.load(Ordering::Acquire) != 0 {
             error!(
                 "Durable dirty-marker clear refused: an apply window's pair count is unbalanced; leaving marker for recovery"
             );
@@ -2078,7 +2076,9 @@ impl Blockchain {
             // cheap flush+clear close instead of a full rebuild.
             self.reconcile_chain_state_if_dirty().await?;
             self.apply_batch.marked.store(false, Ordering::Release);
-            self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+            self.apply_batch
+                .unbalanced_marks
+                .store(0, Ordering::Release);
             self.apply_batch
                 .opened_this_process
                 .store(true, Ordering::Release);
@@ -2192,7 +2192,9 @@ impl Blockchain {
         // Everything the pair counter guarded is now healed from the
         // canonical store — discharge it BEFORE the clear, so the durable
         // clear's unbalanced backstop never blocks recovery's own close.
-        self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+        self.apply_batch
+            .unbalanced_marks
+            .store(0, Ordering::Release);
         self.clear_chain_state_dirty()?; // (5) clear LAST
 
         // STARTUP reports AFTERWARDS, and only if there was something to report.
@@ -2261,7 +2263,9 @@ impl Blockchain {
                 if let Some(marker) = dirty {
                     self.recover_dirty_chain_state(&marker, false).await?;
                 }
-                self.apply_batch.unbalanced_marks.store(0, Ordering::Release);
+                self.apply_batch
+                    .unbalanced_marks
+                    .store(0, Ordering::Release);
             }
             return Ok(());
         }
@@ -2314,7 +2318,8 @@ impl Blockchain {
             .and_then(|raw| codec::deserialize::<u32>(&raw).ok())
         {
             Some(height) => {
-                self.last_known_checkpoint.store(height as u64, Ordering::Release);
+                self.last_known_checkpoint
+                    .store(height as u64, Ordering::Release);
                 height
             }
             None => {
@@ -2365,9 +2370,8 @@ impl Blockchain {
     /// verification, never less.
     pub fn raise_trusted_checkpoint(&self, height: u32) -> Result<(), BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
-        let height = height.min(
-            (self.get_latest_block_index() as u32).saturating_sub(CHECKPOINT_REORG_MARGIN),
-        );
+        let height = height
+            .min((self.get_latest_block_index() as u32).saturating_sub(CHECKPOINT_REORG_MARGIN));
         let encoded = codec::serialize(&height)?;
         meta_tree.update_and_fetch(TRUSTED_CHECKPOINT_KEY, |old| {
             let current = old
@@ -3803,7 +3807,8 @@ impl Blockchain {
         // prolonging the fork. Keep all eligible branches so a rejected best falls through to the
         // next-best VALID branch — the deterministic lowest-hash tie-break is then resolved over
         // ADOPTABLE branches only.
-        #[allow(clippy::type_complexity)] // Branch, branch work, canonical work, deterministic tip key.
+        #[allow(clippy::type_complexity)]
+        // Branch, branch work, canonical work, deterministic tip key.
         let mut ranked: Vec<(Vec<Arc<Block>>, BigUint, BigUint, [u8; 32])> = Vec::new();
         let mut branches_evaluated: usize = 0;
         // Read the finality checkpoint once (monotonic within a pass). Every branch from a candidate
@@ -4152,9 +4157,7 @@ impl Blockchain {
         // flush below covers it; failures are logged per transaction, never fatal, because a
         // missing witness must not abort an otherwise-valid adoption.
         for b in &branch {
-            if let Err(e) =
-                self.retain_confirmed_witnesses(&b.transactions, b.index as u64, true)
-            {
+            if let Err(e) = self.retain_confirmed_witnesses(&b.transactions, b.index as u64, true) {
                 warn!(
                     "Reorg: could not retain witnesses for adopted block {}: {}",
                     b.index, e
@@ -4354,8 +4357,10 @@ impl Blockchain {
         // Rebuilds the missing index entry instead of deleting the body: the entry restores
         // prunability, and the normal retention rules then decide the block's fate on the next
         // pass, which is a strictly safer default than discarding a block a reorg might want.
-        if !self.orphan_index_reconciled
-            .swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if !self
+            .orphan_index_reconciled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             let mut repaired = 0usize;
             for item in orphan_blocks.iter() {
                 let (key, raw) = item?;
@@ -6516,8 +6521,9 @@ impl Blockchain {
     /// consume the richer outcome.
     pub async fn add_transaction(&self, transaction: Transaction) -> Result<(), BlockchainError> {
         match self.admit_transaction(transaction).await? {
-            TransactionAdmissionOutcome::Inserted
-            | TransactionAdmissionOutcome::AlreadyPending => Ok(()),
+            TransactionAdmissionOutcome::Inserted | TransactionAdmissionOutcome::AlreadyPending => {
+                Ok(())
+            }
             TransactionAdmissionOutcome::AlreadyConfirmed(_) => {
                 Err(BlockchainError::InvalidTransaction)
             }
@@ -8745,7 +8751,12 @@ mod tests {
         ];
         // Pre-activation, activation edge, post-activation; and reward periods
         // 0 / 1 / 3 so the halving branch is exercised too.
-        let heights = [1u32, FEE_SYSTEM_ACTIVATION_HEIGHT - 1, FEE_SYSTEM_ACTIVATION_HEIGHT, 900_000];
+        let heights = [
+            1u32,
+            FEE_SYSTEM_ACTIVATION_HEIGHT - 1,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+            900_000,
+        ];
         let stamps = [
             genesis_ts,
             genesis_ts + 15_768_000,
@@ -8794,7 +8805,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(compared, 120, "every shape/height/period combination must be compared");
+        assert_eq!(
+            compared, 120,
+            "every shape/height/period combination must be compared"
+        );
     }
 
     // The packer's running accountant must admit and reject EXACTLY the set the
@@ -8833,7 +8847,8 @@ mod tests {
             let running = accounting.admits(&bc, tx).unwrap();
 
             assert_eq!(
-                reference, running,
+                reference,
+                running,
                 "verdict diverged at candidate {} (fee {})",
                 idx,
                 tx.fee()
@@ -8875,7 +8890,6 @@ mod tests {
             accounting.commit(&fat).unwrap();
         }
     }
-
 
     // `reduction_factor` REPLACED `f64::powi` in the coinbase formula. The coinbase
     // is validated by exact equality, so if the two ever disagreed by a single bit
@@ -8921,7 +8935,9 @@ mod tests {
                 MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
             };
             let reward_floor = MIN_BLOCK_REWARD.min(current_max);
-            Transaction::round_amount((base_reward + effective_fees).clamp(reward_floor, current_max))
+            Transaction::round_amount(
+                (base_reward + effective_fees).clamp(reward_floor, current_max),
+            )
         }
 
         const SIX_MONTHS: u64 = 15_768_000;
@@ -8975,7 +8991,9 @@ mod tests {
                 MIN_BLOCK_REWARD + ((current_max - MIN_BLOCK_REWARD) * fee_factor)
             };
             let reward_floor = MIN_BLOCK_REWARD.min(current_max);
-            Transaction::round_amount((base_reward + effective_fees).clamp(reward_floor, current_max))
+            Transaction::round_amount(
+                (base_reward + effective_fees).clamp(reward_floor, current_max),
+            )
         }
 
         // Timestamps: before genesis (saturating_sub floors the age at 0), the
@@ -8990,13 +9008,10 @@ mod tests {
         }
 
         let fee_shapes = [
-            0.0f64,
-            1e-8,                 // one unit
-            0.726_392,            // the admissible-band edge
-            3.846,                // fee_factor saturation point
-            40.0,
-            1e6,
-            1e18,                 // absurd but finite
+            0.0f64, 1e-8,      // one unit
+            0.726_392, // the admissible-band edge
+            3.846,     // fee_factor saturation point
+            40.0, 1e6, 1e18, // absurd but finite
         ];
         let counts = [0usize, 1, MAX_BLOCK_TX_COUNT - 1, MAX_BLOCK_TX_COUNT];
 
@@ -9005,8 +9020,12 @@ mod tests {
             let periods = ts.saturating_sub(genesis_ts) / SIX_MONTHS;
             let factor = Blockchain::reduction_factor(periods);
             let current_max = MAX_BLOCK_REWARD * factor;
-            assert!(factor.is_finite() && (0.0..=1.0).contains(&factor),
-                "decay factor out of range at ts {}: {}", ts, factor);
+            assert!(
+                factor.is_finite() && (0.0..=1.0).contains(&factor),
+                "decay factor out of range at ts {}: {}",
+                ts,
+                factor
+            );
 
             for &n in &counts {
                 for &fees in &fee_shapes {
@@ -9015,8 +9034,20 @@ mod tests {
                         .block_reward_from_totals(1_000, ts, n, fees)
                         .expect("reward must compute for every input");
 
-                    assert!(got.is_finite(), "non-finite reward at ts {} n {} fees {}", ts, n, fees);
-                    assert!(got >= 0.0, "negative reward at ts {} n {} fees {}", ts, n, fees);
+                    assert!(
+                        got.is_finite(),
+                        "non-finite reward at ts {} n {} fees {}",
+                        ts,
+                        n,
+                        fees
+                    );
+                    assert!(
+                        got >= 0.0,
+                        "negative reward at ts {} n {} fees {}",
+                        ts,
+                        n,
+                        fees
+                    );
                     // The ceiling invariant, with the one tolerance the formula
                     // genuinely needs: the clamp to current_max runs BEFORE the
                     // 8-decimal rounding, so rounding can carry the result up to
@@ -9030,24 +9061,42 @@ mod tests {
                     assert!(
                         got <= current_max + 1e-8,
                         "reward {} exceeded ceiling {} by more than a unit at ts {} n {} fees {}",
-                        got, current_max, ts, n, fees
+                        got,
+                        current_max,
+                        ts,
+                        n,
+                        fees
                     );
                     // and it must convert to units without trapping
                     let units = Transaction::to_units(got);
-                    assert!(units >= 0, "negative units at ts {} n {} fees {}", ts, n, fees);
+                    assert!(
+                        units >= 0,
+                        "negative units at ts {} n {} fees {}",
+                        ts,
+                        n,
+                        fees
+                    );
 
                     // and it must be what an un-upgraded node computes
                     let old_max = MAX_BLOCK_REWARD * REDUCTION_RATE.powi(periods.min(8192) as i32);
                     assert_eq!(
                         old_reward(old_max, n, fees).to_bits(),
                         got.to_bits(),
-                        "DIVERGED at ts {} periods {} n {} fees {}", ts, periods, n, fees
+                        "DIVERGED at ts {} periods {} n {} fees {}",
+                        ts,
+                        periods,
+                        n,
+                        fees
                     );
                     checked += 1;
                 }
             }
         }
-        assert!(checked > 800, "expected a broad sweep, only checked {}", checked);
+        assert!(
+            checked > 800,
+            "expected a broad sweep, only checked {}",
+            checked
+        );
     }
 
     // ADVERSARIAL: the activation boundary itself. An off-by-one here splits the
@@ -9063,8 +9112,8 @@ mod tests {
         let ts = genesis_ts + 3_000_000; // still period 0, as at the real activation
 
         let edge_fees = [
-            0.0f64, 1e-8, 0.0001, 0.0002,
-            0.726_391, 0.726_392, 0.726_393,   // either side of the band edge
+            0.0f64, 1e-8, 0.0001, 0.0002, 0.726_391, 0.726_392,
+            0.726_393, // either side of the band edge
             3.846, 40.0, 1e6,
         ];
 
@@ -9082,10 +9131,20 @@ mod tests {
                 let above = bc
                     .block_reward_from_totals(FEE_SYSTEM_ACTIVATION_HEIGHT + 1, ts, n, fees)
                     .unwrap();
-                assert_eq!(below.to_bits(), at.to_bits(),
-                    "coinbase changed across activation at fees {} n {}", fees, n);
-                assert_eq!(at.to_bits(), above.to_bits(),
-                    "coinbase changed after activation at fees {} n {}", fees, n);
+                assert_eq!(
+                    below.to_bits(),
+                    at.to_bits(),
+                    "coinbase changed across activation at fees {} n {}",
+                    fees,
+                    n
+                );
+                assert_eq!(
+                    at.to_bits(),
+                    above.to_bits(),
+                    "coinbase changed after activation at fees {} n {}",
+                    fees,
+                    n
+                );
             }
         }
 
@@ -9104,23 +9163,42 @@ mod tests {
         let over = vec![tx(5.0)];
         assert!(
             bc.template_fee_accounting_is_admissible_at(
-                FEE_SYSTEM_ACTIVATION_HEIGHT - 1, ts, &over, FEE_SYSTEM_ACTIVATION_HEIGHT
-            ).unwrap(),
+                FEE_SYSTEM_ACTIVATION_HEIGHT - 1,
+                ts,
+                &over,
+                FEE_SYSTEM_ACTIVATION_HEIGHT
+            )
+            .unwrap(),
             "the rule must be inert one block BEFORE activation"
         );
         assert!(
             !bc.template_fee_accounting_is_admissible_at(
-                FEE_SYSTEM_ACTIVATION_HEIGHT, ts, &over, FEE_SYSTEM_ACTIVATION_HEIGHT
-            ).unwrap(),
+                FEE_SYSTEM_ACTIVATION_HEIGHT,
+                ts,
+                &over,
+                FEE_SYSTEM_ACTIVATION_HEIGHT
+            )
+            .unwrap(),
             "the rule must be live exactly AT the activation height"
         );
         // An ordinary fee stays admissible on both sides — the rule must not be a
         // blanket reject.
         let ordinary = vec![tx(0.0002)];
-        for h in [FEE_SYSTEM_ACTIVATION_HEIGHT - 1, FEE_SYSTEM_ACTIVATION_HEIGHT, FEE_SYSTEM_ACTIVATION_HEIGHT + 1] {
+        for h in [
+            FEE_SYSTEM_ACTIVATION_HEIGHT - 1,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+            FEE_SYSTEM_ACTIVATION_HEIGHT + 1,
+        ] {
             assert!(
-                bc.template_fee_accounting_is_admissible_at(h, ts, &ordinary, FEE_SYSTEM_ACTIVATION_HEIGHT).unwrap(),
-                "an ordinary default-fee transaction must stay mineable at height {}", h
+                bc.template_fee_accounting_is_admissible_at(
+                    h,
+                    ts,
+                    &ordinary,
+                    FEE_SYSTEM_ACTIVATION_HEIGHT
+                )
+                .unwrap(),
+                "an ordinary default-fee transaction must stay mineable at height {}",
+                h
             );
         }
     }
@@ -9132,7 +9210,9 @@ mod tests {
         let _ = bc.genesis_timestamp.set(1_783_191_900);
         for fees in [0.0f64, 1.0, 1e12] {
             for n in [0usize, 1, 4095] {
-                let got = bc.block_reward_from_totals(0, 1_783_191_900, n, fees).unwrap();
+                let got = bc
+                    .block_reward_from_totals(0, 1_783_191_900, n, fees)
+                    .unwrap();
                 assert_eq!(got, GENESIS_LAUNCH_AMOUNT, "genesis reward moved");
             }
         }
@@ -9150,7 +9230,11 @@ mod tests {
         // today, the fee activation (~2026-08-09), and the day before the halving
         assert_eq!(period_at(1_785_265_500), 0, "2026-07-28");
         assert_eq!(period_at(1_786_300_000), 0, "~2026-08-09, fee activation");
-        assert_eq!(period_at(genesis + SIX_MONTHS - 1), 0, "instant before halving");
+        assert_eq!(
+            period_at(genesis + SIX_MONTHS - 1),
+            0,
+            "instant before halving"
+        );
         assert_eq!(period_at(genesis + SIX_MONTHS), 1, "first halving");
 
         // period 0 is exactly 1.0 — the identity, on every implementation.
@@ -9205,8 +9289,16 @@ mod tests {
         assert_eq!(Blockchain::reduction_factor(4000), 0.0);
         for periods in [8192u64, 100_000, 1 << 31, 1 << 40, u64::MAX] {
             let f = Blockchain::reduction_factor(periods);
-            assert_eq!(f, 0.0, "absurd period {} must decay to zero, got {}", periods, f);
-            assert!(f.is_finite(), "period {} produced a non-finite factor", periods);
+            assert_eq!(
+                f, 0.0,
+                "absurd period {} must decay to zero, got {}",
+                periods, f
+            );
+            assert!(
+                f.is_finite(),
+                "period {} produced a non-finite factor",
+                periods
+            );
         }
         // And the reward path stays sane rather than exploding.
         let ceiling = MAX_BLOCK_REWARD * Blockchain::reduction_factor(u64::MAX);
@@ -9454,7 +9546,9 @@ mod tests {
         // What an adopted branch block actually carries: the truncated storage form.
         let stored = full.with_truncated_signature(sig_hash.clone());
         assert_eq!(
-            hex::decode(stored.signature.as_ref().unwrap()).unwrap().len(),
+            hex::decode(stored.signature.as_ref().unwrap())
+                .unwrap()
+                .len(),
             64,
             "precondition: a branch block's copy is a 64-byte prefix"
         );
@@ -10067,7 +10161,10 @@ mod tests {
             .await
             .expect("healthy chain rebuilds");
         let healthy = dump_raw_tree(&tree);
-        assert!(healthy.len() > 1, "precondition: balances and watermark exist");
+        assert!(
+            healthy.len() > 1,
+            "precondition: balances and watermark exist"
+        );
 
         // Interior corruption: block 3 vanishes, tip stays 6.
         delete_raw_block(&bc, 3);
@@ -10077,10 +10174,7 @@ mod tests {
             .await
             .expect_err("a canonical gap must NOT rebuild");
         assert!(
-            matches!(
-                err,
-                BlockchainError::CanonicalCorruption { height: 3, .. }
-            ),
+            matches!(err, BlockchainError::CanonicalCorruption { height: 3, .. }),
             "expected typed corruption at height 3, got {err:?}"
         );
         assert_eq!(
@@ -10128,10 +10222,7 @@ mod tests {
             .rebuild_confirmed_tx_index()
             .expect_err("a canonical gap must NOT rebuild");
         assert!(
-            matches!(
-                err,
-                BlockchainError::CanonicalCorruption { height: 2, .. }
-            ),
+            matches!(err, BlockchainError::CanonicalCorruption { height: 2, .. }),
             "expected typed corruption at height 2, got {err:?}"
         );
         assert_eq!(dump_raw_tree(&confirmed), confirmed_before);
@@ -10152,10 +10243,7 @@ mod tests {
             .await
             .expect_err("missing genesis must NOT rebuild");
         assert!(
-            matches!(
-                err,
-                BlockchainError::CanonicalCorruption { height: 0, .. }
-            ),
+            matches!(err, BlockchainError::CanonicalCorruption { height: 0, .. }),
             "expected typed corruption at height 0, got {err:?}"
         );
     }
@@ -10176,10 +10264,7 @@ mod tests {
             .await
             .expect_err("undecodable block must NOT rebuild");
         assert!(
-            matches!(
-                err,
-                BlockchainError::CanonicalCorruption { height: 2, .. }
-            ),
+            matches!(err, BlockchainError::CanonicalCorruption { height: 2, .. }),
             "expected typed corruption at height 2, got {err:?}"
         );
     }
@@ -10207,17 +10292,17 @@ mod tests {
                 _ => unreachable!(),
             }
             bc.db
-                .insert(b"block_2", codec::serialize(&block).expect("serialize fault"))
+                .insert(
+                    b"block_2",
+                    codec::serialize(&block).expect("serialize fault"),
+                )
                 .expect("overwrite block 2");
 
             let err = bc
                 .validate_canonical_chain_structure()
                 .expect_err("decodable structural corruption must fail closed");
             assert!(
-                matches!(
-                    err,
-                    BlockchainError::CanonicalCorruption { height: 2, .. }
-                ),
+                matches!(err, BlockchainError::CanonicalCorruption { height: 2, .. }),
                 "{fault} fault should be attributed to height 2, got {err:?}"
             );
         }
@@ -12928,11 +13013,8 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let index_key = Blockchain::orphan_index_key(
-            &stranded.previous_hash,
-            stranded.index,
-            &stranded.hash,
-        );
+        let index_key =
+            Blockchain::orphan_index_key(&stranded.previous_hash, stranded.index, &stranded.hash);
         assert!(
             index_tree.get(index_key.as_bytes()).unwrap().is_none(),
             "precondition: the body has no index entry"
@@ -13957,7 +14039,10 @@ mod tests {
         Blockchain::set_balances_height(&balances, 2).unwrap();
         bc.mark_chain_state_dirty(2, "finalize_block").unwrap();
 
-        let batch = bc.begin_receipt_batch().await.expect("begin heals then opens");
+        let batch = bc
+            .begin_receipt_batch()
+            .await
+            .expect("begin heals then opens");
         assert_eq!(
             bc.chain_state_dirty().unwrap(),
             None,
@@ -15062,12 +15147,8 @@ mod tests {
         let debits = bc
             .open_pending_debits_tree()
             .expect("pending debits tree should open");
-        Blockchain::set_pending_debit_for(
-            &debits,
-            &wallet.address,
-            tx.total_debit_units(),
-        )
-        .expect("pending debit should reserve");
+        Blockchain::set_pending_debit_for(&debits, &wallet.address, tx.total_debit_units())
+            .expect("pending debit should reserve");
         assert!(
             bc.get_pending_debit_units(&wallet.address).await.unwrap() > 0,
             "the debit must be reserved before eviction, or the assertion below is vacuous"
@@ -15227,9 +15308,10 @@ mod tests {
             .as_secs();
         for recipient in ["NOT_AN_ADDRESS", "ZZZZ", &"AB".repeat(20), "MINING_REWARDS"] {
             let tx = signed_transfer(&wallet, recipient, 1.0, now).await;
-            let err = bc.add_transaction(tx).await.expect_err(
-                "a non-canonical recipient must not enter the mempool",
-            );
+            let err = bc
+                .add_transaction(tx)
+                .await
+                .expect_err("a non-canonical recipient must not enter the mempool");
             assert!(
                 matches!(err, BlockchainError::NonCanonicalTransaction),
                 "expected NonCanonicalTransaction for {:?}, got {:?}",

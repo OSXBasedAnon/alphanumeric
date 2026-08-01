@@ -13,8 +13,8 @@ use tokio::time::interval;
 
 use crate::a9::blockchain::{
     current_finalize_stage, finalize_stage_name, pow_target_bytes, pow_target_from_difficulty,
-    set_finalize_stage, BlockchainError, FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT_BYTES, MAX_TEMPLATE_TX_BYTES, NETWORK_FEE, TemplateFeeAccounting,
+    set_finalize_stage, BlockchainError, TemplateFeeAccounting, FEE_SYSTEM_ACTIVATION_HEIGHT,
+    MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES, MAX_TEMPLATE_TX_BYTES, NETWORK_FEE,
 };
 use crate::a9::blockchain::{Block, Blockchain, Transaction};
 use crate::a9::codec;
@@ -672,10 +672,7 @@ impl MiningManager {
                                 }
 
                                 // Preserve the explicit cadence gate and its short-circuit boundary.
-                                #[allow(
-                                    clippy::collapsible_if,
-                                    clippy::manual_is_multiple_of
-                                )]
+                                #[allow(clippy::collapsible_if, clippy::manual_is_multiple_of)]
                                 if nonce % TIP_CHANGE_CHECK_INTERVAL == 0 {
                                     if tip_change_counter_check.load(Ordering::Acquire)
                                         != template_tip_version

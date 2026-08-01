@@ -8,9 +8,9 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use crate::a9::mldsa;
 
@@ -350,7 +350,10 @@ mod tests {
     #[test]
     fn wallet_debug_never_renders_key_material() {
         let wallet = Wallet::new(None).expect("unencrypted wallet");
-        assert!(!wallet.is_encrypted, "this test must cover the RAW-key case");
+        assert!(
+            !wallet.is_encrypted,
+            "this test must cover the RAW-key case"
+        );
 
         let key_bytes = wallet
             .encrypted_private_key
@@ -388,7 +391,9 @@ mod tests {
         let wallet = Wallet::new(None).expect("unencrypted wallet");
         let rendered = format!("{:?}", wallet);
         assert!(
-            !rendered.to_ascii_lowercase().contains("mldsa_secret_key_bytes: ["),
+            !rendered
+                .to_ascii_lowercase()
+                .contains("mldsa_secret_key_bytes: ["),
             "nested secret key bytes must not be rendered: {rendered}"
         );
     }
@@ -424,7 +429,9 @@ mod tests {
             Some(b"wrong passphrase"),
             true,
         );
-        assert!(wrong.is_err(), "a wrong passphrase must not restore a wallet");
+        assert!(
+            wrong.is_err(),
+            "a wrong passphrase must not restore a wallet"
+        );
     }
-
 }
