@@ -4,11 +4,11 @@ pub mod bpos;
 pub mod codec;
 pub mod mempool;
 pub mod mgmt;
+pub mod miner;
 pub mod mldsa;
 pub mod node;
 pub mod oracle;
 pub mod ui;
-pub mod miner;
 pub mod velocity;
 pub mod wallet;
 #[cfg(feature = "webrtc_mesh")]

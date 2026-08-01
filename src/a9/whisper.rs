@@ -549,11 +549,7 @@ mod tests {
                 // Exactly what handle_create_transaction now emits.
                 let sent = raw_fee_units.min(ceiling).max(10_000);
                 assert_eq!(
-                    w.decode_message_from_fee(
-                        Transaction::from_units(sent),
-                        0,
-                        amount
-                    ),
+                    w.decode_message_from_fee(Transaction::from_units(sent), 0, amount),
                     None,
                     "auto fee {} units on a {} coin payment decoded as a whisper",
                     sent,
@@ -580,7 +576,8 @@ mod tests {
                     amount
                 );
                 assert!(
-                    Transaction::to_units(fee) > max_non_whisper_fee_units(Transaction::to_units(amount)),
+                    Transaction::to_units(fee)
+                        > max_non_whisper_fee_units(Transaction::to_units(amount)),
                     "whisper {:?} at {} coins should sit above the payment ceiling",
                     code,
                     amount

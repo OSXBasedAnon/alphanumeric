@@ -145,7 +145,14 @@ pub fn spawn(blockchain: Arc<RwLock<Blockchain>>) {
             // immediately with the newest tip — the coalescing described above
             // falls out of the loop shape and needs no state of its own.
             let tip = *rx.borrow_and_update();
-            fire(&program, &args, &hex::encode(tip.hash), tip.height, HOOK_TIMEOUT).await;
+            fire(
+                &program,
+                &args,
+                &hex::encode(tip.hash),
+                tip.height,
+                HOOK_TIMEOUT,
+            )
+            .await;
         }
     });
 }
@@ -235,10 +242,7 @@ mod tests {
         assert_eq!(expand("%s", &hash, 42), hash);
         assert_eq!(expand("%h", &hash, 42), "42");
         assert_eq!(expand("--tip=%h", &hash, 7), "--tip=7");
-        assert_eq!(
-            expand("/n/%s/%h", &hash, 9),
-            format!("/n/{hash}/9")
-        );
+        assert_eq!(expand("/n/%s/%h", &hash, 9), format!("/n/{hash}/9"));
     }
 
     #[test]
@@ -292,7 +296,10 @@ mod tests {
             "%h".to_string(),
         ];
         let hash = "ab".repeat(32);
-        assert_eq!(fire("/bin/sh", &args, &hash, 4321, HOOK_TIMEOUT).await, Fired::Ok);
+        assert_eq!(
+            fire("/bin/sh", &args, &hash, 4321, HOOK_TIMEOUT).await,
+            Fired::Ok
+        );
 
         let written = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
@@ -307,7 +314,14 @@ mod tests {
     async fn a_nonzero_exit_is_reported_but_not_fatal() {
         // A pool's script failing must be visible and must not stop the loop.
         assert_eq!(
-            fire("/bin/sh", &["-c".to_string(), "exit 3".to_string()], "aa", 1, HOOK_TIMEOUT).await,
+            fire(
+                "/bin/sh",
+                &["-c".to_string(), "exit 3".to_string()],
+                "aa",
+                1,
+                HOOK_TIMEOUT
+            )
+            .await,
             Fired::Failed
         );
     }
@@ -316,7 +330,14 @@ mod tests {
     async fn a_missing_program_does_not_panic() {
         // A typo'd path must degrade to a warning, never take the node down.
         assert_eq!(
-            fire("/nonexistent/definitely-not-here", &[], "aa", 1, HOOK_TIMEOUT).await,
+            fire(
+                "/nonexistent/definitely-not-here",
+                &[],
+                "aa",
+                1,
+                HOOK_TIMEOUT
+            )
+            .await,
             Fired::NotStarted
         );
     }
@@ -339,7 +360,11 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the hook was awaited instead of being killed at its deadline"
         );
-        assert_eq!(fired, Fired::TimedOut, "a hung hook must be killed, not awaited");
+        assert_eq!(
+            fired,
+            Fired::TimedOut,
+            "a hung hook must be killed, not awaited"
+        );
     }
 
     // The hook is spawned, never shell-interpreted, so a template containing

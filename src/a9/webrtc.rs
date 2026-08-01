@@ -1715,8 +1715,8 @@ mod tests {
     /// propagation with no error, no log and no backoff.
     #[test]
     fn drain_response_tolerates_absence_but_rejects_malformed_envelopes() {
-        let empty: DrainResponse =
-            serde_json::from_str(r#"{"ok":true}"#).expect("absent envelopes is a valid empty drain");
+        let empty: DrainResponse = serde_json::from_str(r#"{"ok":true}"#)
+            .expect("absent envelopes is a valid empty drain");
         assert!(empty.envelopes.is_empty());
 
         let null: DrainResponse = serde_json::from_str(r#"{"ok":true,"envelopes":null}"#)
@@ -1752,5 +1752,4 @@ mod tests {
                 .expect("unknown fields must be ignored");
         assert!(parsed.envelopes.is_empty());
     }
-
 }
