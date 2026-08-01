@@ -3630,6 +3630,7 @@ impl Blockchain {
     /// Snapshot of the current witness-blocked branches for the Node-layer
     /// rehydrator (R): (branch_tip_hash, attempts, needed blocks). Prunes expired
     /// entries as a side effect.
+    #[allow(clippy::type_complexity)] // Protocol snapshot shape; a wrapper would obscure tuple order.
     pub fn witness_blocked_snapshot(&self) -> Vec<([u8; 32], u32, Vec<(u32, [u8; 32])>)> {
         let now = Self::now_unix_secs();
         let mut map = self.witness_blocked.lock();
@@ -3802,6 +3803,7 @@ impl Blockchain {
         // prolonging the fork. Keep all eligible branches so a rejected best falls through to the
         // next-best VALID branch — the deterministic lowest-hash tie-break is then resolved over
         // ADOPTABLE branches only.
+        #[allow(clippy::type_complexity)] // Branch, branch work, canonical work, deterministic tip key.
         let mut ranked: Vec<(Vec<Arc<Block>>, BigUint, BigUint, [u8; 32])> = Vec::new();
         let mut branches_evaluated: usize = 0;
         // Read the finality checkpoint once (monotonic within a pass). Every branch from a candidate
@@ -5044,6 +5046,7 @@ impl Blockchain {
     /// replay_revert_block is the exact inverse of the apply over the reverted
     /// span. Caller must hold balances_index_gate across this call AND the
     /// subsequent write-back so no concurrent catch-up moves the tree.
+    #[allow(clippy::type_complexity)] // Exact replay state; keep the fallible Option contract visible.
     fn balances_at_fork_state(
         &self,
         balances_tree: &sled::Tree,
@@ -6190,6 +6193,7 @@ impl Blockchain {
             .ok_or(BlockchainError::NonCanonicalTransaction)?;
         let is_full = Self::hex_field_has_decoded_len(signature, mldsa::SIGNATURE_BYTES);
         let is_receipt = Self::hex_field_has_decoded_len(signature, 64);
+        #[allow(clippy::nonminimal_bool)] // Read as the two explicit rejection conditions.
         if !is_full && !(sig_mode == SignatureValidationMode::AllowTruncatedStored && is_receipt) {
             return Err(BlockchainError::NonCanonicalTransaction);
         }
@@ -9182,7 +9186,11 @@ mod tests {
         let mut prev = f64::INFINITY;
         for periods in 0u64..=64 {
             let f = Blockchain::reduction_factor(periods);
-            assert!(f >= 0.0 && f <= 1.0, "factor out of range at {}", periods);
+            assert!(
+                (0.0..=1.0).contains(&f),
+                "factor out of range at {}",
+                periods
+            );
             assert!(f <= prev, "factor increased at {}", periods);
             prev = f;
         }
@@ -10577,6 +10585,7 @@ mod tests {
     const ESTIMATOR_NOW: u64 = 2_000_000_000;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // Named fee-policy ordering invariants; inline const is post-MSRV.
     fn fee_estimate_quiet_mempool_recommends_the_anchor() {
         let bc = test_blockchain();
 
@@ -11553,7 +11562,7 @@ mod tests {
 
     #[test]
     fn merkle_root_from_leaf_hashes_matches_transaction_path_for_all_shapes() {
-        let txs = vec![
+        let txs = [
             user_tx("alice", "bob", 1.0, 1),
             user_tx("carol", "dave", 2.0, 2),
             user_tx("erin", "frank", 3.0, 3),
@@ -11907,8 +11916,10 @@ mod tests {
         assert_eq!(scanned, 900, "only the reward < MATURITY deep is immature");
 
         // Replay the same two blocks through the replay helper and read its `recent` window.
-        let (mut bal, mut recent): (HashMap<String, i128>, VecDeque<(u32, String, i128)>) =
-            (HashMap::new(), VecDeque::new());
+        let (mut bal, mut recent) = (
+            HashMap::<String, i128>::new(),
+            VecDeque::<(u32, String, i128)>::new(),
+        );
         Blockchain::replay_apply_block_checked(
             mature_reward_h,
             &mature.transactions,
@@ -12568,7 +12579,7 @@ mod tests {
 
         // Three same-height (2), equal-work competitors off `block1`, ordered by hash so we can
         // name lowest / middle / highest deterministically regardless of how they hash.
-        let mut competitors = vec![
+        let mut competitors = [
             metadata_test_block(2, block1.hash, "comp_a", 1.0),
             metadata_test_block(2, block1.hash, "comp_b", 1.0),
             metadata_test_block(2, block1.hash, "comp_c", 1.0),
@@ -12586,17 +12597,17 @@ mod tests {
 
         // Equal work, same height, strictly LOWER hash -> adopt (the fix).
         assert!(
-            blockchain.external_branch_wins_fork_choice(&[lowest.clone()], 1, 2),
+            blockchain.external_branch_wins_fork_choice(std::slice::from_ref(&lowest), 1, 2),
             "must adopt a same-height equal-work competitor with a strictly lower tip hash"
         );
         // Equal work, same height, strictly HIGHER hash -> keep ours.
         assert!(
-            !blockchain.external_branch_wins_fork_choice(&[highest.clone()], 1, 2),
+            !blockchain.external_branch_wins_fork_choice(std::slice::from_ref(&highest), 1, 2),
             "must NOT reorg to a higher-hash same-height equal-work competitor"
         );
         // Our own tip (equal hash) never 'wins' over itself -> no needless reorg/flap.
         assert!(
-            !blockchain.external_branch_wins_fork_choice(&[middle.clone()], 1, 2),
+            !blockchain.external_branch_wins_fork_choice(std::slice::from_ref(&middle), 1, 2),
             "equal hash is not strictly lower -> no reorg"
         );
 
@@ -12612,7 +12623,7 @@ mod tests {
         let local3 = metadata_test_block(3, middle.hash, "local3", 1.0);
         insert_raw_block(&blockchain, &local3);
         assert!(
-            !blockchain.external_branch_wins_fork_choice(&[lowest.clone()], 1, 3),
+            !blockchain.external_branch_wins_fork_choice(std::slice::from_ref(&lowest), 1, 3),
             "a strictly lighter branch must never be adopted, even with a lower tip hash"
         );
     }
@@ -14333,7 +14344,7 @@ mod tests {
         let old5 = test_block_with_txs(5, prev, "miner5", 10.0, &[("dave", "erin", 1.0)]);
         prev = old5.hash;
         let old6 = metadata_test_block(6, prev, "bob", 10.0);
-        let old_branch = vec![old4, old5, old6];
+        let old_branch = [old4, old5, old6];
 
         let mut prev = fork_prev;
         let new4 = test_block_with_txs(4, prev, "nb4", 10.0, &[("alice", "bob", 2.0)]);
