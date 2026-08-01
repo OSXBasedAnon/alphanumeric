@@ -7365,10 +7365,7 @@ impl Blockchain {
         result
     }
 
-    fn scheduled_reward_ceiling(
-        &self,
-        block_timestamp: u64,
-    ) -> Result<f64, BlockchainError> {
+    fn scheduled_reward_ceiling(&self, block_timestamp: u64) -> Result<f64, BlockchainError> {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
 
         // Calculate periods since genesis for halving. Genesis is immutable, so
@@ -9342,12 +9339,13 @@ mod tests {
         let below = REWARD_CURVE_V2_ACTIVATION_HEIGHT - 1;
         let at = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
 
-        let legacy_empty = bc
-            .block_reward_units_from_totals(below, ts, 0, 0)
-            .unwrap();
+        let legacy_empty = bc.block_reward_units_from_totals(below, ts, 0, 0).unwrap();
         let activated_empty = bc.block_reward_units_from_totals(at, ts, 0, 0).unwrap();
         assert_eq!(legacy_empty, Transaction::to_units(10.0));
-        assert_eq!(activated_empty, legacy_empty, "empty issuance must not move");
+        assert_eq!(
+            activated_empty, legacy_empty,
+            "empty issuance must not move"
+        );
 
         let floor_fee_units = Transaction::to_units(0.0001);
         let legacy_floor = bc
@@ -9406,15 +9404,10 @@ mod tests {
         let mut checked = 0usize;
         for period in [0u64, 1, 3, 13, 20, 21, 22, 60] {
             let ts = genesis_ts + period * SIX_MONTHS;
-            let ceiling_units = Transaction::to_units(
-                MAX_BLOCK_REWARD * Blockchain::reduction_factor(period),
-            );
-            let subsidy_units = bc
-                .block_reward_units_from_totals(height, ts, 0, 0)
-                .unwrap();
-            let zero_fee_nonempty = bc
-                .block_reward_units_from_totals(height, ts, 1, 0)
-                .unwrap();
+            let ceiling_units =
+                Transaction::to_units(MAX_BLOCK_REWARD * Blockchain::reduction_factor(period));
+            let subsidy_units = bc.block_reward_units_from_totals(height, ts, 0, 0).unwrap();
+            let zero_fee_nonempty = bc.block_reward_units_from_totals(height, ts, 1, 0).unwrap();
             assert_eq!(zero_fee_nonempty, subsidy_units);
             assert!(
                 subsidy_units <= ceiling_units,
@@ -9426,9 +9419,7 @@ mod tests {
                 let reward = bc
                     .block_reward_units_from_totals(height, ts, 1, fee)
                     .unwrap();
-                let miner_fee_units = fee
-                    .checked_mul(REWARD_V2_MINER_FEE_NUMERATOR)
-                    .unwrap()
+                let miner_fee_units = fee.checked_mul(REWARD_V2_MINER_FEE_NUMERATOR).unwrap()
                     / REWARD_V2_MINER_FEE_DENOMINATOR;
                 assert!(reward >= subsidy_units, "fee lowered miner reward");
                 assert!(reward >= previous_reward, "reward is not monotonic in fees");
@@ -9482,9 +9473,7 @@ mod tests {
 
         for period in [20u64, 21, 22, 60, 200] {
             let ts = genesis_ts + period * SIX_MONTHS;
-            let subsidy_units = bc
-                .block_reward_units_from_totals(height, ts, 0, 0)
-                .unwrap();
+            let subsidy_units = bc.block_reward_units_from_totals(height, ts, 0, 0).unwrap();
             let reward_units = bc
                 .block_reward_units_from_totals(height, ts, 1, fee_units)
                 .unwrap();
@@ -9548,15 +9537,14 @@ mod tests {
         for tx in &candidates {
             prefix.push(tx.clone());
             let reference = bc
-                .template_fee_accounting_is_admissible(
-                    height,
-                    ts,
-                    &prefix,
-                )
+                .template_fee_accounting_is_admissible(height, ts, &prefix)
                 .unwrap();
             let running = accounting.admits(&bc, tx).unwrap();
             assert_eq!(running, reference);
-            assert!(running, "Reward V2 must admit every non-negative fee aggregate");
+            assert!(
+                running,
+                "Reward V2 must admit every non-negative fee aggregate"
+            );
             accounting.commit(tx).unwrap();
         }
     }
@@ -9566,22 +9554,13 @@ mod tests {
         let (bc, genesis) = fee_accounting_test_chain();
         let ts = genesis.timestamp + 3_000_000;
         let fee_units = Transaction::to_units(0.0001);
-        let mut activated = fee_accounting_test_block(
-            &bc,
-            REWARD_CURVE_V2_ACTIVATION_HEIGHT,
-            ts,
-            &[fee_units],
-        );
+        let mut activated =
+            fee_accounting_test_block(&bc, REWARD_CURVE_V2_ACTIVATION_HEIGHT, ts, &[fee_units]);
         bc.validate_block_reward_rules_at(&activated, FEE_SYSTEM_ACTIVATION_HEIGHT)
             .expect("the exact Reward V2 coinbase must validate at activation");
 
         let legacy_reward = bc
-            .block_reward_units_from_totals(
-                REWARD_CURVE_V2_ACTIVATION_HEIGHT - 1,
-                ts,
-                1,
-                fee_units,
-            )
+            .block_reward_units_from_totals(REWARD_CURVE_V2_ACTIVATION_HEIGHT - 1, ts, 1, fee_units)
             .unwrap();
         activated.transactions[0].amount_units = legacy_reward;
         assert!(matches!(
