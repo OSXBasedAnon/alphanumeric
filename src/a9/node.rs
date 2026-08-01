@@ -72,6 +72,14 @@ pub const DEFAULT_PORT: u16 = 7177;
 /// Marker error for a relay block POST rejected by the gateway's per-IP rate limit.
 /// Callers match on this to BACK OFF instead of backfilling (which amplifies the storm).
 const RELAY_POST_RATE_LIMITED: &str = "Block relay post rate-limited";
+/// Marker error for a relay block POST that failed everywhere for TRANSIENT reasons
+/// only: transport errors, client timeouts, 408, or 5xx. Distinct from the rate-limit
+/// marker because the right response differs — a 429 means the per-IP window is CLOSED
+/// and a retry must wait for it to roll over, while a transient blip deserves one
+/// prompt second attempt. Permanent 4xx verdicts (schema, auth, size) map to NEITHER
+/// marker: the identical request would meet the identical answer, so retrying it is
+/// pure amplification.
+const RELAY_POST_TRANSIENT: &str = "Block relay post transiently unavailable";
 /// Single-flight latch for the detached post-mine relay backfill (process-wide: one
 /// node per process in practice). Overlapping runs re-post the same recent window and
 /// only burn POST budget — the newest run supersedes the older one's purpose.
@@ -4894,6 +4902,7 @@ impl Node {
 
         let mut any_ok = false;
         let mut rate_limited = false;
+        let mut transient = false;
         for url in Self::discovery_blocks_urls() {
             let res = self.http_client.post(url).json(&payload).send().await;
             match res {
@@ -4902,6 +4911,8 @@ impl Node {
                     let status = res.status();
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         rate_limited = true;
+                    } else if Self::relay_post_status_is_transient(status) {
+                        transient = true;
                     }
                     let body = res.text().await.unwrap_or_default();
                     warn!(
@@ -4910,7 +4921,12 @@ impl Node {
                         Self::response_body_snippet(&body)
                     );
                 }
-                Err(e) => warn!("Block relay post error: {}", e),
+                Err(e) => {
+                    // Connect/TLS/timeout errors never reached a relay verdict;
+                    // they are transient by construction.
+                    transient = true;
+                    warn!("Block relay post error: {}", e);
+                }
             }
         }
 
@@ -4921,16 +4937,66 @@ impl Node {
             // 32-block backfill — under a 429 that backfill is 32 MORE posts into the
             // same closed window, which is how one burst snowballed into 2,409 failed
             // posts during the 2026-07-08 recovery storms.
-            if rate_limited {
-                return Err(NodeError::Network(RELAY_POST_RATE_LIMITED.into()));
-            }
-            return Err(NodeError::Network(
-                "Block relay post failed on all endpoints".into(),
-            ));
+            return Self::fold_relay_post_outcomes(any_ok, rate_limited, transient);
         }
 
         self.mark_block_relayed(block).await;
         Ok(())
+    }
+
+    /// One-retry worthiness of a failed relay POST status. 429 is deliberately NOT
+    /// here — rate limiting has its own marker and a longer backoff. 408 and every
+    /// 5xx are momentary server/edge conditions worth one more attempt; the
+    /// remaining 4xx are the relay's permanent verdict on this exact request.
+    fn relay_post_status_is_transient(status: reqwest::StatusCode) -> bool {
+        status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
+    }
+
+    /// Fold one relay POST round (across every configured endpoint) into the
+    /// documented error contract. Rate limiting outranks transient: a 429 anywhere
+    /// means the per-IP window is closed, and retrying before it rolls over is fuel
+    /// on the fire regardless of what the other endpoints answered.
+    fn fold_relay_post_outcomes(
+        any_ok: bool,
+        rate_limited: bool,
+        transient: bool,
+    ) -> Result<(), NodeError> {
+        if any_ok {
+            return Ok(());
+        }
+        if rate_limited {
+            return Err(NodeError::Network(RELAY_POST_RATE_LIMITED.into()));
+        }
+        if transient {
+            return Err(NodeError::Network(RELAY_POST_TRANSIENT.into()));
+        }
+        Err(NodeError::Network(
+            "Block relay post failed on all endpoints".into(),
+        ))
+    }
+
+    /// Whether — and after how long — a failed fresh-block relay POST gets its ONE
+    /// detached retry. A fresh block is the post that matters most for propagation
+    /// (relay-dependent nodes fork against it until it lands), and before this the
+    /// non-429 failure path had NO second attempt: the next heal was the periodic
+    /// relay-tip refresh, up to an announce interval (~300s) away — observed on a
+    /// TCP-less client as falling multiple blocks behind and catching up in
+    /// multi-height jumps. Rate-limited waits out the per-IP window; a transient
+    /// blip gets a prompt second try (the client timeout is 3s, so the blip has had
+    /// that long to clear). Permanent rejections return None: the same request
+    /// would meet the same verdict. ONE retry only, decided here and consulted
+    /// nowhere else — the retry's own failure is terminal until the periodic heal,
+    /// which is what keeps a hard relay outage from turning every mined block into
+    /// a post storm (the 2026-07-08 lesson).
+    fn relay_post_retry_delay(error: &NodeError) -> Option<Duration> {
+        let text = error.to_string();
+        if text.contains(RELAY_POST_RATE_LIMITED) {
+            return Some(Duration::from_secs(10));
+        }
+        if text.contains(RELAY_POST_TRANSIENT) {
+            return Some(Duration::from_secs(3));
+        }
+        None
     }
 
     async fn post_recent_blocks_to_relay(&self, limit: u32) {
@@ -5764,6 +5830,35 @@ impl Node {
         self.publish_block(tip, "Local tip").await
     }
 
+    /// DETACHED + SINGLE-FLIGHT ascending relay backfill. Detached because the run
+    /// is paced (~10 posts/s inside post_recent_blocks_to_relay) — awaited it would
+    /// add ~3s to every mined block's publish path, and one run per mined block at
+    /// 32 posts each was the biggest contributor to the per-IP POST budget (the
+    /// 2026-07-08 429 storms). Single-flight because overlapping runs re-post the
+    /// same recent window and only burn budget. Called after a successful fresh
+    /// block post — first try or its one retry — so the recent-window re-post
+    /// always trails a block the relay just accepted.
+    fn spawn_relay_backfill(&self) {
+        if RELAY_BACKFILL_INFLIGHT.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            // Reset the single-flight flag via a destructor so a panic (or cancellation)
+            // inside post_recent_blocks_to_relay cannot wedge it `true` forever and
+            // permanently disable all future relay backfill for the process.
+            struct BackfillGuard;
+            impl Drop for BackfillGuard {
+                fn drop(&mut self) {
+                    RELAY_BACKFILL_INFLIGHT.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = BackfillGuard;
+            node.post_recent_blocks_to_relay(Node::relay_backfill_limit())
+                .await;
+        });
+    }
+
     pub async fn publish_block(&self, block: Block, context: &str) -> Result<(), NodeError> {
         let post_mine = context == "Post-mine";
 
@@ -5802,46 +5897,35 @@ impl Node {
 
         if let Err(e) = relay_result {
             warn!("{} block relay failed: {}", context, e);
-            // A rate-limited FRESH block is the one post that matters most for
-            // propagation (everyone else forks against it until it lands). Give it a
-            // single detached retry once the per-IP window has rolled over; if that
-            // also fails, the periodic backfill covers it. One shot only — looping
-            // here would recreate the amplification this path just stopped doing.
-            if e.to_string().contains(RELAY_POST_RATE_LIMITED) {
+            // A failed FRESH block is the one post that matters most for propagation
+            // (relay-dependent nodes fork against it until it lands). Retryable
+            // failures — a rolled-over per-IP window or a transient blip — get ONE
+            // detached second attempt; relay_post_retry_delay documents the ladder
+            // and returns None for permanent rejections. If the retry also fails,
+            // the periodic relay-tip heal covers it. One shot only — looping here
+            // would recreate the amplification this path just stopped doing.
+            if let Some(delay) = Self::relay_post_retry_delay(&e) {
                 let node = self.clone();
                 let retry_block = block.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    if let Err(e) = node.post_block_relay(&retry_block).await {
-                        warn!(
-                            "Rate-limited block #{} retry also failed: {}",
+                    tokio::time::sleep(delay).await;
+                    match node.post_block_relay(&retry_block).await {
+                        Ok(()) => {
+                            // The recovered fresh block re-opens the same gap-heal
+                            // window a first-try success gets: the ascending
+                            // backfill posts parents before children, so any hole
+                            // behind this block heals in the same pass.
+                            node.spawn_relay_backfill();
+                        }
+                        Err(e) => warn!(
+                            "Block #{} relay retry also failed: {}",
                             retry_block.index, e
-                        );
+                        ),
                     }
                 });
             }
-        } else if !RELAY_BACKFILL_INFLIGHT.swap(true, Ordering::SeqCst) {
-            // DETACHED + SINGLE-FLIGHT: the backfill is a best-effort gap heal, and it
-            // is now paced (~10 posts/s inside post_recent_blocks_to_relay) — awaited
-            // here it would add ~3s to every mined block's publish path, and one run
-            // per mined block at 32 posts each was the biggest contributor to the
-            // per-IP POST budget (the 2026-07-08 429 storms). The fresh block above
-            // already posted; the recent-window re-post can trail behind.
-            let node = self.clone();
-            tokio::spawn(async move {
-                // Reset the single-flight flag via a destructor so a panic (or cancellation)
-                // inside post_recent_blocks_to_relay cannot wedge it `true` forever and
-                // permanently disable all future relay backfill for the process.
-                struct BackfillGuard;
-                impl Drop for BackfillGuard {
-                    fn drop(&mut self) {
-                        RELAY_BACKFILL_INFLIGHT.store(false, Ordering::SeqCst);
-                    }
-                }
-                let _guard = BackfillGuard;
-                node.post_recent_blocks_to_relay(Node::relay_backfill_limit())
-                    .await;
-            });
+        } else {
+            self.spawn_relay_backfill();
         }
 
         // If there were no already-connected peers, discovery gets one best-effort
@@ -17691,5 +17775,78 @@ mod tests {
             !src.contains("validation_result = false"),
             "no path may assign the canonical verdict; PoW and ledger rules are the sole authority"
         );
+    }
+
+    /// The relay-post error contract: a round with ANY accepting endpoint is a
+    /// success; rate limiting outranks transient (a 429 anywhere means the per-IP
+    /// window is closed, whatever the other endpoints said); transient-only rounds
+    /// carry the transient marker; permanent rejections carry neither marker.
+    #[test]
+    fn relay_post_outcomes_fold_to_the_documented_contract() {
+        assert!(Node::fold_relay_post_outcomes(true, false, false).is_ok());
+        assert!(
+            Node::fold_relay_post_outcomes(true, true, true).is_ok(),
+            "one accepting endpoint is a success even when others failed"
+        );
+        let rate = Node::fold_relay_post_outcomes(false, true, true).unwrap_err();
+        assert!(
+            rate.to_string().contains(RELAY_POST_RATE_LIMITED),
+            "rate limiting must outrank transient"
+        );
+        let transient = Node::fold_relay_post_outcomes(false, false, true).unwrap_err();
+        assert!(transient.to_string().contains(RELAY_POST_TRANSIENT));
+        let permanent = Node::fold_relay_post_outcomes(false, false, false).unwrap_err();
+        let text = permanent.to_string();
+        assert!(
+            !text.contains(RELAY_POST_RATE_LIMITED) && !text.contains(RELAY_POST_TRANSIENT),
+            "a permanent rejection must not look retryable"
+        );
+    }
+
+    #[test]
+    fn transient_relay_statuses_are_exactly_timeout_and_server_errors() {
+        for code in [408u16, 500, 502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(
+                Node::relay_post_status_is_transient(status),
+                "{code} is a momentary condition and must be retryable"
+            );
+        }
+        for code in [400u16, 401, 403, 404, 409, 413, 422] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(
+                !Node::relay_post_status_is_transient(status),
+                "{code} is the relay's permanent verdict and must not be retried"
+            );
+        }
+    }
+
+    /// Permanent rejections — and errors that never came from the relay POST at
+    /// all — get no retry: the identical request would meet the identical answer.
+    #[test]
+    fn permanent_relay_rejections_are_never_retried() {
+        let permanent = Node::fold_relay_post_outcomes(false, false, false).unwrap_err();
+        assert!(Node::relay_post_retry_delay(&permanent).is_none());
+        let unrelated = NodeError::Blockchain("No local chain tip found".to_string());
+        assert!(Node::relay_post_retry_delay(&unrelated).is_none());
+    }
+
+    /// Retryable failures get exactly one bounded delay each: a transient blip
+    /// retries promptly (after the 3s client timeout has had time to clear), a
+    /// closed per-IP window waits out its rollover. The single-shot property
+    /// itself is structural: publish_block consults relay_post_retry_delay once,
+    /// and the retry task's failure arm only warns — a double failure is terminal
+    /// until the periodic relay-tip heal.
+    #[test]
+    fn retryable_relay_failures_get_one_bounded_delay_each() {
+        let transient = Node::fold_relay_post_outcomes(false, false, true).unwrap_err();
+        let prompt = Node::relay_post_retry_delay(&transient).expect("transient must retry");
+        let rate = Node::fold_relay_post_outcomes(false, true, false).unwrap_err();
+        let waited = Node::relay_post_retry_delay(&rate).expect("rate-limited must retry");
+        assert!(
+            prompt < waited,
+            "a blip must retry sooner than a closed rate window"
+        );
+        assert!(waited >= Duration::from_secs(10));
     }
 }
