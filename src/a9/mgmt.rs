@@ -381,6 +381,14 @@ pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
 }
 
+/// User-facing transaction creation result. Only `Submitted` authorizes gossip;
+/// duplicate outcomes are successful idempotent requests, not newly created payments.
+pub enum CreateTransactionOutcome {
+    Submitted(Transaction),
+    AlreadyPending,
+    AlreadyConfirmed(u32),
+}
+
 fn set_restrictive_file_permissions(path: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1098,16 +1106,15 @@ impl Mgmt {
         }
     }
 
-    /// Create, sign, and submit a transaction to the LOCAL mempool. On success returns
-    /// the submitted transaction so the caller can announce it to the network
-    /// (`Node::gossip_transaction`) — submission alone reaches no other miner.
+    /// Create, sign, and atomically classify a transaction against canonical and
+    /// durable pending state. Only `Submitted` may be announced to the network.
     pub async fn handle_create_transaction(
         &self,
         command: &str,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Db>>,
-    ) -> Result<Transaction> {
+    ) -> Result<CreateTransactionOutcome> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
         let parsed = match parse_create_transaction_command(command) {
@@ -1337,10 +1344,10 @@ impl Mgmt {
         // right after "Done".
         let submit_result = {
             let chain = blockchain.read().await;
-            chain.add_transaction(transaction.clone()).await
+            chain.admit_transaction(transaction.clone()).await
         };
         match submit_result {
-            Ok(_) => {
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
                 writeln!(stdout, "Done")?;
 
                 // Get final balances
@@ -1366,7 +1373,27 @@ impl Mgmt {
                 writeln!(stdout, "  Fee:      {}", fee)?;
                 writeln!(stdout, "  Balance:  {}\n", new_sender_balance)?;
 
-                Ok(transaction)
+                Ok(CreateTransactionOutcome::Submitted(transaction))
+            }
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
+                writeln!(stdout, "Not submitted: an identical transaction is already pending.")?;
+                writeln!(
+                    stdout,
+                    "To make a distinct payment, change the amount or fee, or retry in the next second."
+                )?;
+                Ok(CreateTransactionOutcome::AlreadyPending)
+            }
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+                writeln!(
+                    stdout,
+                    "Not submitted: an identical transaction is already confirmed at block {}.",
+                    height
+                )?;
+                writeln!(
+                    stdout,
+                    "To make a distinct payment, change the amount or fee, or retry in the next second."
+                )?;
+                Ok(CreateTransactionOutcome::AlreadyConfirmed(height))
             }
             Err(e) => {
                 writeln!(stdout)?;

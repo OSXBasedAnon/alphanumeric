@@ -31,7 +31,7 @@ use alphanumeric::a9::{
         MINT_CLIP, MIN_RELAY_FEE_UNITS, NETWORK_FEE, TARGET_BLOCK_TIME,
     },
     bpos::{BPoSSentinel, ValidatorTier},
-    mgmt::{Mgmt, WalletKeyData},
+    mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
     ui::{
         ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
         ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
@@ -2015,13 +2015,15 @@ async fn async_main() -> Result<()> {
                         .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
                         .await
                     {
-                        Ok(tx) => {
+                        Ok(CreateTransactionOutcome::Submitted(tx)) => {
                             // Announce it: submission only reaches the LOCAL mempool, and
                             // the gateway relay carries blocks, not transactions — without
                             // this gossip no other miner ever hears about the tx and only
                             // the sender could confirm it (pre-v7.6.8 behavior).
                             node.gossip_transaction(&tx).await;
                         }
+                        Ok(CreateTransactionOutcome::AlreadyPending)
+                        | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
                         Err(e) => {
                             println!("Error: {}", e);
                             println!("Failed to create transaction: {}", e);
@@ -4149,10 +4151,12 @@ Some(_) => {
                             )
                             .await
                         {
-                            Ok(tx) => {
+                            Ok(CreateTransactionOutcome::Submitted(tx)) => {
                                 // Same as the explicit create arm: announce or nobody mines it.
                                 node.gossip_transaction(&tx).await;
                             }
+                            Ok(CreateTransactionOutcome::AlreadyPending)
+                            | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
                             Err(e) => {
                                 println!("Failed to create transaction: {}", e);
                             }
