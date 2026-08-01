@@ -12901,7 +12901,10 @@ impl Node {
             .next()
             .unwrap_or_default();
         let transport: Arc<dyn SignalTransport> =
-            match HttpSignalTransport::new(self.handshake_key_bytes.as_ref().clone(), gateway_base)
+            match HttpSignalTransport::new(
+                zeroize::Zeroizing::new(self.handshake_key_bytes.as_ref().clone()),
+                gateway_base,
+            )
             {
                 Ok(t) => Arc::new(t),
                 Err(e) => return Err(format!("transport init failed: {}", e)),

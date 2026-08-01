@@ -34,6 +34,25 @@ jobs:
         continue-on-error: true
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  # The job above runs DEFAULT features, so the bootstrap_publisher code -- which the
+  # live publisher actually runs -- is compiled by `cargo check --all-features` but its
+  # tests never execute. This runs the SHIPPED feature set explicitly rather than
+  # --all-features: the two branches do not carry the same features (gpu-mining adds
+  # gpu_miner), so --all-features would silently mean different things per branch and
+  # would drag a GPU backend onto a runner with no GPU. Naming the set keeps this job
+  # identical everywhere and immune to whatever feature lands next.
+  release-features:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust quality components
+        run: rustup component add rustfmt clippy
+      - name: Tests with the shipped feature set
+        run: cargo test --locked --features bootstrap_publisher,webrtc_mesh
+
   # MANDATORY, unlike fmt/clippy above. RustSec advisories, licenses, and dependency
   # sources are enforced here. GHSA/OSV-only records are enforced by osv.yml.
   # Separate job so an advisory failure is legible on its own and does not mask a test

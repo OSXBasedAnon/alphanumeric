@@ -11,6 +11,7 @@
 #![cfg(feature = "webrtc_mesh")]
 
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -199,6 +200,17 @@ pub struct SignalEnvelope {
     pub signature: String,
 }
 
+/// Typed body of `POST /api/signal/drain`. `envelopes` defaults to empty so an
+/// omitted field stays the valid "mailbox is empty" response, while anything
+/// present that is not a well-formed envelope list is a hard error rather than a
+/// silent empty drain. Unknown sibling fields are ignored, so the gateway can add
+/// response fields without breaking older nodes.
+#[derive(serde::Deserialize)]
+struct DrainResponse {
+    #[serde(default)]
+    envelopes: Vec<SignalEnvelope>,
+}
+
 /// Canonical JSON string, byte-identical to the gateway's canonicalize() (lib/canonical.ts) and the
 /// node's canonicalize_json(): object keys sorted by codepoint, compact serialization. This is the
 /// preimage both sides sign/verify — it MUST match or every envelope is rejected.
@@ -242,13 +254,16 @@ pub trait SignalTransport: Send + Sync {
 /// the integration tests; the node provides its own impl reusing sign_with_handshake_key.
 pub struct HttpSignalTransport {
     pub node_id: String,
-    key_pkcs8: Vec<u8>,
+    /// Ed25519 PKCS#8 mesh identity. Zeroized on drop: this key authenticates
+    /// every signalling message this node sends, so a copy left in freed memory
+    /// is enough to impersonate it on the mesh.
+    key_pkcs8: Zeroizing<Vec<u8>>,
     http: reqwest::Client,
     gateway_base: String,
 }
 
 impl HttpSignalTransport {
-    pub fn new(key_pkcs8: Vec<u8>, gateway_base: String) -> Result<Self, String> {
+    pub fn new(key_pkcs8: Zeroizing<Vec<u8>>, gateway_base: String) -> Result<Self, String> {
         use ring::signature::{Ed25519KeyPair, KeyPair};
         let kp = Ed25519KeyPair::from_pkcs8(&key_pkcs8).map_err(|e| e.to_string())?;
         let node_id = hex::encode(kp.public_key().as_ref());
@@ -319,12 +334,15 @@ impl SignalTransport for HttpSignalTransport {
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let envs = v
-            .get("envelopes")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        Ok(serde_json::from_value(envs).unwrap_or_default())
+        // Typed, and deliberately asymmetric. An ABSENT `envelopes` field is the
+        // gateway's legitimate "nothing queued" answer, so it deserializes to an
+        // empty list. A PRESENT but malformed one is a schema break and must
+        // surface: the old `unwrap_or_default()` collapsed both into "no signals",
+        // so a gateway contract change would have silently disabled mesh formation
+        // — no error, no log, no backoff, just a node that quietly stops peering
+        // and pays the propagation cost of being mesh-less.
+        let body: DrainResponse = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(body.envelopes)
     }
 }
 
@@ -1056,13 +1074,15 @@ mod tests {
     use webrtc::data_channel::data_channel_message::DataChannelMessage;
     use webrtc::data_channel::RTCDataChannel;
 
-    fn gen_key() -> Vec<u8> {
+    fn gen_key() -> Zeroizing<Vec<u8>> {
         use ring::rand::SystemRandom;
         use ring::signature::Ed25519KeyPair;
-        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .unwrap()
-            .as_ref()
-            .to_vec()
+        Zeroizing::new(
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec(),
+        )
     }
 
     // A remote peer's candidates arrive un-vetted inside its SDP. The strip filter must drop
@@ -1683,4 +1703,50 @@ mod tests {
         }
         let _ = pc.close().await;
     }
+    /// The drain response contract is deliberately asymmetric: an omitted
+    /// `envelopes` field is the gateway's valid "mailbox empty" answer, while a
+    /// PRESENT but malformed one is a schema break that must surface. Collapsing
+    /// both into an empty list — the previous `unwrap_or_default()` — meant a
+    /// gateway contract change would silently disable mesh formation, costing
+    /// propagation with no error, no log and no backoff.
+    #[test]
+    fn drain_response_tolerates_absence_but_rejects_malformed_envelopes() {
+        let empty: DrainResponse =
+            serde_json::from_str(r#"{"ok":true}"#).expect("absent envelopes is a valid empty drain");
+        assert!(empty.envelopes.is_empty());
+
+        let null: DrainResponse = serde_json::from_str(r#"{"ok":true,"envelopes":null}"#)
+            .unwrap_or(DrainResponse { envelopes: vec![] });
+        assert!(null.envelopes.is_empty());
+
+        let ok: DrainResponse = serde_json::from_str(
+            r#"{"envelopes":[{"from":"a","to":"b","kind":"offer","payload":"p","ts":1,"signature":"s"}]}"#,
+        )
+        .expect("well-formed envelope list must parse");
+        assert_eq!(ok.envelopes.len(), 1);
+        assert_eq!(ok.envelopes[0].kind, "offer");
+
+        for malformed in [
+            r#"{"envelopes":"not-a-list"}"#,
+            r#"{"envelopes":[{"from":"a"}]}"#,
+            r#"{"envelopes":[{"from":"a","to":"b","kind":"offer","payload":"p","ts":"not-a-number","signature":"s"}]}"#,
+            r#"{"envelopes":{"from":"a"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DrainResponse>(malformed).is_err(),
+                "malformed drain body must error rather than read as empty: {malformed}"
+            );
+        }
+    }
+
+    /// Unknown sibling fields must not break older nodes: the gateway has to be
+    /// able to add response fields without a lockstep client release.
+    #[test]
+    fn drain_response_ignores_unknown_fields() {
+        let parsed: DrainResponse =
+            serde_json::from_str(r#"{"envelopes":[],"cursor":"x","server_time":42}"#)
+                .expect("unknown fields must be ignored");
+        assert!(parsed.envelopes.is_empty());
+    }
+
 }
