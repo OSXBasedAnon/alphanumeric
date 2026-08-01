@@ -3073,6 +3073,7 @@ impl Node {
                 .map(|addr| addr.to_string())
         };
         let network_id = hex::encode(self.network_id);
+        let consensus_fingerprint = self.blockchain.read().await.consensus_fingerprint().1;
 
         let stats_enabled = std::env::var("ALPHANUMERIC_STATS_ENABLED")
             .map(|v| !v.eq_ignore_ascii_case("false"))
@@ -3141,6 +3142,32 @@ impl Node {
         payload.insert(
             "release_version".to_string(),
             json!(env!("CARGO_PKG_VERSION")),
+        );
+        // Unsigned advisory consensus telemetry. These fields deliberately stay
+        // outside the canonical signed message so upgraded nodes remain announce-
+        // compatible with existing gateways. The fingerprint detects any broader
+        // descriptor drift; the explicit Reward V2 tuple makes activation adoption
+        // directly queryable without reverse-mapping hashes. Never use these
+        // self-reported values as a substitute for validating blocks.
+        payload.insert(
+            "consensus_fingerprint".to_string(),
+            json!(consensus_fingerprint),
+        );
+        payload.insert(
+            "reward_rules_version".to_string(),
+            json!(crate::a9::blockchain::REWARD_CURVE_RULES_VERSION),
+        );
+        payload.insert(
+            "reward_activation_height".to_string(),
+            json!(crate::a9::blockchain::REWARD_CURVE_V2_ACTIVATION_HEIGHT),
+        );
+        payload.insert(
+            "reward_fee_numerator".to_string(),
+            json!(crate::a9::blockchain::REWARD_V2_MINER_FEE_NUMERATOR),
+        );
+        payload.insert(
+            "reward_fee_denominator".to_string(),
+            json!(crate::a9::blockchain::REWARD_V2_MINER_FEE_DENOMINATOR),
         );
         payload.insert(
             "signature".to_string(),

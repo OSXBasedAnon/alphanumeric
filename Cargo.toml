@@ -1,6 +1,6 @@
 [package]
 name = "alphanumeric"
-version = "7.9.3"
+version = "7.9.4"
 edition = "2021"
 # The node is distributed as signed binaries, not as a crates.io package. This also
 # keeps the license gate scoped to third-party code: our own crate carries no
