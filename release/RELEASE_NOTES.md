@@ -1,3 +1,30 @@
+# alphanumeric v7.9.4
+
+Scheduled consensus compatibility release. Reward accounting V2 activates at
+block `569,423`. Miners, pools, public nodes, and other validating operators must
+upgrade before that height.
+
+## Operator action
+
+- Upgrade every block-producing or validating deployment before block `569,423`.
+- Confirm the process reports version `7.9.4` after restart.
+- Compare the announced consensus fingerprint across upgraded peers during the
+  rollout.
+- Do not run an older miner past the activation boundary.
+
+Blocks below the activation height retain the existing rules exactly. At and
+above the activation height, compatible nodes use the updated reward-accounting
+rules. This release also makes mining-template fee aggregation identical to the
+consensus path and advertises advisory activation metadata through peer
+announcements.
+
+There is no database migration, wallet migration, resync, transaction-format
+change, or network-message change. Release artifacts and their SHA-256 checksums
+must be generated from the reviewed `7.9.4` tag; checksums from earlier releases
+do not apply.
+
+---
+
 # alphanumeric v7.9.3
 
 Security and hardening release, following a full audit of the node. **No change

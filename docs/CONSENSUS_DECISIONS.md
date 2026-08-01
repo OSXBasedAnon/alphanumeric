@@ -19,3 +19,15 @@ Disposition: accept the current rule. It does not justify a standalone hard fork
 future change requires a new threat model, reproducible simulation across adversarial
 schedules, specification text, activation planning, and independent review. It must
 not be bundled into unrelated non-consensus hardening.
+
+## Reward accounting V2
+
+Reward accounting V2 activates at block `569,423`. The boundary is fixed in the
+node and included in its advisory consensus fingerprint. Blocks below the
+activation height retain the legacy rules exactly; blocks at and above it use the
+V2 rules.
+
+Disposition: ship as a coordinated consensus release. Miners, pools, public
+nodes, and other validating operators must run a compatible release before the
+activation height. The change does not require a database migration, wallet
+migration, resync, transaction-format change, or network-message change.
