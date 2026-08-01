@@ -947,6 +947,7 @@ mod tests {
     /// blocks behind" fix) and a fast one must grow toward the readback-
     /// amortizing cap.
     #[test]
+    #[allow(clippy::assertions_on_constants)] // Named proof of the live dispatch cap invariant.
     fn dispatch_iters_adapt_toward_target() {
         // Slow adapter: 4 iters took 2s -> shrink to the floor.
         assert_eq!(next_dispatch_iters(4, 2000.0, 250.0, 64), 1);

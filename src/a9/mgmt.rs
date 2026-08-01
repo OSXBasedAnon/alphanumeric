@@ -126,6 +126,8 @@ pub async fn resolve_default_wallet(
                 .get_confirmed_balance_units(&wallet.address)
                 .await
                 .unwrap_or(0);
+            // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+            #[allow(clippy::unnecessary_map_or)]
             if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
                 best = Some((units, (*name).clone(), wallet.address.clone()));
             }
@@ -999,6 +1001,9 @@ impl Mgmt {
     /// possibly say it — see the call site for why that ordering matters. It must only hand
     /// the block off (spawn, queue); anything that blocks or awaits inside it is stalling a
     /// freshly-mined block against the clock that decides whether it orphans.
+    // The arguments are explicit capabilities/state owned by the caller. Bundling them would create
+    // a second mining context whose lifetime and synchronization invariants could drift.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_mine_command(
         &self,
         command: &[&str],
@@ -2035,7 +2040,7 @@ impl Mgmt {
     /// warm hues are money you cannot spend yet (orange still maturing, pink
     /// already leaving), green is the derived confirmed sum. A zero balance
     /// renders dim, because a zero is not money.
-
+    ///
     /// Recent activity across every loaded wallet, newest first.
     ///
     /// Reads the address index directly rather than going through the whisper
@@ -2736,7 +2741,7 @@ impl Mgmt {
             let p = v / total_confirmed * 100.0;
             if p > 0.0 && p < 0.05 {
                 " <0.1%".to_string()
-            } else if p < 100.0 && p >= 99.95 {
+            } else if (99.95..100.0).contains(&p) {
                 ">99.9%".to_string()
             } else {
                 format!("{:>5.1}%", p)

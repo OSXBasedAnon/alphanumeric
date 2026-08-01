@@ -1332,6 +1332,7 @@ async fn async_main() -> Result<()> {
         // one — the miner otherwise never learns; the maturing reward just
         // silently vanishes from `balance` and the end-of-run summary overstates
         // earnings.
+        #[allow(clippy::type_complexity)] // Session telemetry: height, exact hash, reward.
         let session_mined: Arc<tokio::sync::Mutex<Vec<(u32, [u8; 32], f64)>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         {
@@ -2172,6 +2173,8 @@ async fn async_main() -> Result<()> {
         .unwrap_or(0);
 
     // ── Overview ───────────────────────────────────────────────────────────
+    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+    #[allow(clippy::unnecessary_map_or)]
     let synced = network_height.map_or(true, |net| current_height + 1 >= net);
     ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, "\n ")?;
     ui_seg(&mut stdout, &mut color_spec, UI_LABEL, true, "Overview")?;
@@ -2185,10 +2188,10 @@ async fn async_main() -> Result<()> {
         ui_seg(&mut stdout, &mut color_spec, UI_ORANGE, false, "▸ SYNCING")?;
         ui_pad(&mut stdout, &mut color_spec, 10, 17)?;
     }
-    let local_text = ui_thousands(current_height as u64);
+    let local_text = ui_thousands(current_height);
     ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &local_text)?;
     ui_seg(&mut stdout, &mut color_spec, UI_DIM, false, " / ")?;
-    let net_text = network_height.map_or_else(|| "unknown".to_string(), |h| ui_thousands(h as u64));
+    let net_text = network_height.map_or_else(|| "unknown".to_string(), ui_thousands);
     ui_seg(&mut stdout, &mut color_spec, UI_BLUE, false, &net_text)?;
     ui_pad(
         &mut stdout,
@@ -2429,7 +2432,7 @@ async fn async_main() -> Result<()> {
         &mut color_spec,
         Some((
             "Height:",
-            &[(UI_GREEN, ui_thousands(current_height as u64))],
+            &[(UI_GREEN, ui_thousands(current_height))],
         )),
         Some((
             "Fork Count:",
@@ -2448,7 +2451,7 @@ async fn async_main() -> Result<()> {
             &[
                 (
                     UI_GREEN,
-                    network_height.map_or_else(|| "unknown".to_string(), |h| ui_thousands(h as u64)),
+                    network_height.map_or_else(|| "unknown".to_string(), ui_thousands),
                 ),
                 (UI_DIM, "  (gateway)".to_string()),
             ],
@@ -5129,6 +5132,8 @@ fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
+        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
         if i > 0 && (s.len() - i) % 3 == 0 {
             out.push(',');
         }
@@ -5831,22 +5836,9 @@ fn ui_hashrate(hashrate_ths: f64) -> (f64, &'static str) {
     }
 }
 
-/// The wallet a bare `mine` or a two-argument send should act as.
-///
-/// Resolution order, chosen so the fallback can never land on a wallet the
-/// operator has forgotten about:
-///   1. the wallet named `default_wallet` (what `create_default_wallet` makes),
-///   2. the only wallet, when exactly one is loaded,
-///   3. otherwise the wallet holding the LARGEST confirmed balance, ties broken
-///      by name so the answer is identical on every run.
-///
-/// Step 3 matters: an arbitrary pick (say, whatever the HashMap yielded first)
-/// could mine rewards into an empty side wallet, or fail a send from one — the
-/// balance ranking lands on the wallet actually in use. The caller always
-/// announces which wallet was chosen; a silent default is what makes a wrong
-/// guess dangerous, not the guess itself.
-///
-
+// The wallet a bare `mine` or a two-argument send should act as is resolved in
+// mgmt::resolve_default_wallet. Keep its policy rationale there rather than
+// accidentally attaching stale wallet documentation to the duration helper.
 /// Compact human-readable duration for status display, e.g. 11506 -> "3h 11m".
 /// Display-only helper: `info` keeps the raw seconds and appends this so a
 /// stalled node's block age reads at a glance instead of as a wall of seconds.
@@ -5899,6 +5891,7 @@ enum CanonicalReconcile {
 ///     the fork point to rebuild the canonical branch. (A fork older than the
 ///     finality window is additionally blocked from reorging by the checkpoint,
 ///     but that is not the general reason.) The only cure is a fresh re-bootstrap.
+///
 /// A behind node and a forked node can BOTH lack a block at the manifest tip
 /// height, so without the anchor a forked node reads as merely behind, tries to
 /// stream forever, and never recovers (the stale-client trap seen live
@@ -6477,6 +6470,9 @@ fn write_bootstrap_archive_zip(
 }
 
 #[cfg(feature = "bootstrap_publisher")]
+// These are distinct authenticated publication capabilities and signed snapshot metadata. A
+// context wrapper would only hide the boundary without reducing ownership or synchronization risk.
+#[allow(clippy::too_many_arguments)]
 async fn publish_bootstrap_snapshot(
     db: &sled::Db,
     blockchain: &Arc<RwLock<Blockchain>>,
@@ -7249,6 +7245,7 @@ const WHISPER_ACCUM_MAX_KEYS: usize = 512;
 
 /// Whether a rollup may be emitted now. `None` means nothing has been emitted
 /// yet, so the first one is due immediately.
+#[allow(clippy::unnecessary_map_or)]
 fn whisper_rollup_due(last_emit: Option<Instant>, now: Instant) -> bool {
     // map_or, not is_none_or: the latter is 1.82 and this crate holds an MSRV
     // floor of 1.70.

@@ -31,10 +31,24 @@ jobs:
       - name: Locked tests
         run: cargo test --locked
       - name: Clippy
-        continue-on-error: true
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --no-default-features --features bootstrap_publisher,webrtc_mesh --all-targets -- -D warnings
 
-  # The job above runs DEFAULT features, so the bootstrap_publisher code -- which the
+  # GPU code is shipped only from gpu-mining and requires Apple's Metal toolchain to lint. Keep it
+  # out of the Linux common job, but make the branch-specific gate equally mandatory.
+  gpu-clippy:
+    if: github.ref_name == 'gpu-mining' || github.base_ref == 'gpu-mining'
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust quality components
+        run: rustup component add clippy
+      - name: Clippy with the shipped GPU feature set
+        run: cargo clippy --locked --no-default-features --features bootstrap_publisher,webrtc_mesh,gpu_miner --all-targets -- -D warnings
+
+  # The locked test step above runs DEFAULT features, so the bootstrap_publisher code -- which the
   # live publisher actually runs -- is compiled by `cargo check --all-features` but its
   # tests never execute. This runs the SHIPPED feature set explicitly rather than
   # --all-features: the two branches do not carry the same features (gpu-mining adds

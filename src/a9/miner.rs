@@ -902,6 +902,11 @@ impl MiningManager {
                                     return Ok(());
                                 }
 
+                                // Preserve the explicit cadence gate and its short-circuit boundary.
+                                #[allow(
+                                    clippy::collapsible_if,
+                                    clippy::manual_is_multiple_of
+                                )]
                                 if nonce % TIP_CHANGE_CHECK_INTERVAL == 0 {
                                     if tip_change_counter_check.load(Ordering::Acquire)
                                         != template_tip_version
