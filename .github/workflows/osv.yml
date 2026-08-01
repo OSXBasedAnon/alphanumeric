@@ -1,0 +1,20 @@
+name: OSV Dependency Scan
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 11 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    with:
+      scan-args: |-
+        --lockfile=./Cargo.lock
+      fail-on-vuln: true
+      upload-sarif: false

@@ -1,0 +1,27 @@
+# OSV exceptions are narrow, reasoned, and time-bounded. Expiry intentionally
+# turns a carried exception into a CI failure requiring fresh review.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0057"
+ignoreUntil = 2027-01-31
+reason = "fxhash 0.2.1 is transitive via inquire/sled; hashing only, no untrusted-input parser. Reviewed 2026-07-31."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0121"
+ignoreUntil = 2027-01-31
+reason = "gcc 0.3.55 is a transitive build dependency and is absent at runtime. Reviewed 2026-07-31."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+ignoreUntil = 2027-01-31
+reason = "instant 0.1.13 is a transitive time shim with no demonstrated vulnerability. Reviewed 2026-07-31."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-01-31
+reason = "paste 1.0.15 is a compile-time transitive proc macro with no demonstrated vulnerability. Reviewed 2026-07-31."
+
+[[IgnoredVulns]]
+id = "GHSA-vxx9-2994-q338"
+ignoreUntil = 2027-01-31
+reason = "yamux 0.12.1 remote-panic path is unreachable: runtime uses fixed 0.13.10 backend and Kademlia fallback is opt-in/off by default. Re-review on any libp2p change. Reviewed 2026-07-31."

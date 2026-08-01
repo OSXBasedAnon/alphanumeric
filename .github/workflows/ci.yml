@@ -17,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      # Pinned by commit digest, not tag: a tag can be moved, a digest cannot.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Install Rust quality components
@@ -32,3 +33,20 @@ jobs:
       - name: Clippy
         continue-on-error: true
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # MANDATORY, unlike fmt/clippy above. RustSec advisories, licenses, and dependency
+  # sources are enforced here. GHSA/OSV-only records are enforced by osv.yml.
+  # Separate job so an advisory failure is legible on its own and does not mask a test
+  # regression (or get masked by one).
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Dependency advisories, licences and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses sources
+          arguments: --locked

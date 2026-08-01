@@ -903,6 +903,11 @@ impl Block {
         Self::consensus_next_difficulty(current_difficulty, timestamp_diff, block_index)
     }
 
+    /// Consensus-critical timestamp-driven retarget. Miner-supplied timestamps are
+    /// bounded but still influence the next target. The current behavior is an
+    /// explicitly accepted consensus characteristic, not a local hardening surface;
+    /// changing it requires a separately justified coordinated activation. See
+    /// `docs/CONSENSUS_DECISIONS.md#timestamp-driven-retarget`.
     pub fn consensus_next_difficulty(
         parent_difficulty: u64,
         timestamp_diff: u64,
@@ -1068,6 +1073,9 @@ pub enum BlockchainError {
     /// Never returned by block validation — a mined block carrying such a tx is
     /// still fully valid (see the admission guard in add_transaction).
     FeeBelowRelayFloor,
+    /// A canonical row in [0, tip] is absent, undecodable, or fails structural
+    /// authentication. Derived indexes must never be published from such a chain.
+    CanonicalCorruption { height: u32, reason: String },
     BatchValidationFailed(Vec<usize>),
 }
 
@@ -1126,6 +1134,15 @@ impl fmt::Display for BlockchainError {
                     Transaction::from_units(MIN_RELAY_FEE_UNITS)
                 )
             }
+            BlockchainError::CanonicalCorruption { height, reason } => {
+                write!(
+                    f,
+                    "Canonical block {} failed structural authentication ({}); the block \
+                     store is corrupt. Derived indexes were left unchanged. Restore from \
+                     a verified snapshot or re-sync from the network.",
+                    height, reason
+                )
+            }
             BlockchainError::BatchValidationFailed(errors) => {
                 write!(f, "Batch validation failed with {} errors", errors.len())
             }
@@ -1134,6 +1151,15 @@ impl fmt::Display for BlockchainError {
 }
 
 impl std::error::Error for BlockchainError {}
+
+/// Result of mempool admission, decided atomically with the durable pending write.
+/// Only `Inserted` is permission to announce a transaction as newly submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionAdmissionOutcome {
+    Inserted,
+    AlreadyPending,
+    AlreadyConfirmed(u32),
+}
 
 impl From<sled::Error> for BlockchainError {
     fn from(err: sled::Error) -> Self {
@@ -2638,6 +2664,81 @@ impl Blockchain {
         self.rebuild_confirmed_tx_index()
     }
 
+    fn canonical_corruption(height: u32, reason: impl Into<String>) -> BlockchainError {
+        BlockchainError::CanonicalCorruption {
+            height,
+            reason: reason.into(),
+        }
+    }
+
+    /// Load one canonical row and authenticate the invariants that make a sequential
+    /// derived-state replay meaningful. This deliberately checks storage structure,
+    /// not newly invented consensus rules: row/index agreement, parent linkage,
+    /// monotonic time, the transaction commitment, and the block hash commitment.
+    fn load_structurally_valid_canonical_block(
+        &self,
+        height: u32,
+        previous: Option<&Block>,
+    ) -> Result<Block, BlockchainError> {
+        let block = self
+            .get_block(height)
+            .map_err(|e| Self::canonical_corruption(height, format!("unreadable row: {e}")))?;
+
+        if block.index != height {
+            return Err(Self::canonical_corruption(
+                height,
+                format!("row contains block index {}", block.index),
+            ));
+        }
+        match previous {
+            Some(parent) => {
+                if block.previous_hash != parent.hash {
+                    return Err(Self::canonical_corruption(height, "parent hash mismatch"));
+                }
+                if block.timestamp < parent.timestamp {
+                    return Err(Self::canonical_corruption(
+                        height,
+                        "timestamp precedes parent",
+                    ));
+                }
+            }
+            None if height == 0 && block.previous_hash != [0u8; 32] => {
+                return Err(Self::canonical_corruption(
+                    height,
+                    "genesis previous hash is nonzero",
+                ));
+            }
+            None => {}
+        }
+
+        let merkle = Self::calculate_merkle_root(&block.transactions).map_err(|e| {
+            Self::canonical_corruption(height, format!("cannot derive merkle root: {e}"))
+        })?;
+        if merkle != block.merkle_root {
+            return Err(Self::canonical_corruption(height, "merkle root mismatch"));
+        }
+        if block.calculate_hash_for_block() != block.hash {
+            return Err(Self::canonical_corruption(height, "block hash mismatch"));
+        }
+        Ok(block)
+    }
+
+    /// Authenticate the complete canonical row sequence before a clean node begins
+    /// trusting persisted derived state. The O(chain) startup cost is deliberate:
+    /// decodable corruption must not remain latent behind a valid-looking tip row.
+    fn validate_canonical_chain_structure(&self) -> Result<(), BlockchainError> {
+        let Some(tip) = self.highest_block_index() else {
+            return Ok(());
+        };
+        let mut previous: Option<Block> = None;
+        for height in 0..=tip {
+            self.note_chain_progress();
+            let block = self.load_structurally_valid_canonical_block(height, previous.as_ref())?;
+            previous = Some(block);
+        }
+        Ok(())
+    }
+
     /// Force-rebuild the replay registry from the canonical chain, unconditionally.
     /// Used by interrupted-commit (dirty-marker) recovery: a crash mid-reorg can commit
     /// the canonical slot rewrite (which IS atomic) yet leave the registry's separate
@@ -2648,31 +2749,47 @@ impl Blockchain {
     pub fn rebuild_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let tree = self.open_confirmed_tx_tree()?;
-        tree.clear()?;
-        index.clear()?;
         if let Some(tip) = self.highest_block_index() {
             let mut batch = sled::Batch::default();
             let mut index_batch = sled::Batch::default();
+            let mut previous: Option<Block> = None;
             for h in 0..=tip {
                 // Heartbeat: this loop can hold the chain lock for a long time on a large
                 // chain, and a watchdog probing lock acquirability cannot otherwise tell
                 // that apart from a deadlock.
                 self.note_chain_progress();
-                if let Ok(block) = self.get_block(h) {
-                    let idx = block.index.to_le_bytes().to_vec();
-                    let ts_prefix = block.timestamp.to_be_bytes();
-                    for tx in &block.transactions {
-                        if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
-                            continue;
-                        }
-                        let tx_id = tx.get_tx_id();
-                        batch.insert(tx_id.as_bytes(), idx.clone());
-                        let mut index_key = ts_prefix.to_vec();
-                        index_key.extend_from_slice(tx_id.as_bytes());
-                        index_batch.insert(index_key, Vec::<u8>::new());
+                // FAIL CLOSED on a canonical gap, and note that the whole scan runs BEFORE
+                // the clear below: a skipped height would drop every transaction in that
+                // block out of the replay registry, silently re-opening those tx ids to
+                // replay, while the completion marker still claims the registry is built.
+                // Scanning first means a corrupt store leaves the PREVIOUS registry in
+                // place rather than a cleared or half-filled one.
+                let block = self
+                    .load_structurally_valid_canonical_block(h, previous.as_ref())
+                    .map_err(|e| {
+                        log::error!(
+                            "rebuild_confirmed_tx_index: refusing to publish a partial replay registry: {}",
+                            e
+                        );
+                        e
+                    })?;
+                let idx = block.index.to_le_bytes().to_vec();
+                let ts_prefix = block.timestamp.to_be_bytes();
+                for tx in &block.transactions {
+                    if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                        continue;
                     }
+                    let tx_id = tx.get_tx_id();
+                    batch.insert(tx_id.as_bytes(), idx.clone());
+                    let mut index_key = ts_prefix.to_vec();
+                    index_key.extend_from_slice(tx_id.as_bytes());
+                    index_batch.insert(index_key, Vec::<u8>::new());
                 }
+                previous = Some(block);
             }
+            // Scan proved contiguous — only now discard the old registry.
+            tree.clear()?;
+            index.clear()?;
             tree.apply_batch(batch)?;
             index.apply_batch(index_batch)?;
             tree.flush()?;
@@ -2681,6 +2798,11 @@ impl Blockchain {
             if let Some(tip_block) = self.get_last_block() {
                 let _ = self.prune_confirmed_txs(tip_block.timestamp);
             }
+        } else {
+            // No blocks at all: nothing to derive, so the registry must end up empty.
+            // Kept explicit because the clear above now sits behind the contiguity scan.
+            tree.clear()?;
+            index.clear()?;
         }
         // Stamp the completion marker unconditionally — even for a chain with no blocks or no
         // indexable txs — so ensure_confirmed_tx_index does not re-derive on every startup. New
@@ -4767,44 +4889,28 @@ impl Blockchain {
             std::collections::VecDeque::new();
         let covered = self.highest_block_index();
         if let Some(tip) = covered {
-            let mut missing = 0u32;
-            let mut first_missing = 0u32;
+            let mut previous: Option<Block> = None;
             for h in 0..=tip {
                 // Heartbeat: this loop can hold the chain lock for a long time on a large
                 // chain, and a watchdog probing lock acquirability cannot otherwise tell
                 // that apart from a deadlock.
                 self.note_chain_progress();
-                let Ok(block) = self.get_block(h) else {
-                    // M23: blocks are never pruned, so a gap in [0, tip] is genuine on-disk
-                    // corruption. Skipping it silently (as before) rebuilds WRONG balances
-                    // that still look authoritative because `tip` is unchanged. Count and
-                    // alarm loudly so the corruption is visible. Deliberately NOT a hard
-                    // fail: one bad old block must not strand a node whose recent state is
-                    // fine, and there is no pruning path that makes a gap legitimate.
-                    if missing == 0 {
-                        first_missing = h;
-                    }
-                    missing += 1;
-                    continue;
-                };
+                let block = self
+                    .load_structurally_valid_canonical_block(h, previous.as_ref())
+                    .map_err(|e| {
+                        log::error!(
+                            "rebuild_balances_index: refusing to publish a partial balance index: {}",
+                            e
+                        );
+                        e
+                    })?;
                 Self::replay_apply_block_checked(
                     h,
                     &block.transactions,
                     &mut balances,
                     &mut recent,
                 )?;
-            }
-            if missing > 0 {
-                log::error!(
-                    "rebuild_balances_index: {} of {} blocks in [0, {}] failed to load \
-                     (first at height {}) and were SKIPPED -- rebuilt balances are \
-                     INCOMPLETE and almost certainly WRONG. The block DB is corrupt; \
-                     restore from a good snapshot or re-sync from the network.",
-                    missing,
-                    tip + 1,
-                    tip,
-                    first_missing,
-                );
+                previous = Some(block);
             }
         }
 
@@ -5125,15 +5231,15 @@ impl Blockchain {
         // Stream canonical history below the fork by numeric height (O(1) block RAM instead of
         // loading + sorting the whole sub-chain), then the branch — numeric height order is
         // exactly the replay order.
+        let mut previous: Option<Block> = None;
         for h in 0..fork_start {
-            let Ok(block) = self.get_block(h) else {
-                continue;
-            };
+            let block = self.load_structurally_valid_canonical_block(h, previous.as_ref())?;
             if Self::replay_apply_block_checked(h, &block.transactions, &mut balances, &mut recent)
                 .is_err()
             {
                 return Ok(false);
             }
+            previous = Some(block);
         }
         for block in branch {
             if Self::replay_apply_block_checked(
@@ -5220,6 +5326,14 @@ impl Blockchain {
         // seconds on a multi-GB chain); the crash-dirty path below still
         // force-rebuilds via recover_dirty_chain_state.
         let _ = self.current_chain_tip_metadata()?;
+
+        // Dirty recovery authenticates the canonical sequence while rebuilding both
+        // authoritative derived indexes. A clean start would otherwise trust those
+        // indexes after checking only the tip, leaving decodable interior corruption
+        // latent until it affected block admission.
+        if dirty_state.is_none() {
+            self.validate_canonical_chain_structure()?;
+        }
 
         // Get and set the network difficulty first
         self.get_network_difficulty().await?;
@@ -6393,7 +6507,26 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Backward-compatible admission used by peer/reorg paths. Pending duplicates are
+    /// idempotent; confirmed replays remain rejection errors for callers that do not
+    /// consume the richer outcome.
     pub async fn add_transaction(&self, transaction: Transaction) -> Result<(), BlockchainError> {
+        match self.admit_transaction(transaction).await? {
+            TransactionAdmissionOutcome::Inserted
+            | TransactionAdmissionOutcome::AlreadyPending => Ok(()),
+            TransactionAdmissionOutcome::AlreadyConfirmed(_) => {
+                Err(BlockchainError::InvalidTransaction)
+            }
+        }
+    }
+
+    /// Validate and classify a transaction atomically with canonical/pending state.
+    /// Callers must announce only `Inserted`; the other outcomes describe an existing
+    /// payment and are not errors for idempotent user/API submission.
+    pub async fn admit_transaction(
+        &self,
+        transaction: Transaction,
+    ) -> Result<TransactionAdmissionOutcome, BlockchainError> {
         if transaction.sender == "MINING_REWARDS" {
             return Err(BlockchainError::InvalidTransaction);
         }
@@ -6407,8 +6540,8 @@ impl Blockchain {
         // tx win every height (the 2026-07-09 "Transaction is invalid" mining loop).
         // Rejecting at admission kills the loop at every entry point at once, since
         // all of them funnel through here.
-        if self.confirmed_tx_index(&transaction.get_tx_id()).is_some() {
-            return Err(BlockchainError::InvalidTransaction);
+        if let Some(height) = self.confirmed_tx_index(&transaction.get_tx_id()) {
+            return Ok(TransactionAdmissionOutcome::AlreadyConfirmed(height));
         }
 
         // Rate limit check
@@ -6573,8 +6706,8 @@ impl Blockchain {
         // The cheap early replay check avoids unnecessary ML-DSA work. Repeat it
         // under the state lock so a transaction confirmed while its signature was
         // being verified cannot be reinserted into pending state.
-        if self.confirmed_tx_index(&tx_id).is_some() {
-            return Err(BlockchainError::InvalidTransaction);
+        if let Some(height) = self.confirmed_tx_index(&tx_id) {
+            return Ok(TransactionAdmissionOutcome::AlreadyConfirmed(height));
         }
 
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
@@ -6593,7 +6726,7 @@ impl Blockchain {
                 }
             }
             self.add_to_mempool(mempool_tx).await?;
-            return Ok(());
+            return Ok(TransactionAdmissionOutcome::AlreadyPending);
         }
 
         // Exact i128 on both operands, same reasoning as validate_transaction:
@@ -6643,7 +6776,7 @@ impl Blockchain {
             pending_credits_tree.flush()?;
         }
 
-        Ok(())
+        Ok(TransactionAdmissionOutcome::Inserted)
     }
 
     pub async fn get_pending_amount(&self, address: &str) -> Result<f64, BlockchainError> {
@@ -9679,6 +9812,15 @@ mod tests {
         out
     }
 
+    fn dump_raw_tree(tree: &sled::Tree) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        tree.iter()
+            .map(|item| {
+                let (key, value) = item.expect("tree row should be readable");
+                (key.to_vec(), value.to_vec())
+            })
+            .collect()
+    }
+
     #[test]
     fn replay_registry_flags_a_reused_transaction() {
         let bc = test_blockchain();
@@ -9882,6 +10024,237 @@ mod tests {
             .db
             .insert(key.as_bytes(), codec::serialize(block).unwrap())
             .expect("raw block insert should succeed");
+    }
+
+    /// Contiguous coinbase-only chain [0, tip] paying `recipient`, inserted raw.
+    fn raw_chain_to(blockchain: &Blockchain, tip: u32, recipient: &str) {
+        let mut prev = [0u8; 32];
+        for h in 0..=tip {
+            let b = metadata_test_block(h, prev, recipient, 1.0);
+            prev = b.hash;
+            insert_raw_block(blockchain, &b);
+        }
+    }
+
+    fn delete_raw_block(blockchain: &Blockchain, height: u32) {
+        blockchain
+            .db
+            .remove(format!("block_{height}").as_bytes())
+            .expect("raw block delete should succeed");
+    }
+
+    /// FAULT INJECTION (A-02): an interior canonical gap must stop the balance rebuild
+    /// rather than publish a partial index. Skipping the height would leave balances
+    /// that are silently wrong while the tip still advertises them as current — and
+    /// because the balance writer gates block admission, that node then rejects valid
+    /// canonical blocks anyway.
+    #[tokio::test]
+    async fn balance_rebuild_fails_closed_on_an_interior_canonical_gap() {
+        let bc = test_blockchain();
+        let miner = "11".repeat(20);
+        raw_chain_to(&bc, 6, &miner);
+
+        let tree = bc.db.open_tree(BALANCES_TREE).expect("balances tree");
+        bc.rebuild_balances_index(&tree)
+            .await
+            .expect("healthy chain rebuilds");
+        let healthy = dump_raw_tree(&tree);
+        assert!(healthy.len() > 1, "precondition: balances and watermark exist");
+
+        // Interior corruption: block 3 vanishes, tip stays 6.
+        delete_raw_block(&bc, 3);
+
+        let err = bc
+            .rebuild_balances_index(&tree)
+            .await
+            .expect_err("a canonical gap must NOT rebuild");
+        assert!(
+            matches!(
+                err,
+                BlockchainError::CanonicalCorruption { height: 3, .. }
+            ),
+            "expected typed corruption at height 3, got {err:?}"
+        );
+        assert_eq!(
+            dump_raw_tree(&tree),
+            healthy,
+            "every balance value and the watermark must remain byte-identical"
+        );
+    }
+
+    /// Same fault, replay registry. The scan runs BEFORE the clear, so a corrupt store
+    /// leaves the previous registry in place instead of a cleared or half-filled one —
+    /// a dropped height would silently re-open every tx id in that block to replay.
+    #[test]
+    fn replay_registry_rebuild_fails_closed_on_an_interior_canonical_gap() {
+        let bc = test_blockchain();
+        let miner = "22".repeat(20);
+        raw_chain_to(&bc, 6, &miner);
+
+        bc.rebuild_confirmed_tx_index()
+            .expect("healthy chain rebuilds");
+        let confirmed = bc.open_confirmed_tx_tree().expect("confirmed tree");
+        let timestamp_index = bc
+            .db
+            .open_tree(CONFIRMED_TX_TS_INDEX)
+            .expect("timestamp index");
+        confirmed
+            .insert(b"preserve-me", 77u32.to_le_bytes().as_ref())
+            .expect("seed prior confirmed row");
+        timestamp_index
+            .insert(b"preserve-index-row", &[])
+            .expect("seed prior index row");
+        let confirmed_before = dump_raw_tree(&confirmed);
+        let timestamp_before = dump_raw_tree(&timestamp_index);
+        let built_before = bc
+            .open_chain_meta_tree()
+            .expect("meta")
+            .get(CONFIRMED_TX_BUILT_KEY)
+            .expect("read marker")
+            .is_some();
+        assert!(built_before, "precondition: healthy rebuild stamped built");
+
+        delete_raw_block(&bc, 2);
+
+        let err = bc
+            .rebuild_confirmed_tx_index()
+            .expect_err("a canonical gap must NOT rebuild");
+        assert!(
+            matches!(
+                err,
+                BlockchainError::CanonicalCorruption { height: 2, .. }
+            ),
+            "expected typed corruption at height 2, got {err:?}"
+        );
+        assert_eq!(dump_raw_tree(&confirmed), confirmed_before);
+        assert_eq!(dump_raw_tree(&timestamp_index), timestamp_before);
+    }
+
+    /// A missing genesis is the same class of fault and must be caught at height 0.
+    #[tokio::test]
+    async fn balance_rebuild_fails_closed_on_missing_genesis() {
+        let bc = test_blockchain();
+        let miner = "33".repeat(20);
+        raw_chain_to(&bc, 4, &miner);
+        delete_raw_block(&bc, 0);
+
+        let tree = bc.db.open_tree(BALANCES_TREE).expect("balances tree");
+        let err = bc
+            .rebuild_balances_index(&tree)
+            .await
+            .expect_err("missing genesis must NOT rebuild");
+        assert!(
+            matches!(
+                err,
+                BlockchainError::CanonicalCorruption { height: 0, .. }
+            ),
+            "expected typed corruption at height 0, got {err:?}"
+        );
+    }
+
+    /// An undecodable block is corruption too — not just an absent key.
+    #[tokio::test]
+    async fn balance_rebuild_fails_closed_on_an_undecodable_block() {
+        let bc = test_blockchain();
+        let miner = "44".repeat(20);
+        raw_chain_to(&bc, 5, &miner);
+        bc.db
+            .insert(b"block_2".as_ref(), b"not-a-block".as_ref())
+            .expect("corrupt block 2");
+
+        let tree = bc.db.open_tree(BALANCES_TREE).expect("balances tree");
+        let err = bc
+            .rebuild_balances_index(&tree)
+            .await
+            .expect_err("undecodable block must NOT rebuild");
+        assert!(
+            matches!(
+                err,
+                BlockchainError::CanonicalCorruption { height: 2, .. }
+            ),
+            "expected typed corruption at height 2, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_structure_rejects_decodable_tampering() {
+        for fault in ["index", "parent", "merkle", "hash"] {
+            let bc = test_blockchain();
+            raw_chain_to(&bc, 4, &"55".repeat(20));
+            let mut block = bc.get_block(2).expect("block 2");
+            match fault {
+                "index" => {
+                    block.index = 99;
+                    block.hash = block.calculate_hash_for_block();
+                }
+                "parent" => {
+                    block.previous_hash = [9u8; 32];
+                    block.hash = block.calculate_hash_for_block();
+                }
+                "merkle" => {
+                    block.merkle_root = [7u8; 32];
+                    block.hash = block.calculate_hash_for_block();
+                }
+                "hash" => block.hash[0] ^= 1,
+                _ => unreachable!(),
+            }
+            bc.db
+                .insert(b"block_2", codec::serialize(&block).expect("serialize fault"))
+                .expect("overwrite block 2");
+
+            let err = bc
+                .validate_canonical_chain_structure()
+                .expect_err("decodable structural corruption must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    BlockchainError::CanonicalCorruption { height: 2, .. }
+                ),
+                "{fault} fault should be attributed to height 2, got {err:?}"
+            );
+        }
+    }
+
+    /// Positive control for the clean-startup gate. Without it, the tampering test
+    /// above would still pass if the validator rejected every chain, and a boot-time
+    /// gate that refuses intact chains would take the node down on a healthy database.
+    /// Also asserts the read-only gate leaves no dirty marker behind: a clean start
+    /// that marked itself dirty would force a full rebuild on every subsequent boot.
+    #[test]
+    fn canonical_structure_accepts_an_intact_chain() {
+        let bc = test_blockchain();
+        raw_chain_to(&bc, 12, &"66".repeat(20));
+
+        bc.validate_canonical_chain_structure()
+            .expect("an intact canonical chain must pass the startup gate");
+
+        assert!(
+            bc.chain_state_dirty()
+                .expect("dirty-marker read should succeed")
+                .is_none(),
+            "validating a clean chain must not set the durable dirty marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_dirty_recovery_preserves_the_durable_marker() {
+        let bc = test_blockchain();
+        raw_chain_to(&bc, 5, &"66".repeat(20));
+        bc.mark_chain_state_dirty(5, "fault injection")
+            .expect("write dirty marker");
+        delete_raw_block(&bc, 2);
+        let marker = bc
+            .chain_state_dirty()
+            .expect("read marker")
+            .expect("marker exists");
+
+        bc.recover_dirty_chain_state(&marker, true)
+            .await
+            .expect_err("corrupt canonical storage must abort recovery");
+        assert!(
+            bc.chain_state_dirty().expect("read marker").is_some(),
+            "recovery failure must not clear its retry signal"
+        );
     }
 
     /// Balance round-trip identity: to_units(from_units(u)) == u for every u the chain
@@ -12797,6 +13170,81 @@ mod tests {
             .await
             .expect("mempool should load");
         assert_eq!(mempool.len(), 1);
+    }
+
+    /// Classification and insertion happen under one mutation lock. Two simultaneous
+    /// copies cannot both be reported as newly inserted.
+    #[tokio::test]
+    async fn concurrent_duplicate_admission_has_exactly_one_insertion() {
+        let blockchain = Arc::new(test_blockchain());
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let tx = signed_transfer(&wallet, &"cc".repeat(20), 1.0, 10_000).await;
+        set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
+        let chain_a = Arc::clone(&blockchain);
+        let chain_b = Arc::clone(&blockchain);
+        let tx_b = tx.clone();
+        let (a, b) = tokio::join!(
+            async move { chain_a.admit_transaction(tx).await },
+            async move { chain_b.admit_transaction(tx_b).await }
+        );
+        let outcomes = [a.expect("first result"), b.expect("second result")];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == TransactionAdmissionOutcome::Inserted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == TransactionAdmissionOutcome::AlreadyPending)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_pending_row_is_classified_and_rehydrated() {
+        let blockchain = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let tx = signed_transfer(&wallet, &"dd".repeat(20), 1.0, 10_001).await;
+        let tx_id = tx.get_tx_id();
+        set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
+        assert_eq!(
+            blockchain.admit_transaction(tx.clone()).await.unwrap(),
+            TransactionAdmissionOutcome::Inserted
+        );
+        *blockchain.mempool.write().await = Mempool::new();
+
+        assert_eq!(
+            blockchain.admit_transaction(tx).await.unwrap(),
+            TransactionAdmissionOutcome::AlreadyPending
+        );
+        assert!(
+            blockchain
+                .get_mempool_transaction_by_id(&tx_id)
+                .await
+                .is_some(),
+            "durable-only pending state must be restored to memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_transaction_returns_its_atomic_outcome() {
+        let blockchain = test_blockchain();
+        let wallet = Wallet::new(None).expect("test wallet should build");
+        let tx = signed_transfer(&wallet, &"ee".repeat(20), 1.0, 10_002).await;
+        blockchain
+            .open_confirmed_tx_tree()
+            .unwrap()
+            .insert(tx.get_tx_id().as_bytes(), 42u32.to_le_bytes().as_ref())
+            .unwrap();
+
+        assert_eq!(
+            blockchain.admit_transaction(tx).await.unwrap(),
+            TransactionAdmissionOutcome::AlreadyConfirmed(42)
+        );
     }
 
     #[tokio::test]
