@@ -6547,53 +6547,31 @@ impl Node {
         if tx.sender.is_empty() || tx.recipient.is_empty() {
             return Self::explorer_err(StatusCode::BAD_REQUEST, "missing sender or recipient");
         }
-        // M1: report duplicates EXPLICITLY instead of the bare 200 the mempool's
-        // Ok-on-collision would otherwise yield. An identical (sender, recipient,
-        // amount, fee, timestamp) tuple produces a byte-identical signed tx, so a
-        // caller's intended *second* same-second payment is indistinguishable from a
-        // resend and would otherwise vanish silently. Read-only pre-check on the opt-in
-        // explorer endpoint; the admission / propagation / consensus path below is
-        // unchanged. (audit M1 — residual of the now-fixed C02 replay finding)
+        // Transaction identity is (sender, recipient, amount, fee, timestamp). The
+        // atomic admission outcome below distinguishes a new insertion from a resend
+        // under the same lock as canonical and durable-pending state.
         let tx_id = tx.get_tx_id();
-        {
-            let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
-                return Self::explorer_busy();
-            };
-            if let Some(height) = chain.confirmed_tx_height(&tx_id) {
-                let finalized_height = chain.trusted_checkpoint_height();
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "ok": true, "status": "already_confirmed",
-                        "tx_id": tx_id.clone(), "height": height,
-                        "final": height <= finalized_height
-                    })),
-                );
-            }
-            if chain.get_mempool_transaction_by_id(&tx_id).await.is_some() {
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "ok": true, "status": "already_pending", "tx_id": tx_id.clone(),
-                        "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
-                    })),
-                );
-            }
-        }
         // Validate + admit through the canonical path. M2: a READ lock suffices --
         // add_transaction is &self and serializes its balance-check + mempool mutation on
         // state_mutation_lock (the same lock save_block/finalize_block take, same order),
         // so a write lock added no exclusion, it only held the exclusive blockchain lock
         // across the CPU-heavy ML-DSA verify. Read lets admissions verify concurrently and
         // stops starving readers/mining during a tx burst.
+        //
+        // The outcome is rendered to a String here rather than carried as-is:
+        // BlockchainError is not Send, and the already-confirmed arm below awaits, so
+        // keeping the error in scope past this point would sink the handler's Send bound.
         let submit = {
             let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
                 return Self::explorer_busy();
             };
-            chain.add_transaction(tx.clone()).await
+            chain
+                .admit_transaction(tx.clone())
+                .await
+                .map_err(|e| e.to_string())
         };
         match submit {
-            Ok(()) => {
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
                 // Announce now (mesh + peers) instead of waiting for the periodic
                 // re-gossip, so a withdrawal propagates immediately. The detached
                 // gossip task also seeds the compact leaf index from the canonical
@@ -6605,6 +6583,26 @@ impl Node {
                 (
                     StatusCode::OK,
                     Json(json!({ "ok": true, "status": "accepted", "tx_id": tx.get_tx_id() })),
+                )
+            }
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true, "status": "already_pending", "tx_id": tx_id,
+                    "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
+                })),
+            ),
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+                let finalized_height = match timeout(Duration::from_secs(3), state.blockchain.read()).await {
+                    Ok(chain) => chain.trusted_checkpoint_height(),
+                    Err(_) => return Self::explorer_busy(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_confirmed", "tx_id": tx_id,
+                        "height": height, "final": height <= finalized_height
+                    })),
                 )
             }
             Err(e) => Self::explorer_err(
@@ -9939,7 +9937,7 @@ impl Node {
             self.cache_verified_compact_transaction(full_tx);
         }
 
-        let mut validation_result = {
+        let validation_result = {
             let blockchain = self.blockchain.read().await;
             match blockchain.validate_block(block).await {
                 Ok(()) => true,
@@ -9965,28 +9963,23 @@ impl Node {
             }
         };
 
-        // Tracks whether validation_result was flipped to false purely by the (time-varying)
-        // conflicting-verified-header check, so that verdict is NOT negative-cached below.
-        let mut conflict_derived_reject = false;
+        // BPoS is monitoring/finality telemetry only. Its peer-derived, local and
+        // time-varying state must never alter the deterministic PoW/ledger verdict.
+        // Keeping `validation_result` immutable makes that boundary compiler-enforced.
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
-                // Header consensus is versioned by activation height:
-                // - v1: enforce only when verifier context is mature
-                // - v2+: enforce unconditionally from activation height
                 if sentinel
-                    .should_enforce_consensus_for_block(block.index)
+                    .has_monitoring_quorum_for_block(block.index)
                     .await
                 {
                     if sentinel
                         .has_conflicting_verified_header(block.index, &block.hash)
                         .await
                     {
-                        debug!(
-                            "Rejecting block {} due to conflicting verified header at same height",
+                        warn!(
+                            "BPoS observed a conflicting verified header at height {}; canonical PoW validity is unchanged",
                             block.index
                         );
-                        validation_result = false;
-                        conflict_derived_reject = true;
                     } else {
                         let has_record = sentinel.has_verification_record(&block.hash);
                         if sentinel.should_require_verified_header_record_for_block(block.index)
@@ -9998,7 +9991,7 @@ impl Node {
                             );
                         } else if has_record && !sentinel.is_header_verified(&block.hash).await {
                             debug!(
-                                "Accepting block {} with pending BPoS verifier quorum; rejecting only proven header conflicts",
+                                "Block {} has a pending BPoS verifier quorum; canonical PoW validity is unchanged",
                                 block.index
                             );
                         }
@@ -10007,20 +10000,13 @@ impl Node {
             }
         }
 
-        // Do NOT negative-cache a conflict-derived rejection: has_conflicting_verified_header is
-        // time-varying (the attacker's verified header ages out / its backoff elapses), so caching
-        // false under this block's own hash would suppress the honest tip for up to the cache TTL
-        // even after the conflict clears. Re-evaluate it fresh next time — same reasoning as the
-        // bad-claimed-hash path above, which also declines to negative-cache.
-        if !conflict_derived_reject {
-            self.validation_cache.insert(
-                block_hash,
-                ValidationCacheEntry {
-                    valid: validation_result,
-                    timestamp: SystemTime::now(),
-                },
-            );
-        }
+        self.validation_cache.insert(
+            block_hash,
+            ValidationCacheEntry {
+                valid: validation_result,
+                timestamp: SystemTime::now(),
+            },
+        );
         self.maybe_prune_validation_cache();
 
         if validation_result {
@@ -17669,5 +17655,41 @@ mod tests {
         );
         assert_eq!(group.data[8], 0x56);
         assert_eq!(group.data[9], 0);
+    }
+
+    /// CONSENSUS BOUNDARY REGRESSION GUARD.
+    ///
+    /// BPoS is monitoring/finality telemetry. Its inputs are peer-derived, local and
+    /// time-varying, so letting it reach the block verdict would make validity
+    /// non-deterministic across nodes — different nodes accepting different blocks at
+    /// the same height is a partition, not a disagreement about telemetry. The boundary
+    /// is enforced structurally rather than by policy: `validation_result` is bound once,
+    /// immutably, before the sentinel runs, so the monitoring path physically cannot
+    /// assign it and the compiler rejects any attempt.
+    ///
+    /// A behavioural test cannot cover this — there is no code path left to exercise —
+    /// so the binding form itself is what gets asserted. If this fails, the boundary was
+    /// reopened and the change needs consensus review, not a test fix.
+    #[test]
+    fn bpos_telemetry_cannot_reach_the_canonical_block_verdict() {
+        // Scan production code only: this test's own literals live in the test module
+        // and would otherwise match the patterns it forbids.
+        let src = include_str!("node.rs");
+        let src = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first segment");
+        assert!(
+            src.contains("let validation_result = {"),
+            "validation_result must remain a single immutable binding"
+        );
+        assert!(
+            !src.contains("let mut validation_result"),
+            "validation_result must never be mutable: telemetry could then change PoW validity"
+        );
+        assert!(
+            !src.contains("validation_result = false"),
+            "no path may assign the canonical verdict; PoW and ledger rules are the sole authority"
+        );
     }
 }

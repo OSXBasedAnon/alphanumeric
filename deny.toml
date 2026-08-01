@@ -1,0 +1,68 @@
+# cargo-deny — dependency advisory policy.
+#
+# The gate is MANDATORY in CI for RustSec advisories. GHSA/OSV-only records are
+# enforced separately by `.github/workflows/osv.yml` and `osv-scanner.toml`.
+# Every exception is explicit and reviewed; obsolete entries must be deleted.
+
+[advisories]
+version = 2
+# Deny by default. Only the explicitly-listed IDs below are tolerated.
+yanked = "deny"
+ignore = [
+  # --- Unmaintained transitive crates. No demonstrated vulnerability in any of them;
+  # each arrives through a dependency we do not control directly. Reviewed 2026-07-31.
+
+  # fxhash 0.2.1 — via inquire / sled. Hashing only, no untrusted-input parsing.
+  "RUSTSEC-2025-0057",
+
+  # gcc 0.3.55 — via get_if_addrs-sys. BUILD dependency; not present at runtime.
+  "RUSTSEC-2025-0121",
+
+  # instant 0.1.13 — transitive time shim. Unmaintained, no known defect.
+  "RUSTSEC-2024-0384",
+
+  # paste 1.0.15 — transitive proc-macro. Compile-time only.
+  "RUSTSEC-2024-0436",
+
+]
+
+# NOT ignored, recorded so it is not re-investigated from scratch: yamux 0.12.1 carries
+# GHSA-vxx9-2994-q338 / CVE-2026-32314 (remote panic). It has no RUSTSEC id, so the
+# RustSec-backed gate above does not flag it and no ignore entry is needed. It is also
+# not a live path: libp2p-yamux 0.47.0 vendors BOTH 0.12.1 and 0.13.10, the node builds
+# `yamux::Config::default()` (node.rs) which resolves to the FIXED 0.13.10 backend, and
+# the only subsystem reaching it is the Kademlia discovery fallback —
+# kademlia_fallback_enabled() is unwrap_or(false), off unless
+# ALPHANUMERIC_DISCOVERY_ENABLE_KAD_FALLBACK is explicitly set. Verified 2026-07-31.
+# Re-check both conditions on any libp2p bump; prefer dropping the legacy backend when
+# upstream constraints permit. If a RUSTSEC id is ever assigned, this becomes a real
+# decision rather than a note.
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are common in a libp2p/webrtc tree and are not a security
+# signal on their own; the advisories section above is what gates security.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
