@@ -8443,10 +8443,13 @@ mod tests {
     fn idle_snapshot_gate_stays_up_on_behind_prefix_but_exits_on_fork_or_too_far() {
         let depth = alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH;
         // NOT forked, within incremental range: STAY UP (false).
-        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000), false)); // caught up
-        assert!(!idle_reconcile_needs_snapshot(1000, Some(1001), false)); // 1 behind
-        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + 64), false)); // finality window
-                                                                               // Exactly at the bound is not beyond the bound.
+        // Caught up.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000), false));
+        // One block behind.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1001), false));
+        // At the finality window.
+        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + 64), false));
+        // Exactly at the bound is not beyond the bound.
         assert!(!idle_reconcile_needs_snapshot(
             1000,
             Some(1000 + depth),
@@ -8465,11 +8468,15 @@ mod tests {
         assert!(!idle_reconcile_needs_snapshot(1000, None, false));
         // FORKED overrides EVERYTHING — re-bootstrap even at a tiny gap, even
         // "caught up", even with no beacon: a forked service serves wrong data.
-        assert!(idle_reconcile_needs_snapshot(1000, Some(1001), true)); // 1 behind but forked
-        assert!(idle_reconcile_needs_snapshot(1000, Some(1000), true)); // "caught up" on a fork
-        assert!(idle_reconcile_needs_snapshot(1000, None, true)); // forked, beacon unknown
-        assert!(idle_reconcile_needs_snapshot(1000, Some(500), true)); // forked, ahead-by-height
-                                                                       // Saturation safety: no underflow/overflow at the u32 extremes.
+        // One block behind but forked.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1001), true));
+        // "Caught up" on a fork.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(1000), true));
+        // Forked with the beacon unavailable.
+        assert!(idle_reconcile_needs_snapshot(1000, None, true));
+        // Forked and ahead by height.
+        assert!(idle_reconcile_needs_snapshot(1000, Some(500), true));
+        // Saturation safety: no underflow/overflow at the u32 extremes.
         assert!(!idle_reconcile_needs_snapshot(u32::MAX, Some(0), false));
         assert!(idle_reconcile_needs_snapshot(0, Some(u32::MAX), false));
     }
