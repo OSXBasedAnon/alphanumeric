@@ -25,10 +25,8 @@ use std::path::Path;
 use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
-        Block, Blockchain, RateLimiter, Transaction, CONSENSUS_HEADER_RULES_VERSION,
-        FEE_ACCOUNTING_RULES_VERSION, FEE_ESTIMATE_ANCHOR_UNITS, FEE_SYSTEM_ACTIVATION_HEIGHT,
-        LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES,
-        MINT_CLIP, MIN_RELAY_FEE_UNITS, NETWORK_FEE, TARGET_BLOCK_TIME,
+        Block, Blockchain, RateLimiter, Transaction, FEE_ESTIMATE_ANCHOR_UNITS,
+        MIN_RELAY_FEE_UNITS,
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
@@ -44,6 +42,15 @@ use alphanumeric::a9::{
         UI_ORANGE, UI_PINK, UI_RULE,
     },
     whisper::WhisperModule,
+};
+
+#[cfg(test)]
+use alphanumeric::a9::blockchain::{
+    CONSENSUS_HEADER_RULES_VERSION, FEE_ACCOUNTING_RULES_VERSION,
+    FEE_SYSTEM_ACTIVATION_HEIGHT, LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS,
+    MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES, MINT_CLIP, NETWORK_FEE,
+    REWARD_CURVE_RULES_VERSION, REWARD_CURVE_V2_ACTIVATION_HEIGHT,
+    REWARD_V2_MINER_FEE_DENOMINATOR, REWARD_V2_MINER_FEE_NUMERATOR, TARGET_BLOCK_TIME,
 };
 use alphanumeric::config::AppConfig;
 
@@ -436,33 +443,7 @@ fn verify_bootstrap_snapshot_tip(
 }
 
 fn compute_consensus_fingerprint(blockchain: &Blockchain) -> (String, String) {
-    let genesis_hash = blockchain
-        .get_block(0)
-        .map(|b| hex::encode(b.hash))
-        .unwrap_or_else(|_| "missing_genesis".to_string());
-
-    let descriptor = format!(
-        "fee={:.12};reward={:.8};adj={};block_time={};target_block_time={};network_fee={:.8};mint_clip={:.8};genesis={};hdr_rules_ver={};hdr_future={};fee_rules_ver={};fee_activation={};fee_envelope_units={};max_block_weight={}",
-        blockchain.transaction_fee,
-        blockchain.mining_reward,
-        blockchain.difficulty_adjustment_interval,
-        blockchain.block_time,
-        TARGET_BLOCK_TIME,
-        NETWORK_FEE,
-        MINT_CLIP,
-        genesis_hash,
-        CONSENSUS_HEADER_RULES_VERSION,
-        MAX_BLOCK_FUTURE_TIME,
-        FEE_ACCOUNTING_RULES_VERSION,
-        FEE_SYSTEM_ACTIVATION_HEIGHT,
-        LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS,
-        MAX_BLOCK_WEIGHT_BYTES
-    );
-
-    let mut hasher = Sha256::new();
-    hasher.update(descriptor.as_bytes());
-    let fingerprint = hex::encode(hasher.finalize());
-    (descriptor, fingerprint)
+    blockchain.consensus_fingerprint()
 }
 
 /// App-thread stack. Windows gives the process main thread only 1MB (Unix: 8MB),
@@ -8064,7 +8045,7 @@ mod tests {
     }
 
     #[test]
-    fn consensus_fingerprint_commits_activated_fee_and_weight_rules() {
+    fn consensus_fingerprint_commits_all_activated_consensus_rules() {
         let db = sled::Config::new()
             .temporary(true)
             .open()
@@ -8082,10 +8063,18 @@ mod tests {
 
         for component in [
             format!("hdr_rules_ver={CONSENSUS_HEADER_RULES_VERSION}"),
+            format!("hdr_future={MAX_BLOCK_FUTURE_TIME}"),
             format!("fee_rules_ver={FEE_ACCOUNTING_RULES_VERSION}"),
             format!("fee_activation={FEE_SYSTEM_ACTIVATION_HEIGHT}"),
             format!("fee_envelope_units={LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS}"),
             format!("max_block_weight={MAX_BLOCK_WEIGHT_BYTES}"),
+            format!("network_fee={NETWORK_FEE:.8}"),
+            format!("mint_clip={MINT_CLIP:.8}"),
+            format!("reward_rules_ver={REWARD_CURVE_RULES_VERSION}"),
+            format!("reward_activation={REWARD_CURVE_V2_ACTIVATION_HEIGHT}"),
+            format!(
+                "reward_fee_share={REWARD_V2_MINER_FEE_NUMERATOR}/{REWARD_V2_MINER_FEE_DENOMINATOR}"
+            ),
         ] {
             assert!(
                 descriptor.contains(&component),
