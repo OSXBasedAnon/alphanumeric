@@ -144,7 +144,10 @@ impl GpuMiner {
                 if gi.device_type == wgpu::DeviceType::Cpu {
                     continue; // never silently mine on llvmpipe
                 }
-                if candidates.iter().any(|c| Self::same_adapter(&c.get_info(), &gi)) {
+                if candidates
+                    .iter()
+                    .any(|c| Self::same_adapter(&c.get_info(), &gi))
+                {
                     continue; // already queued (the HighPerformance pick)
                 }
                 candidates.push(a);
@@ -193,10 +196,7 @@ impl GpuMiner {
     /// avoid re-trying the HighPerformance pick when it reappears in the
     /// enumerate_adapters() fallback list (AdapterInfo isn't Eq).
     fn same_adapter(a: &wgpu::AdapterInfo, b: &wgpu::AdapterInfo) -> bool {
-        a.name == b.name
-            && a.backend == b.backend
-            && a.device == b.device
-            && a.vendor == b.vendor
+        a.name == b.name && a.backend == b.backend && a.device == b.device && a.vendor == b.vendor
     }
 
     /// Initialize a device + pipeline + buffers on ONE adapter and gate it on
@@ -432,7 +432,8 @@ impl GpuMiner {
         let mut done = 0u64;
         while done < max_nonces && !stop.load(Ordering::Relaxed) {
             let this = batch.min((max_nonces - done).min(u32::MAX as u64) as u32);
-            if let Some(n) = self.search_batch(header, zero_bits, start_nonce.wrapping_add(done), this)
+            if let Some(n) =
+                self.search_batch(header, zero_bits, start_nonce.wrapping_add(done), this)
             {
                 return Some(n);
             }
@@ -870,7 +871,14 @@ pub fn gpu_mine_attempt(
                 record_tip_change_observation();
                 return None;
             }
-            let full = build_header(number, previous_hash, timestamp, nonce, difficulty, merkle_root);
+            let full = build_header(
+                number,
+                previous_hash,
+                timestamp,
+                nonce,
+                difficulty,
+                merkle_root,
+            );
             let hash = *blake3::hash(&full).as_bytes();
             return Some((nonce, timestamp, difficulty, hash));
         }

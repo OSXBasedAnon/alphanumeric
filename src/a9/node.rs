@@ -4064,8 +4064,7 @@ impl Node {
                                 // child, so one sled hiccup mid-append would sideline our
                                 // own live lineage for the whole 300s cooldown.
                                 early = Some(
-                                    if e.contains("Database error") || e.contains("Serialization")
-                                    {
+                                    if e.contains("Database error") || e.contains("Serialization") {
                                         Converge::BeaconStale
                                     } else {
                                         Converge::BranchInvalid
@@ -5284,8 +5283,8 @@ impl Node {
                 let (floor, sigs_ok) = {
                     let bc = self.blockchain.read().await;
                     let floor = bc.verification_floor();
-                    let sigs_ok = block.index <= floor
-                        || bc.block_signatures_fully_verified(&block);
+                    let sigs_ok =
+                        block.index <= floor || bc.block_signatures_fully_verified(&block);
                     (floor, sigs_ok)
                 };
                 if !sigs_ok {
@@ -5548,8 +5547,7 @@ impl Node {
                 // (2026-07-11: prep told a wedged operator to restart while the boot
                 // check kept streaming-skipping — a perfect advice loop; that fix stays).
                 Converge::NeedsBootstrap => {
-                    let tip_before =
-                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    let tip_before = self.blockchain.read().await.get_latest_block_index() as u32;
                     // Slice the sync to the caller's budget, floored at 10s so a
                     // nearly-expired budget still gets one usable probe+stream window
                     // (bounded overshoot, same spirit as the round cap's 2s floor).
@@ -5557,8 +5555,7 @@ impl Node {
                     let healed = self
                         .sync_full_history_from_peer_bounded(true, Some(slice))
                         .await;
-                    let tip_after =
-                        self.blockchain.read().await.get_latest_block_index() as u32;
+                    let tip_after = self.blockchain.read().await.get_latest_block_index() as u32;
                     match healed {
                         Converge::Converged | Converge::AtTipAhead => {
                             // Same ghost-block guard as the Converged arm: one stale
@@ -5595,7 +5592,8 @@ impl Node {
                         Converge::Progressed => {
                             if Instant::now() >= deadline {
                                 return Err(NodeError::Retryable(
-                                    "a background peer sync is closing the gap; retry shortly".into(),
+                                    "a background peer sync is closing the gap; retry shortly"
+                                        .into(),
                                 ));
                             }
                             tokio::time::sleep(backoff).await;
@@ -6678,10 +6676,11 @@ impl Node {
                 })),
             ),
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
-                let finalized_height = match timeout(Duration::from_secs(3), state.blockchain.read()).await {
-                    Ok(chain) => chain.trusted_checkpoint_height(),
-                    Err(_) => return Self::explorer_busy(),
-                };
+                let finalized_height =
+                    match timeout(Duration::from_secs(3), state.blockchain.read()).await {
+                        Ok(chain) => chain.trusted_checkpoint_height(),
+                        Err(_) => return Self::explorer_busy(),
+                    };
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -8206,239 +8205,242 @@ impl Node {
             spawn_supervised("beacon-watch", move || {
                 let node_clone = node_clone.clone();
                 async move {
-                let mut ticker = interval(Duration::from_secs(tick_secs));
-                // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
-                // the default Burst behavior replays every slept-through tick back-to-back
-                // — hours of beacon polls and converge calls fired in seconds. One
-                // immediate tick, then the normal cadence.
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                let mut last_version: u64 = u64::MAX;
-                let mut ticks_since_full: u64 = 0;
-                let mut publisher_bootstrap_strikes: u32 = 0;
-                let mut publisher_relay_gap_strikes: u32 = 0;
-                let mut tick_no: u64 = 0;
-                let safety_ticks = (safety_secs / tick_secs).max(1);
-                loop {
-                    ticker.tick().await;
-                    tick_no += 1;
+                    let mut ticker = interval(Duration::from_secs(tick_secs));
+                    // Wake-from-sleep: where Instant advances across an OS suspend (Windows),
+                    // the default Burst behavior replays every slept-through tick back-to-back
+                    // — hours of beacon polls and converge calls fired in seconds. One
+                    // immediate tick, then the normal cadence.
+                    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                    let mut last_version: u64 = u64::MAX;
+                    let mut ticks_since_full: u64 = 0;
+                    let mut publisher_bootstrap_strikes: u32 = 0;
+                    let mut publisher_relay_gap_strikes: u32 = 0;
+                    let mut tick_no: u64 = 0;
+                    let safety_ticks = (safety_secs / tick_secs).max(1);
+                    loop {
+                        ticker.tick().await;
+                        tick_no += 1;
 
-                    // Publisher idle throttle: when the local tip hasn't moved in over
-                    // 2 minutes nobody is mining — probing the relay every second is
-                    // ~86k edge requests/day of pure idle burn. Probe every 5th tick
-                    // instead; the first block after an idle stretch is noticed within
-                    // <=5s, which is fine when blocks were minutes apart anyway. Full
-                    // 1s cadence resumes automatically once blocks flow again.
-                    if is_publisher {
-                        let tip_age = {
-                            let bc = node_clone.blockchain.read().await;
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            bc.get_last_block()
-                                .map(|b| now.saturating_sub(b.timestamp))
-                                .unwrap_or(0)
-                        };
-                        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        if tip_age > 120 && tick_no % 5 != 0 {
-                            continue;
-                        }
-                    }
-
-                    // The publisher is the SOURCE of the beacon: fetching its own
-                    // beacon back through the CDN every second was another ~86k wasted
-                    // edge requests/day. Only clients follow the beacon.
-                    let beacon = if is_publisher {
-                        None
-                    } else {
-                        node_clone.fetch_tip_beacon().await
-                    };
-                    let beacon_changed = beacon.map(|b| b.version != last_version).unwrap_or(false);
-
-                    ticks_since_full += 1;
-                    let safety_due = ticks_since_full >= safety_ticks;
-                    if !beacon_changed && !safety_due {
-                        continue; // nothing new — no fetch, no origin/Redis touch
-                    }
-                    ticks_since_full = 0;
-                    if let Some(b) = beacon {
-                        last_version = b.version;
-                    }
-
-                    // The PUBLISHER and a CLIENT have opposite relationships to the
-                    // beacon, so they sync differently:
-                    //
-                    // * Publisher: it is the SOURCE of the beacon. Miners POST their
-                    //   blocks to the relay, which therefore runs AHEAD of the
-                    //   publisher's tip; the publisher must INGEST those blocks (a
-                    //   forward relay pull), which advances its tip and — via the tip
-                    //   signal — posts the fresh beacon that fans out to everyone.
-                    //   converge_to_canonical(own_beacon) would be a no-op (it already
-                    //   holds its own beacon), so it must pull the relay directly. No
-                    //   extra publish: the ingested blocks are already on the relay.
-                    //
-                    // * Client: it FOLLOWS the beacon. converge_to_canonical drives it
-                    //   to the authoritative tip from any state — forward-stream when
-                    //   behind, reorg when forked — and never re-publishes the canonical
-                    //   blocks it adopts (that would echo-storm the relay).
-                    if is_publisher {
-                        // Publisher: converge to the HEAVIEST chain the relay holds
-                        // (fork-aware). This ingests miner blocks forward AND reorgs off a
-                        // losing fork the publisher may have latched onto during a race —
-                        // so it can never get stuck on a dead branch while miners extend a
-                        // heavier one (which would freeze the beacon for the whole network).
-                        //
-                        // P2P GAP-FILL FALLBACK: at high block rates the relay can develop
-                        // ancestry HOLES (posts dropped by rate limits / lost requests), and
-                        // then NO relay candidate is walkable — converge keeps returning
-                        // BeaconStale while miners (who share blocks peer-to-peer) sprint
-                        // ahead and the beacon crawls (2026-07-08 evening stall). The miners
-                        // ARE our peers, so after repeated walk failures with the relay head
-                        // visibly ahead, pull the missing span directly over p2p GetBlocks
-                        // (fully validated, existing path) and let converge resume.
-                        let outcome = node_clone.converge_to_relay_tip().await;
-                        if matches!(outcome, Converge::BeaconStale) {
-                            publisher_relay_gap_strikes += 1;
-                        } else {
-                            publisher_relay_gap_strikes = 0;
-                        }
-                        if publisher_relay_gap_strikes >= 10 {
-                            publisher_relay_gap_strikes = 0;
-                            let behind = match node_clone.fetch_relay_head().await {
-                                Some(head) => {
-                                    let local = {
-                                        let bc = node_clone.blockchain.read().await;
-                                        bc.get_latest_block_index() as u32
-                                    };
-                                    head.height > local.saturating_add(2)
-                                }
-                                None => false,
+                        // Publisher idle throttle: when the local tip hasn't moved in over
+                        // 2 minutes nobody is mining — probing the relay every second is
+                        // ~86k edge requests/day of pure idle burn. Probe every 5th tick
+                        // instead; the first block after an idle stretch is noticed within
+                        // <=5s, which is fine when blocks were minutes apart anyway. Full
+                        // 1s cadence resumes automatically once blocks flow again.
+                        if is_publisher {
+                            let tip_age = {
+                                let bc = node_clone.blockchain.read().await;
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                bc.get_last_block()
+                                    .map(|b| now.saturating_sub(b.timestamp))
+                                    .unwrap_or(0)
                             };
-                            if behind {
-                                warn!("Publisher: relay ancestry unwalkable while behind; pulling gap from p2p peers");
-                                if let Err(e) = node_clone.sync_with_network().await {
-                                    debug!("p2p gap-fill sync failed: {}", e);
-                                }
+                            // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+                            #[allow(clippy::manual_is_multiple_of)]
+                            if tip_age > 120 && tick_no % 5 != 0 {
+                                continue;
                             }
                         }
-                        match outcome {
-                            Converge::Converged | Converge::AtTipAhead | Converge::Progressed => {
-                                publisher_bootstrap_strikes = 0;
+
+                        // The publisher is the SOURCE of the beacon: fetching its own
+                        // beacon back through the CDN every second was another ~86k wasted
+                        // edge requests/day. Only clients follow the beacon.
+                        let beacon = if is_publisher {
+                            None
+                        } else {
+                            node_clone.fetch_tip_beacon().await
+                        };
+                        let beacon_changed =
+                            beacon.map(|b| b.version != last_version).unwrap_or(false);
+
+                        ticks_since_full += 1;
+                        let safety_due = ticks_since_full >= safety_ticks;
+                        if !beacon_changed && !safety_due {
+                            continue; // nothing new — no fetch, no origin/Redis touch
+                        }
+                        ticks_since_full = 0;
+                        if let Some(b) = beacon {
+                            last_version = b.version;
+                        }
+
+                        // The PUBLISHER and a CLIENT have opposite relationships to the
+                        // beacon, so they sync differently:
+                        //
+                        // * Publisher: it is the SOURCE of the beacon. Miners POST their
+                        //   blocks to the relay, which therefore runs AHEAD of the
+                        //   publisher's tip; the publisher must INGEST those blocks (a
+                        //   forward relay pull), which advances its tip and — via the tip
+                        //   signal — posts the fresh beacon that fans out to everyone.
+                        //   converge_to_canonical(own_beacon) would be a no-op (it already
+                        //   holds its own beacon), so it must pull the relay directly. No
+                        //   extra publish: the ingested blocks are already on the relay.
+                        //
+                        // * Client: it FOLLOWS the beacon. converge_to_canonical drives it
+                        //   to the authoritative tip from any state — forward-stream when
+                        //   behind, reorg when forked — and never re-publishes the canonical
+                        //   blocks it adopts (that would echo-storm the relay).
+                        if is_publisher {
+                            // Publisher: converge to the HEAVIEST chain the relay holds
+                            // (fork-aware). This ingests miner blocks forward AND reorgs off a
+                            // losing fork the publisher may have latched onto during a race —
+                            // so it can never get stuck on a dead branch while miners extend a
+                            // heavier one (which would freeze the beacon for the whole network).
+                            //
+                            // P2P GAP-FILL FALLBACK: at high block rates the relay can develop
+                            // ancestry HOLES (posts dropped by rate limits / lost requests), and
+                            // then NO relay candidate is walkable — converge keeps returning
+                            // BeaconStale while miners (who share blocks peer-to-peer) sprint
+                            // ahead and the beacon crawls (2026-07-08 evening stall). The miners
+                            // ARE our peers, so after repeated walk failures with the relay head
+                            // visibly ahead, pull the missing span directly over p2p GetBlocks
+                            // (fully validated, existing path) and let converge resume.
+                            let outcome = node_clone.converge_to_relay_tip().await;
+                            if matches!(outcome, Converge::BeaconStale) {
+                                publisher_relay_gap_strikes += 1;
+                            } else {
+                                publisher_relay_gap_strikes = 0;
                             }
-                            // Transient — don't count toward a restart.
-                            Converge::BeaconStale => {}
-                            // A candidate branch failed validation (incompatible-client
-                            // fork). It is memoized dead inside converge_to_relay_tip;
-                            // never a strike — the live branch gets tried next tick.
-                            Converge::BranchInvalid => {}
-                            // Genuine deep divergence the publisher cannot converge
-                            // incrementally (>64-block local rewrite, or needed history
-                            // aged out of the relay). Left unhandled this FREEZES the beacon
-                            // for the whole network. converge_to_relay_tip targets the
-                            // relay's heaviest tip, so NeedsBootstrap here already implies
-                            // "a heavier chain exists that we can't reach forward" — after 2
-                            // consecutive such ticks, restart into a fresh bootstrap from
-                            // that chain (launchd respawns us; the imported snapshot carries
-                            // tip-64 as the trusted checkpoint, so finality is preserved). A
-                            // single blip never triggers it.
-                            Converge::NeedsBootstrap => {
-                                publisher_bootstrap_strikes += 1;
-                                warn!(
+                            if publisher_relay_gap_strikes >= 10 {
+                                publisher_relay_gap_strikes = 0;
+                                let behind = match node_clone.fetch_relay_head().await {
+                                    Some(head) => {
+                                        let local = {
+                                            let bc = node_clone.blockchain.read().await;
+                                            bc.get_latest_block_index() as u32
+                                        };
+                                        head.height > local.saturating_add(2)
+                                    }
+                                    None => false,
+                                };
+                                if behind {
+                                    warn!("Publisher: relay ancestry unwalkable while behind; pulling gap from p2p peers");
+                                    if let Err(e) = node_clone.sync_with_network().await {
+                                        debug!("p2p gap-fill sync failed: {}", e);
+                                    }
+                                }
+                            }
+                            match outcome {
+                                Converge::Converged
+                                | Converge::AtTipAhead
+                                | Converge::Progressed => {
+                                    publisher_bootstrap_strikes = 0;
+                                }
+                                // Transient — don't count toward a restart.
+                                Converge::BeaconStale => {}
+                                // A candidate branch failed validation (incompatible-client
+                                // fork). It is memoized dead inside converge_to_relay_tip;
+                                // never a strike — the live branch gets tried next tick.
+                                Converge::BranchInvalid => {}
+                                // Genuine deep divergence the publisher cannot converge
+                                // incrementally (>64-block local rewrite, or needed history
+                                // aged out of the relay). Left unhandled this FREEZES the beacon
+                                // for the whole network. converge_to_relay_tip targets the
+                                // relay's heaviest tip, so NeedsBootstrap here already implies
+                                // "a heavier chain exists that we can't reach forward" — after 2
+                                // consecutive such ticks, restart into a fresh bootstrap from
+                                // that chain (launchd respawns us; the imported snapshot carries
+                                // tip-64 as the trusted checkpoint, so finality is preserved). A
+                                // single blip never triggers it.
+                                Converge::NeedsBootstrap => {
+                                    publisher_bootstrap_strikes += 1;
+                                    warn!(
                                     "Publisher: relay chain diverged below the reorg window (strike {}/2); will re-bootstrap on 2",
                                     publisher_bootstrap_strikes
                                 );
-                                if publisher_bootstrap_strikes >= 2 {
-                                    // TIER 2 (gateway-independent): before restarting to
-                                    // re-bootstrap from the gateway snapshot, try to
-                                    // reconstruct the canonical chain directly from a seed
-                                    // peer over GetBlocks (same validation, beacon-anchored).
-                                    // No-op if no seed is configured -> falls through to the
-                                    // original restart, so behaviour is unchanged there.
-                                    match node_clone.sync_full_history_from_peer(false).await {
-                                        Converge::Converged
-                                        | Converge::AtTipAhead
-                                        | Converge::Progressed => {
-                                            publisher_bootstrap_strikes = 0;
-                                            info!("Publisher: recovered via peer full-history sync; not restarting");
-                                        }
-                                        _ => {
-                                            warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
-                                            // Persist a hard force-rebootstrap marker BEFORE exiting (M10):
-                                            // otherwise the restart's boot reconcile trusts our own stale
-                                            // manifest, skips the re-bootstrap, re-diverges, and respawns
-                                            // in a loop with the beacon frozen network-wide. Cooldown-guarded.
-                                            let _ = node_clone.schedule_force_rebootstrap_hard(
+                                    if publisher_bootstrap_strikes >= 2 {
+                                        // TIER 2 (gateway-independent): before restarting to
+                                        // re-bootstrap from the gateway snapshot, try to
+                                        // reconstruct the canonical chain directly from a seed
+                                        // peer over GetBlocks (same validation, beacon-anchored).
+                                        // No-op if no seed is configured -> falls through to the
+                                        // original restart, so behaviour is unchanged there.
+                                        match node_clone.sync_full_history_from_peer(false).await {
+                                            Converge::Converged
+                                            | Converge::AtTipAhead
+                                            | Converge::Progressed => {
+                                                publisher_bootstrap_strikes = 0;
+                                                info!("Publisher: recovered via peer full-history sync; not restarting");
+                                            }
+                                            _ => {
+                                                warn!("Publisher: restarting to re-bootstrap onto the canonical chain");
+                                                // Persist a hard force-rebootstrap marker BEFORE exiting (M10):
+                                                // otherwise the restart's boot reconcile trusts our own stale
+                                                // manifest, skips the re-bootstrap, re-diverges, and respawns
+                                                // in a loop with the beacon frozen network-wide. Cooldown-guarded.
+                                                let _ = node_clone.schedule_force_rebootstrap_hard(
                                                 "publisher: relay chain diverged below reorg window",
                                             );
-                                            // Nonzero exit so systemd Restart=on-failure / launchd actually
-                                            // respawns us (M9) — exit(0) reads as a clean stop and strands the node.
-                                            std::process::exit(3);
+                                                // Nonzero exit so systemd Restart=on-failure / launchd actually
+                                                // respawns us (M9) — exit(0) reads as a clean stop and strands the node.
+                                                std::process::exit(3);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                    } else if let Some(b) = beacon {
-                        // FROZEN-TIP CURE. A node that cannot apply block H+1 — its
-                        // witnesses are unobtainable because the body it received is
-                        // witness-short — used to deadlock: H+1 stays above the node's
-                        // own verification floor forever, so it demands full witnesses
-                        // forever, even once the network has buried it by hundreds of
-                        // blocks. Observed live: the explorer frozen for 80 minutes.
-                        //
-                        // The cure lives in converge_to_canonical, which receipt-trusts
-                        // a block only once that block is transitively committed by the
-                        // signed beacon (walked hash-by-hash down from beacon.hash) AND
-                        // buried a full reorg margin below it. Burial is proven per
-                        // block, against a hash — never inferred from the beacon HEIGHT.
-                        // Recovery is also PROMPT: it needs no stall timer, because
-                        // what makes it safe is the pinning, not the waiting.
-                        //
-                        // Nothing here advances the checkpoint. Finality trails history
-                        // this node has actually applied; a height alone never moves it
-                        // (see raise_trusted_checkpoint's tip clamp).
-                        match node_clone.converge_to_canonical(&b).await {
-                            Converge::Converged | Converge::AtTipAhead => {}
-                            Converge::Progressed => {
-                                debug!("Live sync: progressed toward beacon {}", b.height);
-                            }
-                            Converge::NeedsBootstrap => {
-                                warn!(
+                        } else if let Some(b) = beacon {
+                            // FROZEN-TIP CURE. A node that cannot apply block H+1 — its
+                            // witnesses are unobtainable because the body it received is
+                            // witness-short — used to deadlock: H+1 stays above the node's
+                            // own verification floor forever, so it demands full witnesses
+                            // forever, even once the network has buried it by hundreds of
+                            // blocks. Observed live: the explorer frozen for 80 minutes.
+                            //
+                            // The cure lives in converge_to_canonical, which receipt-trusts
+                            // a block only once that block is transitively committed by the
+                            // signed beacon (walked hash-by-hash down from beacon.hash) AND
+                            // buried a full reorg margin below it. Burial is proven per
+                            // block, against a hash — never inferred from the beacon HEIGHT.
+                            // Recovery is also PROMPT: it needs no stall timer, because
+                            // what makes it safe is the pinning, not the waiting.
+                            //
+                            // Nothing here advances the checkpoint. Finality trails history
+                            // this node has actually applied; a height alone never moves it
+                            // (see raise_trusted_checkpoint's tip clamp).
+                            match node_clone.converge_to_canonical(&b).await {
+                                Converge::Converged | Converge::AtTipAhead => {}
+                                Converge::Progressed => {
+                                    debug!("Live sync: progressed toward beacon {}", b.height);
+                                }
+                                Converge::NeedsBootstrap => {
+                                    warn!(
                                     "Divergence below finality window at beacon {}; trying peer full-history sync",
                                     b.height
                                 );
-                                // TIER 2: reconstruct the canonical chain from a seed peer —
-                                // or any CONNECTED peer (a seedless client, the common case,
-                                // previously made this a no-op and fell straight through to
-                                // "gateway bootstrap required"). Safety is source-independent:
-                                // the sync's STEP-2 signed-beacon tip probe and per-block
-                                // ingest validation gate every peer, and the single-flight
-                                // guard keeps this from overlapping the idle-loop heal.
-                                match node_clone.sync_full_history_from_peer(true).await {
-                                    Converge::Converged
-                                    | Converge::AtTipAhead
-                                    | Converge::Progressed => {
-                                        info!("Client: recovered canonical chain via peer full-history sync");
-                                    }
-                                    _ => {
-                                        warn!("Client: peer full-sync unavailable; gateway bootstrap required");
+                                    // TIER 2: reconstruct the canonical chain from a seed peer —
+                                    // or any CONNECTED peer (a seedless client, the common case,
+                                    // previously made this a no-op and fell straight through to
+                                    // "gateway bootstrap required"). Safety is source-independent:
+                                    // the sync's STEP-2 signed-beacon tip probe and per-block
+                                    // ingest validation gate every peer, and the single-flight
+                                    // guard keeps this from overlapping the idle-loop heal.
+                                    match node_clone.sync_full_history_from_peer(true).await {
+                                        Converge::Converged
+                                        | Converge::AtTipAhead
+                                        | Converge::Progressed => {
+                                            info!("Client: recovered canonical chain via peer full-history sync");
+                                        }
+                                        _ => {
+                                            warn!("Client: peer full-sync unavailable; gateway bootstrap required");
+                                        }
                                     }
                                 }
-                            }
-                            Converge::BeaconStale => {}
-                            // The signed beacon pointed at a branch our engine rejects
-                            // (should not happen with an honest publisher; possible
-                            // transiently around its own reorg). Wait for the next
-                            // beacon rather than escalate.
-                            Converge::BranchInvalid => {
-                                debug!(
+                                Converge::BeaconStale => {}
+                                // The signed beacon pointed at a branch our engine rejects
+                                // (should not happen with an honest publisher; possible
+                                // transiently around its own reorg). Wait for the next
+                                // beacon rather than escalate.
+                                Converge::BranchInvalid => {
+                                    debug!(
                                     "Beacon branch failed local validation; awaiting next beacon"
                                 );
+                                }
                             }
                         }
                     }
-                }
                 }
             });
         }
@@ -8511,7 +8513,9 @@ impl Node {
                         );
                         if strikes >= 2 {
                             if headless {
-                                error!("lock watchdog: restarting to self-heal (supervisor respawns)");
+                                error!(
+                                    "lock watchdog: restarting to self-heal (supervisor respawns)"
+                                );
                                 // Nonzero so Restart=on-failure supervisors actually respawn (M9).
                                 std::process::exit(3);
                             } else if strikes == 2 {
@@ -9288,8 +9292,7 @@ impl Node {
                 .as_secs();
             let mut breakers = self.outbound_circuit_breakers.write().await;
             breakers.retain(|addr, state| {
-                state.open_until.is_some_and(|until| until > now)
-                    || active_peers.contains(addr)
+                state.open_until.is_some_and(|until| until > now) || active_peers.contains(addr)
             });
         }
     }
@@ -9951,12 +9954,7 @@ impl Node {
             // (Ok(false), not negative-cached, re-verified later) rather than surfacing an error, so
             // a transient hiccup on an honest block self-corrects and Phase 1 never returns Err.
             let mut full_tx = match self
-                .resolve_full_tx_for_block(
-                    tx,
-                    peer,
-                    witness_deadline,
-                    &mut witness_fetch_budget,
-                )
+                .resolve_full_tx_for_block(tx, peer, witness_deadline, &mut witness_fetch_budget)
                 .await
             {
                 Ok(Some(tx)) => tx,
@@ -10057,10 +10055,7 @@ impl Node {
         // Keeping `validation_result` immutable makes that boundary compiler-enforced.
         if validation_result {
             if let Some(ref sentinel) = self.header_sentinel {
-                if sentinel
-                    .has_monitoring_quorum_for_block(block.index)
-                    .await
-                {
+                if sentinel.has_monitoring_quorum_for_block(block.index).await {
                     if sentinel
                         .has_conflicting_verified_header(block.index, &block.hash)
                         .await
@@ -10258,12 +10253,7 @@ impl Node {
         let request = NetworkMessage::TxRequest {
             tx_id: tx_id.to_string(),
         };
-        match tokio::time::timeout(
-            timeout,
-            self.send_message_with_response(addr, &request),
-        )
-        .await
-        {
+        match tokio::time::timeout(timeout, self.send_message_with_response(addr, &request)).await {
             Ok(Ok(NetworkMessage::TxResponse {
                 tx_id: response_id,
                 tx,
@@ -11488,7 +11478,11 @@ impl Node {
         }
         // Domain-tagged for the same reason the block key is: one map, two kinds
         // of verdict, and a tag byte that keeps them structurally disjoint.
-        format!("t:{}:{}", tx.create_hash(), &hasher.finalize().to_hex()[..32])
+        format!(
+            "t:{}:{}",
+            tx.create_hash(),
+            &hasher.finalize().to_hex()[..32]
+        )
     }
 
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
@@ -11884,9 +11878,9 @@ impl Node {
                         drop(peers);
                         let node = self.clone();
                         // `block` is owned here and unused afterwards — cloning deep-copied
-                // a whole Block (up to MAX_BLOCK_TX_COUNT txs with witnesses) once
-                // per accepted block for nothing.
-                let block_arc = Arc::new(block);
+                        // a whole Block (up to MAX_BLOCK_TX_COUNT txs with witnesses) once
+                        // per accepted block for nothing.
+                        let block_arc = Arc::new(block);
                         tokio::spawn(async move {
                             if let Err(e) = node
                                 .broadcast_block(block_arc, None, selected_peers, true)
@@ -12907,15 +12901,13 @@ impl Node {
             .into_iter()
             .next()
             .unwrap_or_default();
-        let transport: Arc<dyn SignalTransport> =
-            match HttpSignalTransport::new(
-                zeroize::Zeroizing::new(self.handshake_key_bytes.as_ref().clone()),
-                gateway_base,
-            )
-            {
-                Ok(t) => Arc::new(t),
-                Err(e) => return Err(format!("transport init failed: {}", e)),
-            };
+        let transport: Arc<dyn SignalTransport> = match HttpSignalTransport::new(
+            zeroize::Zeroizing::new(self.handshake_key_bytes.as_ref().clone()),
+            gateway_base,
+        ) {
+            Ok(t) => Arc::new(t),
+            Err(e) => return Err(format!("transport init failed: {}", e)),
+        };
         let api = match build_api(false) {
             Ok(a) => Arc::new(a),
             Err(e) => return Err(format!("API init failed: {}", e)),
@@ -14428,13 +14420,13 @@ impl Node {
                 // The hash this block MUST have was fixed by the block above it (and the
                 // topmost by the signed beacon). PoW is checked alongside, so a peer cannot
                 // hand back a cheaply-forged body under a demanded hash.
-                if !Self::committed_link_ok(&block, expected_hash) || !block.verify_pow_meets_floor()
+                if !Self::committed_link_ok(&block, expected_hash)
+                    || !block.verify_pow_meets_floor()
                 {
                     return None;
                 }
-                buffered_bytes = buffered_bytes.saturating_add(
-                    codec::serialize(&block).map(|v| v.len()).unwrap_or(0),
-                );
+                buffered_bytes = buffered_bytes
+                    .saturating_add(codec::serialize(&block).map(|v| v.len()).unwrap_or(0));
                 if buffered_bytes > COMMITTED_SPAN_MAX_BYTES {
                     return None;
                 }
@@ -14966,10 +14958,7 @@ impl Node {
                                 .into_iter()
                                 // Hash + PoW-floor already verified inside
                                 // request_blocks (batch filter) — no re-hash here.
-                                .filter(|block| {
-                                    block.index >= start
-                                        && block.index <= end
-                                })
+                                .filter(|block| block.index >= start && block.index <= end)
                                 .collect();
                             candidate_blocks.sort_by_key(|block| block.index);
 
@@ -15518,7 +15507,10 @@ mod tests {
                 honest.merkle_root, variant.merkle_root,
                 "{label}: premise — the root does not distinguish these bodies"
             );
-            assert_eq!(honest.hash, variant.hash, "{label}: premise — one block hash");
+            assert_eq!(
+                honest.hash, variant.hash,
+                "{label}: premise — one block hash"
+            );
 
             // Requirement: the cache does separate them.
             assert_ne!(
@@ -15651,8 +15643,14 @@ mod tests {
         let sig = "ab".repeat(80);
         let block_key = Node::validation_cache_key(&block_carrying(tx_with_signature(&sig)));
         let tx_key = Node::transaction_cache_key(&tx_with_signature(&sig));
-        assert!(block_key.starts_with("b:"), "block verdicts carry the b: tag");
-        assert!(tx_key.starts_with("t:"), "transaction verdicts carry the t: tag");
+        assert!(
+            block_key.starts_with("b:"),
+            "block verdicts carry the b: tag"
+        );
+        assert!(
+            tx_key.starts_with("t:"),
+            "transaction verdicts carry the t: tag"
+        );
     }
 
     // Replay protection is the reason the cache exists; keying on the body must not cost it.
@@ -17672,7 +17670,10 @@ mod tests {
         );
         // The healthy case.
         assert!(!watchdog_strikes(true, true, true));
-        assert!(!watchdog_strikes(true, false, true), "an idle chain is not wedged");
+        assert!(
+            !watchdog_strikes(true, false, true),
+            "an idle chain is not wedged"
+        );
     }
 
     #[test]

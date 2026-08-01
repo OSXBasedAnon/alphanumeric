@@ -32,19 +32,17 @@ use alphanumeric::a9::{
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
-    ui::{
-        ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
-        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM,
-        UI_MUTED,
-        UI_GREEN, UI_LABEL, UI_LAVENDER, UI_ORANGE, UI_PINK, UI_RULE,
-    },
+    miner::{Miner, MiningManager},
     node::{
-        force_rebootstrap_marker_path, rebootstrap_cooldown_path,
-        rebootstrap_hard_cooldown_active,
+        force_rebootstrap_marker_path, rebootstrap_cooldown_path, rebootstrap_hard_cooldown_active,
         Converge, Node, NodeError, NodeRuntimeConfig,
     },
     oracle::DifficultyOracle,
-    miner::{Miner, MiningManager},
+    ui::{
+        ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
+        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
+        UI_ORANGE, UI_PINK, UI_RULE,
+    },
     whisper::WhisperModule,
 };
 use alphanumeric::config::AppConfig;
@@ -501,9 +499,8 @@ static MINING_READING_STDIN: AtomicBool = AtomicBool::new(false);
 /// erases the prompt line, writes the message, and redraws the prompt. Every
 /// background notice goes through `notify()` so it uses that when a prompt is
 /// live, and falls back to println! for headless runs where there is no editor.
-static EXTERNAL_PRINTER: std::sync::Mutex<
-    Option<Box<dyn rustyline::ExternalPrinter + Send>>,
-> = std::sync::Mutex::new(None);
+static EXTERNAL_PRINTER: std::sync::Mutex<Option<Box<dyn rustyline::ExternalPrinter + Send>>> =
+    std::sync::Mutex::new(None);
 
 /// Print a line from a BACKGROUND task without corrupting a live prompt.
 ///
@@ -527,7 +524,10 @@ fn notify(msg: String) {
 /// terminal cannot park a runtime worker, and cannot hold the global printer mutex across a
 /// scheduling point that other notifiers are queued behind.
 async fn notify_async(msg: String) {
-    if tokio::task::spawn_blocking(move || notify(msg)).await.is_err() {
+    if tokio::task::spawn_blocking(move || notify(msg))
+        .await
+        .is_err()
+    {
         // The blocking pool is gone (runtime shutting down); the notice is not worth
         // resurrecting a path for at that point.
     }
@@ -4450,7 +4450,6 @@ async fn handle_network_commands(
 
                     // Show detailed peer information
                     if new_peers > 0 {
-
                         pb.finish_with_message(format!(
                             "Found {} new peers (total: {}) across {} subnets",
                             new_peers,
@@ -5211,16 +5210,20 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 // multi-GB DB), and canonical_reconcile_decision used to
                 // recompute it internally — two identical scans per boot.
                 let boot_local_tip = local_tip_height(db_path);
-                let canonical_anchor: Option<(u32, String)> = match (
+                let canonical_anchor: Option<(u32, String)> =
+                    match (&manifest_result, boot_local_tip) {
+                        (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
+                            fetch_canonical_anchor_at_or_below(tip).await
+                        }
+                        _ => None,
+                    };
+                match canonical_reconcile_decision(
+                    db_path,
                     &manifest_result,
+                    live_beacon_height,
+                    canonical_anchor,
                     boot_local_tip,
                 ) {
-                    (Ok(m), Some(tip)) if m.height.map(|h| h as u32 > tip).unwrap_or(false) => {
-                        fetch_canonical_anchor_at_or_below(tip).await
-                    }
-                    _ => None,
-                };
-                match canonical_reconcile_decision(db_path, &manifest_result, live_beacon_height, canonical_anchor, boot_local_tip) {
                     CanonicalReconcile::InSyncOrUnknown => {
                         boot_note(
                             status.as_ref(),
@@ -5638,8 +5641,9 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                         .expected_extracted_bytes
                         .or(archive_expectations.unverified_extract_limit);
                     let copied = if let Some(limit) = budget {
-                        let remaining =
-                            limit.saturating_sub(stats.extracted_bytes).saturating_add(1);
+                        let remaining = limit
+                            .saturating_sub(stats.extracted_bytes)
+                            .saturating_add(1);
                         std::io::copy(&mut std::io::Read::take(&mut file, remaining), &mut outfile)
                             .map_err(|e| e.to_string())?
                     } else {
@@ -6018,7 +6022,12 @@ fn canonical_reconcile_decision(
     }
 
     CanonicalReconcile::Diverged {
-        local: format!("tip {} ({} behind live tip {})", local_tip, live_height.saturating_sub(local_tip), live_height),
+        local: format!(
+            "tip {} ({} behind live tip {})",
+            local_tip,
+            live_height.saturating_sub(local_tip),
+            live_height
+        ),
         canonical_height: height,
         canonical_hash,
     }
@@ -6121,7 +6130,11 @@ fn local_tip_height(db_path: &str) -> Option<u32> {
         .open()
         .ok()?;
     db.scan_prefix(b"block_")
-        .filter_map(|entry| entry.ok().and_then(|(k, _)| bootstrap_block_index_from_key(&k)))
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|(k, _)| bootstrap_block_index_from_key(&k))
+        })
         .max()
 }
 
@@ -6211,19 +6224,22 @@ fn best_anchor_from_history(body: &serde_json::Value, local_tip: u32) -> Option<
         }
         for h in headers {
             let (Some(height), Some(hash)) = (
-                h.get("height").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()),
+                h.get("height")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok()),
                 h.get("hash").and_then(|v| v.as_str()),
             ) else {
                 continue;
             };
-            if height > local_tip || hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            if height > local_tip
+                || hash.len() != 64
+                || !hash.chars().all(|c| c.is_ascii_hexdigit())
+            {
                 continue;
             }
             let better = match &best {
                 None => true,
-                Some((bh, bsnap, _)) => {
-                    height > *bh || (height == *bh && snapshot_height > *bsnap)
-                }
+                Some((bh, bsnap, _)) => height > *bh || (height == *bh && snapshot_height > *bsnap),
             };
             if better {
                 best = Some((height, snapshot_height, hash.to_ascii_lowercase()));
@@ -6704,18 +6720,27 @@ async fn publish_bootstrap_snapshot(
         {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                warn!("bootstrap upload-grant unavailable ({}); using legacy upload", r.status());
+                warn!(
+                    "bootstrap upload-grant unavailable ({}); using legacy upload",
+                    r.status()
+                );
                 break 'direct;
             }
             Err(e) => {
-                warn!("bootstrap upload-grant request failed ({}); using legacy upload", e);
+                warn!(
+                    "bootstrap upload-grant request failed ({}); using legacy upload",
+                    e
+                );
                 break 'direct;
             }
         };
         let grant: UploadGrant = match grant_resp.json().await {
             Ok(g) => g,
             Err(e) => {
-                warn!("bootstrap upload-grant parse failed ({}); using legacy upload", e);
+                warn!(
+                    "bootstrap upload-grant parse failed ({}); using legacy upload",
+                    e
+                );
                 break 'direct;
             }
         };
@@ -6728,13 +6753,17 @@ async fn publish_bootstrap_snapshot(
             network_id_hex, height, tip_hash_hex
         );
         let put_url = {
-            let mut u = match reqwest::Url::parse(&format!("{}/", grant.api_url.trim_end_matches('/'))) {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!("bootstrap upload-grant api_url invalid ({}); using legacy upload", e);
-                    break 'direct;
-                }
-            };
+            let mut u =
+                match reqwest::Url::parse(&format!("{}/", grant.api_url.trim_end_matches('/'))) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(
+                            "bootstrap upload-grant api_url invalid ({}); using legacy upload",
+                            e
+                        );
+                        break 'direct;
+                    }
+                };
             u.query_pairs_mut().append_pair("pathname", &pathname);
             u.to_string()
         };
@@ -6758,12 +6787,16 @@ async fn publish_bootstrap_snapshot(
                 Ok(b) if !b.url.trim().is_empty() => {
                     log::info!(
                         "bootstrap snapshot uploaded directly to blob ({} bytes): {}",
-                        compressed_bytes, b.url
+                        compressed_bytes,
+                        b.url
                     );
                     direct_blob_url = Some(b.url);
                 }
                 Ok(_) => warn!("blob put returned empty url; using legacy upload"),
-                Err(e) => warn!("blob put response parse failed ({}); using legacy upload", e),
+                Err(e) => warn!(
+                    "blob put response parse failed ({}); using legacy upload",
+                    e
+                ),
             },
             Ok(r) => {
                 let status = r.status();
@@ -7413,11 +7446,7 @@ impl WhisperAccum {
     /// Codes ordered by count descending, then code ascending. Total and
     /// deterministic: the order must not depend on hash iteration or arrival.
     fn ordered_codes(&self) -> Vec<(String, usize)> {
-        let mut v: Vec<(String, usize)> = self
-            .codes
-            .iter()
-            .map(|(c, n)| (c.clone(), *n))
-            .collect();
+        let mut v: Vec<(String, usize)> = self.codes.iter().map(|(c, n)| (c.clone(), *n)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v
     }
@@ -7425,11 +7454,8 @@ impl WhisperAccum {
     fn render(&self) -> String {
         // The tail is whispers, not codes — the same unit as the header count,
         // and the same number the fitter reserved room for.
-        let (shown, unshown) = fit_code_tokens(
-            &self.ordered_codes(),
-            WHISPER_CODE_BUDGET_COLS,
-            self.count,
-        );
+        let (shown, unshown) =
+            fit_code_tokens(&self.ordered_codes(), WHISPER_CODE_BUDGET_COLS, self.count);
         let mut codes = shown.join("  ");
         if unshown > 0 {
             codes.push_str(&format!("  +{unshown} more"));
@@ -7490,7 +7516,10 @@ mod tests {
     // the half of the behaviour that is NOT allowed to change.
     #[test]
     fn ordinary_wallet_volume_never_digests() {
-        assert!(!should_digest_receipts(1, 0), "a single payment stays verbose");
+        assert!(
+            !should_digest_receipts(1, 0),
+            "a single payment stays verbose"
+        );
         assert!(
             !should_digest_receipts(RECEIPT_BURST_LINES, RECEIPT_SUSTAINED_LINES),
             "sitting exactly ON both thresholds is still ordinary use"
@@ -7602,7 +7631,10 @@ mod tests {
         let tx = tx_with_sig_hash("aa", "bb", 100, "sig-one");
 
         assert!(announced.first_sighting(&tx), "first sighting reports");
-        assert!(!announced.first_sighting(&tx), "the re-scan must not report it again");
+        assert!(
+            !announced.first_sighting(&tx),
+            "the re-scan must not report it again"
+        );
 
         // Same envelope, different signing: a distinct message, still reported.
         let resigned = tx_with_sig_hash("aa", "bb", 100, "sig-two");
@@ -7613,7 +7645,10 @@ mod tests {
 
         // A different payment entirely.
         let other = tx_with_sig_hash("aa", "bb", 101, "sig-one");
-        assert!(announced.first_sighting(&other), "a distinct payment reports");
+        assert!(
+            announced.first_sighting(&other),
+            "a distinct payment reports"
+        );
     }
 
     // The memory is bounded, and it forgets in the safe direction: an evicted entry may print
@@ -7623,7 +7658,10 @@ mod tests {
         let mut announced = AnnouncedCredits::new();
         for i in 0..ANNOUNCED_CREDIT_MEMORY + 64 {
             let tx = tx_with_sig_hash("aa", "bb", i as u64, "sig");
-            assert!(announced.first_sighting(&tx), "every distinct credit reports");
+            assert!(
+                announced.first_sighting(&tx),
+                "every distinct credit reports"
+            );
         }
         assert!(
             announced.order.len() <= ANNOUNCED_CREDIT_MEMORY,
@@ -7752,7 +7790,11 @@ mod tests {
     // fee band is not exclusive, so ordinary payments land in it.
     #[test]
     fn fold_totals_the_value_so_a_digest_never_hides_money() {
-        let a = accum_of(&[("aa", "ABCD", 1.5), ("bb", "ABCD", 2.25), ("cc", "EFGH", 0.25)]);
+        let a = accum_of(&[
+            ("aa", "ABCD", 1.5),
+            ("bb", "ABCD", 2.25),
+            ("cc", "EFGH", 0.25),
+        ]);
         assert_eq!(a.count, 3);
         assert_eq!(a.senders.len(), 3);
         assert!((a.total - 4.0).abs() < 1e-9, "total was {}", a.total);
@@ -7761,8 +7803,16 @@ mod tests {
 
     #[test]
     fn fold_is_deterministic_regardless_of_input_order() {
-        let forward = accum_of(&[("aa", "ABCD", 0.1), ("bb", "EFGH", 0.1), ("cc", "ABCD", 0.1)]);
-        let reverse = accum_of(&[("cc", "ABCD", 0.1), ("bb", "EFGH", 0.1), ("aa", "ABCD", 0.1)]);
+        let forward = accum_of(&[
+            ("aa", "ABCD", 0.1),
+            ("bb", "EFGH", 0.1),
+            ("cc", "ABCD", 0.1),
+        ]);
+        let reverse = accum_of(&[
+            ("cc", "ABCD", 0.1),
+            ("bb", "EFGH", 0.1),
+            ("aa", "ABCD", 0.1),
+        ]);
         assert_eq!(forward.ordered_codes(), reverse.ordered_codes());
         assert_eq!(forward.render(), reverse.render());
     }
@@ -7832,7 +7882,10 @@ mod tests {
         let tokens = vec![("ABCD".to_string(), 12), ("EFGH".to_string(), 34)];
         // "ABCD ×12" + "  " + "EFGH ×34" = 18 columns but 20 bytes.
         let (shown, unshown) = fit_code_tokens(&tokens, 18, 46);
-        assert_eq!(unshown, 0, "both tokens fit in 18 columns and must be shown");
+        assert_eq!(
+            unshown, 0,
+            "both tokens fit in 18 columns and must be shown"
+        );
         let line = shown.join("  ");
         assert_eq!(line.chars().count(), 18);
         assert_eq!(line.len(), 20, "…even though they are 20 BYTES");
@@ -7849,10 +7902,16 @@ mod tests {
             .collect();
         a.merge(700, &many);
         assert!(a.codes_saturated, "the code map must be saturated");
-        assert!(!a.senders_saturated, "one sender never saturates the sender cap");
+        assert!(
+            !a.senders_saturated,
+            "one sender never saturates the sender cap"
+        );
         let line = a.render();
         assert!(line.contains("from 1 sender "), "got: {line}");
-        assert!(!line.contains("1+ sender"), "exact count reported as a bound");
+        assert!(
+            !line.contains("1+ sender"),
+            "exact count reported as a bound"
+        );
     }
 
     // The tip signal re-scans the tip on a reorg, so a height at or below one
@@ -7880,7 +7939,10 @@ mod tests {
         assert!(a.codes.len() <= WHISPER_ACCUM_MAX_KEYS);
         assert!(a.senders.len() <= WHISPER_ACCUM_MAX_KEYS);
         assert!((a.total - 5.0).abs() < 1e-6);
-        assert!(a.render().contains("+ senders"), "saturation must be visible");
+        assert!(
+            a.render().contains("+ senders"),
+            "saturation must be visible"
+        );
     }
 
     // The rollup anchor names a range once it spans blocks, so a reader can find
@@ -7958,8 +8020,15 @@ mod tests {
                 "single",
                 format!(
                     "\n{}whisper{}   {}XKQF{}  {:.8} ♦  from {}…  {}block {}{}",
-                    EV_WHISPER, EV_OFF, EV_CODE, EV_OFF, 12345.6789, "c3d4e5f6a7", EV_DIM,
-                    999_999, EV_OFF
+                    EV_WHISPER,
+                    EV_OFF,
+                    EV_CODE,
+                    EV_OFF,
+                    12345.6789,
+                    "c3d4e5f6a7",
+                    EV_DIM,
+                    999_999,
+                    EV_OFF
                 ),
             ),
             ("rollup", a.render()),
@@ -8023,8 +8092,14 @@ mod tests {
         }
 
         assert_eq!(verbose_printed, 2, "the two quiet blocks stay verbose");
-        assert!(accum.is_empty(), "the rollup must flush once the flood stops");
-        assert_eq!(reported, offered, "every whisper is accounted for exactly once");
+        assert!(
+            accum.is_empty(),
+            "the rollup must flush once the flood stops"
+        );
+        assert_eq!(
+            reported, offered,
+            "every whisper is accounted for exactly once"
+        );
 
         // 40 flooded blocks span 200s. Without the cooldown that is 40 notices;
         // with a 30s interval it must be far fewer, and never more than one per
@@ -8033,7 +8108,10 @@ mod tests {
             rollups <= 200 / WHISPER_ROLLUP_INTERVAL.as_secs() as usize + 2,
             "flood produced {rollups} notices — cooldown is not bounding output"
         );
-        assert!(rollups >= 2, "a 200s flood must still report more than once");
+        assert!(
+            rollups >= 2,
+            "a 200s flood must still report more than once"
+        );
     }
 
     // The rule that keeps a rollup from being reported twice: once one is
@@ -8076,9 +8154,7 @@ mod tests {
             format!("hdr_rules_ver={CONSENSUS_HEADER_RULES_VERSION}"),
             format!("fee_rules_ver={FEE_ACCOUNTING_RULES_VERSION}"),
             format!("fee_activation={FEE_SYSTEM_ACTIVATION_HEIGHT}"),
-            format!(
-                "fee_envelope_units={LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS}"
-            ),
+            format!("fee_envelope_units={LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS}"),
             format!("max_block_weight={MAX_BLOCK_WEIGHT_BYTES}"),
         ] {
             assert!(
@@ -8146,8 +8222,9 @@ mod tests {
             db.flush().unwrap();
         }
 
-        let defl = write_bootstrap_archive_zip(&src_dir, &defl_zip, zip::CompressionMethod::Deflated)
-            .unwrap();
+        let defl =
+            write_bootstrap_archive_zip(&src_dir, &defl_zip, zip::CompressionMethod::Deflated)
+                .unwrap();
         let stor = write_bootstrap_archive_zip(&src_dir, &stor_zip, zip::CompressionMethod::Stored)
             .unwrap();
 
@@ -8239,7 +8316,10 @@ mod tests {
                 return;
             }
         };
-        assert!(src.is_dir(), "ALPHANUMERIC_TEST_DB must be a sled dir: {src:?}");
+        assert!(
+            src.is_dir(),
+            "ALPHANUMERIC_TEST_DB must be a sled dir: {src:?}"
+        );
         let uniq = std::process::id();
         let out_dir = std::env::temp_dir().join(format!("a9_realzip_out_{}", uniq));
         let defl_zip = std::env::temp_dir().join(format!("a9_realzip_defl_{}.zip", uniq));
@@ -8310,11 +8390,8 @@ mod tests {
     /// Fresh sled DB at a unique temp path holding the given (height, hash-tag)
     /// blocks; handle dropped so canonical_reconcile_decision can re-open by path.
     fn reconcile_test_db(name: &str, heights: &[(u32, u8)]) -> String {
-        let path = std::env::temp_dir().join(format!(
-            "a9_reconcile_{}_{}",
-            std::process::id(),
-            name
-        ));
+        let path =
+            std::env::temp_dir().join(format!("a9_reconcile_{}_{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&path);
         let db = sled::Config::new().path(&path).open().unwrap();
         for (h, tag) in heights {
@@ -8369,9 +8446,18 @@ mod tests {
         assert!(!idle_reconcile_needs_snapshot(1000, Some(1000), false)); // caught up
         assert!(!idle_reconcile_needs_snapshot(1000, Some(1001), false)); // 1 behind
         assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + 64), false)); // finality window
-        assert!(!idle_reconcile_needs_snapshot(1000, Some(1000 + depth), false)); // exactly at bound = not > bound
+                                                                               // Exactly at the bound is not beyond the bound.
+        assert!(!idle_reconcile_needs_snapshot(
+            1000,
+            Some(1000 + depth),
+            false
+        ));
         // NOT forked, beyond the bound: genuinely aged out -> re-bootstrap (true).
-        assert!(idle_reconcile_needs_snapshot(1000, Some(1000 + depth + 1), false));
+        assert!(idle_reconcile_needs_snapshot(
+            1000,
+            Some(1000 + depth + 1),
+            false
+        ));
         assert!(idle_reconcile_needs_snapshot(0, Some(50_000), false));
         // NOT forked, beacon behind local (we are AHEAD): never re-bootstrap.
         assert!(!idle_reconcile_needs_snapshot(1000, Some(500), false));
@@ -8383,7 +8469,7 @@ mod tests {
         assert!(idle_reconcile_needs_snapshot(1000, Some(1000), true)); // "caught up" on a fork
         assert!(idle_reconcile_needs_snapshot(1000, None, true)); // forked, beacon unknown
         assert!(idle_reconcile_needs_snapshot(1000, Some(500), true)); // forked, ahead-by-height
-        // Saturation safety: no underflow/overflow at the u32 extremes.
+                                                                       // Saturation safety: no underflow/overflow at the u32 extremes.
         assert!(!idle_reconcile_needs_snapshot(u32::MAX, Some(0), false));
         assert!(idle_reconcile_needs_snapshot(0, Some(u32::MAX), false));
     }
@@ -8512,11 +8598,14 @@ mod tests {
                 (94, &"2".repeat(64), &"9".repeat(64)), // prev doesn't match
             ],
         );
-        let junk = history_entry(400, vec![(92, "not-hex", &"0".repeat(64)), (99, &"3".repeat(64), &"0".repeat(64))]);
-        let got = best_anchor_from_history(
-            &history_body(vec![linked, unlinked, junk]),
-            95,
+        let junk = history_entry(
+            400,
+            vec![
+                (92, "not-hex", &"0".repeat(64)),
+                (99, &"3".repeat(64), &"0".repeat(64)),
+            ],
         );
+        let got = best_anchor_from_history(&history_body(vec![linked, unlinked, junk]), 95);
         // unlinked window's 93/94 rejected; junk's 92 non-hex skipped and its
         // window is unlinked anyway; linked window's 91 is the best survivor.
         assert_eq!(got, Some((91, "f".repeat(64))));

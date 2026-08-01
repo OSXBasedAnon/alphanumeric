@@ -946,12 +946,12 @@ impl VelocityManager {
                 // pool; only ready requests touch the async workers. (Velocity is
                 // disabled today — this de-traps it for whenever it turns on.)
                 let mgr = Arc::clone(&self);
-                let request =
-                    match tokio::task::spawn_blocking(move || mgr.request_rx.recv()).await {
-                        Ok(Ok(request)) => request,
-                        // Channel closed, or the blocking task was cancelled.
-                        _ => return,
-                    };
+                let request = match tokio::task::spawn_blocking(move || mgr.request_rx.recv()).await
+                {
+                    Ok(Ok(request)) => request,
+                    // Channel closed, or the blocking task was cancelled.
+                    _ => return,
+                };
                 if let Err(e) = self.process_shred_request(request).await {
                     warn!("Error processing shred request: {}", e);
                 }
