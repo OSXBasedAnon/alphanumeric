@@ -117,6 +117,13 @@ pub struct BPoSSentinel {
 
 #[allow(dead_code)]
 impl BPoSSentinel {
+    /// A header may be at most this many seconds old (3 block times) to be
+    /// considered temporally consistent, and at most this many seconds ahead of
+    /// local time. Both bound a PEER-SUPPLIED timestamp, so both are enforced
+    /// saturating.
+    const MAX_HEADER_AGE_SECS: u64 = 6;
+    const MAX_HEADER_SKEW_SECS: u64 = 2;
+
     // Memory constants
     const MAX_PERFORMANCE_HISTORY: usize = 24;
     const MAX_ACTION_HISTORY: usize = 100;
@@ -446,7 +453,7 @@ impl BPoSSentinel {
                 .as_secs();
 
             for header_state in headers.iter().take(100) {
-                if now - header_state.timestamp < FORK_DETECTION_WINDOW {
+                if now.saturating_sub(header_state.timestamp) < FORK_DETECTION_WINDOW {
                     let verified_count = header_state.verified_by.len();
                     let total_nodes = self.node_metrics.len().max(1);
 
@@ -1018,7 +1025,7 @@ impl BPoSSentinel {
 
         let needs_full = force_full_update || {
             let health = self.network_health.read().await;
-            now - health.last_update > 300
+            now.saturating_sub(health.last_update) > 300
         };
         let full_snapshot = if needs_full {
             let peer_count = self.node.peers.read().await.len();
@@ -1064,11 +1071,28 @@ impl BPoSSentinel {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if now - header.timestamp > 6 || header.timestamp > now + 2 {
+        if !Self::header_timestamp_is_temporally_consistent(now, header.timestamp) {
             return false;
         }
 
         true
+    }
+
+    /// Temporal admissibility of a PEER-SUPPLIED header timestamp against a
+    /// reference clock: at most `MAX_HEADER_AGE_SECS` old (3 block times) and at
+    /// most `MAX_HEADER_SKEW_SECS` ahead.
+    ///
+    /// Split out as a pure function for two reasons. It is directly testable
+    /// without standing up a sentinel and a chain, and the saturating subtraction
+    /// is load-bearing: the timestamp is attacker-controlled, so a raw `now -
+    /// timestamp` underflows on a future-dated header. That underflow used to
+    /// reject such headers only by accident — the wrapped value looked enormous —
+    /// which meant the behaviour depended on release wrapping semantics and would
+    /// have panicked under overflow checks. The skew clause is what rejects them
+    /// now, deliberately.
+    fn header_timestamp_is_temporally_consistent(now: u64, timestamp: u64) -> bool {
+        now.saturating_sub(timestamp) <= Self::MAX_HEADER_AGE_SECS
+            && timestamp <= now.saturating_add(Self::MAX_HEADER_SKEW_SECS)
     }
 
     async fn verify_chain_health(&self) -> bool {
@@ -1525,7 +1549,7 @@ impl BPoSSentinel {
             .as_secs();
 
         let mut last_broadcast = self.last_anomaly_broadcast.write().await;
-        if now - *last_broadcast < 60 {
+        if now.saturating_sub(*last_broadcast) < 60 {
             // Skip broadcast if less than 60 seconds since last one
             return Ok(());
         }
@@ -2444,7 +2468,7 @@ impl HeaderSentinel {
         {
             let mut headers = self.headers.write().await;
             // Remove old headers (older than 24 hours)
-            headers.retain(|state| now - state.timestamp < 24 * 3600);
+            headers.retain(|state| now.saturating_sub(state.timestamp) < 24 * 3600);
             // If still too many headers, keep only the most recent ones
             if headers.len() > self.max_headers {
                 let excess = headers.len() - self.max_headers;
@@ -2456,7 +2480,7 @@ impl HeaderSentinel {
 
         // Clean up verifications (DashMap — no lock needed)
         self.verifications
-            .retain(|_, v| now - v.timestamp < 24 * 3600);
+            .retain(|_, v| now.saturating_sub(v.timestamp) < 24 * 3600);
 
         // Update sync state — acquired AFTER the `headers` guard above is dropped.
         let mut sync_state = self.sync_state.write().await;
@@ -3319,4 +3343,58 @@ mod tests {
             "header verification paths deadlocked under concurrent interleaving"
         );
     }
+    /// A backward wall-clock adjustment, or a hostile future-dated header, must
+    /// not underflow the age arithmetic. Under release wrapping that produced a
+    /// huge age (rejecting by accident); under overflow checks it would panic on
+    /// attacker-controlled input. The skew bound is what rejects future headers
+    /// now, and it does so deliberately.
+    #[test]
+    fn header_timestamp_checks_survive_clock_movement_in_both_directions() {
+        let now = 1_700_000_000u64;
+
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(now, now));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now - BPoSSentinel::MAX_HEADER_AGE_SECS
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now - BPoSSentinel::MAX_HEADER_AGE_SECS - 1
+        ));
+
+        // Future-dated within the allowed skew is fine; beyond it is rejected --
+        // and neither path may underflow.
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now + BPoSSentinel::MAX_HEADER_SKEW_SECS
+        ));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(
+            now,
+            now + BPoSSentinel::MAX_HEADER_SKEW_SECS + 1
+        ));
+
+        // Extreme adversarial inputs: no panic, no wrap, correct verdict.
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(now, u64::MAX));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(now, 0));
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(0, u64::MAX));
+        assert!(BPoSSentinel::header_timestamp_is_temporally_consistent(0, 0));
+        // A clock that jumped backwards past the header: age saturates to 0, and
+        // the skew bound is what decides.
+        assert!(!BPoSSentinel::header_timestamp_is_temporally_consistent(1, 1_000_000));
+    }
+
+    /// No wall-clock difference in this module may use raw subtraction: every one
+    /// of them takes an operand that is peer-supplied or a stored timestamp that
+    /// a clock adjustment can move ahead of `now`.
+    #[test]
+    fn bpos_uses_no_raw_wall_clock_subtraction() {
+        let src = include_str!("bpos.rs");
+        let production = src.split("#[cfg(test)]").next().expect("first segment");
+        assert!(
+            !production.contains("now - "),
+            "wall-clock differences must use saturating_sub: a backward clock \
+             adjustment would otherwise wrap or panic"
+        );
+    }
+
 }
