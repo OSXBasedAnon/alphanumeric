@@ -7392,17 +7392,18 @@ impl Blockchain {
 
     /// Exact atomic-unit Reward V2 calculation.
     ///
-    /// Let C be the scheduled ceiling, S the historical empty-block reward, and
-    /// F the aggregate regular fees. The rule is:
+    /// Let S be the scheduled subsidy and F the aggregate regular fees. The
+    /// scheduled ceiling bounds S only; fees are value transferred from senders,
+    /// not new issuance. The rule is:
     ///
-    /// `R = min(C, S + floor(65 * F / 100))`
+    /// `R = S + floor(65 * F / 100)`
     ///
     /// This gives two consensus invariants for every non-negative F:
     /// `R >= S` and `R - F <= S`. A transaction can therefore never reduce the
     /// miner below the empty subsidy, while self-funded fees can never increase
     /// net issuance above that subsidy. The remaining 35% is burned.
     fn reward_curve_v2_units(
-        current_max: f64,
+        subsidy_ceiling: f64,
         tx_count: usize,
         total_fee_units: i128,
     ) -> Result<i128, BlockchainError> {
@@ -7410,12 +7411,11 @@ impl Blockchain {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
 
-        let ceiling_units = Transaction::to_units(current_max);
-        let reward_floor = MIN_BLOCK_REWARD.min(current_max);
+        let reward_floor = MIN_BLOCK_REWARD.min(subsidy_ceiling);
         // Derive S through the exact historical empty-block operation order so
         // Reward V2 does not alter one empty block at any emission period.
         let subsidy_units = Transaction::to_units(Transaction::round_amount(
-            (current_max * 0.2).clamp(reward_floor, current_max),
+            (subsidy_ceiling * 0.2).clamp(reward_floor, subsidy_ceiling),
         ));
         let fee_units = if tx_count == 0 { 0 } else { total_fee_units };
         let miner_fee_units = fee_units
@@ -7424,8 +7424,7 @@ impl Blockchain {
             / REWARD_V2_MINER_FEE_DENOMINATOR;
         let reward_units = subsidy_units
             .checked_add(miner_fee_units)
-            .ok_or(BlockchainError::InvalidTransactionAmount)?
-            .min(ceiling_units);
+            .ok_or(BlockchainError::InvalidTransactionAmount)?;
 
         Ok(reward_units)
     }
@@ -7452,8 +7451,8 @@ impl Blockchain {
             )?));
         }
 
-        let current_max = self.scheduled_reward_ceiling(block_timestamp)?;
-        Self::reward_curve_v2_units(current_max, tx_count, total_fee_units)
+        let subsidy_ceiling = self.scheduled_reward_ceiling(block_timestamp)?;
+        Self::reward_curve_v2_units(subsidy_ceiling, tx_count, total_fee_units)
     }
 
     /// Internal aggregate adapter retained for the legacy f64 reward path and
@@ -9372,7 +9371,7 @@ mod tests {
             (0.0002, 10.00013),
             (5.0, 13.25),
             (40.0, 36.0),
-            (62.0, 50.0),
+            (62.0, 50.3),
         ] {
             let got = bc
                 .block_reward_units_from_totals(at, ts, 1, Transaction::to_units(fee))
@@ -9405,7 +9404,7 @@ mod tests {
         ];
 
         let mut checked = 0usize;
-        for period in [0u64, 1, 3, 13, 21, 22, 60] {
+        for period in [0u64, 1, 3, 13, 20, 21, 22, 60] {
             let ts = genesis_ts + period * SIX_MONTHS;
             let ceiling_units = Transaction::to_units(
                 MAX_BLOCK_REWARD * Blockchain::reduction_factor(period),
@@ -9417,24 +9416,42 @@ mod tests {
                 .block_reward_units_from_totals(height, ts, 1, 0)
                 .unwrap();
             assert_eq!(zero_fee_nonempty, subsidy_units);
+            assert!(
+                subsidy_units <= ceiling_units,
+                "scheduled subsidy exceeded its ceiling"
+            );
 
             let mut previous_reward = subsidy_units;
             for fee in fee_units {
                 let reward = bc
                     .block_reward_units_from_totals(height, ts, 1, fee)
                     .unwrap();
+                let miner_fee_units = fee
+                    .checked_mul(REWARD_V2_MINER_FEE_NUMERATOR)
+                    .unwrap()
+                    / REWARD_V2_MINER_FEE_DENOMINATOR;
                 assert!(reward >= subsidy_units, "fee lowered miner reward");
                 assert!(reward >= previous_reward, "reward is not monotonic in fees");
-                assert!(reward <= ceiling_units, "reward exceeded scheduled ceiling");
+                assert_eq!(
+                    reward,
+                    subsidy_units.checked_add(miner_fee_units).unwrap(),
+                    "miner did not receive the exact scheduled fee share"
+                );
                 assert!(
                     reward.checked_sub(fee).unwrap() <= subsidy_units,
                     "fee-funded block exceeded empty-block net issuance"
                 );
+                if fee > 0 {
+                    assert!(
+                        miner_fee_units < fee,
+                        "a self-funded fee must cost the miner more than it returns"
+                    );
+                }
                 previous_reward = reward;
                 checked += 1;
             }
         }
-        assert_eq!(checked, 7 * fee_units.len());
+        assert_eq!(checked, 8 * fee_units.len());
 
         assert!(matches!(
             bc.block_reward_units_from_totals(height, genesis_ts, 1, -1),
@@ -9448,6 +9465,70 @@ mod tests {
             bc.block_reward_units_from_totals(height, genesis_ts, 1, i128::MAX),
             Err(BlockchainError::InvalidTransactionAmount)
         ));
+    }
+
+    #[test]
+    fn reward_curve_v2_keeps_fee_compensation_after_subsidy_crossover() {
+        const SIX_MONTHS: u64 = 15_768_000;
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let height = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
+        let fee_units = Transaction::to_units(1.0);
+        let miner_fee_units = fee_units
+            .checked_mul(REWARD_V2_MINER_FEE_NUMERATOR)
+            .unwrap()
+            / REWARD_V2_MINER_FEE_DENOMINATOR;
+
+        for period in [20u64, 21, 22, 60, 200] {
+            let ts = genesis_ts + period * SIX_MONTHS;
+            let subsidy_units = bc
+                .block_reward_units_from_totals(height, ts, 0, 0)
+                .unwrap();
+            let reward_units = bc
+                .block_reward_units_from_totals(height, ts, 1, fee_units)
+                .unwrap();
+            assert_eq!(
+                reward_units,
+                subsidy_units.checked_add(miner_fee_units).unwrap(),
+                "fee compensation disappeared in emission period {period}"
+            );
+            assert!(
+                reward_units > subsidy_units,
+                "a positive mineable fee must increase miner compensation"
+            );
+            assert!(
+                reward_units.checked_sub(fee_units).unwrap() <= subsidy_units,
+                "fee-funded net issuance exceeded the period subsidy"
+            );
+        }
+    }
+
+    #[test]
+    fn reward_curve_v2_many_transaction_block_matches_exact_aggregate() {
+        let bc = test_blockchain();
+        let genesis_ts = 1_783_191_900u64;
+        let _ = bc.genesis_timestamp.set(genesis_ts);
+        let height = REWARD_CURVE_V2_ACTIVATION_HEIGHT;
+        let ts = genesis_ts + 3_000_000;
+        let minimum_fee_units = Transaction::to_units(0.0001);
+        let fee_units: Vec<i128> = (0..4_095)
+            .map(|offset| minimum_fee_units + i128::from(offset % 97))
+            .collect();
+        let exact_total = fee_units
+            .iter()
+            .try_fold(0i128, |total: i128, fee| total.checked_add(*fee))
+            .unwrap();
+        let block = fee_accounting_test_block(&bc, height, ts, &fee_units);
+        let block_reward_units = Transaction::to_units(bc.calculate_block_reward(&block).unwrap());
+        let aggregate_reward_units = bc
+            .block_reward_units_from_totals(height, ts, fee_units.len(), exact_total)
+            .unwrap();
+
+        assert_eq!(
+            block_reward_units, aggregate_reward_units,
+            "the transaction fold and exact aggregate reward paths diverged"
+        );
     }
 
     #[test]

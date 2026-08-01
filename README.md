@@ -174,14 +174,17 @@ advisory consensus fingerprint so operators can monitor rollout compatibility.
 - `FEE_PERCENTAGE = 0.000563063063` remains the Whisper encoding constant; it is
   not the regular-wallet fee policy
 - Reward constants: `MIN_BLOCK_REWARD = 1.0`, launch
-  `MAX_BLOCK_REWARD = 50.0`; the effective ceiling decays by 17% every six
-  months and eventually falls below the nominal floor
+  `MAX_BLOCK_REWARD = 50.0`; the effective subsidy ceiling decays by 17% every
+  six months and eventually falls below the nominal floor
 - Reward network fee: `NETWORK_FEE = 0.0005`
 - Fee clipping factor: `MINT_CLIP = 0.35`
 - Target block time: `TARGET_BLOCK_TIME = 5` seconds
 - Empty-block rewards are clamped from `0.2 * current_max` into
   `[min(MIN_BLOCK_REWARD, current_max), current_max]`
-- Non-empty block rewards scale with effective fees and are clamped to `[min(MIN_BLOCK_REWARD, current_max), current_max]`
+- Before block `569,423`, non-empty block rewards retain the legacy fee curve.
+  From block `569,423`, miner compensation is the scheduled subsidy plus 65% of
+  included transaction fees; the remaining 35% is burned. The decaying ceiling
+  bounds the subsidy component, while exact fee units are transferred separately.
 
 Actual realized issuance still depends on real network activity (block production + transaction fees).
 
