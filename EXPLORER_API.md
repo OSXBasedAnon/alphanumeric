@@ -144,17 +144,22 @@ Retries can still receive transient `429` or `503` responses:
 A withdrawal worker should treat `accepted` / `already_confirmed` as success, retry on
 `503`, and back off on `429`.
 
-Two `400`s are NOT terminal, so do not page on `400` alone. Rate-limit rejections arrive
-as `400` with a `Rate limit exceeded: ...` message and mean back off, not fail:
+Backpressure returns `429` with a machine-readable reason; a `400` is terminal.
 
-    ... Too many transactions from this address   at the 100-pending-per-address cap
-    ... Too many requests                          per-sender submission rate
-    ... Mempool is full                            back off, then RE-SIGN AT A HIGHER FEE
-                                                   (retrying the identical tx cannot succeed)
+    429 {"error": "rate_limited", "reason": "<reason>",
+         "retryable": true, "retry_same_transaction": <bool>, "detail": "<message>"}
 
-Genuinely terminal `400`s are `FeeBelowRelayFloor`, `InsufficientFunds` and
-`InvalidTransactionSignature`. Treat `already_pending` as success only when the returned
-`tx_id` matches the one you submitted — see the duplicate-identity note above.
+    reason                      retry_same_transaction
+    per_address_pending_cap     true    at the 100-pending-per-sender-address cap
+    per_sender_rate             true    per-sender submission rate
+    mempool_full                FALSE   back off, then RE-SIGN AT A HIGHER FEE — eviction
+                                        is fee-ordered, so resubmitting the identical
+                                        transaction can never win a slot
+
+Branch on `retry_same_transaction`, not on the reason string. A `400`
+(`InsufficientFunds`, `InvalidTransactionSignature`, `FeeBelowRelayFloor`, bad amount) is
+terminal — alert on it. Treat `already_pending` as success only when the returned `tx_id`
+matches the one you submitted — see the duplicate-identity note above.
 
 On `accepted`, the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and scheduled its network

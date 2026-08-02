@@ -89,15 +89,21 @@ pair is the simplest correct policy.
 
 ### Classifying failures
 
-Rate-limit rejections currently return **400**, the same status as a permanently invalid
-transaction. Match on the message before deciding to page a human:
+Backpressure returns **429** with a machine-readable reason. A **400** is terminal.
 
-| Message contains | Action |
-|---|---|
-| `Rate limit exceeded: Too many transactions from this address` | back off, you are at the 100 cap |
-| `Rate limit exceeded: Too many requests` | back off, per-sender rate |
-| `Rate limit exceeded: Mempool is full` | back off, then **re-sign with a higher fee** — a retry of the identical transaction can never succeed |
-| `FeeBelowRelayFloor`, `InsufficientFunds`, `InvalidTransactionSignature` | terminal, do not retry |
+```json
+429 {"error": "rate_limited", "reason": "mempool_full",
+     "retryable": true, "retry_same_transaction": false, "detail": "..."}
+```
+
+| `reason` | `retry_same_transaction` | Action |
+|---|---|---|
+| `per_address_pending_cap` | `true` | back off, you are at the 100-pending cap |
+| `per_sender_rate` | `true` | back off, per-sender submission rate |
+| `mempool_full` | **`false`** | back off, then **re-sign at a higher fee** — eviction is fee-ordered and all-or-nothing, so resubmitting the identical transaction can never win a slot |
+
+**Branch on `retry_same_transaction`, not on the reason string.** A 400
+(`InsufficientFunds`, `InvalidTransactionSignature`, `FeeBelowRelayFloor`) is terminal.
 
 Minimum relay fee is 10,000 units (0.0001 `ALPHA`). Minimum transfer is 564 units. Use
 `/explorer/fee-estimate` rather than hardcoding.
@@ -112,15 +118,18 @@ arbitrary fee values for ordinary withdrawals.
 
 `/explorer/address/{addr}` returns confirmed ledger state.
 
-**The `balance` field is the raw confirmed total.** It includes mining rewards that are
-still immature (coinbase maturity is **100 blocks**) and does **not** subtract in-flight
-mempool debits, so it can exceed what the address can actually spend right now. Do not use
-it directly as available balance for a user.
+**Use `spendable_units`, not `balance_units`.** `balance` is the raw confirmed ledger
+total: it includes mining rewards that are still immature (coinbase maturity is **100
+blocks**) and does not subtract in-flight mempool debits, so it can exceed what the address
+can actually spend. `spendable` / `spendable_units` is confirmed minus pending debits minus
+immature rewards, and is the number to credit a user against. It is `null` if it cannot be
+computed.
 
-**An empty `transactions` array does not prove there were no deposits.** It is read
-directly from the address index, which can be unbuilt or mid-rebuild after a bootstrap or
-re-index. Confirm the node is ready and fresh via `/explorer/status` (`index_ready`,
-`blocks_behind`) before treating an empty history as authoritative.
+**Check `history_available` before reading `transactions`.** The history is served off the
+address index, which can be unbuilt or mid-rebuild after a bootstrap or re-index. When that
+is the case `history_available` is `false` and `transactions` is **`null`** rather than an
+empty array, so a scanner cannot mistake "index not ready" for "no deposits". Retry until
+it is `true`, and also confirm freshness via `/explorer/status` (`blocks_behind`).
 
 `GET` endpoints can return **503** under chain-lock contention during heavy sync or
 indexing. A deposit scanner must treat non-200 as "retry", never as "no data", or it will

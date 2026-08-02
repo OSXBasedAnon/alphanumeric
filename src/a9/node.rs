@@ -6203,6 +6203,33 @@ impl Node {
         Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "chain busy, retry shortly")
     }
 
+    /// Classify a rejected submission as backpressure, returning the machine-readable
+    /// reason and whether resubmitting the SAME signed transaction can ever succeed.
+    ///
+    /// `None` means the rejection is terminal (bad signature, insufficient funds, fee
+    /// below the relay floor) and the caller should not retry at all.
+    ///
+    /// Matched on the rendered Display string because the admission error is turned into
+    /// a String upstream — `BlockchainError` is `!Send` and cannot be held across the
+    /// submit handler's awaits. `RateLimitExceeded` is the only variant whose Display
+    /// begins "Rate limit exceeded", so the prefix is an exact discriminator.
+    fn classify_submit_backpressure(detail: &str) -> Option<(&'static str, bool)> {
+        if !detail.starts_with("Rate limit exceeded") {
+            return None;
+        }
+        if detail.contains("Too many transactions from this address") {
+            // MEMPOOL_MAX_PER_ADDRESS pending slots are full; they drain as blocks land.
+            Some(("per_address_pending_cap", true))
+        } else if detail.contains("Mempool is full") {
+            // Eviction is fee-ordered and all-or-nothing, so resubmitting THIS
+            // transaction can never win a slot. Only a re-sign at a higher fee clears
+            // it, and that is a different transaction.
+            Some(("mempool_full", false))
+        } else {
+            Some(("per_sender_rate", true))
+        }
+    }
+
     /// Addresses are hex strings (or the MINING_REWARDS literal); reject anything
     /// else before it reaches a tree scan.
     fn explorer_valid_address(address: &str) -> bool {
@@ -6561,11 +6588,26 @@ impl Node {
             let balance_units = chain
                 .confirmed_balance_units_readonly(&address)
                 .unwrap_or(0);
+            // Confirmed minus pending debits minus still-immature mining rewards. The
+            // raw `balance` below is the ledger total and can be strictly larger, so an
+            // integrator who reads it as "available" over-credits. Publishing both
+            // removes the guess.
+            let spendable_units = chain.get_spendable_balance_units(&address).await.ok();
             let index_meta = chain.address_index_meta();
+            // The history is served straight off the address index. While that index is
+            // unbuilt or mid-rebuild it yields an EMPTY page, which is indistinguishable
+            // from "this address never received anything" — the one reading that costs a
+            // deposit. Serve null rather than a plausible empty list, so a scanner fails
+            // loudly instead of concluding wrongly. `summary` is already gated this way.
+            let history_available = index_meta.is_some();
             let summary = chain.address_history_summary(&address).unwrap_or(None);
-            let entries = chain
-                .address_txs_page(&address, limit, before)
-                .unwrap_or_default();
+            let entries = if history_available {
+                chain
+                    .address_txs_page(&address, limit, before)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let next = if entries.len() == limit {
                 entries.last().map(
                     |entry| json!({ "before_height": entry.height, "before_pos": entry.position }),
@@ -6577,6 +6619,9 @@ impl Node {
                 "address": address,
                 "balance": Transaction::from_units(balance_units),
                 "balance_units": balance_units.to_string(),
+                "spendable": spendable_units.map(Transaction::from_units),
+                "spendable_units": spendable_units.map(|units| units.to_string()),
+                "history_available": history_available,
                 "index_ready": index_meta.is_some(),
                 "index_height": index_meta.map(|(height, _)| height),
                 "summary": summary.map(|s| json!({
@@ -6590,10 +6635,14 @@ impl Node {
                     "first_height": s.first_height,
                     "last_height": s.last_height,
                 })),
-                "transactions": entries
-                    .iter()
-                    .map(Self::explorer_entry_json)
-                    .collect::<Vec<_>>(),
+                "transactions": if history_available {
+                    json!(entries
+                        .iter()
+                        .map(Self::explorer_entry_json)
+                        .collect::<Vec<_>>())
+                } else {
+                    Value::Null
+                },
                 "next": next,
             })
         };
@@ -6747,10 +6796,32 @@ impl Node {
                     })),
                 )
             }
-            Err(e) => Self::explorer_err(
-                StatusCode::BAD_REQUEST,
-                &format!("transaction rejected: {}", e),
-            ),
+            Err(e) => {
+                let detail = e.to_string();
+                // Backpressure is not permanent failure, and it used to be
+                // indistinguishable from it: every rejection left here as a 400, so a
+                // withdrawal worker either paged on ordinary congestion or retried
+                // something that could never succeed. Give those a 429 with a
+                // machine-readable reason instead.
+                if let Some((reason, retry_same_transaction)) =
+                    Self::classify_submit_backpressure(&detail)
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({
+                            "error": "rate_limited",
+                            "reason": reason,
+                            "retryable": true,
+                            "retry_same_transaction": retry_same_transaction,
+                            "detail": detail,
+                        })),
+                    );
+                }
+                Self::explorer_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("transaction rejected: {}", detail),
+                )
+            }
         }
     }
 
@@ -15516,6 +15587,51 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A withdrawal worker decides "retry" vs "page a human" from this classification, so the
+    // three backpressure reasons must stay distinguishable from each other AND from a terminal
+    // rejection. The mempool-full case is the one worth pinning: eviction is fee-ordered and
+    // all-or-nothing, so resubmitting the identical signed transaction can never win a slot,
+    // and a worker that retries it instead of re-signing at a higher fee loops forever.
+    #[test]
+    fn submit_backpressure_classification_separates_retry_from_terminal() {
+        use crate::a9::blockchain::BlockchainError;
+
+        // Exact Display strings the three sources actually produce.
+        let per_address =
+            BlockchainError::RateLimitExceeded("Too many transactions from this address".into())
+                .to_string();
+        let per_sender = BlockchainError::RateLimitExceeded("Too many requests".into()).to_string();
+        let full = BlockchainError::RateLimitExceeded("Mempool is full".into()).to_string();
+
+        assert_eq!(
+            Node::classify_submit_backpressure(&per_address),
+            Some(("per_address_pending_cap", true))
+        );
+        assert_eq!(
+            Node::classify_submit_backpressure(&per_sender),
+            Some(("per_sender_rate", true))
+        );
+        assert_eq!(
+            Node::classify_submit_backpressure(&full),
+            Some(("mempool_full", false)),
+            "a full mempool needs a re-sign at a higher fee, never a retry of the same tx"
+        );
+
+        // Terminal rejections must not be reported as retryable.
+        for terminal in [
+            BlockchainError::InsufficientFunds.to_string(),
+            BlockchainError::InvalidTransactionSignature.to_string(),
+            BlockchainError::FeeBelowRelayFloor.to_string(),
+            BlockchainError::InvalidTransactionAmount.to_string(),
+        ] {
+            assert_eq!(
+                Node::classify_submit_backpressure(&terminal),
+                None,
+                "terminal rejection must not be classified as backpressure: {terminal}"
+            );
+        }
+    }
 
     // The re-bootstrap marker and cooldown stamp are control state whose WRITE RESULT decides
     // the caller's branch — a false negative tells the operator to wait for a background
