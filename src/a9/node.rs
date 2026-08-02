@@ -12185,11 +12185,34 @@ impl Node {
                     }
                 }
 
-                // Validate transaction
-                let tx_valid = {
+                // Validate transaction. The verdict is rendered to plain bools INSIDE the
+                // guard: BlockchainError is !Send and must not be held across an await.
+                let (tx_valid, settled_reject) = {
                     let blockchain = self.blockchain.read().await;
-                    blockchain.validate_transaction(&tx_ref, None).await.is_ok()
+                    match blockchain.validate_transaction(&tx_ref, None).await {
+                        Ok(()) => (true, false),
+                        // Only a verdict that is a pure function of the transaction BYTES may
+                        // be remembered. A transient reject — funds, or a stale balances index
+                        // during catch-up — must stay retryable: recording it would swallow
+                        // every later re-gossip of a transaction that becomes valid, which is
+                        // the same poison the bloom gate above is written to avoid.
+                        Err(BlockchainError::InvalidTransactionSignature)
+                        | Err(BlockchainError::InvalidTransactionAmount) => (false, true),
+                        Err(_) => (false, false),
+                    }
                 };
+                if settled_reject {
+                    // These bytes can never become valid, so the (already-supported) negative
+                    // entry short-circuits any repeat of them at the cache check above.
+                    self.validation_cache.insert(
+                        tx_hash.clone(),
+                        ValidationCacheEntry {
+                            valid: false,
+                            timestamp: SystemTime::now(),
+                        },
+                    );
+                    self.maybe_prune_validation_cache();
+                }
                 if tx_valid {
                     // Update cache
                     self.validation_cache.insert(
