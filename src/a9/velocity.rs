@@ -334,6 +334,10 @@ impl BloomFilter {
 
 /// Erasure coding manager implementation
 impl ErasureManager {
+    // Infallible by construction: ERASURE_SHARD_COUNT/PARITY are non-zero compile-time
+    // constants well inside Reed-Solomon's limits, and this constructor returns Self
+    // with no channel to propagate an error. Waived rather than faked with a fallback.
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         let encoder = ReedSolomon::new(ERASURE_SHARD_COUNT, ERASURE_PARITY_SHARD_COUNT)
             .expect("Failed to create Reed-Solomon encoder");
