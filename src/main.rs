@@ -789,7 +789,12 @@ async fn async_main() -> Result<()> {
         pb.inc(1);
 
         pb.set_message("Creating blockchain...");
-        let rate_limiter = Arc::new(RateLimiter::new(60, 100));
+        // Per-sender admission circuit breaker: catches a client stuck in a submit loop
+        // without shaping legitimate concentrated traffic. It is NOT the inbound spam gate —
+        // gossip is paced per-PEER before dispatch, and mempool occupancy is bounded
+        // separately by MEMPOOL_MAX_PER_ADDRESS. At the previous 100/60s a single sender was
+        // capped at 1.67 tx/s, which a pool paying its miners reaches in one payout round.
+        let rate_limiter = Arc::new(RateLimiter::new(60, 2_000));
         let difficulty = Arc::new(Mutex::new(0_u64));
 
         let blockchain = Arc::new(RwLock::new(Blockchain::new(

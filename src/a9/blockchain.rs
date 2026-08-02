@@ -5981,6 +5981,19 @@ impl Blockchain {
             0
         };
 
+        let required_amount = tx.total_debit_units();
+
+        // The M06 overlay below is a bounded but uncached per-block scan. `immature` sums
+        // MINING_REWARDS credits and is therefore never negative, so the balance it reports
+        // can only be LOWER than `confirmed - pending`. When that upper bound already falls
+        // short, the scan cannot change the verdict — take the identical rejection without
+        // paying for it. Equivalence: available = confirmed - pending - immature
+        // <= confirmed - pending, so `confirmed - pending < required` implies
+        // `available < required` for every possible scan result.
+        if confirmed_units - pending_units < required_amount {
+            return Err(BlockchainError::InsufficientFunds);
+        }
+
         // M06 (advisory): for mempool admission (block=None) don't offer to spend an immature
         // reward at the prospective next height. The block=Some path is a local-miner check
         // already covered by gate (1) / the finalize inline check, so it stays 0 here.
@@ -5992,7 +6005,6 @@ impl Blockchain {
             Some(_) => 0,
         };
         let available_balance = confirmed_units - pending_units - immature;
-        let required_amount = tx.total_debit_units();
 
         if available_balance < required_amount {
             return Err(BlockchainError::InsufficientFunds);
@@ -6770,6 +6782,16 @@ impl Blockchain {
             .await?;
         let pending_units = self.get_pending_debit_units(&transaction.sender).await?;
 
+        let total_required = transaction.total_debit_units();
+
+        // Same equivalence as validate_transaction: `immature` is a sum of MINING_REWARDS
+        // credits and never negative, so `available <= confirmed - pending`. If that upper
+        // bound already falls short the scan cannot change the outcome — skip it and take
+        // the identical rejection.
+        if confirmed_units - pending_units < total_required {
+            return Err(BlockchainError::InsufficientFunds);
+        }
+
         // M06 (advisory): don't admit a tx that spends an immature reward at the next height.
         let immature = self.immature_reward_units_scan(
             &transaction.sender,
@@ -6777,7 +6799,6 @@ impl Blockchain {
             &[],
         );
         let available_balance = confirmed_units - pending_units - immature;
-        let total_required = transaction.total_debit_units();
         if available_balance < total_required {
             return Err(BlockchainError::InsufficientFunds);
         }
@@ -12469,6 +12490,58 @@ mod tests {
     // gates) must compute the SAME immature total for the same chain — otherwise a reorg whose
     // dry-run passes could fail the authoritative rebuild after slots are rewritten. Cross-check
     // them on a window straddling the maturity boundary.
+    // validate_transaction and admit_transaction skip the M06 immature-reward scan when
+    // `confirmed - pending` already falls short of the required amount. That short-circuit is
+    // sound ONLY because the scan can never return a negative total: it sums MINING_REWARDS
+    // credits, and block validation pins every coinbase amount to calculate_block_reward. If a
+    // negative total ever became representable, `available` could exceed `confirmed - pending`
+    // and the early-out would reject transactions the full path accepts. Pin the invariant.
+    #[test]
+    fn immature_reward_scan_is_never_negative_so_the_balance_early_out_is_sound() {
+        let bc = test_blockchain();
+        let spend_h = MATURITY_ACTIVATION_HEIGHT + MINING_REWARD_MATURITY;
+
+        // No coinbase to this address at all: exactly zero, never below it.
+        assert_eq!(
+            bc.immature_reward_units_scan("EMPTY", spend_h as u64, &[]),
+            0,
+            "an address with no rewards must contribute nothing, not a negative"
+        );
+
+        let coinbase_block = |idx: u32, amt: i128| {
+            let mut b = metadata_test_block(idx, [0u8; 32], "miner", 1.0);
+            b.transactions = vec![Transaction {
+                sender: "MINING_REWARDS".to_string(),
+                recipient: "X".to_string(),
+                fee_units: 0,
+                amount_units: amt,
+                timestamp: 1,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            }];
+            b
+        };
+        insert_raw_block(&bc, &coinbase_block(spend_h - 1, 900));
+        insert_raw_block(&bc, &coinbase_block(spend_h - 2, 700));
+
+        let immature = bc.immature_reward_units_scan("X", spend_h as u64, &[]);
+        assert_eq!(immature, 1_600, "both rewards are still inside the window");
+        assert!(
+            immature >= 0,
+            "a negative immature total would invalidate the early-out"
+        );
+
+        // The implication the early-out relies on, stated directly: whenever the cheap upper
+        // bound falls short, the full computation falls short too — for any scan result.
+        let (confirmed, pending, required) = (1_000i128, 100i128, 950i128);
+        assert!(confirmed - pending < required, "cheap bound rejects");
+        assert!(
+            confirmed - pending - immature < required,
+            "full path must reach the identical rejection"
+        );
+    }
+
     #[test]
     fn reward_maturity_scan_matches_replay_over_window() {
         use std::collections::VecDeque;
