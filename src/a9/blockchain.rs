@@ -7514,6 +7514,42 @@ impl Blockchain {
         Ok(final_reward)
     }
 
+    /// Block reward for `block`, in coins.
+    ///
+    /// The computation is exact. Reward V2 runs entirely in atomic units
+    /// (`reward_curve_v2_units`) and no float participates in deriving the value;
+    /// the `f64` here is only this function's return type, retained because the
+    /// coinbase construction and the exact-equality check both predate the
+    /// unit-native path.
+    ///
+    /// PRECISION BOUND (reviewed, deliberately not "fixed" — see below). The value
+    /// crosses `i128 -> f64 -> i128` at this boundary and again at the coinbase
+    /// equality check in `validate_block_reward_rules_at`. `f64` represents every
+    /// integer below 2^53 = 9,007,199,254,740,992 atomic units exactly, so that
+    /// round trip is lossless for any reward under 90,071,992 coins.
+    ///
+    /// Under Reward V2 the scheduled ceiling bounds the SUBSIDY only, so
+    /// `R = S + floor(65*F/100)` has no consensus upper bound — it rises with fees.
+    /// The bound is therefore economic rather than a rule: reaching 2^53 needs on the
+    /// order of 138,600,000 coins of fees in ONE block, roughly 70% of total supply,
+    /// simultaneously burned (35%) and paid to one miner (65%). Any chain on which
+    /// that is possible has already failed for reasons that dwarf a one-unit rounding
+    /// difference, so this is not a live bound and does not need re-deriving when the
+    /// fee schedule moves.
+    ///
+    /// Nor is it a fork surface at the edge: the miner (coinbase construction) and the
+    /// validator (exact-equality check) call THIS function and apply the identical
+    /// IEEE-754 conversion, so both sides compute the same value even where the
+    /// mathematically ideal result would differ.
+    ///
+    /// DECISION: do not change this in isolation. Removing the float would edit
+    /// consensus-critical reward construction and the exact-coinbase check to
+    /// eliminate a condition that cannot occur, trading a real regression risk for no
+    /// reachable benefit. The correct occasion is a deliberate end-to-end
+    /// monetary-types migration, where these lines are being rewritten anyway and
+    /// byte-for-byte equivalence is proven across every emission period, both
+    /// activation boundaries, empty and full blocks, and the CPU and GPU template
+    /// paths.
     pub fn calculate_block_reward(&self, block: &Block) -> Result<f64, BlockchainError> {
         if block.index == 0 {
             return Ok(GENESIS_LAUNCH_AMOUNT);
