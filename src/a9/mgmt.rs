@@ -271,7 +271,11 @@ fn parse_create_transaction_command(
                 if explicit_fee_units.is_some() {
                     return Err("--fee may only be specified once".to_string());
                 }
-                let value = option.strip_prefix("--fee=").expect("prefix checked above");
+                // The match arm above guarantees the prefix; bind rather than expect so a
+                // future arm edit cannot turn a CLI typo into a panic.
+                let Some(value) = option.strip_prefix("--fee=") else {
+                    return Err("--fee requires a decimal ALPHA value".to_string());
+                };
                 if value.is_empty() {
                     return Err("--fee requires a decimal ALPHA value".to_string());
                 }

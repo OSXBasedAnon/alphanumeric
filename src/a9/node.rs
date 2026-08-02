@@ -1882,6 +1882,10 @@ impl Node {
     // Initialization
     //----------------------------------------------------------------------
 
+    // Infallible by construction: every argument below is a non-zero compile-time
+    // constant. There is no error to propagate and this constructor cannot fail,
+    // so the crate-level deny is waived here rather than faked with a fallback.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     pub async fn new(
         db: Arc<Db>,
         blockchain: Arc<RwLock<Blockchain>>,
@@ -13044,6 +13048,10 @@ impl Node {
     /// poll, topology dialer, and inbound processor. The node's own handshake key gives the mesh
     /// its real identity, so the gateway accepts its signaling exactly like its announce.
     #[cfg(feature = "webrtc_mesh")]
+    // Infallible by construction: every argument below is a non-zero compile-time
+    // constant. There is no error to propagate and this constructor cannot fail,
+    // so the crate-level deny is waived here rather than faked with a fallback.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn try_spawn_webrtc_mesh(&self) -> Result<(), String> {
         use crate::a9::webrtc::{
             build_api, default_stun_urls, HttpSignalTransport, SignalTransport, WebRtcMesh,
