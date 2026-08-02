@@ -5424,7 +5424,14 @@ impl Blockchain {
 
                 let mut full_tx = tx.clone();
                 let tx_id = full_tx.get_tx_id();
-                let sig_hex = full_tx.signature.as_ref().unwrap();
+                // Bind rather than unwrap. The guard above already routes a missing
+                // signature to invalid_txs, so this arm is unreachable today — but the
+                // guard is several statements away, and a reorder would turn a stored
+                // record with no witness into a panic instead of a rejection.
+                let Some(sig_hex) = full_tx.signature.as_ref() else {
+                    invalid_txs.push(key.to_vec());
+                    continue;
+                };
                 let sig_bytes = match hex::decode(sig_hex) {
                     Ok(v) => v,
                     Err(_) => {
@@ -7865,7 +7872,13 @@ impl Blockchain {
             let tx_id = tx.get_tx_id();
             let expected_sig_hash = tx.sig_hash.as_ref().cloned();
 
-            let sig_hex = tx.signature.as_ref().unwrap();
+            // Bind rather than unwrap, same reasoning as the rehydration path above: the
+            // is_none guard is several statements back, and a missing witness must stay a
+            // rejection rather than becoming a panic if that guard ever moves.
+            let Some(sig_hex) = tx.signature.as_ref() else {
+                invalid_txs.push(key.to_vec());
+                continue;
+            };
             let sig_bytes = match hex::decode(sig_hex) {
                 Ok(v) => v,
                 Err(_) => {
