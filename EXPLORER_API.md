@@ -122,6 +122,14 @@ time.
 
 Submission is idempotent: retrying the identical signed transaction cannot
 create a second payment, and a processed duplicate is reported explicitly.
+
+**The inverse is the hazard.** Transaction identity is
+`sender:recipient:amount:fee:timestamp` at one-second granularity, with no nonce, so two
+GENUINELY DISTINCT payments that share all five fields are the same transaction and only
+one of them happens. `already_pending` therefore means *either* your own retry *or* a
+second payment that collided. Compare the returned `tx_id` against the one you submitted,
+and give a distinct payment a distinct timestamp or fee. See
+[docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md#two-distinct-payments-can-silently-become-one).
 Retries can still receive transient `429` or `503` responses:
 
     200  {"ok": true, "status": "accepted",         "tx_id": "<opaque id>"}   admitted; announcement scheduled
@@ -133,9 +141,20 @@ Retries can still receive transient `429` or `503` responses:
     429  {"error": "rate_limited"}
     503  {"error": "chain busy, retry shortly"}         chain lock contended
 
-A withdrawal worker should treat `accepted` / `already_pending` / `already_confirmed`
-all as success, retry on `503`, back off on `429`, and alert on a real `400` or
-malformed-payload `422`.
+A withdrawal worker should treat `accepted` / `already_confirmed` as success, retry on
+`503`, and back off on `429`.
+
+Two `400`s are NOT terminal, so do not page on `400` alone. Rate-limit rejections arrive
+as `400` with a `Rate limit exceeded: ...` message and mean back off, not fail:
+
+    ... Too many transactions from this address   at the 100-pending-per-address cap
+    ... Too many requests                          per-sender submission rate
+    ... Mempool is full                            back off, then RE-SIGN AT A HIGHER FEE
+                                                   (retrying the identical tx cannot succeed)
+
+Genuinely terminal `400`s are `FeeBelowRelayFloor`, `InsufficientFunds` and
+`InvalidTransactionSignature`. Treat `already_pending` as success only when the returned
+`tx_id` matches the one you submitted — see the duplicate-identity note above.
 
 On `accepted`, the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and scheduled its network
@@ -168,6 +187,10 @@ network-facing key, address, message, and transaction encodings an integration
 must reproduce.
 
 ## Notes for exchanges
+
+See [docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md) for asset identity
+(ticker, decimals, network id), the scheduled consensus activations, withdrawal queue
+limits, deposit-scanner pitfalls, and node operational requirements.
 
 - Run a dedicated node with the API enabled behind your own proxy/auth.
 - Deposits: watch `/explorer/address/{your_deposit_addrs}` (balance + history),
