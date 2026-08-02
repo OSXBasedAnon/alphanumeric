@@ -300,6 +300,30 @@ pub fn rebootstrap_cooldown_path(db_dir: &str) -> std::path::PathBuf {
     std::path::Path::new(db_dir).join("rebootstrap_cooldown")
 }
 
+/// Write `contents` to `path` and fsync it, on ONE write-capable handle.
+///
+/// The obvious spelling — `fs::write` then reopen read-only and `sync_all` — is
+/// silently Unix-only. `sync_all` is `FlushFileBuffers` on Windows, which requires
+/// `GENERIC_WRITE` on the handle, so syncing a read-only handle there fails with
+/// `ERROR_ACCESS_DENIED` (os error 5) even though the write itself succeeded. That
+/// left Windows nodes with the control file present on disk but the call reporting
+/// failure, which inverted the caller's "scheduled / not scheduled" branch and told
+/// the operator to wait for a background recovery that was never coming.
+///
+/// Used for the re-bootstrap marker and cooldown stamp: both are control state that
+/// decides what the NEXT boot does, so they must survive the power cut that may
+/// follow the exit which writes them.
+pub fn write_durable(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(contents)?;
+    f.sync_all()
+}
+
 /// True while a marker-forced re-bootstrap happened less than the cooldown ago.
 pub fn rebootstrap_cooldown_active(db_dir: &str) -> bool {
     rebootstrap_cooldown_within(db_dir, REBOOTSTRAP_COOLDOWN_SECS)
@@ -3246,12 +3270,7 @@ impl Node {
         // Durable write (fsync): this marker is control state that decides whether
         // the NEXT boot re-bootstraps — it exists precisely to break crash loops,
         // so it must survive the power cut / kernel panic that may follow.
-        let write_result = std::fs::write(&marker, format!("{}\n", reason)).and_then(|()| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open(&marker)
-                .and_then(|f| f.sync_all())
-        });
+        let write_result = write_durable(&marker, format!("{}\n", reason).as_bytes());
         match write_result {
             Ok(()) => {
                 warn!(
@@ -15497,6 +15516,40 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The re-bootstrap marker and cooldown stamp are control state whose WRITE RESULT decides
+    // the caller's branch — a false negative tells the operator to wait for a background
+    // recovery that never comes. Pin the two properties that carry that: the write reports
+    // success on its own handle (the earlier reopen-read-only-then-fsync spelling reported
+    // ERROR_ACCESS_DENIED on Windows, where FlushFileBuffers needs write access), and a
+    // rewrite fully replaces the previous contents rather than leaving a longer tail behind.
+    #[test]
+    fn write_durable_reports_success_and_replaces_prior_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "a9_write_durable_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let marker = force_rebootstrap_marker_path(dir.to_str().unwrap());
+
+        write_durable(&marker, b"runtime too-far-behind exit\n").expect("first write must succeed");
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"runtime too-far-behind exit\n"
+        );
+
+        // Shorter second reason must not leave a tail of the longer first one.
+        write_durable(&marker, b"short\n").expect("rewrite must succeed");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"short\n");
+
+        // Empty payload is a real case: the cooldown stamp carries no body, only an mtime.
+        let cooldown = rebootstrap_cooldown_path(dir.to_str().unwrap());
+        write_durable(&cooldown, b"").expect("empty write must succeed");
+        assert!(cooldown.exists(), "cooldown stamp must exist for its mtime");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // A self-consistent block at `index` whose parent is `previous_hash`. PoW is not mined —
     // these exercise the COMMITMENT rule, which is what stands between us and a hostile peer;

@@ -1757,14 +1757,10 @@ async fn async_main() -> Result<()> {
                                 // Durable (fsync'd): this marker exists to break a
                                 // crash loop, so it must survive the power cut /
                                 // kernel panic that may follow the exit below.
-                                if let Err(e) = std::fs::write(&marker, b"runtime too-far-behind exit\n")
-                                    .and_then(|()| {
-                                        std::fs::OpenOptions::new()
-                                            .read(true)
-                                            .open(&marker)
-                                            .and_then(|f| f.sync_all())
-                                    })
-                                {
+                                if let Err(e) = alphanumeric::a9::node::write_durable(
+                                    &marker,
+                                    b"runtime too-far-behind exit\n",
+                                ) {
                                     eprintln!(
                                         "Warning: could not write re-bootstrap marker {}: {}",
                                         marker.display(),
@@ -5631,12 +5627,7 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         // Durable (fsync'd): losing this cooldown stamp to a power cut restores
         // the snapshot-download loop it exists to prevent.
         let cooldown = rebootstrap_cooldown_path(db_path);
-        let _ = std::fs::write(&cooldown, b"").and_then(|()| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open(&cooldown)
-                .and_then(|f| f.sync_all())
-        });
+        let _ = alphanumeric::a9::node::write_durable(&cooldown, b"");
     }
     Ok(())
 }
