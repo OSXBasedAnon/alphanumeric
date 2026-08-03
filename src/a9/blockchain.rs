@@ -11856,6 +11856,72 @@ mod tests {
     }
 
     #[test]
+    // A reorg can revert blocks from above FEE_SYSTEM_ACTIVATION_HEIGHT back below it, and the
+    // orphan engine can re-present the same block while this node sits at a different tip. The
+    // fee-accounting verdict must therefore be a pure function of the BLOCK's own index, never of
+    // the chain tip — otherwise identical bytes would be valid on one node and invalid on another
+    // purely because their tips differed, which is a split with no attacker involved.
+    //
+    // The existing boundary tests vary the activation-height PARAMETER; this one holds the
+    // parameter at the real activation height, varies only the block's own index, and then moves
+    // the tip underneath both blocks to prove the answer does not move with it.
+    #[test]
+    fn fee_accounting_verdict_follows_the_block_index_not_the_chain_tip() {
+        let (bc, genesis) = fee_accounting_test_chain();
+        // Fee content the activated rule rejects but the prior rule accepts.
+        let over_bound = &[Transaction::to_units(1.0)];
+        let below = fee_accounting_test_block(
+            &bc,
+            FEE_SYSTEM_ACTIVATION_HEIGHT - 1,
+            genesis.timestamp,
+            over_bound,
+        );
+        let at = fee_accounting_test_block(
+            &bc,
+            FEE_SYSTEM_ACTIVATION_HEIGHT,
+            genesis.timestamp,
+            over_bound,
+        );
+
+        // Identical fee content. The ONLY difference is the block's own index.
+        let verdict = |b: &Block| {
+            bc.validate_block_reward_rules_at(b, FEE_SYSTEM_ACTIVATION_HEIGHT)
+                .is_ok()
+        };
+        assert!(
+            verdict(&below),
+            "one block below the activation height these fees stay mineable"
+        );
+        assert!(
+            matches!(
+                bc.validate_block_reward_rules_at(&at, FEE_SYSTEM_ACTIVATION_HEIGHT),
+                Err(BlockchainError::FeeAccountingLimitExceeded)
+            ),
+            "at the activation height the identical fees must be rejected"
+        );
+
+        // Now move the tip underneath them. A reorg re-presenting either block would evaluate it
+        // against a different chain tip; the verdict must be unchanged both times.
+        for tip in [
+            FEE_SYSTEM_ACTIVATION_HEIGHT - 2,
+            FEE_SYSTEM_ACTIVATION_HEIGHT + 8,
+        ] {
+            insert_raw_block(
+                &bc,
+                &metadata_test_block(tip, [0u8; 32], &"33".repeat(20), 1.0),
+            );
+            assert!(
+                verdict(&below),
+                "verdict for the below-activation block moved when the tip did (tip {tip})"
+            );
+            assert!(
+                !verdict(&at),
+                "verdict for the at-activation block moved when the tip did (tip {tip})"
+            );
+        }
+    }
+
+    #[test]
     fn fee_accounting_envelope_boundary_is_atomic_in_the_rising_regime() {
         const SIX_MONTHS: u64 = 15_768_000;
         let (bc, genesis) = fee_accounting_test_chain();
