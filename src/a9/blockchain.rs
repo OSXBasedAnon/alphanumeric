@@ -11855,7 +11855,6 @@ mod tests {
         .expect("a pre-activation client's signed transfer must stay valid");
     }
 
-    #[test]
     // A reorg can revert blocks from above FEE_SYSTEM_ACTIVATION_HEIGHT back below it, and the
     // orphan engine can re-present the same block while this node sits at a different tip. The
     // fee-accounting verdict must therefore be a pure function of the BLOCK's own index, never of
