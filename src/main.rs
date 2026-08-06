@@ -5217,19 +5217,22 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
     // and the download URL if we do end up (re)bootstrapping. Gateway first, R2
     // recovery mirror second — same pinned-key verification either way.
     let manifest_client = bootstrap_manifest_http_client()?;
-    let manifest_result: Result<BootstrapManifestPointer> =
-        match fetch_verified_bootstrap_manifest(&manifest_client).await {
-            Ok((manifest, source)) => {
-                if source != "gateway" {
-                    boot_note(
+    let manifest_result: Result<BootstrapManifestPointer> = match fetch_verified_bootstrap_manifest(
+        &manifest_client,
+    )
+    .await
+    {
+        Ok((manifest, source)) => {
+            if source != "gateway" {
+                boot_note(
                         status.as_ref(),
                         format!("gateway unreachable; using the signed manifest from the {} (verified against the pinned publisher key)", source),
                     );
-                }
-                Ok(manifest)
             }
-            Err(e) => Err(e),
-        };
+            Ok(manifest)
+        }
+        Err(e) => Err(e),
+    };
 
     if !force_bootstrap {
         match local_launch_db_status(db_path) {
