@@ -38,7 +38,14 @@ impl Ord for FeePerByte {
     }
 }
 
-#[derive(Debug, PartialEq)]
+// Deliberately NO Ord/Eq: two DISTINCT transactions can share a fee_per_byte, so any
+// ordered container keyed on the entry would silently collapse them — a paid transaction
+// vanishing with no error and no log. (The removed impls claimed exactly that: Ord over
+// fee_per_byte alone, with Eq asserted on top, violating the Ord contract for every
+// equal-fee pair. Nothing called them; dead_code cannot flag trait impls.) Order per-site
+// instead, ending in tx_id when a total order is needed — the selection comparator and
+// the eviction heap tuple below both already do this.
+#[derive(Debug)]
 pub struct MempoolEntry {
     transaction: Transaction,
     tx_id: String,
@@ -46,20 +53,6 @@ pub struct MempoolEntry {
     fee_per_byte: FeePerByte,
     size: usize,
 }
-
-impl PartialOrd for MempoolEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MempoolEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.fee_per_byte.cmp(&other.fee_per_byte)
-    }
-}
-
-impl Eq for MempoolEntry {}
 
 // Prune at most this often, NOT on every insert. A full expiry scan on every single insert
 // was O(N) per admission (quadratic-fill DoS as the pool grows toward MEMPOOL_MAX_TRANSACTIONS).
