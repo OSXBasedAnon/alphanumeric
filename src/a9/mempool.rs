@@ -15,12 +15,24 @@ const MEMPOOL_MAX_PER_ADDRESS: usize = 100;
 pub const MAX_BLOCK_SIZE: usize = 1_000_000;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 2_000;
 
+// Exact fee-per-byte ordering key: compares as the rational fee_units / size_bytes via
+// integer cross-multiplication — no float division, no rounding, no NaN corner. (The f64
+// form this replaces could round two distinct feerates onto the same double, silently
+// demoting a strictly-better feerate to a timestamp tie.) Equality is RATIONAL equality
+// (10/2 == 5/1), deliberately consistent with Ord: this is a fee VALUE, not a transaction
+// identity — identity tie-breaks (timestamp, sender, tx_id) stay at the call sites, per
+// the MempoolEntry note below. saturating_mul so absurd inputs clamp instead of wrapping
+// the comparison; real values sit far inside i128 (fee_units is balance-bounded below
+// 2^50, sizes are transaction-bounded).
 #[derive(Debug, Clone, Copy)]
-struct FeePerByte(f64);
+struct FeePerByte {
+    fee_units: i128,
+    size_bytes: u64,
+}
 
 impl PartialEq for FeePerByte {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -34,7 +46,9 @@ impl PartialOrd for FeePerByte {
 
 impl Ord for FeePerByte {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
+        self.fee_units
+            .saturating_mul(i128::from(other.size_bytes))
+            .cmp(&other.fee_units.saturating_mul(i128::from(self.size_bytes)))
     }
 }
 
@@ -171,7 +185,10 @@ impl Mempool {
 
         // Incoming fee-per-byte governs eviction: only strictly-cheaper residents are evictable,
         // so a low-fee tx can never displace a higher-fee one.
-        let fee_per_byte = FeePerByte(tx.fee() / tx_size as f64);
+        let fee_per_byte = FeePerByte {
+            fee_units: tx.fee_units,
+            size_bytes: tx_size as u64,
+        };
 
         // If the pool is at capacity, try to make room by evicting only strictly-cheaper
         // transactions — all-or-nothing. If that cannot free enough, reject WITHOUT evicting.
@@ -501,6 +518,11 @@ impl Mempool {
         use std::collections::BinaryHeap;
 
         // Only transactions strictly cheaper than the incoming one are eviction candidates.
+        // Within an equal-fee band the NEWEST goes first (Reverse(timestamp) inside the
+        // min-tuple): selection confirms oldest-first, so evicting oldest-first would
+        // destroy exactly the band member closest to confirmation while keeping the one
+        // furthest from it — inverted queue fairness. Newest-first keeps eviction aligned
+        // with the inclusion order the pool already promises.
         let mut candidates = BinaryHeap::new();
         for entry in self.transactions.iter() {
             let sender = entry.key();
@@ -508,7 +530,7 @@ impl Mempool {
                 if tx.fee_per_byte < incoming_fee {
                     candidates.push(Reverse((
                         tx.fee_per_byte,
-                        tx.timestamp,
+                        Reverse(tx.timestamp),
                         sender.clone(),
                         tx.tx_id.clone(),
                         tx.size,
@@ -524,7 +546,7 @@ impl Mempool {
         let mut count_freed = 0usize;
         while space_freed < required_space || count_freed < required_count {
             match candidates.pop() {
-                Some(Reverse((_, _timestamp, sender, tx_id, size))) => {
+                Some(Reverse((_, Reverse(_timestamp), sender, tx_id, size))) => {
                     to_remove.entry(sender).or_default().insert(tx_id);
                     space_freed += size;
                     count_freed += 1;
@@ -587,11 +609,18 @@ mod tests {
     use super::*;
     use std::collections::BinaryHeap;
 
+    fn rate(fee_units: i128, size_bytes: u64) -> FeePerByte {
+        FeePerByte {
+            fee_units,
+            size_bytes,
+        }
+    }
+
     #[test]
     fn fee_per_byte_orders_highest_fee_first() {
-        let low = FeePerByte(1.0);
-        let mid = FeePerByte(2.5);
-        let high = FeePerByte(10.0);
+        let low = rate(1, 1);
+        let mid = rate(5, 2); // 2.5/byte
+        let high = rate(10, 1);
 
         assert!(high > mid);
         assert!(mid > low);
@@ -602,6 +631,32 @@ mod tests {
         assert_eq!(heap.pop(), Some(mid));
         assert_eq!(heap.pop(), Some(low));
         assert_eq!(heap.pop(), None);
+    }
+
+    // FeePerByte is a VALUE: equal rationals from different (fee, size) pairs compare
+    // Equal AND eq — the Ord/Eq contract holds by construction (identity tie-breaks live
+    // at the call sites, not in this type).
+    #[test]
+    fn fee_per_byte_equality_is_rational_not_structural() {
+        assert_eq!(rate(10, 2), rate(5, 1));
+        assert_eq!(rate(10, 2).cmp(&rate(5, 1)), Ordering::Equal);
+        assert!(rate(10, 2) > rate(9, 2));
+    }
+
+    // The exactness the f64 form could not provide: (2^53 + 1) / 2^53 rounds to exactly
+    // 1.0 as a double, so the old comparison saw a TIE between a strictly better feerate
+    // and 1.0/byte and fell through to timestamp order. Cross-multiplication keeps them
+    // strictly ordered.
+    #[test]
+    fn fee_per_byte_cross_multiplication_beats_f64_rounding() {
+        let base: i128 = 1 << 53;
+        let better = rate(base + 1, 1 << 53);
+        let exactly_one = rate(1, 1);
+
+        // the double quotients tie — this is the case the integer form exists for
+        assert_eq!((base + 1) as f64 / base as f64, 1.0_f64);
+        assert!(better > exactly_one);
+        assert_ne!(better, exactly_one);
     }
 
     // Mempool admission does not verify signatures (that is the blockchain layer's job), so a
@@ -889,6 +944,43 @@ mod tests {
         );
     }
 
+    // Within an equal-fee band, eviction must take the NEWEST first: selection confirms
+    // oldest-first, so the oldest band member is closest to confirmation and is the one
+    // the pool should fight to keep.
+    #[test]
+    fn try_evict_below_evicts_newest_first_within_an_equal_fee_band() {
+        let mut mp = Mempool::new();
+        // Same amount/fee, same-length senders, timestamps in the same msgpack width
+        // class -> identical serialized size, therefore an exactly equal fee-per-byte.
+        let older = tx_with("aa", 1_000_000, 1.0, 0.001);
+        let newer = tx_with("ab", 1_000_001, 1.0, 0.001);
+        let older_id = older.get_tx_id();
+        let newer_id = newer.get_tx_id();
+        mp.add_transaction(older).expect("older admitted");
+        mp.add_transaction(newer).expect("newer admitted");
+        // Ordering keys on ARRIVAL time (deliberately: the signed timestamp is
+        // sender-chosen, and keying fairness on it would let backdaters jump the queue).
+        // Both entries above arrive within the same second, so give the band a real
+        // arrival order to exercise the tie-break.
+        if let Some(mut txs) = mp.transactions.get_mut("aa") {
+            txs[0].timestamp = 100;
+        }
+        if let Some(mut txs) = mp.transactions.get_mut("ab") {
+            txs[0].timestamp = 200;
+        }
+
+        let freed = mp.try_evict_below(0, 1, rate(1_000_000, 1));
+        assert!(freed, "one slot from two candidates must succeed");
+        assert!(
+            mp.find_transaction_by_id(&older_id).is_some(),
+            "the oldest of the equal-fee band is next in line to confirm and must survive"
+        );
+        assert!(
+            mp.find_transaction_by_id(&newer_id).is_none(),
+            "the newest of the equal-fee band is evicted first"
+        );
+    }
+
     // The eviction planner is all-or-nothing: if the strictly-cheaper set cannot satisfy the
     // requirement, it evicts nothing and reports failure.
     #[test]
@@ -898,7 +990,7 @@ mod tests {
         let only_id = only.get_tx_id();
         mp.add_transaction(only).expect("resident admitted");
         // Ask to free TWO slots with an incoming fee above everything; only one cheaper tx exists.
-        let freed = mp.try_evict_below(0, 2, FeePerByte(1_000_000.0));
+        let freed = mp.try_evict_below(0, 2, rate(1_000_000, 1));
         assert!(!freed, "cannot free 2 slots from a single candidate");
         assert!(
             mp.find_transaction_by_id(&only_id).is_some(),
