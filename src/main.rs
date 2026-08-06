@@ -56,6 +56,17 @@ const KEY_FILE_PATH: &str = "private.key";
 const NODE_IDENTITY_KEY_PATH: &str = "node_identity.key";
 // Use the canonical host directly (avoid 307 redirects that can strip Authorization headers).
 const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/manifest";
+// Same signed manifest, mirrored to R2 by the gateway every 15 minutes (wrapped under
+// `latest` in recovery.json). R2 is CDN-hosted storage with no self-hosted origin behind
+// it, so it stays reachable when the machine behind the apex is not — without it, a fresh
+// node fails closed on a 1KB pointer while the snapshot it points at sits fully available
+// on the same CDN. TRANSPORT fallback only: whichever source answers, the manifest passes
+// the same pinned-key signature verification, so a copy an attacker could place here
+// without the publisher's private key fails exactly as it would on the primary. Kept a
+// compile-time constant like the primary on purpose — a security-path URL must not be
+// steerable by whoever controls the environment.
+const BOOTSTRAP_MANIFEST_FALLBACK_URL: &str =
+    "https://cdn.alphanumeric.blue/bootstrap/recovery.json";
 const DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024;
 const MAX_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -89,6 +100,15 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 struct BootstrapManifestResponse {
     ok: bool,
     manifest: BootstrapManifestPointer,
+}
+
+// Shape of the R2 recovery mirror (bootstrap/recovery.json): the gateway wraps the exact
+// signed manifest under `latest`, alongside advisory fields (seed peers, notes) that this
+// fetch deliberately ignores — the peer list is unsigned by design and must never ride in
+// on the manifest's trust.
+#[derive(serde::Deserialize)]
+struct RecoveryManifestFile {
+    latest: BootstrapManifestPointer,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -4921,6 +4941,56 @@ fn bootstrap_manifest_http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+// Fetch the signed bootstrap manifest: gateway first, R2 recovery mirror second. Both
+// payloads pass through the same verify_bootstrap_manifest(), so the fallback adds a
+// second place to READ the manifest, never a second authority. A verification failure on
+// the primary also falls through — the mirror may hold a good copy while the gateway
+// serves a corrupt one, and a forged mirror copy cannot pass the pinned-key check anyway.
+// Returns the manifest plus which source served it, for the boot log.
+async fn fetch_verified_bootstrap_manifest(
+    client: &reqwest::Client,
+) -> Result<(BootstrapManifestPointer, &'static str)> {
+    let primary: Result<BootstrapManifestPointer> =
+        match client.get(BOOTSTRAP_MANIFEST_URL).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
+                    Ok(parsed) if parsed.ok => {
+                        verify_bootstrap_manifest(&parsed.manifest).map(|()| parsed.manifest)
+                    }
+                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
+                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
+        };
+    let primary_err = match primary {
+        Ok(manifest) => return Ok((manifest, "gateway")),
+        Err(e) => e,
+    };
+    let fallback: Result<BootstrapManifestPointer> =
+        match client.get(BOOTSTRAP_MANIFEST_FALLBACK_URL).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(body) => match serde_json::from_slice::<RecoveryManifestFile>(&body) {
+                    Ok(parsed) => verify_bootstrap_manifest(&parsed.latest).map(|()| parsed.latest),
+                    Err(e) => Err(format!("Recovery manifest payload parse failed: {}", e).into()),
+                },
+                Err(e) => Err(format!("Recovery manifest body read failed: {}", e).into()),
+            },
+            Ok(r) => Err(format!("Recovery manifest endpoint failed: {}", r.status()).into()),
+            Err(e) => Err(format!("Recovery manifest request failed: {}", e).into()),
+        };
+    match fallback {
+        Ok(manifest) => Ok((manifest, "recovery mirror")),
+        Err(fallback_err) => Err(format!(
+            "gateway: {} / recovery mirror: {}",
+            primary_err, fallback_err
+        )
+        .into()),
+    }
+}
+
 fn bootstrap_download_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -5060,23 +5130,21 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
 
     // Fetch and verify the signed bootstrap manifest up front. It carries the
     // canonical tip (height + hash) we reconcile a genesis-valid local DB against,
-    // and the download URL if we do end up (re)bootstrapping.
+    // and the download URL if we do end up (re)bootstrapping. Gateway first, R2
+    // recovery mirror second — same pinned-key verification either way.
     let manifest_client = bootstrap_manifest_http_client()?;
     let manifest_result: Result<BootstrapManifestPointer> =
-        match manifest_client.get(BOOTSTRAP_MANIFEST_URL).send().await {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
-                    Ok(parsed) if parsed.ok => match verify_bootstrap_manifest(&parsed.manifest) {
-                        Ok(()) => Ok(parsed.manifest),
-                        Err(e) => Err(e),
-                    },
-                    Ok(_) => Err("Bootstrap manifest response is not ok".into()),
-                    Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
-                },
-                Err(e) => Err(format!("Bootstrap manifest body read failed: {}", e).into()),
-            },
-            Ok(r) => Err(format!("Bootstrap manifest endpoint failed: {}", r.status()).into()),
-            Err(e) => Err(format!("Bootstrap manifest request failed: {}", e).into()),
+        match fetch_verified_bootstrap_manifest(&manifest_client).await {
+            Ok((manifest, source)) => {
+                if source != "gateway" {
+                    boot_note(
+                        status.as_ref(),
+                        format!("gateway unreachable; using the signed manifest from the {} (verified against the pinned publisher key)", source),
+                    );
+                }
+                Ok(manifest)
+            }
+            Err(e) => Err(e),
         };
 
     if !force_bootstrap {
@@ -8791,5 +8859,56 @@ mod tests {
             verify_bootstrap_manifest_with_publisher(&manifest, &manifest.publisher_pubkey)
                 .is_err()
         );
+    }
+
+    // The R2 recovery mirror wraps the signed manifest under `latest` next to advisory
+    // fields (seed peers, notes). Unwrapping must yield a manifest that passes the SAME
+    // verifier — the mirror is a second transport, never a second authority.
+    #[test]
+    fn recovery_manifest_file_unwraps_the_same_signed_manifest() {
+        let manifest = signed_bootstrap_manifest();
+        let wrapped = serde_json::json!({
+            "schema": "alphanumeric-recovery/1",
+            "network_id": manifest.network_id,
+            "updated_at": manifest.updated_at,
+            "latest": manifest,
+            "seed_peers": [{"ip": "203.0.113.7", "port": 7177, "verified": true, "probe_ms": 42}],
+            "seed_peers_verified": 1,
+            "note": "advisory text the node must ignore"
+        });
+        let parsed: RecoveryManifestFile =
+            serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
+
+        assert!(verify_bootstrap_manifest_with_publisher(
+            &parsed.latest,
+            &parsed.latest.publisher_pubkey
+        )
+        .is_ok());
+    }
+
+    // A mirror an attacker can write to still buys nothing: tampering with the wrapped
+    // manifest breaks the signature exactly as it would on the primary path.
+    #[test]
+    fn recovery_manifest_file_tampering_still_fails_signature_verification() {
+        let mut manifest = signed_bootstrap_manifest();
+        manifest.height = Some(999_999);
+        let wrapped = serde_json::json!({ "latest": manifest });
+        let parsed: RecoveryManifestFile =
+            serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
+
+        assert!(verify_bootstrap_manifest_with_publisher(
+            &parsed.latest,
+            &parsed.latest.publisher_pubkey
+        )
+        .is_err());
+    }
+
+    // A recovery file with no `latest` is a parse error, not a silent empty manifest.
+    #[test]
+    fn recovery_manifest_file_without_latest_is_a_parse_error() {
+        let err = serde_json::from_str::<RecoveryManifestFile>(
+            r#"{"schema":"alphanumeric-recovery/1","seed_peers":[]}"#,
+        );
+        assert!(err.is_err());
     }
 }
