@@ -37,7 +37,7 @@ Control: HTTPS bootstrap URLs, pinned publisher identity, signed manifest fields
 Coverage: startup path in `ensure_bootstrap_db`, manifest verification tests, and bootstrap archive size tests.
 
 5. Balance/amount divergence from floating-point comparisons in consensus checks.
-Control: integer unit-based minimum amount checks and integer tolerance logic for difficulty validation.
+Control: integer unit-based minimum amount checks, and exact integer equality between a block's declared difficulty and the value re-derived from its parent — `block.difficulty != expected_difficulty` is rejected outright. No tolerance band is applied; the earlier 0.1% variance allowance was removed.
 Coverage: validation paths in `validate_block_internal`, `prevalidate_unattached_block_strict`, and mempool admission.
 
 6. Orphan-index corruption and orphan linkage inconsistencies.
