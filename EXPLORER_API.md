@@ -160,8 +160,15 @@ and return PLAIN TEXT, not JSON. Only a `400` whose body parses as
 response's `Content-Type`, not the status alone.
 
 A withdrawal worker should treat `accepted` / `already_pending` / `already_confirmed` all as
-success, retry on `503`, and back off on `429`. Treat `already_pending` as success only when
-the returned `tx_id` matches the one you submitted — see the duplicate-identity note above.
+success, retry on `503`, and back off on `429`.
+
+`already_pending` does NOT distinguish your own retry from a colliding second payment, and
+comparing the returned `tx_id` cannot separate them — the id is a pure function of the five
+fields you posted, so it always matches, and a collision is exactly the case where two
+distinct payments share those fields. Reserve the 5-tuple client-side before signing; if
+`already_pending` returns for a 5-tuple you never submitted, treat it as a collision and
+re-sign with a different timestamp rather than marking the payment done. See the
+duplicate-identity note above.
 
 **A `400` is NOT automatically terminal.** On the current release every admission rejection —
 retryable backpressure included — is returned as a `400` carrying one human-readable string,
