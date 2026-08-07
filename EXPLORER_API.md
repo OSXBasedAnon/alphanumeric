@@ -68,6 +68,17 @@ be reorged out. When that happens `/explorer/tx?id=` moves `confirmed → pendin
 (it is returned to the mempool for re-mining) or `404`, and `confirmations` can
 decrease. **Always re-poll; never cache a one-time `confirmed`.**
 
+**A `404` does not prove the transaction is gone.** The id→height registry behind
+`/explorer/tx?id=` is a rolling recent-confirmed window: an entry is pruned once the
+confirming block's timestamp falls more than ~6h05m (`MAX_TX_AGE_SECS` 21,600 s +
+`MAX_BLOCK_FUTURE_TIME` 300 s) behind the tip. Past that window a permanently confirmed,
+finalized transaction ALSO answers `404 not_found`. Never read a `404` as "dropped, safe to
+resubmit" for anything submitted more than a few hours ago — a worker that was down for six
+hours and re-polls on restart would otherwise read a landed payment as reorged away and
+reissue it. Once you have seen `confirmed` with a height, record `(height, position)` and
+re-verify with `/explorer/tx/{height}/{position}` or `/explorer/address/{address}`; those
+read the chain directly and never expire.
+
 ## Submit a transaction (POST /explorer/submit-tx)
 
 Body: a signed transaction as JSON. Read responses are display-oriented
@@ -136,30 +147,49 @@ Retries can still receive transient `429` or `503` responses:
     200  {"ok": true, "status": "already_pending",  "tx_id": "<opaque id>"}   identical tx already in mempool
     200  {"ok": true, "status": "already_confirmed","tx_id": "<opaque id>",
           "height": <n>, "final": <bool>}                               already in a block
-    400  {"error": "transaction rejected: <reason>"}    failed validation
-    422  (malformed JSON body)
-    429  {"error": "rate_limited"}
+    400  {"error": "transaction rejected: <reason>"}    failed validation OR backpressure
+    400  (plain text)  malformed JSON body — NOT the {"error": ...} shape
+    415  (plain text)  missing or wrong Content-Type (must be application/json)
+    422  (plain text)  well-formed JSON that does not match the transaction shape
+    429  {"error": "rate_limited"}                      node-wide submit bucket
     503  {"error": "chain busy, retry shortly"}         chain lock contended
 
-A withdrawal worker should treat `accepted` / `already_confirmed` as success, retry on
-`503`, and back off on `429`.
+The `400` / `415` / `422` rejections above come from the HTTP layer before the handler runs
+and return PLAIN TEXT, not JSON. Only a `400` whose body parses as
+`{"error": "transaction rejected: …"}` came from transaction validation — key off the
+response's `Content-Type`, not the status alone.
 
-Backpressure returns `429` with a machine-readable reason; a `400` is terminal.
+A withdrawal worker should treat `accepted` / `already_pending` / `already_confirmed` all as
+success, retry on `503`, and back off on `429`. Treat `already_pending` as success only when
+the returned `tx_id` matches the one you submitted — see the duplicate-identity note above.
 
-    429 {"error": "rate_limited", "reason": "<reason>",
-         "retryable": true, "retry_same_transaction": <bool>, "detail": "<message>"}
+**A `400` is NOT automatically terminal.** On the current release every admission rejection —
+retryable backpressure included — is returned as a `400` carrying one human-readable string,
+so match on the message text:
 
-    reason                      retry_same_transaction
-    per_address_pending_cap     true    at the 100-pending-per-sender-address cap
-    per_sender_rate             true    per-sender submission rate
-    mempool_full                FALSE   back off, then RE-SIGN AT A HIGHER FEE — eviction
-                                        is fee-ordered, so resubmitting the identical
-                                        transaction can never win a slot
+    400 "transaction rejected: Rate limit exceeded: Too many transactions from this address"
+        RETRYABLE — at the 100-pending-per-sender-address cap; back off and resend the SAME
+        signed transaction, the slots drain as blocks land
+    400 "transaction rejected: Rate limit exceeded: Too many requests"
+        RETRYABLE — per-sender submission rate; back off and resend the SAME signed transaction
+    400 "transaction rejected: Rate limit exceeded: Mempool is full"
+        NOT retryable as-is — back off, then RE-SIGN AT A HIGHER FEE; eviction is fee-ordered
+        and all-or-nothing, so resubmitting the identical transaction can never win a slot
 
-Branch on `retry_same_transaction`, not on the reason string. A `400`
-(`InsufficientFunds`, `InvalidTransactionSignature`, `FeeBelowRelayFloor`, bad amount) is
-terminal — alert on it. Treat `already_pending` as success only when the returned `tx_id`
-matches the one you submitted — see the duplicate-identity note above.
+Every other `400` — `Insufficient funds for the transaction`, `Transaction signature is
+invalid or missing`, `Transaction fee below the relay floor (min …)`, `Transaction amount is
+invalid or negative` — is terminal; alert on it.
+
+The `429` is a NODE-WIDE submission token bucket (5/s sustained, burst 20) shared by every
+sender regardless of the per-sender limit. It carries no reason field and is always
+retryable.
+
+> **Coming in the next release:** a structured `429` carrying `reason` / `retryable` /
+> `retry_same_transaction` / `detail`, with reasons `per_address_pending_cap`,
+> `per_sender_rate` and `mempool_full`, so a client can branch on a field instead of a
+> string. It is implemented on `main` but is NOT in the current release — do not code
+> against those fields yet. A client that matches the `400` strings above today and also
+> tolerates a structured `429` will survive the upgrade without a redeploy.
 
 On `accepted`, the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and scheduled its network
