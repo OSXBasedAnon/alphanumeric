@@ -3998,6 +3998,11 @@ use std::process::Command;
  if cfg!(windows) && std::env::var("ALPHANUMERIC_PAUSE_ON_EXIT").ok().as_deref() == Some("true") {
      let _ = Command::new("cmd").args(["/C", "pause"]).status();
  }
+// Flush before exit, for the same reason the ^C / EOF / read-error arms above do: sled is
+// opened with flush_every_ms(1000) and the signal handler does not run for a TYPED command,
+// so returning here discards up to ~1s of writes. `exit` is the documented way to end a
+// session and was the only one of these paths that skipped it.
+let _ = db.flush();
 let _ = remove_db_lock(&format!("{}.lock", db_path));
 let _ = remove_instance_lock();
 return Ok(());
