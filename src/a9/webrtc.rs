@@ -1942,10 +1942,6 @@ mod tests {
             .expect("absent envelopes is a valid empty drain");
         assert!(empty.envelopes.is_empty());
 
-        let null: DrainResponse = serde_json::from_str(r#"{"ok":true,"envelopes":null}"#)
-            .unwrap_or(DrainResponse { envelopes: vec![] });
-        assert!(null.envelopes.is_empty());
-
         let ok: DrainResponse = serde_json::from_str(
             r#"{"envelopes":[{"from":"a","to":"b","kind":"offer","payload":"p","ts":1,"signature":"s"}]}"#,
         )
@@ -1954,6 +1950,13 @@ mod tests {
         assert_eq!(ok.envelopes[0].kind, "offer");
 
         for malformed in [
+            // `#[serde(default)]` covers an ABSENT field, not a present null — so an explicit
+            // null is a schema break like any other. It is also the most likely SHAPE of that
+            // break (a null DB column, or JSON.stringify({envelopes: null}), neither of which
+            // omits the key the way `undefined` would), which is why it belongs here rather
+            // than being waved through. It used to be asserted via `unwrap_or(empty)`, which
+            // holds whichever way it deserializes and so could not fail.
+            r#"{"ok":true,"envelopes":null}"#,
             r#"{"envelopes":"not-a-list"}"#,
             r#"{"envelopes":[{"from":"a"}]}"#,
             r#"{"envelopes":[{"from":"a","to":"b","kind":"offer","payload":"p","ts":"not-a-number","signature":"s"}]}"#,
