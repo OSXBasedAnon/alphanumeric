@@ -73,10 +73,19 @@ and send one.** Branch on `status`:
 | `already_pending` | **either** your own retry, **or** a distinct payment that collided |
 | `already_confirmed` | already mined |
 
-Treat `already_pending` as success only when the `tx_id` matches the one you submitted. If
-you intended a distinct payment, re-sign with a different timestamp (wait one second) or
-vary the fee by one unit. Serialising withdrawals to one per second per (recipient, amount)
-pair is the simplest correct policy.
+`already_pending` means the node already holds a transaction with your exact five identity
+fields. It **cannot** tell you whether that is your own retry or a colliding second payment,
+and comparing the returned `tx_id` does not help: `get_tx_id` is a pure function of the five
+fields you just posted, so the returned id always equals the one you submitted — and a
+collision is by definition two payments whose five fields are identical, which is precisely
+when the ids match.
+
+The defence has to be client-side. **Reserve the 5-tuple (sender, recipient, amount, fee,
+timestamp) in your own store before signing**, and refuse to issue a second withdrawal that
+reuses one. If `already_pending` comes back for a 5-tuple you have not previously submitted,
+treat it as a COLLISION: do not mark the withdrawal paid — re-sign with a different
+timestamp (wait one second) or vary the fee by one unit. Serialising withdrawals to one per
+second per (recipient, amount) pair is the simplest correct policy.
 
 ### Queue limits
 
@@ -197,6 +206,6 @@ its own.
 | Batch withdrawal (one transaction, many recipients) | **None.** Send N separate transactions; the miner template drains many transactions per sender per block, so this works, subject to the 100-pending cap. |
 | Fee bump / RBF | **None.** A stuck transaction is replaced by signing a distinct one (different timestamp or fee). |
 | Mempool acceptance query | **None.** Submission response is the acceptance signal. |
-| Block or deposit webhooks | **None** for exchanges. `ALPHANUMERIC_BLOCKNOTIFY` pushes tip changes to an external hook, intended for mining pools; poll `/explorer/status` otherwise. |
+| Block or deposit webhooks | No per-address webhooks and no outbound HTTP from the node. There IS a tip push: `ALPHANUMERIC_BLOCKNOTIFY="/path/to/script %s %h"` runs your command on every new tip (`%s` hash, `%h` height) — Bitcoin Core's `-blocknotify` contract. Built for pools, but it suits a deposit scanner just as well: trigger a block-walk on the hook instead of polling `/explorer/tip`. Single-flight, coalesces under load, killed after 10 s. |
 | HD derivation standard | **None** published. Post-quantum keys do not use BIP32-style derivation. |
 | Multisig | **None.** |
