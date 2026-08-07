@@ -384,11 +384,31 @@ const MESH_STALE_SECS: u64 = 45;
 /// flood at ingress so it can't monopolize the shared inbound queue (head-of-line blocking).
 const MESH_MSG_RATE: f64 = 100.0;
 const MESH_MSG_BURST: f64 = 200.0;
+/// Live inbound DataChannels a single peer may hold open at once. The mesh needs exactly one
+/// (`MESH_CHANNEL_LABEL`); the slack absorbs a re-open racing a close. Without a cap a remote can
+/// open unbounded channels on its one RTCPeerConnection — `RTCSctpTransport::accept_data_channels`
+/// has no limit of its own (`max_channels` gates only OUTBOUND id allocation) — retaining a closure
+/// and SCTP stream per channel.
+const MESH_MAX_CHANNELS_PER_PEER: usize = 4;
 
 /// A peer connection plus when we created it (for the stale reaper).
 struct PeerConn {
     pc: Arc<RTCPeerConnection>,
     created: Instant,
+}
+
+/// Per-PEER inbound accounting, shared by every DataChannel that peer opens.
+///
+/// The bucket used to be constructed inside `register_channel`, i.e. one bucket per CHANNEL. A
+/// remote opening N channels on its single RTCPeerConnection therefore got N independent buckets
+/// and N x MESH_MSG_RATE — defeating the exact head-of-line protection the limit exists for, since
+/// the inbound queue (`MESH_INBOUND_CAP`) is shared and `try_send` drops other peers' gossip once
+/// it saturates. One entry per peer id, dropped with the connection in `forget_if_current`.
+struct PeerIngress {
+    bucket: Arc<std::sync::Mutex<TokenBucket>>,
+    /// Live channel count for this peer, capped at MESH_MAX_CHANNELS_PER_PEER. Incremented on
+    /// registration, decremented by the channel's own on_close.
+    live_channels: usize,
 }
 
 /// Simple per-peer token bucket for inbound message rate limiting.
@@ -451,6 +471,9 @@ pub struct WebRtcMesh {
     /// Terminal flag set by the kill switch's shutdown(). Checked under the conns lock in new_pc so a
     /// dial/offer already in flight when shutdown() runs can't re-insert (and leak) a pc afterwards.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-peer inbound rate limiter + live channel count, keyed by peer id. Shared across all of
+    /// that peer's DataChannels so the limit is genuinely per-peer (see `PeerIngress`).
+    ingress: Arc<Mutex<HashMap<String, PeerIngress>>>,
 }
 
 // Opaque Debug so a `#[derive(Debug)]` holder (the Node) compiles — the inner webrtc/transport
@@ -485,6 +508,7 @@ impl WebRtcMesh {
             dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingress: Arc::new(Mutex::new(HashMap::new())),
         });
         Ok((mesh, inbound_rx))
     }
@@ -563,6 +587,7 @@ impl WebRtcMesh {
             pcs
         };
         self.channels.lock().await.clear();
+        self.ingress.lock().await.clear();
         for pc in pcs {
             let _ = pc.close().await;
         }
@@ -583,6 +608,9 @@ impl WebRtcMesh {
         };
         if removed {
             self.channels.lock().await.remove(peer_id);
+            // Drop this peer's rate limiter with its connection, so the map is bounded by live
+            // peers (<= MESH_MAX_CONNS) rather than by every peer id ever seen.
+            self.ingress.lock().await.remove(peer_id);
             // A lost link to a LOWER-id peer means that peer (the impolite initiator for this edge)
             // will re-dial us — stay responsive on the poll so we catch the re-offer promptly.
             if peer_id < self.local_id() {
@@ -675,16 +703,64 @@ impl WebRtcMesh {
         }
     }
 
+    /// Claim one channel slot for `peer_id` and hand back THAT PEER's shared rate limiter, or None
+    /// if the peer already holds MESH_MAX_CHANNELS_PER_PEER live channels.
+    ///
+    /// Every channel a peer opens draws from the one bucket returned here, so a peer's inbound
+    /// budget is MESH_MSG_RATE in total rather than per channel.
+    async fn acquire_ingress_slot(
+        &self,
+        peer_id: &str,
+    ) -> Option<Arc<std::sync::Mutex<TokenBucket>>> {
+        let mut ingress = self.ingress.lock().await;
+        let entry = ingress
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerIngress {
+                bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                    MESH_MSG_RATE,
+                    MESH_MSG_BURST,
+                ))),
+                live_channels: 0,
+            });
+        if entry.live_channels >= MESH_MAX_CHANNELS_PER_PEER {
+            return None;
+        }
+        entry.live_channels += 1;
+        Some(entry.bucket.clone())
+    }
+
     /// Wire a DataChannel's lifecycle: on open, register it as a live link; on message, forward the
     /// bytes to the inbound sink tagged with the peer id.
-    fn register_channel(&self, peer_id: String, dc: Arc<RTCDataChannel>) {
+    ///
+    /// Returns false if this peer already holds MESH_MAX_CHANNELS_PER_PEER live channels, in which
+    /// case NOTHING is wired and the caller must close the channel.
+    async fn register_channel(&self, peer_id: String, dc: Arc<RTCDataChannel>) -> bool {
         let inbound = self.inbound_tx.clone();
         let peer_for_msg = peer_id.clone();
-        // One token bucket per peer (this closure is this peer's only message handler).
-        let bucket = Arc::new(std::sync::Mutex::new(TokenBucket::new(
-            MESH_MSG_RATE,
-            MESH_MSG_BURST,
-        )));
+        // The rate limiter is looked up PER PEER and shared by every channel that peer opens — it
+        // is deliberately not constructed here. Constructing it per channel handed a remote one
+        // full budget per DataChannel, and nothing caps how many it may open.
+        let Some(bucket) = self.acquire_ingress_slot(&peer_id).await else {
+            return false;
+        };
+
+        // Release the slot when the channel closes, so a peer that legitimately re-opens over a
+        // long-lived connection can't be wedged at the cap by a monotonic counter. The bucket
+        // itself deliberately SURVIVES the close: dropping it per channel would restore the full
+        // burst on every re-open and hand back the bypass this fix removes. It is dropped with the
+        // peer in forget_if_current/shutdown.
+        let ingress_for_close = self.ingress.clone();
+        let peer_for_close = peer_id.clone();
+        dc.on_close(Box::new(move || {
+            let ingress = ingress_for_close.clone();
+            let peer = peer_for_close.clone();
+            Box::pin(async move {
+                if let Some(entry) = ingress.lock().await.get_mut(&peer) {
+                    entry.live_channels = entry.live_channels.saturating_sub(1);
+                }
+            })
+        }));
+
         dc.on_message(Box::new(move |msg: DcMessage| {
             let inbound = inbound.clone();
             let peer = peer_for_msg.clone();
@@ -729,6 +805,7 @@ impl WebRtcMesh {
                 }
             })
         }));
+        true
     }
 
     /// Create a peer connection and, for the responder side, capture the inbound DataChannel.
@@ -746,7 +823,31 @@ impl WebRtcMesh {
             let peer = peer.clone();
             Box::pin(async move {
                 if let Some(me) = me.upgrade() {
-                    me.register_channel(peer, dc);
+                    // Over the per-peer channel cap: wire no message handler (so it can never
+                    // deliver anything or draw on the peer's budget) and close it.
+                    if !me.register_channel(peer.clone(), Arc::clone(&dc)).await {
+                        log::debug!(
+                            "mesh: refusing excess DataChannel from {}…",
+                            &peer[..8.min(peer.len())]
+                        );
+                        // Closing HERE would be a partial no-op: this callback runs BEFORE the
+                        // SCTP stream is attached (sctp_transport::accept_data_channels invokes
+                        // on_data_channel, and only then handle_open), so RTCDataChannel::close
+                        // takes its `data_channel == None` path and the stream is attached a
+                        // moment later regardless. handle_open sets the stream and THEN fires
+                        // on_open, so closing from there actually tears it down. Weak ref for the
+                        // same reason as the normal on_open below — a strong self-reference would
+                        // pin a never-opened channel alive past its pc.
+                        let dc_weak = Arc::downgrade(&dc);
+                        dc.on_open(Box::new(move || {
+                            let dc_weak = dc_weak.clone();
+                            Box::pin(async move {
+                                if let Some(dc) = dc_weak.upgrade() {
+                                    let _ = dc.close().await;
+                                }
+                            })
+                        }));
+                    }
                 }
             })
         }));
@@ -850,7 +951,11 @@ impl WebRtcMesh {
             .create_data_channel(MESH_CHANNEL_LABEL, Some(mesh_channel_init()))
             .await
             .map_err(|e| e.to_string())?;
-        self.register_channel(peer_id.to_string(), dc);
+        // Our own outbound channel; the cap can only bite if this peer already holds the maximum,
+        // in which case the offer is pointless.
+        if !self.register_channel(peer_id.to_string(), dc).await {
+            return Err("mesh: peer already at the channel cap".to_string());
+        }
         let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
         let offer = set_local_and_gather(pc, offer)
             .await
@@ -1196,15 +1301,133 @@ mod tests {
         }
     }
 
+    /// Minimal in-process transport. These tests exercise the mesh's own bookkeeping and never
+    /// signal, so they should not depend on an HTTP client at all.
+    ///
+    /// Constructing `HttpSignalTransport` builds a `reqwest::Client`, and under SOME feature
+    /// unifications that resolve rustls with no crypto provider installed it panics outright
+    /// ("No rustls crypto provider is configured") before the test can assert anything — observed
+    /// with `--features webrtc_mesh` alone. Both CI configurations (default features, and
+    /// `bootstrap_publisher,webrtc_mesh`) happen to pull in a provider, so the sibling tests below
+    /// that still build one are green there; they are simply carrying a dependency they do not
+    /// need. New tests should prefer this mock.
+    struct NullSignalTransport {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SignalTransport for NullSignalTransport {
+        fn local_node_id(&self) -> &str {
+            &self.id
+        }
+        async fn post_signal(&self, _to: &str, _kind: &str, _payload: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn drain_signals(&self) -> Result<Vec<SignalEnvelope>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_mesh() -> Arc<WebRtcMesh> {
+        let t: Arc<dyn SignalTransport> = Arc::new(NullSignalTransport { id: "0".repeat(64) });
+        WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new())
+            .unwrap()
+            .0
+    }
+
+    // THE security property: a peer's inbound budget is MESH_MSG_RATE in total, not per channel.
+    // The bucket used to be constructed inside register_channel, so a remote opening N
+    // DataChannels on its one RTCPeerConnection got N full budgets and could flood the shared
+    // MESH_INBOUND_CAP queue, starving every other peer's block and tx gossip.
+    #[tokio::test]
+    async fn mesh_rate_limit_is_shared_across_one_peers_channels() {
+        let mesh = test_mesh();
+
+        let first = mesh
+            .acquire_ingress_slot("peer-a")
+            .await
+            .expect("first channel");
+        let second = mesh
+            .acquire_ingress_slot("peer-a")
+            .await
+            .expect("second channel");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "every channel from one peer must draw on the SAME bucket"
+        );
+
+        // Drain the burst through the first channel.
+        let mut spent = 0u32;
+        while first.lock().unwrap().allow() {
+            spent += 1;
+            assert!(spent < 10_000, "bucket must be exhaustible");
+        }
+        assert!(spent > 0, "a fresh bucket starts with budget");
+
+        // The second channel must find it empty. Before the fix it held a fresh full burst.
+        assert!(
+            !second.lock().unwrap().allow(),
+            "opening another channel must not reset the peer's inbound budget"
+        );
+
+        // Per-peer isolation still holds: a different peer is unaffected.
+        let other = mesh
+            .acquire_ingress_slot("peer-b")
+            .await
+            .expect("other peer");
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(
+            other.lock().unwrap().allow(),
+            "one peer's flood must not consume another peer's budget"
+        );
+    }
+
+    // Bounds the retained-channel leak: nothing caps how many DataChannels a remote may open on a
+    // single connection, so the mesh caps them itself and closes the excess.
+    #[tokio::test]
+    async fn mesh_refuses_channels_past_the_per_peer_cap() {
+        let mesh = test_mesh();
+
+        for i in 0..MESH_MAX_CHANNELS_PER_PEER {
+            assert!(
+                mesh.acquire_ingress_slot("flooder").await.is_some(),
+                "channel {i} is within the cap"
+            );
+        }
+        assert!(
+            mesh.acquire_ingress_slot("flooder").await.is_none(),
+            "past the cap the channel is refused, and the caller closes it"
+        );
+        assert!(
+            mesh.acquire_ingress_slot("innocent").await.is_some(),
+            "the cap is per peer, so a flooder cannot lock anyone else out"
+        );
+    }
+
+    // The limiter map must be bounded by LIVE peers, not by every peer id ever seen — otherwise
+    // the fix for one unbounded-growth bug introduces another.
+    #[tokio::test]
+    async fn mesh_ingress_state_is_dropped_with_the_peer_connection() {
+        let mesh = test_mesh();
+        let peer = "peer-gone";
+        let pc = mesh.new_pc(peer).await.unwrap();
+        mesh.acquire_ingress_slot(peer).await.expect("slot");
+        assert!(mesh.ingress.lock().await.contains_key(peer));
+
+        assert!(mesh.forget_if_current(peer, &pc).await);
+        assert!(
+            !mesh.ingress.lock().await.contains_key(peer),
+            "the rate limiter must not outlive its connection"
+        );
+    }
+
     // Guards the ABA fix: a stale pc's teardown (reaper or a late state-change callback) must NEVER
     // evict a fresh pc that a concurrent re-dial rebound to the same peer id.
     #[tokio::test]
     async fn forget_if_current_only_removes_the_matching_pc() {
-        let t: Arc<dyn SignalTransport> = Arc::new(
-            HttpSignalTransport::new(gen_key(), "http://127.0.0.1:0".to_string()).unwrap(),
-        );
-        let (mesh, _rx) =
-            WebRtcMesh::new(t, Arc::new(build_api(true).unwrap()), Vec::new()).unwrap();
+        // Was built on HttpSignalTransport, which panics under `rustls-no-provider` before this
+        // test could assert anything; the transport is irrelevant to the ABA property under test.
+        let mesh = test_mesh();
         let peer = "peer-x";
         let pc1 = mesh.new_pc(peer).await.unwrap();
         // A re-dial rebinds `peer` to a fresh pc (HashMap insert replaces the entry).
