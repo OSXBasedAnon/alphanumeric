@@ -8733,17 +8733,32 @@ pub struct BlockchainInfo {
     pub last_block_time: u64,
 }
 
+/// Cap on retained per-block verification records. `add_block_verification` runs for EVERY block
+/// this node persists, so without a bound the map grows for the life of the process — a cold sync
+/// to a ~520k tip retained ~130 MB, and steady 5s blocks add ~17,280 entries/day, which matters
+/// most on the long-lived bootstrap publisher (it is not restarted between releases). Nothing
+/// consults an old entry: the only read is `get_verification_count` on the record written one line
+/// earlier, and `is_block_verified`'s 3-verifier quorum is unreachable in the normal flow (see the
+/// comment at the persist call site). The cap is generous so the live window is untouched; both
+/// sibling collections in bpos.rs are bounded the same way (MAX_VERIFIED_BLOCKS, MAX_HISTORY).
+const MAX_TRACKED_VERIFICATIONS: usize = 1_024;
+
 #[derive(Debug)]
 pub struct ChainSentinel {
     verified_blocks: Arc<DashMap<[u8; 32], BlockVerification>>,
     integrity_score: AtomicU64,
     last_verification: AtomicU64,
+    /// Monotonic insertion counter, so eviction can drop the OLDEST records. The map is keyed by
+    /// block hash, which carries no recency ordering of its own.
+    verification_seq: AtomicU64,
 }
 
 #[derive(Debug)]
 struct BlockVerification {
     verifiers: HashSet<String>, // Node IDs that verified
     integrity_confirmed: bool,
+    /// Insertion order, used only for eviction.
+    seq: u64,
 }
 
 impl ChainSentinel {
@@ -8752,6 +8767,28 @@ impl ChainSentinel {
             verified_blocks: Arc::new(DashMap::new()),
             integrity_score: AtomicU64::new(100), // Start at 100%
             last_verification: AtomicU64::new(0),
+            verification_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Drop the oldest records once the map exceeds its cap, in one batch down to 3/4 capacity so
+    /// the O(n) scan is amortized across many inserts rather than run on every block.
+    fn evict_oldest_verifications(&self) {
+        let len = self.verified_blocks.len();
+        if len <= MAX_TRACKED_VERIFICATIONS {
+            return;
+        }
+        let to_remove = len.saturating_sub(MAX_TRACKED_VERIFICATIONS * 3 / 4);
+        // Collect keys BEFORE removing: DashMap holds shard locks for the lifetime of the
+        // iterator, so removing inside the loop can deadlock against this same thread.
+        let mut by_seq: Vec<(u64, [u8; 32])> = self
+            .verified_blocks
+            .iter()
+            .map(|e| (e.value().seq, *e.key()))
+            .collect();
+        by_seq.sort_unstable_by_key(|(seq, _)| *seq);
+        for (_, hash) in by_seq.into_iter().take(to_remove) {
+            self.verified_blocks.remove(&hash);
         }
     }
 
@@ -8847,6 +8884,7 @@ impl ChainSentinel {
     }
 
     pub fn add_block_verification(&self, block: &Block, verifier: String) {
+        let seq = self.verification_seq.fetch_add(1, Ordering::Relaxed);
         self.verified_blocks
             .entry(block.hash)
             .and_modify(|v| {
@@ -8862,8 +8900,12 @@ impl ChainSentinel {
                 BlockVerification {
                     verifiers,
                     integrity_confirmed: false,
+                    seq,
                 }
             });
+        // Bound the map AFTER the insert, so the record just written — the only one any caller
+        // reads back (see get_verification_count at the persist site) — is never the one evicted.
+        self.evict_oldest_verifications();
     }
 
     pub fn is_block_verified(&self, block: &Block) -> bool {
@@ -8891,6 +8933,81 @@ impl Default for ChainSentinel {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    // add_block_verification runs for EVERY persisted block, so an unbounded map grew for the life
+    // of the process (~17,280 entries/day at 5s blocks; worst on the publisher, which is not
+    // restarted between releases). Bounding it must not disturb the ONE property the persist path
+    // depends on: the record just written is readable back immediately.
+    #[test]
+    fn chain_sentinel_verifications_stay_bounded_and_keep_the_newest() {
+        let sentinel = ChainSentinel::new();
+        let block_at = |n: u32| {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&n.to_be_bytes());
+            Block {
+                index: n,
+                previous_hash: [0u8; 32],
+                timestamp: 1_000 + n as u64,
+                transactions: Vec::new(),
+                nonce: 0,
+                difficulty: 0,
+                hash,
+                merkle_root: [0u8; 32],
+            }
+        };
+
+        let total = (MAX_TRACKED_VERIFICATIONS * 2) as u32;
+        for n in 0..total {
+            let block = block_at(n);
+            sentinel.add_block_verification(&block, "network".to_string());
+            // The persist path reads the count back on the very next line and rejects the block
+            // when it is 0 — eviction must never take the record it just wrote.
+            assert_eq!(
+                sentinel.get_verification_count(&block),
+                1,
+                "the just-written record must survive its own insert at n={n}"
+            );
+        }
+
+        assert!(
+            sentinel.verified_blocks.len() <= MAX_TRACKED_VERIFICATIONS,
+            "map must stay bounded, got {}",
+            sentinel.verified_blocks.len()
+        );
+        // The newest records are the ones kept; the oldest are gone.
+        assert_eq!(sentinel.get_verification_count(&block_at(total - 1)), 1);
+        assert_eq!(
+            sentinel.get_verification_count(&block_at(0)),
+            0,
+            "the oldest record is evicted, not an arbitrary one"
+        );
+    }
+
+    // Repeated verifications of the SAME block accumulate verifiers rather than allocating a new
+    // record, so re-persisting a block cannot inflate the map.
+    #[test]
+    fn chain_sentinel_accumulates_verifiers_for_one_block() {
+        let sentinel = ChainSentinel::new();
+        let block = Block {
+            index: 7,
+            previous_hash: [0u8; 32],
+            timestamp: 1_007,
+            transactions: Vec::new(),
+            nonce: 0,
+            difficulty: 0,
+            hash: [7u8; 32],
+            merkle_root: [0u8; 32],
+        };
+
+        sentinel.add_block_verification(&block, "a".to_string());
+        sentinel.add_block_verification(&block, "b".to_string());
+        assert_eq!(sentinel.get_verification_count(&block), 2);
+        assert_eq!(sentinel.verified_blocks.len(), 1);
+        assert!(!sentinel.is_block_verified(&block), "quorum is 3");
+
+        sentinel.add_block_verification(&block, "c".to_string());
+        assert!(sentinel.is_block_verified(&block));
+    }
 
     fn test_blockchain() -> Blockchain {
         let db = sled::Config::new()
