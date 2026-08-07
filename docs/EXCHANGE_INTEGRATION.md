@@ -83,27 +83,46 @@ pair is the simplest correct policy.
 - **100 concurrently pending transactions per sender address** (`MEMPOOL_MAX_PER_ADDRESS`).
   A hot wallet is one address, so a burst of more than 100 queued withdrawals fails at the
   101st. Cap in-flight submissions below 100, or shard across several hot wallets.
-- **2,000 submissions per 60 s per sender address.**
+- **100 submissions per 60 s per sender address** — 1.67 tx/s sustained. (Raised to 2,000
+  on `main`; not in any released binary, so size your hot wallet against 100.)
+- The submit endpoint is additionally fronted by a **node-wide** token bucket: 5
+  submissions/s sustained, burst 20, shared across every sender regardless of the
+  per-sender limit. Exceeding it returns `429 {"error": "rate_limited"}`. This, not the
+  per-sender limit, is the ceiling on sustained submission throughput against one node.
 - No server-side way to query current mempool depth for your address. Track in-flight
   count client-side.
 
 ### Classifying failures
 
-Backpressure returns **429** with a machine-readable reason. A **400** is terminal.
+On the current release **every** admission rejection — retryable backpressure included — is
+returned as HTTP **400** with a single human-readable string:
 
 ```json
-429 {"error": "rate_limited", "reason": "mempool_full",
-     "retryable": true, "retry_same_transaction": false, "detail": "..."}
+400 {"error": "transaction rejected: Rate limit exceeded: Too many transactions from this address"}
 ```
 
-| `reason` | `retry_same_transaction` | Action |
-|---|---|---|
-| `per_address_pending_cap` | `true` | back off, you are at the 100-pending cap |
-| `per_sender_rate` | `true` | back off, per-sender submission rate |
-| `mempool_full` | **`false`** | back off, then **re-sign at a higher fee** — eviction is fee-ordered and all-or-nothing, so resubmitting the identical transaction can never win a slot |
+**A 400 is therefore NOT automatically terminal.** Match on the message text:
 
-**Branch on `retry_same_transaction`, not on the reason string.** A 400
-(`InsufficientFunds`, `InvalidTransactionSignature`, `FeeBelowRelayFloor`) is terminal.
+| Message contains | Retryable | Action |
+|---|---|---|
+| `Rate limit exceeded: Too many transactions from this address` | yes | at the 100-pending cap; back off, resend the same signed transaction |
+| `Rate limit exceeded: Too many requests` | yes | per-sender submission rate; back off, resend the same signed transaction |
+| `Rate limit exceeded: Mempool is full` | no | **re-sign at a higher fee** — eviction is fee-ordered and all-or-nothing, so resubmitting the identical transaction can never win a slot |
+| `Insufficient funds`, `signature is invalid or missing`, `fee below the relay floor`, `amount is invalid or negative` | no | terminal — alert |
+
+A **429** `{"error": "rate_limited"}` is also possible. It comes from the node-wide
+submission token bucket (5/s sustained, burst 20) shared by all senders, carries no reason
+field, and is always retryable.
+
+Malformed requests are rejected by the HTTP layer before the handler runs and return PLAIN
+TEXT, not JSON: `400` for a JSON syntax error, `415` for a missing/wrong `Content-Type`,
+`422` for well-formed JSON that is not a transaction. Key off `Content-Type` — only a `400`
+whose body parses as `{"error": "transaction rejected: …"}` came from validation.
+
+> **Coming in the next release:** a structured `429` carrying `reason` / `retryable` /
+> `retry_same_transaction`, so you can branch on a field instead of a string. Implemented on
+> `main`, NOT in the current release — do not code against it yet. A client that matches the
+> strings above and also tolerates the structured form upgrades without a redeploy.
 
 Minimum relay fee is 10,000 units (0.0001 `ALPHA`). Minimum transfer is 564 units. Use
 `/explorer/fee-estimate` rather than hardcoding.
@@ -118,18 +137,29 @@ arbitrary fee values for ordinary withdrawals.
 
 `/explorer/address/{addr}` returns confirmed ledger state.
 
-**Use `spendable_units`, not `balance_units`.** `balance` is the raw confirmed ledger
-total: it includes mining rewards that are still immature (coinbase maturity is **100
-blocks**) and does not subtract in-flight mempool debits, so it can exceed what the address
-can actually spend. `spendable` / `spendable_units` is confirmed minus pending debits minus
-immature rewards, and is the number to credit a user against. It is `null` if it cannot be
-computed.
+The current release returns exactly these fields: `address`, `balance`, `balance_units`,
+`index_ready`, `index_height`, `summary`, `transactions`, `next`.
 
-**Check `history_available` before reading `transactions`.** The history is served off the
-address index, which can be unbuilt or mid-rebuild after a bootstrap or re-index. When that
-is the case `history_available` is `false` and `transactions` is **`null`** rather than an
-empty array, so a scanner cannot mistake "index not ready" for "no deposits". Retry until
-it is `true`, and also confirm freshness via `/explorer/status` (`blocks_behind`).
+**`balance_units` is the raw confirmed ledger total.** It includes mining rewards that are
+still immature (coinbase maturity is **100 blocks**) and does not subtract in-flight mempool
+debits, so it can exceed what the address can actually spend. For a deposit address that
+never mines and that you never spend from concurrently, it is safe to credit against. For
+any address you also withdraw from, subtract your own in-flight debits client-side.
+
+> **Coming in the next release:** a precomputed `spendable` / `spendable_units` pair
+> (confirmed minus pending debits minus immature rewards, `null` when it cannot be
+> computed). Implemented on `main`, NOT in the current release.
+
+**Check `index_ready` before trusting `transactions`.** The history is served off the
+address index, which can be unbuilt or mid-rebuild after a bootstrap or re-index. On the
+current release `transactions` is **always an array**, and an unbuilt index yields an
+**empty array indistinguishable from "no deposits"** — so a scanner must refuse to conclude
+anything from an empty `transactions` unless `index_ready` is `true`. Retry until it is, and
+also confirm freshness via `/explorer/status` (`blocks_behind`).
+
+> **Coming in the next release:** a `history_available` flag, with `transactions` served as
+> `null` rather than an empty array when the index is not ready, so the two cases cannot be
+> confused. Implemented on `main`, NOT in the current release.
 
 `GET` endpoints can return **503** under chain-lock contention during heavy sync or
 indexing. A deposit scanner must treat non-200 as "retry", never as "no data", or it will
