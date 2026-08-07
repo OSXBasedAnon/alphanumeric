@@ -280,7 +280,6 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_RELAY_SYNC_BACKFILL_DEPTH` (default `64`, the checkpoint reorg margin; max `256`)
 - `ALPHANUMERIC_RELAY_SYNC_MAX_ROUNDS` (default `4`, max `24`)
 - `ALPHANUMERIC_PUBLIC_IP`
-- `ALPHANUMERIC_ENABLE_UPNP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`
 - `ALPHANUMERIC_TX_WITNESS_CACHE_SIZE`
 
