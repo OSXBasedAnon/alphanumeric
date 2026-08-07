@@ -2,27 +2,44 @@
 
 <img width="862" height="696" alt="Screenshot 2026-07-27 at 8 18 50 AM" src="https://github.com/user-attachments/assets/24268ad5-2547-4c90-828f-c40242e490c5" />
 
-[![Rust](https://img.shields.io/badge/Rust-stable-orange)](#build-and-run)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange)](#build-from-source)
 [![Platform](https://img.shields.io/badge/Platform-macOS%2FOSX%20%7C%20Linux%20%7C%20Windows-blue)](#supported-platforms)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
 https://www.alphanumeric.blue/
 
-Rust blockchain node and command-line wallet client for macOS/OSX, Linux, and Windows.
+`alphanumeric` is a proof-of-work Layer 1 blockchain whose transactions are signed with
+**ML-DSA-87 (FIPS 204)**, the NIST post-quantum lattice signature, rather than an elliptic
+curve. This single binary is the full node, wallet and miner for macOS/OSX, Linux and Windows.
 
-`alphanumeric` is a Rust blockchain node runtime with integrated peer discovery, wallet management, mining, local chain storage, bootstrap sync, and diagnostics tooling. The current release line is `7.9.4`.
+## At a Glance
+
+| | |
+|---|---|
+| Ticker | `ALPHA` (glyph `♦`), 8 decimals, 1 ALPHA = 100,000,000 units |
+| Consensus | Proof of work, ~5 s target block time |
+| Signatures | ML-DSA-87 (FIPS 204): signature 4,627 B, public key 2,592 B |
+| Addresses | 40 lowercase hex characters, `SHA256(public_key)[..20]` |
+| Finality | Trusted checkpoint trailing the tip by 64 blocks |
+| Storage | Embedded `sled`, with a signed bootstrap snapshot for fast first sync |
+| Default P2P port | `7177` |
 
 ## Quick Nav
 
-- [System Goals](#system-goals)
-- [Technical Architecture](#technical-architecture)
-- [Tokenomics](#tokenomics)
-- [Supported Platforms](#supported-platforms)
-- [Build and Run](#build-and-run)
-- [Bootstrap and Storage](#bootstrap-and-storage)
-- [Configuration via Environment Variables](#configuration-via-environment-variables)
-- [CLI Surface](#cli-surface)
-- [Security Posture](#security-posture)
+**Run a node:** [Build from Source](#build-from-source) · [Bootstrap and Storage](#bootstrap-and-storage) · [Configuration](#configuration-via-environment-variables) · [CLI Surface](#cli-surface) · [Operations Checklist](#operations-checklist)
+
+**Understand the chain:** [System Goals](#system-goals) · [Technical Architecture](#technical-architecture) · [Consensus and Validation](#consensus-and-validation) · [Tokenomics](#tokenomics) · [Security Posture](#security-posture)
+
+**Build on it:**
+
+| Document | What it covers |
+|---|---|
+| [`EXPLORER_API.md`](EXPLORER_API.md) | Read API and transaction submit: endpoints, fees, finality, failure handling |
+| [`SIGNING_SPEC.md`](SIGNING_SPEC.md) | The exact signed-message format, encodings, and a deterministic test vector |
+| [`docs/EXCHANGE_INTEGRATION.md`](docs/EXCHANGE_INTEGRATION.md) | Asset identity, deposits, withdrawals, queue limits, node requirements |
+| [`docs/GPU_MINING.md`](https://github.com/OSXBasedAnon/alphanumeric/blob/gpu-mining/docs/GPU_MINING.md) | GPU mining setup and tuning (lives on the `gpu-mining` branch, which carries the GPU backend) |
+| [`docs/CONSENSUS_DECISIONS.md`](docs/CONSENSUS_DECISIONS.md) | Why the consensus rules are what they are |
+| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Threats considered and the controls against them |
 
 ## System Goals
 
@@ -57,19 +74,10 @@ The client is intended to run on:
 - Linux
 - Windows
 
-The repository can be built from source with the Rust stable toolchain. Release zips may include a more user-focused `README.md` from `release/README.md`; this repository README is the technical project overview.
-
-## Capability Matrix
-
-| Capability | Scope |
-| --- | --- |
-| Node runtime | Listener, peer connect/disconnect, maintenance loops |
-| P2P transport | Length-prefixed framed messaging, bounded payloads |
-| Sync | Peer block-range requests and ingestion |
-| Persistence | Embedded `sled` storage and local bootstrap |
-| Mining | Local mining manager and miner workflows |
-| Wallet ops | Create/rename/list/history/account + transaction creation |
-| Ops visibility | Status/sync/connect/discovery commands + stats server hooks |
+The repository can be built from source with the Rust stable toolchain. Prebuilt macOS/OSX
+release archives are published on the [releases page](https://github.com/OSXBasedAnon/alphanumeric/releases).
+Release zips may include a more user-focused `README.md` from `release/README.md`; this
+repository README is the technical project overview.
 
 ## Technical Architecture
 
@@ -95,17 +103,6 @@ Runtime shape:
    - sync
    - optional stats
 5. process interactive commands and network events
-
-```mermaid
-flowchart LR
-    CLI[CLI / main.rs] --> NODE[Node Runtime / node.rs]
-    NODE --> P2P[P2P Transport]
-    NODE --> SYNC[Sync + Discovery]
-    NODE --> CHAIN[Blockchain / blockchain.rs]
-    CHAIN --> DB[(sled)]
-    CLI --> MGMT[Wallet Mgmt / mgmt.rs]
-    CLI --> MINER[Mining / miner.rs]
-```
 
 ## Network and Protocol Notes
 
@@ -139,15 +136,26 @@ higher one) until difficulty or hashrate settles. This is expected and self-corr
 it does not affect finality (reorgs remain bounded by the checkpoint margin) — and finer
 target granularity is a candidate for a future coordinated protocol upgrade.
 
-If you are integrating against this repository, pin a commit hash and validate behavior at that exact revision.
+If you are integrating against this repository, build from a **release tag**, not from `main`.
+`main` carries work that has not shipped, so behaviour observed there may not match any
+binary on the network. Pinning an arbitrary commit is worse still: a commit that predates a
+consensus activation will disagree with the network once the chain reaches that height.
 
-### Scheduled compatibility boundary
+### Consensus activations
 
-Client `7.9.4` activates updated reward accounting at block `569,423`.
-Pre-activation blocks retain the existing rules. Miners, pools, public nodes, and
-other validating operators must upgrade before the activation height; older
-software may not agree on block validity after that point. The node announces an
-advisory consensus fingerprint so operators can monitor rollout compatibility.
+Consensus rules change at scheduled block heights, compiled into the client rather than
+signalled at runtime: a node compares the block index against the activation constant and
+switches by itself, with no configuration, restart or operator action at the boundary.
+
+The practical consequence is that **an operator must be on a release that contains an
+activation before the chain reaches it.** Software that predates one computes different
+values from that height on, disagrees with the network about block validity, and follows a
+chain the rest of the network has abandoned. The node announces an advisory consensus
+fingerprint so operators can monitor rollout compatibility.
+
+Which heights are pending, and the minimum release for each, are listed in the
+[release notes](https://github.com/OSXBasedAnon/alphanumeric/releases) for the current
+version. Run the current release and this takes care of itself.
 
 ## Tokenomics
 
@@ -166,28 +174,28 @@ advisory consensus fingerprint so operators can monitor rollout compatibility.
 ### Runtime Parameters (Current Code)
 
 - Reference-wallet fee: automatic, priced off the live mempool
-  (`Blockchain::fee_estimate`): a flat `0.0002` anchor (2x the relay floor) on
-  a quiet network, one unit above the marginal next-block fee under
-  congestion, always capped at `0.002` for an automatic fee (`0.01` remains the
-  ceiling for an explicitly chosen `--fee`)
+  (`Blockchain::fee_estimate`). The relay floor is `0.0001`. Full policy, including the
+  explicit `--fee` ceiling, is under [CLI Surface](#cli-surface)
 - `FEE_PERCENTAGE = 0.000563063063` remains the Whisper encoding constant; it is
   not the regular-wallet fee policy
 - Reward constants: `MIN_BLOCK_REWARD = 1.0`, launch
   `MAX_BLOCK_REWARD = 50.0`; the effective subsidy ceiling decays by 17% every
   six months and eventually falls below the nominal floor
-- Reward network fee: `NETWORK_FEE = 0.0005`
-- Fee clipping factor: `MINT_CLIP = 0.35`
+- Reward network fee: `NETWORK_FEE = 0.0005`, the pinned fee on the coinbase transaction
 - Target block time: `TARGET_BLOCK_TIME = 5` seconds
 - Empty-block rewards are clamped from `0.2 * current_max` into
   `[min(MIN_BLOCK_REWARD, current_max), current_max]`
-- Before block `569,423`, non-empty block rewards retain the legacy fee curve.
-  From block `569,423`, miner compensation is the scheduled subsidy plus 65% of
-  included transaction fees; the remaining 35% is burned. The decaying ceiling
-  bounds the subsidy component, while exact fee units are transferred separately.
+- Two reward curves exist, selected by block height at the Reward Curve V2 activation.
+  Below it, the legacy curve damps the fee contribution by `MINT_CLIP = 0.35` and is frozen
+  permanently, because changing its operation order would invalidate historical coinbases.
+  At and above it, miner compensation is the scheduled subsidy plus 65% of included
+  transaction fees, with the remaining 35% burned: the decaying ceiling bounds the subsidy
+  component, and exact fee units are transferred separately in integer arithmetic. See
+  [`docs/CONSENSUS_DECISIONS.md`](docs/CONSENSUS_DECISIONS.md)
 
 Actual realized issuance still depends on real network activity (block production + transaction fees).
 
-## Build and Run
+## Build from Source
 
 Prerequisites:
 
@@ -254,7 +262,14 @@ Primary local artifacts:
 Common variables used by the runtime include:
 
 - `ALPHANUMERIC_BIND_IP`
+- `ALPHANUMERIC_PORT` (P2P listen port; defaults to `7177`)
 - `ALPHANUMERIC_DB_PATH`
+- `ALPHANUMERIC_EXPLORER_API` (opt-in HTTP read API plus transaction submit. Accepts a bare
+  port, bound to loopback, or `host:port`. Off unless set; this is what an integration or a
+  block explorer talks to. See [`EXPLORER_API.md`](EXPLORER_API.md))
+- `ALPHANUMERIC_BLOCKNOTIFY` (runs a command on every new chain tip, following Bitcoin
+  Core's `-blocknotify` contract: `%s` is the block hash, `%h` the height. Useful for pools
+  and deposit scanners that would otherwise poll)
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
@@ -297,7 +312,7 @@ Interactive command loop examples:
 - `account [address_or_wallet_name]` (bare: your default wallet)
 - `history`
 - `rename <old_name> <new_name>`
-- `mine [wallet_name] [--continuous]` (bare: your default wallet; the GPU build adds `[--gpu|--cpu]`)
+- `mine [wallet_name] [--continuous|-c]` (bare: rewards go to your default wallet). This branch mines on CPU; the GPU backend is a separate build on the [`gpu-mining` branch](https://github.com/OSXBasedAnon/alphanumeric/blob/gpu-mining/docs/GPU_MINING.md), not a runtime flag
 - `info`
 - `debug`
 
@@ -342,7 +357,8 @@ Minimum recommended setup for a reachable node:
 Windows firewall example:
 
 ```powershell
-New-NetFirewallRule -Name "Alphanumeric Network" -DisplayName "Alphanumeric Network (Port 7177)" -Protocol TCP -LocalPort 7177 -Direction Inbound,Outbound -Action Allow
+New-NetFirewallRule -Name "Alphanumeric Inbound" -DisplayName "Alphanumeric Network (Port 7177 in)" -Protocol TCP -LocalPort 7177 -Direction Inbound -Action Allow
+New-NetFirewallRule -Name "Alphanumeric Outbound" -DisplayName "Alphanumeric Network (Port 7177 out)" -Protocol TCP -RemotePort 7177 -Direction Outbound -Action Allow
 ```
 
 macOS/OSX firewall note:
