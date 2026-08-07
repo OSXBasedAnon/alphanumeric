@@ -50,10 +50,6 @@ const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = WALLET_FEE_SAFETY_LIMIT_UNITS; // 
 const CREATE_TRANSACTION_USAGE: &str =
     "Usage: create <sender_address> <recipient_address> <amount> [--fee <ALPHA>]";
 
-/// Blocks until the coinbase mined at `reward_height` leaves the M06 immature set — i.e.
-/// until the wallet's spendable balance includes it. It drops out once the tip reaches
-/// reward_height + MINING_REWARD_MATURITY − 1 (the display's spend height is tip+1).
-/// Display-only; the enforced set comes from the breakdown itself.
 /// The three counterparties worth printing in full: the most recent inbound, the most recent
 /// outbound, and the one appearing most often.
 ///
@@ -137,6 +133,11 @@ pub async fn resolve_default_wallet(
         .map(|(name, wallet)| ((*name).clone(), wallet.address.clone()))
 }
 
+/// Blocks until the coinbase mined at `reward_height` leaves the M06 immature set — i.e.
+/// until the wallet's spendable balance includes it. It drops out once the tip reaches
+/// reward_height + MINING_REWARD_MATURITY − 1 (the display's spend height is tip+1), which
+/// is where the `- 1` below comes from.
+/// Display-only; the enforced set comes from the breakdown itself.
 fn blocks_until_mature(reward_height: u32, as_of_height: u64) -> u64 {
     (reward_height as u64)
         .saturating_add(MINING_REWARD_MATURITY as u64 - 1)
