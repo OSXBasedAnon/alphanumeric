@@ -33,7 +33,7 @@ Control: removed manual `unsafe impl Send/Sync` for `HybridSwarm`; rely on compi
 Coverage: compile-time safety checks.
 
 4. Bootstrap poisoning or resource exhaustion via weak manifests, malformed hashes, or oversized archives.
-Control: HTTPS bootstrap URLs, pinned publisher identity, signed manifest fields, strict SHA-256 format checks, streamed download verification, signed archive size/file-count checks, disk preflight, and bounded unverified fallback extraction.
+Control: HTTPS bootstrap URLs, pinned publisher identity, signed manifest fields, strict SHA-256 format checks, streamed download verification, signed archive size/file-count checks, and disk preflight. There is no unverified fallback: a manifest that fails signature verification aborts the bootstrap rather than proceeding under a size cap, and the download/extraction bounds come from the signed `compressed_bytes` / `extracted_bytes` / `file_count` fields, so they cannot be relaxed by an attacker or by an environment variable.
 Coverage: startup path in `ensure_bootstrap_db`, manifest verification tests, and bootstrap archive size tests.
 
 5. Balance/amount divergence from floating-point comparisons in consensus checks.
