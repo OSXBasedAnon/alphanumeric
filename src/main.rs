@@ -5713,7 +5713,19 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         // Durable (fsync'd): losing this cooldown stamp to a power cut restores
         // the snapshot-download loop it exists to prevent.
         let cooldown = rebootstrap_cooldown_path(db_path);
-        let _ = alphanumeric::a9::node::write_durable(&cooldown, b"");
+        // Report a failed stamp instead of dropping it. This runs immediately after a
+        // multi-hundred-MB extract, so ENOSPC is the realistic error — and a lost stamp leaves
+        // `rebootstrap_hard_cooldown_active` false forever, so the 2-strike divergence path
+        // exits again and the node re-enters the snapshot-download loop this stamp exists to
+        // break, with nothing in the log naming the cause. Every sibling durable write reports.
+        if let Err(e) = alphanumeric::a9::node::write_durable(&cooldown, b"") {
+            warn!(
+                "Could not stamp the re-bootstrap cooldown at {}: {} — a repeated divergence may \
+                 re-download the snapshot instead of retrying convergence",
+                cooldown.display(),
+                e
+            );
+        }
     }
     Ok(())
 }
