@@ -67,12 +67,10 @@ const BOOTSTRAP_MANIFEST_URL: &str = "https://alphanumeric.blue/api/bootstrap/ma
 // steerable by whoever controls the environment.
 const BOOTSTRAP_MANIFEST_FALLBACK_URL: &str =
     "https://cdn.alphanumeric.blue/bootstrap/recovery.json";
-const DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
-const MIN_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 1024 * 1024;
-const MAX_MAX_BOOTSTRAP_ZIP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024;
-const MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
+// The DEFAULT/MIN/MAX bootstrap zip- and extract-limit constants were removed with the two env
+// vars they clamped (see the note above ensure_bootstrap_zip_size): every path that consumed them
+// sat behind a condition that became permanently false when the unverified bootstrap path was
+// deleted. Download and extraction are bounded by the manifest's SIGNED size fields instead.
 const BOOTSTRAP_MIN_DISK_BUFFER_BYTES: u64 = 1024 * 1024 * 1024;
 const PEERS_URL: &str = "https://alphanumeric.blue/api/peers?limit=50";
 const TIP_URL: &str = "https://alphanumeric.blue/api/tip";
@@ -4719,33 +4717,34 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn bootstrap_zip_size_limit_from_env_value(value: Option<&str>) -> u64 {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| value.clamp(MIN_MAX_BOOTSTRAP_ZIP_BYTES, MAX_MAX_BOOTSTRAP_ZIP_BYTES))
-        .unwrap_or(DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES)
-}
+// ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES and ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
+// with their parse-and-clamp helpers, used to live here. Both were read ONLY behind
+// `if !verified_manifest` in ensure_bootstrap_db, and that flag became unconditionally true when
+// the unverified bootstrap path was removed (a manifest either verifies or the function returns
+// Err). So the variables were inert: an operator could set one, have it parsed and clamped by a
+// unit-tested helper, and see it silently ignored. Deleted rather than left as a promise the code
+// does not keep. The download and extraction remain bounded by the SIGNED compressed_bytes /
+// extracted_bytes / file_count in the manifest, which is the stronger check anyway.
 
-fn bootstrap_zip_size_limit_bytes() -> u64 {
-    let value = std::env::var("ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES").ok();
-    bootstrap_zip_size_limit_from_env_value(value.as_deref())
-}
+/// Removes a partial bootstrap archive when it goes out of scope.
+///
+/// Every error return between creating the zip and extracting it — a body-read failure, a size
+/// mismatch, the SHA-256 mismatch, the disk-space recheck — used to leave a ~125 MB file behind
+/// FOREVER. The caller falls back to P2P reconstruction and boots, so `has_local_block_data` is
+/// true on every later start and `ensure_bootstrap_db` returns long before the `File::create`
+/// could truncate it. The orphan also made the next attempt's preflight pessimistic:
+/// `ensure_bootstrap_disk_space` runs BEFORE that truncate, so it measured free space with the
+/// stale archive still occupying `compressed_bytes` and could refuse a bootstrap that would
+/// actually have fit.
+///
+/// Deliberately always armed — never disarmed on success. By the time extraction finishes it has
+/// already deleted the archive itself, so the removal here is a harmless no-op.
+struct BootstrapZipCleanup<'a>(&'a str);
 
-fn unverified_bootstrap_extract_limit_from_env_value(value: Option<&str>) -> u64 {
-    value
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| {
-            value.clamp(
-                MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
-                MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES,
-            )
-        })
-        .unwrap_or(DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES)
-}
-
-fn unverified_bootstrap_extract_limit_bytes() -> u64 {
-    let value = std::env::var("ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES").ok();
-    unverified_bootstrap_extract_limit_from_env_value(value.as_deref())
+impl Drop for BootstrapZipCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
 }
 
 fn ensure_bootstrap_zip_size(size: u64, limit: u64, context: &str) -> Result<()> {
@@ -5297,7 +5296,6 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         expected_compressed_bytes,
         expected_extracted_bytes,
         expected_file_count,
-        verified_manifest,
     ) = match manifest_result {
         Ok(manifest) => {
             let expected_sha256 = manifest
@@ -5316,7 +5314,6 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 manifest.compressed_bytes,
                 manifest.extracted_bytes,
                 manifest.file_count,
-                true,
             )
         }
         Err(e) => {
@@ -5367,7 +5364,13 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         return Err(format!("Bootstrap download failed: {}", res.status()).into());
     }
 
-    let fallback_zip_limit = (!verified_manifest).then(bootstrap_zip_size_limit_bytes);
+    // No fallback cap exists any more: the manifest is verified or this function has already
+    // returned (fail-closed, above), so the download is always bounded by the SIGNED
+    // compressed_bytes. This used to read ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES behind an
+    // `if !verified_manifest` that could never be true, so the variable was inert — an operator
+    // could set it, see it parsed and clamped by a tested helper, and have it silently ignored.
+    // The env var and its helper are gone rather than left as a promise the code does not keep.
+    let fallback_zip_limit: Option<u64> = None;
     if let Some(content_length) = res.content_length() {
         ensure_bootstrap_download_complete(
             content_length,
@@ -5420,6 +5423,8 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         Some(bar)
     };
     let mut dl_last_decile = 0u64;
+
+    let _zip_cleanup = BootstrapZipCleanup(zip_path.as_str());
 
     let mut zip_file = fs::File::create(&zip_path)
         .await
@@ -5491,8 +5496,8 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         expected_extracted_bytes,
     )?;
 
-    // Verified manifests must provide SHA-256. The only no-hash path is the
-    // explicit unsafe fallback for local/dev recovery.
+    // Every manifest that reaches here is signature-verified and must carry a SHA-256; the
+    // no-hash fallback this once referred to (local/dev unverified recovery) no longer exists.
     if let Some(expected) = expected_sha256
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase())
@@ -5548,8 +5553,10 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
     let archive_expectations = BootstrapArchiveExpectations {
         expected_extracted_bytes,
         expected_file_count,
-        unverified_extract_limit: (!verified_manifest)
-            .then(unverified_bootstrap_extract_limit_bytes),
+        // Always None for the same reason as fallback_zip_limit: the unverified bootstrap path
+        // it belonged to was removed. The field itself stays — it is a live, tested cap in the
+        // extraction path — but nothing can populate it while every manifest is signature-checked.
+        unverified_extract_limit: None,
     };
     // Per-file extract progress (interactive only). ProgressBar is thread-safe, so
     // the blocking extraction ticks the same bar; the true length is set once the
@@ -5615,7 +5622,10 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 } else {
                     let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
                     // Cap the per-entry copy so a single oversized entry can't exhaust disk
-                    // BEFORE the cumulative-size check runs (the unverified path isn't SHA-pinned).
+                    // BEFORE the cumulative-size check runs. (This once guarded the unverified,
+                    // non-SHA-pinned path; it is kept as defence in depth for the verified one —
+                    // the archive is only SHA-checked as a whole, so a malformed entry can still
+                    // blow up disk mid-extract before the digest is ever computed.)
                     // Read at most (budget - already-extracted + 1) bytes; the +1 guarantees
                     // update_bootstrap_archive_stats sees the overflow and aborts mid-extract.
                     let budget = archive_expectations
@@ -8684,29 +8694,40 @@ mod tests {
         manifest
     }
 
+    // The clamp tests for ALPHANUMERIC_MAX_BOOTSTRAP_ZIP_BYTES and
+    // ALPHANUMERIC_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES were deleted with the helpers they
+    // covered. They passed while the values they parsed could never reach the download or the
+    // extractor, which is the failure mode green tests are worst at revealing: the helper was
+    // correct, its caller was unreachable. `ensure_bootstrap_zip_size` below is still live —
+    // it enforces the SIGNED compressed_bytes.
+    // A failed bootstrap attempt must not leave its partial archive on disk: the node boots via
+    // the P2P fallback, so nothing ever revisits the path to truncate it, and the stale bytes
+    // make the NEXT attempt's disk preflight refuse space that is actually available.
     #[test]
-    fn bootstrap_zip_limit_env_value_is_clamped() {
-        assert_eq!(
-            bootstrap_zip_size_limit_from_env_value(None),
-            DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES
+    fn bootstrap_zip_cleanup_removes_a_partial_archive() {
+        let dir = std::env::temp_dir().join(format!("a9-zip-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let zip = dir.join("blockchain.db.zip");
+        std::fs::write(&zip, b"partially downloaded archive").expect("seed partial zip");
+        assert!(zip.exists());
+
+        {
+            let _cleanup = BootstrapZipCleanup(zip.to_str().unwrap());
+            // ... an error return happens here (bad SHA-256, short body, disk recheck, ...)
+        }
+        assert!(
+            !zip.exists(),
+            "the partial archive must not outlive the failed attempt"
         );
-        assert_eq!(
-            bootstrap_zip_size_limit_from_env_value(Some("not-a-number")),
-            DEFAULT_MAX_BOOTSTRAP_ZIP_BYTES
-        );
-        assert_eq!(
-            bootstrap_zip_size_limit_from_env_value(Some("1")),
-            MIN_MAX_BOOTSTRAP_ZIP_BYTES
-        );
-        assert_eq!(
-            bootstrap_zip_size_limit_from_env_value(Some("2097152")),
-            2_097_152
-        );
-        let over_max = (MAX_MAX_BOOTSTRAP_ZIP_BYTES + 1).to_string();
-        assert_eq!(
-            bootstrap_zip_size_limit_from_env_value(Some(over_max.as_str())),
-            MAX_MAX_BOOTSTRAP_ZIP_BYTES
-        );
+
+        // Always-armed is safe: dropping again once extraction has already removed the file is a
+        // no-op, not an error.
+        {
+            let _cleanup = BootstrapZipCleanup(zip.to_str().unwrap());
+        }
+        assert!(!zip.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -8718,27 +8739,6 @@ mod tests {
 
         assert!(err.contains("too large"));
         assert!(err.contains("test body"));
-    }
-
-    #[test]
-    fn unverified_bootstrap_extract_limit_env_value_is_clamped() {
-        assert_eq!(
-            unverified_bootstrap_extract_limit_from_env_value(None),
-            DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
-        );
-        assert_eq!(
-            unverified_bootstrap_extract_limit_from_env_value(Some("not-a-number")),
-            DEFAULT_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
-        );
-        assert_eq!(
-            unverified_bootstrap_extract_limit_from_env_value(Some("1")),
-            MIN_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
-        );
-        let over_max = (MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES + 1).to_string();
-        assert_eq!(
-            unverified_bootstrap_extract_limit_from_env_value(Some(over_max.as_str())),
-            MAX_MAX_UNVERIFIED_BOOTSTRAP_EXTRACT_BYTES
-        );
     }
 
     #[test]

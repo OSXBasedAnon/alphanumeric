@@ -11322,8 +11322,13 @@ impl Node {
             return Ok(());
         }
 
-        self.network_bloom.insert(&block.hash);
         self.blockchain.write().await.save_block(&block).await?;
+        // COMMIT after the save, exactly as the full-block arms do: verify runs
+        // `validate_block` (AllowTruncatedStored) while save_block opens with
+        // `prevalidate_unattached_block_strict` (RequireFull), so a block can clear the first and
+        // fail the second. Committing in between poisoned the hash on the `?` early return and
+        // the read-only dedup gate then dropped every later delivery of it.
+        self.network_bloom.insert(&block.hash);
         self.remember_compact_full_block(Arc::clone(&block), true);
         self.compact_pending.lock().remove(&block.hash);
         self.publish_discovery_state("Accepted compact block").await;
@@ -11949,9 +11954,13 @@ impl Node {
 
                 // Verify block before processing
                 if self.verify_block_parallel(&block).await? {
-                    Self::commit_validated_event_block(&self.network_bloom, &block_hash);
                     // Save block to blockchain
                     self.blockchain.write().await.save_block(&block).await?;
+                    // COMMIT only after the save succeeds, for the same reason as the TCP
+                    // `NetworkMessage::Block` arm: verify and persist do not apply the same
+                    // signature strictness, so committing between them poisons the hash on a
+                    // save failure and permanently suppresses re-delivery.
+                    Self::commit_validated_event_block(&self.network_bloom, &block_hash);
 
                     // Relay exactly once across ingress arms: if another arm (a concurrent TCP early
                     // relay) already claimed this block's relay slot, skip re-flooding it here. The
@@ -12563,11 +12572,23 @@ impl Node {
                     .verify_block_with_witness(&block_ref, Some(addr))
                     .await?
                 {
-                    self.network_bloom.insert(&block_hash);
                     // Save block to blockchain. Idempotent for an already-present block (the
                     // brief check-then-insert race is closed by save_block's state lock +
                     // same-hash short-circuit), so a duplicate delivery is a safe no-op.
                     self.blockchain.write().await.save_block(&block_ref).await?;
+                    // COMMIT the dedup hash only now — AFTER the block is durably stored, not
+                    // after verify alone. verify gates on `validate_block`
+                    // (SignatureValidationMode::AllowTruncatedStored) while save_block's first
+                    // act is `prevalidate_unattached_block_strict` (RequireFull, which rejects
+                    // any non-coinbase signature that decodes to <= 64 bytes), so a block can
+                    // pass verify and still fail the save. Committing before the save left that
+                    // hash poisoned on the `?` early return, and the read-only gate above then
+                    // dropped every later delivery of it — the exact suppression that gate's own
+                    // comment warns about. A transient save failure (sled IO, reconcile error)
+                    // did the same to a perfectly valid block. This widens the check-then-insert
+                    // window by the save duration, which costs at most a duplicate save_block
+                    // call — documented directly above as a safe no-op.
+                    self.network_bloom.insert(&block_hash);
                     self.remember_compact_full_block(Arc::clone(&block_ref), true);
                     self.publish_discovery_state("Accepted block").await;
 
@@ -17655,6 +17676,126 @@ mod tests {
             !Node::event_block_should_validate(&bloom, &hash),
             "only a successfully validated hash becomes a dedup hit"
         );
+    }
+
+    /// The ordering invariant itself, asserted structurally.
+    ///
+    /// The helper-level test below can only show that a commit which is never made leaves the
+    /// hash re-deliverable; it cannot show that the ingress arms actually order their calls that
+    /// way, and a behavioural test would need a full node, a peer and a chain. So the SOURCE FORM
+    /// is what gets asserted — the same approach as
+    /// `bpos_telemetry_cannot_reach_the_canonical_block_verdict` above.
+    ///
+    /// The count assertion is the important half: it fails when a FOURTH block-ingress site
+    /// appears, which is exactly how the compact-block path was missed the first time (a grep for
+    /// `insert(&block_hash)` does not match `insert(&block.hash)`).
+    #[test]
+    fn block_ingress_commits_the_dedup_bloom_only_after_the_save() {
+        // Production code only: this test's own literals would otherwise match.
+        let src = include_str!("node.rs");
+        let src = src.split("#[cfg(test)]").next().expect("production source");
+
+        // Byte offsets from `find` can land mid-UTF-8 (comments contain em dashes), so windows
+        // are clamped to char boundaries before slicing.
+        fn floor_boundary(s: &str, mut i: usize) -> usize {
+            while i > 0 && !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        }
+        fn ceil_boundary(s: &str, mut i: usize) -> usize {
+            while i < s.len() && !s.is_char_boundary(i) {
+                i += 1;
+            }
+            i
+        }
+        fn occurrences(hay: &str, needle: &str) -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(i) = hay[from..].find(needle) {
+                out.push(from + i);
+                from += i + needle.len();
+            }
+            out
+        }
+
+        let commits = [
+            "self.network_bloom.insert(&block.hash);", // compact-block path
+            "Self::commit_validated_event_block(&self.network_bloom, &block_hash);", // NewBlock
+            "self.network_bloom.insert(&block_hash);", // TCP NetworkMessage::Block arm
+        ];
+
+        let mut checked = 0;
+        for needle in commits {
+            for at in occurrences(src, needle) {
+                // publish_block commits OUR OWN, already-persisted block (`let _ = ...`); there is
+                // no save for it to follow, and re-receiving it should dedup.
+                let pre = floor_boundary(src, at.saturating_sub(8));
+                if src[pre..at].contains("let _ = ") {
+                    continue;
+                }
+                let lo = floor_boundary(src, at.saturating_sub(2_000));
+                assert!(
+                    src[lo..at].contains("save_block("),
+                    "block-ingress commit `{needle}` must come AFTER save_block, so a block that \
+                     passes verify (AllowTruncatedStored) but fails the save (RequireFull) cannot \
+                     poison the dedup bloom and suppress every later delivery of that hash"
+                );
+                let after = at + needle.len();
+                let hi = ceil_boundary(src, (after + 400).min(src.len()));
+                assert!(
+                    !src[ceil_boundary(src, after)..hi].contains("save_block("),
+                    "save_block must not FOLLOW the commit `{needle}` — that is the ordering this \
+                     test exists to forbid"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 3,
+            "expected exactly 3 block-ingress dedup commits (TCP Block arm, NewBlock event arm, \
+             compact-block path); a new one must order its save before its commit"
+        );
+    }
+
+    // All THREE block-ingress arms — the TCP `NetworkMessage::Block` arm, the
+    // `NetworkEvent::NewBlock` arm, and the compact-block path — commit the dedup hash only
+    // AFTER save_block returns Ok, never between verify and save. The two gates do not agree on
+    // signature strictness (verify runs `validate_block`/AllowTruncatedStored, save_block opens
+    // with `prevalidate_unattached_block_strict`/RequireFull), so a block can pass the first and
+    // fail the second. Committing in between poisoned the hash on the `?` early return, and the
+    // read-only gate then dropped every later delivery of it — including the honest block, whose
+    // truncated twin is hash-identical. A transient save failure did the same.
+    //
+    // Not suppressing on a deterministic save failure is FORCED, not a trade: the twin shares the
+    // honest block's hash, so any suppression keyed on that hash re-creates the bug. The cost is
+    // that such a block is re-examined on every delivery; that is bounded by verify's negative
+    // cache, by prevalidate's cheap length check failing before any heavy work, and by the
+    // per-peer failure accounting.
+    //
+    // This test exercises the helper pair the event arm uses; the ordering itself is enforced by
+    // the call sites, which is why the sequence below mirrors them literally.
+    #[test]
+    fn event_block_bloom_is_not_poisoned_by_a_failed_persist() {
+        let bloom = NetworkBloom::new(4_096, 0.01);
+        let hash = [0xa7u8; 32];
+
+        // Delivery 1: verify passes, persist fails.
+        assert!(Node::event_block_should_validate(&bloom, &hash));
+        let persisted: Result<(), ()> = Err(());
+        if persisted.is_ok() {
+            Node::commit_validated_event_block(&bloom, &hash);
+        }
+
+        // Delivery 2 of the SAME hash must still be eligible: nothing was committed.
+        assert!(
+            Node::event_block_should_validate(&bloom, &hash),
+            "a failed persist must leave the hash re-deliverable, not suppressed"
+        );
+
+        // Delivery 2 persists; only now is the hash a dedup hit.
+        Node::commit_validated_event_block(&bloom, &hash);
+        assert!(!Node::event_block_should_validate(&bloom, &hash));
     }
 
     #[test]

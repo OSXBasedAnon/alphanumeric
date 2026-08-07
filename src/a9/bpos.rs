@@ -834,6 +834,39 @@ impl BPoSSentinel {
         Ok(all_versions)
     }
 
+    /// Height window to broadcast this tick: the new blocks since `last_height`, capped to the
+    /// most RECENT `max` of them. `None` when there is nothing new.
+    ///
+    /// Two things this gets right that the previous inline arithmetic did not.
+    /// 1. The cursor advances to exactly the window that was SENT. It used to clamp the range to
+    ///    `last_height + 100` and then set the cursor to `current_height`, so everything past the
+    ///    clamp was skipped for good instead of being picked up on the next tick.
+    /// 2. When far behind, the window is the NEWEST `max`, not the oldest. The cursor starts at 0,
+    ///    so against a live chain the first tick used to select heights 1..=100 — ancient headers
+    ///    whose parent link the receiver cannot resolve (`verify_headers_batch` drops a header
+    ///    whose `prev_hash` is in neither the chunk nor the peer's store, and genesis' parent is
+    ///    in neither), making the whole batch a no-op. Simply advancing the cursor to the clamp
+    ///    would instead crawl the entire chain 100 blocks per 10s tick — ~14h from genesis at
+    ///    today's height — spraying stale headers the whole way. This is a beacon of the tip, so
+    ///    the tip is what it broadcasts.
+    fn header_broadcast_window(
+        last_height: u32,
+        current_height: u32,
+        max: u32,
+    ) -> Option<(u32, u32)> {
+        if current_height <= last_height || max == 0 {
+            return None;
+        }
+        let to = current_height;
+        // Never reach below height 1 (genesis is pinned, not broadcast) and never re-send what the
+        // cursor already covered.
+        let from = to
+            .saturating_sub(max.saturating_sub(1))
+            .max(last_height.saturating_add(1))
+            .max(1);
+        Some((from, to))
+    }
+
     fn start_header_verification(&self) {
         let sentinel = Arc::clone(&self.header_sentinel);
         let blockchain = Arc::clone(&self.blockchain);
@@ -863,10 +896,14 @@ impl BPoSSentinel {
                 // cycle just to take 100 headers (O(chain) RAM + CPU, growing
                 // forever), the same unbounded-materialization class as the whisper
                 // scan fix.
+                let Some((from, to)) =
+                    Self::header_broadcast_window(last_height, current_height, 100)
+                else {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                };
                 let headers = {
                     let chain = blockchain.read().await;
-                    let from = last_height.saturating_add(1);
-                    let to = current_height.min(last_height.saturating_add(100));
                     let mut out = Vec::with_capacity((to.saturating_sub(from) + 1) as usize);
                     for i in from..=to {
                         if let Ok(block) = chain.get_block(i) {
@@ -901,7 +938,8 @@ impl BPoSSentinel {
                     }
                 }
 
-                last_height = current_height;
+                // Advance to what was actually SENT, not to the chain tip.
+                last_height = to;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -2845,6 +2883,56 @@ impl From<BlockchainError> for String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // The cursor must advance to exactly what was sent — never past it — so nothing inside the
+    // cap is dropped. Beyond the cap the window DELIBERATELY jumps to the newest `max` rather
+    // than crawling forward from genesis; that skip is the intended behaviour for a tip beacon,
+    // and is asserted explicitly below.
+    #[test]
+    fn header_broadcast_window_tracks_the_tip_and_advances_only_past_what_it_sent() {
+        type S = BPoSSentinel;
+
+        // Nothing new -> no broadcast.
+        assert_eq!(S::header_broadcast_window(100, 100, 100), None);
+        assert_eq!(S::header_broadcast_window(100, 99, 100), None);
+
+        // Steady state: one new block -> exactly that block.
+        assert_eq!(S::header_broadcast_window(100, 101, 100), Some((101, 101)));
+
+        // Within the cap: every new block, nothing skipped.
+        assert_eq!(S::header_broadcast_window(100, 150, 100), Some((101, 150)));
+
+        // First tick against a live chain: the cursor starts at 0, and the window is the newest
+        // 100 — NOT heights 1..=100, whose parent links no peer can resolve.
+        assert_eq!(
+            S::header_broadcast_window(0, 520_000, 100),
+            Some((519_901, 520_000))
+        );
+
+        // Far behind after a catch-up: still the newest 100, and the cursor lands on the tip so
+        // the next tick resumes from there instead of crawling.
+        let (from, to) = S::header_broadcast_window(1_000, 11_000, 100).unwrap();
+        assert_eq!((from, to), (10_901, 11_000));
+        assert_eq!(
+            S::header_broadcast_window(to, 11_000, 100),
+            None,
+            "advancing the cursor to `to` leaves nothing pending"
+        );
+
+        // The window never reaches below height 1 (genesis is pinned, not broadcast).
+        assert_eq!(S::header_broadcast_window(0, 5, 100), Some((1, 5)));
+        assert_eq!(S::header_broadcast_window(0, 1, 100), Some((1, 1)));
+
+        // Contiguity across ticks: chaining the windows covers every height with no gap.
+        let mut cursor = 0u32;
+        let mut covered = Vec::new();
+        for tip in [10u32, 20, 30] {
+            let (f, t) = S::header_broadcast_window(cursor, tip, 100).unwrap();
+            covered.extend(f..=t);
+            cursor = t;
+        }
+        assert_eq!(covered, (1..=30).collect::<Vec<_>>());
+    }
 
     fn aged_verification(timestamp: u64) -> VerificationState {
         VerificationState {
