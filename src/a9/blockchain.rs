@@ -2419,16 +2419,36 @@ impl Blockchain {
     }
 
     /// One-time seed: if no checkpoint has ever been recorded, trust the chain we
-    /// already hold as of this upgrade (its tip). Blocks already in the DB were
-    /// accepted under the prior rules and are never re-verified; only blocks that
-    /// arrive ABOVE this height must prove themselves. Idempotent.
+    /// already hold as of this upgrade, TRAILING the tip by the reorg margin exactly
+    /// as `advance_checkpoint_behind` does. Blocks below the seed were accepted under
+    /// the prior rules and are never re-verified; only blocks above it must prove
+    /// themselves. Idempotent.
+    ///
+    /// The margin is not optional here. Seeding at the bare tip closed the window in
+    /// which our own most recent blocks can still be reorged, which is the exact
+    /// property `verification_floor_never_outruns_the_applied_tip` exists to protect:
+    /// "finality must trail an applied tip by exactly the reorg margin". A node that
+    /// happened to hold a losing same-height fork when it first seeded would pin that
+    /// fork as final and then reject the heavier branch replacing it outright
+    /// (`adopt_branch_if_valid` drops any branch whose base is `<= checkpoint`),
+    /// wedging itself off the canonical chain. Recovery existed — the runtime
+    /// divergence detector eventually forces a re-bootstrap — but it costs a wedge
+    /// and a full snapshot re-download to undo something a one-block race at restart
+    /// was enough to cause.
+    ///
+    /// Seeding LOWER is the conservative direction on both axes it touches: the node
+    /// becomes more willing to follow the heavier chain (convergent), and reports
+    /// fewer transactions as `final` until it catches up (an integrator waits longer,
+    /// never less). Nothing here is consensus: the checkpoint gates reorg depth and
+    /// the reported `final` flag, and appears nowhere in block validation.
     pub fn seed_trusted_checkpoint_if_unset(&self) -> Result<(), BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
         if meta_tree.get(TRUSTED_CHECKPOINT_KEY)?.is_some() {
             return Ok(());
         }
         let tip = self.get_latest_block_index() as u32;
-        meta_tree.insert(TRUSTED_CHECKPOINT_KEY, codec::serialize(&tip)?)?;
+        let seed = tip.saturating_sub(CHECKPOINT_REORG_MARGIN);
+        meta_tree.insert(TRUSTED_CHECKPOINT_KEY, codec::serialize(&seed)?)?;
         meta_tree.flush()?;
         Ok(())
     }
@@ -10626,6 +10646,50 @@ mod tests {
         // Seeding is a no-op once any checkpoint exists.
         bc.seed_trusted_checkpoint_if_unset().unwrap();
         assert_eq!(bc.trusted_checkpoint_height(), 105);
+    }
+
+    // The FIRST seed obeys the same invariant every later advance does: trail the
+    // applied tip by the reorg margin. Seeding at the bare tip used to close the
+    // reorg window on our own most recent blocks, so a node that restarted while
+    // holding a losing same-height fork pinned that fork as final and then rejected
+    // the heavier branch replacing it (adopt_branch_if_valid drops a branch whose
+    // base is <= checkpoint). A one-block race at restart was enough to trigger it.
+    #[test]
+    fn seeding_trails_the_tip_by_the_reorg_margin() {
+        let bc = test_blockchain();
+        let tip = 1_000u32;
+        seed_tip_at(&bc, tip);
+
+        bc.seed_trusted_checkpoint_if_unset().unwrap();
+        assert_eq!(
+            bc.trusted_checkpoint_height(),
+            tip - CHECKPOINT_REORG_MARGIN,
+            "the first seed must trail the applied tip by exactly the reorg margin"
+        );
+
+        // The window that the bug closed: a branch replacing any of our most recent
+        // blocks must remain adoptable, i.e. its base must sit ABOVE the checkpoint.
+        let contested_base = tip; // a same-height fork at our own tip
+        assert!(
+            contested_base > bc.trusted_checkpoint_height(),
+            "a same-height fork at our tip must stay reorgable after seeding"
+        );
+
+        // Still idempotent.
+        bc.seed_trusted_checkpoint_if_unset().unwrap();
+        assert_eq!(
+            bc.trusted_checkpoint_height(),
+            tip - CHECKPOINT_REORG_MARGIN
+        );
+    }
+
+    // A chain shorter than the margin must not underflow to a bogus height.
+    #[test]
+    fn seeding_saturates_on_a_chain_shorter_than_the_margin() {
+        let bc = test_blockchain();
+        seed_tip_at(&bc, 10);
+        bc.seed_trusted_checkpoint_if_unset().unwrap();
+        assert_eq!(bc.trusted_checkpoint_height(), 0);
     }
 
     #[test]
