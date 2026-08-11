@@ -8511,13 +8511,18 @@ mod tests {
     fn reconcile_behind_within_stream_window_streams() {
         let db = reconcile_test_db("behind_small", &[(100, 7)]);
         let m = manifest_at(150, 9); // no local block at 150
+
+        // Boot passes the tip it already scanned. Keep this policy-boundary test
+        // independent of a second best-effort sled reopen; other reconcile tests
+        // exercise the fallback scan with no tip hint.
+        let local_tip = Some(100);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(150), None, None),
+            canonical_reconcile_decision(&db, &m, Some(150), None, local_tip),
             CanonicalReconcile::InSyncOrUnknown
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, None),
+            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, local_tip),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
