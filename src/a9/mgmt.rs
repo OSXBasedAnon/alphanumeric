@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
 use sled::Db;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::Write;
 use std::sync::Arc;
@@ -443,6 +443,73 @@ impl WalletKeyData {
     }
 }
 
+/// A wallet name is the durable identity the CLI uses to select a private key. Two records with
+/// the same name cannot be represented faithfully in the in-memory `HashMap`: the later insert
+/// shadows the earlier key. Validate the file BEFORE decryption/loading and BEFORE every write so
+/// an ambiguous file is never silently accepted or made worse.
+fn validate_unique_wallet_names(wallets: &[WalletKeyData]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(wallets.len());
+    let mut duplicates = Vec::new();
+
+    for wallet in wallets {
+        if !seen.insert(wallet.wallet_name.as_str()) {
+            duplicates.push(wallet.wallet_name.as_str());
+        }
+    }
+
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+
+    duplicates.sort_unstable();
+    duplicates.dedup();
+    Err(format!(
+        "{} contains duplicate wallet name(s) {:?}. Refusing to load or modify an ambiguous wallet file; restore a backup or repair the duplicate records before retrying.",
+        KEY_FILE_PATH, duplicates
+    )
+    .into())
+}
+
+/// Resolve an explicit or automatic wallet name against BOTH views of wallet state. `loaded_names`
+/// contains only keys that decrypted successfully; `durable_wallets` also contains encrypted or
+/// otherwise unloadable records. Checking only the former allowed `new X` to append a second `X`
+/// while the original encrypted wallet was skipped for lack of a passphrase.
+fn select_new_wallet_name(
+    requested: Option<String>,
+    loaded_names: &HashSet<&str>,
+    durable_wallets: &[WalletKeyData],
+) -> Result<String> {
+    let name_is_taken = |name: &str| {
+        loaded_names.contains(name)
+            || durable_wallets
+                .iter()
+                .any(|wallet| wallet.wallet_name == name)
+    };
+
+    if let Some(name) = requested {
+        if name_is_taken(&name) {
+            return Err("Duplicate wallet name".into());
+        }
+        return Ok(name);
+    }
+
+    // Preserve the existing numbering convention (loaded count + 1), but advance past names held
+    // only on disk instead of failing or colliding with them.
+    let mut index = loaded_names
+        .len()
+        .checked_add(1)
+        .ok_or("Unable to allocate an automatic wallet name")?;
+    loop {
+        let candidate = format!("wallet_{}", index);
+        if !name_is_taken(&candidate) {
+            return Ok(candidate);
+        }
+        index = index
+            .checked_add(1)
+            .ok_or("Unable to allocate an automatic wallet name")?;
+    }
+}
+
 pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
 }
@@ -529,6 +596,10 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
 /// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
 /// on this class; this closes the corresponding write side.
 async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
+    // Last-line invariant at the durable boundary: even if a future wallet-mutation path forgets
+    // its own preflight check, it cannot persist a file in which one name aliases multiple keys.
+    validate_unique_wallet_names(key_data_vec)?;
+
     // The serialized buffer contains every wallet's key material in the clear for
     // passphrase-less wallets, so it is wiped on drop rather than left in a freed
     // allocation. Zeroizing<String> derefs to str, so the write path is unchanged.
@@ -582,17 +653,24 @@ impl Mgmt {
         // Read the key file - we know it exists because create_default_wallet must have run
         let existing_data = fs::read_to_string(KEY_FILE_PATH).await?;
         let existing_keys = serde_json::from_str::<Vec<WalletKeyData>>(&existing_data)?;
+        validate_unique_wallet_names(&existing_keys)?;
 
         let is_encrypted = passphrase.map(|p| !p.is_empty()).unwrap_or(false);
 
-        // Generate name for the new wallet
-        let name = wallet_name.unwrap_or_else(|| format!("wallet_{}", wallets.len() + 1));
-        if wallets.contains_key(&name) {
-            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-            writeln!(stdout, "\nError: Wallet with this name already exists")?;
-            stdout.reset()?;
-            return Err("Duplicate wallet name".into());
-        }
+        // Resolve against the durable file, not only the successfully decrypted in-memory subset.
+        // Keep the borrowed name set scoped here so it cannot overlap the later mutable insert.
+        let name = {
+            let loaded_names: HashSet<&str> = wallets.keys().map(String::as_str).collect();
+            match select_new_wallet_name(wallet_name, &loaded_names, &existing_keys) {
+                Ok(name) => name,
+                Err(error) => {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                    writeln!(stdout, "\nError: {}", error)?;
+                    stdout.reset()?;
+                    return Err(error);
+                }
+            }
+        };
 
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
         writeln!(stdout, "\nInitializing wallet creation process...")?;
@@ -874,6 +952,9 @@ impl Mgmt {
         match fs::read_to_string(KEY_FILE_PATH).await {
             Ok(key_data) => {
                 let wallet_key_data: Vec<WalletKeyData> = serde_json::from_str(&key_data)?;
+                // Validate before attempting any decryption. Otherwise two loadable records with the
+                // same name are inserted sequentially and the latter silently hides the former.
+                validate_unique_wallet_names(&wallet_key_data)?;
                 let mut stdout = StandardStream::stdout(ColorChoice::Auto);
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true))?;
                 writeln!(stdout, "\nFound {} wallets to load", wallet_key_data.len())?;
@@ -899,6 +980,15 @@ impl Mgmt {
                             wallet_data.is_encrypted,
                         ) {
                             Ok(wallet) => {
+                                // Defensive fail-closed guard at the representation boundary. The
+                                // durable preflight above makes this unreachable for a valid file.
+                                if wallets.contains_key(&wallet_name) {
+                                    return Err(format!(
+                                        "Duplicate wallet name {:?} encountered while loading {}",
+                                        wallet_name, KEY_FILE_PATH
+                                    )
+                                    .into());
+                                }
                                 wallets.insert(wallet_name.clone(), wallet);
                             }
                             Err(e) => {
@@ -966,11 +1056,12 @@ impl Mgmt {
                 )))
             }
         };
+        // Do not mutate a pre-existing ambiguous file. `old_name` cannot identify which duplicate
+        // key the operator intended to rename, so automatic repair here would risk renaming the
+        // wrong wallet.
+        validate_unique_wallet_names(&wallet_key_data)?;
 
-        if wallet_key_data
-            .iter()
-            .any(|w| w.wallet_name == new_name && w.wallet_name != old_name)
-        {
+        if wallet_key_data.iter().any(|w| w.wallet_name == new_name) {
             return Err("Duplicate wallet name".into());
         }
 
@@ -2954,6 +3045,70 @@ mod tests {
     const FROZEN_PLAINTEXT_WALLET_JSON: &str = r#"[{"wallet_name":"plaintext-fixture","wallet_address":"2222222222222222222222222222222222222222","private_key":[254,253,252],"last_sync_timestamp":1700000001,"is_encrypted":false,"key_verification_hash":[7,7]}]"#;
     const FROZEN_NO_KEY_WALLET_JSON: &str = r#"[{"wallet_name":"keyless-fixture","wallet_address":"3333333333333333333333333333333333333333","private_key":null,"last_sync_timestamp":1700000002,"is_encrypted":false,"key_verification_hash":[]}]"#;
 
+    fn wallet_key_record(name: &str, is_encrypted: bool) -> WalletKeyData {
+        WalletKeyData::new(
+            name.to_string(),
+            "1".repeat(40),
+            Some(Zeroizing::new(vec![1, 2, 3, 4])),
+            is_encrypted,
+        )
+    }
+
+    #[test]
+    fn wallet_name_preflight_rejects_ambiguous_durable_records() {
+        let records = vec![
+            wallet_key_record("vault", true),
+            wallet_key_record("ordinary", false),
+            wallet_key_record("vault", false),
+        ];
+
+        let error = validate_unique_wallet_names(&records)
+            .expect_err("two durable records must never share one CLI wallet name")
+            .to_string();
+        assert!(error.contains("duplicate wallet name"));
+        assert!(error.contains("vault"));
+        assert!(error.contains("Refusing to load or modify"));
+    }
+
+    #[test]
+    fn explicit_new_wallet_name_checks_records_skipped_from_memory() {
+        // This is the original failure shape: `cold_vault` is encrypted on disk but absent from the
+        // loaded-name set because the process started without its passphrase.
+        let records = vec![
+            wallet_key_record("default_wallet", false),
+            wallet_key_record("cold_vault", true),
+        ];
+        let loaded_names: HashSet<&str> = HashSet::from(["default_wallet"]);
+
+        let error = select_new_wallet_name(Some("cold_vault".to_string()), &loaded_names, &records)
+            .expect_err("an encrypted disk-only wallet still owns its name")
+            .to_string();
+        assert_eq!(error, "Duplicate wallet name");
+
+        assert_eq!(
+            select_new_wallet_name(Some("new_vault".to_string()), &loaded_names, &records)
+                .expect("an unused explicit name remains valid"),
+            "new_vault"
+        );
+    }
+
+    #[test]
+    fn automatic_wallet_name_advances_past_disk_only_collision() {
+        // One loaded wallet preserves the historical starting candidate `wallet_2`; a skipped
+        // durable `wallet_2` must make selection advance, not fail or append a duplicate.
+        let records = vec![
+            wallet_key_record("default_wallet", false),
+            wallet_key_record("wallet_2", true),
+        ];
+        let loaded_names: HashSet<&str> = HashSet::from(["default_wallet"]);
+
+        assert_eq!(
+            select_new_wallet_name(None, &loaded_names, &records)
+                .expect("automatic naming should find the next durable-free name"),
+            "wallet_3"
+        );
+    }
+
     /// Serializing a `WalletKeyData` must reproduce the frozen bytes EXACTLY --
     /// field names, field order, and the JSON representation of the key bytes.
     /// `Zeroizing<Vec<u8>>` must serialize as a bare array, not as a wrapper
@@ -3384,5 +3539,39 @@ mod tests {
         );
         assert!(ok_path.exists());
         let _ = std::fs::remove_file(&ok_path);
+    }
+
+    #[tokio::test]
+    async fn persistence_rejects_duplicate_names_without_touching_the_existing_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "a9-persist-duplicate-{}-{}.key",
+            std::process::id(),
+            unique
+        ));
+        std::fs::write(&path, b"existing-wallet-file").expect("seed protected target");
+
+        let duplicate_records = vec![
+            wallet_key_record("same-name", false),
+            wallet_key_record("same-name", true),
+        ];
+        let error = persist_wallet_keys(
+            path.to_str().expect("temp path is valid utf-8"),
+            &duplicate_records,
+        )
+        .await
+        .expect_err("the durable write boundary must reject aliases")
+        .to_string();
+
+        assert!(error.contains("duplicate wallet name"));
+        assert_eq!(
+            std::fs::read(&path).expect("existing target remains readable"),
+            b"existing-wallet-file",
+            "validation must happen before the temporary file or target is written"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
