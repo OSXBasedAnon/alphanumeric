@@ -57,9 +57,13 @@ use tokio::sync::RwLock;
 
 use crate::a9::blockchain::Blockchain;
 
-/// Command template. Unset (or blank) means the hook never runs and this module
-/// costs nothing — the task is not even spawned.
+/// Legacy whitespace-delimited command template. Its parsing contract is kept
+/// unchanged for existing operators.
 const ENV_VAR: &str = "ALPHANUMERIC_BLOCKNOTIFY";
+
+/// Structured argv form for paths or individual arguments containing spaces.
+/// When set, this takes precedence over ENV_VAR and must be a JSON string array.
+const ARGV_ENV_VAR: &str = "ALPHANUMERIC_BLOCKNOTIFY_ARGV";
 
 /// A hook still running after this is broken, not slow: the whole point is to
 /// beat a 5s block interval. Killed rather than left to accumulate.
@@ -98,7 +102,7 @@ fn expand(arg: &str, hash_hex: &str, height: u32) -> String {
     out
 }
 
-/// Split the template into program + arguments on whitespace.
+/// Split the legacy template into program + arguments on whitespace.
 ///
 /// Executed directly, never through a shell. That removes command injection as a
 /// category rather than arguing it is unreachable, and it means a hook cannot be
@@ -111,15 +115,60 @@ fn parse_template(raw: &str) -> Option<(String, Vec<String>)> {
     Some((program, parts.map(str::to_string).collect()))
 }
 
-/// Start the notifier if `ALPHANUMERIC_BLOCKNOTIFY` is set. Returns immediately;
-/// the work happens on a detached task.
-pub fn spawn(blockchain: Arc<RwLock<Blockchain>>) {
+/// Parse the structured argv form without involving a shell. JSON gives paths
+/// and individual arguments unambiguous boundaries on every supported platform.
+fn parse_structured_argv(raw: &str) -> Result<(String, Vec<String>), String> {
+    let argv: Vec<String> = serde_json::from_str(raw)
+        .map_err(|error| format!("must be a JSON array of strings: {error}"))?;
+    let mut argv = argv.into_iter();
+    let program = argv
+        .next()
+        .ok_or_else(|| "must contain an executable as its first element".to_string())?;
+    if program.trim().is_empty() {
+        return Err("executable must not be blank".to_string());
+    }
+    Ok((program, argv.collect()))
+}
+
+/// Resolve configuration once at startup. The structured form is deliberately
+/// a separate variable: existing whitespace templates retain byte-for-byte
+/// parsing semantics, while an invalid structured value fails closed instead of
+/// accidentally executing a fragment as a program name.
+fn configured_command() -> Option<(String, Vec<String>)> {
+    match std::env::var(ARGV_ENV_VAR) {
+        Ok(raw) => {
+            return match parse_structured_argv(&raw) {
+                Ok(command) => Some(command),
+                Err(error) => {
+                    warn!("{ARGV_ENV_VAR} {error}; block notifications are disabled");
+                    None
+                }
+            };
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!("{ARGV_ENV_VAR} is not valid Unicode; block notifications are disabled");
+            return None;
+        }
+    }
+
     let raw = match std::env::var(ENV_VAR) {
-        Ok(v) => v,
-        Err(_) => return,
+        Ok(value) => value,
+        Err(_) => return None,
     };
-    let Some((program, args)) = parse_template(&raw) else {
-        warn!("{ENV_VAR} is set but blank; block notifications are disabled");
+    match parse_template(&raw) {
+        Some(command) => Some(command),
+        None => {
+            warn!("{ENV_VAR} is set but blank; block notifications are disabled");
+            None
+        }
+    }
+}
+
+/// Start the notifier if either block-notification variable is set. Returns
+/// immediately; the work happens on a detached task.
+pub fn spawn(blockchain: Arc<RwLock<Blockchain>>) {
+    let Some((program, args)) = configured_command() else {
         return;
     };
 
@@ -274,6 +323,23 @@ mod tests {
         assert!(parse_template("   ").is_none());
     }
 
+    #[test]
+    fn parses_structured_argv_without_losing_spaces() {
+        let raw = r#"["C:\\Program Files\\Pool\\notify.exe","%s","height %h",""]"#;
+        let (program, args) = parse_structured_argv(raw).unwrap();
+        assert_eq!(program, r"C:\Program Files\Pool\notify.exe");
+        assert_eq!(args, vec!["%s", "height %h", ""]);
+    }
+
+    #[test]
+    fn rejects_invalid_structured_argv() {
+        assert!(parse_structured_argv("").is_err());
+        assert!(parse_structured_argv("[]").is_err());
+        assert!(parse_structured_argv(r#"["", "%s"]"#).is_err());
+        assert!(parse_structured_argv(r#"["/bin/hook", 7]"#).is_err());
+        assert!(parse_structured_argv(r#"{"program":"/bin/hook"}"#).is_err());
+    }
+
     // ---- process handling: the half with the real hazards --------------------
 
     #[tokio::test]
@@ -306,6 +372,45 @@ mod tests {
             written.trim(),
             format!("{hash} 4321"),
             "hook did not receive the expanded argv"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_argv_executes_paths_and_arguments_with_spaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "a9 blocknotify argv {} {unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program_path = dir.join("notify hook.sh");
+        let output_path = dir.join("received argument.txt");
+        std::fs::write(&program_path, "#!/bin/sh\nprintf '%s' \"$1\" > \"$2\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&program_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program_path, permissions).unwrap();
+
+        let raw = serde_json::to_string(&vec![
+            program_path.to_string_lossy().into_owned(),
+            "argument containing spaces".to_string(),
+            output_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (program, args) = parse_structured_argv(&raw).unwrap();
+        assert_eq!(
+            fire(&program, &args, "aa", 1, HOOK_TIMEOUT).await,
+            Fired::Ok
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "argument containing spaces"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -375,5 +480,9 @@ mod tests {
         let (p, a) = parse_template("/bin/hook ; rm -rf / %s").unwrap();
         assert_eq!(p, "/bin/hook");
         assert_eq!(a, vec![";", "rm", "-rf", "/", "%s"]);
+
+        let (p, a) = parse_structured_argv(r#"["/bin/hook", ";", "rm -rf /", "%s"]"#).unwrap();
+        assert_eq!(p, "/bin/hook");
+        assert_eq!(a, vec![";", "rm -rf /", "%s"]);
     }
 }
