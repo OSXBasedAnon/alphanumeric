@@ -269,7 +269,10 @@ Common variables used by the runtime include:
   block explorer talks to. See [`EXPLORER_API.md`](EXPLORER_API.md))
 - `ALPHANUMERIC_BLOCKNOTIFY` (runs a command on every new chain tip, following Bitcoin
   Core's `-blocknotify` contract: `%s` is the block hash, `%h` the height. Useful for pools
-  and deposit scanners that would otherwise poll)
+  and deposit scanners that would otherwise poll; legacy whitespace-delimited syntax)
+- `ALPHANUMERIC_BLOCKNOTIFY_ARGV` (preferred when a program path or argument contains
+  spaces: a JSON string array such as `["C:\\Program Files\\Pool\\notify.exe","%s","%h"]`;
+  takes precedence over `ALPHANUMERIC_BLOCKNOTIFY` and is executed directly without a shell)
 - `ALPHANUMERIC_HEADLESS` (`true` runs node services without the interactive command loop)
 - `ALPHANUMERIC_FORCE_BOOTSTRAP`
 - `ALPHANUMERIC_IGNORE_DB_LOCK`
