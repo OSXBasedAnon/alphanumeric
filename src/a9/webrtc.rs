@@ -14,6 +14,7 @@
 #![cfg(feature = "webrtc_mesh")]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -173,6 +174,8 @@ pub fn mesh_channel_init() -> RTCDataChannelInit {
 /// all candidates bundled in (non-trickle). This keeps signaling to a single offer + single answer
 /// exchange over the mailbox — no per-candidate round-trips — which is what keeps the free-tier
 /// Redis budget flat.
+const MESH_ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn set_local_and_gather(
     pc: &Arc<RTCPeerConnection>,
     desc: RTCSessionDescription,
@@ -182,7 +185,7 @@ pub async fn set_local_and_gather(
     // Bound the wait so a peer whose STUN gathering never completes can't hang the handshake
     // indefinitely. On elapse proceed best-effort: local_description() still returns whatever
     // candidates were gathered so far, preserving the non-trickle single-exchange model.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), gather_complete.recv()).await;
+    let _ = tokio::time::timeout(MESH_ICE_GATHER_TIMEOUT, gather_complete.recv()).await;
     pc.local_description()
         .await
         .ok_or_else(|| "no local description after gathering".into())
@@ -255,6 +258,22 @@ pub trait SignalTransport: Send + Sync {
 
 /// Concrete HTTP transport: signs with a ring Ed25519 key and POSTs to a gateway base URL. Used by
 /// the integration tests; the node provides its own impl reusing sign_with_handshake_key.
+#[derive(Clone, Copy)]
+struct SignalHttpTimeouts {
+    connect: Duration,
+    read: Duration,
+    request: Duration,
+}
+
+// Signaling responses are small and bounded, and a half-open mesh handshake is reaped after 45s.
+// Keep every HTTP phase comfortably inside that lifecycle so a gateway/proxy that accepts a
+// connection but stops making progress cannot pin either the poller or topology dialer forever.
+const SIGNAL_HTTP_TIMEOUTS: SignalHttpTimeouts = SignalHttpTimeouts {
+    connect: Duration::from_secs(5),
+    read: Duration::from_secs(10),
+    request: Duration::from_secs(15),
+};
+
 pub struct HttpSignalTransport {
     pub node_id: String,
     /// Ed25519 PKCS#8 mesh identity. Zeroized on drop: this key authenticates
@@ -267,13 +286,27 @@ pub struct HttpSignalTransport {
 
 impl HttpSignalTransport {
     pub fn new(key_pkcs8: Zeroizing<Vec<u8>>, gateway_base: String) -> Result<Self, String> {
+        Self::new_with_timeouts(key_pkcs8, gateway_base, SIGNAL_HTTP_TIMEOUTS)
+    }
+
+    fn new_with_timeouts(
+        key_pkcs8: Zeroizing<Vec<u8>>,
+        gateway_base: String,
+        timeouts: SignalHttpTimeouts,
+    ) -> Result<Self, String> {
         use ring::signature::{Ed25519KeyPair, KeyPair};
         let kp = Ed25519KeyPair::from_pkcs8(&key_pkcs8).map_err(|e| e.to_string())?;
         let node_id = hex::encode(kp.public_key().as_ref());
+        let http = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read)
+            .timeout(timeouts.request)
+            .build()
+            .map_err(|e| format!("signaling HTTP client: {e}"))?;
         Ok(Self {
             node_id,
             key_pkcs8,
-            http: reqwest::Client::new(),
+            http,
             gateway_base,
         })
     }
@@ -355,7 +388,6 @@ impl SignalTransport for HttpSignalTransport {
 
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use webrtc::data_channel::data_channel_message::DataChannelMessage as DcMessage;
 use webrtc::data_channel::RTCDataChannel;
@@ -1192,6 +1224,191 @@ mod tests {
                 .as_ref()
                 .to_vec(),
         )
+    }
+
+    enum StubResponse {
+        StallBeforeHeaders,
+        StallDuringBody,
+        Complete(&'static str),
+    }
+
+    /// One-request HTTP/1.1 stub for proving client deadlines without touching the live gateway.
+    /// The two stall modes deliberately keep the socket open, so only the client's own configured
+    /// timeout can finish the request; each test also has a wider Tokio deadline as a hang guard.
+    async fn spawn_signal_http_stub(
+        response: StubResponse,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind signaling HTTP stub");
+        let address = listener.local_addr().expect("stub local address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept signaling request");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("read signaling request");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                assert!(
+                    request.len() <= 128 * 1024,
+                    "stub request headers are bounded"
+                );
+            }
+
+            match response {
+                StubResponse::StallBeforeHeaders => std::future::pending::<()>().await,
+                StubResponse::StallDuringBody => {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\nconnection: keep-alive\r\n\r\n{",
+                        )
+                        .await
+                        .expect("write partial signaling response");
+                    stream.flush().await.expect("flush partial response");
+                    std::future::pending::<()>().await;
+                }
+                StubResponse::Complete(body) => {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(reply.as_bytes())
+                        .await
+                        .expect("write complete signaling response");
+                }
+            }
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn test_http_transport(
+        gateway_base: String,
+        timeouts: SignalHttpTimeouts,
+    ) -> HttpSignalTransport {
+        ensure_crypto_provider();
+        HttpSignalTransport::new_with_timeouts(gen_key(), gateway_base, timeouts)
+            .expect("build signaling transport")
+    }
+
+    async fn stop_signal_http_stub(task: tokio::task::JoinHandle<()>) {
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn signaling_http_deadlines_fit_inside_handshake_reaping() {
+        assert!(SIGNAL_HTTP_TIMEOUTS.connect < SIGNAL_HTTP_TIMEOUTS.read);
+        assert!(SIGNAL_HTTP_TIMEOUTS.read < SIGNAL_HTTP_TIMEOUTS.request);
+        assert!(
+            MESH_ICE_GATHER_TIMEOUT + SIGNAL_HTTP_TIMEOUTS.request
+                < Duration::from_secs(MESH_STALE_SECS)
+        );
+    }
+
+    #[tokio::test]
+    async fn signaling_post_times_out_when_server_never_returns_headers() {
+        let (gateway_base, server) = spawn_signal_http_stub(StubResponse::StallBeforeHeaders).await;
+        let transport = test_http_transport(
+            gateway_base,
+            SignalHttpTimeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+                request: Duration::from_millis(200),
+            },
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            transport.post_signal(&"11".repeat(32), "offer", "v=0\r\n"),
+        )
+        .await
+        .expect("the client's total deadline must beat the test hang guard");
+        assert!(
+            result.is_err(),
+            "a header stall must fail, not report success"
+        );
+        assert!(
+            !server.is_finished(),
+            "the stub must still hold the socket open when the client times out"
+        );
+        stop_signal_http_stub(server).await;
+    }
+
+    #[tokio::test]
+    async fn signaling_drain_times_out_when_response_body_stalls() {
+        let (gateway_base, server) = spawn_signal_http_stub(StubResponse::StallDuringBody).await;
+        let transport = test_http_transport(
+            gateway_base,
+            SignalHttpTimeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_millis(200),
+                request: Duration::from_secs(2),
+            },
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(3), transport.drain_signals())
+            .await
+            .expect("the client's read deadline must beat the test hang guard");
+        assert!(
+            result.is_err(),
+            "a stalled drain body must fail, not read empty"
+        );
+        assert!(
+            !server.is_finished(),
+            "the stub must still hold the body open when the client times out"
+        );
+        stop_signal_http_stub(server).await;
+    }
+
+    #[tokio::test]
+    async fn signaling_deadlines_preserve_normal_drain_responses() {
+        let (gateway_base, server) =
+            spawn_signal_http_stub(StubResponse::Complete(r#"{"ok":true,"envelopes":[]}"#)).await;
+        let transport = test_http_transport(
+            gateway_base,
+            SignalHttpTimeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        );
+
+        let envelopes = transport
+            .drain_signals()
+            .await
+            .expect("a complete bounded drain response remains valid");
+        assert!(envelopes.is_empty());
+        server.await.expect("signaling HTTP stub completes cleanly");
+    }
+
+    #[tokio::test]
+    async fn signaling_deadlines_preserve_normal_signal_posts() {
+        let (gateway_base, server) =
+            spawn_signal_http_stub(StubResponse::Complete(r#"{"ok":true}"#)).await;
+        let transport = test_http_transport(
+            gateway_base,
+            SignalHttpTimeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+                request: Duration::from_secs(2),
+            },
+        );
+
+        transport
+            .post_signal(&"22".repeat(32), "offer", "v=0\r\n")
+            .await
+            .expect("a complete bounded signal-post response remains valid");
+        server.await.expect("signaling HTTP stub completes cleanly");
     }
 
     // A remote peer's candidates arrive un-vetted inside its SDP. The strip filter must drop
