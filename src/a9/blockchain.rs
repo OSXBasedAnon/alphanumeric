@@ -2888,7 +2888,8 @@ impl Blockchain {
     /// Fixed layout, hand-rolled so the entry format never depends on codec
     /// evolution: flags(1) || amount_units_le(16) || fee_units_le(16) ||
     /// timestamp_le(8) || counterparty_utf8(rest). Changing this layout requires a
-    /// new tree name — decode tolerates (skips) undersized values, not reshaped ones.
+    /// new tree name. Reads reject malformed rows so an explorer never turns
+    /// damaged index data into a plausible empty history.
     fn encode_address_tx_value(
         flags: u8,
         amount_units: i128,
@@ -2905,13 +2906,43 @@ impl Blockchain {
         value
     }
 
+    fn derived_index_error(index: &str, reason: impl Into<String>) -> BlockchainError {
+        BlockchainError::SerializationError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} index is malformed: {}", index, reason.into()),
+        )))
+    }
+
     fn decode_address_tx_entry(
         prefix_len: usize,
         key: &[u8],
         value: &[u8],
-    ) -> Option<AddressTxEntry> {
-        if key.len() != prefix_len + 8 || value.len() < 41 {
-            return None;
+    ) -> Result<AddressTxEntry, BlockchainError> {
+        if key.len() != prefix_len + 8 {
+            return Err(Self::derived_index_error(
+                ADDRESS_TX_TREE,
+                format!(
+                    "entry key has {} bytes; expected {}",
+                    key.len(),
+                    prefix_len + 8
+                ),
+            ));
+        }
+        if value.len() <= 41 {
+            return Err(Self::derived_index_error(
+                ADDRESS_TX_TREE,
+                format!(
+                    "entry value has {} bytes; expected fixed fields plus a counterparty",
+                    value.len()
+                ),
+            ));
+        }
+        let flags = value[0];
+        if flags == 0 || flags & !(ADDRESS_TX_FLAG_SENDER | ADDRESS_TX_FLAG_RECIPIENT) != 0 {
+            return Err(Self::derived_index_error(
+                ADDRESS_TX_TREE,
+                format!("entry has invalid role flags {flags:#04x}"),
+            ));
         }
         let mut height = [0u8; 4];
         let mut position = [0u8; 4];
@@ -2923,14 +2954,17 @@ impl Blockchain {
         amount.copy_from_slice(&value[1..17]);
         fee.copy_from_slice(&value[17..33]);
         ts.copy_from_slice(&value[33..41]);
-        Some(AddressTxEntry {
+        let counterparty = std::str::from_utf8(&value[41..]).map_err(|e| {
+            Self::derived_index_error(ADDRESS_TX_TREE, format!("counterparty is not UTF-8: {e}"))
+        })?;
+        Ok(AddressTxEntry {
             height: u32::from_be_bytes(height),
             position: u32::from_be_bytes(position),
-            flags: value[0],
+            flags,
             amount_units: i128::from_le_bytes(amount),
             fee_units: i128::from_le_bytes(fee),
             timestamp: u64::from_le_bytes(ts),
-            counterparty: String::from_utf8_lossy(&value[41..]).into_owned(),
+            counterparty: counterparty.to_owned(),
         })
     }
 
@@ -3026,10 +3060,7 @@ impl Blockchain {
     /// True once the address index has ever completed a build — the signal the
     /// display paths use to distinguish "no activity" from "index unavailable".
     pub fn address_index_ready(&self) -> bool {
-        self.open_chain_meta_tree()
-            .ok()
-            .and_then(|tree| tree.get(ADDRESS_TX_META_KEY).ok().flatten())
-            .is_some()
+        matches!(self.address_index_meta(), Ok(Some(_)))
     }
 
     /// Force-rebuild the address index from the canonical chain. Invalidates the
@@ -3117,7 +3148,7 @@ impl Blockchain {
         &self,
         address: &str,
     ) -> Result<Option<AddressHistorySummary>, BlockchainError> {
-        if !self.address_index_ready() {
+        if self.address_index_meta()?.is_none() {
             return Ok(None);
         }
         let tree = self.open_address_tx_tree()?;
@@ -3125,9 +3156,7 @@ impl Blockchain {
         let mut summary = AddressHistorySummary::default();
         for item in tree.scan_prefix(&prefix) {
             let (key, value) = item?;
-            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
-                continue;
-            };
+            let entry = Self::decode_address_tx_entry(prefix.len(), &key, &value)?;
             summary.tx_count += 1;
             if entry.is_sender() {
                 summary.sent_units = summary.sent_units.saturating_add(entry.amount_units);
@@ -3160,9 +3189,7 @@ impl Blockchain {
         let mut entries = Vec::new();
         for item in tree.scan_prefix(&prefix).rev() {
             let (key, value) = item?;
-            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
-                continue;
-            };
+            let entry = Self::decode_address_tx_entry(prefix.len(), &key, &value)?;
             if let Some(cutoff) = since_timestamp {
                 if entry.timestamp < cutoff {
                     if entry.timestamp.saturating_add(2 * MAX_BLOCK_FUTURE_TIME) < cutoff {
@@ -3204,9 +3231,7 @@ impl Blockchain {
         let mut entries = Vec::new();
         for item in tree.range(prefix.clone()..cursor).rev() {
             let (key, value) = item?;
-            let Some(entry) = Self::decode_address_tx_entry(prefix.len(), &key, &value) else {
-                continue;
-            };
+            let entry = Self::decode_address_tx_entry(prefix.len(), &key, &value)?;
             entries.push(entry);
             if entries.len() >= limit {
                 break;
@@ -3228,11 +3253,19 @@ impl Blockchain {
     }
 
     /// (height, hash) the address index is built through, if it has ever built.
-    pub fn address_index_meta(&self) -> Option<(u32, [u8; 32])> {
-        self.open_chain_meta_tree()
-            .ok()
-            .and_then(|tree| tree.get(ADDRESS_TX_META_KEY).ok().flatten())
-            .and_then(|raw| codec::deserialize::<(u32, [u8; 32])>(&raw).ok())
+    pub fn address_index_meta(&self) -> Result<Option<(u32, [u8; 32])>, BlockchainError> {
+        let meta = self.open_chain_meta_tree()?;
+        let Some(raw) = meta.get(ADDRESS_TX_META_KEY)? else {
+            return Ok(None);
+        };
+        codec::deserialize::<(u32, [u8; 32])>(&raw)
+            .map(Some)
+            .map_err(|e| {
+                Self::derived_index_error(
+                    ADDRESS_TX_TREE,
+                    format!("indexed-tip metadata cannot be decoded: {e}"),
+                )
+            })
     }
 
     /// Sum of all positive confirmed balances — the actual circulating supply.
@@ -3256,15 +3289,22 @@ impl Blockchain {
             if key.as_ref() == BALANCES_HEIGHT_KEY {
                 continue;
             }
-            if let Ok(address) = std::str::from_utf8(&key) {
-                if SYSTEM_ADDRESSES.contains(&address) {
-                    continue;
-                }
+            let address = std::str::from_utf8(&key).map_err(|e| {
+                Self::derived_index_error(BALANCES_TREE, format!("balance key is not UTF-8: {e}"))
+            })?;
+            if SYSTEM_ADDRESSES.contains(&address) {
+                continue;
             }
-            if let Ok(units) = Self::deserialize_units_compatible(&value) {
-                if units > 0 {
-                    total = total.saturating_add(units);
-                }
+            let units = Self::deserialize_units_compatible(&value).map_err(|e| {
+                Self::derived_index_error(
+                    BALANCES_TREE,
+                    format!("balance row cannot be decoded: {e}"),
+                )
+            })?;
+            if units > 0 {
+                total = total.checked_add(units).ok_or_else(|| {
+                    Self::derived_index_error(BALANCES_TREE, "positive-balance sum overflowed")
+                })?;
             }
         }
         *self.supply_cache.lock() = Some((version, total));
@@ -16226,6 +16266,7 @@ mod tests {
     fn address_index_unavailable_before_first_build() {
         let bc = test_blockchain();
         assert!(!bc.address_index_ready());
+        assert_eq!(bc.address_index_meta().unwrap(), None);
         assert_eq!(
             bc.address_history_summary("anyone").unwrap(),
             None,
@@ -16500,6 +16541,67 @@ mod tests {
     }
 
     #[test]
+    fn address_index_decoder_rejects_every_malformed_row_shape() {
+        let prefix = Blockchain::address_tx_prefix("alice");
+        let key = Blockchain::address_tx_key("alice", 7, 3);
+        let valid = Blockchain::encode_address_tx_value(
+            ADDRESS_TX_FLAG_SENDER,
+            100,
+            2,
+            1_700_000_000,
+            "bob",
+        );
+        assert!(Blockchain::decode_address_tx_entry(prefix.len(), &key, &valid).is_ok());
+
+        assert!(
+            Blockchain::decode_address_tx_entry(prefix.len(), &key[..key.len() - 1], &valid,)
+                .is_err()
+        );
+        assert!(Blockchain::decode_address_tx_entry(prefix.len(), &key, &valid[..41]).is_err());
+
+        let mut bad_flags = valid.clone();
+        bad_flags[0] = 0x80;
+        assert!(Blockchain::decode_address_tx_entry(prefix.len(), &key, &bad_flags).is_err());
+
+        let mut bad_utf8 = valid;
+        bad_utf8.truncate(41);
+        bad_utf8.push(0xff);
+        assert!(Blockchain::decode_address_tx_entry(prefix.len(), &key, &bad_utf8).is_err());
+    }
+
+    #[test]
+    fn malformed_address_index_rows_fail_history_reads_instead_of_disappearing() {
+        let bc = test_blockchain();
+        let meta = bc.open_chain_meta_tree().unwrap();
+        meta.insert(
+            ADDRESS_TX_META_KEY,
+            codec::serialize(&(2u32, [2u8; 32])).unwrap(),
+        )
+        .unwrap();
+        let index = bc.open_address_tx_tree().unwrap();
+        index
+            .insert(Blockchain::address_tx_key("alice", 2, 0), vec![0u8; 8])
+            .unwrap();
+
+        assert!(bc.address_history_summary("alice").is_err());
+        assert!(bc.address_recent_txs("alice", 10, None).is_err());
+        assert!(bc.address_txs_page("alice", 10, Some((3, 0))).is_err());
+    }
+
+    #[test]
+    fn malformed_address_index_metadata_is_an_error_not_unavailable_history() {
+        let bc = test_blockchain();
+        bc.open_chain_meta_tree()
+            .unwrap()
+            .insert(ADDRESS_TX_META_KEY, vec![0xff])
+            .unwrap();
+
+        assert!(bc.address_index_meta().is_err());
+        assert!(!bc.address_index_ready());
+        assert!(bc.address_history_summary("alice").is_err());
+    }
+
+    #[test]
     fn pow_byte_compare_matches_biguint_compare() {
         // The mining hot loop replaced `BigUint::from_bytes_be(&hash) <= target`
         // with a fixed-width byte comparison. Prove them interchangeable across
@@ -16549,5 +16651,34 @@ mod tests {
             .insert("alice".as_bytes(), codec::serialize(&123_i128).unwrap())
             .unwrap();
         assert_eq!(bc.confirmed_balance_units_readonly("alice").unwrap(), 123);
+
+        balances.insert("broken".as_bytes(), vec![0xff]).unwrap();
+        assert!(bc.confirmed_balance_units_readonly("broken").is_err());
+    }
+
+    #[test]
+    fn malformed_supply_rows_fail_without_caching_a_partial_total() {
+        let bc = test_blockchain();
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&123_i128).unwrap())
+            .unwrap();
+        balances.insert("broken".as_bytes(), vec![0xff]).unwrap();
+
+        assert!(bc.total_confirmed_supply_units().is_err());
+        assert!(
+            bc.supply_cache.lock().is_none(),
+            "a failed scan must never cache the valid prefix as total supply"
+        );
+
+        balances.remove("broken".as_bytes()).unwrap();
+        balances
+            .insert(vec![0xff], codec::serialize(&456_i128).unwrap())
+            .unwrap();
+        assert!(bc.total_confirmed_supply_units().is_err());
+        assert!(bc.supply_cache.lock().is_none());
+
+        balances.remove(vec![0xff]).unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 123);
     }
 }
