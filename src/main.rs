@@ -3741,7 +3741,14 @@ Some("history") => {
 
 Some("debug") => {
     let blockchain_guard = blockchain.read().await;
-    let oracle = DifficultyOracle::new();
+    // Populate diagnostics from the canonical chain. A fresh, empty oracle
+    // returns fallback constants intended for calculation callers; displaying
+    // those as live network measurements made every `debug` invocation claim
+    // the same variance/load/entropy/stability regardless of chain history.
+    let mut oracle = DifficultyOracle::new();
+    for block in blockchain_guard.get_recent_blocks(50) {
+        oracle.record_block_metrics(block.timestamp, block.difficulty);
+    }
 
     if let Some(last_block) = blockchain_guard.get_last_block() {
         let now = SystemTime::now()

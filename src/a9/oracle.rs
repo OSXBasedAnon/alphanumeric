@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::io::Write;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 use crate::a9::blockchain::TARGET_BLOCK_TIME;
@@ -9,6 +8,14 @@ pub struct DifficultyOracle {
     window_size: usize,
     recent_block_times: VecDeque<u64>,
     difficulty_history: VecDeque<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NetworkState {
+    variance: f64,
+    load: f64,
+    entropy: f64,
+    stability: f64,
 }
 
 impl DifficultyOracle {
@@ -147,6 +154,22 @@ impl DifficultyOracle {
         (-variance / (4.0 * mean.powi(2))).exp()
     }
 
+    /// Return measured network state only when at least one block interval is
+    /// available. The individual calculation helpers retain their historical
+    /// defaults for consensus-adjacent callers, but diagnostics must never
+    /// present those fallback constants as observations from the live chain.
+    fn network_state(&self) -> Option<NetworkState> {
+        if self.recent_block_times.len() < 2 || self.difficulty_history.len() < 2 {
+            return None;
+        }
+        Some(NetworkState {
+            variance: self.calculate_difficulty_variance(),
+            load: self.estimate_computational_load(),
+            entropy: self.measure_network_entropy(),
+            stability: self.assess_network_stability(),
+        })
+    }
+
     pub async fn display_difficulty_metrics(
         &self,
         tip_difficulty: u64,
@@ -154,13 +177,20 @@ impl DifficultyOracle {
         timestamp_diff: u64,
     ) -> std::io::Result<()> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
+        self.write_difficulty_metrics(&mut stdout, tip_difficulty, next_difficulty, timestamp_diff)
+    }
+
+    fn write_difficulty_metrics<W: WriteColor>(
+        &self,
+        stdout: &mut W,
+        tip_difficulty: u64,
+        next_difficulty: u64,
+        timestamp_diff: u64,
+    ) -> std::io::Result<()> {
         let mut header = ColorSpec::new();
 
         // Core metrics
-        let variance = self.calculate_difficulty_variance();
-        let load = self.estimate_computational_load();
-        let entropy = self.measure_network_entropy();
-        let stability = self.assess_network_stability();
+        let network_state = self.network_state();
         let idle_intervals = timestamp_diff.saturating_sub(TARGET_BLOCK_TIME) / TARGET_BLOCK_TIME;
 
         // Calculate adjustment components
@@ -186,14 +216,30 @@ impl DifficultyOracle {
         metrics.set_fg(Some(Color::Rgb(137, 207, 211)));
         stdout.set_color(&metrics)?;
         writeln!(stdout, "\nNetwork State:")?;
-        writeln!(
-            stdout,
-            "Variance:            {:.4} (stability measure)",
-            variance
-        )?;
-        writeln!(stdout, "Load:                {:.1}%", load * 100.0)?;
-        writeln!(stdout, "Entropy:             {:.4} (randomness)", entropy)?;
-        writeln!(stdout, "Stability:           {:.1}%", stability * 100.0)?;
+        if let Some(state) = network_state {
+            writeln!(
+                stdout,
+                "Variance:            {:.4} (stability measure)",
+                state.variance
+            )?;
+            writeln!(stdout, "Load:                {:.1}%", state.load * 100.0)?;
+            writeln!(
+                stdout,
+                "Entropy:             {:.4} (randomness)",
+                state.entropy
+            )?;
+            writeln!(
+                stdout,
+                "Stability:           {:.1}%",
+                state.stability * 100.0
+            )?;
+        } else {
+            const UNAVAILABLE: &str = "unavailable (insufficient history)";
+            writeln!(stdout, "Variance:            {UNAVAILABLE}")?;
+            writeln!(stdout, "Load:                {UNAVAILABLE}")?;
+            writeln!(stdout, "Entropy:             {UNAVAILABLE}")?;
+            writeln!(stdout, "Stability:           {UNAVAILABLE}")?;
+        }
 
         // Adjustment Factors
         metrics.set_fg(Some(Color::Rgb(242, 237, 161)));
@@ -228,5 +274,47 @@ impl DifficultyOracle {
 impl Default for DifficultyOracle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termcolor::Buffer;
+
+    fn rendered(oracle: &DifficultyOracle) -> String {
+        let mut buffer = Buffer::no_color();
+        oracle
+            .write_difficulty_metrics(&mut buffer, 100, 101, TARGET_BLOCK_TIME)
+            .expect("render diagnostics");
+        String::from_utf8(buffer.as_slice().to_vec()).expect("diagnostics are UTF-8")
+    }
+
+    #[test]
+    fn diagnostics_do_not_present_defaults_as_live_measurements() {
+        let mut oracle = DifficultyOracle::new();
+        assert!(oracle.network_state().is_none());
+
+        oracle.record_block_metrics(100, 100);
+        assert!(oracle.network_state().is_none());
+        let output = rendered(&oracle);
+        assert_eq!(
+            output.matches("unavailable (insufficient history)").count(),
+            4
+        );
+        assert!(!output.contains("Load:                50.0%"));
+    }
+
+    #[test]
+    fn diagnostics_use_recorded_block_history() {
+        let mut oracle = DifficultyOracle::new();
+        oracle.record_block_metrics(100, 100);
+        oracle.record_block_metrics(105, 110);
+
+        let state = oracle.network_state().expect("one interval is sufficient");
+        assert_eq!(state.load, 1.0);
+        let output = rendered(&oracle);
+        assert!(!output.contains("unavailable"));
+        assert!(output.contains("Load:                100.0%"));
     }
 }
