@@ -6207,6 +6207,17 @@ impl Node {
         Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "chain busy, retry shortly")
     }
 
+    fn explorer_storage_unavailable(
+        operation: &str,
+        err: &BlockchainError,
+    ) -> (StatusCode, Json<Value>) {
+        // Keep database details in the local log: exposing paths or backend errors
+        // through an unauthenticated endpoint is unnecessary. The stable response
+        // tells integrations to retry/alert instead of accepting a plausible zero.
+        error!("Explorer {} read failed: {}", operation, err);
+        Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+    }
+
     /// Classify a rejected submission as backpressure, returning the machine-readable
     /// reason and whether resubmitting the SAME signed transaction can ever succeed.
     ///
@@ -6325,7 +6336,10 @@ impl Node {
         };
         let payload = {
             let tip = chain.get_last_block();
-            let index_meta = chain.address_index_meta();
+            let index_meta = match chain.address_index_meta() {
+                Ok(meta) => meta,
+                Err(err) => return Self::explorer_storage_unavailable("status metadata", &err),
+            };
             let local_height = tip.as_ref().map(|b| b.index);
             // FRESHNESS SIGNAL: a resilient service node stays UP and serves while
             // it is a bit behind (rather than self-terminating), so a consumer
@@ -6589,26 +6603,47 @@ impl Node {
             return Self::explorer_busy();
         };
         let payload = {
-            let balance_units = chain
-                .confirmed_balance_units_readonly(&address)
-                .unwrap_or(0);
+            let balance_units = match chain.confirmed_balance_units_readonly(&address) {
+                Ok(units) => units,
+                Err(err) => return Self::explorer_storage_unavailable("address balance", &err),
+            };
             // Confirmed minus pending debits minus still-immature mining rewards. The
             // raw `balance` below is the ledger total and can be strictly larger, so an
             // integrator who reads it as "available" over-credits. Publishing both
             // removes the guess.
+            // Unlike a zero, null already says this optional overlay could not be
+            // computed. Preserve that established contract; the fail-closed paths
+            // below target fields whose old fallbacks looked like valid data.
             let spendable_units = chain.get_spendable_balance_units(&address).await.ok();
-            let index_meta = chain.address_index_meta();
+            let index_meta = match chain.address_index_meta() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    return Self::explorer_storage_unavailable("address index metadata", &err)
+                }
+            };
             // The history is served straight off the address index. While that index is
             // unbuilt or mid-rebuild it yields an EMPTY page, which is indistinguishable
             // from "this address never received anything" — the one reading that costs a
             // deposit. Serve null rather than a plausible empty list, so a scanner fails
             // loudly instead of concluding wrongly. `summary` is already gated this way.
             let history_available = index_meta.is_some();
-            let summary = chain.address_history_summary(&address).unwrap_or(None);
+            let summary = if history_available {
+                match chain.address_history_summary(&address) {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        return Self::explorer_storage_unavailable("address history summary", &err)
+                    }
+                }
+            } else {
+                None
+            };
             let entries = if history_available {
-                chain
-                    .address_txs_page(&address, limit, before)
-                    .unwrap_or_default()
+                match chain.address_txs_page(&address, limit, before) {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        return Self::explorer_storage_unavailable("address history page", &err)
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -6663,7 +6698,10 @@ impl Node {
             return Self::explorer_busy();
         };
         let payload = {
-            let supply_units = chain.total_confirmed_supply_units().unwrap_or(0);
+            let supply_units = match chain.total_confirmed_supply_units() {
+                Ok(units) => units,
+                Err(err) => return Self::explorer_storage_unavailable("confirmed supply", &err),
+            };
             json!({
                 "height": chain.get_latest_block_index() as u32,
                 "supply": Transaction::from_units(supply_units),
@@ -15616,6 +15654,14 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_storage_failures_are_machine_readable_and_never_look_successful() {
+        let (status, Json(body)) =
+            Node::explorer_storage_unavailable("test read", &BlockchainError::InvalidTransaction);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({ "error": "storage_unavailable" }));
+    }
 
     // A withdrawal worker decides "retry" vs "page a human" from this classification, so the
     // three backpressure reasons must stay distinguishable from each other AND from a terminal

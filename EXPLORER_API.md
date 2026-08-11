@@ -39,6 +39,18 @@ Amounts appear both as a decimal `amount`/`balance` and an exact integer
 `*_units` string — **use the `_units` integer for accounting**; the decimal is
 for display (floats lose precision).
 
+The address/supply financial reads, and the address-index metadata reported by
+status, fail closed when their local database or derived index cannot answer.
+Treat either `503` response as unavailable data and retry/alert; never substitute
+zero or an empty transaction list:
+
+    503  {"error": "chain busy, retry shortly"}  chain lock contended
+    503  {"error": "storage_unavailable"}        storage/index read failed
+
+A genuinely absent address still returns a successful zero balance. An address
+index that has never completed returns `history_available: false` and
+`transactions: null`; neither condition is a storage error.
+
 ## Finality (for exchanges — credit deposits safely)
 
 The chain finalizes history behind a trusted checkpoint: **blocks at or below

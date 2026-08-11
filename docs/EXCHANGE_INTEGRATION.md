@@ -170,9 +170,10 @@ also confirm freshness via `/explorer/status` (`blocks_behind`).
 > `null` rather than an empty array when the index is not ready, so the two cases cannot be
 > confused. Implemented on `main`, NOT in the current release.
 
-`GET` endpoints can return **503** under chain-lock contention during heavy sync or
-indexing. A deposit scanner must treat non-200 as "retry", never as "no data", or it will
-skip blocks.
+`GET` endpoints can return **503** under chain-lock contention during heavy sync/indexing
+(`{"error":"chain busy, retry shortly"}`) or when storage/index data cannot be read
+(`{"error":"storage_unavailable"}`). A deposit scanner must treat either response as
+"retry/alert", never as "no data", or it can skip deposits or accept a false zero.
 
 Credit rules and reorg handling are covered in
 [`EXPLORER_API.md`](../EXPLORER_API.md#finality-for-exchanges--credit-deposits-safely).
