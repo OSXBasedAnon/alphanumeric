@@ -24,6 +24,13 @@ ignore = [
   # paste 1.0.15 — transitive proc-macro. Compile-time only.
   "RUSTSEC-2024-0436",
 
+  # lru 0.7.8 (via reed-solomon-erasure 6.0.0, latest) and 0.8.1 (direct) — pop() UAF
+  # requires a cache KEY whose Drop panics, caught via catch_unwind. Every LruCache key
+  # in this crate is [u8;32], String, or (u32,[u8;32]) — none has a panicking Drop —
+  # and catch_unwind is unused. Re-review if a cache key type gains a Drop impl.
+  # Reviewed 2026-08-13.
+  "RUSTSEC-2026-0253",
+
 ]
 
 # NOT ignored, recorded so it is not re-investigated from scratch: yamux 0.12.1 carries
