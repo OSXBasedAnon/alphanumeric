@@ -6852,8 +6852,14 @@ impl Node {
                         StatusCode::TOO_MANY_REQUESTS,
                         Json(json!({
                             "error": "rate_limited",
+                            // Mirrors retry_same_transaction rather than a blanket true: for
+                            // mempool_full, resubmitting the identical transaction can never win
+                            // a slot (eviction is fee-ordered and all-or-nothing), so a client
+                            // that reads only this top-level field must not be told to loop on
+                            // it. The recovery is a RE-SIGN at a higher fee — a different
+                            // transaction, hence not "retryable".
+                            "retryable": retry_same_transaction,
                             "reason": reason,
-                            "retryable": true,
                             "retry_same_transaction": retry_same_transaction,
                             "detail": detail,
                         })),
