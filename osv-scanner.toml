@@ -22,6 +22,11 @@ ignoreUntil = 2027-01-31
 reason = "paste 1.0.15 is a compile-time transitive proc macro with no demonstrated vulnerability. Reviewed 2026-07-31."
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0253"
+ignoreUntil = 2027-02-28
+reason = "lru 0.7.8/0.8.1 pop() UAF requires a cache KEY whose Drop panics, caught via catch_unwind. Every LruCache key in this crate is [u8;32], String, or (u32,[u8;32]) — none has a panicking Drop — and catch_unwind is unused. 0.7.8 is pinned by reed-solomon-erasure 6.0.0 (latest), so only a filter can clear it. Re-review if a cache key type gains a Drop impl. Reviewed 2026-08-13."
+
+[[IgnoredVulns]]
 id = "GHSA-vxx9-2994-q338"
 ignoreUntil = 2027-01-31
 reason = "yamux 0.12.1 remote-panic path is unreachable: runtime uses fixed 0.13.10 backend and Kademlia fallback is opt-in/off by default. Re-review on any libp2p change. Reviewed 2026-07-31."
