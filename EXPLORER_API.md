@@ -182,33 +182,34 @@ distinct payments share those fields. Reserve the 5-tuple client-side before sig
 re-sign with a different timestamp rather than marking the payment done. See the
 duplicate-identity note above.
 
-**A `400` is NOT automatically terminal.** On the current release every admission rejection —
-retryable backpressure included — is returned as a `400` carrying one human-readable string,
-so match on the message text:
+**Backpressure is a `429`; a terminal rejection is a `400`.** Admission backpressure —
+the per-address pending cap, the per-sender submission rate, and a full mempool — is
+returned as HTTP `429` with a machine-readable body, so you branch on a field, not on a
+string:
 
-    400 "transaction rejected: Rate limit exceeded: Too many transactions from this address"
+    429 {"error":"rate_limited","reason":"per_address_pending_cap",
+         "retryable":true,"retry_same_transaction":true,"detail":"…"}
         RETRYABLE — at the 100-pending-per-sender-address cap; back off and resend the SAME
         signed transaction, the slots drain as blocks land
-    400 "transaction rejected: Rate limit exceeded: Too many requests"
+    429 {"error":"rate_limited","reason":"per_sender_rate",
+         "retryable":true,"retry_same_transaction":true,"detail":"…"}
         RETRYABLE — per-sender submission rate; back off and resend the SAME signed transaction
-    400 "transaction rejected: Rate limit exceeded: Mempool is full"
+    429 {"error":"rate_limited","reason":"mempool_full",
+         "retryable":false,"retry_same_transaction":false,"detail":"…"}
         NOT retryable as-is — back off, then RE-SIGN AT A HIGHER FEE; eviction is fee-ordered
         and all-or-nothing, so resubmitting the identical transaction can never win a slot
 
-Every other `400` — `Insufficient funds for the transaction`, `Transaction signature is
-invalid or missing`, `Transaction fee below the relay floor (min …)`, `Transaction amount is
-invalid or negative` — is terminal; alert on it.
+`retryable` mirrors `retry_same_transaction`, so a worker can branch on the top-level flag
+alone: it is `false` for `mempool_full` because only a re-sign at a higher fee — a different
+transaction — can ever clear it.
 
-The `429` is a NODE-WIDE submission token bucket (5/s sustained, burst 20) shared by every
-sender regardless of the per-sender limit. It carries no reason field and is always
-retryable.
+Every `400 "transaction rejected: …"` is terminal — `Insufficient funds for the
+transaction`, `Transaction signature is invalid or missing`, `Transaction fee below the relay
+floor (min …)`, `Transaction amount is invalid or negative` — alert on it.
 
-> **Coming in the next release:** a structured `429` carrying `reason` / `retryable` /
-> `retry_same_transaction` / `detail`, with reasons `per_address_pending_cap`,
-> `per_sender_rate` and `mempool_full`, so a client can branch on a field instead of a
-> string. It is implemented on `main` but is NOT in the current release — do not code
-> against those fields yet. A client that matches the `400` strings above today and also
-> tolerates a structured `429` will survive the upgrade without a redeploy.
+A separate `429` comes from a NODE-WIDE submission token bucket (5/s sustained, burst 20)
+shared by every sender regardless of the per-sender limit. It carries no `reason` field and
+is always retryable.
 
 On `accepted`, the node has admitted the tx to its mempool (after full signature,
 balance, replay, and already-confirmed checks) and scheduled its network
