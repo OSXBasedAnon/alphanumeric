@@ -1,6 +1,6 @@
 use arrayref::array_ref;
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -385,6 +385,25 @@ const TX_DEDUP_ESTIMATED_ENTRY_BYTES: usize = 128;
 /// Bounds unique transaction work that has claimed ingress but has not reached a durable admission
 /// verdict yet. Saturation is retryable and never inserts an accepted key.
 const TX_DEDUP_MAX_INFLIGHT: usize = MAX_PARALLEL_VALIDATIONS * 2;
+/// Transport-only transaction batch ceiling. A batch contains unchanged legacy
+/// `Transaction` values and every value still takes the ordinary admission path.
+/// 256 covers the observed 200+ payment pool rounds while keeping decode,
+/// inventory and response work strictly finite.
+pub const TX_RELAY_BATCH_MAX: usize = 256;
+/// Leave room below the encrypted 4 MiB frame cap for the enum/envelope and AEAD
+/// overhead. Construction chunks bodies at this lower plaintext budget; ingress
+/// rejects a body batch above it before transaction validation starts.
+const TX_RELAY_BODY_MAX_BYTES: usize = MAX_MESSAGE_SIZE - 64 * 1024;
+const TX_RELAY_INVENTORY_MAX_BYTES: usize = 64 * 1024;
+/// Separate per-peer expensive-work ceiling for body batches. The generic node
+/// limiter counts the bounded envelope as one message; this second limiter
+/// prevents that envelope from multiplying signature work without bound while
+/// still admitting two full 256-item pool rounds per minute.
+const TX_RELAY_PEER_WORK_PER_MINUTE: usize = TX_RELAY_BATCH_MAX * 2;
+const TX_RELAY_PENDING_REQUEST_MAX_ENTRIES: usize = 8_192;
+const TX_RELAY_PENDING_REQUEST_TTL: Duration = Duration::from_secs(60);
+const EXPLORER_BATCH_BODY_MAX_BYTES: usize = MAX_MESSAGE_SIZE;
+const EXPLORER_BATCH_CONCURRENCY: usize = 1;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
 const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
 /// Level the validation cache is pruned back to once it crosses its ceiling. The gap is what
@@ -397,6 +416,12 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 /// negotiates compact transport without changing NETWORK_VERSION or the signed
 /// handshake schema. New message variants are sent only after observing it.
 const COMPACT_BLOCK_V1_CAPABILITY_SUFFIX: &str = "|a9-compact-block-v1";
+/// Capability marker for the backward-compatible transaction inventory/request
+/// transport. Old peers ignore the Ping/Pong node-id suffix and continue to
+/// receive the unchanged full `Transaction` message.
+const TX_INVENTORY_V1_CAPABILITY_SUFFIX: &str = "|a9-tx-inventory-v1";
+const TX_INVENTORY_V1_ENABLED: bool = true;
+const TX_INVENTORY_CAPABILITY_TTL: Duration = Duration::from_secs(15 * 60);
 /// Release safety gate for the TCP compact extension.
 ///
 /// The TCP reader processes one frame at a time, while compact reconstruction
@@ -883,6 +908,96 @@ pub struct IndexedCompactTransactionV1 {
     pub transaction: Transaction,
 }
 
+/// A sequence whose declared/decoded size can never exceed `MAX`.
+///
+/// MessagePack exposes an array's declared length through `size_hint`, allowing
+/// an oversized peer declaration to fail before a proportional Vec allocation.
+/// JSON has no array-length declaration, so its decoder grows only to `MAX` and
+/// rejects the first excess element; the HTTP body has a separate byte ceiling.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct BoundedSequence<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedSequence<T, MAX> {
+    fn new(values: Vec<T>) -> Result<Self, &'static str> {
+        if values.len() > MAX {
+            Err("bounded sequence exceeds item limit")
+        } else {
+            Ok(Self(values))
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TransactionBodyV1 {
+    pub key: [u8; 32],
+    pub transaction: Transaction,
+}
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for BoundedSequence<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedSequenceVisitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedSequenceVisitor<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedSequence<T, MAX>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "an array containing at most {MAX} items")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                if sequence.size_hint().is_some_and(|declared| declared > MAX) {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+
+                let capacity = sequence.size_hint().unwrap_or(0).min(MAX);
+                let mut values = Vec::with_capacity(capacity);
+                while values.len() < MAX {
+                    let Some(value) = sequence.next_element()? else {
+                        return Ok(BoundedSequence(values));
+                    };
+                    values.push(value);
+                }
+                // JSON does not declare an array length. Decode only the first
+                // excess value as IgnoredAny so an oversized body never allocates
+                // a 257th full ML-DSA Transaction merely to reject its count.
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                Ok(BoundedSequence(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedSequenceVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExplorerTransactionBatchV1 {
+    version: u8,
+    transactions: BoundedSequence<Transaction, TX_RELAY_BATCH_MAX>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     Version {
@@ -992,6 +1107,18 @@ pub enum NetworkMessage {
     CompactBlockResponseV1 {
         block_hash: [u8; 32],
         block: Option<Block>,
+    },
+    /// Transport-only announcement of exact full-witness transaction digests.
+    /// These variants are sent only to peers that advertised the matching
+    /// Ping/Pong capability; legacy peers retain `Transaction(Transaction)`.
+    TransactionInventoryV1 {
+        keys: BoundedSequence<[u8; 32], TX_RELAY_BATCH_MAX>,
+    },
+    GetTransactionsV1 {
+        keys: BoundedSequence<[u8; 32], TX_RELAY_BATCH_MAX>,
+    },
+    TransactionsV1 {
+        transactions: BoundedSequence<TransactionBodyV1, TX_RELAY_BATCH_MAX>,
     },
 }
 
@@ -1243,6 +1370,66 @@ struct ExactTransactionDeduper {
     max_inflight: usize,
 }
 
+/// Exact, bounded authorization for the second half of inventory/request relay.
+/// A capable peer may still use the legacy `Transaction` message at any time,
+/// but the high-multiplicity `TransactionsV1` envelope is accepted only for
+/// bodies this node explicitly requested from that peer.
+#[derive(Debug)]
+struct PendingTransactionBodyRequests {
+    entries: HashMap<(SocketAddr, [u8; 32]), Instant>,
+    order: VecDeque<((SocketAddr, [u8; 32]), Instant)>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl PendingTransactionBodyRequests {
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_entries),
+            order: VecDeque::with_capacity(max_entries),
+            max_entries: max_entries.max(1),
+            ttl,
+        }
+    }
+
+    fn record(&mut self, peer: SocketAddr, keys: &[[u8; 32]], now: Instant) {
+        self.prune_expired(now);
+        for key in keys {
+            let composite = (peer, *key);
+            while self.order.len() >= self.max_entries {
+                let Some((oldest, recorded)) = self.order.pop_front() else {
+                    break;
+                };
+                if self.entries.get(&oldest) == Some(&recorded) {
+                    self.entries.remove(&oldest);
+                }
+            }
+            // Refreshing an unanswered request appends a new timestamp. The old
+            // queue node becomes a harmless stale record whose timestamp no
+            // longer matches `entries`; the queue itself remains hard-capped.
+            self.entries.insert(composite, now);
+            self.order.push_back((composite, now));
+        }
+    }
+
+    fn take(&mut self, peer: SocketAddr, key: &[u8; 32], now: Instant) -> bool {
+        self.prune_expired(now);
+        self.entries.remove(&(peer, *key)).is_some()
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        while let Some((key, recorded)) = self.order.front().copied() {
+            if now.duration_since(recorded) < self.ttl {
+                break;
+            }
+            self.order.pop_front();
+            if self.entries.get(&key) == Some(&recorded) {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TransactionClaimResult {
     Claimed(TransactionIngressClaim),
@@ -1280,6 +1467,10 @@ impl ExactTransactionDeduper {
 
     fn is_accepted(&self, key: &[u8; 32]) -> bool {
         self.accepted.lock().contains(key)
+    }
+
+    fn is_known(&self, key: &[u8; 32]) -> bool {
+        self.is_accepted(key) || self.inflight.contains_key(key)
     }
 
     fn claim(self: &Arc<Self>, key: [u8; 32]) -> TransactionClaimResult {
@@ -1598,6 +1789,12 @@ pub struct Node {
     outbound_connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<OutboundConnection>>>>>,
     outbound_circuit_breakers: Arc<RwLock<HashMap<SocketAddr, OutboundCircuitState>>>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// Per-peer expensive transaction-body work, independent of envelope
+    /// message counting and canonical per-sender admission limits.
+    transaction_relay_work_limiter: Arc<RateLimiter>,
+    /// Exact outstanding inventory requests. This prevents a peer from using
+    /// the batched body variant as an unsolicited 256x message-rate multiplier.
+    pending_transaction_body_requests: Arc<PLMutex<PendingTransactionBodyRequests>>,
     http_client: Client,
     discovery_state: Arc<Mutex<DiscoveryState>>,
     // Single-flight flag for discover_network_nodes. Kept in an AtomicBool (not
@@ -1631,6 +1828,10 @@ pub struct Node {
     /// Peers that advertised CompactBlockV1 over the backward-compatible ping/pong
     /// capability marker. Entries expire unless refreshed by health pings.
     compact_capable_peers: Arc<DashMap<SocketAddr, Instant>>,
+    /// Peers eligible for transaction inventory/request relay. Kept separate
+    /// from compact-block capability so either transport can be rolled back
+    /// independently without changing the wire or durable state.
+    transaction_inventory_capable_peers: Arc<DashMap<SocketAddr, Instant>>,
     /// Bounds duplicate concurrent reconstruction work without poisoning the
     /// definitive block dedup bloom on a transient missing-body failure.
     compact_inflight: Arc<DashMap<[u8; 32], CompactInflight>>,
@@ -1999,6 +2200,10 @@ struct ExplorerState {
     // per-sender mempool rate limit is the real guard; this only blunts a flood
     // of junk that would fail validation, keeping it off the mempool lock.
     submit_bucket: Arc<PLMutex<(Instant, f64)>>,
+    // At most one expensive batch is admitted at a time. The endpoint is still
+    // bounded by request tokens and bytes; this independently prevents several
+    // 256-signature batches from occupying CPU together.
+    batch_submit_slots: Arc<Semaphore>,
     // Coarse per-process token bucket for the O(chain) explorer READ endpoints (address summary,
     // supply): a node-side flood guard for the opt-in explorer, independent of any upstream proxy.
     read_bucket: Arc<PLMutex<(Instant, f64)>>,
@@ -2222,6 +2427,7 @@ impl Node {
                 NonZeroUsize::new(8192).expect("nonzero"),
             ))),
             compact_capable_peers: Arc::new(DashMap::new()),
+            transaction_inventory_capable_peers: Arc::new(DashMap::new()),
             compact_inflight: Arc::new(DashMap::new()),
             compact_reconstruction_slots: Arc::new(Semaphore::new(
                 COMPACT_RECONSTRUCTION_CONCURRENCY,
@@ -2245,6 +2451,16 @@ impl Node {
                 NonZeroUsize::new(COMPACT_TX_INDEX_ENTRIES).expect("nonzero"),
             ))),
             rate_limiter: Arc::new(RateLimiter::new(60, 100)),
+            transaction_relay_work_limiter: Arc::new(RateLimiter::new(
+                60,
+                TX_RELAY_PEER_WORK_PER_MINUTE,
+            )),
+            pending_transaction_body_requests: Arc::new(PLMutex::new(
+                PendingTransactionBodyRequests::new(
+                    TX_RELAY_PENDING_REQUEST_MAX_ENTRIES,
+                    TX_RELAY_PENDING_REQUEST_TTL,
+                ),
+            )),
             bind_addr,
             listener,
             p2p_swarm: Arc::new(Mutex::new(None)),
@@ -6375,14 +6591,14 @@ impl Node {
     }
 
     //----------------------------------------------------------------------
-    // Explorer API (opt-in, read-only)
+    // Explorer API (opt-in)
     //----------------------------------------------------------------------
     //
     // A localhost JSON surface for SELF-HOSTED explorers/integrations: run your
     // own node, point your website at it. Design rules, in order:
     //   1. OFF by default — unset env var means no task, no socket, zero cost.
-    //   2. Read-only — no handler may ever write (no ensure/rebuild side
-    //      effects), so anonymous GETs cannot amplify into DB work.
+    //   2. GETs are read-only (no ensure/rebuild side effects). The explicit
+    //      submit endpoints write only through canonical transaction admission.
     //   3. Bounded — every read is cursor-paged or single-block, and chain-lock
     //      acquisition is time-boxed (503 "chain busy" instead of queueing
     //      handlers behind a busy write lock).
@@ -6397,6 +6613,19 @@ impl Node {
 
     fn explorer_busy() -> (StatusCode, Json<Value>) {
         Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "chain busy, retry shortly")
+    }
+
+    fn explorer_submit_busy() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "chain busy, retry shortly",
+                "status": "retryable_failure",
+                "retryable": true,
+                "reason": "chain_busy",
+                "retry_same_transaction": true,
+            })),
+        )
     }
 
     fn explorer_storage_unavailable(
@@ -6516,6 +6745,7 @@ impl Node {
                 "/explorer/supply",
                 "/explorer/fee-estimate  (advisory next-block fee recommendation)",
                 "POST /explorer/submit-tx  (body: signed transaction JSON)",
+                "POST /explorer/submit-tx-batch  (body: {version:1,transactions:[...]}, max 256)",
             ],
         }))
     }
@@ -6944,32 +7174,42 @@ impl Node {
         (StatusCode::OK, Json(payload))
     }
 
-    /// Submit a signed transaction to the network (opt-in explorer API write path).
-    /// This is the endpoint web wallets / exchanges POST a signed tx to. It changes
-    /// NO consensus surface: the tx goes through the SAME add_transaction validation
-    /// the CLI `create` uses (signature, balance, replay guard, already-confirmed
-    /// gate), and on acceptance is announced via the SAME gossip path. A node only
-    /// serves this when its operator sets ALPHANUMERIC_EXPLORER_API — the publisher
-    /// and ordinary clients never do, so existing infra is untouched.
-    async fn explorer_submit_tx_handler(
-        State(state): State<ExplorerState>,
-        Json(tx): Json<Transaction>,
-    ) -> (StatusCode, Json<Value>) {
+    fn allow_explorer_submit(state: &ExplorerState) -> bool {
         // Coarse token bucket (refill 5/s, cap 20): a cheap flood guard so junk
-        // that would fail validation can't hammer the mempool write lock. The real
-        // rule is the per-sender rate limit inside add_transaction.
-        {
-            let mut b = state.submit_bucket.lock();
-            let now = Instant::now();
-            b.1 = (b.1 + now.duration_since(b.0).as_secs_f64() * 5.0).min(20.0);
-            b.0 = now;
-            if b.1 < 1.0 {
-                return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-            }
-            b.1 -= 1.0;
+        // cannot hammer the mempool write lock. A bounded batch consumes one HTTP
+        // request token and a separate exclusive work slot; every contained tx
+        // still consumes its canonical per-sender admission budget.
+        let mut bucket = state.submit_bucket.lock();
+        let now = Instant::now();
+        bucket.1 = (bucket.1 + now.duration_since(bucket.0).as_secs_f64() * 5.0).min(20.0);
+        bucket.0 = now;
+        if bucket.1 < 1.0 {
+            return false;
         }
+        bucket.1 -= 1.0;
+        true
+    }
+
+    /// Canonical shared admission used by both single and batch HTTP transport.
+    /// The response is intentionally rendered here so an item in a batch gets the
+    /// same status code and JSON fields as the identical individually submitted tx.
+    async fn explorer_admit_transaction(
+        state: &ExplorerState,
+        tx: &Transaction,
+    ) -> ((StatusCode, Json<Value>), bool) {
         if tx.sender.is_empty() || tx.recipient.is_empty() {
-            return Self::explorer_err(StatusCode::BAD_REQUEST, "missing sender or recipient");
+            return (
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "missing sender or recipient",
+                        "status": "rejected",
+                        "retryable": false,
+                        "reason": "malformed_transaction",
+                    })),
+                ),
+                false,
+            );
         }
         // Transaction identity is (sender, recipient, amount, fee, timestamp). The
         // atomic admission outcome below distinguishes a new insertion from a resend
@@ -6987,7 +7227,7 @@ impl Node {
         // keeping the error in scope past this point would sink the handler's Send bound.
         let submit = {
             let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
-                return Self::explorer_busy();
+                return (Self::explorer_submit_busy(), false);
             };
             chain
                 .admit_transaction(tx.clone())
@@ -6995,39 +7235,38 @@ impl Node {
                 .map_err(|e| e.to_string())
         };
         match submit {
-            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
-                // Announce now (mesh + peers) instead of waiting for the periodic
-                // re-gossip, so a withdrawal propagates immediately. The detached
-                // gossip task also seeds the compact leaf index from the canonical
-                // admitted mempool entry; keeping that work out of this handler
-                // preserves Axum's Send future requirement.
-                let node = state.node.clone();
-                let announce = tx.clone();
-                tokio::spawn(async move { node.gossip_transaction(&announce).await });
+            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => (
                 (
                     StatusCode::OK,
                     Json(json!({ "ok": true, "status": "accepted", "tx_id": tx.get_tx_id() })),
-                )
-            }
+                ),
+                true,
+            ),
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true, "status": "already_pending", "tx_id": tx_id,
-                    "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
-                })),
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "status": "already_pending", "tx_id": tx_id,
+                        "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
+                    })),
+                ),
+                false,
             ),
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
                 let finalized_height =
                     match timeout(Duration::from_secs(3), state.blockchain.read()).await {
                         Ok(chain) => chain.trusted_checkpoint_height(),
-                        Err(_) => return Self::explorer_busy(),
+                        Err(_) => return (Self::explorer_submit_busy(), false),
                     };
                 (
-                    StatusCode::OK,
-                    Json(json!({
-                        "ok": true, "status": "already_confirmed", "tx_id": tx_id,
-                        "height": height, "final": height <= finalized_height
-                    })),
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "ok": true, "status": "already_confirmed", "tx_id": tx_id,
+                            "height": height, "final": height <= finalized_height
+                        })),
+                    ),
+                    false,
                 )
             }
             Err(e) => {
@@ -7041,28 +7280,124 @@ impl Node {
                     Self::classify_submit_backpressure(&detail)
                 {
                     return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({
-                            "error": "rate_limited",
-                            // Mirrors retry_same_transaction rather than a blanket true: for
-                            // mempool_full, resubmitting the identical transaction can never win
-                            // a slot (eviction is fee-ordered and all-or-nothing), so a client
-                            // that reads only this top-level field must not be told to loop on
-                            // it. The recovery is a RE-SIGN at a higher fee — a different
-                            // transaction, hence not "retryable".
-                            "retryable": retry_same_transaction,
-                            "reason": reason,
-                            "retry_same_transaction": retry_same_transaction,
-                            "detail": detail,
-                        })),
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({
+                                "error": "rate_limited",
+                                "status": if retry_same_transaction { "retryable_failure" } else { "rejected" },
+                                // Mirrors retry_same_transaction rather than a blanket true: for
+                                // mempool_full, resubmitting the identical transaction can never win
+                                // a slot (eviction is fee-ordered and all-or-nothing), so a client
+                                // that reads only this top-level field must not be told to loop on
+                                // it. The recovery is a RE-SIGN at a higher fee — a different
+                                // transaction, hence not "retryable".
+                                "retryable": retry_same_transaction,
+                                "reason": reason,
+                                "retry_same_transaction": retry_same_transaction,
+                                "detail": detail,
+                            })),
+                        ),
+                        false,
                     );
                 }
-                Self::explorer_err(
-                    StatusCode::BAD_REQUEST,
-                    &format!("transaction rejected: {}", detail),
+                (
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!("transaction rejected: {}", detail),
+                            "status": "rejected",
+                            "retryable": false,
+                            "reason": "transaction_rejected",
+                            "tx_id": tx_id,
+                            "detail": detail,
+                        })),
+                    ),
+                    false,
                 )
             }
         }
+    }
+
+    /// Submit one signed transaction through the legacy HTTP shape.
+    async fn explorer_submit_tx_handler(
+        State(state): State<ExplorerState>,
+        Json(tx): Json<Transaction>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_submit(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        let (response, inserted) = Self::explorer_admit_transaction(&state, &tx).await;
+        if inserted {
+            // Keep network I/O outside the Axum handler. The canonical admission
+            // has completed, so a failed best-effort announcement does not change
+            // the truthful accepted response.
+            let node = state.node.clone();
+            tokio::spawn(async move { node.gossip_transaction(&tx).await });
+        }
+        response
+    }
+
+    /// Transport-only batch endpoint. Items are admitted in request order so
+    /// same-sender balance and pending-cap behavior is deterministic and exactly
+    /// equivalent to issuing the same single submissions sequentially.
+    async fn explorer_submit_tx_batch_handler(
+        State(state): State<ExplorerState>,
+        Json(batch): Json<ExplorerTransactionBatchV1>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_submit(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        if batch.version != 1 {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "unsupported batch version");
+        }
+        if batch.transactions.as_slice().is_empty() {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "empty transaction batch");
+        }
+        let Ok(_batch_permit) = Arc::clone(&state.batch_submit_slots).try_acquire_owned() else {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "batch_busy", "retryable": true })),
+            );
+        };
+
+        let transactions = batch.transactions.into_inner();
+        let mut results = Vec::with_capacity(transactions.len());
+        let mut inserted = Vec::new();
+        for (index, transaction) in transactions.into_iter().enumerate() {
+            let ((status, Json(mut payload)), was_inserted) =
+                Self::explorer_admit_transaction(&state, &transaction).await;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("index".into(), json!(index));
+                object.insert("http_status".into(), json!(status.as_u16()));
+            } else {
+                payload = json!({
+                    "index": index,
+                    "http_status": status.as_u16(),
+                    "response": payload,
+                });
+            }
+            results.push(payload);
+            if was_inserted {
+                inserted.push(transaction);
+            }
+        }
+
+        if !inserted.is_empty() {
+            let node = state.node.clone();
+            tokio::spawn(async move { node.gossip_transactions(&inserted).await });
+        }
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "ok": results.iter().all(|item| {
+                    item.get("http_status").and_then(Value::as_u64).is_some_and(|code| code < 400)
+                }),
+                "version": 1,
+                "count": results.len(),
+                "results": results,
+            })),
+        )
     }
 
     /// Start the explorer API iff ALPHANUMERIC_EXPLORER_API is set. Accepts
@@ -7097,6 +7432,7 @@ impl Node {
             start_time: self.start_time,
             network_id: self.network_id,
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
+            batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
         };
 
@@ -7123,6 +7459,11 @@ impl Node {
             .route(
                 "/explorer/submit-tx",
                 axum::routing::post(Self::explorer_submit_tx_handler),
+            )
+            .route(
+                "/explorer/submit-tx-batch",
+                axum::routing::post(Self::explorer_submit_tx_batch_handler)
+                    .layer(DefaultBodyLimit::max(EXPLORER_BATCH_BODY_MAX_BYTES)),
             )
             .with_state(state);
 
@@ -9501,21 +9842,24 @@ impl Node {
     }
 
     fn tcp_capability_node_id(base_node_id: &str) -> String {
+        let mut advertised = base_node_id.to_string();
         if TCP_COMPACT_V1_ENABLED {
-            format!("{}{}", base_node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
-        } else {
-            base_node_id.to_string()
+            advertised.push_str(COMPACT_BLOCK_V1_CAPABILITY_SUFFIX);
         }
+        if TX_INVENTORY_V1_ENABLED {
+            advertised.push_str(TX_INVENTORY_V1_CAPABILITY_SUFFIX);
+        }
+        advertised
     }
 
-    fn observe_compact_capability(&self, addr: SocketAddr, advertised_node_id: &str) {
-        if !TCP_COMPACT_V1_ENABLED {
-            return;
+    fn observe_tcp_capabilities(&self, addr: SocketAddr, advertised_node_id: &str) {
+        if Self::advertises_compact_v1(advertised_node_id) {
+            self.compact_capable_peers.insert(addr, Instant::now());
         }
-        if !Self::advertises_compact_v1(advertised_node_id) {
-            return;
+        if Self::advertises_transaction_inventory_v1(advertised_node_id) {
+            self.transaction_inventory_capable_peers
+                .insert(addr, Instant::now());
         }
-        self.compact_capable_peers.insert(addr, Instant::now());
     }
 
     fn advertises_compact_v1(advertised_node_id: &str) -> bool {
@@ -9526,17 +9870,31 @@ impl Node {
     }
 
     fn compact_v1_marker_well_formed(advertised_node_id: &str) -> bool {
-        let Some(base_id) = advertised_node_id.strip_suffix(COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
-        else {
+        Self::capability_marker_well_formed(advertised_node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
+    }
+
+    fn advertises_transaction_inventory_v1(advertised_node_id: &str) -> bool {
+        TX_INVENTORY_V1_ENABLED
+            && Self::capability_marker_well_formed(
+                advertised_node_id,
+                TX_INVENTORY_V1_CAPABILITY_SUFFIX,
+            )
+    }
+
+    fn capability_marker_well_formed(advertised_node_id: &str, suffix: &str) -> bool {
+        let mut parts = advertised_node_id.split('|');
+        let Some(base_id) = parts.next() else {
             return false;
         };
         // The authenticated session prevents off-path capability injection.
         // Require the established 32-byte node-id shape as well so an arbitrary
         // ping payload cannot accidentally enable an extension.
-        base_id.len() == 64
+        let base_valid = base_id.len() == 64
             && hex::decode(base_id)
                 .map(|bytes| bytes.len() == 32)
-                .unwrap_or(false)
+                .unwrap_or(false);
+        let marker = suffix.strip_prefix('|').unwrap_or(suffix);
+        base_valid && parts.any(|part| part == marker)
     }
 
     fn tcp_compact_peer_eligible(advertised_fresh: bool) -> bool {
@@ -9559,6 +9917,23 @@ impl Node {
         }
     }
 
+    fn peer_supports_transaction_inventory_v1(&self, addr: SocketAddr) -> bool {
+        if !TX_INVENTORY_V1_ENABLED {
+            return false;
+        }
+        let fresh = self
+            .transaction_inventory_capable_peers
+            .get(&addr)
+            .map(|seen| seen.elapsed() < TX_INVENTORY_CAPABILITY_TTL)
+            .unwrap_or(false);
+        if fresh {
+            true
+        } else {
+            self.transaction_inventory_capable_peers.remove(&addr);
+            false
+        }
+    }
+
     // Peer health check implementation
     async fn check_peer_health_internal(&self, addr: SocketAddr) -> Result<(), NodeError> {
         // Simple ping-pong health check
@@ -9577,7 +9952,7 @@ impl Node {
 
         match response {
             NetworkMessage::Pong { timestamp, node_id } => {
-                self.observe_compact_capability(addr, &node_id);
+                self.observe_tcp_capabilities(addr, &node_id);
                 if now.abs_diff(timestamp) <= 5 {
                     Ok(())
                 } else {
@@ -9643,6 +10018,10 @@ impl Node {
         self.compact_capable_peers.retain(|addr, seen| {
             active_peers.contains(addr) && seen.elapsed() < COMPACT_CAPABILITY_TTL
         });
+        self.transaction_inventory_capable_peers
+            .retain(|addr, seen| {
+                active_peers.contains(addr) && seen.elapsed() < TX_INVENTORY_CAPABILITY_TTL
+            });
         self.compact_inflight
             .retain(|_, state| state.started.elapsed() < COMPACT_INFLIGHT_TTL);
 
@@ -12181,65 +12560,65 @@ impl Node {
         Ok(message)
     }
 
+    /// Exact, canonical transaction admission for non-TCP-event transports.
+    /// Returns true only for a new insertion and performs no network I/O, so a
+    /// caller can aggregate several successes into one inventory announcement.
+    async fn admit_network_event_transaction(&self, tx: &Transaction) -> Result<bool, NodeError> {
+        let tx_key = Self::transaction_ingress_key(tx);
+        let claim = match self.transaction_deduper.claim(tx_key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            TransactionClaimResult::DuplicateAccepted
+            | TransactionClaimResult::DuplicateInflight => return Ok(false),
+            TransactionClaimResult::Saturated => {
+                debug!("Deferring transaction: exact ingress work cache is saturated");
+                return Ok(false);
+            }
+        };
+
+        if !self.validate_transaction(tx, None).await? {
+            return Ok(false);
+        }
+        // Render the non-Send BlockchainError before later awaits.
+        let admission = {
+            let blockchain = self.blockchain.read().await;
+            match blockchain.admit_transaction(tx.clone()).await {
+                Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => Some(Ok(true)),
+                Ok(
+                    crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending
+                    | crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(_),
+                ) => Some(Ok(false)),
+                // Policy reject, not a fault — don't error-spam an event pump or
+                // fail the remaining independent items in a transport batch.
+                Err(BlockchainError::FeeBelowRelayFloor) => None,
+                Err(e) => Some(Err(NodeError::from(e))),
+            }
+        };
+        let inserted = match admission {
+            Some(Ok(inserted)) => inserted,
+            Some(Err(e)) => return Err(e),
+            None => {
+                debug!("Dropping below-floor-fee gossip tx");
+                return Ok(false);
+            }
+        };
+        claim.commit();
+
+        if inserted {
+            self.seed_compact_index_from_admitted_transaction(tx).await;
+        }
+        Ok(inserted)
+    }
+
     pub async fn handle_network_event(&self, event: NetworkEvent) -> Result<(), NodeError> {
         match event {
             NetworkEvent::NewTransaction(tx) => {
-                let tx_key = Self::transaction_ingress_key(&tx);
-                let claim = match self.transaction_deduper.claim(tx_key) {
-                    TransactionClaimResult::Claimed(claim) => claim,
-                    TransactionClaimResult::DuplicateAccepted
-                    | TransactionClaimResult::DuplicateInflight => return Ok(()),
-                    TransactionClaimResult::Saturated => {
-                        debug!("Deferring transaction: exact ingress work cache is saturated");
-                        return Ok(());
-                    }
-                };
-
-                // Validate transaction before adding
-                if self.validate_transaction(&tx, None).await? {
-                    // Classify admission atomically so only a genuinely new insertion is
-                    // announced. Render the non-Send error away before any later await.
-                    let admission = {
-                        let blockchain = self.blockchain.read().await;
-                        match blockchain.admit_transaction(tx.clone()).await {
-                            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
-                                Some(Ok(true))
-                            }
-                            Ok(
-                                crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending
-                                | crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(_),
-                            ) => Some(Ok(false)),
-                            // Policy reject, not a fault — don't error!-spam the event pump for
-                            // pre-floor peers' cheap transactions.
-                            Err(BlockchainError::FeeBelowRelayFloor) => None,
-                            Err(e) => Some(Err(NodeError::from(e))),
-                        }
-                    };
-                    let inserted = match admission {
-                        Some(Ok(inserted)) => inserted,
-                        Some(Err(e)) => return Err(e),
-                        None => {
-                            debug!("Dropping below-floor-fee gossip tx");
-                            return Ok(());
-                        }
-                    };
-                    claim.commit();
-
-                    if inserted {
-                        self.seed_compact_index_from_admitted_transaction(&tx).await;
-
-                        // SPAWN the gossip off the single-consumer event pump: gossip_transaction
-                        // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
-                        // costs a full 5s TCP connect — awaiting it inline stalled the pump (the
-                        // ONLY server of GetBlocks/ChainRequest) for up to ~40s per inbound tx,
-                        // timing out syncing peers' block fetches (2026-07-12 audit). Same spawn
-                        // pattern as the re-announce and create paths.
-                        let node = self.clone();
-                        let gossip_tx = tx.clone();
-                        tokio::spawn(async move {
-                            node.gossip_transaction(&gossip_tx).await;
-                        });
-                    }
+                if self.admit_network_event_transaction(&tx).await? {
+                    // SPAWN gossip off the single-consumer event pump. Network I/O
+                    // can take seconds; canonical admission is already complete.
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        node.gossip_transaction(&tx).await;
+                    });
                 }
             }
 
@@ -12366,6 +12745,7 @@ impl Node {
                 self.outbound_connections.write().await.remove(&addr);
                 self.outbound_circuit_breakers.write().await.remove(&addr);
                 self.compact_capable_peers.remove(&addr);
+                self.transaction_inventory_capable_peers.remove(&addr);
 
                 // If peer count too low, trigger discovery
                 let peer_count = self.peers.read().await.len();
@@ -12506,6 +12886,14 @@ impl Node {
         if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(&message) {
             return Ok(None);
         }
+        if Self::is_transaction_inventory_extension(&message)
+            && (!TX_INVENTORY_V1_ENABLED || !self.peer_supports_transaction_inventory_v1(addr))
+        {
+            // Unknown variants disconnect old peers, so senders are capability
+            // gated. Apply the symmetric ingress gate: a peer cannot activate
+            // this work merely by sending an extension variant.
+            return Ok(None);
+        }
 
         // Deduplicate non-transaction gossip only. Transactions use the exact full-witness
         // accepted/in-flight cache in their match arm below: a probabilistic Bloom hit must never
@@ -12533,6 +12921,106 @@ impl Node {
         }
 
         match message {
+            NetworkMessage::TransactionInventoryV1 { keys } => {
+                if raw.len() > TX_RELAY_INVENTORY_MAX_BYTES {
+                    self.record_peer_failure(addr).await;
+                    return Err(NodeError::Network(
+                        "Transaction inventory exceeds byte limit".into(),
+                    ));
+                }
+                let mut unique = HashSet::with_capacity(keys.as_slice().len());
+                let requested: Vec<[u8; 32]> = keys
+                    .into_inner()
+                    .into_iter()
+                    .filter(|key| unique.insert(*key))
+                    .filter(|key| !self.transaction_deduper.is_known(key))
+                    .collect();
+                self.pending_transaction_body_requests.lock().record(
+                    addr,
+                    &requested,
+                    Instant::now(),
+                );
+                let keys = BoundedSequence::new(requested)
+                    .map_err(|e| NodeError::Network(e.to_string()))?;
+                return Ok(Some(NetworkMessage::GetTransactionsV1 { keys }));
+            }
+
+            NetworkMessage::GetTransactionsV1 { .. } => {
+                // This is a correlated response to TransactionInventoryV1 and is
+                // consumed synchronously by send_message_with_response. An
+                // unsolicited copy has no cache context and cannot be served.
+            }
+
+            NetworkMessage::TransactionsV1 { transactions } => {
+                if raw.len() > TX_RELAY_BODY_MAX_BYTES {
+                    self.record_peer_failure(addr).await;
+                    return Err(NodeError::Network(
+                        "Transaction body batch exceeds byte limit".into(),
+                    ));
+                }
+                let mut inserted = Vec::new();
+                let work_key = format!("tx_batch_work:{}", addr);
+                let mut key_fault_recorded = false;
+                let mut unsolicited_fault_recorded = false;
+                for body in transactions.into_inner() {
+                    let actual_key = Self::transaction_ingress_key(&body.transaction);
+                    if actual_key != body.key {
+                        if !key_fault_recorded {
+                            self.record_peer_failure(addr).await;
+                            key_fault_recorded = true;
+                        }
+                        debug!("Rejected transaction body with mismatched inventory key");
+                        continue;
+                    }
+                    // Settled exact echoes are free. Unique/in-flight work is
+                    // charged independently even though the outer envelope spent
+                    // only one generic message token.
+                    if self.transaction_deduper.is_accepted(&actual_key) {
+                        continue;
+                    }
+                    if !self.pending_transaction_body_requests.lock().take(
+                        addr,
+                        &actual_key,
+                        Instant::now(),
+                    ) {
+                        if !unsolicited_fault_recorded {
+                            self.record_peer_failure(addr).await;
+                            unsolicited_fault_recorded = true;
+                        }
+                        debug!("Rejected unsolicited transaction body batch item");
+                        continue;
+                    }
+                    if !self.transaction_relay_work_limiter.check_limit(&work_key) {
+                        debug!(
+                            "Deferring transaction body batch from {}: peer work limit reached",
+                            addr
+                        );
+                        break;
+                    }
+                    let transaction = body.transaction;
+                    match self.admit_network_event_transaction(&transaction).await {
+                        Ok(true) => inserted.push(transaction),
+                        Ok(false) => {}
+                        Err(error) => {
+                            // Item failures are independent by construction. Match
+                            // legacy transaction ingress and silently leave bad or
+                            // transiently inadmissible items eligible for a retry.
+                            debug!(
+                                "Rejected transaction body from {} without aborting batch: {}",
+                                addr, error
+                            );
+                        }
+                    }
+                }
+                if !inserted.is_empty() {
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        node.gossip_transactions_excluding(&inserted, Some(addr))
+                            .await;
+                    });
+                }
+            }
+
             NetworkMessage::TxRequest { tx_id } => {
                 let mempool_tx = self
                     .blockchain
@@ -13141,7 +13629,7 @@ impl Node {
             }
 
             NetworkMessage::Ping { timestamp, node_id } => {
-                self.observe_compact_capability(addr, &node_id);
+                self.observe_tcp_capabilities(addr, &node_id);
                 // Update peer info
                 let mut peers = self.peers.write().await;
                 if let Some(info) = peers.get_mut(&addr) {
@@ -13158,7 +13646,7 @@ impl Node {
             }
 
             NetworkMessage::Pong { timestamp, node_id } => {
-                self.observe_compact_capability(addr, &node_id);
+                self.observe_tcp_capabilities(addr, &node_id);
                 // Calculate and update latency
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -13252,6 +13740,15 @@ impl Node {
         )
     }
 
+    fn is_transaction_inventory_extension(message: &NetworkMessage) -> bool {
+        matches!(
+            message,
+            NetworkMessage::TransactionInventoryV1 { .. }
+                | NetworkMessage::GetTransactionsV1 { .. }
+                | NetworkMessage::TransactionsV1 { .. }
+        )
+    }
+
     fn should_dedup_message(message: &NetworkMessage) -> bool {
         matches!(
             message,
@@ -13270,8 +13767,159 @@ impl Node {
         source: SocketAddr,
         peers: Vec<SocketAddr>,
     ) -> Result<(), NodeError> {
-        // Don't broadcast to source peer
-        let targets: Vec<_> = peers.into_iter().filter(|&addr| addr != source).collect();
+        self.broadcast_transactions(vec![tx], Some(source), peers)
+            .await
+    }
+
+    async fn send_legacy_transaction_batch(
+        &self,
+        peer: SocketAddr,
+        transactions: &[Arc<Transaction>],
+    ) -> Result<(), NodeError> {
+        for transaction in transactions {
+            self.send_message(peer, &NetworkMessage::Transaction((**transaction).clone()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send_transaction_inventory_batch(
+        &self,
+        peer: SocketAddr,
+        transactions: &[Arc<Transaction>],
+    ) -> Result<(), NodeError> {
+        let mut by_key = HashMap::with_capacity(transactions.len());
+        for transaction in transactions {
+            by_key
+                .entry(Self::transaction_ingress_key(transaction))
+                .or_insert_with(|| Arc::clone(transaction));
+        }
+        let announced_keys: Vec<[u8; 32]> = by_key.keys().copied().collect();
+        let announcement = NetworkMessage::TransactionInventoryV1 {
+            keys: BoundedSequence::new(announced_keys.clone())
+                .map_err(|e| NodeError::Network(e.to_string()))?,
+        };
+        if codec::serialize(&announcement)?.len() > TX_RELAY_INVENTORY_MAX_BYTES {
+            return Err(NodeError::Network(
+                "Transaction inventory exceeds construction byte limit".into(),
+            ));
+        }
+
+        let response = self.send_message_with_response(peer, &announcement).await?;
+        let NetworkMessage::GetTransactionsV1 { keys } = response else {
+            return Err(NodeError::Network(
+                "Unexpected transaction inventory response".into(),
+            ));
+        };
+
+        let mut seen = HashSet::with_capacity(keys.as_slice().len());
+        let mut requested = Vec::with_capacity(keys.as_slice().len());
+        for key in keys.into_inner() {
+            if !seen.insert(key) {
+                self.record_peer_failure(peer).await;
+                return Err(NodeError::Network(
+                    "Peer requested duplicate or unannounced transaction body".into(),
+                ));
+            }
+            let Some(transaction) = by_key.get(&key) else {
+                self.record_peer_failure(peer).await;
+                return Err(NodeError::Network(
+                    "Peer requested duplicate or unannounced transaction body".into(),
+                ));
+            };
+            requested.push(Arc::clone(transaction));
+        }
+
+        // Chunk by both item count and actual legacy transaction encoding size.
+        // A transaction too large for the body budget retains the ordinary
+        // single-message fallback instead of becoming unrelayable.
+        let mut body: Vec<TransactionBodyV1> = Vec::new();
+        let mut body_bytes = 0usize;
+        for transaction in requested {
+            let wire_body = TransactionBodyV1 {
+                key: Self::transaction_ingress_key(&transaction),
+                transaction: (*transaction).clone(),
+            };
+            let transaction_bytes = codec::serialize(&wire_body)?.len();
+            if transaction_bytes > TX_RELAY_BODY_MAX_BYTES {
+                if !body.is_empty() {
+                    self.send_transaction_body_batch(peer, std::mem::take(&mut body))
+                        .await?;
+                    body_bytes = 0;
+                }
+                self.send_message(peer, &NetworkMessage::Transaction((*transaction).clone()))
+                    .await?;
+                continue;
+            }
+            if !body.is_empty()
+                && (body.len() == TX_RELAY_BATCH_MAX
+                    || body_bytes.saturating_add(transaction_bytes) > TX_RELAY_BODY_MAX_BYTES)
+            {
+                self.send_transaction_body_batch(peer, std::mem::take(&mut body))
+                    .await?;
+                body_bytes = 0;
+            }
+            body_bytes = body_bytes.saturating_add(transaction_bytes);
+            body.push(wire_body);
+        }
+        if !body.is_empty() {
+            self.send_transaction_body_batch(peer, body).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_transaction_body_batch(
+        &self,
+        peer: SocketAddr,
+        transactions: Vec<TransactionBodyV1>,
+    ) -> Result<(), NodeError> {
+        let message = NetworkMessage::TransactionsV1 {
+            transactions: BoundedSequence::new(transactions)
+                .map_err(|e| NodeError::Network(e.to_string()))?,
+        };
+        if codec::serialize(&message)?.len() > TX_RELAY_BODY_MAX_BYTES {
+            return Err(NodeError::Network(
+                "Transaction body batch exceeds construction byte limit".into(),
+            ));
+        }
+        self.send_message(peer, &message).await
+    }
+
+    async fn send_transaction_batch_to_peer(
+        &self,
+        peer: SocketAddr,
+        transactions: &[Arc<Transaction>],
+    ) -> Result<(), NodeError> {
+        for chunk in transactions.chunks(TX_RELAY_BATCH_MAX) {
+            if self.peer_supports_transaction_inventory_v1(peer) {
+                if let Err(error) = self.send_transaction_inventory_batch(peer, chunk).await {
+                    // A stale/misadvertised capability must never make delivery
+                    // worse than the legacy network. Forget it and immediately
+                    // retry unchanged full Transaction messages.
+                    self.transaction_inventory_capable_peers.remove(&peer);
+                    debug!(
+                        "Transaction inventory relay to {} failed ({}); using legacy fallback",
+                        peer, error
+                    );
+                    self.send_legacy_transaction_batch(peer, chunk).await?;
+                }
+            } else {
+                self.send_legacy_transaction_batch(peer, chunk).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn broadcast_transactions(
+        &self,
+        transactions: Vec<Arc<Transaction>>,
+        source: Option<SocketAddr>,
+        peers: Vec<SocketAddr>,
+    ) -> Result<(), NodeError> {
+        let targets: Vec<_> = peers
+            .into_iter()
+            .filter(|addr| Some(*addr) != source)
+            .collect();
         if targets.is_empty() {
             return Ok(());
         }
@@ -13280,8 +13928,9 @@ impl Node {
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
+        let transactions = Arc::new(transactions);
         let broadcast_futures = targets.into_iter().map(|peer| {
-            let tx = Arc::clone(&tx);
+            let transactions = Arc::clone(&transactions);
             let permit = semaphore.clone().acquire_owned();
             let node = self.clone();
 
@@ -13289,7 +13938,7 @@ impl Node {
                 let _permit = permit.await.map_err(|e| {
                     NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
                 })?;
-                node.send_message(peer, &NetworkMessage::Transaction((*tx).clone()))
+                node.send_transaction_batch_to_peer(peer, &transactions)
                     .await
             }
         });
@@ -13717,40 +14366,69 @@ impl Node {
     /// time-boxed and the peers guard is snapshot-then-drop (never held across an await — the
     /// 2026-07-08/09 wedge class).
     pub async fn gossip_transaction(&self, tx_ref: &Transaction) {
-        // Confirm O(1) mempool membership before treating this as verified. This
-        // covers local CLI and periodic re-gossip paths while avoiding any
-        // per-announcement scan of the up-to-50k transaction pool.
-        if !self
-            .seed_compact_index_from_admitted_transaction(tx_ref)
-            .await
-        {
-            debug!("Skipping transaction gossip because it is no longer admitted");
+        self.gossip_transactions(std::slice::from_ref(tx_ref)).await;
+    }
+
+    pub async fn gossip_transactions(&self, transactions: &[Transaction]) {
+        self.gossip_transactions_excluding(transactions, None).await;
+    }
+
+    async fn gossip_transactions_excluding(
+        &self,
+        transactions: &[Transaction],
+        source: Option<SocketAddr>,
+    ) {
+        for chunk in transactions.chunks(TX_RELAY_BATCH_MAX) {
+            self.gossip_transaction_chunk_excluding(chunk, source).await;
+        }
+    }
+
+    async fn gossip_transaction_chunk_excluding(
+        &self,
+        transactions: &[Transaction],
+        source: Option<SocketAddr>,
+    ) {
+        let mut admitted = Vec::with_capacity(transactions.len());
+        let mut seen = HashSet::with_capacity(transactions.len());
+        for transaction in transactions {
+            // Confirm O(1) mempool membership before treating this as verified.
+            // This covers local/API/re-gossip paths and prevents a stale caller
+            // from marking arbitrary bytes accepted merely by announcing them.
+            if !self
+                .seed_compact_index_from_admitted_transaction(transaction)
+                .await
+            {
+                debug!("Skipping transaction gossip because it is no longer admitted");
+                continue;
+            }
+            let key = Self::transaction_ingress_key(transaction);
+            if !seen.insert(key) {
+                continue;
+            }
+            self.transaction_deduper.mark_accepted(key);
+            admitted.push(Arc::new(transaction.clone()));
+        }
+        if admitted.is_empty() {
             return;
         }
-        self.transaction_deduper
-            .mark_accepted(Self::transaction_ingress_key(tx_ref));
 
         #[cfg(feature = "webrtc_mesh")]
-        self.mesh_gossip(&NetworkMessage::Transaction(tx_ref.clone()))
-            .await;
+        for transaction in &admitted {
+            // WebRTC remains on the stable full-body variant. Capability
+            // negotiation belongs to authenticated TCP Ping/Pong sessions.
+            self.mesh_gossip(&NetworkMessage::Transaction((**transaction).clone()))
+                .await;
+        }
 
         let selected_peers = {
             let peers = self.peers.read().await;
             self.select_broadcast_peers(&peers, peers.len().min(8))
         };
-        for &addr in &selected_peers {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.send_message(addr, &NetworkMessage::Transaction(tx_ref.clone())),
-            )
+        if let Err(error) = self
+            .broadcast_transactions(admitted, source, selected_peers)
             .await
-            {
-                Ok(Err(e)) => {
-                    warn!("Failed to broadcast transaction to {}: {}", addr, e)
-                }
-                Err(_) => warn!("Transaction broadcast to {} timed out", addr),
-                Ok(Ok(())) => {}
-            }
+        {
+            warn!("Failed to broadcast transaction batch: {}", error);
         }
     }
 
@@ -14527,6 +15205,7 @@ impl Node {
             .await
             .remove(&peer_addr);
         self.compact_capable_peers.remove(&peer_addr);
+        self.transaction_inventory_capable_peers.remove(&peer_addr);
 
         // Notify disconnect. Same rationale as the PeerJoin try_send above.
         if let Err(e) = tx.try_send(NetworkEvent::PeerLeave(peer_addr)) {
@@ -14608,7 +15287,7 @@ impl Node {
 
         match response {
             NetworkMessage::Pong { timestamp, node_id } => {
-                self.observe_compact_capability(addr, &node_id);
+                self.observe_tcp_capabilities(addr, &node_id);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -17893,8 +18572,8 @@ mod tests {
         );
         assert_eq!(
             Node::tcp_capability_node_id(&node_id),
-            node_id,
-            "the local ping/pong node id must not emit the capability suffix"
+            format!("{}{}", node_id, TX_INVENTORY_V1_CAPABILITY_SUFFIX),
+            "the local ping/pong id advertises transaction inventory but must not emit dormant compact capability"
         );
         assert!(
             !Node::tcp_compact_peer_eligible(true),
@@ -17940,6 +18619,624 @@ mod tests {
         assert!(!Node::is_tcp_compact_extension(&NetworkMessage::Block(
             compact_test_block()
         )));
+    }
+
+    #[test]
+    fn transaction_inventory_capability_is_exact_and_composable() {
+        let node_id = "ab".repeat(32);
+        let advertised = Node::tcp_capability_node_id(&node_id);
+        assert!(Node::advertises_transaction_inventory_v1(&advertised));
+        assert!(!Node::advertises_transaction_inventory_v1(&node_id));
+        assert!(!advertised.contains(COMPACT_BLOCK_V1_CAPABILITY_SUFFIX));
+
+        let combined = format!(
+            "{}{}{}",
+            node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX, TX_INVENTORY_V1_CAPABILITY_SUFFIX
+        );
+        assert!(Node::compact_v1_marker_well_formed(&combined));
+        assert!(Node::advertises_transaction_inventory_v1(&combined));
+
+        assert!(!Node::advertises_transaction_inventory_v1(&format!(
+            "{}{}",
+            "zz".repeat(32),
+            TX_INVENTORY_V1_CAPABILITY_SUFFIX
+        )));
+        assert!(!Node::advertises_transaction_inventory_v1(
+            TX_INVENTORY_V1_CAPABILITY_SUFFIX
+        ));
+        assert!(!Node::advertises_transaction_inventory_v1(&format!(
+            "{}|a9-tx-inventory-v10",
+            node_id
+        )));
+    }
+
+    #[test]
+    fn bounded_sequence_rejects_oversized_declared_and_json_counts() {
+        let at_limit = vec![[7u8; 32]; TX_RELAY_BATCH_MAX];
+        let encoded = codec::serialize(&at_limit).unwrap();
+        let decoded: BoundedSequence<[u8; 32], TX_RELAY_BATCH_MAX> =
+            codec::deserialize(&encoded).expect("declared count at ceiling");
+        assert_eq!(decoded.as_slice(), at_limit.as_slice());
+
+        let over_limit = vec![[7u8; 32]; TX_RELAY_BATCH_MAX + 1];
+        let encoded = codec::serialize(&over_limit).unwrap();
+        assert!(
+            codec::deserialize::<BoundedSequence<[u8; 32], TX_RELAY_BATCH_MAX>>(&encoded).is_err()
+        );
+
+        // JSON arrays carry no count declaration. The custom visitor retains at
+        // most MAX values and decodes the first excess item as IgnoredAny rather
+        // than allocating another full transaction-sized value.
+        let json = serde_json::to_vec(&vec![1u8; TX_RELAY_BATCH_MAX + 1]).unwrap();
+        assert!(serde_json::from_slice::<BoundedSequence<u8, TX_RELAY_BATCH_MAX>>(&json).is_err());
+    }
+
+    #[test]
+    fn transaction_batch_work_budget_covers_pool_round_and_stays_finite() {
+        let limiter = RateLimiter::new(60, TX_RELAY_PEER_WORK_PER_MINUTE);
+        for _ in 0..TX_RELAY_PEER_WORK_PER_MINUTE {
+            assert!(limiter.check_limit("one-peer"));
+        }
+        assert!(!limiter.check_limit("one-peer"));
+        assert!(limiter.check_limit("independent-peer"));
+    }
+
+    #[test]
+    fn pending_transaction_body_requests_are_exact_consumable_and_bounded() {
+        let peer = SocketAddr::from(([203, 0, 113, 10], 7_177));
+        let other_peer = SocketAddr::from(([203, 0, 113, 11], 7_177));
+        let now = Instant::now();
+        let mut requests = PendingTransactionBodyRequests::new(2, Duration::from_secs(60));
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+
+        requests.record(peer, &[first, second], now);
+        assert!(requests.take(peer, &first, now));
+        assert!(!requests.take(peer, &first, now), "a request is one-use");
+        assert!(
+            !requests.take(other_peer, &second, now),
+            "authorization is bound to the serving peer"
+        );
+        assert!(requests.take(peer, &second, now));
+
+        let many: Vec<[u8; 32]> = (0..10).map(|value| [value; 32]).collect();
+        requests.record(peer, &many, now);
+        assert!(requests.entries.len() <= 2);
+        assert!(requests.order.len() <= 2);
+
+        let latest = [9u8; 32];
+        assert!(!requests.take(peer, &latest, now + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn transaction_inventory_protocol_round_trips_legacy_transactions() {
+        let transaction = tx_with_signature("ab");
+        let key = Node::transaction_ingress_key(&transaction);
+        let messages = [
+            NetworkMessage::TransactionInventoryV1 {
+                keys: BoundedSequence::new(vec![key]).unwrap(),
+            },
+            NetworkMessage::GetTransactionsV1 {
+                keys: BoundedSequence::new(vec![key]).unwrap(),
+            },
+            NetworkMessage::TransactionsV1 {
+                transactions: BoundedSequence::new(vec![TransactionBodyV1 {
+                    key,
+                    transaction: transaction.clone(),
+                }])
+                .unwrap(),
+            },
+        ];
+        assert!(messages
+            .iter()
+            .all(Node::is_transaction_inventory_extension));
+
+        for message in messages {
+            let encoded = codec::serialize(&message).unwrap();
+            assert!(encoded.len() < TX_RELAY_INVENTORY_MAX_BYTES);
+            let decoded: NetworkMessage = codec::deserialize(&encoded).unwrap();
+            match decoded {
+                NetworkMessage::TransactionInventoryV1 { keys }
+                | NetworkMessage::GetTransactionsV1 { keys } => {
+                    assert_eq!(keys.as_slice(), &[key]);
+                }
+                NetworkMessage::TransactionsV1 { transactions } => {
+                    assert_eq!(transactions.as_slice().len(), 1);
+                    assert_eq!(transactions.as_slice()[0].key, key);
+                    assert_eq!(transactions.as_slice()[0].transaction, transaction);
+                }
+                _ => panic!("wrong transaction inventory extension variant"),
+            }
+        }
+
+        assert!(!Node::is_transaction_inventory_extension(
+            &NetworkMessage::Transaction(transaction)
+        ));
+    }
+
+    #[test]
+    fn full_256_item_mldsa_sized_batch_fits_transport_budgets() {
+        let mut prototype = tx_with_signature(&"ab".repeat(4_627));
+        prototype.pub_key = Some("cd".repeat(2_592));
+        let transactions: Vec<Transaction> = (0..TX_RELAY_BATCH_MAX as u64)
+            .map(|offset| {
+                let mut transaction = prototype.clone();
+                transaction.timestamp = transaction.timestamp.saturating_add(offset);
+                transaction
+            })
+            .collect();
+        let bodies: Vec<TransactionBodyV1> = transactions
+            .iter()
+            .cloned()
+            .map(|transaction| TransactionBodyV1 {
+                key: Node::transaction_ingress_key(&transaction),
+                transaction,
+            })
+            .collect();
+        let message = NetworkMessage::TransactionsV1 {
+            transactions: BoundedSequence::new(bodies.clone()).unwrap(),
+        };
+        let encoded = codec::serialize(&message).unwrap();
+        assert!(
+            encoded.len() <= TX_RELAY_BODY_MAX_BYTES,
+            "256 current-size witnesses must fit the body budget: {} bytes",
+            encoded.len()
+        );
+        let json_body = serde_json::to_vec(&json!({
+            "version": 1,
+            "transactions": &transactions,
+        }))
+        .unwrap();
+        assert!(
+            json_body.len() <= EXPLORER_BATCH_BODY_MAX_BYTES,
+            "256 current-size witnesses must fit the HTTP body budget: {} bytes",
+            json_body.len()
+        );
+        let decoded_http: ExplorerTransactionBatchV1 =
+            serde_json::from_slice(&json_body).expect("bounded HTTP envelope round trip");
+        assert_eq!(decoded_http.version, 1);
+        assert_eq!(
+            decoded_http.transactions.as_slice(),
+            transactions.as_slice()
+        );
+        match codec::deserialize::<NetworkMessage>(&encoded).unwrap() {
+            NetworkMessage::TransactionsV1 {
+                transactions: decoded,
+            } => assert_eq!(decoded.as_slice(), bodies.as_slice()),
+            _ => panic!("wrong 256-payment body variant"),
+        }
+    }
+
+    /// Release canary for the transaction batching/inventory rollout. This intentionally does
+    /// not call `Node::start`: only the explicit loopback listeners below run, so discovery,
+    /// announce, relay, WebRTC, stats, explorer and bootstrap publisher tasks cannot start or
+    /// contact production services. Every sled database is temporary and every listener binds
+    /// 127.0.0.1:0; dropping the test runtime removes the databases and identity-lock files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "hermetic release canary: signs and relays 221 ML-DSA transactions"]
+    async fn isolated_mixed_version_transaction_relay_release_canary() {
+        use crate::a9::blockchain::FEE_PERCENTAGE;
+        use crate::a9::wallet::Wallet;
+        use ring::rand::SystemRandom;
+        use sysinfo::{Pid, System};
+
+        // main() installs this process-wide before constructing a Node. The library test owns its
+        // process and must mirror that initialization even though the canary never performs HTTP.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        const CANARY_TRANSACTION_COUNT: usize = 221;
+        const LEGACY_SAMPLE_COUNT: usize = 32;
+        const FUNDED_UNITS: i128 = 10_000_000_000;
+        const MAX_CANARY_RSS_GROWTH: u64 = 512 * 1024 * 1024;
+
+        fn process_rss_bytes() -> u64 {
+            let mut system = System::new();
+            system.refresh_processes();
+            system
+                .process(Pid::from_u32(std::process::id()))
+                .map(|process| process.memory())
+                .unwrap_or(0)
+        }
+
+        async fn canary_node(funded_addresses: &[String]) -> Node {
+            let db = sled::Config::new()
+                .temporary(true)
+                .flush_every_ms(Some(50))
+                .open()
+                .expect("temporary canary sled database");
+            let blockchain = Blockchain::new(
+                db.clone(),
+                FEE_PERCENTAGE,
+                50.0,
+                100,
+                5,
+                Arc::new(RateLimiter::new(60, 10_000)),
+                Arc::new(Mutex::new(0)),
+            );
+            blockchain
+                .create_genesis_block()
+                .await
+                .expect("canary genesis");
+            blockchain.initialize().await.expect("canary chain init");
+            let balances = blockchain
+                .db
+                .open_tree("balances")
+                .expect("canary balances tree");
+            for address in funded_addresses {
+                balances
+                    .insert(
+                        address.as_bytes(),
+                        codec::serialize(&FUNDED_UNITS).expect("serialize canary balance"),
+                    )
+                    .expect("fund canary address");
+            }
+            balances.flush().expect("flush canary balances");
+
+            let rng = SystemRandom::new();
+            let handshake_key = Ed25519KeyPair::generate_pkcs8(&rng)
+                .expect("canary handshake key")
+                .as_ref()
+                .to_vec();
+            let blockchain = Arc::new(RwLock::new(blockchain));
+            let mut node = Node::new(
+                Arc::new(db),
+                blockchain,
+                handshake_key,
+                NodeRuntimeConfig {
+                    bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                    velocity_enabled: false,
+                    max_peers: 16,
+                    max_connections: 32,
+                    seed_nodes: Vec::new(),
+                    data_dir: None,
+                },
+            )
+            .await
+            .expect("construct isolated canary node");
+            node.bind_addr = node
+                .listener
+                .as_ref()
+                .expect("canary loopback listener")
+                .local_addr()
+                .expect("canary listener address");
+            assert!(node.bind_addr.ip().is_loopback());
+            node
+        }
+
+        fn spawn_canary_acceptor(
+            node: &Node,
+        ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+            let listener = Arc::clone(node.listener.as_ref().expect("canary listener"));
+            let serving_node = node.clone();
+            let (event_tx, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let event_drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+            let acceptor = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, address)) = listener.accept().await else {
+                        return;
+                    };
+                    let node = serving_node.clone();
+                    let tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = node.handle_connection(stream, address, tx).await;
+                    });
+                }
+            });
+            (acceptor, event_drain)
+        }
+
+        fn pending_count(node: &Node) -> usize {
+            node.db
+                .open_tree("pending_transactions")
+                .expect("canary pending tree")
+                .len()
+        }
+
+        async fn wait_for_pending(node: &Node, expected: usize, label: &str) {
+            timeout(Duration::from_secs(90), async {
+                loop {
+                    if pending_count(node) >= expected {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{label} did not reach {expected} pending transactions (got {})",
+                    pending_count(node)
+                )
+            });
+        }
+
+        let wallets = [
+            Wallet::new(None).expect("canary wallet 1"),
+            Wallet::new(None).expect("canary wallet 2"),
+            Wallet::new(None).expect("canary wallet 3"),
+        ];
+        let funded_addresses: Vec<String> = wallets
+            .iter()
+            .map(|wallet| wallet.address.clone())
+            .collect();
+        let public_keys =
+            futures::future::join_all(wallets.iter().map(|wallet| wallet.get_public_key_hex()))
+                .await;
+        let base_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(1_000);
+        let mut transactions = Vec::with_capacity(CANARY_TRANSACTION_COUNT);
+        for index in 0..CANARY_TRANSACTION_COUNT {
+            let wallet_index = index % wallets.len();
+            let wallet = &wallets[wallet_index];
+            let recipient = format!("{:040x}", index + 1);
+            let timestamp = base_timestamp.saturating_add(index as u64);
+            let amount = 1.0;
+            let fee = amount * FEE_PERCENTAGE;
+            let message = format!(
+                "{}:{}:{:.8}:{:.8}:{}",
+                wallet.address, recipient, amount, fee, timestamp
+            );
+            let signature = wallet
+                .sign_transaction(message.as_bytes())
+                .await
+                .expect("sign canary transaction");
+            let signature_bytes = hex::decode(&signature).expect("decode canary signature");
+            let mut transaction = Transaction::new(
+                wallet.address.clone(),
+                recipient,
+                amount,
+                fee,
+                timestamp,
+                Some(signature),
+            );
+            transaction.pub_key = public_keys[wallet_index].clone();
+            transaction.sig_hash = Some(Transaction::signature_hash_hex(&signature_bytes));
+            transactions.push(transaction);
+        }
+
+        let sender = canary_node(&funded_addresses).await;
+        let new_peer = canary_node(&funded_addresses).await;
+        let legacy_peer = canary_node(&funded_addresses).await;
+        let slow_peer = canary_node(&funded_addresses).await;
+        let mut tasks = Vec::new();
+        for node in [&new_peer, &legacy_peer, &slow_peer] {
+            let (acceptor, drain) = spawn_canary_acceptor(node);
+            tasks.push(acceptor);
+            tasks.push(drain);
+        }
+
+        let rss_before = process_rss_bytes();
+        let explorer_state = ExplorerState {
+            blockchain: Arc::clone(&sender.blockchain),
+            node: sender.clone(),
+            start_time: sender.start_time,
+            network_id: sender.network_id,
+            submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
+            batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
+            read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
+        };
+        let http_started = Instant::now();
+        // Keep the handler's detached gossip at its final peer-snapshot read until all admitted
+        // keys are visible, then release it against an intentionally empty table. This makes the
+        // staged new/legacy timing below deterministic without adding a production-only switch.
+        let empty_peer_guard = sender.peers.write().await;
+        let (status, Json(payload)) = Node::explorer_submit_tx_batch_handler(
+            State(explorer_state),
+            Json(ExplorerTransactionBatchV1 {
+                version: 1,
+                transactions: BoundedSequence::new(transactions.clone())
+                    .expect("bounded canary batch"),
+            }),
+        )
+        .await;
+        let http_elapsed = http_started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(
+            payload.get("count").and_then(Value::as_u64),
+            Some(CANARY_TRANSACTION_COUNT as u64)
+        );
+        wait_for_pending(&sender, CANARY_TRANSACTION_COUNT, "batch submitter").await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if sender.transaction_deduper.accepted.lock().entries.len()
+                    == CANARY_TRANSACTION_COUNT
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("batch handler detached gossip reached peer snapshot");
+        tokio::task::yield_now().await;
+        drop(empty_peer_guard);
+        let peer_snapshot_barrier = sender.peers.write().await;
+        assert!(peer_snapshot_barrier.is_empty());
+        drop(peer_snapshot_barrier);
+
+        sender
+            .send_ping(new_peer.bind_addr)
+            .await
+            .expect("negotiate inventory capability");
+        assert!(sender.peer_supports_transaction_inventory_v1(new_peer.bind_addr));
+        assert!(new_peer.peer_supports_transaction_inventory_v1(sender.bind_addr));
+
+        let first_new_started = Instant::now();
+        sender
+            .send_transaction_batch_to_peer(
+                new_peer.bind_addr,
+                &transactions[..LEGACY_SAMPLE_COUNT]
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("new inventory sample relay");
+        wait_for_pending(&new_peer, LEGACY_SAMPLE_COUNT, "new inventory sample").await;
+        let first_new_elapsed = first_new_started.elapsed();
+
+        assert!(!sender.peer_supports_transaction_inventory_v1(legacy_peer.bind_addr));
+        let legacy_started = Instant::now();
+        sender
+            .send_transaction_batch_to_peer(
+                legacy_peer.bind_addr,
+                &transactions[..LEGACY_SAMPLE_COUNT]
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("legacy full-transaction fallback relay");
+        wait_for_pending(&legacy_peer, LEGACY_SAMPLE_COUNT, "legacy fallback sample").await;
+        let legacy_elapsed = legacy_started.elapsed();
+        assert!(!sender.peer_supports_transaction_inventory_v1(legacy_peer.bind_addr));
+
+        let remainder_started = Instant::now();
+        sender
+            .send_transaction_batch_to_peer(
+                new_peer.bind_addr,
+                &transactions[LEGACY_SAMPLE_COUNT..CANARY_TRANSACTION_COUNT - 1]
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("remaining inventory relay");
+        wait_for_pending(
+            &new_peer,
+            CANARY_TRANSACTION_COUNT - 1,
+            "220-payment inventory relay",
+        )
+        .await;
+        let remainder_elapsed = remainder_started.elapsed();
+
+        let height_response = sender
+            .send_message_with_response(slow_peer.bind_addr, &NetworkMessage::GetBlockHeight)
+            .await
+            .expect("establish isolated slow-peer session");
+        assert!(matches!(height_response, NetworkMessage::BlockHeight(_)));
+        let slow_connection = sender
+            .outbound_connections
+            .read()
+            .await
+            .get(&slow_peer.bind_addr)
+            .cloned()
+            .expect("slow-peer outbound connection");
+        let slow_guard = slow_connection.lock().await;
+        let final_transaction = Arc::new(transactions[CANARY_TRANSACTION_COUNT - 1].clone());
+        let broadcast_sender = sender.clone();
+        let new_addr = new_peer.bind_addr;
+        let slow_addr = slow_peer.bind_addr;
+        let slow_broadcast = tokio::spawn(async move {
+            broadcast_sender
+                .broadcast_transactions(vec![final_transaction], None, vec![new_addr, slow_addr])
+                .await
+        });
+        let fast_delivery_started = Instant::now();
+        wait_for_pending(
+            &new_peer,
+            CANARY_TRANSACTION_COUNT,
+            "fast peer alongside blocked peer",
+        )
+        .await;
+        let fast_delivery_elapsed = fast_delivery_started.elapsed();
+        assert!(
+            !slow_broadcast.is_finished(),
+            "the held slow-peer connection must still be blocked while the fast peer completes"
+        );
+        drop(slow_guard);
+        slow_broadcast
+            .await
+            .expect("slow-peer broadcast task")
+            .expect("slow-peer broadcast result");
+        wait_for_pending(&slow_peer, 1, "released slow peer").await;
+
+        let duplicate_started = Instant::now();
+        sender
+            .send_transaction_batch_to_peer(
+                new_peer.bind_addr,
+                &transactions
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("new-path duplicate replay");
+        sender
+            .send_transaction_batch_to_peer(
+                legacy_peer.bind_addr,
+                &transactions[..LEGACY_SAMPLE_COUNT]
+                    .iter()
+                    .cloned()
+                    .map(Arc::new)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("legacy duplicate replay");
+        let duplicate_elapsed = duplicate_started.elapsed();
+        assert_eq!(pending_count(&new_peer), CANARY_TRANSACTION_COUNT);
+        assert_eq!(pending_count(&legacy_peer), LEGACY_SAMPLE_COUNT);
+        assert_eq!(
+            new_peer.transaction_deduper.accepted.lock().entries.len(),
+            CANARY_TRANSACTION_COUNT
+        );
+        assert_eq!(
+            legacy_peer
+                .transaction_deduper
+                .accepted
+                .lock()
+                .entries
+                .len(),
+            LEGACY_SAMPLE_COUNT
+        );
+        assert_eq!(
+            new_peer
+                .transaction_deduper
+                .inflight_count
+                .load(Ordering::Acquire),
+            0
+        );
+        {
+            let pending_requests = new_peer.pending_transaction_body_requests.lock();
+            assert!(pending_requests.entries.is_empty());
+            assert!(pending_requests.order.len() <= TX_RELAY_PENDING_REQUEST_MAX_ENTRIES);
+        }
+
+        // Compare identical 32-payment validation work on the new and legacy paths. The
+        // inventory RTT may cost a little on loopback, but a gross regression is a release
+        // failure; the generous margin keeps this assertion stable under shared CI load.
+        assert!(
+            first_new_elapsed <= legacy_elapsed.saturating_mul(3) + Duration::from_secs(1),
+            "inventory sample regressed grossly: new={first_new_elapsed:?}, legacy={legacy_elapsed:?}"
+        );
+        let rss_after = process_rss_bytes();
+        let rss_growth = rss_after.saturating_sub(rss_before);
+        assert!(
+            rss_growth <= MAX_CANARY_RSS_GROWTH,
+            "canary RSS grew by {} MiB",
+            rss_growth / (1024 * 1024)
+        );
+        eprintln!(
+            "CANARY_METRICS http_batch={http_elapsed:?} new_32={first_new_elapsed:?} legacy_32={legacy_elapsed:?} new_remaining={remainder_elapsed:?} fast_alongside_slow={fast_delivery_elapsed:?} duplicate_replay={duplicate_elapsed:?} rss_growth_mib={:.2}",
+            rss_growth as f64 / (1024.0 * 1024.0)
+        );
+
+        // Close every loopback stream before aborting listeners so connection-handler clones
+        // release their identity locks. Sled temporary databases delete themselves on final drop.
+        sender.outbound_connections.write().await.clear();
+        sleep(Duration::from_millis(100)).await;
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     // The witness-resolution count bound must mirror the ledger's own block-body limit exactly:
