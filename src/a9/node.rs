@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use sled::Db;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     convert::TryInto,
     hash::{Hash, Hasher},
     io::Write,
@@ -375,6 +375,16 @@ const OUTBOUND_CIRCUIT_FAILURE_THRESHOLD: u32 = 6;
 const OUTBOUND_CIRCUIT_OPEN_SECS: u64 = 15;
 const BLOOM_FILTER_SIZE: usize = 100_000;
 const BLOOM_FILTER_FPR: f64 = 0.01;
+/// Exact transaction-ingress deduplication. Accepted keys are fixed-size full-witness digests, so
+/// the count and byte bounds describe the same finite resource from two directions. The count cap
+/// matches the mempool ceiling; confirmed replays remain protected by the chain's replay index after
+/// an older local key is evicted.
+const TX_DEDUP_ACCEPTED_MAX_ENTRIES: usize = 50_000;
+const TX_DEDUP_ACCEPTED_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const TX_DEDUP_ESTIMATED_ENTRY_BYTES: usize = 128;
+/// Bounds unique transaction work that has claimed ingress but has not reached a durable admission
+/// verdict yet. Saturation is retryable and never inserts an accepted key.
+const TX_DEDUP_MAX_INFLIGHT: usize = MAX_PARALLEL_VALIDATIONS * 2;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
 const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
 /// Level the validation cache is pruned back to once it crosses its ceiling. The gap is what
@@ -1174,6 +1184,180 @@ impl Clone for NetworkBloom {
 }
 
 //----------------------------------------------------------------------
+// Exact Transaction Ingress Deduplication
+//----------------------------------------------------------------------
+
+#[derive(Debug)]
+struct AcceptedTransactionKeys {
+    entries: HashSet<[u8; 32]>,
+    insertion_order: VecDeque<[u8; 32]>,
+    estimated_bytes: usize,
+    max_entries: usize,
+    byte_budget: usize,
+}
+
+impl AcceptedTransactionKeys {
+    fn new(max_entries: usize, byte_budget: usize) -> Self {
+        Self {
+            entries: HashSet::new(),
+            insertion_order: VecDeque::new(),
+            estimated_bytes: 0,
+            max_entries: max_entries.max(1),
+            byte_budget: byte_budget.max(TX_DEDUP_ESTIMATED_ENTRY_BYTES),
+        }
+    }
+
+    fn contains(&self, key: &[u8; 32]) -> bool {
+        self.entries.contains(key)
+    }
+
+    fn insert(&mut self, key: [u8; 32]) {
+        if self.entries.insert(key) {
+            self.insertion_order.push_back(key);
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_add(TX_DEDUP_ESTIMATED_ENTRY_BYTES);
+        }
+
+        while self.entries.len() > self.max_entries || self.estimated_bytes > self.byte_budget {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                self.entries.clear();
+                self.estimated_bytes = 0;
+                break;
+            };
+            if self.entries.remove(&oldest) {
+                self.estimated_bytes = self
+                    .estimated_bytes
+                    .saturating_sub(TX_DEDUP_ESTIMATED_ENTRY_BYTES);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExactTransactionDeduper {
+    accepted: PLMutex<AcceptedTransactionKeys>,
+    inflight: DashMap<[u8; 32], u64>,
+    inflight_count: AtomicUsize,
+    next_claim_id: AtomicU64,
+    max_inflight: usize,
+}
+
+#[derive(Debug)]
+enum TransactionClaimResult {
+    Claimed(TransactionIngressClaim),
+    DuplicateAccepted,
+    DuplicateInflight,
+    Saturated,
+}
+
+#[derive(Debug)]
+struct TransactionIngressClaim {
+    deduper: Arc<ExactTransactionDeduper>,
+    key: [u8; 32],
+    claim_id: u64,
+    active: bool,
+}
+
+impl ExactTransactionDeduper {
+    fn new(max_entries: usize, byte_budget: usize, max_inflight: usize) -> Self {
+        Self {
+            accepted: PLMutex::new(AcceptedTransactionKeys::new(max_entries, byte_budget)),
+            inflight: DashMap::new(),
+            inflight_count: AtomicUsize::new(0),
+            next_claim_id: AtomicU64::new(1),
+            max_inflight: max_inflight.max(1),
+        }
+    }
+
+    fn reserve_inflight_slot(&self) -> bool {
+        self.inflight_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.max_inflight).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn is_accepted(&self, key: &[u8; 32]) -> bool {
+        self.accepted.lock().contains(key)
+    }
+
+    fn claim(self: &Arc<Self>, key: [u8; 32]) -> TransactionClaimResult {
+        if self.is_accepted(&key) {
+            return TransactionClaimResult::DuplicateAccepted;
+        }
+        if !self.reserve_inflight_slot() {
+            return TransactionClaimResult::Saturated;
+        }
+
+        let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
+        match self.inflight.entry(key) {
+            Entry::Occupied(_) => {
+                self.inflight_count.fetch_sub(1, Ordering::AcqRel);
+                TransactionClaimResult::DuplicateInflight
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(claim_id);
+
+                // An admission can commit between the first accepted lookup and this in-flight
+                // insertion. Recheck after owning the exact key and release this redundant claim.
+                if self.is_accepted(&key) {
+                    self.release_claim(&key, claim_id);
+                    return TransactionClaimResult::DuplicateAccepted;
+                }
+
+                TransactionClaimResult::Claimed(TransactionIngressClaim {
+                    deduper: Arc::clone(self),
+                    key,
+                    claim_id,
+                    active: true,
+                })
+            }
+        }
+    }
+
+    fn release_claim(&self, key: &[u8; 32], claim_id: u64) {
+        if let Entry::Occupied(entry) = self.inflight.entry(*key) {
+            if *entry.get() == claim_id {
+                entry.remove();
+                self.inflight_count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn commit_claim(&self, key: [u8; 32], claim_id: u64) {
+        // Publish accepted before removing in-flight so no concurrent caller can observe a gap in
+        // which neither exact set owns the key.
+        self.accepted.lock().insert(key);
+        self.release_claim(&key, claim_id);
+    }
+
+    fn mark_accepted(&self, key: [u8; 32]) {
+        self.accepted.lock().insert(key);
+        // Local/API admission may race a network claim for the same bytes. Acceptance is now
+        // authoritative, so release that redundant work slot regardless of which path owned it.
+        if self.inflight.remove(&key).is_some() {
+            self.inflight_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl TransactionIngressClaim {
+    fn commit(mut self) {
+        self.deduper.commit_claim(self.key, self.claim_id);
+        self.active = false;
+    }
+}
+
+impl Drop for TransactionIngressClaim {
+    fn drop(&mut self) {
+        if self.active {
+            self.deduper.release_claim(&self.key, self.claim_id);
+        }
+    }
+}
+
+//----------------------------------------------------------------------
 // Validation Pool
 //----------------------------------------------------------------------
 
@@ -1406,6 +1590,9 @@ pub struct Node {
     max_connections: usize,
     pub network_health: Arc<RwLock<NetworkHealth>>,
     network_bloom: Arc<NetworkBloom>,
+    /// Exact full-witness transaction acceptance/in-flight dedupe. Unlike `network_bloom`, this
+    /// structure is authoritative for transaction suppression and has no false positives.
+    transaction_deduper: Arc<ExactTransactionDeduper>,
     peer_failures: Arc<RwLock<HashMap<SocketAddr, u32>>>,
     peer_secrets: Arc<RwLock<HashMap<SocketAddr, Vec<u8>>>>,
     outbound_connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<OutboundConnection>>>>>,
@@ -2021,6 +2208,11 @@ impl Node {
                 std::num::NonZeroUsize::new(512).expect("nonzero"),
             ))),
             network_bloom: Arc::new(NetworkBloom::new(BLOOM_FILTER_SIZE, BLOOM_FILTER_FPR)),
+            transaction_deduper: Arc::new(ExactTransactionDeduper::new(
+                TX_DEDUP_ACCEPTED_MAX_ENTRIES,
+                TX_DEDUP_ACCEPTED_BYTE_BUDGET,
+                TX_DEDUP_MAX_INFLIGHT,
+            )),
             // Bounded relay-once set for the early relay path (see field comment). Same 8192 cap
             // as the mesh seen-set; a block hash is a fixed 32 bytes so this is ~small.
             early_relay_seen: Arc::new(PLMutex::new(LruCache::new(
@@ -8308,8 +8500,8 @@ impl Node {
         // client right after boot, mid mesh churn) reached nobody and would otherwise
         // sit local-only until the sender mined it themselves, resurrecting the
         // pre-v7.6.8 behavior through a timing hole. Re-announcing is cheap and
-        // idempotent: receivers dedup via their network bloom, duplicate mempool adds
-        // are rejected, and the mesh send is a no-op with no links up.
+        // idempotent: receivers suppress exact accepted transaction keys, duplicate mempool adds
+        // are classified without a re-relay, and the mesh send is a no-op with no links up.
         let regossip_node = node.clone();
         spawn_logged("pending-regossip", async move {
             let mut regossip_interval = interval(Duration::from_secs(45));
@@ -10464,7 +10656,10 @@ impl Node {
         self.compact_tx_index.lock().put(leaf, tx_id);
     }
 
-    async fn seed_compact_index_from_admitted_transaction(&self, transaction: &Transaction) {
+    async fn seed_compact_index_from_admitted_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> bool {
         if let Some(admitted) = self
             .blockchain
             .read()
@@ -10474,8 +10669,10 @@ impl Node {
         {
             if Self::witness_matches_committed_receipt(transaction, &admitted) {
                 self.cache_verified_compact_transaction(&admitted);
+                return true;
             }
         }
+        false
     }
 
     fn lookup_verified_compact_transaction(&self, leaf: &[u8; 32]) -> Option<Transaction> {
@@ -11667,6 +11864,53 @@ impl Node {
         )
     }
 
+    /// Fixed-size exact key for transaction ingress work. Bind every in-memory field directly
+    /// instead of hashing the display transaction ID, which intentionally excludes witness data.
+    /// Length-prefixing strings/options keeps absent and empty values structurally distinct. The
+    /// exhaustive destructure intentionally makes a future `Transaction` field fail compilation
+    /// here until its identity treatment is decided.
+    fn transaction_ingress_key(tx: &Transaction) -> [u8; 32] {
+        fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+
+        fn hash_optional_string(hasher: &mut blake3::Hasher, value: Option<&str>) {
+            match value {
+                Some(value) => {
+                    hasher.update(&[1]);
+                    hash_bytes(hasher, value.as_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            };
+        }
+
+        let Transaction {
+            sender,
+            recipient,
+            fee_units,
+            amount_units,
+            timestamp,
+            signature,
+            pub_key,
+            sig_hash,
+        } = tx;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"alphanumeric:transaction-ingress:v1\0");
+        hash_bytes(&mut hasher, sender.as_bytes());
+        hash_bytes(&mut hasher, recipient.as_bytes());
+        hasher.update(&fee_units.to_le_bytes());
+        hasher.update(&amount_units.to_le_bytes());
+        hasher.update(&timestamp.to_le_bytes());
+        hash_optional_string(&mut hasher, signature.as_deref());
+        hash_optional_string(&mut hasher, pub_key.as_deref());
+        hash_optional_string(&mut hasher, sig_hash.as_deref());
+        *hasher.finalize().as_bytes()
+    }
+
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
         now.duration_since(entry.timestamp)
             .map(|age| age.as_secs() < VALIDATION_CACHE_TTL_SECS)
@@ -11940,49 +12184,62 @@ impl Node {
     pub async fn handle_network_event(&self, event: NetworkEvent) -> Result<(), NodeError> {
         match event {
             NetworkEvent::NewTransaction(tx) => {
-                // Deduplicate transactions using bloom filter
-                let tx_bytes = codec::serialize(&tx)?;
-                // READ-ONLY until admission succeeds — the same rule the NewBlock
-                // arm below documents. Inserting first meant a tx dropped for a
-                // TRANSIENT reason (a stale balances index during catch-up makes
-                // validate_transaction report InsufficientFunds) still marked the
-                // hash as seen, so every later re-gossip of that same transaction
-                // was silently swallowed at this gate until the bloom rotated. The
-                // retry mechanism was defeated by the poison it created.
-                if self.network_bloom.check(&tx_bytes) {
-                    return Ok(());
-                }
+                let tx_key = Self::transaction_ingress_key(&tx);
+                let claim = match self.transaction_deduper.claim(tx_key) {
+                    TransactionClaimResult::Claimed(claim) => claim,
+                    TransactionClaimResult::DuplicateAccepted
+                    | TransactionClaimResult::DuplicateInflight => return Ok(()),
+                    TransactionClaimResult::Saturated => {
+                        debug!("Deferring transaction: exact ingress work cache is saturated");
+                        return Ok(());
+                    }
+                };
 
                 // Validate transaction before adding
                 if self.validate_transaction(&tx, None).await? {
-                    // Add to blockchain. M2: read lock suffices -- add_transaction
-                    // self-serializes on state_mutation_lock, so the write lock only held
-                    // the exclusive lock across the ML-DSA verify (see submit-tx handler).
-                    {
+                    // Classify admission atomically so only a genuinely new insertion is
+                    // announced. Render the non-Send error away before any later await.
+                    let admission = {
                         let blockchain = self.blockchain.read().await;
-                        if let Err(e) = blockchain.add_transaction(tx.clone()).await {
-                            if matches!(e, BlockchainError::FeeBelowRelayFloor) {
-                                // Policy reject, not a fault — don't error!-spam
-                                // the event pump for pre-floor peers' cheap txs.
-                                debug!("Dropping below-floor-fee gossip tx");
-                                return Ok(());
+                        match blockchain.admit_transaction(tx.clone()).await {
+                            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+                                Some(Ok(true))
                             }
-                            return Err(e.into());
+                            Ok(
+                                crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending
+                                | crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(_),
+                            ) => Some(Ok(false)),
+                            // Policy reject, not a fault — don't error!-spam the event pump for
+                            // pre-floor peers' cheap transactions.
+                            Err(BlockchainError::FeeBelowRelayFloor) => None,
+                            Err(e) => Some(Err(NodeError::from(e))),
                         }
-                    }
-                    self.seed_compact_index_from_admitted_transaction(&tx).await;
+                    };
+                    let inserted = match admission {
+                        Some(Ok(inserted)) => inserted,
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            debug!("Dropping below-floor-fee gossip tx");
+                            return Ok(());
+                        }
+                    };
+                    claim.commit();
 
-                    // SPAWN the gossip off the single-consumer event pump: gossip_transaction
-                    // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
-                    // costs a full 5s TCP connect — awaiting it inline stalled the pump (the
-                    // ONLY server of GetBlocks/ChainRequest) for up to ~40s per inbound tx,
-                    // timing out syncing peers' block fetches (2026-07-12 audit). Same spawn
-                    // pattern as the re-announce and create paths.
-                    let node = self.clone();
-                    let gossip_tx = tx.clone();
-                    tokio::spawn(async move {
-                        node.gossip_transaction(&gossip_tx).await;
-                    });
+                    if inserted {
+                        self.seed_compact_index_from_admitted_transaction(&tx).await;
+
+                        // SPAWN the gossip off the single-consumer event pump: gossip_transaction
+                        // sends to up to 8 peers with a 5s per-peer timeout, and a cold NAT peer
+                        // costs a full 5s TCP connect — awaiting it inline stalled the pump (the
+                        // ONLY server of GetBlocks/ChainRequest) for up to ~40s per inbound tx,
+                        // timing out syncing peers' block fetches (2026-07-12 audit). Same spawn
+                        // pattern as the re-announce and create paths.
+                        let node = self.clone();
+                        let gossip_tx = tx.clone();
+                        tokio::spawn(async move {
+                            node.gossip_transaction(&gossip_tx).await;
+                        });
+                    }
                 }
             }
 
@@ -12250,11 +12507,11 @@ impl Node {
             return Ok(None);
         }
 
-        // Deduplicate gossip only. Requests/responses must always be processed, otherwise one
-        // peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request. Hash the
-        // CANONICAL re-serialization rather than the wire bytes: MessagePack decoding is not
-        // injective, so a hostile peer could otherwise re-encode the same message many ways to slip
-        // every copy past the bloom. Only gossip messages pay this (requests/responses skip it).
+        // Deduplicate non-transaction gossip only. Transactions use the exact full-witness
+        // accepted/in-flight cache in their match arm below: a probabilistic Bloom hit must never
+        // suppress a first valid payment. Requests/responses must always be processed, otherwise
+        // one peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request. Hash
+        // the CANONICAL re-serialization rather than wire bytes for the remaining gossip classes.
         if Self::should_dedup_message(&message) {
             let canonical = codec::serialize(&message)
                 .map_err(|_| NodeError::Network("Failed to serialize message".into()))?;
@@ -12264,11 +12521,15 @@ impl Node {
             }
         }
 
-        // Rate limiting
-        let rate_key = format!("peer_msg:{}:{:?}", addr, std::mem::discriminant(&message));
-        if !self.rate_limiter.check_limit(&rate_key) {
-            self.record_peer_failure(addr).await;
-            return Err(NodeError::Network("Rate limit exceeded".into()));
+        // Transactions perform accepted-key suppression and their remaining rate/claim ordering
+        // inside the match arm. Other message classes retain the existing ordering here.
+        let message_discriminant = std::mem::discriminant(&message);
+        if !matches!(&message, NetworkMessage::Transaction(_)) {
+            let rate_key = format!("peer_msg:{}:{:?}", addr, message_discriminant);
+            if !self.rate_limiter.check_limit(&rate_key) {
+                self.record_peer_failure(addr).await;
+                return Err(NodeError::Network("Rate limit exceeded".into()));
+            }
         }
 
         match message {
@@ -12301,17 +12562,42 @@ impl Node {
 
             NetworkMessage::Transaction(tx_data) => {
                 let tx_ref = Arc::new(tx_data);
-                // Relay-policy floor, BEFORE the validation cache: the cache
-                // marks validity ahead of admission, so without this gate a
-                // repeat receipt of a cached below-floor tx would re-broadcast
-                // it to 8 peers and defeat the floor. Silent ignore — policy,
-                // not a peer fault (no penalty, no negative cache entry).
+                let ingress_key = Self::transaction_ingress_key(&tx_ref);
+                let rate_key = format!("peer_msg:{}:{:?}", addr, message_discriminant);
+
+                // A settled echo is free, as it was under the old Bloom gate. New and in-flight
+                // work spends the peer's budget before claiming so a rate-exhausted source cannot
+                // briefly own the exact key and make a simultaneous healthy delivery defer.
+                if self.transaction_deduper.is_accepted(&ingress_key) {
+                    return Ok(None);
+                }
+                if !self.rate_limiter.check_limit(&rate_key) {
+                    self.record_peer_failure(addr).await;
+                    return Err(NodeError::Network("Rate limit exceeded".into()));
+                }
+                let ingress_claim = match self.transaction_deduper.claim(ingress_key) {
+                    TransactionClaimResult::Claimed(claim) => claim,
+                    TransactionClaimResult::DuplicateAccepted
+                    | TransactionClaimResult::DuplicateInflight => return Ok(None),
+                    TransactionClaimResult::Saturated => {
+                        debug!(
+                            "Deferring transaction from {}: exact ingress work cache is saturated",
+                            addr
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                // Relay-policy floor, after exact duplicate suppression but before the validation
+                // cache. A new below-floor message spends rate budget; a settled accepted echo does
+                // not. Silent ignore remains policy rather than a peer fault.
                 if tx_ref.fee_units < MIN_RELAY_FEE_UNITS {
                     return Ok(None);
                 }
                 let tx_hash = Self::transaction_cache_key(&tx_ref);
 
                 // Check validation cache
+                let mut cached_valid = false;
                 if let Some(cached) = self
                     .validation_cache
                     .get(&tx_hash)
@@ -12320,13 +12606,10 @@ impl Node {
                     if !Self::is_validation_cache_entry_fresh(&cached, SystemTime::now()) {
                         self.validation_cache.remove(&tx_hash);
                     } else if cached.valid {
-                        // If previously validated, just broadcast
-                        let peers = self.peers.read().await;
-                        let selected_peers = self.select_broadcast_peers(&peers, 8);
-                        drop(peers);
-                        self.broadcast_transaction(tx_ref, addr, selected_peers)
-                            .await?;
-                        return Ok(None);
+                        // A validation verdict is not an admission verdict. Continue to the
+                        // canonical admission path rather than re-broadcasting bytes that may
+                        // have failed transient admission after their earlier validation.
+                        cached_valid = true;
                     } else {
                         return Ok(None);
                     }
@@ -12334,7 +12617,9 @@ impl Node {
 
                 // Validate transaction. The verdict is rendered to plain bools INSIDE the
                 // guard: BlockchainError is !Send and must not be held across an await.
-                let (tx_valid, settled_reject) = {
+                let (tx_valid, settled_reject) = if cached_valid {
+                    (true, false)
+                } else {
                     let blockchain = self.blockchain.read().await;
                     match blockchain.validate_transaction(&tx_ref, None).await {
                         Ok(()) => (true, false),
@@ -12371,13 +12656,30 @@ impl Node {
                     );
                     self.maybe_prune_validation_cache();
 
-                    // Add to blockchain. M2: read lock suffices (add_transaction
-                    // self-serializes on state_mutation_lock; write held it across verify).
-                    let tx_added = {
+                    // Classify canonical admission so the exact key is committed only after
+                    // durable pending/confirmed state exists, and relay only a new insertion.
+                    // Render BlockchainError away before the subsequent awaits.
+                    let (tx_inserted, tx_accepted) = {
                         let blockchain = self.blockchain.read().await;
-                        blockchain.add_transaction((*tx_ref).clone()).await.is_ok()
+                        match blockchain.admit_transaction((*tx_ref).clone()).await {
+                            Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+                                (true, true)
+                            }
+                            Ok(
+                                crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending
+                                | crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(_),
+                            ) => (false, true),
+                            Err(_) => (false, false),
+                        }
                     };
-                    if tx_added {
+                    if tx_accepted {
+                        ingress_claim.commit();
+                    } else {
+                        // Transient admission failures remain eligible on an identical retry.
+                        return Ok(None);
+                    }
+
+                    if tx_inserted {
                         self.seed_compact_index_from_admitted_transaction(&tx_ref)
                             .await;
                         // Broadcast to peers
@@ -12954,7 +13256,6 @@ impl Node {
         matches!(
             message,
             NetworkMessage::Block(_)
-                | NetworkMessage::Transaction(_)
                 | NetworkMessage::AlertMessage(_)
                 | NetworkMessage::HeaderVerification { .. }
                 | NetworkMessage::HeaderSync { .. }
@@ -13410,19 +13711,24 @@ impl Node {
     /// confirm it. Now both the network ingest path (NewTransaction event) and the local
     /// create path announce through here.
     ///
-    /// The bloom insert makes this idempotent AND absorbs our own echo: a peer that
-    /// gossips the tx back to us is dropped at the NewTransaction dedup gate instead of
-    /// erroring on a duplicate mempool add. Sends are time-boxed and the peers guard is
-    /// snapshot-then-drop (never held across an await — the 2026-07-08/09 wedge class).
+    /// The exact accepted-key insert makes this idempotent and absorbs our own echo without a
+    /// probabilistic decision. Transactions do not touch the shared Bloom, so their traffic cannot
+    /// create false-positive pressure for block/message classes that still use it. Sends are
+    /// time-boxed and the peers guard is snapshot-then-drop (never held across an await — the
+    /// 2026-07-08/09 wedge class).
     pub async fn gossip_transaction(&self, tx_ref: &Transaction) {
         // Confirm O(1) mempool membership before treating this as verified. This
         // covers local CLI and periodic re-gossip paths while avoiding any
         // per-announcement scan of the up-to-50k transaction pool.
-        self.seed_compact_index_from_admitted_transaction(tx_ref)
-            .await;
-        if let Ok(tx_bytes) = codec::serialize(tx_ref) {
-            let _ = self.network_bloom.insert(&tx_bytes);
+        if !self
+            .seed_compact_index_from_admitted_transaction(tx_ref)
+            .await
+        {
+            debug!("Skipping transaction gossip because it is no longer admitted");
+            return;
         }
+        self.transaction_deduper
+            .mark_accepted(Self::transaction_ingress_key(tx_ref));
 
         #[cfg(feature = "webrtc_mesh")]
         self.mesh_gossip(&NetworkMessage::Transaction(tx_ref.clone()))
@@ -13450,8 +13756,8 @@ impl Node {
 
     /// Flood a message to every connected mesh peer, parallel to the TCP flood. No-op if the mesh is
     /// off / not up / has no peers. The actual send is SPAWNED, so a slow or backpressured DataChannel
-    /// can never add latency to the caller's base-path (TCP/relay) propagation. Peers dedup via the
-    /// bloom, so double-delivery is harmless.
+    /// can never add latency to the caller's base-path (TCP/relay) propagation. Peers use the exact
+    /// transaction cache or the class-appropriate Bloom gate, so double-delivery is harmless.
     #[cfg(feature = "webrtc_mesh")]
     async fn mesh_gossip(&self, msg: &NetworkMessage) {
         let mesh = { self.webrtc_mesh.read().await.clone() };
@@ -15913,6 +16219,300 @@ mod tests {
             Node::transaction_cache_key(&genuine.clone()),
             "identical messages must still short-circuit"
         );
+
+        assert_ne!(
+            Node::transaction_ingress_key(&genuine),
+            Node::transaction_ingress_key(&other),
+            "the exact ingress key must bind the complete witness too"
+        );
+    }
+
+    #[test]
+    fn exact_transaction_ingress_key_binds_every_field_and_option_shape() {
+        let base = tx_with_signature(&"ab".repeat(80));
+        let base_key = Node::transaction_ingress_key(&base);
+        let mut variants = Vec::new();
+
+        let mut tx = base.clone();
+        tx.sender.push('0');
+        variants.push(("sender", tx));
+        let mut tx = base.clone();
+        tx.recipient.push('0');
+        variants.push(("recipient", tx));
+        let mut tx = base.clone();
+        tx.fee_units += 1;
+        variants.push(("fee_units", tx));
+        let mut tx = base.clone();
+        tx.amount_units += 1;
+        variants.push(("amount_units", tx));
+        let mut tx = base.clone();
+        tx.timestamp += 1;
+        variants.push(("timestamp", tx));
+        let mut tx = base.clone();
+        tx.signature = Some("ac".repeat(80));
+        variants.push(("signature", tx));
+        let mut tx = base.clone();
+        tx.pub_key = Some("ce".repeat(32));
+        variants.push(("pub_key", tx));
+        let mut tx = base.clone();
+        tx.sig_hash = Some("de".repeat(32));
+        variants.push(("sig_hash", tx));
+
+        for (field, variant) in variants {
+            assert_ne!(
+                base_key,
+                Node::transaction_ingress_key(&variant),
+                "changing {field} must change the exact ingress key"
+            );
+        }
+
+        macro_rules! assert_option_shape_is_bound {
+            ($field:ident) => {{
+                let mut absent = base.clone();
+                absent.$field = None;
+                let mut empty = absent.clone();
+                empty.$field = Some(String::new());
+                assert_ne!(
+                    Node::transaction_ingress_key(&absent),
+                    Node::transaction_ingress_key(&empty),
+                    "{}: absent and present-empty are distinct representations",
+                    stringify!($field)
+                );
+            }};
+        }
+        assert_option_shape_is_bound!(signature);
+        assert_option_shape_is_bound!(pub_key);
+        assert_option_shape_is_bound!(sig_hash);
+    }
+
+    #[test]
+    fn incomplete_first_witness_cannot_suppress_a_later_complete_copy() {
+        let complete = tx_with_signature(&"ab".repeat(80));
+        let mut incomplete = complete.clone();
+        incomplete.signature = Some("ab".repeat(32));
+        let incomplete_key = Node::transaction_ingress_key(&incomplete);
+        let complete_key = Node::transaction_ingress_key(&complete);
+        assert_ne!(incomplete_key, complete_key, "premise: distinct witnesses");
+
+        let deduper = Arc::new(ExactTransactionDeduper::new(8, 8 * 128, 2));
+        let incomplete_claim = match deduper.claim(incomplete_key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("incomplete first copy must own only its key, got {other:?}"),
+        };
+        let complete_claim = match deduper.claim(complete_key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("complete witness must remain independently admissible, got {other:?}"),
+        };
+
+        // A validation/persistence rejection never commits the incomplete representation.
+        drop(incomplete_claim);
+        complete_claim.commit();
+        assert!(matches!(
+            deduper.claim(complete_key),
+            TransactionClaimResult::DuplicateAccepted
+        ));
+        assert!(matches!(
+            deduper.claim(incomplete_key),
+            TransactionClaimResult::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn exact_transaction_deduper_releases_retry_and_commits_only_acceptance() {
+        let deduper = Arc::new(ExactTransactionDeduper::new(8, 8 * 128, 2));
+        let key = [0x11; 32];
+
+        let first = match deduper.claim(key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("first delivery must claim exact work, got {other:?}"),
+        };
+        assert!(matches!(
+            deduper.claim(key),
+            TransactionClaimResult::DuplicateInflight
+        ));
+
+        // A transient failure drops the uncommitted guard and makes identical bytes retryable.
+        drop(first);
+        let retry = match deduper.claim(key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("uncommitted work must be retryable, got {other:?}"),
+        };
+        retry.commit();
+        assert!(matches!(
+            deduper.claim(key),
+            TransactionClaimResult::DuplicateAccepted
+        ));
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn exact_transaction_deduper_bounds_inflight_and_accepted_keys() {
+        // Let the byte budget bind before the larger count cap.
+        let deduper = Arc::new(ExactTransactionDeduper::new(8, 2 * 128, 1));
+        let first = match deduper.claim([1; 32]) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("first delivery must claim, got {other:?}"),
+        };
+        assert!(matches!(
+            deduper.claim([2; 32]),
+            TransactionClaimResult::Saturated
+        ));
+        drop(first);
+
+        for key in [[1; 32], [2; 32], [3; 32]] {
+            let claim = match deduper.claim(key) {
+                TransactionClaimResult::Claimed(claim) => claim,
+                other => panic!("new key must claim, got {other:?}"),
+            };
+            claim.commit();
+        }
+
+        let accepted = deduper.accepted.lock();
+        assert_eq!(accepted.entries.len(), 2);
+        assert!(accepted.estimated_bytes <= 2 * 128);
+        assert!(!accepted.entries.contains(&[1; 32]));
+        assert!(accepted.entries.contains(&[2; 32]));
+        assert!(accepted.entries.contains(&[3; 32]));
+        drop(accepted);
+
+        assert!(matches!(
+            deduper.claim([1; 32]),
+            TransactionClaimResult::Claimed(_)
+        ));
+
+        // And independently prove the count cap binds when the byte budget is loose.
+        let count_bounded = Arc::new(ExactTransactionDeduper::new(2, 8 * 128, 1));
+        for key in [[4; 32], [5; 32], [6; 32]] {
+            let claim = match count_bounded.claim(key) {
+                TransactionClaimResult::Claimed(claim) => claim,
+                other => panic!("new key must claim, got {other:?}"),
+            };
+            claim.commit();
+        }
+        assert_eq!(count_bounded.accepted.lock().entries.len(), 2);
+    }
+
+    #[test]
+    fn local_acceptance_wins_a_race_without_leaking_inflight_count() {
+        let deduper = Arc::new(ExactTransactionDeduper::new(8, 8 * 128, 2));
+        let key = [0x44; 32];
+        let claim = match deduper.claim(key) {
+            TransactionClaimResult::Claimed(claim) => claim,
+            other => panic!("first delivery must claim, got {other:?}"),
+        };
+
+        deduper.mark_accepted(key);
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            deduper.claim(key),
+            TransactionClaimResult::DuplicateAccepted
+        ));
+
+        // The displaced guard must not decrement the counter a second time.
+        drop(claim);
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_identical_deliveries_have_exactly_one_claim_owner() {
+        const THREADS: usize = 32;
+        let deduper = Arc::new(ExactTransactionDeduper::new(64, 64 * 128, THREADS));
+        let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let ready = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let release = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let duplicates = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let deduper = Arc::clone(&deduper);
+                let start = Arc::clone(&start);
+                let ready = Arc::clone(&ready);
+                let release = Arc::clone(&release);
+                let claimed = Arc::clone(&claimed);
+                let duplicates = Arc::clone(&duplicates);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let result = deduper.claim([0x77; 32]);
+                    match &result {
+                        TransactionClaimResult::Claimed(_) => {
+                            claimed.fetch_add(1, Ordering::AcqRel);
+                        }
+                        TransactionClaimResult::DuplicateInflight => {
+                            duplicates.fetch_add(1, Ordering::AcqRel);
+                        }
+                        other => panic!("unexpected concurrent claim result: {other:?}"),
+                    }
+                    // Keep the winning guard alive until every contender has observed the key.
+                    ready.wait();
+                    release.wait();
+                    drop(result);
+                })
+            })
+            .collect();
+
+        start.wait();
+        ready.wait();
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 1);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(claimed.load(Ordering::Acquire), 1);
+        assert_eq!(duplicates.load(Ordering::Acquire), THREADS - 1);
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_unique_deliveries_never_exceed_the_inflight_cap() {
+        const THREADS: usize = 32;
+        const CAP: usize = 8;
+        let deduper = Arc::new(ExactTransactionDeduper::new(64, 64 * 128, CAP));
+        let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let ready = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let release = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let saturated = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|index| {
+                let deduper = Arc::clone(&deduper);
+                let start = Arc::clone(&start);
+                let ready = Arc::clone(&ready);
+                let release = Arc::clone(&release);
+                let claimed = Arc::clone(&claimed);
+                let saturated = Arc::clone(&saturated);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    let result = deduper.claim(key);
+                    match &result {
+                        TransactionClaimResult::Claimed(_) => {
+                            claimed.fetch_add(1, Ordering::AcqRel);
+                        }
+                        TransactionClaimResult::Saturated => {
+                            saturated.fetch_add(1, Ordering::AcqRel);
+                        }
+                        other => panic!("unexpected unique claim result: {other:?}"),
+                    }
+                    ready.wait();
+                    release.wait();
+                    drop(result);
+                })
+            })
+            .collect();
+
+        start.wait();
+        ready.wait();
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), CAP);
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(claimed.load(Ordering::Acquire), CAP);
+        assert_eq!(saturated.load(Ordering::Acquire), THREADS - CAP);
+        assert_eq!(deduper.inflight_count.load(Ordering::Acquire), 0);
     }
 
     // The header carries merkle_root as a CLAIMED field, so an honest header can sit over
@@ -17714,6 +18314,30 @@ mod tests {
     }
 
     #[test]
+    fn bloom_hit_cannot_suppress_first_transaction_delivery() {
+        let tx = tx_with_signature(&"ab".repeat(80));
+        let message = NetworkMessage::Transaction(tx.clone());
+        let canonical = codec::serialize(&message).unwrap();
+        let bloom_key = blake3::hash(&canonical);
+        let bloom = NetworkBloom::new(4_096, 0.01);
+        let _ = bloom.insert(bloom_key.as_bytes());
+        assert!(
+            bloom.check(bloom_key.as_bytes()),
+            "forced Bloom-hit premise"
+        );
+
+        assert!(
+            !Node::should_dedup_message(&message),
+            "transactions must bypass probabilistic generic gossip dedupe"
+        );
+        let deduper = Arc::new(ExactTransactionDeduper::new(8, 8 * 128, 2));
+        assert!(matches!(
+            deduper.claim(Node::transaction_ingress_key(&tx)),
+            TransactionClaimResult::Claimed(_)
+        ));
+    }
+
+    #[test]
     fn event_block_bloom_commits_only_after_successful_validation() {
         let bloom = NetworkBloom::new(4_096, 0.01);
         let hash = [0x5cu8; 32];
@@ -17942,6 +18566,12 @@ mod tests {
         assert!(Node::should_dedup_message(&NetworkMessage::AlertMessage(
             "notice".to_string()
         )));
+        assert!(
+            !Node::should_dedup_message(&NetworkMessage::Transaction(tx_with_signature(
+                &"ab".repeat(80)
+            ))),
+            "transactions use exact full-witness dedupe, never the shared Bloom"
+        );
         assert!(!Node::should_dedup_message(&NetworkMessage::GetBlocks {
             start: 1,
             end: 2,
