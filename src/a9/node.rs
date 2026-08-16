@@ -1138,7 +1138,13 @@ pub enum NetworkMessage {
 #[derive(Debug)]
 pub enum NetworkEvent {
     NewTransaction(Transaction),
-    NewBlock(Block),
+    // Arc, not Block: producers already hold the accepted block in an Arc (compact
+    // cache), and the event pump only reads it. Carrying the Arc means an enqueued
+    // block costs one refcount bump instead of a multi-MiB deep copy. Worst-case
+    // queue retention stays bounded by capacity x the largest admissible block
+    // (MAX_MESSAGE_SIZE for wire deliveries; the compact assembled-byte and block
+    // tx-count caps for locally reconstructed ones).
+    NewBlock(Arc<Block>),
     PeerJoin(SocketAddr),
     PeerLeave(SocketAddr),
     ChainRequest {
@@ -1158,7 +1164,7 @@ impl Clone for NetworkEvent {
     fn clone(&self) -> Self {
         match self {
             NetworkEvent::NewTransaction(tx) => NetworkEvent::NewTransaction(tx.clone()),
-            NetworkEvent::NewBlock(block) => NetworkEvent::NewBlock(block.clone()),
+            NetworkEvent::NewBlock(block) => NetworkEvent::NewBlock(Arc::clone(block)),
             NetworkEvent::PeerJoin(addr) => NetworkEvent::PeerJoin(*addr),
             NetworkEvent::PeerLeave(addr) => NetworkEvent::PeerLeave(*addr),
             NetworkEvent::ChainResponse { blocks, sender } => NetworkEvent::ChainResponse {
@@ -13096,7 +13102,7 @@ impl Node {
         self.compact_pending.lock().remove(&block.hash);
         self.publish_discovery_state("Accepted compact block").await;
         events
-            .send(NetworkEvent::NewBlock((*block).clone()))
+            .send(NetworkEvent::NewBlock(Arc::clone(&block)))
             .await
             .map_err(|e| NodeError::Network(format!("Failed to send block event: {}", e)))?;
 
@@ -13183,7 +13189,8 @@ impl Node {
                 // Re-enter the ordinary full-block event path. It performs the
                 // same standalone validation, save/orphan/reorg handling, bloom
                 // commit, and relay semantics as pre-compact TCP delivery.
-                self.remember_compact_full_block(Arc::new(full.clone()), false);
+                let full = Arc::new(full);
+                self.remember_compact_full_block(Arc::clone(&full), false);
                 events
                     .send(NetworkEvent::NewBlock(full))
                     .await
@@ -13847,12 +13854,7 @@ impl Node {
 
                             // Fallback to traditional broadcast (broadcast_block also floods the mesh)
                             if let Err(e) = self
-                                .broadcast_block(
-                                    Arc::new(block.clone()),
-                                    None,
-                                    selected_peers,
-                                    true,
-                                )
+                                .broadcast_block(Arc::clone(&block), None, selected_peers, true)
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
@@ -13875,13 +13877,9 @@ impl Node {
                             self.select_broadcast_peers(&peers, peers.len().min(16));
                         drop(peers);
                         let node = self.clone();
-                        // `block` is owned here and unused afterwards — cloning deep-copied
-                        // a whole Block (up to MAX_BLOCK_TX_COUNT txs with witnesses) once
-                        // per accepted block for nothing.
-                        let block_arc = Arc::new(block);
                         tokio::spawn(async move {
                             if let Err(e) = node
-                                .broadcast_block(block_arc, None, selected_peers, true)
+                                .broadcast_block(block, None, selected_peers, true)
                                 .await
                             {
                                 warn!("Failed to broadcast block to selected peers: {}", e);
@@ -14604,7 +14602,7 @@ impl Node {
                     self.publish_discovery_state("Accepted block").await;
 
                     // Send network event
-                    tx.send(NetworkEvent::NewBlock((*block_ref).clone()))
+                    tx.send(NetworkEvent::NewBlock(Arc::clone(&block_ref)))
                         .await
                         .map_err(|e| {
                             NodeError::Network(format!("Failed to send block event: {}", e))
@@ -15487,7 +15485,7 @@ impl Node {
                     return;
                 }
                 if self
-                    .handle_network_event(NetworkEvent::NewBlock(block))
+                    .handle_network_event(NetworkEvent::NewBlock(Arc::new(block)))
                     .await
                     .is_ok()
                 {
@@ -15510,7 +15508,10 @@ impl Node {
                 // the TCP/relay path (peer=Some) which can fetch the witness. The shared path re-checks
                 // and hits its validation cache, so this costs no extra verification.
                 if self.verify_block_parallel(&b).await.unwrap_or(false) {
-                    if let Err(err) = self.handle_network_event(NetworkEvent::NewBlock(b)).await {
+                    if let Err(err) = self
+                        .handle_network_event(NetworkEvent::NewBlock(Arc::new(b)))
+                        .await
+                    {
                         debug!("WebRTC mesh: block processing error: {}", err);
                     } else {
                         mesh_seen.lock().put(hash, ());
