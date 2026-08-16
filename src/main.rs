@@ -40,6 +40,7 @@ use alphanumeric::a9::{
         ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
         UI_ORANGE, UI_PINK, UI_RULE,
     },
+    wallet_ledger::{LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
 };
 
@@ -893,9 +894,29 @@ async fn async_main() -> Result<()> {
             )
         }; // blockchain_lock is dropped here
 
+        // Open the ONE operator payment ledger, shared between the CLI signer (collision-free
+        // timestamp allocation) and the node's protected submission endpoints (idempotency and
+        // cross-path collision detection). A single shared instance is required: a payment signed
+        // locally and one submitted through the API must land in the same transaction index, or a
+        // collision between them goes undetected. Failure to open is not fatal to the node — mining,
+        // serving and the legacy endpoints run regardless — but every payment path that depends on
+        // it fails closed rather than fall back to unsafe timestamp reuse.
+        let wallet_ledger =
+            match WalletLedger::open(DEFAULT_LEDGER_FILENAME, LedgerConfig::default()) {
+                Ok(ledger) => Some(Arc::new(ledger)),
+                Err(error) => {
+                    error!(
+                        "wallet payment ledger unavailable ({error}); local payment signing and \
+                         protected submission endpoints are disabled until it can be opened"
+                    );
+                    None
+                }
+            };
+
         let mgmt = Box::new(Mgmt::new(
             db.clone(),
             blockchain.clone(),
+            wallet_ledger.clone(),
         ));
         pb.inc(1);
 
@@ -927,6 +948,7 @@ async fn async_main() -> Result<()> {
                 // Peer cache lives next to the chain DB so it survives reboots
                 // (the temp-dir default gets wiped exactly when it matters).
                 data_dir: Some(db_path.clone()),
+                wallet_ledger: wallet_ledger.clone(),
             },
         )
         .await {

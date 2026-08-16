@@ -12,6 +12,7 @@ pub mod outbound;
 pub mod ui;
 pub mod velocity;
 pub mod wallet;
+pub mod wallet_ledger;
 #[cfg(feature = "webrtc_mesh")]
 pub mod webrtc;
 pub mod whisper;
