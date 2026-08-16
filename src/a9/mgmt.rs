@@ -1,10 +1,10 @@
+use crate::a9::store::Store;
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
-use sled::Db;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::Write;
@@ -634,7 +634,7 @@ fn load_error_is_first_run(e: &std::io::Error) -> bool {
 
 impl Mgmt {
     pub fn new(
-        _db: sled::Db,
+        _db: Store,
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
         wallet_ledger: Option<Arc<WalletLedger>>,
     ) -> Self {
@@ -975,7 +975,7 @@ impl Mgmt {
 
     pub async fn load_wallets(
         &self,
-        _db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Store>>,
         passphrase: Option<&[u8]>,
     ) -> Result<HashMap<String, Wallet>> {
         let mut wallets = HashMap::new();
@@ -1134,7 +1134,7 @@ impl Mgmt {
         miner: &Miner,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
-        _db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Store>>,
         use_gpu: bool,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         announce: &dyn Fn(&Block),
@@ -1313,7 +1313,7 @@ impl Mgmt {
         command: &str,
         wallets: &mut HashMap<String, Wallet>,
         blockchain: &Arc<RwLock<Blockchain>>,
-        _db_arc: &Arc<RwLock<Db>>,
+        _db_arc: &Arc<RwLock<Store>>,
     ) -> Result<CreateTransactionOutcome> {
         let mut stdout = StandardStream::stdout(ColorChoice::Always);
 
