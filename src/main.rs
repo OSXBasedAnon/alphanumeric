@@ -100,7 +100,14 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[derive(serde::Deserialize)]
 struct BootstrapManifestResponse {
     ok: bool,
-    manifest: BootstrapManifestPointer,
+    /// Legacy (sled-format) manifest slot — read by pre-8.0 binaries.
+    #[serde(default)]
+    manifest: Option<BootstrapManifestPointer>,
+    /// redb-format manifest slot published by the upgraded explorer during the
+    /// engine-migration window. This binary generation prefers it; the legacy
+    /// slot remains for tip reconcile when the redb slot is not yet published.
+    #[serde(default)]
+    manifest_redb: Option<BootstrapManifestPointer>,
 }
 
 // Shape of the R2 recovery mirror (bootstrap/recovery.json): the gateway wraps the exact
@@ -5395,7 +5402,15 @@ async fn fetch_verified_bootstrap_manifest(
             Ok(r) if r.status().is_success() => match r.bytes().await {
                 Ok(body) => match serde_json::from_slice::<BootstrapManifestResponse>(&body) {
                     Ok(parsed) if parsed.ok => {
-                        verify_bootstrap_manifest(&parsed.manifest).map(|()| parsed.manifest)
+                        // Prefer the redb-generation slot; fall back to the
+                        // legacy slot (still valid for tip reconcile — the
+                        // format gate at the download site governs artifacts).
+                        match parsed.manifest_redb.or(parsed.manifest) {
+                            Some(manifest) => {
+                                verify_bootstrap_manifest(&manifest).map(|()| manifest)
+                            }
+                            None => Err("Bootstrap manifest response has no manifest".into()),
+                        }
                     }
                     Ok(_) => Err("Bootstrap manifest response is not ok".into()),
                     Err(e) => Err(format!("Bootstrap manifest payload parse failed: {}", e).into()),
