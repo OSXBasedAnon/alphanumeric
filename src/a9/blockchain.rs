@@ -4727,12 +4727,13 @@ impl Blockchain {
         // durability is the window's begin-marker + commit flush, and the
         // gated clear below only balances the window's mark/clear pair.
         if !self.apply_batch_open() {
+            // One authoritative fsync. Tree::flush() is a full-DB fsync in sled
+            // (single shared log), so the balances/chain-meta tree flushes that
+            // used to follow were pure repeats — same fix, same reason as the
+            // finalize-path tail.
             self.db
                 .flush()
                 .map_err(|e| BlockchainError::FlushError(e.to_string()))?;
-            // Tree opened only to flush.
-            self.db.open_tree(BALANCES_TREE)?.flush()?;
-            self.open_chain_meta_tree()?.flush()?;
         }
         self.clear_chain_state_dirty()?;
         self.notify_tip_changed(block);
