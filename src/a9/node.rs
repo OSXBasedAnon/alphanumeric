@@ -61,6 +61,10 @@ use crate::a9::blockchain::{
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
 use crate::a9::mldsa;
+use crate::a9::outbound::{
+    AdmissionError as OutboundAdmissionError, MessageCost as OutboundMessageCost,
+    OutboundScheduler, Reservation as OutboundReservation, TrafficClass,
+};
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
 
 //----------------------------------------------------------------------
@@ -361,6 +365,11 @@ const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
+const OUTBOUND_AEAD_OVERHEAD: usize = 12 + 16; // ChaCha20-Poly1305 nonce + authentication tag
+/// Optional mesh transaction gossip is independent from the canonical TCP scheduler. It must be
+/// bounded, but saturation may only drop the additive mesh copy — never consume TCP reservations.
+const MESH_TX_OUTBOUND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const MESH_TX_OUTBOUND_TASK_BUDGET: usize = 256;
 const OUTBOUND_POOL_IDLE_SECS: u64 = 90;
 const OUTBOUND_POOL_MAX_FACTOR: usize = 2;
 // Per-peer outbound circuit breaker. Loosened 2026-07-11 (was 3 / 30s): under a
@@ -1788,6 +1797,10 @@ pub struct Node {
     peer_secrets: Arc<RwLock<HashMap<SocketAddr, Vec<u8>>>>,
     outbound_connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<OutboundConnection>>>>>,
     outbound_circuit_breakers: Arc<RwLock<HashMap<SocketAddr, OutboundCircuitState>>>,
+    /// Transport-only egress admission. It bounds encoded bytes and work before callers wait on
+    /// the authenticated connection, and prioritizes block/control work over bulk backlog.
+    outbound_scheduler: Arc<OutboundScheduler>,
+    mesh_transaction_outbound: Arc<MeshTransactionOutboundBudget>,
     pub rate_limiter: Arc<RateLimiter>,
     /// Per-peer expensive transaction-body work, independent of envelope
     /// message counting and canonical per-sender admission limits.
@@ -2165,6 +2178,75 @@ struct OutboundConnection {
     exchange_armed: bool,
 }
 
+/// A message encoded exactly once before outbound admission. Encryption remains per attempt
+/// because every frame needs a fresh nonce, but a retry no longer reserializes a large body.
+#[derive(Debug)]
+struct PreparedOutboundMessage {
+    plaintext: Vec<u8>,
+    cost: OutboundMessageCost,
+}
+
+#[derive(Debug)]
+struct MeshTransactionOutboundBudget {
+    bytes: Arc<Semaphore>,
+    tasks: Arc<Semaphore>,
+    dropped: AtomicU64,
+}
+
+impl MeshTransactionOutboundBudget {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(MESH_TX_OUTBOUND_BYTE_BUDGET)),
+            tasks: Arc::new(Semaphore::new(MESH_TX_OUTBOUND_TASK_BUDGET)),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
+    fn try_reserve(&self, bytes: usize) -> Option<MeshTransactionOutboundReservation> {
+        let byte_permits = match u32::try_from(bytes.max(1)) {
+            Ok(permits) if bytes <= MESH_TX_OUTBOUND_BYTE_BUDGET => permits,
+            _ => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let task = match self.tasks.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let bytes = match self.bytes.clone().try_acquire_many_owned(byte_permits) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        Some(MeshTransactionOutboundReservation {
+            _bytes: bytes,
+            _task: task,
+        })
+    }
+
+    fn snapshot(&self) -> (usize, usize, u64) {
+        (
+            MESH_TX_OUTBOUND_BYTE_BUDGET.saturating_sub(self.bytes.available_permits()),
+            MESH_TX_OUTBOUND_TASK_BUDGET.saturating_sub(self.tasks.available_permits()),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(feature = "webrtc_mesh")]
+#[derive(Debug)]
+struct MeshTransactionOutboundReservation {
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+    _task: tokio::sync::OwnedSemaphorePermit,
+}
+
 #[derive(Debug, Clone, Default)]
 struct OutboundCircuitState {
     consecutive_failures: u32,
@@ -2182,6 +2264,8 @@ struct PortMappingResult {
 struct StatsState {
     blockchain: Arc<RwLock<Blockchain>>,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
+    outbound_scheduler: Arc<OutboundScheduler>,
+    mesh_transaction_outbound: Arc<MeshTransactionOutboundBudget>,
     start_time: u64,
     network_id: [u8; 32],
     // Coarse per-process token bucket so an unauthenticated flood of /stats (when
@@ -2314,6 +2398,20 @@ impl Node {
             .filter(|d| !d.trim().is_empty())
             .map(Arc::from);
         let peer_cache_path = Self::resolve_peer_cache_path(data_dir.as_deref());
+        let bounded_max_peers = max_peers.max(MIN_PEERS);
+        let outbound_scheduler = Arc::new(OutboundScheduler::from_env(bounded_max_peers));
+        let mesh_transaction_outbound = Arc::new(MeshTransactionOutboundBudget::new());
+        let outbound_config = outbound_scheduler.snapshot();
+        info!(
+            "Outbound scheduler {} (global={} MiB, per-peer={} MiB)",
+            if outbound_config.enabled {
+                "enabled"
+            } else {
+                "disabled: legacy rate path active"
+            },
+            outbound_config.global_queue_capacity_bytes / (1024 * 1024),
+            outbound_config.peer_queue_capacity_bytes / (1024 * 1024),
+        );
         debug_assert_eq!(
             COMPACT_GLOBAL_CACHE_BYTE_BUDGET,
             COMPACT_PENDING_CACHE_BYTE_BUDGET + COMPACT_FULL_CACHE_BYTE_BUDGET
@@ -2392,7 +2490,7 @@ impl Node {
         Ok(Self {
             db,
             peers: Arc::new(RwLock::new(HashMap::new())),
-            max_peers: max_peers.max(MIN_PEERS),
+            max_peers: bounded_max_peers,
             max_connections: max_connections.max(10),
             blockchain,
             network_health: Arc::new(RwLock::new(NetworkHealth::new())),
@@ -2495,6 +2593,8 @@ impl Node {
             peer_secrets: Arc::new(RwLock::new(HashMap::new())),
             outbound_connections: Arc::new(RwLock::new(HashMap::new())),
             outbound_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            outbound_scheduler,
+            mesh_transaction_outbound,
             handshake_public_key: keypair.public_key().as_ref().to_vec(),
             handshake_key_bytes: Arc::new(handshake_key_bytes),
             #[cfg(feature = "webrtc_mesh")]
@@ -6496,6 +6596,43 @@ impl Node {
             .unwrap_or_default()
             .as_secs()
             .saturating_sub(state.start_time);
+        let outbound = state.outbound_scheduler.snapshot();
+        let (mesh_tx_bytes, mesh_tx_tasks, mesh_tx_dropped) =
+            state.mesh_transaction_outbound.snapshot();
+        let mut outbound_classes = serde_json::Map::new();
+        for class in TrafficClass::ALL {
+            let metrics = outbound.classes[class as usize];
+            outbound_classes.insert(
+                class.as_str().to_string(),
+                json!({
+                    "queue_capacity_bytes": metrics.queue_capacity_bytes,
+                    "peer_queue_capacity_bytes": metrics.peer_queue_capacity_bytes,
+                    "queue_capacity_messages": metrics.queue_capacity_messages,
+                    "peer_queue_capacity_messages": metrics.peer_queue_capacity_messages,
+                    "max_in_flight": metrics.max_in_flight,
+                    "max_queue_age_ms": metrics.max_queue_age_ms,
+                    "peer_byte_rate_per_second": metrics.peer_byte_rate_per_second,
+                    "peer_work_rate_per_second": metrics.peer_work_rate_per_second,
+                    "admitted_messages": metrics.admitted_messages,
+                    "admitted_bytes": metrics.admitted_bytes,
+                    "admitted_work": metrics.admitted_work,
+                    "completed_messages": metrics.completed_messages,
+                    "failed_messages": metrics.failed_messages,
+                    "cancelled_messages": metrics.cancelled_messages,
+                    "rejected_oversized": metrics.rejected_oversized,
+                    "rejected_queue_full": metrics.rejected_queue_full,
+                    "rejected_rate_limited": metrics.rejected_rate_limited,
+                    "queue_timeouts": metrics.queue_timeouts,
+                    "queued_messages": metrics.queued_messages,
+                    "queued_bytes": metrics.queued_bytes,
+                    "in_flight_messages": metrics.in_flight_messages,
+                    "in_flight_bytes": metrics.in_flight_bytes,
+                    "queue_wait_samples": metrics.queue_wait_samples,
+                    "average_queue_wait_ms": metrics.average_queue_wait_ms(),
+                    "maximum_queue_wait_ms": metrics.maximum_queue_wait_ms(),
+                }),
+            );
+        }
 
         (
             StatusCode::OK,
@@ -6508,6 +6645,23 @@ impl Node {
                 "peers": peers,
                 "version": format!("rust-{}", NETWORK_VERSION),
                 "uptime_secs": uptime_secs,
+                "outbound_relay": {
+                    "scheduler_enabled": outbound.enabled,
+                    "global_queue_capacity_bytes": outbound.global_queue_capacity_bytes,
+                    "peer_queue_capacity_bytes": outbound.peer_queue_capacity_bytes,
+                    "peer_states": outbound.peer_states,
+                    "peer_state_capacity": outbound.peer_state_capacity,
+                    "peer_table_full": outbound.peer_table_full,
+                    "classes": outbound_classes,
+                    "mesh_transaction": {
+                        "compiled": cfg!(feature = "webrtc_mesh"),
+                        "active_bytes": mesh_tx_bytes,
+                        "active_tasks": mesh_tx_tasks,
+                        "byte_capacity": MESH_TX_OUTBOUND_BYTE_BUDGET,
+                        "task_capacity": MESH_TX_OUTBOUND_TASK_BUDGET,
+                        "dropped_optional_copies": mesh_tx_dropped,
+                    },
+                },
             })),
         )
     }
@@ -6537,6 +6691,8 @@ impl Node {
         let state = StatsState {
             blockchain: Arc::clone(&self.blockchain),
             peers: Arc::clone(&self.peers),
+            outbound_scheduler: Arc::clone(&self.outbound_scheduler),
+            mesh_transaction_outbound: Arc::clone(&self.mesh_transaction_outbound),
             start_time: self.start_time,
             network_id: self.network_id,
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
@@ -8746,18 +8902,72 @@ impl Node {
                 let broadcast_len = metrics_node.tx.len();
                 let receivers = metrics_node.tx.receiver_count();
                 let peer_count = metrics_node.peers.read().await.len();
+                let outbound = metrics_node.outbound_scheduler.snapshot();
+                let outbound_queued_bytes: u64 = outbound
+                    .classes
+                    .iter()
+                    .map(|class| class.queued_bytes)
+                    .sum();
+                let outbound_queued_messages: u64 = outbound
+                    .classes
+                    .iter()
+                    .map(|class| class.queued_messages)
+                    .sum();
+                let outbound_in_flight_bytes: u64 = outbound
+                    .classes
+                    .iter()
+                    .map(|class| class.in_flight_bytes)
+                    .sum();
+                let outbound_in_flight_messages: u64 = outbound
+                    .classes
+                    .iter()
+                    .map(|class| class.in_flight_messages)
+                    .sum();
+                let outbound_timeouts: u64 = outbound
+                    .classes
+                    .iter()
+                    .map(|class| class.queue_timeouts)
+                    .sum();
+                let (mesh_tx_bytes, mesh_tx_tasks, mesh_tx_dropped) =
+                    metrics_node.mesh_transaction_outbound.snapshot();
 
                 if in_flight >= EVENT_QUEUE_WARN_THRESHOLD
                     || broadcast_len >= (EVENT_BROADCAST_CAPACITY * 8 / 10)
+                    || outbound_queued_bytes.saturating_add(outbound_in_flight_bytes)
+                        >= (outbound.global_queue_capacity_bytes as u64).saturating_mul(3) / 4
+                    || mesh_tx_bytes >= MESH_TX_OUTBOUND_BYTE_BUDGET * 3 / 4
+                    || mesh_tx_tasks >= MESH_TX_OUTBOUND_TASK_BUDGET * 3 / 4
                 {
                     warn!(
-                        "Backpressure: event_queue={} broadcast_backlog={} peers={} receivers={}",
-                        in_flight, broadcast_len, peer_count, receivers
+                        "Backpressure: event_queue={} broadcast_backlog={} outbound_queue_messages={} outbound_queue_bytes={} outbound_in_flight_messages={} outbound_in_flight_bytes={} outbound_timeouts={} mesh_tx_bytes={} mesh_tx_tasks={} mesh_tx_dropped={} peers={} receivers={}",
+                        in_flight,
+                        broadcast_len,
+                        outbound_queued_messages,
+                        outbound_queued_bytes,
+                        outbound_in_flight_messages,
+                        outbound_in_flight_bytes,
+                        outbound_timeouts,
+                        mesh_tx_bytes,
+                        mesh_tx_tasks,
+                        mesh_tx_dropped,
+                        peer_count,
+                        receivers
                     );
                 } else {
                     debug!(
-                        "Backpressure: event_queue={} broadcast_backlog={} peers={} receivers={}",
-                        in_flight, broadcast_len, peer_count, receivers
+                        "Backpressure: event_queue={} broadcast_backlog={} outbound_queue_messages={} outbound_queue_bytes={} outbound_in_flight_messages={} outbound_in_flight_bytes={} outbound_timeouts={} mesh_tx_bytes={} mesh_tx_tasks={} mesh_tx_dropped={} peers={} receivers={}",
+                        in_flight,
+                        broadcast_len,
+                        outbound_queued_messages,
+                        outbound_queued_bytes,
+                        outbound_in_flight_messages,
+                        outbound_in_flight_bytes,
+                        outbound_timeouts,
+                        mesh_tx_bytes,
+                        mesh_tx_tasks,
+                        mesh_tx_dropped,
+                        peer_count,
+                        receivers
                     );
                 }
             }
@@ -9641,6 +9851,9 @@ impl Node {
                     breakers.remove(addr);
                 }
             }
+            for addr in remove_list {
+                self.outbound_scheduler.remove_peer(addr);
+            }
         }
 
         // IMPROVEMENT: Initiate discovery if we need more peers
@@ -9786,6 +9999,9 @@ impl Node {
                 for addr in &removals {
                     breakers.remove(addr);
                 }
+            }
+            for addr in removals {
+                self.outbound_scheduler.remove_peer(addr);
             }
         }
 
@@ -10472,10 +10688,167 @@ impl Node {
         connection
     }
 
+    /// Classify transport work without changing its wire representation. The encoded byte count is
+    /// exact; work units intentionally follow the potentially multiplicative part of each message
+    /// (transactions, blocks, headers, shreds, peer entries) rather than charging every envelope as
+    /// one request.
+    fn outbound_message_cost(
+        message: &NetworkMessage,
+        encrypted_bytes: usize,
+    ) -> OutboundMessageCost {
+        let (class, work) = match message {
+            NetworkMessage::Block(block) => (TrafficClass::Block, block.transactions.len()),
+            NetworkMessage::CompactBlockV1(compact) => {
+                (TrafficClass::Block, compact.transaction_hashes.len())
+            }
+            NetworkMessage::HeaderVerification { .. } => (TrafficClass::Block, 1),
+            NetworkMessage::Shred(_) => (TrafficClass::Block, 1),
+            NetworkMessage::ShredRequest(ShredRequestType::Missing { indices, .. }) => {
+                (TrafficClass::Block, indices.len())
+            }
+            NetworkMessage::ShredRequest(ShredRequestType::Range {
+                start_height,
+                end_height,
+            }) => (
+                TrafficClass::Block,
+                end_height.saturating_sub(*start_height).saturating_add(1) as usize,
+            ),
+            NetworkMessage::ShredResponse { shreds, .. } => (TrafficClass::Block, shreds.len()),
+            NetworkMessage::GetCompactTransactionsV1 { indexes, .. } => {
+                (TrafficClass::Block, indexes.len())
+            }
+            NetworkMessage::CompactTransactionsV1 { transactions, .. } => {
+                (TrafficClass::Block, transactions.len())
+            }
+            NetworkMessage::GetCompactBlockV1 { .. } => (TrafficClass::Block, 1),
+            NetworkMessage::CompactBlockResponseV1 { block, .. } => (
+                TrafficClass::Block,
+                block
+                    .as_ref()
+                    .map(|block| block.transactions.len())
+                    .unwrap_or(1),
+            ),
+
+            NetworkMessage::Transaction(_) => (TrafficClass::Transaction, 1),
+            NetworkMessage::TxRequest { .. } => (TrafficClass::Transaction, 1),
+            NetworkMessage::TxResponse { .. } => (TrafficClass::Transaction, 1),
+            NetworkMessage::TransactionInventoryV1 { keys }
+            | NetworkMessage::GetTransactionsV1 { keys } => {
+                (TrafficClass::Transaction, keys.as_slice().len())
+            }
+            NetworkMessage::TransactionsV1 { transactions } => {
+                (TrafficClass::Transaction, transactions.as_slice().len())
+            }
+
+            NetworkMessage::GetBlocks { start, end } => (
+                TrafficClass::Bootstrap,
+                end.saturating_sub(*start).saturating_add(1) as usize,
+            ),
+            NetworkMessage::Blocks(blocks) => (
+                TrafficClass::Bootstrap,
+                blocks.iter().fold(blocks.len(), |total, block| {
+                    total.saturating_add(block.transactions.len())
+                }),
+            ),
+            NetworkMessage::GetHeaders {
+                start_height,
+                end_height,
+            } => (
+                TrafficClass::Bootstrap,
+                end_height.saturating_sub(*start_height).saturating_add(1) as usize,
+            ),
+            NetworkMessage::HeaderSync { headers, .. } => (TrafficClass::Bootstrap, headers.len()),
+            NetworkMessage::RawData(data) => (
+                TrafficClass::Bootstrap,
+                data.len().saturating_add(4095) / 4096,
+            ),
+
+            NetworkMessage::MldsaKeyRegistration { .. }
+            | NetworkMessage::WalletInfo { .. }
+            | NetworkMessage::GetWalletInfo { .. }
+            | NetworkMessage::WalletInfoResponse { .. } => (TrafficClass::Registration, 1),
+
+            NetworkMessage::Version { .. }
+            | NetworkMessage::AlertMessage(_)
+            | NetworkMessage::Challenge(_)
+            | NetworkMessage::ChallengeResponse { .. }
+            | NetworkMessage::GetPeers
+            | NetworkMessage::GetBlockHeight
+            | NetworkMessage::BlockHeight(_)
+            | NetworkMessage::Ping { .. }
+            | NetworkMessage::Pong { .. } => (TrafficClass::Control, 1),
+            NetworkMessage::Peers(peers) => (TrafficClass::Control, peers.len()),
+        };
+        OutboundMessageCost {
+            class,
+            bytes: encrypted_bytes,
+            work: work.max(1),
+        }
+    }
+
+    fn prepare_outbound_message(
+        message: &NetworkMessage,
+    ) -> Result<PreparedOutboundMessage, NodeError> {
+        let plaintext = codec::serialize(message)?;
+        let encrypted_bytes = plaintext
+            .len()
+            .checked_add(OUTBOUND_AEAD_OVERHEAD)
+            .ok_or_else(|| NodeError::Network("Outgoing message size overflow".into()))?;
+        if encrypted_bytes > MAX_MESSAGE_SIZE {
+            return Err(NodeError::Network("Outgoing message too large".to_string()));
+        }
+        Ok(PreparedOutboundMessage {
+            cost: Self::outbound_message_cost(message, encrypted_bytes),
+            plaintext,
+        })
+    }
+
+    fn outbound_admission_error(error: OutboundAdmissionError) -> NodeError {
+        let detail = error.to_string();
+        match error {
+            OutboundAdmissionError::QueueFull { .. }
+            | OutboundAdmissionError::RateLimited { .. }
+            | OutboundAdmissionError::QueueExpired { .. }
+            | OutboundAdmissionError::PeerTableFull => NodeError::Retryable(detail),
+            OutboundAdmissionError::Oversized { .. } | OutboundAdmissionError::Closed => {
+                NodeError::Network(detail)
+            }
+        }
+    }
+
     pub async fn send_message_with_response(
         &self,
         addr: SocketAddr,
         message: &NetworkMessage,
+    ) -> Result<NetworkMessage, NodeError> {
+        let prepared = Self::prepare_outbound_message(message)?;
+        // Exact rollback behavior: disabling the scheduler restores the former message-count
+        // limiter. Enabled nodes use byte/work buckets instead, so one ML-DSA body and one tiny
+        // ping are no longer incorrectly charged as equal work.
+        if !self.outbound_scheduler.is_enabled() {
+            let rate_key = format!("msg_to_{}", addr);
+            if !self.rate_limiter.check_limit(&rate_key) {
+                return Err(NodeError::Network("Rate limit exceeded".to_string()));
+            }
+        }
+        let reservation = self
+            .outbound_scheduler
+            .admit(addr, prepared.cost)
+            .await
+            .map_err(Self::outbound_admission_error)?;
+        let result = self
+            .send_prepared_message_with_response(addr, message, &prepared, &reservation)
+            .await;
+        reservation.finish(result.is_ok());
+        result
+    }
+
+    async fn send_prepared_message_with_response(
+        &self,
+        addr: SocketAddr,
+        message: &NetworkMessage,
+        prepared: &PreparedOutboundMessage,
+        reservation: &OutboundReservation,
     ) -> Result<NetworkMessage, NodeError> {
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -10498,14 +10871,12 @@ impl Node {
             ));
         }
 
-        // Rate limit check
-        let rate_key = format!("msg_to_{}", addr);
-        if !self.rate_limiter.check_limit(&rate_key) {
-            return Err(NodeError::Network("Rate limit exceeded".to_string()));
-        }
-
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
+            let dispatch = reservation
+                .acquire_dispatch()
+                .await
+                .map_err(Self::outbound_admission_error)?;
             self.check_outbound_circuit(addr).await?;
 
             let conn = match self.get_or_create_outbound_connection(addr).await {
@@ -10513,6 +10884,7 @@ impl Node {
                 Err(e) => {
                     self.record_outbound_failure(addr).await;
                     last_error = Some(e);
+                    drop(dispatch);
                     if attempt + 1 < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
                         continue;
@@ -10535,12 +10907,13 @@ impl Node {
                     "Discarded desynced pooled connection to {}",
                     addr
                 )));
+                drop(dispatch);
                 continue;
             }
             stream_guard.exchange_armed = true;
             let result: Result<NetworkMessage, NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
-                let data = self.encrypt_message(message, &shared_secret)?;
+                let data = self.encrypt_serialized_message(&prepared.plaintext, &shared_secret)?;
                 if data.is_empty() {
                     return Err(NodeError::Network(
                         "Refusing to send empty request".to_string(),
@@ -10598,6 +10971,7 @@ impl Node {
             stream_guard.last_used = Instant::now();
             stream_guard.last_used_wall = SystemTime::now();
             drop(stream_guard);
+            drop(dispatch);
 
             match result {
                 Ok(response) => {
@@ -12399,6 +12773,47 @@ impl Node {
         addr: SocketAddr,
         message: &NetworkMessage,
     ) -> Result<(), NodeError> {
+        let prepared = Self::prepare_outbound_message(message)?;
+        self.send_prepared_outbound_message(addr, message, &prepared)
+            .await
+    }
+
+    async fn send_prepared_outbound_message(
+        &self,
+        addr: SocketAddr,
+        message: &NetworkMessage,
+        prepared: &PreparedOutboundMessage,
+    ) -> Result<(), NodeError> {
+        if !self.outbound_scheduler.is_enabled()
+            && !matches!(
+                message,
+                NetworkMessage::Block(_) | NetworkMessage::CompactBlockV1(_)
+            )
+        {
+            let rate_key = format!("send_to_{}", addr);
+            if !self.rate_limiter.check_limit(&rate_key) {
+                return Err(NodeError::Network("Rate limit exceeded".to_string()));
+            }
+        }
+        let reservation = self
+            .outbound_scheduler
+            .admit(addr, prepared.cost)
+            .await
+            .map_err(Self::outbound_admission_error)?;
+        let result = self
+            .send_prepared_message(addr, message, prepared, &reservation)
+            .await;
+        reservation.finish(result.is_ok());
+        result
+    }
+
+    async fn send_prepared_message(
+        &self,
+        addr: SocketAddr,
+        message: &NetworkMessage,
+        prepared: &PreparedOutboundMessage,
+        reservation: &OutboundReservation,
+    ) -> Result<(), NodeError> {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const MAX_ATTEMPTS: u32 = 2;
 
@@ -12408,23 +12823,12 @@ impl Node {
             ));
         }
 
-        // Rate limit check. Blocks are exempt: a burst of tx/gossip traffic to a peer must
-        // never spend the budget that a block send needs, since dropping a block send stalls
-        // propagation and raises the orphan rate. Our own block sends are already bounded by
-        // the valid-PoW production rate and guarded by the outbound circuit breaker below, so
-        // exempting them adds no amplification. All other message types stay paced per peer.
-        if !matches!(
-            message,
-            NetworkMessage::Block(_) | NetworkMessage::CompactBlockV1(_)
-        ) {
-            let rate_key = format!("send_to_{}", addr);
-            if !self.rate_limiter.check_limit(&rate_key) {
-                return Err(NodeError::Network("Rate limit exceeded".to_string()));
-            }
-        }
-
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
+            let dispatch = reservation
+                .acquire_dispatch()
+                .await
+                .map_err(Self::outbound_admission_error)?;
             self.check_outbound_circuit(addr).await?;
 
             let conn = match self.get_or_create_outbound_connection(addr).await {
@@ -12432,6 +12836,7 @@ impl Node {
                 Err(e) => {
                     self.record_outbound_failure(addr).await;
                     last_error = Some(e);
+                    drop(dispatch);
                     if attempt + 1 < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
                         continue;
@@ -12451,12 +12856,13 @@ impl Node {
                     "Discarded desynced pooled connection to {}",
                     addr
                 )));
+                drop(dispatch);
                 continue;
             }
             stream_guard.exchange_armed = true;
             let result: Result<(), NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
-                let data = self.encrypt_message(message, &shared_secret)?;
+                let data = self.encrypt_serialized_message(&prepared.plaintext, &shared_secret)?;
                 if data.is_empty() {
                     return Err(NodeError::Network(
                         "Refusing to send empty message".to_string(),
@@ -12486,6 +12892,7 @@ impl Node {
             stream_guard.last_used = Instant::now();
             stream_guard.last_used_wall = SystemTime::now();
             drop(stream_guard);
+            drop(dispatch);
 
             match result {
                 Ok(()) => {
@@ -12746,6 +13153,7 @@ impl Node {
                 self.outbound_circuit_breakers.write().await.remove(&addr);
                 self.compact_capable_peers.remove(&addr);
                 self.transaction_inventory_capable_peers.remove(&addr);
+                self.outbound_scheduler.remove_peer(addr);
 
                 // If peer count too low, trigger discovery
                 let peer_count = self.peers.read().await.len();
@@ -14444,7 +14852,13 @@ impl Node {
                 return;
             }
             if let Ok(bytes) = codec::serialize(msg) {
+                let Some(reservation) = self.mesh_transaction_outbound.try_reserve(bytes.len())
+                else {
+                    debug!("Optional mesh transaction copy dropped by bounded outbound budget");
+                    return;
+                };
                 tokio::spawn(async move {
+                    let _reservation = reservation;
                     let _ = mesh.broadcast(&bytes).await;
                 });
             }
@@ -14624,10 +15038,17 @@ impl Node {
             return Ok(0);
         }
 
+        // Serialize the identical announcement once. Per-peer encryption still uses a fresh nonce,
+        // while fanout clones only these Arcs instead of deep-cloning and reserializing the compact
+        // body for every target.
+        let message = Arc::new(NetworkMessage::CompactBlockV1((*compact).clone()));
+        let prepared = Arc::new(Self::prepare_outbound_message(&message)?);
+
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
         let sends = targets.into_iter().map(|peer| {
-            let compact = Arc::clone(&compact);
+            let message = Arc::clone(&message);
+            let prepared = Arc::clone(&prepared);
             let permit = semaphore.clone().acquire_owned();
             let node = self.clone();
             async move {
@@ -14638,7 +15059,7 @@ impl Node {
                             e
                         ))
                     })?;
-                    node.send_message(peer, &NetworkMessage::CompactBlockV1((*compact).clone()))
+                    node.send_prepared_outbound_message(peer, &message, &prepared)
                         .await
                 }
                 .await;
@@ -14755,12 +15176,28 @@ impl Node {
             return Ok(0);
         }
 
+        // Full block bytes are identical for every target and compact fallback. Keep one canonical
+        // transport object and one encoded plaintext behind Arcs; encryption remains per peer so
+        // nonce/key isolation is unchanged. This removes up to ten simultaneous deep block clones
+        // and MessagePack encodes from the broadcast hot path.
+        let full_message = Arc::new(NetworkMessage::Block((*block).clone()));
+        let full_prepared = Arc::new(Self::prepare_outbound_message(&full_message)?);
+        let compact_transport = compact
+            .as_ref()
+            .map(|compact| {
+                let message = Arc::new(NetworkMessage::CompactBlockV1((**compact).clone()));
+                Self::prepare_outbound_message(&message)
+                    .map(|prepared| (message, Arc::new(prepared)))
+            })
+            .transpose()?;
+
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
         let broadcast_futures = sends.into_iter().map(|(peer, use_compact)| {
-            let block = Arc::clone(&block);
-            let compact = compact.clone();
+            let full_message = Arc::clone(&full_message);
+            let full_prepared = Arc::clone(&full_prepared);
+            let compact_transport = compact_transport.clone();
             let permit = semaphore.clone().acquire_owned();
             let node = self.clone();
 
@@ -14770,11 +15207,16 @@ impl Node {
                         NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
                     })?;
                     if use_compact {
-                        let compact = compact.ok_or_else(|| {
-                            NodeError::Network("Compact broadcast body unavailable".into())
-                        })?;
+                        let (compact_message, compact_prepared) =
+                            compact_transport.ok_or_else(|| {
+                                NodeError::Network("Compact broadcast body unavailable".into())
+                            })?;
                         match node
-                            .send_message(peer, &NetworkMessage::CompactBlockV1((*compact).clone()))
+                            .send_prepared_outbound_message(
+                                peer,
+                                &compact_message,
+                                &compact_prepared,
+                            )
                             .await
                         {
                             Ok(()) => Ok(()),
@@ -14784,12 +15226,16 @@ impl Node {
                                     "Compact broadcast to {} failed ({}); retrying full block",
                                     peer, compact_error
                                 );
-                                node.send_message(peer, &NetworkMessage::Block((*block).clone()))
-                                    .await
+                                node.send_prepared_outbound_message(
+                                    peer,
+                                    &full_message,
+                                    &full_prepared,
+                                )
+                                .await
                             }
                         }
                     } else {
-                        node.send_message(peer, &NetworkMessage::Block((*block).clone()))
+                        node.send_prepared_outbound_message(peer, &full_message, &full_prepared)
                             .await
                     }
                 }
@@ -14909,24 +15355,45 @@ impl Node {
     async fn write_encrypted_frame<W>(
         &self,
         writer: &mut W,
+        peer: SocketAddr,
         message: &NetworkMessage,
         shared_secret: &[u8],
     ) -> Result<(), NodeError>
     where
         W: AsyncWrite + Unpin,
     {
-        let data = self.encrypt_message(message, shared_secret)?;
-        if data.is_empty() {
-            return Err(NodeError::Network("Refusing to send empty frame".into()));
-        }
-        if data.len() > MAX_MESSAGE_SIZE {
-            return Err(NodeError::Network("Outgoing frame too large".into()));
-        }
+        let prepared = Self::prepare_outbound_message(message)?;
+        let reservation = self
+            .outbound_scheduler
+            .admit(peer, prepared.cost)
+            .await
+            .map_err(Self::outbound_admission_error)?;
+        let result = async {
+            // This is the response half of an accepted inbound stream, independent of the pooled
+            // outbound stream. It owns the same budgets but must not take that stream's dispatch
+            // lock: crossed simultaneous requests must remain able to answer one another.
+            reservation.start_independent_dispatch();
+            let data = self.encrypt_serialized_message(&prepared.plaintext, shared_secret)?;
+            if data.is_empty() {
+                return Err(NodeError::Network("Refusing to send empty frame".into()));
+            }
+            if data.len() > MAX_MESSAGE_SIZE {
+                return Err(NodeError::Network("Outgoing frame too large".into()));
+            }
 
-        writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        writer.write_all(&data).await?;
-        writer.flush().await?;
-        Ok(())
+            tokio::time::timeout(Duration::from_secs(10), async {
+                writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
+                writer.write_all(&data).await?;
+                writer.flush().await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await
+            .map_err(|_| NodeError::Network(format!("Response write timed out to {}", peer)))??;
+            Ok(())
+        }
+        .await;
+        reservation.finish(result.is_ok());
+        result
     }
 
     async fn handle_connection(
@@ -15157,20 +15624,28 @@ impl Node {
                     };
 
                     if let Some(response) = response {
-                        match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            self.write_encrypted_frame(&mut writer, &response, &shared_secret),
-                        )
-                        .await
+                        match self
+                            .write_encrypted_frame(
+                                &mut writer,
+                                peer_addr,
+                                &response,
+                                &shared_secret,
+                            )
+                            .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                warn!("Response write failed to {}: {}", peer_addr, e);
-                                self.record_peer_failure(peer_addr).await;
+                            Ok(()) => {}
+                            Err(NodeError::Retryable(detail)) => {
+                                // Local queue/rate backpressure is not a peer fault. Close this
+                                // request stream so the remote caller receives EOF and retries a
+                                // different peer instead of waiting its full response timeout.
+                                debug!(
+                                    "Response to {} deferred by outbound backpressure: {}",
+                                    peer_addr, detail
+                                );
                                 break 'connection;
                             }
-                            Err(_) => {
-                                warn!("Response write timed out to {}", peer_addr);
+                            Err(e) => {
+                                warn!("Response write failed to {}: {}", peer_addr, e);
                                 self.record_peer_failure(peer_addr).await;
                                 break 'connection;
                             }
@@ -15206,6 +15681,7 @@ impl Node {
             .remove(&peer_addr);
         self.compact_capable_peers.remove(&peer_addr);
         self.transaction_inventory_capable_peers.remove(&peer_addr);
+        self.outbound_scheduler.remove_peer(peer_addr);
 
         // Notify disconnect. Same rationale as the PeerJoin try_send above.
         if let Err(e) = tx.try_send(NetworkEvent::PeerLeave(peer_addr)) {
@@ -15261,6 +15737,9 @@ impl Node {
             warn!("Removing unresponsive peer {}", addr);
             self.peers.write().await.remove(&addr);
             self.peer_secrets.write().await.remove(&addr);
+            self.outbound_connections.write().await.remove(&addr);
+            self.outbound_circuit_breakers.write().await.remove(&addr);
+            self.outbound_scheduler.remove_peer(addr);
         }
 
         Ok(())
@@ -16513,9 +16992,9 @@ impl Node {
     }
 
     // Encryption/decryption utilities
-    fn encrypt_message(
+    fn encrypt_serialized_message(
         &self,
-        message: &NetworkMessage,
+        plaintext: &[u8],
         shared_secret: &[u8],
     ) -> Result<Vec<u8>, NodeError> {
         // Use ChaCha20-Poly1305 for authenticated encryption
@@ -16531,11 +17010,9 @@ impl Node {
             .map_err(|_| NodeError::Network("Failed to generate nonce".into()))?;
         let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
 
-        // Serialize message
-        let message_bytes = codec::serialize(message)?;
-
-        // Encrypt in-place
-        let mut in_out = message_bytes;
+        // Encrypt a fresh owned copy in-place. The caller may reuse `plaintext` for a retry, but a
+        // sealed buffer cannot be reused because each attempt receives a new nonce.
+        let mut in_out = plaintext.to_vec();
         key.seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
             .map_err(|_| NodeError::Network("Encryption failed".into()))?;
 
@@ -18682,6 +19159,86 @@ mod tests {
     }
 
     #[test]
+    fn outbound_costs_are_exact_by_bytes_and_multiplicative_work() {
+        let inventory = NetworkMessage::TransactionInventoryV1 {
+            keys: BoundedSequence::new(vec![[1u8; 32]; 7]).unwrap(),
+        };
+        let inventory_prepared = Node::prepare_outbound_message(&inventory).unwrap();
+        assert_eq!(inventory_prepared.cost.class, TrafficClass::Transaction);
+        assert_eq!(inventory_prepared.cost.work, 7);
+        assert_eq!(
+            inventory_prepared.cost.bytes,
+            inventory_prepared.plaintext.len() + OUTBOUND_AEAD_OVERHEAD
+        );
+
+        let cases = [
+            (
+                NetworkMessage::GetBlocks { start: 10, end: 19 },
+                TrafficClass::Bootstrap,
+                10,
+            ),
+            (
+                NetworkMessage::ShredRequest(ShredRequestType::Missing {
+                    block_hash: [2u8; 32],
+                    indices: vec![1, 2, 3],
+                }),
+                TrafficClass::Block,
+                3,
+            ),
+            (
+                NetworkMessage::Peers(vec![SocketAddr::from(([127, 0, 0, 1], 1)); 5]),
+                TrafficClass::Control,
+                5,
+            ),
+            (
+                NetworkMessage::MldsaKeyRegistration {
+                    node_id: "node".into(),
+                    mldsa_public_key: vec![0; 32],
+                    ed25519_signature: vec![0; 64],
+                },
+                TrafficClass::Registration,
+                1,
+            ),
+        ];
+        for (message, expected_class, expected_work) in cases {
+            let prepared = Node::prepare_outbound_message(&message).unwrap();
+            assert_eq!(prepared.cost.class, expected_class);
+            assert_eq!(prepared.cost.work, expected_work);
+            assert_eq!(
+                prepared.cost.bytes,
+                codec::serialize(&message).unwrap().len() + OUTBOUND_AEAD_OVERHEAD
+            );
+        }
+    }
+
+    #[cfg(feature = "webrtc_mesh")]
+    #[test]
+    fn optional_mesh_transaction_budget_is_bounded_and_recovers() {
+        let budget = MeshTransactionOutboundBudget::new();
+        let mut held = Vec::with_capacity(MESH_TX_OUTBOUND_TASK_BUDGET);
+        for _ in 0..MESH_TX_OUTBOUND_TASK_BUDGET {
+            held.push(
+                budget
+                    .try_reserve(1)
+                    .expect("mesh task admitted up to count cap"),
+            );
+        }
+        assert!(budget.try_reserve(1).is_none());
+        let (_, active_tasks, dropped) = budget.snapshot();
+        assert_eq!(active_tasks, MESH_TX_OUTBOUND_TASK_BUDGET);
+        assert_eq!(dropped, 1);
+
+        held.pop();
+        assert!(budget.try_reserve(1).is_some());
+        assert!(
+            budget
+                .try_reserve(MESH_TX_OUTBOUND_BYTE_BUDGET + 1)
+                .is_none(),
+            "one optional mesh copy cannot exceed the full byte lane"
+        );
+    }
+
+    #[test]
     fn pending_transaction_body_requests_are_exact_consumable_and_bounded() {
         let peer = SocketAddr::from(([203, 0, 113, 10], 7_177));
         let other_peer = SocketAddr::from(([203, 0, 113, 11], 7_177));
@@ -19002,7 +19559,7 @@ mod tests {
         let legacy_peer = canary_node(&funded_addresses).await;
         let slow_peer = canary_node(&funded_addresses).await;
         let mut tasks = Vec::new();
-        for node in [&new_peer, &legacy_peer, &slow_peer] {
+        for node in [&sender, &new_peer, &legacy_peer, &slow_peer] {
             let (acceptor, drain) = spawn_canary_acceptor(node);
             tasks.push(acceptor);
             tasks.push(drain);
@@ -19065,6 +19622,44 @@ mod tests {
         assert!(sender.peer_supports_transaction_inventory_v1(new_peer.bind_addr));
         assert!(new_peer.peer_supports_transaction_inventory_v1(sender.bind_addr));
 
+        // Both nodes issue a request at the same instant. Each outbound request holds its local
+        // per-peer dispatch gate while awaiting the response; the response travels on the separate
+        // accepted stream and must therefore be budgeted without taking that gate. If response
+        // writes accidentally share the gate, these crossed requests deadlock until timeout.
+        let crossed_barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let crossed_sender = sender.clone();
+        let crossed_new_addr = new_peer.bind_addr;
+        let sender_barrier = Arc::clone(&crossed_barrier);
+        let crossed_a = tokio::spawn(async move {
+            sender_barrier.wait().await;
+            crossed_sender
+                .send_message_with_response(crossed_new_addr, &NetworkMessage::GetBlockHeight)
+                .await
+        });
+        let crossed_new = new_peer.clone();
+        let crossed_sender_addr = sender.bind_addr;
+        let new_barrier = Arc::clone(&crossed_barrier);
+        let crossed_b = tokio::spawn(async move {
+            new_barrier.wait().await;
+            crossed_new
+                .send_message_with_response(crossed_sender_addr, &NetworkMessage::GetBlockHeight)
+                .await
+        });
+        crossed_barrier.wait().await;
+        let (crossed_a, crossed_b) = timeout(Duration::from_secs(5), async {
+            tokio::join!(crossed_a, crossed_b)
+        })
+        .await
+        .expect("crossed requests must not deadlock");
+        assert!(matches!(
+            crossed_a.expect("sender crossed request task").unwrap(),
+            NetworkMessage::BlockHeight(_)
+        ));
+        assert!(matches!(
+            crossed_b.expect("new-peer crossed request task").unwrap(),
+            NetworkMessage::BlockHeight(_)
+        ));
+
         let first_new_started = Instant::now();
         sender
             .send_transaction_batch_to_peer(
@@ -19122,6 +19717,83 @@ mod tests {
             .await
             .expect("establish isolated slow-peer session");
         assert!(matches!(height_response, NetworkMessage::BlockHeight(_)));
+
+        // Hold one synthetic active transaction dispatch, queue an actual transaction first, then
+        // an actual control request. Once released, control must overtake the older transaction
+        // waiter on the same authenticated stream.
+        let priority_transaction = transactions[CANARY_TRANSACTION_COUNT - 1].clone();
+        let blocker_message = NetworkMessage::Transaction(priority_transaction.clone());
+        let blocker_prepared = Node::prepare_outbound_message(&blocker_message).unwrap();
+        let blocker = sender
+            .outbound_scheduler
+            .admit(slow_peer.bind_addr, blocker_prepared.cost)
+            .await
+            .expect("priority blocker admission");
+        let blocker_dispatch = blocker
+            .acquire_dispatch()
+            .await
+            .expect("priority blocker dispatch")
+            .expect("scheduler enabled in canary");
+        let (priority_order_tx, mut priority_order_rx) = mpsc::unbounded_channel();
+        let priority_sender = sender.clone();
+        let priority_slow_addr = slow_peer.bind_addr;
+        let transaction_order = priority_order_tx.clone();
+        let transaction_waiter = tokio::spawn(async move {
+            let result = priority_sender
+                .send_message(
+                    priority_slow_addr,
+                    &NetworkMessage::Transaction(priority_transaction),
+                )
+                .await;
+            transaction_order.send(("transaction", result)).unwrap();
+        });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if sender.outbound_scheduler.snapshot().classes[TrafficClass::Transaction as usize]
+                    .queued_messages
+                    >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transaction waiter reached priority queue");
+        let control_sender = sender.clone();
+        let control_slow_addr = slow_peer.bind_addr;
+        let control_waiter = tokio::spawn(async move {
+            let result = control_sender
+                .send_message_with_response(control_slow_addr, &NetworkMessage::GetBlockHeight)
+                .await
+                .map(|_| ());
+            priority_order_tx.send(("control", result)).unwrap();
+        });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if sender.outbound_scheduler.snapshot().classes[TrafficClass::Control as usize]
+                    .queued_messages
+                    >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control waiter reached priority queue");
+        drop(blocker_dispatch);
+        blocker.finish(true);
+        let (first_class, first_result) = priority_order_rx.recv().await.unwrap();
+        first_result.expect("first priority send");
+        assert_eq!(first_class, "control");
+        let (second_class, second_result) = priority_order_rx.recv().await.unwrap();
+        second_result.expect("second priority send");
+        assert_eq!(second_class, "transaction");
+        transaction_waiter.await.unwrap();
+        control_waiter.await.unwrap();
+        wait_for_pending(&slow_peer, 1, "priority transaction").await;
+
         let slow_connection = sender
             .outbound_connections
             .read()
@@ -19231,7 +19903,9 @@ mod tests {
 
         // Close every loopback stream before aborting listeners so connection-handler clones
         // release their identity locks. Sled temporary databases delete themselves on final drop.
-        sender.outbound_connections.write().await.clear();
+        for node in [&sender, &new_peer, &legacy_peer, &slow_peer] {
+            node.outbound_connections.write().await.clear();
+        }
         sleep(Duration::from_millis(100)).await;
         for task in tasks {
             task.abort();
