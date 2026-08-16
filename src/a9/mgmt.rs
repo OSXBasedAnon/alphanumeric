@@ -3440,13 +3440,22 @@ mod tests {
     /// cannot print the bytes.
     #[test]
     fn wallet_key_data_debug_redacts_key_material() {
-        let data = WalletKeyData::new(
+        let mut data = WalletKeyData::new(
             "redaction-fixture".to_string(),
             "4".repeat(40),
             Some(Zeroizing::new(vec![0xAB, 0xCD, 0xEF])),
             false,
         );
+        // Freeze the only non-deterministic field. `new` stamps the live epoch
+        // second, and the substring assertions below scan the WHOLE rendering —
+        // an arbitrary timestamp can contain any decimal fragment, which made
+        // this test fail on unlucky seconds (first seen as a CI-only "flake").
+        data.last_sync_timestamp = 1_000_000_000;
         let rendered = format!("{:?}", data);
+        assert!(
+            rendered.contains("<redacted 3 bytes>"),
+            "the redaction placeholder is the pinned Debug form: {rendered}"
+        );
         assert!(
             !rendered.contains("171") && !rendered.contains("205") && !rendered.contains("239"),
             "key bytes must not appear in Debug output: {rendered}"
