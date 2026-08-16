@@ -173,7 +173,15 @@ impl SchedulerConfig {
         let message_caps = [64, 256, 256, 64, 64];
         // Lower-priority classes total ten of sixteen peer slots, reserving six for block/control.
         let peer_message_caps = [4, 4, 6, 3, 1];
-        let concurrency = [16, 32, 16, 4, 4];
+        // Bootstrap concurrency matches Block/Transaction rather than sitting at a tight 4. This
+        // in-flight count governs BOTH our own GetBlocks/GetHeaders requests — each of which holds
+        // its slot across the up-to-30s response wait — and the sync-serving responses we write back
+        // to peers (Blocks/HeaderSync flow through the same class in write_encrypted_frame). At 4, a
+        // node that both syncs and serves more than four concurrent bulk transfers stalled the fifth
+        // for the full max_queue_age and then dropped that peer's connection. The class byte slice
+        // (a quarter of the global pool) remains the real memory bound, so a wider count only lets
+        // moderate-sized responses proceed together; it never lets bulk traffic exceed its bytes.
+        let concurrency = [16, 32, 16, 16, 4];
         let ages = [max_queue_age, half_age, half_age, max_queue_age, half_age];
 
         // Per-peer token buckets are intentionally generous relative to one saturated 1 MiB / 5.4
@@ -1196,6 +1204,40 @@ mod tests {
             snapshot.classes[TrafficClass::Transaction as usize].queued_bytes,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_serving_admits_many_concurrent_bulk_transfers() {
+        // A GetBlocks request holds its class in-flight slot across the response wait, and the
+        // matching Blocks response we serve back to a peer flows through the SAME class. This pins
+        // the finding fix: a node must be able to sync from and serve more than four peers at once.
+        // With the former in-flight cap of 4, the fifth admission timed out and dropped that peer.
+        let scheduler = OutboundScheduler::new(SchedulerConfig::for_test());
+        const CONCURRENT_BULK_PEERS: usize = 8;
+        assert!(
+            scheduler.config.classes[TrafficClass::Bootstrap as usize].max_in_flight
+                >= CONCURRENT_BULK_PEERS,
+            "bootstrap serving concurrency must cover several simultaneous bulk transfers"
+        );
+        // A moderate 256 KiB response so the class byte slice is not the limiter here: eight of
+        // these fit the test byte budget, leaving the in-flight count as the property under test.
+        let mut held = Vec::new();
+        for index in 0..CONCURRENT_BULK_PEERS {
+            held.push(
+                scheduler
+                    .admit(
+                        peer(index as u16 + 1),
+                        cost(TrafficClass::Bootstrap, 256 * 1024),
+                    )
+                    .await
+                    .expect("each concurrent bulk transfer must be admitted, not queue-expired"),
+            );
+        }
+        assert_eq!(
+            scheduler.snapshot().classes[TrafficClass::Bootstrap as usize].rejected_queue_full,
+            0
+        );
+        drop(held);
     }
 
     #[tokio::test]
