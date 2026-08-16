@@ -744,14 +744,12 @@ async fn async_main() -> Result<()> {
         let db = match open_chain_db(&db_path) {
             Ok(db) => db,
             Err(e) => {
-                // redb surfaces unrecoverable damage as Corrupted storage
-                // errors (stringified through the store boundary); a repair
-                // pass already ran inside open. Anything still corrupt gets
-                // the quarantine ladder, same recovery contract as before.
-                let is_corruption = {
-                    let msg = e.to_string();
-                    msg.contains("Corrupt") || msg.contains("corrupt")
-                };
+                // Corruption is classified at the store boundary from redb's
+                // error VARIANTS (clobbered magic = Io(InvalidData), damaged
+                // pages = Corrupted, gross truncation = pre-open guard), never
+                // by string-matching engine internals here. Anything classified
+                // gets the quarantine ladder, same recovery contract as before.
+                let is_corruption = e.is_corruption();
                 if is_corruption {
                     warn!("Store reported corruption; retrying open before quarantine...");
                     match open_chain_db(&db_path) {
@@ -783,7 +781,8 @@ async fn async_main() -> Result<()> {
             tokio::spawn(async move {
                 // Treat SIGTERM (systemd/docker `stop`) identically to SIGINT (Ctrl-C):
                 // without it, `systemctl stop` kills the node with no graceful flush and
-                // the last ~interval of writes rely on sled log recovery.
+                // the last flush-window of non-marker writes would be lost
+                // (consensus state is marker-flushed per block; see a9::store).
                 #[cfg(unix)]
                 {
                     use tokio::signal::unix::{signal, SignalKind};
@@ -1838,7 +1837,7 @@ async fn async_main() -> Result<()> {
                                     alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                 );
                                 // Flush before exit like every other exit path:
-                                // sled buffers ~1s of writes, and discarding them
+                                // the store buffers non-durable writes between periodic flushes, and discarding them
                                 // here costs a derived-state rebuild on the next
                                 // boot — on the very path whose job is recovery.
                                 let _ = db_for_recon.flush();
@@ -1944,7 +1943,7 @@ async fn async_main() -> Result<()> {
                         // Flush before exit: the signal-handler flush never runs on
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
-                        // ~1s of sled writes.
+                        // the flush-window of buffered store writes.
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -1957,7 +1956,7 @@ async fn async_main() -> Result<()> {
                         // Flush before exit: the signal-handler flush never runs on
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
-                        // ~1s of sled writes.
+                        // the flush-window of buffered store writes.
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -1993,7 +1992,7 @@ async fn async_main() -> Result<()> {
                         // Flush before exit: the signal-handler flush never runs on
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
-                        // ~1s of sled writes.
+                        // the flush-window of buffered store writes.
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2005,7 +2004,7 @@ async fn async_main() -> Result<()> {
                         // Flush before exit: the signal-handler flush never runs on
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
-                        // ~1s of sled writes.
+                        // the flush-window of buffered store writes.
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2017,7 +2016,7 @@ async fn async_main() -> Result<()> {
                         // Flush before exit: the signal-handler flush never runs on
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
-                        // ~1s of sled writes.
+                        // the flush-window of buffered store writes.
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2233,7 +2232,7 @@ async fn async_main() -> Result<()> {
         .unwrap_or(0);
 
     // ── Overview ───────────────────────────────────────────────────────────
-    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.89 MSRV (raised by redb).
     #[allow(clippy::unnecessary_map_or)]
     let synced = network_height.map_or(true, |net| current_height + 1 >= net);
     ui_seg(&mut stdout, &mut color_spec, UI_LABEL, false, "\n ")?;
@@ -4798,12 +4797,35 @@ fn run_sled_conversion(sled_dir: &str, out_dir: &str) -> std::result::Result<(),
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let dst_path = std::path::Path::new(out_dir).join(CHAIN_DB_FILE);
     if dst_path.exists() {
-        return Err(format!(
-            "{} already exists — refusing to overwrite; remove it to re-convert",
-            dst_path.display()
-        ));
+        // A launch-time data PROBE creates an empty store file as a side
+        // effect; tolerate exactly that (every table empty) instead of
+        // sending the operator on a confusing manual-delete errand. Anything
+        // with data refuses, hard.
+        let existing = Store::open(&dst_path, 64 * 1024 * 1024).map_err(|e| e.to_string())?;
+        let mut has_data = false;
+        for name in existing.tree_names().map_err(|e| e.to_string())? {
+            let t = existing.open_tree(&name).map_err(|e| e.to_string())?;
+            if !t.is_empty().map_err(|e| e.to_string())? {
+                has_data = true;
+                break;
+            }
+        }
+        drop(existing);
+        if has_data {
+            return Err(format!(
+                "{} already exists and contains data — refusing to overwrite; remove it to re-convert",
+                dst_path.display()
+            ));
+        }
+        println!("  (replacing an empty probe-created store file)");
+        std::fs::remove_file(&dst_path).map_err(|e| e.to_string())?;
     }
-    let dst = Store::open(&dst_path, 256 * 1024 * 1024).map_err(|e| e.to_string())?;
+    // Crash-safe output: build under a temp name, durably seal, then rename
+    // into place — a converter crash can never leave a plausible partial
+    // store at the final path.
+    let work_path = std::path::Path::new(out_dir).join("chain.redb.converting");
+    let _ = std::fs::remove_file(&work_path);
+    let dst = Store::open(&work_path, 256 * 1024 * 1024).map_err(|e| e.to_string())?;
 
     let mut names: Vec<Vec<u8>> = src.tree_names().into_iter().map(|n| n.to_vec()).collect();
     names.sort();
@@ -4861,6 +4883,11 @@ fn run_sled_conversion(sled_dir: &str, out_dir: &str) -> std::result::Result<(),
         );
     }
     dst.flush().map_err(|e| e.to_string())?;
+    drop(dst);
+    std::fs::rename(&work_path, &dst_path).map_err(|e| e.to_string())?;
+    std::fs::File::open(out_dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
     println!(
         "Conversion complete: {} trees, {} entries, byte-verified. New store: {}",
         names.len(),
@@ -4886,8 +4913,10 @@ fn chain_db_cache_bytes() -> u64 {
 /// The chain database file inside the (directory-shaped) `db_path`. Keeping
 /// `db_path` a directory preserves every existing path assumption — quarantine
 /// renames, snapshot zips, bootstrap extraction — while the engine's single
-/// file lives inside it. Legacy sled files in the same directory are inert and
-/// serve as the in-place rollback copy until the operator removes them.
+/// file lives inside it. Legacy sled files in the same directory are inert;
+/// they survive an in-place upgrade (rollback = old binary reading them), but
+/// NOT a re-bootstrap, which replaces the whole directory. The chain DB holds
+/// only public, re-derivable data, so that loss is acceptable by design.
 const CHAIN_DB_FILE: &str = "chain.redb";
 
 fn chain_db_file(db_path: &str) -> std::path::PathBuf {
@@ -5522,7 +5551,7 @@ fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
         #[allow(clippy::manual_is_multiple_of)]
         if i > 0 && (s.len() - i) % 3 == 0 {
             out.push(',');
@@ -7079,25 +7108,26 @@ async fn publish_bootstrap_snapshot(
     // else writes it between hashing and upload.
     let (sha256, compressed_bytes) = hash_file_streaming(std::path::Path::new(&zip_path)).await?;
 
-    // Space-amplification invariant, measured once per publish: the aged live
-    // DB against the fresh import this cycle just produced. Steady-state has
-    // been AT OR BELOW 1.0 (sled's LowSpace GC plus the fleet inheriting
-    // compacted snapshots); a sustained climb is sled's number-one pathology
-    // arriving, and the alarm threshold is set well before recovery times or
-    // disk become a problem.
-    if let Ok(live_physical) = db.size_on_disk() {
-        let fresh_physical = archive_stats.extracted_bytes.max(1);
-        let ratio = live_physical as f64 / fresh_physical as f64;
+    // Space-amplification invariant, measured once per publish, on the
+    // engine's OWN accounting (review F2: comparing the file against a copy of
+    // itself read exactly 1.0 forever — a dead meter). redb's amplification
+    // mode is freed-page fragmentation: the file only shrinks on clean close,
+    // so a sustained climb in file/stored is the signal, with fragmented bytes
+    // as the direct cause.
+    if let Ok(space) = db.space_stats() {
+        let ratio = space.file_bytes as f64 / space.stored_bytes.max(1) as f64;
         log::info!(
-            "publisher DB physical {} MiB vs fresh-import {} MiB (amplification {:.2}x)",
-            live_physical / (1024 * 1024),
-            fresh_physical / (1024 * 1024),
+            "publisher store: file {} MiB, stored {} MiB, fragmented {} MiB (amplification {:.2}x)",
+            space.file_bytes / (1024 * 1024),
+            space.stored_bytes / (1024 * 1024),
+            space.fragmented_bytes / (1024 * 1024),
             ratio
         );
         if ratio > 3.0 {
             log::warn!(
-                "chain DB space amplification {:.2}x exceeds the 3x alarm — sled is no longer \
-                 reclaiming segments; investigate before recovery times and disk degrade",
+                "chain store space amplification {:.2}x exceeds the 3x alarm — freed-page \
+                 fragmentation is accumulating; a clean restart releases it, and a sustained \
+                 climb after restarts warrants investigation",
                 ratio
             );
         }

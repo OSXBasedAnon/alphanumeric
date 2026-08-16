@@ -9571,7 +9571,7 @@ impl Node {
             announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 announce_interval.tick().await;
-                // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+                // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
                 #[allow(clippy::manual_is_multiple_of)]
                 if tick % relay_every == 0 {
                     if let Err(e) = node_clone.ensure_public_tip_relayed().await {
@@ -10060,7 +10060,7 @@ impl Node {
                                     .map(|b| now.saturating_sub(b.timestamp))
                                     .unwrap_or(0)
                             };
-                            // `is_multiple_of` requires a newer compiler than the crate's Rust 1.70 MSRV.
+                            // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
                             #[allow(clippy::manual_is_multiple_of)]
                             if tip_age > 120 && tick_no % 5 != 0 {
                                 continue;
@@ -12255,7 +12255,7 @@ impl Node {
         Ok(None)
     }
 
-    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+    // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.89 MSRV (raised by redb).
     #[allow(clippy::unnecessary_map_or)]
     fn witness_matches_committed_receipt(receipt: &Transaction, candidate: &Transaction) -> bool {
         candidate.get_tx_id() == receipt.get_tx_id()

@@ -58,6 +58,14 @@ from_err!(
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
+/// Physical-vs-logical space accounting (see `Store::space_stats`).
+#[derive(Clone, Copy, Debug)]
+pub struct SpaceStats {
+    pub file_bytes: u64,
+    pub stored_bytes: u64,
+    pub fragmented_bytes: u64,
+}
+
 /// Table definitions require `&'static str` names; the chain's tree names are a
 /// small fixed set, so leak-once interning is bounded and permanent by design.
 fn interned(name: &str) -> &'static str {
@@ -137,12 +145,56 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// Errors that must route the caller into the corruption-recovery ladder
+/// (quarantine + re-bootstrap) carry this marker prefix. Classification happens
+/// HERE, from redb's error variants — never by string-matching engine internals
+/// at call sites (review finding F1: redb reports a clobbered magic number as
+/// Io(InvalidData), which a bare "Corrupt" substring match missed).
+pub const CORRUPTION_MARKER: &str = "CORRUPTION:";
+
+impl StoreError {
+    pub fn is_corruption(&self) -> bool {
+        self.0.starts_with(CORRUPTION_MARKER)
+    }
+}
+
+fn classify_open_error(e: redb::DatabaseError, pre_existing: bool) -> StoreError {
+    let corrupt = match &e {
+        redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)) => true,
+        // On a PRE-EXISTING file, an InvalidData at open is a damaged header /
+        // magic number, not an environmental I/O problem.
+        redb::DatabaseError::Storage(redb::StorageError::Io(io)) => {
+            pre_existing && io.kind() == std::io::ErrorKind::InvalidData
+        }
+        _ => false,
+    };
+    if corrupt {
+        StoreError(format!("{CORRUPTION_MARKER} {e}"))
+    } else {
+        StoreError(e.to_string())
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>, cache_bytes: usize) -> Result<Store> {
         let path = path.as_ref().to_path_buf();
+        // Gross-truncation guard (review F1): a pre-existing non-empty file
+        // shorter than redb's header region trips an assert INSIDE the engine
+        // (an uncatchable panic) before any error can be returned. Classify it
+        // as corruption here so the recovery ladder gets its chance.
+        let pre_existing_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if pre_existing_len > 0 && pre_existing_len < 4096 {
+            return Err(StoreError(format!(
+                "{CORRUPTION_MARKER} store file {} is truncated ({} bytes — smaller than \
+                 the engine header region)",
+                path.display(),
+                pre_existing_len
+            )));
+        }
         let db = redb::Builder::new()
             .set_cache_size(cache_bytes)
-            .create(&path)?;
+            .create(&path)
+            .map_err(|e| classify_open_error(e, pre_existing_len > 0))?;
         let store = Store {
             inner: Arc::new(Inner {
                 db,
@@ -234,6 +286,24 @@ impl Store {
 
     pub fn size_on_disk(&self) -> Result<u64> {
         Ok(std::fs::metadata(&self.inner.path)?.len())
+    }
+
+    /// Space accounting for the amplification telemetry (review F2): the
+    /// physical file size against the engine's own logical accounting, plus the
+    /// freed-but-unreleased byte count — redb's actual amplification mode
+    /// (the file only shrinks on clean close).
+    pub fn space_stats(&self) -> Result<SpaceStats> {
+        let file_bytes = std::fs::metadata(&self.inner.path)?.len();
+        let _guard = self.inner.write_lock.lock();
+        let txn = self.inner.db.begin_write()?;
+        let stats = txn.stats()?;
+        let out = SpaceStats {
+            file_bytes,
+            stored_bytes: stats.stored_bytes() + stats.metadata_bytes(),
+            fragmented_bytes: stats.fragmented_bytes(),
+        };
+        txn.abort()?;
+        Ok(out)
     }
 
     /// Consistent point-in-time copy of the database file for snapshot
@@ -471,10 +541,20 @@ impl Tree {
             Some(end) => Box::new(table.range(start..end)?),
             None => Box::new(table.range(start..)?),
         };
+        // Byte budget (review F3): pages stop at the entry limit OR this many
+        // accumulated bytes, whichever first — a run of max-size block values
+        // must never turn one page into a multi-GiB buffer. Resume logic
+        // already handles short pages.
+        const PAGE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
         let mut out = Vec::with_capacity(limit.min(1024));
+        let mut bytes = 0usize;
         for entry in iter.take(limit) {
             let (k, v) = entry?;
+            bytes += k.value().len() + v.value().len();
             out.push((k.value().to_vec(), v.value().to_vec()));
+            if bytes >= PAGE_BYTE_BUDGET {
+                break;
+            }
         }
         Ok(out)
     }
@@ -497,10 +577,16 @@ impl Tree {
             Some(end) => Box::new(table.range(start..end)?),
             None => Box::new(table.range(start..)?),
         };
+        const PAGE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
         let mut out = Vec::with_capacity(limit.min(1024));
+        let mut bytes = 0usize;
         for entry in iter.rev().take(limit) {
             let (k, v) = entry?;
+            bytes += k.value().len() + v.value().len();
             out.push((k.value().to_vec(), v.value().to_vec()));
+            if bytes >= PAGE_BYTE_BUDGET {
+                break;
+            }
         }
         Ok(out)
     }
@@ -577,43 +663,6 @@ impl Tree {
         drop(table);
         txn.commit()?;
         Ok(next)
-    }
-
-    /// Collected full-table contents, key-ascending. For unbounded trees use
-    /// `for_each`; this is for the small bounded ones (balances, orphans,
-    /// pending, meta).
-    pub fn iter_collect(&self) -> Result<Vec<KvPair>> {
-        let mut out = Vec::new();
-        self.for_each(|k, v| {
-            out.push((k.to_vec(), v.to_vec()));
-            true
-        })?;
-        Ok(out)
-    }
-
-    /// Collected range scan over `start..end` (end exclusive; `None` = open).
-    pub fn range_collect(
-        &self,
-        start: impl AsRef<[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<KvPair>> {
-        let txn = self.store.inner.db.begin_read()?;
-        let table = match txn.open_table(self.def()) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let start = start.as_ref();
-        let iter: Box<dyn Iterator<Item = _>> = match end {
-            Some(end) => Box::new(table.range(start..end)?),
-            None => Box::new(table.range(start..)?),
-        };
-        let mut out = Vec::new();
-        for entry in iter {
-            let (k, v) = entry?;
-            out.push((k.value().to_vec(), v.value().to_vec()));
-        }
-        Ok(out)
     }
 }
 
@@ -835,6 +884,18 @@ mod tests {
         let names = store.tree_names().unwrap();
         assert!(names.contains(&b"alpha".to_vec()));
         assert!(names.contains(&b"beta".to_vec()));
+    }
+
+    #[test]
+    fn truncated_store_file_classifies_as_corruption() {
+        let path = std::env::temp_dir().join(format!("a9store-trunc-{}.redb", std::process::id()));
+        std::fs::write(&path, b"redb!but-way-too-short").unwrap();
+        let err = Store::open(&path, 8 * 1024 * 1024).unwrap_err();
+        assert!(
+            err.is_corruption(),
+            "gross truncation must route to the recovery ladder: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
