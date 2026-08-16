@@ -2660,6 +2660,18 @@ impl Blockchain {
         index.apply_batch(index_batch)?;
         tree.flush()?;
         index.flush()?;
+
+        // NOTE: the reverted block's confirmed-witness occurrence rows are deliberately LEFT in
+        // place to age out of the retention window on their own. Proactively removing them here is
+        // unsafe: the reorg's own witness re-retention on the adopted branch is non-fatal (aborting
+        // a reorg after the tip write is a larger risk), so a transient persist failure there would
+        // leave the shared object with NO in-window occurrence, and the next block's refcount prune
+        // would then destroy a witness the canonical chain still needs — an under-retention wedge
+        // that startup reconcile cannot heal because prune runs first. A lingering row instead keeps
+        // the object pinned (bounded over-retention, the safe direction) until it ages out, giving
+        // every restart in that window a reconcile chance. The refcount prune is unaffected: it
+        // releases the shared object once no in-window occurrence, reverted or not, remains.
+
         // Mirror the reverted block out of the address history index (fail-open;
         // see record_confirmed_txs).
         if let Err(e) = self.remove_address_tx_entries(block) {
@@ -4286,8 +4298,15 @@ impl Blockchain {
         // missing witness must not abort an otherwise-valid adoption.
         for b in &branch {
             if let Err(e) = self.retain_confirmed_witnesses(&b.transactions, b.index as u64, true) {
-                warn!(
-                    "Reorg: could not retain witnesses for adopted block {}: {}",
+                // Deliberately non-fatal on this path only. The tip metadata for the adopted branch
+                // is already written above, and aborting a reorg mid-adoption after the tip write is
+                // a larger risk than the bounded, recoverable window this failure opens. Report it at
+                // error level (the default log filter hides warnings) and lean on the startup
+                // reconcile: reconcile_confirmed_witness_index re-pins every in-window canonical
+                // block on the next start, so a transient failure here self-heals rather than
+                // permanently serving this adopted height witness-short.
+                error!(
+                    "Reorg: could not retain witnesses for adopted block {} (will re-pin on next start): {}",
                     b.index, e
                 );
             }
@@ -5498,6 +5517,18 @@ impl Blockchain {
         // degrade to "index unavailable", never a startup failure.
         if let Err(e) = self.ensure_address_tx_index() {
             warn!("Address history index unavailable (build failed): {}", e);
+        }
+        // Reconcile the confirmed-witness occurrence index from the canonical chain BEFORE the first
+        // live prune, so the refcount prune can never sweep a witness the chain still needs (see
+        // reconcile_confirmed_witness_index). Best-effort by design: reconciliation only ADDS pins
+        // for objects that already exist, so it can never cause an over-delete, and a bug or storage
+        // hiccup here must degrade to a logged warning rather than brick node startup. Reported at
+        // error level because the default log filter hides warnings.
+        if let Err(e) = self.reconcile_confirmed_witness_index() {
+            error!(
+                "Confirmed-witness index reconcile failed at startup; pre-existing witnesses may be at risk until it succeeds on a later start: {}",
+                e
+            );
         }
         self.prune_orphans()?;
         let _ = self.promote_orphans_from_tip().await;
@@ -8356,25 +8387,30 @@ impl Blockchain {
             };
             let mut full_tx = tx.clone();
             full_tx.signature = Some(hex::encode(&sig));
-            let Ok(bytes) = codec::serialize(&full_tx) else {
-                continue;
-            };
-            // Do NOT swallow these. If witness retention fails (disk full, transient sled
-            // error) the node keeps accepting blocks while quietly becoming unable to serve
-            // witnesses to peers — and a peer that cannot obtain them cannot advance its
-            // verification floor, which is exactly the multi-minute freeze the beacon escape
-            // has to rescue. That cause was invisible.
-            if let Err(e) = cw_tree.insert(tx_id.as_bytes(), bytes) {
-                warn!(
-                    "Could not retain confirmed witness for {} — peers may be unable to verify near-tip blocks from us: {}",
-                    tx_id, e
-                );
-            }
+            // Fatal, like the inserts below: a witness we are obligated to retain but cannot
+            // serialize would otherwise advance the tip witness-short (unreachable in practice — the
+            // transaction already round-tripped through the block with only its signature swapped —
+            // but consistent with the fail-closed contract rather than a silent skip).
+            let bytes = codec::serialize(&full_tx)?;
+            // Fail closed. A witness we cannot persist is one we cannot serve, and a peer that
+            // cannot obtain it cannot advance its verification floor — the multi-minute freeze the
+            // beacon escape exists to rescue (two independent nodes stuck ~85 min at block 290968,
+            // 2026-07-27). Advancing the local tip without the durable witness behind it is exactly
+            // that fault, so these errors propagate: the caller (`process_transactions_batch`) is
+            // invoked with `?` before the block store and tip write, so a failure here aborts the
+            // block commit while the dirty marker stays set, and recovery re-retains — from this
+            // same store or the pending sidecar — once the underlying fault (disk full, transient
+            // sled error) clears. Halting is the correct response to being unable to keep evidence
+            // we are obligated to serve; the alternative is a silently witness-short frontier.
+            //
+            // The object is content-equivalent per tx_id (the same signed transaction re-mined
+            // carries the same signature), so re-inserting on recovery is idempotent, and the
+            // per-(height, tx_id) index row is the occurrence pin that `prune_confirmed_witnesses`
+            // refcounts before it may delete the shared object.
+            cw_tree.insert(tx_id.as_bytes(), bytes)?;
             let mut idx_key = confirm_height.to_be_bytes().to_vec();
             idx_key.extend_from_slice(tx_id.as_bytes());
-            if let Err(e) = cw_index.insert(idx_key, b"" as &[u8]) {
-                warn!("Could not index confirmed witness for {}: {}", tx_id, e);
-            }
+            cw_index.insert(idx_key, b"" as &[u8])?;
         }
         Ok(())
     }
@@ -8383,28 +8419,110 @@ impl Blockchain {
     /// window. Index keys are height-big-endian prefixed, so a byte range prunes
     /// everything confirmed at or below `tip_height - WITNESS_RETENTION_BLOCKS`.
     fn prune_confirmed_witnesses(&self, tip_height: u64) -> Result<(), BlockchainError> {
-        if tip_height <= WITNESS_RETENTION_BLOCKS {
-            return Ok(());
-        }
-        let cutoff = tip_height - WITNESS_RETENTION_BLOCKS;
         let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
         let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
-        let upper = cutoff.saturating_add(1).to_be_bytes().to_vec();
-        let mut stale: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for item in cw_index.range(..upper) {
+
+        // One pass over the occurrence index separates the pins that keep an object alive (a row at
+        // a height still inside the retention window) from the aged rows to drop. A tx_id stays
+        // "pinned" while ANY in-window occurrence references it, so the shared object survives as
+        // long as any occurrence needs it. This is the refcount that fixes the drop where the
+        // object was deleted on its OLDEST occurrence while a newer in-window occurrence — the same
+        // transaction re-confirmed at a new height after a reorg — still pointed at it.
+        let prune_by_height = tip_height > WITNESS_RETENTION_BLOCKS;
+        let cutoff = tip_height.saturating_sub(WITNESS_RETENTION_BLOCKS);
+        let mut pinned: HashSet<Vec<u8>> = HashSet::new();
+        let mut stale_rows: Vec<Vec<u8>> = Vec::new();
+        for item in cw_index.iter() {
             let (key, _) = item?;
-            let tx_id = if key.len() > 8 {
-                key[8..].to_vec()
-            } else {
-                Vec::new()
-            };
-            stale.push((key.to_vec(), tx_id));
-        }
-        for (idx_key, tx_id) in stale {
-            let _ = cw_index.remove(&idx_key);
-            if !tx_id.is_empty() {
-                let _ = cw_tree.remove(&tx_id);
+            if key.len() <= 8 {
+                stale_rows.push(key.to_vec()); // malformed key: drop it
+                continue;
             }
+            let mut height_bytes = [0u8; 8];
+            height_bytes.copy_from_slice(&key[..8]);
+            let height = u64::from_be_bytes(height_bytes);
+            if prune_by_height && height <= cutoff {
+                stale_rows.push(key.to_vec());
+            } else {
+                pinned.insert(key[8..].to_vec());
+            }
+        }
+
+        // Drop the aged occurrence rows. Best-effort: a lingering row only over-retains its object,
+        // which is the safe direction, and the next prune retries.
+        for row in &stale_rows {
+            let _ = cw_index.remove(row);
+        }
+
+        // Sweep every object no occurrence pins any more: both aged-out transactions and objects
+        // orphaned by a reorg that removed their only in-window occurrence. An object is deleted
+        // ONLY when provably unpinned. Every ambiguity resolves toward keeping it, because
+        // under-retention wedges a syncing peer at its verification floor while over-retention costs
+        // at most a bounded handful of objects until the next sweep. A live canonical transaction is
+        // always pinned here (retention fails closed, so a committed block's rows are durable) and
+        // startup reconciliation rebuilds in-window pins before the first prune, so this never
+        // deletes a witness the canonical chain still needs.
+        let mut swept = 0u64;
+        for item in cw_tree.iter() {
+            let (tx_id, _) = item?;
+            if !pinned.contains(tx_id.as_ref()) {
+                let _ = cw_tree.remove(&tx_id);
+                swept = swept.saturating_add(1);
+            }
+        }
+        if swept > 0 {
+            debug!(
+                "Pruned {} unpinned confirmed witnesses (tip {}, {} pins retained)",
+                swept,
+                tip_height,
+                pinned.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Reconcile the confirmed-witness occurrence index across the canonical retention window,
+    /// BEFORE any prune runs. Every canonical in-window transaction whose witness object we still
+    /// hold gets its `(height, tx_id)` pin restored, so a pre-existing inconsistency — an object
+    /// whose index row was lost by an older build that swallowed the write error, or a reorg-adopted
+    /// branch whose retention did not durably complete — can never let the first refcount prune
+    /// sweep a witness the canonical chain still needs. It only ADDS pins for objects that exist: a
+    /// dangling pin would defeat the refcount, and a lost object cannot be recreated from a stored
+    /// (truncated) block. Removing aged and orphaned rows and objects remains the live prune's job,
+    /// which runs only after this has restored the true pin set.
+    fn reconcile_confirmed_witness_index(&self) -> Result<(), BlockchainError> {
+        let tip_height = (self.get_block_count().max(1) - 1) as u64;
+        let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
+        let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
+        // Match the prune's kept window exactly: prune drops height <= tip - RETENTION, so the kept
+        // range is [tip - (RETENTION - 1), tip]. Reconciling from tip - RETENTION would re-pin a
+        // height the very next prune removes — wasted work and a latent trap.
+        let start = tip_height.saturating_sub(WITNESS_RETENTION_BLOCKS.saturating_sub(1));
+        let mut batch = sled::Batch::default();
+        let mut restored = 0u64;
+        for height in start..=tip_height {
+            let Ok(block) = self.get_block(height as u32) else {
+                continue; // a gap or a missing interior block is not fatal to reconciliation
+            };
+            for tx in &block.transactions {
+                if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                    continue;
+                }
+                let tx_id = tx.get_tx_id();
+                if matches!(cw_tree.get(tx_id.as_bytes()), Ok(Some(_))) {
+                    let mut idx_key = height.to_be_bytes().to_vec();
+                    idx_key.extend_from_slice(tx_id.as_bytes());
+                    batch.insert(idx_key, b"" as &[u8]);
+                    restored = restored.saturating_add(1);
+                }
+            }
+        }
+        cw_index.apply_batch(batch)?;
+        if restored > 0 {
+            debug!(
+                "Reconciled {} confirmed-witness pins across the retention window (tip {})",
+                restored, tip_height
+            );
         }
         Ok(())
     }
@@ -9999,6 +10117,127 @@ mod tests {
         insert_at(5, "tiny_chain_tx");
         bc.prune_confirmed_witnesses(100).unwrap();
         assert!(bc.get_confirmed_witness_tx("tiny_chain_tx").is_some());
+    }
+
+    // Regression for the shared-object drop: ONE witness object pinned by TWO occurrences (an old
+    // height and a recent in-window height, the shape a reorg produces when the same transaction is
+    // re-confirmed at a new height). The old prune removed the object by tx_id on the OLDEST
+    // occurrence's cutoff, dropping a witness a newer in-window occurrence still needed — a liveness
+    // fault, because a peer that cannot obtain it stalls its verification floor.
+    #[test]
+    fn shared_witness_survives_prune_while_a_recent_occurrence_pins_it() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+        let cw_index = bc.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE).unwrap();
+        let tx = metadata_test_block(1, [0u8; 32], "bob", 1.0)
+            .transactions
+            .remove(0);
+        let bytes = codec::serialize(&tx).unwrap();
+        let tx_id = "shared_tx";
+        cw_tree.insert(tx_id.as_bytes(), &bytes[..]).unwrap();
+        for height in [100u64, 500u64] {
+            let mut key = height.to_be_bytes().to_vec();
+            key.extend_from_slice(tx_id.as_bytes());
+            cw_index.insert(key, b"" as &[u8]).unwrap();
+        }
+
+        // Tip 400 -> cutoff 144. The old occurrence (100) ages out, but the recent one (500) still
+        // pins the shared object, so it MUST survive.
+        bc.prune_confirmed_witnesses(400).unwrap();
+        assert!(
+            bc.get_confirmed_witness_tx(tx_id).is_some(),
+            "a witness pinned by a recent in-window occurrence must not be dropped on an older occurrence's cutoff"
+        );
+        assert_eq!(
+            cw_index.iter().keys().filter_map(Result::ok).count(),
+            1,
+            "only the aged occurrence row should have been pruned"
+        );
+
+        // Once the recent occurrence also ages out (tip 800 -> cutoff 544 > 500), no pin remains and
+        // the object is finally released — the bounded window is still enforced.
+        bc.prune_confirmed_witnesses(800).unwrap();
+        assert!(
+            bc.get_confirmed_witness_tx(tx_id).is_none(),
+            "with no in-window occurrence left, the shared object is released"
+        );
+    }
+
+    // A witness whose only in-window occurrence is removed by a reorg revert becomes orphaned and is
+    // swept, while a witness the new branch re-confirms at a fresh height stays pinned. This is the
+    // asymmetric-safety contract: delete only when provably unpinned.
+    #[test]
+    fn a_reorg_orphaned_witness_is_swept_but_a_reconfirmed_one_is_kept() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+        let cw_index = bc.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE).unwrap();
+        let make = |tx_id: &str, height: u64| {
+            let tx = metadata_test_block(1, [0u8; 32], "bob", 1.0)
+                .transactions
+                .remove(0);
+            cw_tree
+                .insert(tx_id.as_bytes(), codec::serialize(&tx).unwrap())
+                .unwrap();
+            let mut key = height.to_be_bytes().to_vec();
+            key.extend_from_slice(tx_id.as_bytes());
+            cw_index.insert(key, b"" as &[u8]).unwrap();
+        };
+        make("orphaned", 500);
+        make("reconfirmed", 500);
+
+        // Directly orphan both objects at height 500 (as their rows would after aging out of the
+        // window), leaving objects with no occurrence — the state the prune sweep must reclaim...
+        for tx_id in ["orphaned", "reconfirmed"] {
+            let mut key = 500u64.to_be_bytes().to_vec();
+            key.extend_from_slice(tx_id.as_bytes());
+            cw_index.remove(key).unwrap();
+        }
+        // ...then the adopted branch re-confirms only "reconfirmed" at a fresh height 505.
+        let mut key = 505u64.to_be_bytes().to_vec();
+        key.extend_from_slice(b"reconfirmed");
+        cw_index.insert(key, b"" as &[u8]).unwrap();
+
+        bc.prune_confirmed_witnesses(600).unwrap();
+        assert!(
+            bc.get_confirmed_witness_tx("orphaned").is_none(),
+            "an object no occurrence pins must be swept"
+        );
+        assert!(
+            bc.get_confirmed_witness_tx("reconfirmed").is_some(),
+            "a re-confirmed object stays pinned at its new height"
+        );
+    }
+
+    // Regression for the reviewed under-retention path: after a reorg whose re-retain at the new
+    // height FAILS (transient disk error; non-fatal on the reorg path), no new pin is written.
+    // Because the reverted occurrence row is deliberately left to age out rather than removed
+    // eagerly, the OLD in-window occurrence keeps the shared object alive, so the next prune does
+    // not destroy a witness the canonical chain still needs — giving reconcile a chance to re-pin on
+    // the next restart. This is precisely the case eager row-removal would have wedged.
+    #[test]
+    fn a_lingering_occurrence_keeps_a_witness_alive_when_reorg_retain_fails() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+        let cw_index = bc.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE).unwrap();
+        let tx = metadata_test_block(1, [0u8; 32], "bob", 1.0)
+            .transactions
+            .remove(0);
+        let tx_id = "reorged_tx";
+        cw_tree
+            .insert(tx_id.as_bytes(), codec::serialize(&tx).unwrap())
+            .unwrap();
+        // Only the old occurrence (height 500) exists; the re-retain at the new height "failed", so
+        // its pin was never written, and the reverted pin was intentionally NOT removed.
+        let mut key = 500u64.to_be_bytes().to_vec();
+        key.extend_from_slice(tx_id.as_bytes());
+        cw_index.insert(key, b"" as &[u8]).unwrap();
+
+        // Tip 600 -> cutoff 344: the old occurrence (500) is still in-window, so the object survives.
+        bc.prune_confirmed_witnesses(600).unwrap();
+        assert!(
+            bc.get_confirmed_witness_tx(tx_id).is_some(),
+            "a lingering in-window occurrence must keep the witness alive across a failed reorg re-retain"
+        );
     }
 
     // A tx FIRST SEEN inside a mined block (no local mempool sidecar copy) whose own signature is
