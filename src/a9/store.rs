@@ -86,6 +86,11 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Table name for the default tree — the namespace sled's `Db` deref exposed.
+/// Fresh redb stores are ours to name; the converter maps sled's default tree
+/// here.
+pub const DEFAULT_TREE: &str = "__default__";
+
 struct Inner {
     db: redb::Database,
     path: PathBuf,
@@ -104,6 +109,32 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Inner>,
+    default_tree: OnceLock<Box<Tree>>,
+}
+
+/// sled's `Db` dereferenced to its default tree, and the node leans on that
+/// (`self.db.get("block_…")`). Preserving the deref keeps those call sites
+/// byte-identical across the engine swap. Boxed to break the Store↔Tree type
+/// cycle; pre-populated by every constructor so the deref is infallible.
+impl std::ops::Deref for Store {
+    type Target = Tree;
+    fn deref(&self) -> &Tree {
+        // Infallible by construction (per the lib.rs lint contract): every
+        // constructor populates `default_tree` before the Store is handed out,
+        // surfacing any failure there as a Result.
+        #[allow(clippy::expect_used)]
+        self.default_tree
+            .get()
+            .expect("default tree pre-populated by every Store constructor")
+    }
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("path", &self.inner.path)
+            .finish()
+    }
 }
 
 impl Store {
@@ -112,14 +143,18 @@ impl Store {
         let db = redb::Builder::new()
             .set_cache_size(cache_bytes)
             .create(&path)?;
-        Ok(Store {
+        let store = Store {
             inner: Arc::new(Inner {
                 db,
                 path,
                 write_lock: Mutex::new(()),
                 temporary: false,
             }),
-        })
+            default_tree: OnceLock::new(),
+        };
+        let default = store.open_tree(DEFAULT_TREE)?;
+        let _ = store.default_tree.set(Box::new(default));
+        Ok(store)
     }
 
     /// A throwaway store in the OS temp dir, deleted when the last handle
@@ -135,14 +170,18 @@ impl Store {
         let db = redb::Builder::new()
             .set_cache_size(64 * 1024 * 1024)
             .create(&path)?;
-        Ok(Store {
+        let store = Store {
             inner: Arc::new(Inner {
                 db,
                 path,
                 write_lock: Mutex::new(()),
                 temporary: true,
             }),
-        })
+            default_tree: OnceLock::new(),
+        };
+        let default = store.open_tree(DEFAULT_TREE)?;
+        let _ = store.default_tree.set(Box::new(default));
+        Ok(store)
     }
 
     pub fn open_tree(&self, name: impl AsRef<[u8]>) -> Result<Tree> {
@@ -176,17 +215,42 @@ impl Store {
         Ok(names)
     }
 
-    /// One durable (fsync) commit covering every previously committed write.
+    /// One durable commit covering every previously committed write, in the
+    /// CONSERVATIVE configuration a public value-bearing chain should run:
+    /// two-phase commit (torn-write protection on non-atomic media — one extra
+    /// fsync, paid only here, never on the hot mutation path) and quick_repair
+    /// (persists allocator state so an unclean open after this point recovers
+    /// in O(1) instead of walking the whole file's checksums — the difference
+    /// between milliseconds and minutes at multi-GB scale).
     pub fn flush(&self) -> Result<()> {
         let _guard = self.inner.write_lock.lock();
         let mut txn = self.inner.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
+        txn.set_two_phase_commit(true);
+        txn.set_quick_repair(true);
         txn.commit()?;
         Ok(())
     }
 
     pub fn size_on_disk(&self) -> Result<u64> {
         Ok(std::fs::metadata(&self.inner.path)?.len())
+    }
+
+    /// Consistent point-in-time copy of the database file for snapshot
+    /// publishing: hold the writer lock (no transaction can begin), seal
+    /// everything with one durable two-phase commit, then copy the file while
+    /// writers are still paused. Readers are unaffected (reads never mutate
+    /// the file). On APFS the copy is a clonefile — effectively instant — so
+    /// the writer pause is milliseconds regardless of database size.
+    pub fn snapshot_file_to(&self, dest: &Path) -> Result<()> {
+        let _guard = self.inner.write_lock.lock();
+        let mut txn = self.inner.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.set_two_phase_commit(true);
+        txn.set_quick_repair(true);
+        txn.commit()?;
+        std::fs::copy(&self.inner.path, dest)?;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -339,14 +403,105 @@ impl Tree {
         }
     }
 
-    /// Collected prefix scan, key-ascending. For unbounded-size scans use
-    /// `for_each_prefix` instead — this one materializes the results.
-    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<Vec<KvPair>> {
-        let mut out = Vec::new();
-        self.for_each_prefix(prefix, |k, v| {
-            out.push((k.to_vec(), v.to_vec()));
-            true
-        })?;
+    /// Lazy, chunked prefix scan with sled's iterator shape
+    /// (`Iterator<Item = Result<(key, value)>>`), so existing call sites —
+    /// including `.flatten()` loops — carry over unchanged. Each page reads
+    /// through a fresh snapshot (weakly consistent across pages, exactly as a
+    /// long-lived sled iterator was against concurrent writers), and memory
+    /// stays bounded by the page size regardless of tree size.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> LazyScan {
+        let prefix = prefix.as_ref().to_vec();
+        let end = prefix_end(&prefix);
+        LazyScan::new(self.clone(), prefix, end)
+    }
+
+    /// Lazy full-table scan, key-ascending, sled iterator shape.
+    pub fn iter(&self) -> LazyScan {
+        LazyScan::new(self.clone(), Vec::new(), None)
+    }
+
+    /// Lazy range scan with sled's `range(..)` shape. Bounds map to the
+    /// byte-order successor where needed (`x ∥ 0x00` is the immediate
+    /// successor of `x`).
+    pub fn range<R: std::ops::RangeBounds<Vec<u8>>>(&self, bounds: R) -> LazyScan {
+        use std::ops::Bound;
+        let start = match bounds.start_bound() {
+            Bound::Included(s) => s.clone(),
+            Bound::Excluded(s) => {
+                let mut succ = s.clone();
+                succ.push(0);
+                succ
+            }
+            Bound::Unbounded => Vec::new(),
+        };
+        let end = match bounds.end_bound() {
+            Bound::Included(e) => {
+                let mut succ = e.clone();
+                succ.push(0);
+                Some(succ)
+            }
+            Bound::Excluded(e) => Some(e.clone()),
+            Bound::Unbounded => None,
+        };
+        LazyScan::new(self.clone(), start, end)
+    }
+
+    /// Delete every entry (sled `Tree::clear` parity): one transaction that
+    /// drops and recreates the table.
+    pub fn clear(&self) -> Result<()> {
+        let _guard = self.store.inner.write_lock.lock();
+        let mut txn = self.store.inner.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        txn.delete_table(self.def())?;
+        txn.open_table(self.def())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// One page of `start..end` (end exclusive; `None` = open), at most `limit`
+    /// entries. The lazy scans build on this.
+    fn range_page(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<KvPair>> {
+        let txn = self.store.inner.db.begin_read()?;
+        let table = match txn.open_table(self.def()) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let iter: Box<dyn Iterator<Item = _>> = match end {
+            Some(end) => Box::new(table.range(start..end)?),
+            None => Box::new(table.range(start..)?),
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for entry in iter.take(limit) {
+            let (k, v) = entry?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// One DESCENDING page from the top of `start..end`, at most `limit`
+    /// entries, using the double-ended range iterator inside one snapshot.
+    fn range_page_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<KvPair>> {
+        let txn = self.store.inner.db.begin_read()?;
+        let table = match txn.open_table(self.def()) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let iter: Box<dyn DoubleEndedIterator<Item = _>> = match end {
+            Some(end) => Box::new(table.range(start..end)?),
+            None => Box::new(table.range(start..)?),
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for entry in iter.rev().take(limit) {
+            let (k, v) = entry?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+        }
         Ok(out)
     }
 
@@ -395,6 +550,47 @@ impl Tree {
         Ok(())
     }
 
+    /// Atomic read-modify-write on one key (sled `update_and_fetch` parity):
+    /// the closure sees the current value and returns the new one (`None`
+    /// deletes). Runs inside a single write transaction under the global write
+    /// lock, so concurrent writers cannot interleave. Returns the NEW value.
+    pub fn update_and_fetch(
+        &self,
+        key: impl AsRef<[u8]>,
+        mut f: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = key.as_ref();
+        let _guard = self.store.inner.write_lock.lock();
+        let mut txn = self.store.inner.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        let mut table = txn.open_table(self.def())?;
+        let current = table.get(key)?.map(|g| g.value().to_vec());
+        let next = f(current.as_deref());
+        match &next {
+            Some(v) => {
+                table.insert(key, v.as_slice())?;
+            }
+            None => {
+                table.remove(key)?;
+            }
+        }
+        drop(table);
+        txn.commit()?;
+        Ok(next)
+    }
+
+    /// Collected full-table contents, key-ascending. For unbounded trees use
+    /// `for_each`; this is for the small bounded ones (balances, orphans,
+    /// pending, meta).
+    pub fn iter_collect(&self) -> Result<Vec<KvPair>> {
+        let mut out = Vec::new();
+        self.for_each(|k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            true
+        })?;
+        Ok(out)
+    }
+
     /// Collected range scan over `start..end` (end exclusive; `None` = open).
     pub fn range_collect(
         &self,
@@ -418,6 +614,114 @@ impl Tree {
             out.push((k.value().to_vec(), v.value().to_vec()));
         }
         Ok(out)
+    }
+}
+
+/// Chunked lazy scan over a tree: pages of `PAGE` entries fetched through
+/// fresh read snapshots, resuming after the last-seen key (its immediate
+/// bytewise successor is `key ∥ 0x00`). Emits at most one terminal error.
+pub struct LazyScan {
+    tree: Option<Tree>,
+    next_start: Vec<u8>,
+    end: Option<Vec<u8>>,
+    buf: std::collections::VecDeque<KvPair>,
+}
+
+impl LazyScan {
+    const PAGE: usize = 1024;
+
+    fn new(tree: Tree, start: Vec<u8>, end: Option<Vec<u8>>) -> Self {
+        LazyScan {
+            tree: Some(tree),
+            next_start: start,
+            end,
+            buf: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Iterator for LazyScan {
+    type Item = Result<KvPair>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(pair) = self.buf.pop_front() {
+            return Some(Ok(pair));
+        }
+        let tree = self.tree.as_ref()?;
+        match tree.range_page(&self.next_start, self.end.as_deref(), Self::PAGE) {
+            Ok(page) => {
+                if page.is_empty() {
+                    self.tree = None;
+                    return None;
+                }
+                if let Some((last_key, _)) = page.last() {
+                    let mut succ = last_key.clone();
+                    succ.push(0);
+                    self.next_start = succ;
+                }
+                self.buf = page.into();
+                self.buf.pop_front().map(Ok)
+            }
+            Err(e) => {
+                self.tree = None;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl LazyScan {
+    /// Descending-order variant (sled's `.rev()` shape). Inherent method, so
+    /// call sites written as `tree.scan_prefix(p).rev()` resolve here instead
+    /// of the `Iterator::rev` adapter (which `LazyScan` cannot support lazily).
+    pub fn rev(self) -> LazyScanRev {
+        LazyScanRev {
+            tree: self.tree,
+            start: self.next_start,
+            next_end: self.end,
+            buf: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+/// Backward chunked scan: pages are taken from the top of the remaining
+/// `start..end` window via the (transaction-local) double-ended range
+/// iterator, and the window's end moves down to the smallest key seen.
+pub struct LazyScanRev {
+    tree: Option<Tree>,
+    start: Vec<u8>,
+    /// Exclusive end of the remaining window; `None` = unbounded high.
+    next_end: Option<Vec<u8>>,
+    buf: std::collections::VecDeque<KvPair>,
+}
+
+impl Iterator for LazyScanRev {
+    type Item = Result<KvPair>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(pair) = self.buf.pop_front() {
+            return Some(Ok(pair));
+        }
+        let tree = self.tree.as_ref()?;
+        match tree.range_page_rev(&self.start, self.next_end.as_deref(), LazyScan::PAGE) {
+            Ok(page) => {
+                if page.is_empty() {
+                    self.tree = None;
+                    return None;
+                }
+                // Page is in DESCENDING order; its last element is the
+                // smallest key seen, which becomes the new exclusive end.
+                if let Some((smallest, _)) = page.last() {
+                    self.next_end = Some(smallest.clone());
+                }
+                self.buf = page.into();
+                self.buf.pop_front().map(Ok)
+            }
+            Err(e) => {
+                self.tree = None;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -462,8 +766,7 @@ mod tests {
         }
         let hits: Vec<Vec<u8>> = tree
             .scan_prefix(b"block_")
-            .unwrap()
-            .into_iter()
+            .map(|r| r.unwrap())
             .map(|(k, _)| k)
             .collect();
         assert_eq!(
@@ -477,7 +780,7 @@ mod tests {
 
         // All-0xff prefix: unbounded high end must not panic or miss.
         tree.insert([0xff, 0xff, 0x01], b"v").unwrap();
-        let ff = tree.scan_prefix([0xff, 0xff]).unwrap();
+        let ff: Vec<_> = tree.scan_prefix([0xff, 0xff]).flatten().collect();
         assert_eq!(ff.len(), 1);
     }
 

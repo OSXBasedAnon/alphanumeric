@@ -1,3 +1,4 @@
+use crate::a9::store::{self, Store};
 use blake3;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
@@ -9,7 +10,6 @@ use parking_lot::Mutex as PLMutex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
-use sled::Db;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::error::Error;
@@ -1063,7 +1063,7 @@ impl Block {
 #[derive(Debug)]
 pub enum BlockchainError {
     CodecError(codec::CodecError),
-    DatabaseError(sled::Error),
+    DatabaseError(store::StoreError),
     RateLimitExceeded(String),
     SerializationError(Box<dyn StdError>),
     SelfTransferNotAllowed,
@@ -1198,8 +1198,8 @@ pub enum TransactionPresence {
     Confirmed(u32),
 }
 
-impl From<sled::Error> for BlockchainError {
-    fn from(err: sled::Error) -> Self {
+impl From<store::StoreError> for BlockchainError {
+    fn from(err: store::StoreError) -> Self {
         Self::DatabaseError(err)
     }
 }
@@ -1412,7 +1412,7 @@ impl SystemKeyDeriver {
 
 #[derive(Debug)]
 pub struct Blockchain {
-    pub db: Db,
+    pub db: Store,
     pub difficulty: Arc<Mutex<u64>>,
     pub transaction_fee: f64,
     pub mining_reward: f64,
@@ -1773,23 +1773,23 @@ impl Blockchain {
         Some(u64::from_be_bytes(bytes))
     }
 
-    fn open_orphan_blocks_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_orphan_blocks_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(ORPHAN_BLOCKS_TREE).map_err(Into::into)
     }
 
-    fn open_orphan_index_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_orphan_index_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(ORPHAN_INDEX_TREE).map_err(Into::into)
     }
 
-    fn open_chain_meta_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_chain_meta_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(CHAIN_META_TREE).map_err(Into::into)
     }
 
-    fn open_pending_debits_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_pending_debits_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(PENDING_DEBITS_TREE).map_err(Into::into)
     }
 
-    fn open_pending_credits_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_pending_credits_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(PENDING_CREDITS_TREE).map_err(Into::into)
     }
 
@@ -1912,7 +1912,7 @@ impl Blockchain {
     }
 
     fn set_pending_debit_for(
-        tree: &sled::Tree,
+        tree: &store::Tree,
         address: &str,
         debit_units: i128,
     ) -> Result<(), BlockchainError> {
@@ -1926,7 +1926,7 @@ impl Blockchain {
     }
 
     fn set_pending_credit_for(
-        tree: &sled::Tree,
+        tree: &store::Tree,
         address: &str,
         credit_units: i128,
     ) -> Result<(), BlockchainError> {
@@ -2471,7 +2471,7 @@ impl Blockchain {
         self.raise_trusted_checkpoint(verified_height.saturating_sub(CHECKPOINT_REORG_MARGIN))
     }
 
-    fn open_confirmed_tx_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_confirmed_tx_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(CONFIRMED_TX_TREE).map_err(Into::into)
     }
 
@@ -2606,8 +2606,8 @@ impl Blockchain {
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let idx = block.index.to_le_bytes().to_vec();
         let ts_prefix = block.timestamp.to_be_bytes();
-        let mut batch = sled::Batch::default();
-        let mut index_batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
+        let mut index_batch = store::Batch::default();
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
@@ -2644,8 +2644,8 @@ impl Blockchain {
         let tree = self.open_confirmed_tx_tree()?;
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let ts_prefix = block.timestamp.to_be_bytes();
-        let mut batch = sled::Batch::default();
-        let mut index_batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
+        let mut index_batch = store::Batch::default();
         for tx in &block.transactions {
             if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
                 continue;
@@ -2854,8 +2854,8 @@ impl Blockchain {
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let tree = self.open_confirmed_tx_tree()?;
         if let Some(tip) = self.highest_block_index() {
-            let mut batch = sled::Batch::default();
-            let mut index_batch = sled::Batch::default();
+            let mut batch = store::Batch::default();
+            let mut index_batch = store::Batch::default();
             let mut previous: Option<Block> = None;
             for h in 0..=tip {
                 // Heartbeat: this loop can hold the chain lock for a long time on a large
@@ -2917,7 +2917,7 @@ impl Blockchain {
         Ok(())
     }
 
-    fn open_address_tx_tree(&self) -> Result<sled::Tree, BlockchainError> {
+    fn open_address_tx_tree(&self) -> Result<store::Tree, BlockchainError> {
         self.db.open_tree(ADDRESS_TX_TREE).map_err(Into::into)
     }
 
@@ -3082,7 +3082,7 @@ impl Blockchain {
     /// re-indexing — idempotent because keys and values are deterministic.
     fn record_address_tx_entries(&self, block: &Block) -> Result<(), BlockchainError> {
         let tree = self.open_address_tx_tree()?;
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         for (key, value) in Self::address_index_ops(block) {
             batch.insert(key, value);
         }
@@ -3104,7 +3104,7 @@ impl Blockchain {
     /// rebuild (or the next full rebuild) clears.
     fn remove_address_tx_entries(&self, block: &Block) -> Result<(), BlockchainError> {
         let tree = self.open_address_tx_tree()?;
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         for (key, _) in Self::address_index_ops(block) {
             batch.remove(key);
         }
@@ -3133,7 +3133,7 @@ impl Blockchain {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         let mut pending = 0usize;
         let mut last_indexed: Option<(u32, [u8; 32])> = None;
         for height in 0..=tip {
@@ -3342,7 +3342,7 @@ impl Blockchain {
         let mut total: i128 = 0;
         for item in balances_tree.iter() {
             let (key, value) = item?;
-            if key.as_ref() == BALANCES_HEIGHT_KEY {
+            if key.as_slice() == BALANCES_HEIGHT_KEY {
                 continue;
             }
             let address = std::str::from_utf8(&key).map_err(|e| {
@@ -3386,14 +3386,14 @@ impl Blockchain {
             }
         }
 
-        let mut debit_batch = sled::Batch::default();
+        let mut debit_batch = store::Batch::default();
         for (address, total) in totals {
             let normalized = total.max(0);
             if normalized > 0 {
                 debit_batch.insert(address.as_bytes(), codec::serialize(&normalized)?);
             }
         }
-        let mut credit_batch = sled::Batch::default();
+        let mut credit_batch = store::Batch::default();
         for (address, total) in incoming {
             let normalized = total.max(0);
             if normalized > 0 {
@@ -3453,7 +3453,7 @@ impl Blockchain {
         // reaches its verdict from the index alone, nothing would ever reclaim it.
         orphan_index.insert(
             Self::orphan_index_key(&block.previous_hash, block.index, &block.hash).as_bytes(),
-            &Self::orphan_index_value(received_at),
+            Self::orphan_index_value(received_at),
         )?;
         orphan_blocks.insert(hash_key.as_bytes(), codec::serialize(&orphan_entry)?)?;
         orphan_blocks.flush()?;
@@ -3856,7 +3856,7 @@ impl Blockchain {
         // Steady-state fast path: with no orphans there is nothing to scan — and
         // this runs on EVERY applied block, previously deserializing the whole
         // pool (up to 10k full blocks) under the write lock even when empty.
-        if orphan_blocks.is_empty() {
+        if orphan_blocks.is_empty()? {
             return Ok(false);
         }
         let mut candidates = Vec::new();
@@ -4235,7 +4235,7 @@ impl Blockchain {
         // any now-stale higher slots in a single batch, so a crash can never leave a
         // half-rewritten chain. The dirty marker (above) + startup recovery re-derive
         // balances if we crash after this point.
-        let mut slot_batch = sled::Batch::default();
+        let mut slot_batch = store::Batch::default();
         for b in &branch {
             let key = format!("block_{}", b.index);
             let storage = Self::to_storage_block(b);
@@ -4272,7 +4272,7 @@ impl Blockchain {
         // failure path still converges on authoritative values.
         match fork_state {
             Some((reverted, _recent)) => {
-                let mut batch = sled::Batch::default();
+                let mut batch = store::Batch::default();
                 for (addr, bal) in &reverted {
                     batch.insert(addr.as_bytes(), codec::serialize(bal)?);
                 }
@@ -4393,7 +4393,7 @@ impl Blockchain {
         let orphan_index = self.open_orphan_index_tree()?;
         // Steady-state fast path (this runs per applied block and per stored
         // orphan): nothing to prune when both trees are empty.
-        if orphan_blocks.is_empty() && orphan_index.is_empty() {
+        if orphan_blocks.is_empty()? && orphan_index.is_empty()? {
             return Ok(());
         }
         let now = Self::now_unix_secs();
@@ -4406,7 +4406,7 @@ impl Blockchain {
         // ORPHAN_MAX_COUNT megabyte-scale blocks) to read three small fields, on a path that
         // runs per applied block and per stored orphan, under the chain write lock.
         let mut retained: Vec<(u64, [u8; 32])> = Vec::new();
-        let mut backfill: Vec<(sled::IVec, u64)> = Vec::new();
+        let mut backfill: Vec<(Vec<u8>, u64)> = Vec::new();
         let checkpoint = self.trusted_checkpoint_height();
         for item in orphan_index.iter() {
             let (key, value) = item?;
@@ -4461,7 +4461,7 @@ impl Blockchain {
         // Rewrite the values recovered from bodies above, so each old entry pays that cost
         // once rather than on every prune.
         for (key, received_at) in backfill {
-            orphan_index.insert(key, &Self::orphan_index_value(received_at))?;
+            orphan_index.insert(key, Self::orphan_index_value(received_at))?;
         }
 
         if retained.len() > ORPHAN_MAX_COUNT {
@@ -4522,7 +4522,7 @@ impl Blockchain {
                 if orphan_index.get(index_key.as_bytes())?.is_none() {
                     orphan_index.insert(
                         index_key.as_bytes(),
-                        &Self::orphan_index_value(entry.received_at),
+                        Self::orphan_index_value(entry.received_at),
                     )?;
                     repaired += 1;
                 }
@@ -4841,7 +4841,7 @@ impl Blockchain {
             .unwrap_or(NonZeroUsize::MIN)
     }
 
-    fn get_balances_height(tree: &sled::Tree) -> Result<Option<u64>, BlockchainError> {
+    fn get_balances_height(tree: &store::Tree) -> Result<Option<u64>, BlockchainError> {
         if let Some(raw) = tree.get(BALANCES_HEIGHT_KEY)? {
             let height: u64 = codec::deserialize(&raw)?;
             Ok(Some(height))
@@ -4854,7 +4854,7 @@ impl Blockchain {
     // the balance content (process_transactions_batch / rebuild / catch-up); this
     // standalone setter remains for tests that stage stale-marker scenarios.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn set_balances_height(tree: &sled::Tree, height: u64) -> Result<(), BlockchainError> {
+    fn set_balances_height(tree: &store::Tree, height: u64) -> Result<(), BlockchainError> {
         tree.insert(BALANCES_HEIGHT_KEY, codec::serialize(&height)?)?;
         Ok(())
     }
@@ -4935,7 +4935,7 @@ impl Blockchain {
     /// the loud M23 corruption alarm and re-derives from scratch.
     async fn catch_up_balances_index(
         &self,
-        balances_tree: &sled::Tree,
+        balances_tree: &store::Tree,
         from: u64,
         tip: u64,
     ) -> Result<(), BlockchainError> {
@@ -5011,7 +5011,7 @@ impl Blockchain {
                 balances_tree.flush()?;
                 return Ok(());
             }
-            let mut batch = sled::Batch::default();
+            let mut batch = store::Batch::default();
             for addr in &touched {
                 if let Some(balance) = balances.get(addr.as_str()) {
                     batch.insert(addr.as_bytes(), codec::serialize(balance)?);
@@ -5029,7 +5029,7 @@ impl Blockchain {
 
     async fn rebuild_balances_index(
         &self,
-        balances_tree: &sled::Tree,
+        balances_tree: &store::Tree,
     ) -> Result<(), BlockchainError> {
         // Stream blocks by numeric height (O(1) block RAM) instead of loading + sorting the
         // WHOLE chain into memory — numeric order is exactly the index/solvency-replay order
@@ -5074,10 +5074,10 @@ impl Blockchain {
         // (get_confirmed_balance -> ensure_balances_index) sees all-old or all-new, never the
         // empty tree that clear() briefly exposed (which returned wrong balances and could
         // trigger a re-entrant rebuild storm). The height marker key is preserved.
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         for entry in balances_tree.iter() {
             let (key, _) = entry?;
-            if key.as_ref() == BALANCES_HEIGHT_KEY {
+            if key.as_slice() == BALANCES_HEIGHT_KEY {
                 continue;
             }
             let vanished = match std::str::from_utf8(key.as_ref()) {
@@ -5202,7 +5202,7 @@ impl Blockchain {
     #[allow(clippy::type_complexity)] // Exact replay state; keep the fallible Option contract visible.
     fn balances_at_fork_state(
         &self,
-        balances_tree: &sled::Tree,
+        balances_tree: &store::Tree,
         fork_start: u32,
         old_tip: u32,
         branch: &[Block],
@@ -5412,7 +5412,7 @@ impl Blockchain {
         Ok(true)
     }
     pub fn new(
-        db: Db,
+        db: Store,
         transaction_fee: f64,
         mining_reward: f64,
         difficulty_adjustment_interval: u64,
@@ -5940,8 +5940,8 @@ impl Blockchain {
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
         let pending_debits_tree = self.open_pending_debits_tree()?;
         let pending_credits_tree = self.open_pending_credits_tree()?;
-        let mut batch = sled::Batch::default();
-        let mut full_batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
+        let mut full_batch = store::Batch::default();
 
         for tx in transactions {
             // Use tx_id instead of string formatting
@@ -6040,7 +6040,9 @@ impl Blockchain {
     }
 
     pub fn get_orphan_count(&self) -> usize {
-        self.open_orphan_blocks_tree().map(|t| t.len()).unwrap_or(0)
+        self.open_orphan_blocks_tree()
+            .and_then(|t| Ok(t.len()? as usize))
+            .unwrap_or(0)
     }
 
     pub async fn get_current_difficulty(&self) -> u64 {
@@ -8238,7 +8240,7 @@ impl Blockchain {
         // (persist_validated_block_with_mode, finalize_block) are strict tip
         // extensions guarded by the state-mutation lock, so confirm_height here is
         // always the new canonical tip.
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         for (address, change) in balance_changes {
             let current = current_balances.get(&address).copied().unwrap_or(0);
             let new_balance = current + change;
@@ -8466,7 +8468,7 @@ impl Blockchain {
         let mut swept = 0u64;
         for item in cw_tree.iter() {
             let (tx_id, _) = item?;
-            if !pinned.contains(tx_id.as_ref()) {
+            if !pinned.contains(tx_id.as_slice()) {
                 let _ = cw_tree.remove(&tx_id);
                 swept = swept.saturating_add(1);
             }
@@ -8499,7 +8501,7 @@ impl Blockchain {
         // range is [tip - (RETENTION - 1), tip]. Reconciling from tip - RETENTION would re-pin a
         // height the very next prune removes — wasted work and a latent trap.
         let start = tip_height.saturating_sub(WITNESS_RETENTION_BLOCKS.saturating_sub(1));
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         let mut restored = 0u64;
         for height in start..=tip_height {
             let Ok(block) = self.get_block(height as u32) else {
@@ -9233,10 +9235,7 @@ mod tests {
     }
 
     fn test_blockchain() -> Blockchain {
-        let db = sled::Config::new()
-            .temporary(true)
-            .open()
-            .expect("temporary sled db should open");
+        let db = store::Store::temporary().expect("temporary store should open");
         Blockchain::new(
             db,
             0.0005,
@@ -10150,7 +10149,7 @@ mod tests {
             "a witness pinned by a recent in-window occurrence must not be dropped on an older occurrence's cutoff"
         );
         assert_eq!(
-            cw_index.iter().keys().filter_map(Result::ok).count(),
+            cw_index.iter().filter_map(Result::ok).count(),
             1,
             "only the aged occurrence row should have been pruned"
         );
@@ -10802,7 +10801,7 @@ mod tests {
         let mut out = std::collections::BTreeMap::new();
         for item in tree.iter() {
             let (k, v) = item.unwrap();
-            if k.as_ref() == BALANCES_HEIGHT_KEY {
+            if k.as_slice() == BALANCES_HEIGHT_KEY {
                 continue;
             }
             let addr = String::from_utf8(k.to_vec()).unwrap();
@@ -10811,7 +10810,7 @@ mod tests {
         out
     }
 
-    fn dump_raw_tree(tree: &sled::Tree) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    fn dump_raw_tree(tree: &store::Tree) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
         tree.iter()
             .map(|item| {
                 let (key, value) = item.expect("tree row should be readable");
@@ -11145,7 +11144,7 @@ mod tests {
             .insert(b"preserve-me", 77u32.to_le_bytes().as_ref())
             .expect("seed prior confirmed row");
         timestamp_index
-            .insert(b"preserve-index-row", &[])
+            .insert(b"preserve-index-row", [])
             .expect("seed prior index row");
         let confirmed_before = dump_raw_tree(&confirmed);
         let timestamp_before = dump_raw_tree(&timestamp_index);
@@ -14564,7 +14563,7 @@ mod tests {
         // Mark ONLY tx_a confirmed (it is in both the mempool and the sled tree); tx_b stays pending.
         let confirmed = bc.open_confirmed_tx_tree().expect("confirmed tx tree");
         confirmed
-            .insert(tx_a.get_tx_id().as_bytes(), 0u32.to_le_bytes().to_vec())
+            .insert(tx_a.get_tx_id().as_bytes(), 0u32.to_le_bytes())
             .expect("mark tx_a confirmed");
 
         let dropped = bc.drop_confirmed_mempool_txs().await;
@@ -15640,7 +15639,7 @@ mod tests {
         }
         a.rebuild_chain_tip_metadata().unwrap();
         let (reverted, _) = fork_state;
-        let mut batch = sled::Batch::default();
+        let mut batch = store::Batch::default();
         for (addr, bal) in &reverted {
             batch.insert(addr.as_bytes(), codec::serialize(bal).unwrap());
         }

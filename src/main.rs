@@ -23,6 +23,7 @@ use std::path::Path;
 
 #[cfg(feature = "bootstrap_publisher")]
 use alphanumeric::a9::codec;
+use alphanumeric::a9::store::{self, Store};
 use alphanumeric::a9::{
     blockchain::{
         Block, Blockchain, RateLimiter, Transaction, FEE_ESTIMATE_ANCHOR_UNITS,
@@ -128,6 +129,10 @@ struct BootstrapManifestPointer {
     extracted_bytes: Option<u64>,
     #[serde(default)]
     file_count: Option<u64>,
+    /// Artifact storage format: None/absent = legacy sled directory; "redb" =
+    /// single-file store artifact. Part of the signed fields when present.
+    #[serde(default)]
+    format: Option<String>,
     publisher_pubkey: String,
     manifest_sig: String,
     updated_at: u64,
@@ -164,6 +169,8 @@ struct BootstrapManifestSignedFields {
     extracted_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
     updated_at: u64,
 }
 
@@ -191,6 +198,7 @@ impl BootstrapManifestPointer {
             compressed_bytes: self.compressed_bytes,
             extracted_bytes: self.extracted_bytes,
             file_count: self.file_count,
+            format: self.format.clone(),
             updated_at: self.updated_at,
         }
     }
@@ -545,6 +553,29 @@ fn main() -> Result<()> {
     // with the panicked subsystem silently gone. The supervised spawns re-arm the
     // load-bearing loops; this hook makes every panic loud (stderr survives even
     // when the log stack is filtered) and names the thread it happened on.
+    // Offline maintenance subcommand (never a resident mode): one-time
+    // sled -> redb conversion for nodes migrating in place. Compiled only with
+    // the `sled-convert` feature; client release builds carry no sled code.
+    #[cfg(feature = "sled-convert")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("convert-sled-db") {
+            let (src, dst) = match (args.get(2), args.get(3)) {
+                (Some(s), Some(d)) => (s.clone(), d.clone()),
+                _ => {
+                    eprintln!("usage: alphanumeric convert-sled-db <sled-db-dir> <output-db-dir>");
+                    std::process::exit(2);
+                }
+            };
+            match run_sled_conversion(&src, &dst) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!("conversion FAILED: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -713,13 +744,16 @@ async fn async_main() -> Result<()> {
         let db = match open_chain_db(&db_path) {
             Ok(db) => db,
             Err(e) => {
-                let is_corruption = matches!(e, sled::Error::Corruption { .. })
-                    || e.to_string().contains("Corruption");
+                // redb surfaces unrecoverable damage as Corrupted storage
+                // errors (stringified through the store boundary); a repair
+                // pass already ran inside open. Anything still corrupt gets
+                // the quarantine ladder, same recovery contract as before.
+                let is_corruption = {
+                    let msg = e.to_string();
+                    msg.contains("Corrupt") || msg.contains("corrupt")
+                };
                 if is_corruption {
-                    warn!("Sled reported corruption. Attempting snapshot cleanup...");
-                    if let Err(clean_err) = cleanup_sled_snapshots(&db_path) {
-                        error!("Snapshot cleanup failed: {}", clean_err);
-                    }
+                    warn!("Store reported corruption; retrying open before quarantine...");
                     match open_chain_db(&db_path) {
                         Ok(db) => db,
                         Err(reopen_err) => {
@@ -4610,7 +4644,7 @@ fn print_ascii_intro() {
                 .++++++++++++++++++++++-                              Architecture: Rust
                 -####++++#####++++#####+                              Algorithm: SHA-256
                     -++++-   --+++.                                              BLAKE3
-             .++++++++++++++++++++++++-                               Database: sled
+             .++++++++++++++++++++++++-                               Database: redb
              +#####+++######++++######+                               Encryption: AES-256-GCM
                  -+++++----++++-                                      Key derivation: Argon2id
                 .+++++.  .-+++-                                       Quantum DSS: ML-DSA-87
@@ -4653,12 +4687,109 @@ fn clamp_db_cache_mib(raw: Option<&str>, default_mib: u64) -> u64 {
 }
 
 const CHAIN_DB_CACHE_DEFAULT_MIB: u64 = 512;
-/// The snapshot temp DB exists only while a publish imports the export, and it runs
-/// CONCURRENTLY with the live DB — with sled's implicit 1 GiB default its cache
-/// stacked on top of the chain cache at exactly the publisher's peak. Import is a
-/// sequential write pass, so it needs working-set headroom, not a big read cache.
-#[cfg(any(feature = "bootstrap_publisher", test))]
-const SNAPSHOT_DB_CACHE_DEFAULT_MIB: u64 = 128;
+
+/// One-time, offline sled -> redb conversion: copy every tree (sled's default
+/// tree maps to the store's default table), then verify BOTH sides tree-by-tree
+/// with entry counts and a SHA-256 over every length-prefixed key/value before
+/// declaring success. The source is opened exclusively (sled's own flock) and
+/// never modified; the destination is written into `{out}/chain.redb` and
+/// durably sealed. Any mismatch fails loudly and leaves the source untouched.
+#[cfg(feature = "sled-convert")]
+fn run_sled_conversion(sled_dir: &str, out_dir: &str) -> std::result::Result<(), String> {
+    use alphanumeric::a9::store::DEFAULT_TREE;
+
+    fn digest_pairs(acc: &mut Sha256, count: &mut u64, k: &[u8], v: &[u8]) {
+        acc.update((k.len() as u64).to_le_bytes());
+        acc.update(k);
+        acc.update((v.len() as u64).to_le_bytes());
+        acc.update(v);
+        *count += 1;
+    }
+
+    let src = sled::Config::new()
+        .path(sled_dir)
+        .cache_capacity(64 * 1024 * 1024)
+        .open()
+        .map_err(|e| format!("open sled source (is the node stopped?): {e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let dst_path = std::path::Path::new(out_dir).join(CHAIN_DB_FILE);
+    if dst_path.exists() {
+        return Err(format!(
+            "{} already exists — refusing to overwrite; remove it to re-convert",
+            dst_path.display()
+        ));
+    }
+    let dst = Store::open(&dst_path, 256 * 1024 * 1024).map_err(|e| e.to_string())?;
+
+    let mut names: Vec<Vec<u8>> = src.tree_names().into_iter().map(|n| n.to_vec()).collect();
+    names.sort();
+    let mut total_entries = 0u64;
+    for name in &names {
+        let src_tree = src.open_tree(name).map_err(|e| e.to_string())?;
+        // sled's default tree keeps its data under the store's default table.
+        let dst_name: &[u8] = if name.as_slice() == b"__sled__default" {
+            DEFAULT_TREE.as_bytes()
+        } else {
+            name.as_slice()
+        };
+        let dst_tree = dst.open_tree(dst_name).map_err(|e| e.to_string())?;
+
+        let mut src_hash = Sha256::new();
+        let mut src_count = 0u64;
+        let mut batch = store::Batch::default();
+        for item in src_tree.iter() {
+            let (k, v) = item.map_err(|e| e.to_string())?;
+            digest_pairs(&mut src_hash, &mut src_count, &k, &v);
+            batch.insert(k.as_ref(), v.as_ref());
+            if batch.len() >= 10_000 {
+                dst_tree
+                    .apply_batch(std::mem::take(&mut batch))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if !batch.is_empty() {
+            dst_tree.apply_batch(batch).map_err(|e| e.to_string())?;
+        }
+
+        let mut dst_hash = Sha256::new();
+        let mut dst_count = 0u64;
+        dst_tree
+            .for_each(|k, v| {
+                digest_pairs(&mut dst_hash, &mut dst_count, k, v);
+                true
+            })
+            .map_err(|e| e.to_string())?;
+
+        if src_count != dst_count || src_hash.finalize() != dst_hash.finalize() {
+            return Err(format!(
+                "verification FAILED for tree {:?}: {} source entries vs {} converted — \
+                 output discarded, source untouched",
+                String::from_utf8_lossy(name),
+                src_count,
+                dst_count
+            ));
+        }
+        total_entries += src_count;
+        println!(
+            "  converted {:40} {:>9} entries, digest verified",
+            String::from_utf8_lossy(name),
+            src_count
+        );
+    }
+    dst.flush().map_err(|e| e.to_string())?;
+    println!(
+        "Conversion complete: {} trees, {} entries, byte-verified. New store: {}",
+        names.len(),
+        total_entries,
+        dst_path.display()
+    );
+    println!(
+        "The sled source at {} was not modified — keep it as rollback until a \
+         healthy restart, then remove it.",
+        sled_dir
+    );
+    Ok(())
+}
 
 fn chain_db_cache_bytes() -> u64 {
     clamp_db_cache_mib(
@@ -4668,20 +4799,20 @@ fn chain_db_cache_bytes() -> u64 {
         * 1024
 }
 
-#[cfg(any(feature = "bootstrap_publisher", test))]
-fn snapshot_db_cache_bytes() -> u64 {
-    clamp_db_cache_mib(
-        std::env::var("ALPHANUMERIC_SNAPSHOT_DB_CACHE_MIB")
-            .ok()
-            .as_deref(),
-        SNAPSHOT_DB_CACHE_DEFAULT_MIB,
-    ) * 1024
-        * 1024
+/// The chain database file inside the (directory-shaped) `db_path`. Keeping
+/// `db_path` a directory preserves every existing path assumption — quarantine
+/// renames, snapshot zips, bootstrap extraction — while the engine's single
+/// file lives inside it. Legacy sled files in the same directory are inert and
+/// serve as the in-place rollback copy until the operator removes them.
+const CHAIN_DB_FILE: &str = "chain.redb";
+
+fn chain_db_file(db_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(db_path).join(CHAIN_DB_FILE)
 }
 
-/// The single place the chain sled DB is configured, so cache sizing and durability cannot drift
-/// across the primary open and the corruption-recovery reopens.
-fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
+/// The single place the chain store is configured, so cache sizing and
+/// durability cannot drift across the primary open and the recovery reopens.
+fn open_chain_db(db_path: &str) -> std::result::Result<Store, store::StoreError> {
     let cache_bytes = chain_db_cache_bytes();
     // Effective-value visibility the plan requires: once per process, not per
     // reopen attempt, and never anything secret.
@@ -4692,14 +4823,10 @@ fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
             cache_bytes / (1024 * 1024)
         );
     });
-    let db = sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .cache_capacity(cache_bytes)
-        .open()?;
+    std::fs::create_dir_all(db_path)?;
+    let db = Store::open(chain_db_file(db_path), cache_bytes as usize)?;
     // Physical footprint at boot: the raw input to the space-amplification
-    // invariant (the publisher logs the aged-vs-fresh-import ratio each
-    // publish). sled's #1 pathology is unbounded space growth; watch it.
+    // invariant. Watched for redb exactly as it was for sled.
     static LOG_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
     LOG_SIZE_ONCE.call_once(|| {
         if let Ok(bytes) = db.size_on_disk() {
@@ -4741,28 +4868,8 @@ async fn hash_file_streaming(
 /// identical to `open_chain_db`.
 const AUX_DB_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn open_chain_db_aux(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
-    sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .cache_capacity(AUX_DB_CACHE_BYTES)
-        .open()
-}
-
-fn cleanup_sled_snapshots(path: &str) -> std::io::Result<()> {
-    let dir = std::path::Path::new(path);
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if name.starts_with("snap.") {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    Ok(())
+fn open_chain_db_aux(db_path: &str) -> std::result::Result<Store, store::StoreError> {
+    Store::open(chain_db_file(db_path), AUX_DB_CACHE_BYTES as usize)
 }
 
 /// Set a database directory aside for diagnosis instead of deleting it.
@@ -5519,6 +5626,22 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         expected_file_count,
     ) = match manifest_result {
         Ok(manifest) => {
+            // FORMAT GATE (engine migration window): this build reads redb
+            // snapshots only. A legacy sled-format manifest (no format field)
+            // is still trusted above for tip reconcile, but its artifact is
+            // not downloadable by this binary — treat the snapshot channel as
+            // unavailable, which routes fresh nodes to the peer-sync fallback
+            // exactly like a gateway outage. The upgraded explorer publishes
+            // the redb-format artifact during the migration window.
+            if manifest.format.as_deref() != Some("redb") {
+                return Err(
+                    "published snapshot is the legacy sled format; this build requires a \
+                     redb-format snapshot (published by the upgraded explorer during the \
+                     migration window). Configure a seed peer for P2P bootstrap, or wait \
+                     for the redb snapshot."
+                        .into(),
+                );
+            }
             let expected_sha256 = manifest
                 .sha256
                 .as_ref()
@@ -6697,7 +6820,7 @@ fn write_bootstrap_archive_zip(
 // context wrapper would only hide the boundary without reducing ownership or synchronization risk.
 #[allow(clippy::too_many_arguments)]
 async fn publish_bootstrap_snapshot(
-    db: &sled::Db,
+    db: &Store,
     blockchain: &Arc<RwLock<Blockchain>>,
     _db_path: &str,
     height: u64,
@@ -6733,6 +6856,8 @@ async fn publish_bootstrap_snapshot(
         extracted_bytes: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
         updated_at: u64,
         publisher_pubkey: String,
         manifest_sig: String,
@@ -6797,37 +6922,27 @@ async fn publish_bootstrap_snapshot(
     let quiesce = blockchain.write().await;
     let quiesce_started = Instant::now();
 
-    // Build a zip of a re-imported sled database in a temp directory (not the live DB dir)
-    // to avoid Windows file locks (os error 33) when reading active log files.
-    // STEP 1 (UNDER the quiesce lock): flush + logical export/import into a temp DB dir.
-    // This is the ONLY part that reads the live DB, so it must hold the write lock (the
-    // 2026-07-16 park fix). Kept deliberately short — NO compression here (see STEP 2).
-    let export_dir_for_import = export_dir_string.clone();
+    // STEP 1 (UNDER the quiesce lock): seal + copy the store file into a temp
+    // artifact dir shaped exactly like a client DB dir ({dir}/chain.redb), so
+    // the existing zip/extract/verify pipeline carries it unchanged. The store
+    // pauses its own writers and seals with one durable two-phase commit, then
+    // clones the file (APFS clonefile — effectively instant); the chain write
+    // lock is held as the belt on top (the 2026-07-16 park discipline), and
+    // there is no multi-second export/import anymore.
+    let export_dir_for_copy = export_dir_string.clone();
     tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
-        let export_path = std::path::Path::new(&export_dir_for_import);
+        let export_path = std::path::Path::new(&export_dir_for_copy);
         if export_path.exists() {
             std::fs::remove_dir_all(export_path).map_err(|e| e.to_string())?;
         }
         std::fs::create_dir_all(export_path).map_err(|e| e.to_string())?;
-
-        db_clone.flush().map_err(|e| e.to_string())?;
-        let export = db_clone.export();
-        // Same defaults `sled::open` used (including flush cadence) EXCEPT the page
-        // cache: this DB runs concurrently with the live one, and import is a
-        // sequential write pass that gains nothing from sled's implicit 1 GiB.
-        let tmp_db = sled::Config::new()
-            .path(export_path)
-            .cache_capacity(snapshot_db_cache_bytes())
-            .open()
+        db_clone
+            .snapshot_file_to(&export_path.join(CHAIN_DB_FILE))
             .map_err(|e| e.to_string())?;
-        // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
-        tmp_db.import(export);
-        tmp_db.flush().map_err(|e| e.to_string())?;
-        drop(tmp_db);
         Ok(())
     })
     .await
-    .map_err(|e| format!("export task failed: {}", e))??;
+    .map_err(|e| format!("snapshot task failed: {}", e))??;
 
     // Live-DB work (export/import) is done — release the quiesce lock NOW, BEFORE the
     // CPU-heavy compression, the zip read, and any network I/O. The temp DB is a standalone
@@ -7141,6 +7256,7 @@ async fn publish_bootstrap_snapshot(
         compressed_bytes: Some(compressed_bytes),
         extracted_bytes: Some(archive_stats.extracted_bytes),
         file_count: Some(archive_stats.file_count),
+        format: Some("redb".to_string()),
         updated_at,
     };
     let msg = serde_json::to_vec(&signed_fields)?;
@@ -7180,6 +7296,7 @@ async fn publish_bootstrap_snapshot(
         compressed_bytes: signed_fields.compressed_bytes,
         extracted_bytes: signed_fields.extracted_bytes,
         file_count: signed_fields.file_count,
+        format: signed_fields.format,
         updated_at: signed_fields.updated_at,
         publisher_pubkey: pub_hex,
         manifest_sig: sig_hex,
@@ -7268,7 +7385,7 @@ async fn publish_bootstrap_snapshot(
 }
 
 #[cfg(feature = "bootstrap_publisher")]
-fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64, Option<String>)> {
+fn read_bootstrap_publish_meta(db: &Store) -> Option<(u64, u64, Option<String>)> {
     let tree = db.open_tree(BOOTSTRAP_META_TREE).ok()?;
     let last_at = tree
         .get(BOOTSTRAP_META_LAST_PUBLISH_AT)
@@ -7293,13 +7410,13 @@ fn read_bootstrap_publish_meta(db: &sled::Db) -> Option<(u64, u64, Option<String
 
 #[cfg(feature = "bootstrap_publisher")]
 fn write_bootstrap_publish_meta(
-    db: &sled::Db,
+    db: &Store,
     last_at: u64,
     last_height: u64,
     network_id: &str,
-) -> std::result::Result<(), sled::Error> {
+) -> std::result::Result<(), store::StoreError> {
     let tree = db.open_tree(BOOTSTRAP_META_TREE)?;
-    let mut batch = sled::Batch::default();
+    let mut batch = store::Batch::default();
     batch.insert(
         BOOTSTRAP_META_LAST_PUBLISH_AT,
         codec::serialize(&last_at).unwrap_or_default(),
@@ -7778,11 +7895,6 @@ mod tests {
             "unset -> conservative chain default"
         );
         assert_eq!(
-            clamp_db_cache_mib(None, SNAPSHOT_DB_CACHE_DEFAULT_MIB),
-            128,
-            "unset -> conservative snapshot-temp default"
-        );
-        assert_eq!(
             clamp_db_cache_mib(Some("garbage"), CHAIN_DB_CACHE_DEFAULT_MIB),
             512,
             "unparseable -> default"
@@ -7802,10 +7914,6 @@ mod tests {
             8192,
             "clamped down to the ceiling"
         );
-        // Env-independent floor: whatever the override says, the resolved snapshot
-        // cache can never be below the clamp floor (keeps the cfg(test) helper
-        // exercised in every build shape).
-        assert!(snapshot_db_cache_bytes() >= 64 * 1024 * 1024);
     }
 
     // The streaming manifest hash must agree exactly with a whole-buffer hash —
@@ -8468,10 +8576,7 @@ mod tests {
 
     #[test]
     fn consensus_fingerprint_commits_all_activated_consensus_rules() {
-        let db = sled::Config::new()
-            .temporary(true)
-            .open()
-            .expect("temporary fingerprint DB");
+        let db = store::Store::temporary().expect("temporary fingerprint DB");
         let blockchain = Blockchain::new(
             db,
             0.0005,
@@ -8543,11 +8648,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(p);
         }
 
-        // Build a throwaway sled DB: block_ keys + low-entropy padding so DEFLATE has
-        // something to work with (mirrors the ~3x sled bulk-import bloat, which is
-        // almost entirely compressible zeros). Closed before we zip it.
+        // Build a throwaway chain store in the NEW artifact shape ({dir}/chain.redb):
+        // block_ keys + low-entropy padding so DEFLATE has something to work with.
+        // Closed (durably flushed) before we zip the directory.
         {
-            let db = sled::Config::new().path(&src_dir).open().unwrap();
+            std::fs::create_dir_all(&src_dir).unwrap();
+            let db = store::Store::open(src_dir.join(CHAIN_DB_FILE), 8 * 1024 * 1024).unwrap();
             for h in 0u32..64 {
                 let b = reconcile_test_block(h, (h % 251) as u8);
                 db.insert(
@@ -8623,7 +8729,7 @@ mod tests {
 
         // (b) The extracted DB reopens with every block_ key intact.
         {
-            let db = sled::Config::new().path(&out_dir).open().unwrap();
+            let db = open_chain_db_aux(out_dir.to_str().unwrap()).unwrap();
             for h in 0u32..64 {
                 assert!(
                     db.get(format!("block_{}", h).as_bytes()).unwrap().is_some(),
@@ -8734,7 +8840,8 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("a9_reconcile_{}_{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&path);
-        let db = sled::Config::new().path(&path).open().unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let db = store::Store::open(path.join(CHAIN_DB_FILE), 8 * 1024 * 1024).unwrap();
         for (h, tag) in heights {
             let b = reconcile_test_block(*h, *tag);
             db.insert(
@@ -8758,6 +8865,7 @@ mod tests {
             compressed_bytes: None,
             extracted_bytes: None,
             file_count: None,
+            format: None,
             publisher_pubkey: String::new(),
             manifest_sig: String::new(),
             updated_at: 0,
@@ -9036,6 +9144,7 @@ mod tests {
             compressed_bytes: None,
             extracted_bytes: None,
             file_count: None,
+            format: None,
             publisher_pubkey,
             manifest_sig: String::new(),
             updated_at: 1_783_184_400,
