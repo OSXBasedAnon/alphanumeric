@@ -382,12 +382,61 @@ Network commands (at the REPL prompt):
 
 ## Security Posture
 
-This project handles key material and peer input. Treat it accordingly.
+Alphanumeric is post-quantum settlement infrastructure. Its security model is built for the
+exchanges, custodians, pools, and validators that hold value on the chain — not only for a single
+operator running one node.
 
-- `private.key` is sensitive. Secure the host and filesystem permissions.
-- Do not commit key material to source control.
-- Treat all network input as untrusted.
-- Validate operational assumptions before mainnet-like usage.
+### Cryptography and consensus
+
+- **Post-quantum authentication.** Every transaction is signed with ML-DSA-87 (FIPS 204), the NIST
+  lattice signature, with sender-to-key binding enforced during validation. There is no
+  elliptic-curve signature to migrate away from.
+- **Deterministic, integer-exact validation.** Block validity, difficulty, fee accounting, and
+  reward economics are evaluated with checked integer arithmetic and are identical across nodes; no
+  floating-point tolerance band is applied to any consensus check.
+- **Deterministic finality.** A trusted checkpoint trails the tip by a fixed reorg margin and
+  advances deterministically. It is never accelerated, paused, or lowered by network-health
+  heuristics.
+- **Replay and freshness protection.** Transactions carry a bounded freshness window backed by a
+  replay registry, so a confirmed payment cannot be re-mined and the registry stays bounded.
+- **Verified bootstrap only.** Fast-sync snapshots are accepted solely under a pinned publisher
+  signature and SHA-256, with signed size and file-count bounds and streamed verification. There is
+  no unverified fallback, and no environment variable can relax those bounds.
+
+### Network and denial-of-service resistance
+
+- All peer input is untrusted and processed under bounded, length-framed messaging with per-peer and
+  per-class byte/work limits, rate limiting, and authenticated encrypted sessions.
+- Admission and validation are **fail-closed**: malformed, oversized, ambiguous, or
+  unverifiable input is rejected rather than best-guessed.
+
+### Integrating securely (exchanges, custodians, pools)
+
+- **Key custody stays with you.** The node never requires custody of your signing keys. Sign in your
+  own HSM or keystore and submit the finished transaction; the submission API accepts pre-signed
+  transactions only.
+- **Do not expose the node directly.** The JSON API has no authentication of its own by design. Bind
+  it to loopback and place it behind your own authenticated reverse proxy — that trust boundary is
+  yours to own.
+- **Idempotent, collision-safe withdrawals.** Submit through the protected endpoints
+  (`/explorer/v2/submit-tx`) with a unique, unguessable idempotency key per withdrawal. The node
+  then makes retries safe and detects same-parameter payment collisions before they can double-pay.
+  See [`docs/EXCHANGE_INTEGRATION.md`](docs/EXCHANGE_INTEGRATION.md).
+
+### Assurance and disclosure
+
+- The consensus, networking, storage, and wallet paths are under a continuous adversarial review
+  program: property and boundary tests, fault injection, differential checks against the reference
+  paths, and threat-model-mapped controls documented in
+  [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Every fixed security issue is pinned by a
+  permanent regression test.
+- This review is internal; an independent third-party audit is a roadmap item and is not yet
+  complete. We state that plainly rather than imply coverage we do not have.
+- **Reporting a vulnerability.** Report suspected vulnerabilities **privately** — do not open public
+  issues or post in Discord for security matters. Use this repository's private vulnerability
+  reporting (GitHub → **Security → Report a vulnerability**). We practice coordinated disclosure and
+  will acknowledge a valid report promptly and agree remediation and disclosure timelines with the
+  reporter.
 
 ## Operations Checklist
 
