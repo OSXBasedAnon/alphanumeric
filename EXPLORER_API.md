@@ -182,6 +182,36 @@ distinct payments share those fields. Reserve the 5-tuple client-side before sig
 re-sign with a different timestamp rather than marking the payment done. See the
 duplicate-identity note above.
 
+### Protected submission (POST /explorer/v2/submit-tx, /explorer/v2/submit-tx-batch)
+
+Additive, versioned endpoints that make the node detect the collision for you when you attach a
+required per-withdrawal `idempotency_key`. The legacy endpoints above are unchanged, so upgrading
+the node breaks nothing; you opt in by moving to `/v2/` and sending a key. Full integration guidance,
+examples, and a reference client are in
+[docs/EXCHANGE_INTEGRATION.md](docs/EXCHANGE_INTEGRATION.md#protected-submission-recommended-let-the-node-detect-collisions-for-you).
+
+Single body: `{"idempotency_key": "<uuid>", "transaction": { …signed-tx… }}`. Batch body:
+`{"version": 1, "transactions": [{"idempotency_key": "<uuid>", "transaction": {…}}, …]}` (max 256),
+one key per item. Keys must be 16–128 printable-ASCII characters and **unguessable** (UUIDv4) or
+scoped to an authenticated client — a predictable key on a reachable endpoint lets someone pre-claim
+it and deny your withdrawal.
+
+Beyond the legacy `accepted` / `already_pending` / `already_confirmed` statuses (a replay also carries
+`idempotent_replay: true`), the protected path adds two `409` outcomes:
+
+    409 {"status":"idempotency_conflict","original_tx_id":"…"}
+        the key is already bound to a DIFFERENT transaction — reuse a key only to retry the exact
+        same withdrawal
+    409 {"status":"transaction_collision","colliding_tx_id":"…"}
+        another withdrawal key already submitted byte-identical transaction bytes; two distinct
+        withdrawals collided — rebuild and re-sign THIS one with a new timestamp, then resubmit
+
+    503 {"error":"ledger_unavailable"}   the operator payment ledger could not be opened; the
+        legacy endpoints still work, but protected submission is disabled until it can
+
+On either `409`, do not mark the withdrawal paid. The endpoints require the ledger; if it cannot be
+opened they return `503` rather than admit a payment without the guarantee.
+
 **Backpressure is a `429`; a terminal rejection is a `400`.** Admission backpressure —
 the per-address pending cap, the per-sender submission rate, and a full mempool — is
 returned as HTTP `429` with a machine-readable body, so you branch on a field, not on a

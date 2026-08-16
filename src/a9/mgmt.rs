@@ -30,6 +30,7 @@ use crate::a9::{
     },
     miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
+    wallet_ledger::{PaymentTuple, WalletLedger},
 };
 
 const KEY_FILE_PATH: &str = "private.key";
@@ -512,6 +513,10 @@ fn select_new_wallet_name(
 
 pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
+    /// Durable operator-side payment ledger for collision-free timestamps and honest retries.
+    /// `None` only if the ledger file could not be opened, in which case the signing path warns
+    /// once and falls back to raw wall-clock timestamps (the pre-ledger behavior).
+    wallet_ledger: Option<Arc<WalletLedger>>,
 }
 
 /// User-facing transaction creation result. Only `Submitted` authorizes gossip;
@@ -631,8 +636,12 @@ impl Mgmt {
     pub fn new(
         _db: sled::Db,
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
+        wallet_ledger: Option<Arc<WalletLedger>>,
     ) -> Self {
-        Mgmt { blockchain }
+        Mgmt {
+            blockchain,
+            wallet_ledger,
+        }
     }
 
     pub fn get_current_timestamp() -> Result<u64> {
@@ -1437,17 +1446,76 @@ impl Mgmt {
         writeln!(stdout, "Done")?;
         drop(blockchain_guard);
 
+        // Collision-free timestamp allocation. The chain's transaction identity is
+        // sender:recipient:amount:fee:timestamp, which is also the signed message, so two
+        // intended-distinct payments that share the first four fields are the SAME transaction —
+        // identical id, identical signed bytes — if signed in the same second. The second would be
+        // silently absorbed as a duplicate and never paid. The ledger advances the timestamp so an
+        // identical-looking second payment becomes a genuinely distinct transaction instead.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "Failed to get timestamp")?
+            .as_secs();
+        let payment_tuple = PaymentTuple::new(
+            sender_address.clone(),
+            recipient_address.clone(),
+            amount_units,
+            fee_units,
+        );
+        let timestamp = match self.wallet_ledger.as_ref() {
+            Some(ledger) => match ledger.allocate_timestamp(&payment_tuple, now) {
+                Ok(allocated) => {
+                    if allocated != now {
+                        writeln!(
+                            stdout,
+                            "  Identical payment (same recipient, amount and fee) already prepared \
+                             this second; using timestamp {allocated} so this is a distinct \
+                             transaction, not a silently-merged duplicate."
+                        )?;
+                    }
+                    allocated
+                }
+                Err(_) => {
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                    write!(stdout, "error")?;
+                    stdout.reset()?;
+                    writeln!(
+                        stdout,
+                        ": too many identical payments (same recipient, amount and fee) in a short \
+                         window to schedule a distinct one; vary the amount or fee to make it a \
+                         separate payment"
+                    )?;
+                    return Err(
+                        "cannot allocate a distinct timestamp for an identical payment burst"
+                            .into(),
+                    );
+                }
+            },
+            // Fail closed: the whole point of the ledger is that a payment is never silently
+            // dropped to a same-second collision. Falling back to a raw timestamp would reintroduce
+            // exactly that risk, so refuse to sign instead.
+            None => {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                write!(stdout, "error")?;
+                stdout.reset()?;
+                writeln!(
+                    stdout,
+                    ": payment ledger unavailable; refusing to sign without collision-safe timestamp \
+                     allocation (a raw timestamp could silently merge two distinct payments)"
+                )?;
+                return Err(
+                    "wallet payment ledger unavailable; cannot reserve a collision-safe timestamp"
+                        .into(),
+                );
+            }
+        };
+
         // Signing phase
         stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
         write!(stdout, "    Signing")?;
         stdout.reset()?;
         write!(stdout, " transaction...")?;
         stdout.flush()?;
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "Failed to get timestamp")?
-            .as_secs();
 
         let message = format!(
             "{}:{}:{:.8}:{:.8}:{}",
@@ -1504,6 +1572,39 @@ impl Mgmt {
         }
 
         // No wallet registry needed - transactions are self-contained with public keys
+
+        // Persist the reservation durably BEFORE submitting (persist-before-expose). If we crash
+        // after this, the payment is recoverable and its timestamp allocation survives restart; if
+        // we crash before it, nothing was ever admitted. Fail closed: never submit a payment we
+        // could not first record, or a crash could destroy the only evidence it was sent. The
+        // fsync runs on a blocking thread so it never stalls the shared node runtime.
+        if let Some(ledger) = self.wallet_ledger.as_ref() {
+            let ledger = Arc::clone(ledger);
+            let tuple = payment_tuple.clone();
+            let tx_id = transaction.get_tx_id();
+            let signed_tx = serde_json::to_string(&transaction).ok();
+            match tokio::task::spawn_blocking(move || {
+                ledger.record(None, tuple, timestamp, tx_id, signed_tx, now)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    writeln!(stdout)?;
+                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                    write!(stdout, "error")?;
+                    stdout.reset()?;
+                    writeln!(
+                        stdout,
+                        ": could not record the payment before submitting: {error}"
+                    )?;
+                    return Err(format!("wallet ledger record failed: {error}").into());
+                }
+                Err(join_error) => {
+                    return Err(format!("wallet ledger task failed: {join_error}").into());
+                }
+            }
+        }
 
         // M2: a read guard suffices — add_transaction self-serializes on its internal
         // state_mutation_lock and runs the ML-DSA verify before taking it, so an exclusive
