@@ -4699,6 +4699,29 @@ fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
         .open()
 }
 
+/// SHA-256 and exact size of a file through a bounded read, so hashing a snapshot
+/// never requires the whole archive in memory. The 1 MiB buffer is the entire
+/// memory footprint regardless of archive size.
+#[cfg(any(feature = "bootstrap_publisher", test))]
+async fn hash_file_streaming(
+    path: &std::path::Path,
+) -> std::result::Result<(String, u64), std::io::Error> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
 /// Short-lived maintenance opens of the chain DB: pre-launch health checks, bootstrap
 /// verification, and gap probes. These handles live for seconds and mostly scan cold
 /// data, so a large page cache only balloons launch RSS; durability settings are
@@ -6817,11 +6840,13 @@ async fn publish_bootstrap_snapshot(
     .await
     .map_err(|e| format!("zip task failed: {}", e))??;
 
-    let bytes = fs::read(&zip_path).await?;
-    let compressed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let sha256 = hex::encode(hasher.finalize());
+    // Manifest hash/size via a bounded streaming pass — the archive itself stays on
+    // disk. Each upload attempt below reopens the file for its body instead of one
+    // buffer being retained (and previously cloned) across both paths, so peak
+    // publisher memory holds at most ONE copy of the zip, and only while an upload
+    // is actually in flight. The path is this attempt's unique temp file; nothing
+    // else writes it between hashing and upload.
+    let (sha256, compressed_bytes) = hash_file_streaming(std::path::Path::new(&zip_path)).await?;
 
     // SOAK SAFETY (env-gated, OFF in production): the upload target is hardcoded to the real
     // gateway, so an isolated soak node must never push to it. The full build (export/import
@@ -6930,6 +6955,19 @@ async fn publish_bootstrap_snapshot(
         struct BlobPutResponse {
             url: String,
         }
+        // Sized body read fresh from disk (wire-identical to the former buffered
+        // clone: same Content-Length, no transfer-encoding change on this
+        // incident-scarred path) and freed as soon as the PUT resolves.
+        let put_body = match fs::read(&zip_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "bootstrap snapshot re-read for blob put failed ({}); using legacy upload",
+                    e
+                );
+                break 'direct;
+            }
+        };
         match client
             .put(&put_url)
             .header("authorization", format!("Bearer {}", grant.token))
@@ -6938,7 +6976,7 @@ async fn publish_bootstrap_snapshot(
             .header("x-vercel-blob-access", "public")
             .header("x-add-random-suffix", "1")
             .header("x-content-type", "application/zip")
-            .body(bytes.clone())
+            .body(put_body)
             .send()
             .await
         {
@@ -6995,7 +7033,9 @@ async fn publish_bootstrap_snapshot(
     let resp = if direct_blob_url.is_some() {
         request.send().await?
     } else {
-        request.body(bytes).send().await?
+        // Legacy full-body publish: replay the archive by reopening the completed
+        // file, not by having retained it in memory across the direct attempt.
+        request.body(fs::read(&zip_path).await?).send().await?
     };
 
     if resp.status().is_redirection() {
@@ -7710,6 +7750,43 @@ mod tests {
         // cache can never be below the clamp floor (keeps the cfg(test) helper
         // exercised in every build shape).
         assert!(snapshot_db_cache_bytes() >= 64 * 1024 * 1024);
+    }
+
+    // The streaming manifest hash must agree exactly with a whole-buffer hash —
+    // it replaces fs::read for snapshot hashing, so any divergence would publish
+    // a manifest whose sha256 no client can verify. The fixture deliberately
+    // crosses the 1 MiB read buffer several times and ends on a partial chunk.
+    #[test]
+    fn streaming_file_hash_matches_buffered_hash() {
+        let mut data = Vec::with_capacity(3 * 1024 * 1024 + 12_345);
+        for i in 0..(3 * 1024 * 1024 + 12_345usize) {
+            data.push((i % 251) as u8);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "an-streamhash-{}-{}.bin",
+            std::process::id(),
+            data.len()
+        ));
+        std::fs::write(&path, &data).expect("write hash fixture");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let expected = hex::encode(hasher.finalize());
+
+        let (streamed, total) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(hash_file_streaming(&path))
+            .expect("streaming hash");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(streamed, expected, "streamed sha256 == buffered sha256");
+        assert_eq!(
+            total,
+            data.len() as u64,
+            "byte count is the exact file size"
+        );
     }
 
     // An ordinary wallet must keep the per-payment lines it has today. This is
