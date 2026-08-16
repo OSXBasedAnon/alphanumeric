@@ -119,7 +119,7 @@ pub async fn resolve_default_wallet(
                 .get_confirmed_balance_units(&wallet.address)
                 .await
                 .unwrap_or(0);
-            // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.70 MSRV.
+            // `Option::is_none_or` requires Rust 1.82; preserve the crate's 1.89 MSRV (raised by redb).
             #[allow(clippy::unnecessary_map_or)]
             if best.as_ref().map_or(true, |(top, _, _)| units > *top) {
                 best = Some((units, (*name).clone(), wallet.address.clone()));

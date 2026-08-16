@@ -2,7 +2,7 @@
 //!
 //! This is purely operator/wallet-side state. It changes NO transaction field, signed message,
 //! transaction ID, codec, Merkle calculation, block, consensus rule, network message, or chain
-//! database format. It never appears on the wire or in the chain sled database.
+//! database format. It never appears on the wire or in the chain database.
 //!
 //! The chain's transaction identity is the tuple `(sender, recipient, amount, fee, timestamp)`,
 //! which is simultaneously the signed message and the replay key. Two payments that a caller
