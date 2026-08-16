@@ -66,6 +66,9 @@ use crate::a9::outbound::{
     OutboundScheduler, Reservation as OutboundReservation, TrafficClass,
 };
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
+use crate::a9::wallet_ledger::{
+    EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger,
+};
 
 //----------------------------------------------------------------------
 // Constants
@@ -1693,6 +1696,10 @@ pub struct NodeRuntimeConfig {
     /// so the address book survives reboots. None falls back to the OS temp dir
     /// (the old default, which OS cleaners wipe — exactly when it matters).
     pub data_dir: Option<String>,
+    /// The one operator payment ledger, shared with the CLI signer. Backs the protected
+    /// (idempotency-key-required) submission endpoints. `None` disables those endpoints and makes
+    /// them report unavailable rather than admit a payment without the idempotency guarantee.
+    pub wallet_ledger: Option<Arc<WalletLedger>>,
 }
 
 /// Byte budget for the transaction-witness memoization cache. The cache is also count-bounded
@@ -1919,6 +1926,9 @@ pub struct Node {
     /// Resolved chain-DB directory (same value main.rs boots with) — lets runtime
     /// paths schedule a force-re-bootstrap marker. None in tests/embedded uses.
     chain_data_dir: Option<Arc<str>>,
+    /// The one operator payment ledger, shared with the CLI signer. Backs the protected
+    /// submission endpoints; `None` disables them. See [`NodeRuntimeConfig::wallet_ledger`].
+    wallet_ledger: Option<Arc<WalletLedger>>,
     /// PEX-learned dialable addresses -> unix time last learned (bounded by
     /// PEX_ADDR_BOOK_CAP, aged out after PEX_ADDR_TTL_SECS), merged into the
     /// persisted peer cache so the address book outgrows our own connections.
@@ -2291,6 +2301,52 @@ struct ExplorerState {
     // Coarse per-process token bucket for the O(chain) explorer READ endpoints (address summary,
     // supply): a node-side flood guard for the opt-in explorer, independent of any upstream proxy.
     read_bucket: Arc<PLMutex<(Instant, f64)>>,
+    // The one shared operator payment ledger; None disables the protected (v2) endpoints.
+    wallet_ledger: Option<Arc<WalletLedger>>,
+    // Serializes the whole check -> admit -> record critical section of a protected submission, so
+    // two concurrent requests cannot interleave admission and ledger binding and mis-attribute a
+    // collision. Protected throughput is deliberately serial (as the batch endpoint already is);
+    // exchanges wanting throughput use the batch endpoint, which is itself one-at-a-time.
+    idempotent_submit_lock: Arc<Mutex<()>>,
+}
+
+/// Structured outcome of canonical admission, so both the legacy and protected endpoints classify a
+/// result the same way without re-parsing rendered JSON. Only the first three represent a payment
+/// the node now knows about and will bind an idempotency key to; `NotAdmitted` covers backpressure,
+/// chain-busy, and terminal rejection, none of which bind a key (the caller retries or re-signs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionClass {
+    Accepted,
+    AlreadyPending,
+    AlreadyConfirmed(u32),
+    NotAdmitted,
+}
+
+/// Idempotency-key length bounds. The minimum discourages trivially-guessable values on a publicly
+/// reachable endpoint; the recommendation (documented) is an unguessable UUIDv4. These are only
+/// structural bounds — the caller is responsible for entropy.
+const IDEMPOTENCY_KEY_MIN_LEN: usize = 16;
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
+
+/// Protected single-submission body: one signed transaction plus its required idempotency key.
+#[derive(Debug, Deserialize)]
+struct ExplorerSubmitTxV2 {
+    idempotency_key: String,
+    transaction: Transaction,
+}
+
+/// One item of a protected batch: every withdrawal carries its own key.
+#[derive(Debug, Deserialize)]
+struct ExplorerSubmitBatchItemV2 {
+    idempotency_key: String,
+    transaction: Transaction,
+}
+
+/// Protected batch body. The item count is bounded on decode exactly like the legacy batch.
+#[derive(Debug, Deserialize)]
+struct ExplorerSubmitBatchV2 {
+    version: u8,
+    transactions: BoundedSequence<ExplorerSubmitBatchItemV2, TX_RELAY_BATCH_MAX>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2375,6 +2431,7 @@ impl Node {
             max_connections,
             seed_nodes: configured_seed_nodes,
             data_dir,
+            wallet_ledger,
         } = runtime_config;
         let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
@@ -2578,6 +2635,7 @@ impl Node {
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
+            wallet_ledger,
             pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
@@ -6902,6 +6960,8 @@ impl Node {
                 "/explorer/fee-estimate  (advisory next-block fee recommendation)",
                 "POST /explorer/submit-tx  (body: signed transaction JSON)",
                 "POST /explorer/submit-tx-batch  (body: {version:1,transactions:[...]}, max 256)",
+                "POST /explorer/v2/submit-tx  (protected: body {idempotency_key, transaction}; required unguessable key)",
+                "POST /explorer/v2/submit-tx-batch  (protected: body {version:1,transactions:[{idempotency_key,transaction},...]}, max 256)",
             ],
         }))
     }
@@ -7352,7 +7412,7 @@ impl Node {
     async fn explorer_admit_transaction(
         state: &ExplorerState,
         tx: &Transaction,
-    ) -> ((StatusCode, Json<Value>), bool) {
+    ) -> ((StatusCode, Json<Value>), AdmissionClass) {
         if tx.sender.is_empty() || tx.recipient.is_empty() {
             return (
                 (
@@ -7364,7 +7424,7 @@ impl Node {
                         "reason": "malformed_transaction",
                     })),
                 ),
-                false,
+                AdmissionClass::NotAdmitted,
             );
         }
         // Transaction identity is (sender, recipient, amount, fee, timestamp). The
@@ -7383,7 +7443,7 @@ impl Node {
         // keeping the error in scope past this point would sink the handler's Send bound.
         let submit = {
             let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
-                return (Self::explorer_submit_busy(), false);
+                return (Self::explorer_submit_busy(), AdmissionClass::NotAdmitted);
             };
             chain
                 .admit_transaction(tx.clone())
@@ -7396,7 +7456,7 @@ impl Node {
                     StatusCode::OK,
                     Json(json!({ "ok": true, "status": "accepted", "tx_id": tx.get_tx_id() })),
                 ),
-                true,
+                AdmissionClass::Accepted,
             ),
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => (
                 (
@@ -7406,13 +7466,15 @@ impl Node {
                         "hint": "identical transaction already pending; a distinct payment must differ in timestamp, amount, or fee"
                     })),
                 ),
-                false,
+                AdmissionClass::AlreadyPending,
             ),
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
                 let finalized_height =
                     match timeout(Duration::from_secs(3), state.blockchain.read()).await {
                         Ok(chain) => chain.trusted_checkpoint_height(),
-                        Err(_) => return (Self::explorer_submit_busy(), false),
+                        Err(_) => {
+                            return (Self::explorer_submit_busy(), AdmissionClass::NotAdmitted)
+                        }
                     };
                 (
                     (
@@ -7422,7 +7484,7 @@ impl Node {
                             "height": height, "final": height <= finalized_height
                         })),
                     ),
-                    false,
+                    AdmissionClass::AlreadyConfirmed(height),
                 )
             }
             Err(e) => {
@@ -7453,7 +7515,7 @@ impl Node {
                                 "detail": detail,
                             })),
                         ),
-                        false,
+                        AdmissionClass::NotAdmitted,
                     );
                 }
                 (
@@ -7468,7 +7530,7 @@ impl Node {
                             "detail": detail,
                         })),
                     ),
-                    false,
+                    AdmissionClass::NotAdmitted,
                 )
             }
         }
@@ -7482,8 +7544,8 @@ impl Node {
         if !Self::allow_explorer_submit(&state) {
             return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
         }
-        let (response, inserted) = Self::explorer_admit_transaction(&state, &tx).await;
-        if inserted {
+        let (response, class) = Self::explorer_admit_transaction(&state, &tx).await;
+        if matches!(class, AdmissionClass::Accepted) {
             // Keep network I/O outside the Axum handler. The canonical admission
             // has completed, so a failed best-effort announcement does not change
             // the truthful accepted response.
@@ -7520,7 +7582,7 @@ impl Node {
         let mut results = Vec::with_capacity(transactions.len());
         let mut inserted = Vec::new();
         for (index, transaction) in transactions.into_iter().enumerate() {
-            let ((status, Json(mut payload)), was_inserted) =
+            let ((status, Json(mut payload)), class) =
                 Self::explorer_admit_transaction(&state, &transaction).await;
             if let Some(object) = payload.as_object_mut() {
                 object.insert("index".into(), json!(index));
@@ -7533,7 +7595,7 @@ impl Node {
                 });
             }
             results.push(payload);
-            if was_inserted {
+            if matches!(class, AdmissionClass::Accepted) {
                 inserted.push(transaction);
             }
         }
@@ -7541,6 +7603,323 @@ impl Node {
         if !inserted.is_empty() {
             let node = state.node.clone();
             tokio::spawn(async move { node.gossip_transactions(&inserted).await });
+        }
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "ok": results.iter().all(|item| {
+                    item.get("http_status").and_then(Value::as_u64).is_some_and(|code| code < 400)
+                }),
+                "version": 1,
+                "count": results.len(),
+                "results": results,
+            })),
+        )
+    }
+
+    /// Structurally bound and sanity-check a caller-supplied idempotency key. On a publicly
+    /// reachable endpoint a guessable key lets an attacker pre-claim it and deny a real withdrawal,
+    /// so keys MUST be unguessable (a UUIDv4 is the documented recommendation) or scoped to an
+    /// authenticated client. This enforces only length and charset; entropy is the caller's job.
+    fn validate_idempotency_key(key: &str) -> Result<(), &'static str> {
+        let len = key.len();
+        if len < IDEMPOTENCY_KEY_MIN_LEN {
+            return Err("idempotency_key too short; use an unguessable value such as a UUIDv4");
+        }
+        if len > IDEMPOTENCY_KEY_MAX_LEN {
+            return Err("idempotency_key too long");
+        }
+        if !key.chars().all(|c| c.is_ascii_graphic()) {
+            return Err("idempotency_key must be printable ASCII with no spaces");
+        }
+        Ok(())
+    }
+
+    /// Uniform error body for a protected submission, always carrying the key and a machine-readable
+    /// `status`.
+    fn explorer_v2_error(
+        status: StatusCode,
+        key: &str,
+        reason: &str,
+        message: &str,
+    ) -> (StatusCode, Json<Value>) {
+        (
+            status,
+            Json(json!({
+                "ok": false,
+                "status": reason,
+                "idempotency_key": key,
+                "error": message,
+            })),
+        )
+    }
+
+    /// Render an idempotent replay (a `Duplicate`) from the stored entry, reporting the payment's
+    /// current known state rather than re-admitting it.
+    fn explorer_v2_idempotent_replay(entry: &LedgerEntry) -> (StatusCode, Json<Value>) {
+        let mut body = match &entry.state {
+            EntryState::Pending => json!({ "status": "already_pending" }),
+            EntryState::Confirmed { height } => {
+                json!({ "status": "already_confirmed", "height": height })
+            }
+            EntryState::Rejected { reason } => json!({ "status": "rejected", "reason": reason }),
+            EntryState::Expired => json!({ "status": "expired" }),
+        };
+        if let Some(object) = body.as_object_mut() {
+            // ok reflects whether the payment is progressing or done, not merely that the lookup
+            // succeeded: a rejected or expired withdrawal will never pay.
+            object.insert(
+                "ok".into(),
+                json!(matches!(
+                    entry.state,
+                    EntryState::Pending | EntryState::Confirmed { .. }
+                )),
+            );
+            object.insert("idempotency_key".into(), json!(entry.idempotency_key));
+            object.insert("tx_id".into(), json!(entry.tx_id));
+            object.insert("idempotent_replay".into(), json!(true));
+        }
+        (StatusCode::OK, Json(body))
+    }
+
+    /// The shared check -> admit -> record core of a protected submission. Serialized by
+    /// `idempotent_submit_lock` so admission and ledger binding cannot interleave across concurrent
+    /// requests and mis-attribute a collision. Returns the response plus whether this call newly
+    /// accepted the transaction (so the caller can announce it once, keeping network I/O out of the
+    /// lock).
+    async fn submit_with_idempotency(
+        state: &ExplorerState,
+        ledger: &Arc<WalletLedger>,
+        idempotency_key: &str,
+        tx: &Transaction,
+    ) -> ((StatusCode, Json<Value>), bool) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let tx_id = tx.get_tx_id();
+
+        let _guard = state.idempotent_submit_lock.lock().await;
+
+        // 1. Four-case contract (in-memory; no fsync).
+        match ledger.check_submission(idempotency_key, &tx_id, now) {
+            SubmissionCheck::Duplicate(entry) => {
+                return (Self::explorer_v2_idempotent_replay(&entry), false);
+            }
+            SubmissionCheck::Conflict(entry) => {
+                return (
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "ok": false,
+                            "status": "idempotency_conflict",
+                            "idempotency_key": idempotency_key,
+                            "original_tx_id": entry.tx_id,
+                            "error": "this idempotency_key is already bound to a different transaction; reuse a key only to retry the exact same withdrawal",
+                        })),
+                    ),
+                    false,
+                );
+            }
+            SubmissionCheck::Collision(entry) => {
+                return (
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "ok": false,
+                            "status": "transaction_collision",
+                            "idempotency_key": idempotency_key,
+                            "colliding_tx_id": entry.tx_id,
+                            "colliding_idempotency_key": entry.idempotency_key,
+                            "error": "another withdrawal key already submitted byte-identical transaction bytes; two distinct withdrawals collided — rebuild and re-sign this one with a new timestamp",
+                        })),
+                    ),
+                    false,
+                );
+            }
+            SubmissionCheck::New => {}
+        }
+
+        // 2. Admit through the canonical path.
+        let ((status, Json(mut payload)), class) =
+            Self::explorer_admit_transaction(state, tx).await;
+
+        // 3. Bind the key ONLY for an admitted/known payment. Backpressure and terminal rejects do
+        //    not bind — the caller retries (same key) or re-signs (a new key) — so they pass through.
+        let entry_state = match class {
+            AdmissionClass::Accepted | AdmissionClass::AlreadyPending => Some(EntryState::Pending),
+            AdmissionClass::AlreadyConfirmed(height) => Some(EntryState::Confirmed { height }),
+            AdmissionClass::NotAdmitted => None,
+        };
+        if let Some(entry_state) = entry_state {
+            let ledger = Arc::clone(ledger);
+            let key = idempotency_key.to_string();
+            let tuple = PaymentTuple::new(
+                tx.sender.clone(),
+                tx.recipient.clone(),
+                tx.amount_units,
+                tx.fee_units,
+            );
+            let ts = tx.timestamp;
+            let txid = tx_id.clone();
+            let signed = serde_json::to_string(tx).ok();
+            let record = tokio::task::spawn_blocking(move || {
+                ledger.record(Some(key), tuple, ts, txid.clone(), signed, now)?;
+                if !matches!(entry_state, EntryState::Pending) {
+                    ledger.update_state(&txid, entry_state, now)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match record {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    // A concurrent submission bound this exact transaction to a different key
+                    // between our check and record: report it as the collision it is. The payment
+                    // itself is admitted once (admission is idempotent); this caller must re-sign.
+                    return (
+                        (
+                            StatusCode::CONFLICT,
+                            Json(json!({
+                                "ok": false,
+                                "status": "transaction_collision",
+                                "idempotency_key": idempotency_key,
+                                "error": "another withdrawal key concurrently submitted identical transaction bytes; rebuild and re-sign this withdrawal with a new timestamp",
+                            })),
+                        ),
+                        false,
+                    );
+                }
+                Err(_) => {
+                    return (
+                        Self::explorer_v2_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            idempotency_key,
+                            "internal_error",
+                            "payment ledger task failed",
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
+
+        // 4. Echo the key on the response for correlation.
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("idempotency_key".into(), json!(idempotency_key));
+        }
+        (
+            (status, Json(payload)),
+            matches!(class, AdmissionClass::Accepted),
+        )
+    }
+
+    /// Protected single submission: requires an idempotency key, applies the full four-case
+    /// contract, and is fully additive to the legacy `submit-tx`.
+    async fn explorer_submit_tx_v2_handler(
+        State(state): State<ExplorerState>,
+        Json(req): Json<ExplorerSubmitTxV2>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_submit(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        if let Err(message) = Self::validate_idempotency_key(&req.idempotency_key) {
+            return Self::explorer_v2_error(
+                StatusCode::BAD_REQUEST,
+                &req.idempotency_key,
+                "invalid_idempotency_key",
+                message,
+            );
+        }
+        let Some(ledger) = state.wallet_ledger.clone() else {
+            return Self::explorer_v2_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &req.idempotency_key,
+                "ledger_unavailable",
+                "protected submission is unavailable: the operator payment ledger could not be opened",
+            );
+        };
+        let (response, newly_accepted) =
+            Self::submit_with_idempotency(&state, &ledger, &req.idempotency_key, &req.transaction)
+                .await;
+        if newly_accepted {
+            let node = state.node.clone();
+            let announce = req.transaction.clone();
+            tokio::spawn(async move { node.gossip_transaction(&announce).await });
+        }
+        response
+    }
+
+    /// Protected batch submission: every item carries its own required key. Items are admitted in
+    /// request order, matching sequential single submissions; a per-item failure never rolls back an
+    /// earlier admitted item.
+    async fn explorer_submit_tx_batch_v2_handler(
+        State(state): State<ExplorerState>,
+        Json(batch): Json<ExplorerSubmitBatchV2>,
+    ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_submit(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        if batch.version != 1 {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "unsupported batch version");
+        }
+        if batch.transactions.as_slice().is_empty() {
+            return Self::explorer_err(StatusCode::BAD_REQUEST, "empty transaction batch");
+        }
+        let Some(ledger) = state.wallet_ledger.clone() else {
+            return Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "ledger_unavailable");
+        };
+        let Ok(_batch_permit) = Arc::clone(&state.batch_submit_slots).try_acquire_owned() else {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "batch_busy", "retryable": true })),
+            );
+        };
+
+        let items = batch.transactions.into_inner();
+        let mut results = Vec::with_capacity(items.len());
+        let mut to_announce = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            let ((status, Json(mut payload)), newly_accepted) =
+                if let Err(message) = Self::validate_idempotency_key(&item.idempotency_key) {
+                    (
+                        Self::explorer_v2_error(
+                            StatusCode::BAD_REQUEST,
+                            &item.idempotency_key,
+                            "invalid_idempotency_key",
+                            message,
+                        ),
+                        false,
+                    )
+                } else {
+                    Self::submit_with_idempotency(
+                        &state,
+                        &ledger,
+                        &item.idempotency_key,
+                        &item.transaction,
+                    )
+                    .await
+                };
+            if newly_accepted {
+                to_announce.push(item.transaction);
+            }
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("index".into(), json!(index));
+                object.insert("http_status".into(), json!(status.as_u16()));
+            } else {
+                payload = json!({
+                    "index": index,
+                    "http_status": status.as_u16(),
+                    "response": payload,
+                });
+            }
+            results.push(payload);
+        }
+
+        if !to_announce.is_empty() {
+            let node = state.node.clone();
+            tokio::spawn(async move { node.gossip_transactions(&to_announce).await });
         }
 
         (
@@ -7590,6 +7969,8 @@ impl Node {
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
             batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
+            wallet_ledger: self.wallet_ledger.clone(),
+            idempotent_submit_lock: Arc::new(Mutex::new(())),
         };
 
         let app = Router::new()
@@ -7619,6 +8000,18 @@ impl Node {
             .route(
                 "/explorer/submit-tx-batch",
                 axum::routing::post(Self::explorer_submit_tx_batch_handler)
+                    .layer(DefaultBodyLimit::max(EXPLORER_BATCH_BODY_MAX_BYTES)),
+            )
+            // Protected (idempotency-key-required) submission endpoints. Additive: the legacy
+            // endpoints above are unchanged, so an existing integration keeps working across the
+            // upgrade and migrates here deliberately.
+            .route(
+                "/explorer/v2/submit-tx",
+                axum::routing::post(Self::explorer_submit_tx_v2_handler),
+            )
+            .route(
+                "/explorer/v2/submit-tx-batch",
+                axum::routing::post(Self::explorer_submit_tx_batch_v2_handler)
                     .layer(DefaultBodyLimit::max(EXPLORER_BATCH_BODY_MAX_BYTES)),
             )
             .with_state(state);
@@ -19128,6 +19521,64 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_key_validation_enforces_length_and_charset() {
+        // A UUIDv4 (the documented recommendation) passes.
+        assert!(Node::validate_idempotency_key("d2c0ef48-849a-4ce8-b67c-04fd7fc8e017").is_ok());
+        // Trivially-guessable / too-short values are refused on a possibly-public endpoint.
+        assert!(Node::validate_idempotency_key("wd-1234").is_err());
+        assert!(Node::validate_idempotency_key("").is_err());
+        // Over-long and non-graphic (spaces/control) values are refused.
+        assert!(Node::validate_idempotency_key(&"a".repeat(IDEMPOTENCY_KEY_MAX_LEN + 1)).is_err());
+        assert!(Node::validate_idempotency_key("has a space in it 0123").is_err());
+    }
+
+    #[test]
+    fn idempotent_replay_maps_each_ledger_state_to_its_status() {
+        let base = LedgerEntry {
+            key: "k".into(),
+            idempotency_key: Some("k".into()),
+            tuple: PaymentTuple::new("a".into(), "b".into(), 1, 1),
+            timestamp: 1,
+            tx_id: "tx".into(),
+            signed_tx: None,
+            state: EntryState::Pending,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let cases = [
+            (EntryState::Pending, "already_pending", true),
+            (
+                EntryState::Confirmed { height: 9 },
+                "already_confirmed",
+                true,
+            ),
+            (
+                EntryState::Rejected {
+                    reason: "bad".into(),
+                },
+                "rejected",
+                false,
+            ),
+            (EntryState::Expired, "expired", false),
+        ];
+        for (state, expected_status, expected_ok) in cases {
+            let mut entry = base.clone();
+            entry.state = state;
+            let (code, Json(body)) = Node::explorer_v2_idempotent_replay(&entry);
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(
+                body.get("status").and_then(Value::as_str),
+                Some(expected_status)
+            );
+            assert_eq!(body.get("ok").and_then(Value::as_bool), Some(expected_ok));
+            assert_eq!(
+                body.get("idempotent_replay").and_then(Value::as_bool),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
     fn bounded_sequence_rejects_oversized_declared_and_json_counts() {
         let at_limit = vec![[7u8; 32]; TX_RELAY_BATCH_MAX];
         let encoded = codec::serialize(&at_limit).unwrap();
@@ -19446,6 +19897,7 @@ mod tests {
                     max_connections: 32,
                     seed_nodes: Vec::new(),
                     data_dir: None,
+                    wallet_ledger: None,
                 },
             )
             .await
@@ -19574,6 +20026,8 @@ mod tests {
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
             batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
+            wallet_ledger: None,
+            idempotent_submit_lock: Arc::new(Mutex::new(())),
         };
         let http_started = Instant::now();
         // Keep the handler's detached gossip at its final peer-snapshot read until all admitted

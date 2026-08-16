@@ -87,6 +87,101 @@ treat it as a COLLISION: do not mark the withdrawal paid — re-sign with a diff
 timestamp (wait one second) or vary the fee by one unit. Serialising withdrawals to one per
 second per (recipient, amount) pair is the simplest correct policy.
 
+### Protected submission (recommended): let the node detect collisions for you
+
+The client-side defense above still works and is unchanged. But the node can now do the detection
+for you if you give it the one thing only your system has — a unique id per withdrawal.
+
+Use the **protected** endpoints and attach an `idempotency_key` (your own withdrawal id) to every
+submission:
+
+- `POST /explorer/v2/submit-tx`
+- `POST /explorer/v2/submit-tx-batch`
+
+The rule is one line:
+
+> Generate one unique, unguessable key per withdrawal. Send it with the transaction. Reuse the same
+> key **only** when retrying that exact withdrawal.
+
+Single submission:
+
+```json
+POST /explorer/v2/submit-tx
+{
+  "idempotency_key": "d2c0ef48-849a-4ce8-b67c-04fd7fc8e017",
+  "transaction": {
+    "sender": "<40-char hex>", "recipient": "<40-char hex>",
+    "amount": 10, "fee": 0.0001, "timestamp": 1786752000,
+    "signature": "<hex>", "pub_key": "<hex>", "sig_hash": "<hex>"
+  }
+}
+```
+
+Batch — every item carries its own key:
+
+```json
+POST /explorer/v2/submit-tx-batch
+{
+  "version": 1,
+  "transactions": [
+    { "idempotency_key": "<uuid-1>", "transaction": { … } },
+    { "idempotency_key": "<uuid-2>", "transaction": { … } }
+  ]
+}
+```
+
+The node evaluates four cases and answers unambiguously:
+
+| Your submission | `status` | Meaning |
+|---|---|---|
+| new key, new transaction | `accepted` (or `already_pending`/`already_confirmed`) | admitted |
+| same key, same transaction | `already_pending`/`already_confirmed`, `idempotent_replay: true` | safe retry — the original result, never a second payment |
+| same key, different transaction | `idempotency_conflict` (HTTP 409) | you reused a withdrawal id for a different transaction — refused |
+| different key, identical transaction | `transaction_collision` (HTTP 409) | two of your withdrawals produced identical bytes and collided |
+
+The last row is the case you could not previously detect: two byte-identical transactions carrying
+two different withdrawal ids are two distinct payments, and without the two ids the node cannot tell
+them from one transaction submitted twice. On `transaction_collision`, re-sign the colliding
+withdrawal (advance its timestamp by one second or change the fee by one unit) and resubmit it under
+its own key. On any `409`, do **not** mark the withdrawal paid until you resolve it.
+
+**Security — keys must be unguessable.** The submission endpoint may be reachable by more than your
+backend. A predictable key such as `withdrawal-1234` lets someone else claim it first and make your
+real withdrawal fail with `idempotency_conflict`. Use a UUIDv4 (or another high-entropy value), or
+scope keys to an authenticated API client. Keys must be 16–128 printable-ASCII characters; the node
+rejects shorter or malformed ones.
+
+**Migration is deliberate; existing integrations are untouched.** The legacy `submit-tx` and
+`submit-tx-batch` endpoints are unchanged, so upgrading the node breaks nothing. You gain this
+protection when you point your withdrawal worker at the `/v2/` endpoints and start sending a key —
+not merely by upgrading. That participation is unavoidable: the withdrawal id is information only
+your system has, so the node cannot supply it for you.
+
+If you instead sign with the reference wallet (`create`/`send`), you already get collision-free
+timestamps automatically — the ledger allocates a distinct timestamp per identical payment — so the
+protected endpoints are specifically for integrations that sign in their own service and POST the
+finished transaction.
+
+A minimal reference client (Python):
+
+```python
+import uuid, requests
+
+def submit_withdrawal(node_url, signed_tx, withdrawal_id=None):
+    # Persist `key` next to the withdrawal row BEFORE submitting; reuse it verbatim on retry.
+    key = withdrawal_id or str(uuid.uuid4())
+    body = requests.post(f"{node_url}/explorer/v2/submit-tx",
+                         json={"idempotency_key": key, "transaction": signed_tx}).json()
+    status = body.get("status")
+    if status in ("accepted", "already_pending", "already_confirmed"):
+        return "paid", key, body            # already_* is an idempotent retry — safe to mark paid
+    if status == "transaction_collision":
+        return "rebuild", key, body         # re-sign with a new timestamp, resubmit under the same id
+    if status == "idempotency_conflict":
+        return "conflict", key, body        # you reused an id for a different tx — investigate
+    return "retry_or_reject", key, body     # backpressure (retry) or terminal rejection — inspect body
+```
+
 ### Queue limits
 
 - **100 concurrently pending transactions per sender address** (`MEMPOOL_MAX_PER_ADDRESS`).
