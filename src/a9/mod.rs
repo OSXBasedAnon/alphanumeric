@@ -9,6 +9,7 @@ pub mod mldsa;
 pub mod node;
 pub mod oracle;
 pub mod outbound;
+pub mod store;
 pub mod ui;
 pub mod velocity;
 pub mod wallet;
