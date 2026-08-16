@@ -368,6 +368,14 @@ const MAX_PARALLEL_WITNESS_FETCHES: usize = 200;
 const EVENT_QUEUE_CAPACITY: usize = 1000;
 const EVENT_QUEUE_WARN_THRESHOLD: usize = 800;
 const EVENT_BROADCAST_CAPACITY: usize = 1000;
+/// Correlation window for our own outbound GetBlocks solicitations: an inbound
+/// ChainResponse is accepted only from a peer we asked this recently.
+const SOLICIT_TTL: Duration = Duration::from_secs(120);
+/// Hard entry cap for the solicitation map. Entries are created only by our own
+/// outbound requests — never by inbound traffic — so the live population is the
+/// catch-up fanout, tens at most. The cap turns that emergent bound into a
+/// stated invariant; live entries being evicted here means fanout is broken.
+const SOLICITED_PEERS_MAX_ENTRIES: usize = 256;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
 const OUTBOUND_AEAD_OVERHEAD: usize = 12 + 16; // ChaCha20-Poly1305 nonce + authentication tag
 /// Optional mesh transaction gossip is independent from the canonical TCP scheduler. It must be
@@ -9527,6 +9535,13 @@ impl Node {
                     node_clone.cleanup_outbound_connections().await;
                     node_clone.prune_runtime_maps().await;
                     node_clone.prune_validation_cache();
+                    // Predictable cadence for the solicitation map: without this,
+                    // expiry only ran when an inbound ChainResponse happened to
+                    // trigger the opportunistic check.
+                    Self::bound_solicited_block_peers_in(
+                        &node_clone.solicited_block_peers,
+                        Instant::now(),
+                    );
                 }
             }
         });
@@ -11257,6 +11272,22 @@ impl Node {
         // Record that we solicited blocks from this peer so a matching inbound
         // ChainResponse can be correlated (see handle_network_event).
         self.solicited_block_peers.insert(addr, Instant::now());
+        if self.solicited_block_peers.len() > SOLICITED_PEERS_MAX_ENTRIES {
+            let evicted =
+                Self::bound_solicited_block_peers_in(&self.solicited_block_peers, Instant::now());
+            if evicted > 0 {
+                static SOLICIT_CAP_WARN: CoalescedWarn =
+                    CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                if let Some(folded) = SOLICIT_CAP_WARN.should_emit() {
+                    warn!(
+                        "solicited-peer map exceeded its {} entry cap; evicted {} live entries — request fanout beyond design{}",
+                        SOLICITED_PEERS_MAX_ENTRIES,
+                        evicted,
+                        CoalescedWarn::folded(folded)
+                    );
+                }
+            }
+        }
         let mut retries = 0;
         while retries < max_retries {
             match self.send_message_with_response(addr, &message).await {
@@ -11307,11 +11338,32 @@ impl Node {
     /// peer a GetBlocks recently. Opportunistically prunes stale entries so the
     /// set cannot grow unbounded.
     fn is_solicited_block_source(&self, addr: SocketAddr) -> bool {
-        const SOLICIT_TTL: Duration = Duration::from_secs(120);
-        let now = Instant::now();
-        self.solicited_block_peers
-            .retain(|_, ts| now.duration_since(*ts) < SOLICIT_TTL);
+        Self::bound_solicited_block_peers_in(&self.solicited_block_peers, Instant::now());
         self.solicited_block_peers.contains_key(&addr)
+    }
+
+    /// Enforce both invariants of the solicitation map — the TTL window and the
+    /// entry cap — returning how many still-in-window entries had to be evicted
+    /// for the cap (0 in any healthy state). Same overflow idiom as
+    /// `inbound_attempts` in `prune_runtime_maps`: expire first, then drop the
+    /// oldest survivors, so the entries most likely to still get a response are
+    /// always the ones preserved.
+    fn bound_solicited_block_peers_in(map: &DashMap<SocketAddr, Instant>, now: Instant) -> usize {
+        map.retain(|_, ts| now.duration_since(*ts) < SOLICIT_TTL);
+        let overflow = map.len().saturating_sub(SOLICITED_PEERS_MAX_ENTRIES);
+        if overflow == 0 {
+            return 0;
+        }
+        let mut oldest: Vec<(SocketAddr, Instant)> =
+            map.iter().map(|e| (*e.key(), *e.value())).collect();
+        oldest.sort_unstable_by_key(|(_, ts)| *ts);
+        let mut evicted = 0;
+        for (addr, _) in oldest.into_iter().take(overflow) {
+            if map.remove(&addr).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     /// Apply a peer-sourced block only after verifying every transaction's full
@@ -18071,6 +18123,46 @@ mod tests {
     fn coalesced_warn_suffix_is_silent_until_something_folded() {
         assert_eq!(CoalescedWarn::folded(0), "");
         assert_eq!(CoalescedWarn::folded(7), " [7 similar warnings coalesced]");
+    }
+
+    #[test]
+    fn solicited_block_peers_expire_and_stay_capped() {
+        // All timestamps are base + offset (never base - offset: Instant panics on
+        // underflow near the platform epoch), and "now" is evaluated in the future.
+        let base = Instant::now();
+        let addr = |i: usize| -> SocketAddr {
+            format!("10.0.{}.{}:7000", i / 256, i % 256)
+                .parse()
+                .unwrap()
+        };
+
+        // Expiry: at eval time the first entry is past the TTL, the second is not.
+        let map: DashMap<SocketAddr, Instant> = DashMap::new();
+        map.insert(addr(0), base);
+        map.insert(addr(1), base + SOLICIT_TTL);
+        let eval = base + SOLICIT_TTL + Duration::from_secs(5);
+        assert_eq!(Node::bound_solicited_block_peers_in(&map, eval), 0);
+        assert!(!map.contains_key(&addr(0)), "aged-out entry is expired");
+        assert!(map.contains_key(&addr(1)), "in-window entry is preserved");
+
+        // Cap: with every entry in-window, the oldest are evicted down to the cap
+        // and the count of live evictions is reported.
+        let map: DashMap<SocketAddr, Instant> = DashMap::new();
+        let extra = 40;
+        for i in 0..SOLICITED_PEERS_MAX_ENTRIES + extra {
+            map.insert(addr(i), base + Duration::from_millis(i as u64));
+        }
+        let eval = base + Duration::from_secs(30);
+        assert_eq!(Node::bound_solicited_block_peers_in(&map, eval), extra);
+        assert_eq!(map.len(), SOLICITED_PEERS_MAX_ENTRIES);
+        assert!(
+            !map.contains_key(&addr(0)) && !map.contains_key(&addr(extra - 1)),
+            "the oldest entries are the ones evicted"
+        );
+        assert!(
+            map.contains_key(&addr(SOLICITED_PEERS_MAX_ENTRIES + extra - 1)),
+            "the newest entry always survives a cap eviction"
+        );
     }
 
     #[test]

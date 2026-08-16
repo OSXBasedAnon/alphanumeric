@@ -389,10 +389,7 @@ fn verify_bootstrap_snapshot_tip(
     expected_height: Option<u64>,
     expected_tip_hash: Option<&str>,
 ) -> Result<()> {
-    let db = sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .open()?;
+    let db = open_chain_db_aux(db_path)?;
 
     let tip_index = db
         .scan_prefix("block_")
@@ -4647,26 +4644,72 @@ fn print_ascii_intro() {
 /// steady-state RSS with no consensus or wire effect. `ALPHANUMERIC_DB_CACHE_MIB` raises it for heavy
 /// roles (the publisher, a busy explorer, initial sync); the default is validated against a real
 /// workload soak before any release lowers it further.
-fn clamp_db_cache_mib(raw: Option<&str>) -> u64 {
-    const DEFAULT_MIB: u64 = 512;
+fn clamp_db_cache_mib(raw: Option<&str>, default_mib: u64) -> u64 {
     const MIN_MIB: u64 = 64;
     const MAX_MIB: u64 = 8192;
     raw.and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.clamp(MIN_MIB, MAX_MIB))
-        .unwrap_or(DEFAULT_MIB)
+        .unwrap_or(default_mib)
 }
 
+const CHAIN_DB_CACHE_DEFAULT_MIB: u64 = 512;
+/// The snapshot temp DB exists only while a publish imports the export, and it runs
+/// CONCURRENTLY with the live DB — with sled's implicit 1 GiB default its cache
+/// stacked on top of the chain cache at exactly the publisher's peak. Import is a
+/// sequential write pass, so it needs working-set headroom, not a big read cache.
+#[cfg(any(feature = "bootstrap_publisher", test))]
+const SNAPSHOT_DB_CACHE_DEFAULT_MIB: u64 = 128;
+
 fn chain_db_cache_bytes() -> u64 {
-    clamp_db_cache_mib(std::env::var("ALPHANUMERIC_DB_CACHE_MIB").ok().as_deref()) * 1024 * 1024
+    clamp_db_cache_mib(
+        std::env::var("ALPHANUMERIC_DB_CACHE_MIB").ok().as_deref(),
+        CHAIN_DB_CACHE_DEFAULT_MIB,
+    ) * 1024
+        * 1024
+}
+
+#[cfg(any(feature = "bootstrap_publisher", test))]
+fn snapshot_db_cache_bytes() -> u64 {
+    clamp_db_cache_mib(
+        std::env::var("ALPHANUMERIC_SNAPSHOT_DB_CACHE_MIB")
+            .ok()
+            .as_deref(),
+        SNAPSHOT_DB_CACHE_DEFAULT_MIB,
+    ) * 1024
+        * 1024
 }
 
 /// The single place the chain sled DB is configured, so cache sizing and durability cannot drift
 /// across the primary open and the corruption-recovery reopens.
 fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
+    let cache_bytes = chain_db_cache_bytes();
+    // Effective-value visibility the plan requires: once per process, not per
+    // reopen attempt, and never anything secret.
+    static LOG_EFFECTIVE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_EFFECTIVE_ONCE.call_once(|| {
+        log::info!(
+            "chain DB page cache: {} MiB (override: ALPHANUMERIC_DB_CACHE_MIB)",
+            cache_bytes / (1024 * 1024)
+        );
+    });
     sled::Config::new()
         .path(db_path)
         .flush_every_ms(Some(1000))
-        .cache_capacity(chain_db_cache_bytes())
+        .cache_capacity(cache_bytes)
+        .open()
+}
+
+/// Short-lived maintenance opens of the chain DB: pre-launch health checks, bootstrap
+/// verification, and gap probes. These handles live for seconds and mostly scan cold
+/// data, so a large page cache only balloons launch RSS; durability settings are
+/// identical to `open_chain_db`.
+const AUX_DB_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn open_chain_db_aux(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
+    sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .cache_capacity(AUX_DB_CACHE_BYTES)
         .open()
 }
 
@@ -5870,11 +5913,7 @@ fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
         return LaunchDbStatus::Unreadable("database path is not a directory".to_string());
     }
 
-    let db = match sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .open()
-    {
+    let db = match open_chain_db_aux(db_path) {
         Ok(db) => db,
         Err(e) => return LaunchDbStatus::Unreadable(format!("database open failed: {}", e)),
     };
@@ -5913,11 +5952,7 @@ fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
 /// Hex hash of the local block at `height`, or None if the DB can't be read or has
 /// no block there. Opens the DB in its own short-lived handle (dropped on return).
 fn local_block_hash_at(db_path: &str, height: u32) -> Option<String> {
-    let db = sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .open()
-        .ok()?;
+    let db = open_chain_db_aux(db_path).ok()?;
     let raw = db.get(format!("block_{}", height).as_bytes()).ok()??;
     let block = Block::from_bytes(raw.as_ref()).ok()?;
     Some(hex::encode(block.hash))
@@ -6249,11 +6284,7 @@ fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, for
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
 fn local_tip_height(db_path: &str) -> Option<u32> {
-    let db = sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .open()
-        .ok()?;
+    let db = open_chain_db_aux(db_path).ok()?;
     db.scan_prefix(b"block_")
         .filter_map(|entry| {
             entry
@@ -6403,11 +6434,7 @@ fn has_local_block_data(db_path: &str) -> bool {
 
     // Only treat DB as initialized when at least one block key exists.
     // This avoids skipping bootstrap when sled created internal files only.
-    let db = match sled::Config::new()
-        .path(db_path)
-        .flush_every_ms(Some(1000))
-        .open()
-    {
+    let db = match open_chain_db_aux(db_path) {
         Ok(db) => db,
         Err(_) => return false,
     };
@@ -6730,7 +6757,14 @@ async fn publish_bootstrap_snapshot(
 
         db_clone.flush().map_err(|e| e.to_string())?;
         let export = db_clone.export();
-        let tmp_db = sled::open(export_path).map_err(|e| e.to_string())?;
+        // Same defaults `sled::open` used (including flush cadence) EXCEPT the page
+        // cache: this DB runs concurrently with the live one, and import is a
+        // sequential write pass that gains nothing from sled's implicit 1 GiB.
+        let tmp_db = sled::Config::new()
+            .path(export_path)
+            .cache_capacity(snapshot_db_cache_bytes())
+            .open()
+            .map_err(|e| e.to_string())?;
         // sled::Db::import panics on IO problems; if it panics the task will fail and publish will be skipped.
         tmp_db.import(export);
         tmp_db.flush().map_err(|e| e.to_string())?;
@@ -7637,32 +7671,45 @@ impl WhisperAccum {
 mod tests {
     use super::*;
 
-    // The chain sled cache is now explicit and operator-tunable rather than sled's implicit 1 GiB
-    // default: a conservative default, invalid input ignored, and hard clamps so a typo cannot set a
-    // 4 MiB cache that thrashes or a 1 TiB cache that OOMs the box.
+    // The sled caches are now explicit and operator-tunable rather than sled's implicit 1 GiB
+    // default: conservative role-specific defaults, invalid input ignored, and hard clamps so a
+    // typo cannot set a 4 MiB cache that thrashes or a 1 TiB cache that OOMs the box.
     #[test]
     fn db_cache_mib_defaults_and_clamps() {
         assert_eq!(
-            clamp_db_cache_mib(None),
+            clamp_db_cache_mib(None, CHAIN_DB_CACHE_DEFAULT_MIB),
             512,
-            "unset -> conservative default"
+            "unset -> conservative chain default"
         );
         assert_eq!(
-            clamp_db_cache_mib(Some("garbage")),
+            clamp_db_cache_mib(None, SNAPSHOT_DB_CACHE_DEFAULT_MIB),
+            128,
+            "unset -> conservative snapshot-temp default"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("garbage"), CHAIN_DB_CACHE_DEFAULT_MIB),
             512,
             "unparseable -> default"
         );
         assert_eq!(
-            clamp_db_cache_mib(Some("  256 ")),
+            clamp_db_cache_mib(Some("  256 "), CHAIN_DB_CACHE_DEFAULT_MIB),
             256,
             "trimmed and parsed"
         );
-        assert_eq!(clamp_db_cache_mib(Some("1")), 64, "clamped up to the floor");
         assert_eq!(
-            clamp_db_cache_mib(Some("999999")),
+            clamp_db_cache_mib(Some("1"), CHAIN_DB_CACHE_DEFAULT_MIB),
+            64,
+            "clamped up to the floor"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("999999"), CHAIN_DB_CACHE_DEFAULT_MIB),
             8192,
             "clamped down to the ceiling"
         );
+        // Env-independent floor: whatever the override says, the resolved snapshot
+        // cache can never be below the clamp floor (keeps the cfg(test) helper
+        // exercised in every build shape).
+        assert!(snapshot_db_cache_bytes() >= 64 * 1024 * 1024);
     }
 
     // An ordinary wallet must keep the per-payment lines it has today. This is
