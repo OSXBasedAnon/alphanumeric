@@ -1338,10 +1338,44 @@ impl Mgmt {
         // congestion, clamped to the wallet safety ceiling by construction. The
         // brief chain read guard here only reaches the mempool and is released
         // before the send flow's own guard below.
+        // Live fee quote, priced off this node's mempool at send time
+        // (Blockchain::fee_estimate) and shown before signing for both automatic and explicit
+        // fees, so the operator sees exactly what the network is charging and where their fee sits
+        // against the relay floor and the automatic/explicit safety caps.
+        let estimate = blockchain.read().await.fee_estimate().await;
+        writeln!(
+            stdout,
+            "  Fee quote (live): recommended {:.8}, relay floor {:.8}, auto-cap {:.8}, explicit-cap {:.8}",
+            Transaction::from_units(estimate.recommended_units),
+            Transaction::from_units(estimate.floor_units),
+            Transaction::from_units(estimate.auto_cap_units),
+            Transaction::from_units(estimate.explicit_cap_units),
+        )?;
+        writeln!(
+            stdout,
+            "                    mempool {} ({} eligible, {} fit the next block)",
+            estimate.basis(),
+            estimate.pending_candidates,
+            estimate.next_block_fits,
+        )?;
         let fee_units = match parsed.fee_units {
-            Some(units) => units,
+            Some(units) => {
+                // Explicit fee. It was already bounded to the relay floor and the explicit safety
+                // cap at parse time. State the honest fee-retry contract plainly: changing the fee
+                // does NOT replace a pending payment. A different fee produces a different
+                // transaction id and a different signed message, so both the original and the
+                // re-fee transaction can confirm. Alphanumeric has no replace-by-fee; there is
+                // nothing to cancel, and a genuine bump belongs to a new payment only after the
+                // original is rejected or has expired.
+                writeln!(
+                    stdout,
+                    "  Fee: {:.8} (explicit). A different fee to the same recipient and amount is a \
+                     separate, independently valid transaction, not a replacement.",
+                    Transaction::from_units(units)
+                )?;
+                units
+            }
             None => {
-                let estimate = blockchain.read().await.fee_estimate().await;
                 // Never emit a fee that would be READ as a whisper. Classification
                 // is a fee-band test and the code space saturates the band, so this
                 // cannot be fixed when decoding — an ordinary payment whose fee
