@@ -713,11 +713,7 @@ async fn async_main() -> Result<()> {
             pb
         };
         pb.set_message("Initializing database...");
-        let db = match sled::Config::new()
-            .path(&db_path)
-            .flush_every_ms(Some(1000))
-            .open()
-        {
+        let db = match open_chain_db(&db_path) {
             Ok(db) => db,
             Err(e) => {
                 let is_corruption = matches!(e, sled::Error::Corruption { .. })
@@ -727,11 +723,7 @@ async fn async_main() -> Result<()> {
                     if let Err(clean_err) = cleanup_sled_snapshots(&db_path) {
                         error!("Snapshot cleanup failed: {}", clean_err);
                     }
-                    match sled::Config::new()
-                        .path(&db_path)
-                        .flush_every_ms(Some(1000))
-                        .open()
-                    {
+                    match open_chain_db(&db_path) {
                         Ok(db) => db,
                         Err(reopen_err) => {
                             warn!("Reopen failed after cleanup: {}", reopen_err);
@@ -740,10 +732,7 @@ async fn async_main() -> Result<()> {
                                 error!("Failed to quarantine DB: {}", q_err);
                                 return Err(Box::new(reopen_err) as Box<dyn Error>);
                             }
-                            sled::Config::new()
-                                .path(&db_path)
-                                .flush_every_ms(Some(1000))
-                                .open()
+                            open_chain_db(&db_path)
                                 .map_err(|fresh_err| {
                                 error!("Failed to open fresh DB: {}", fresh_err);
                                 Box::new(fresh_err) as Box<dyn Error>
@@ -4653,6 +4642,34 @@ fn print_ascii_intro() {
     let _ = stdout.reset();
 }
 
+/// Explicit, bounded page-cache size (bytes) for the chain sled DB. sled 0.34 otherwise defaults to
+/// a 1 GiB cache no operator chose, so making it explicit and conservative bounds a large share of
+/// steady-state RSS with no consensus or wire effect. `ALPHANUMERIC_DB_CACHE_MIB` raises it for heavy
+/// roles (the publisher, a busy explorer, initial sync); the default is validated against a real
+/// workload soak before any release lowers it further.
+fn clamp_db_cache_mib(raw: Option<&str>) -> u64 {
+    const DEFAULT_MIB: u64 = 512;
+    const MIN_MIB: u64 = 64;
+    const MAX_MIB: u64 = 8192;
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_MIB, MAX_MIB))
+        .unwrap_or(DEFAULT_MIB)
+}
+
+fn chain_db_cache_bytes() -> u64 {
+    clamp_db_cache_mib(std::env::var("ALPHANUMERIC_DB_CACHE_MIB").ok().as_deref()) * 1024 * 1024
+}
+
+/// The single place the chain sled DB is configured, so cache sizing and durability cannot drift
+/// across the primary open and the corruption-recovery reopens.
+fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
+    sled::Config::new()
+        .path(db_path)
+        .flush_every_ms(Some(1000))
+        .cache_capacity(chain_db_cache_bytes())
+        .open()
+}
+
 fn cleanup_sled_snapshots(path: &str) -> std::io::Result<()> {
     let dir = std::path::Path::new(path);
     if !dir.exists() {
@@ -7619,6 +7636,34 @@ impl WhisperAccum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The chain sled cache is now explicit and operator-tunable rather than sled's implicit 1 GiB
+    // default: a conservative default, invalid input ignored, and hard clamps so a typo cannot set a
+    // 4 MiB cache that thrashes or a 1 TiB cache that OOMs the box.
+    #[test]
+    fn db_cache_mib_defaults_and_clamps() {
+        assert_eq!(
+            clamp_db_cache_mib(None),
+            512,
+            "unset -> conservative default"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("garbage")),
+            512,
+            "unparseable -> default"
+        );
+        assert_eq!(
+            clamp_db_cache_mib(Some("  256 ")),
+            256,
+            "trimmed and parsed"
+        );
+        assert_eq!(clamp_db_cache_mib(Some("1")), 64, "clamped up to the floor");
+        assert_eq!(
+            clamp_db_cache_mib(Some("999999")),
+            8192,
+            "clamped down to the ceiling"
+        );
+    }
 
     // An ordinary wallet must keep the per-payment lines it has today. This is
     // the half of the behaviour that is NOT allowed to change.
