@@ -1045,10 +1045,7 @@ mod tests {
     async fn reward_boundary_requires_a_fresh_coinbase_template() {
         const SIX_MONTHS_SECS: u64 = 15_768_000;
 
-        let db = sled::Config::new()
-            .temporary(true)
-            .open()
-            .expect("temporary mining-boundary DB");
+        let db = crate::a9::store::Store::temporary().expect("temporary mining-boundary DB");
         let blockchain = Blockchain::new(
             db,
             0.0005,

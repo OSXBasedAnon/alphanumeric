@@ -67,7 +67,9 @@ if-addrs = "0.10"
 lazy_static = "1.4"
 serde_json = "1.0"
 async-trait = "0.1.74"
-sled = "0.34.0"
+# Legacy engine, retained ONLY for the one-time sled->redb conversion tool
+# (`sled-convert` feature); client and publisher builds carry no sled code.
+sled = { version = "0.34.0", optional = true }
 redb = "4.1"
 env_logger = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
@@ -91,6 +93,9 @@ winres = "0.1.12"
 default = ["webrtc_mesh"]
 # Enables DB snapshot publishing (zip+upload+sign) and the `push` command.
 bootstrap_publisher = []
+# One-time sled->redb database conversion tool for nodes migrating in place
+# (the explorer's initial cutover). Never in client release builds.
+sled-convert = ["dep:sled"]
 # Reserved feature flag used by some libp2p/TCP-specific code paths.
 tcp = []
 # WebRTC DataChannel mesh: NAT'd miners hole-punch direct P2P links, signaled by the gateway.

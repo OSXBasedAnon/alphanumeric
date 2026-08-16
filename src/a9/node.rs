@@ -1,3 +1,4 @@
+use crate::a9::store::{self, Store};
 use arrayref::array_ref;
 use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
@@ -30,7 +31,6 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sled::Db;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
@@ -579,7 +579,7 @@ pub enum NodeError {
     Blockchain(String),
 
     #[error("Database error: {0}")]
-    Database(#[from] sled::Error),
+    Database(#[from] store::StoreError),
 
     #[error("Invalid block: {0}")]
     InvalidBlock(String),
@@ -1868,7 +1868,7 @@ impl WitnessCache {
 #[derive(Clone, Debug)]
 pub struct Node {
     // Core components
-    pub db: Arc<Db>,
+    pub db: Arc<Store>,
     pub blockchain: Arc<RwLock<Blockchain>>,
     pub bind_addr: SocketAddr,
     pub listener: Option<Arc<TcpListener>>,
@@ -2501,7 +2501,7 @@ impl Node {
     // so the crate-level deny is waived here rather than faked with a fallback.
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     pub async fn new(
-        db: Arc<Db>,
+        db: Arc<Store>,
         blockchain: Arc<RwLock<Blockchain>>,
         handshake_key_bytes: Vec<u8>,
         runtime_config: NodeRuntimeConfig,
@@ -20249,10 +20249,7 @@ mod tests {
         use ring::rand::SystemRandom;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let db = sled::Config::new()
-            .temporary(true)
-            .open()
-            .expect("temporary protected-submit database");
+        let db = store::Store::temporary().expect("temporary protected-submit database");
         let blockchain = Blockchain::new(
             db.clone(),
             FEE_PERCENTAGE,
@@ -20876,11 +20873,7 @@ mod tests {
         }
 
         async fn canary_node(funded_addresses: &[String]) -> Node {
-            let db = sled::Config::new()
-                .temporary(true)
-                .flush_every_ms(Some(50))
-                .open()
-                .expect("temporary canary sled database");
+            let db = store::Store::temporary().expect("temporary canary store database");
             let blockchain = Blockchain::new(
                 db.clone(),
                 FEE_PERCENTAGE,
@@ -20968,6 +20961,7 @@ mod tests {
                 .open_tree("pending_transactions")
                 .expect("canary pending tree")
                 .len()
+                .expect("canary pending len") as usize
         }
 
         async fn wait_for_pending(node: &Node, expected: usize, label: &str) {
