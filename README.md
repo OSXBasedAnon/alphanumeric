@@ -299,6 +299,27 @@ Common variables used by the runtime include:
 - `ALPHANUMERIC_PUBLIC_IP`
 - `ALPHANUMERIC_PEER_CACHE_PATH`
 - `ALPHANUMERIC_TX_WITNESS_CACHE_SIZE`
+- `ALPHANUMERIC_OUTBOUND_SCHEDULER` (default `true`; transport-only rollback switch for bounded,
+  class-aware TCP egress. Setting `false` restores the legacy direct/message-count path; it does
+  not change consensus, wire messages, or stored data)
+- `ALPHANUMERIC_OUTBOUND_GLOBAL_QUEUE_MIB` (default `64`, accepted range `32..=512`; encoded bytes
+  waiting or in flight across all authenticated TCP peers)
+- `ALPHANUMERIC_OUTBOUND_PEER_QUEUE_MIB` (default `16`, accepted range `16..=64`; encoded bytes
+  waiting or in flight for one peer; class sublimits reserve room for block/control traffic)
+- `ALPHANUMERIC_OUTBOUND_MAX_QUEUE_AGE_MS` (default `10000`, accepted range `1000..=60000`;
+  transaction/control classes use half this value, with a one-second minimum)
+- `ALPHANUMERIC_OUTBOUND_TX_MIB_PER_SEC` (default `16`, accepted range `1..=256`; per-peer
+  transaction byte-token refill rate, with a two-second burst)
+- `ALPHANUMERIC_OUTBOUND_TX_WORK_PER_SEC` (default `4096`, accepted range `256..=65536`; per-peer
+  transaction work-token refill rate, where batched bodies are charged per transaction)
+
+The opt-in `/stats` response includes `outbound_relay` gauges and counters for each traffic class:
+queued/in-flight bytes, queue wait, completion/failure, expiry, rate rejection, and capacity
+rejection. Per-peer scheduler state is independently capped at 4,096 entries even if the configured
+peer limit is unreasonable. Optional WebRTC transaction copies have their own 8 MiB/256-task
+nonblocking lane and drop counter, so mesh saturation cannot consume canonical TCP capacity; block
+mesh traffic remains separate and valid-PoW bounded. These are local transport-policy observations
+and never affect consensus or checkpoint advancement.
 
 Official bootstrap snapshots are accepted only when the blue gateway returns a pinned publisher manifest with a valid signature and SHA-256. New manifests also carry signed compressed size, extracted size, and file count metadata so the node can preflight disk space and verify extraction without imposing a fixed chain-size ceiling.
 
