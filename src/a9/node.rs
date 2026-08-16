@@ -481,6 +481,75 @@ const COMPACT_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 /// validation headroom. A stale claim can be replaced atomically after this.
 const COMPACT_INFLIGHT_TTL: Duration = Duration::from_secs(70);
 
+/// How long a repeating degraded-state warning stays quiet between emissions.
+/// During an outage the condition fires once per block/prep cycle (~5s), and a
+/// wall of identical lines has previously buried an unrelated real problem;
+/// once a minute with an accurate fold count preserves the signal.
+const COALESCED_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Coalesces one repeating warn call site: emits at most once per
+/// `interval_secs`, folding the number of suppressed repeats into the next
+/// emission. Lock-free; declare one `static` per call site. The deterministic
+/// core (`should_emit_at`) is split from the wall-clock wrapper so tests drive
+/// a fake clock.
+struct CoalescedWarn {
+    interval_secs: u64,
+    /// Process-uptime seconds of the last emission, offset by +1 so that 0 can
+    /// mean "never emitted" without colliding with an emission at t=0.
+    last_emit: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl CoalescedWarn {
+    const fn new(interval_secs: u64) -> Self {
+        Self {
+            interval_secs,
+            last_emit: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(folded)` when the caller should log now (`folded` = repeats
+    /// suppressed since the last emission); `None` when this repeat was folded.
+    /// The first call always emits.
+    fn should_emit(&self) -> Option<u64> {
+        self.should_emit_at(process_uptime_secs())
+    }
+
+    fn should_emit_at(&self, now_secs: u64) -> Option<u64> {
+        let stamp = now_secs + 1;
+        let last = self.last_emit.load(Ordering::Relaxed);
+        if last != 0 && stamp.saturating_sub(last) < self.interval_secs {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // CAS so exactly one racing caller wins the emission slot; losers fold.
+        if self
+            .last_emit
+            .compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.suppressed.swap(0, Ordering::Relaxed))
+    }
+
+    /// Log-line suffix for a fold count; empty when nothing was suppressed.
+    fn folded(suppressed: u64) -> String {
+        if suppressed == 0 {
+            String::new()
+        } else {
+            format!(" [{} similar warnings coalesced]", suppressed)
+        }
+    }
+}
+
+fn process_uptime_secs() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 // STUN servers for NAT traversal
 const STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
@@ -5548,23 +5617,43 @@ impl Node {
                         transient = true;
                     }
                     let body = res.text().await.unwrap_or_default();
-                    warn!(
-                        "Block relay post failed: {} {}",
-                        status,
-                        Self::response_body_snippet(&body)
-                    );
+                    static POST_STATUS_WARN: CoalescedWarn =
+                        CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                    if let Some(folded) = POST_STATUS_WARN.should_emit() {
+                        warn!(
+                            "Block relay post failed: {} {}{}",
+                            status,
+                            Self::response_body_snippet(&body),
+                            CoalescedWarn::folded(folded)
+                        );
+                    }
                 }
                 Err(e) => {
                     // Connect/TLS/timeout errors never reached a relay verdict;
                     // they are transient by construction.
                     transient = true;
-                    warn!("Block relay post error: {}", e);
+                    static POST_ERROR_WARN: CoalescedWarn =
+                        CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                    if let Some(folded) = POST_ERROR_WARN.should_emit() {
+                        warn!(
+                            "Block relay post error: {}{}",
+                            e,
+                            CoalescedWarn::folded(folded)
+                        );
+                    }
                 }
             }
         }
 
         if !any_ok {
-            warn!("Block relay post failed on all endpoints");
+            static ALL_ENDPOINTS_WARN: CoalescedWarn =
+                CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+            if let Some(folded) = ALL_ENDPOINTS_WARN.should_emit() {
+                warn!(
+                    "Block relay post failed on all endpoints{}",
+                    CoalescedWarn::folded(folded)
+                );
+            }
             // Distinguish rate-limiting so callers can BACK OFF instead of amplifying:
             // the old uniform error made publish_block answer every failed POST with a
             // 32-block backfill — under a 429 that backfill is 32 MORE posts into the
@@ -6107,7 +6196,14 @@ impl Node {
                         local_tip
                     )));
                 }
-                warn!("Tip beacon unreachable; mining on local tip (fail-open)");
+                static BEACON_FAIL_OPEN_WARN: CoalescedWarn =
+                    CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                if let Some(folded) = BEACON_FAIL_OPEN_WARN.should_emit() {
+                    warn!(
+                        "Tip beacon unreachable; mining on local tip (fail-open){}",
+                        CoalescedWarn::folded(folded)
+                    );
+                }
                 return Ok(());
             };
             debug!(
@@ -6400,7 +6496,14 @@ impl Node {
                                 beacon.height.saturating_sub(local_tip)
                             )));
                         }
-                        warn!("Relay gap while preparing to mine; mining on local tip (fail-open)");
+                        static RELAY_GAP_WARN: CoalescedWarn =
+                            CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                        if let Some(folded) = RELAY_GAP_WARN.should_emit() {
+                            warn!(
+                                "Relay gap while preparing to mine; mining on local tip (fail-open){}",
+                                CoalescedWarn::folded(folded)
+                            );
+                        }
                         return Ok(());
                     }
                     // Same round-attribution discipline as the Progressed arm
@@ -6528,7 +6631,16 @@ impl Node {
         let (relay_result, mut direct_result) = tokio::join!(relay_fut, direct_fut);
 
         if let Err(e) = relay_result {
-            warn!("{} block relay failed: {}", context, e);
+            static RELAY_FAILED_WARN: CoalescedWarn =
+                CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+            if let Some(folded) = RELAY_FAILED_WARN.should_emit() {
+                warn!(
+                    "{} block relay failed: {}{}",
+                    context,
+                    e,
+                    CoalescedWarn::folded(folded)
+                );
+            }
             // A failed FRESH block is the one post that matters most for propagation
             // (relay-dependent nodes fork against it until it lands). Retryable
             // failures — a rolled-over per-IP window or a transient blip — get ONE
@@ -13857,7 +13969,15 @@ impl Node {
                                 .broadcast_block(Arc::clone(&block), None, selected_peers, true)
                                 .await
                             {
-                                warn!("Failed to broadcast block to selected peers: {}", e);
+                                static FALLBACK_BROADCAST_WARN: CoalescedWarn =
+                                    CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                                if let Some(folded) = FALLBACK_BROADCAST_WARN.should_emit() {
+                                    warn!(
+                                        "Failed to broadcast block to selected peers: {}{}",
+                                        e,
+                                        CoalescedWarn::folded(folded)
+                                    );
+                                }
                             }
                         } else {
                             // Velocity succeeded and SKIPS broadcast_block, so flood the mesh here —
@@ -13882,7 +14002,15 @@ impl Node {
                                 .broadcast_block(block, None, selected_peers, true)
                                 .await
                             {
-                                warn!("Failed to broadcast block to selected peers: {}", e);
+                                static DETACHED_BROADCAST_WARN: CoalescedWarn =
+                                    CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                                if let Some(folded) = DETACHED_BROADCAST_WARN.should_emit() {
+                                    warn!(
+                                        "Failed to broadcast block to selected peers: {}{}",
+                                        e,
+                                        CoalescedWarn::folded(folded)
+                                    );
+                                }
                             }
                         });
                     }
@@ -14627,7 +14755,15 @@ impl Node {
                             )
                             .await
                         {
-                            warn!("Failed to propagate block to selected peers: {}", e);
+                            static PROPAGATE_WARN: CoalescedWarn =
+                                CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                            if let Some(folded) = PROPAGATE_WARN.should_emit() {
+                                warn!(
+                                    "Failed to propagate block to selected peers: {}{}",
+                                    e,
+                                    CoalescedWarn::folded(folded)
+                                );
+                            }
                         }
                     }
                 }
@@ -17892,6 +18028,50 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesced_warn_folds_repeats_within_the_interval() {
+        let w = CoalescedWarn::new(60);
+        assert_eq!(w.should_emit_at(0), Some(0), "first call always emits");
+        assert_eq!(w.should_emit_at(1), None);
+        assert_eq!(w.should_emit_at(59), None, "still inside the window");
+        assert_eq!(
+            w.should_emit_at(61),
+            Some(2),
+            "re-emission reports exactly the folded repeats"
+        );
+        assert_eq!(w.should_emit_at(62), None);
+        assert_eq!(
+            w.should_emit_at(300),
+            Some(1),
+            "fold counter resets after each emission"
+        );
+    }
+
+    #[test]
+    fn coalesced_warn_boundary_and_degenerate_interval() {
+        let w = CoalescedWarn::new(60);
+        assert_eq!(w.should_emit_at(10), Some(0));
+        assert_eq!(
+            w.should_emit_at(70),
+            Some(0),
+            "exactly interval seconds later emits again"
+        );
+
+        let always = CoalescedWarn::new(0);
+        assert_eq!(always.should_emit_at(5), Some(0));
+        assert_eq!(
+            always.should_emit_at(5),
+            Some(0),
+            "zero interval never folds"
+        );
+    }
+
+    #[test]
+    fn coalesced_warn_suffix_is_silent_until_something_folded() {
+        assert_eq!(CoalescedWarn::folded(0), "");
+        assert_eq!(CoalescedWarn::folded(7), " [7 similar warnings coalesced]");
+    }
 
     #[test]
     fn explorer_storage_failures_are_machine_readable_and_never_look_successful() {
