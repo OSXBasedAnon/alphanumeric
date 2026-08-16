@@ -2,12 +2,14 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
 use crate::a9::wallet::Wallet;
+use crate::a9::wallet_ledger::{PaymentTuple, WalletLedger};
 
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
 pub const MAX_FEE: f64 = 0.01;
@@ -284,6 +286,7 @@ impl WhisperModule {
         message: &str,
         wallet: &Wallet,
         sender_balance: f64,
+        wallet_ledger: &Arc<WalletLedger>,
     ) -> Result<Transaction, BlockchainError> {
         // Reject rather than silently truncate: only the first MAX_WHISPER_CHARS are encoded.
         if message.chars().count() > MAX_WHISPER_CHARS {
@@ -294,12 +297,22 @@ impl WhisperModule {
             base_tx.amount_units = Transaction::to_units(WHISPER_MIN_AMOUNT);
         }
 
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         let base_amount = base_tx.amount();
+        let initial_fee = self.encode_message_as_fee(message, now, base_amount);
+        let tuple = PaymentTuple::new(
+            wallet.address.clone(),
+            recipient.to_string(),
+            Transaction::to_units(base_amount),
+            Transaction::to_units(initial_fee),
+        );
+        let timestamp = wallet_ledger
+            .allocate_timestamp(&tuple, now)
+            .map_err(|_| BlockchainError::InvalidTransaction)?;
         let total_fee = self.encode_message_as_fee(message, timestamp, base_amount);
         let total_cost = base_amount + total_fee;
 
@@ -325,6 +338,18 @@ impl WhisperModule {
             pub_key: wallet.get_public_key_hex().await,
             sig_hash: None,
         };
+
+        // Like ordinary wallet sends, persist before returning the signed transaction to a caller.
+        // This keeps programmatic Whisper users collision-safe too, rather than protecting only the
+        // interactive `create` command.
+        let ledger = Arc::clone(wallet_ledger);
+        let tx_id = tx.get_tx_id();
+        let signed_tx = serde_json::to_string(&tx).map_err(BlockchainError::from)?;
+        tokio::task::spawn_blocking(move || {
+            ledger.record(None, tuple, timestamp, tx_id, Some(signed_tx), now)
+        })
+        .await
+        .map_err(|error| BlockchainError::IoError(std::io::Error::other(error.to_string())))??;
 
         Ok(tx)
     }
@@ -669,6 +694,14 @@ mod tests {
     async fn whisper_creation_does_not_double_count_previous_local_send() {
         let whisper = WhisperModule::new();
         let wallet = Wallet::new(None).expect("wallet should be created");
+        let ledger_path = std::env::temp_dir().join(format!(
+            "a9-whisper-ledger-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Arc::new(
+            WalletLedger::open(&ledger_path, Default::default()).expect("whisper test ledger"),
+        );
         let recipient = Wallet::new(None)
             .expect("recipient should be created")
             .address;
@@ -682,7 +715,7 @@ mod tests {
             None,
         );
         whisper
-            .create_whisper_transaction(first, &recipient, "HEYD", &wallet, 25.0)
+            .create_whisper_transaction(first, &recipient, "HEYD", &wallet, 25.0, &ledger)
             .await
             .expect("first whisper should pass");
 
@@ -696,6 +729,7 @@ mod tests {
                 "dude",
                 &wallet,
                 spendable_after_pending_one,
+                &ledger,
             )
             .await
             .expect("second whisper should use caller-provided spendable balance only");

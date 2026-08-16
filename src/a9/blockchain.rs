@@ -1188,6 +1188,16 @@ pub enum TransactionAdmissionOutcome {
     AlreadyConfirmed(u32),
 }
 
+/// Canonical read-only transaction location used to reconcile durable client idempotency records.
+/// The lookup is serialized with block application and admission, so callers never observe the
+/// transient gap while a pending transaction is being moved into the confirmed registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionPresence {
+    Absent,
+    Pending,
+    Confirmed(u32),
+}
+
 impl From<sled::Error> for BlockchainError {
     fn from(err: sled::Error) -> Self {
         Self::DatabaseError(err)
@@ -2480,6 +2490,32 @@ impl Blockchain {
         self.confirmed_tx_index(tx_id)
     }
 
+    /// Atomically classify a transaction against canonical confirmed and durable/in-memory pending
+    /// state. Both pending stores are checked because an I/O failure during the legacy admission
+    /// sequence can leave one populated without the other; fund-safety callers must treat either as
+    /// a potentially live payment.
+    pub async fn transaction_presence(
+        &self,
+        tx_id: &str,
+    ) -> Result<TransactionPresence, BlockchainError> {
+        let _state_guard = self.state_mutation_lock.lock().await;
+        if let Some(height) = self.confirmed_tx_index_checked(tx_id)? {
+            return Ok(TransactionPresence::Confirmed(height));
+        }
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        if pending_tree.get(tx_id.as_bytes())?.is_some()
+            || self
+                .mempool
+                .read()
+                .await
+                .find_transaction_by_id(tx_id)
+                .is_some()
+        {
+            return Ok(TransactionPresence::Pending);
+        }
+        Ok(TransactionPresence::Absent)
+    }
+
     /// Remove every mempool transaction that is already confirmed on the canonical
     /// chain. Confirmed txs can re-enter the mempool through gossip echoes or reorg
     /// reconciliation; any block template built while one is present fails
@@ -2542,17 +2578,25 @@ impl Blockchain {
     }
 
     fn confirmed_tx_index(&self, tx_id: &str) -> Option<u32> {
-        let raw = self
-            .open_confirmed_tx_tree()
-            .ok()?
-            .get(tx_id.as_bytes())
-            .ok()??;
+        self.confirmed_tx_index_checked(tx_id).ok().flatten()
+    }
+
+    /// Checked replay-registry lookup for fund-moving paths. Legacy display and hygiene callers use
+    /// `confirmed_tx_index`, where an unavailable cache is intentionally treated as a miss; payment
+    /// admission and reconciliation must instead fail closed on storage uncertainty.
+    fn confirmed_tx_index_checked(&self, tx_id: &str) -> Result<Option<u32>, BlockchainError> {
+        let Some(raw) = self.open_confirmed_tx_tree()?.get(tx_id.as_bytes())? else {
+            return Ok(None);
+        };
         if raw.len() < 4 {
-            return None;
+            return Err(BlockchainError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "confirmed transaction index contains a truncated height",
+            )));
         }
         let mut b = [0u8; 4];
         b.copy_from_slice(&raw[..4]);
-        Some(u32::from_le_bytes(b))
+        Ok(Some(u32::from_le_bytes(b)))
     }
 
     /// Register a confirmed block's non-system transactions in the replay registry,
@@ -6653,7 +6697,7 @@ impl Blockchain {
         // tx win every height (the 2026-07-09 "Transaction is invalid" mining loop).
         // Rejecting at admission kills the loop at every entry point at once, since
         // all of them funnel through here.
-        if let Some(height) = self.confirmed_tx_index(&transaction.get_tx_id()) {
+        if let Some(height) = self.confirmed_tx_index_checked(&transaction.get_tx_id())? {
             return Ok(TransactionAdmissionOutcome::AlreadyConfirmed(height));
         }
 
@@ -6819,7 +6863,7 @@ impl Blockchain {
         // The cheap early replay check avoids unnecessary ML-DSA work. Repeat it
         // under the state lock so a transaction confirmed while its signature was
         // being verified cannot be reinserted into pending state.
-        if let Some(height) = self.confirmed_tx_index(&tx_id) {
+        if let Some(height) = self.confirmed_tx_index_checked(&tx_id)? {
             return Ok(TransactionAdmissionOutcome::AlreadyConfirmed(height));
         }
 
