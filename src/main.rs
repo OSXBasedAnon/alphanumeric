@@ -4892,6 +4892,9 @@ fn run_sled_conversion(sled_dir: &str, out_dir: &str) -> std::result::Result<(),
     dst.flush().map_err(|e| e.to_string())?;
     drop(dst);
     std::fs::rename(&work_path, &dst_path).map_err(|e| e.to_string())?;
+    // Directory fsync is POSIX-only (see fsync_parent_dir); on Windows the
+    // rename is already journaled by NTFS and this would error spuriously.
+    #[cfg(not(windows))]
     std::fs::File::open(out_dir)
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())?;
@@ -5043,15 +5046,27 @@ fn quarantine_db(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Directory-entry durability: renames/unlinks are only crash-durable once the
-/// parent directory itself is fsynced. sled 0.34 never fsyncs directories, so
-/// the repo's own directory-level milestones must do it themselves.
+/// Directory-entry durability: on POSIX, renames/unlinks are only
+/// crash-durable once the parent directory itself is fsynced, and the storage
+/// engine never does it — so the repo's own directory-level milestones must.
+/// On Windows the operation does not exist (opening a directory as a file
+/// fails, and NTFS journals directory metadata itself) — a propagated error
+/// here would fail every fresh bootstrap right AFTER its successful
+/// rename-into-place, so it is a deliberate no-op there.
 fn fsync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::File::open(parent)?.sync_all()
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
 }
 
 fn ensure_db_lock(path: &str) -> std::io::Result<()> {

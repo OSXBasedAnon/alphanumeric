@@ -21,7 +21,7 @@ curve. This single binary is the full node, wallet and miner for macOS/OSX, Linu
 | Signatures | ML-DSA-87 (FIPS 204): signature 4,627 B, public key 2,592 B |
 | Addresses | 40 lowercase hex characters, `SHA256(public_key)[..20]` |
 | Finality | Trusted checkpoint trailing the tip by 64 blocks |
-| Storage | Embedded `sled`, with a signed bootstrap snapshot for fast first sync |
+| Storage | Embedded `redb` (pure-Rust, ACID), with a signed bootstrap snapshot for fast first sync |
 | Default P2P port | `7177` |
 
 ## Quick Nav
@@ -45,7 +45,7 @@ curve. This single binary is the full node, wallet and miner for macOS/OSX, Linu
 
 `alphanumeric` is designed as a single-node executable that bundles the full operational stack needed to participate in a live network:
 
-- deterministic local chain-state persistence (`sled`)
+- deterministic local chain-state persistence (`redb`)
 - bounded, framed P2P messaging with peer lifecycle management
 - block/transaction propagation and sync workflows
 - integrated mining path
