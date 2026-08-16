@@ -32,9 +32,9 @@
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Default ledger filename, alongside the wallet key file in the working directory. One shared
@@ -54,6 +54,10 @@ pub const DEFAULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// Hard ceiling on retained entries regardless of age, so an abusive or runaway caller cannot grow
 /// the ledger without bound. Oldest terminal entries are dropped first.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+/// Hard ceiling on the serialized live snapshot. API entries omit the caller-owned signed body;
+/// local entries retain it for recovery, so a count-only cap would still permit multi-gigabyte
+/// compactions with ML-DSA witnesses.
+pub const DEFAULT_MAX_LIVE_BYTES: usize = 256 * 1024 * 1024;
 /// Compact the append log once it grows past this many bytes, collapsing superseded records.
 pub const DEFAULT_COMPACTION_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -101,7 +105,10 @@ impl PaymentTuple {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EntryState {
-    /// Admitted to a mempool (or awaiting first submission) and not yet known-terminal.
+    /// Durably reserved before the first admission attempt. A retry of this exact operation may
+    /// safely attempt canonical admission; no different transaction may reuse the key.
+    Reserved,
+    /// Admitted to a mempool and not yet known-terminal.
     Pending,
     /// Observed confirmed at the given height.
     Confirmed { height: u32 },
@@ -109,12 +116,20 @@ pub enum EntryState {
     Rejected { reason: String },
     /// The original transaction can no longer be valid under the freshness window.
     Expired,
+    /// The transaction was already pending or confirmed before this node could attribute it to the
+    /// supplied key. It may be the caller's earlier submission or a distinct colliding withdrawal;
+    /// the node must never guess which.
+    AmbiguousExisting,
 }
 
 impl EntryState {
-    /// A terminal state can be pruned once old enough; a pending one is always retained.
+    /// A terminal state can be pruned once old enough. Reserved, pending, and ambiguous entries are
+    /// retained: none is safe to forget while the payment may still be live or unattributed.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, EntryState::Pending)
+        matches!(
+            self,
+            EntryState::Confirmed { .. } | EntryState::Rejected { .. } | EntryState::Expired
+        )
     }
 }
 
@@ -149,6 +164,10 @@ enum LogRecord {
         state: EntryState,
         updated_at: u64,
     },
+    Delete {
+        key: String,
+        tx_id: String,
+    },
 }
 
 /// Result of allocating a collision-free timestamp for a genuinely new payment.
@@ -177,7 +196,7 @@ pub enum AllocateError {
 /// twice — which is exactly why the id has to come from the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmissionCheck {
-    /// Neither the key nor the transaction has been seen; admit it, then `record`.
+    /// Neither the key nor the transaction has been seen; durably `record` it, then admit it.
     New,
     /// This exact (key, transaction) pair is already recorded — an idempotent retry. Return the
     /// stored result rather than admitting again.
@@ -197,6 +216,7 @@ pub struct LedgerConfig {
     pub future_allocation_margin_secs: u64,
     pub retention_secs: u64,
     pub max_entries: usize,
+    pub max_live_bytes: usize,
     pub compaction_threshold_bytes: u64,
 }
 
@@ -207,6 +227,7 @@ impl Default for LedgerConfig {
             future_allocation_margin_secs: DEFAULT_FUTURE_ALLOCATION_MARGIN_SECS,
             retention_secs: DEFAULT_RETENTION_SECS,
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_live_bytes: DEFAULT_MAX_LIVE_BYTES,
             compaction_threshold_bytes: DEFAULT_COMPACTION_THRESHOLD_BYTES,
         }
     }
@@ -222,8 +243,16 @@ struct Inner {
     tx_index: HashMap<String, String>,
     /// Highest timestamp allocated per collision tuple, for distinct-timestamp scheduling.
     tuple_last_ts: HashMap<PaymentTuple, u64>,
-    /// Bytes appended to the log since the last compaction, to trigger compaction by size.
-    log_len_bytes: u64,
+    /// Conservative count of uncompacted log bytes. Reset to zero after a successful compaction;
+    /// initialized to the on-disk length after restart so a large append trail compacts once on the
+    /// next mutation instead of compacting after every write forever.
+    uncompacted_bytes: u64,
+    /// Cached serialized `Upsert` snapshot bytes for live entries, including newlines. Lifecycle
+    /// transitions can change an entry's encoded size, so write paths recompute this value before
+    /// enforcing the hard byte ceiling.
+    live_bytes: usize,
+    /// Separate process lock. Locking the data file itself prevents atomic replacement on Windows.
+    _lock_file: File,
 }
 
 /// Durable operator-side idempotency ledger. Cheap to clone the handle via `Arc`.
@@ -238,13 +267,26 @@ impl WalletLedger {
     /// so recovery never silently drops committed middle records without evidence in the log.
     pub fn open(path: impl Into<PathBuf>, config: LedgerConfig) -> io::Result<Self> {
         let path = path.into();
+        let lock_path = lock_path_for(&path);
+        let lock_file = open_lock_file(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "wallet ledger is already open by another process ({}): {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
         let mut inner = Inner {
             path,
             config,
             entries: HashMap::new(),
             tx_index: HashMap::new(),
             tuple_last_ts: HashMap::new(),
-            log_len_bytes: 0,
+            uncompacted_bytes: 0,
+            live_bytes: 0,
+            _lock_file: lock_file,
         };
         inner.load()?;
         Ok(Self {
@@ -271,8 +313,8 @@ impl WalletLedger {
 
     /// Evaluate the full four-case idempotency contract for an already-signed transaction submitted
     /// under `idempotency_key` (see [`SubmissionCheck`]). Refreshes expiry first so a stale pending
-    /// entry is reported honestly. This does not mutate the ledger — the caller admits on `New` and
-    /// then `record`s.
+    /// entry is reported honestly. This does not durably mutate the ledger — the caller must
+    /// `record` the reservation on `New` before attempting canonical admission.
     pub fn check_submission(
         &self,
         idempotency_key: &str,
@@ -281,7 +323,8 @@ impl WalletLedger {
     ) -> SubmissionCheck {
         let mut inner = self.inner.lock();
         inner.refresh_expiry(now);
-        if let Some(entry) = inner.entries.get(idempotency_key) {
+        let key = primary_key(Some(idempotency_key), tx_id);
+        if let Some(entry) = inner.entries.get(&key) {
             return if entry.tx_id == tx_id {
                 SubmissionCheck::Duplicate(entry.clone())
             } else {
@@ -292,7 +335,7 @@ impl WalletLedger {
         // distinct withdrawals produced identical bytes and collided.
         if let Some(owner_key) = inner.tx_index.get(tx_id) {
             let owner_key = owner_key.clone();
-            if owner_key != idempotency_key {
+            if owner_key != key {
                 if let Some(owner) = inner.entries.get(&owner_key) {
                     return SubmissionCheck::Collision(owner.clone());
                 }
@@ -316,7 +359,7 @@ impl WalletLedger {
         now: u64,
     ) -> io::Result<LedgerEntry> {
         let mut inner = self.inner.lock();
-        let key = idempotency_key.clone().unwrap_or_else(|| tx_id.clone());
+        let key = primary_key(idempotency_key.as_deref(), &tx_id);
         if let Some(existing) = inner.entries.get(&key) {
             if existing.tx_id != tx_id {
                 return Err(io::Error::new(
@@ -338,23 +381,67 @@ impl WalletLedger {
                 ));
             }
         }
-        let entry = LedgerEntry {
+        inner.refresh_expiry(now);
+        inner.recalculate_live_bytes()?;
+        // Enforce the advertised hard cap on the write path. Prefer dropping the oldest terminal
+        // entries, but never evict an operation that can still pay.
+        let new_entry = LedgerEntry {
             key: key.clone(),
             idempotency_key,
             tuple: tuple.clone(),
             timestamp,
             tx_id: tx_id.clone(),
             signed_tx,
-            state: EntryState::Pending,
+            state: EntryState::Reserved,
             created_at: now,
             updated_at: now,
         };
+        let new_entry_bytes = encoded_upsert_len(&new_entry)?;
+        if new_entry_bytes > inner.config.max_live_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "one wallet-ledger entry exceeds the live-byte ceiling",
+            ));
+        }
+        let target_entries = inner.config.max_entries.saturating_sub(1);
+        let target_bytes = inner.config.max_live_bytes.saturating_sub(new_entry_bytes);
+        inner.prune_durable(now, target_entries, target_bytes)?;
+        if inner.entries.len() >= inner.config.max_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "wallet ledger capacity exhausted by non-terminal payments",
+            ));
+        }
+        if inner.live_bytes > target_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "wallet ledger live-byte capacity exhausted by non-terminal payments",
+            ));
+        }
+        let entry = new_entry;
         inner.append(&LogRecord::Upsert {
             entry: entry.clone(),
         })?;
-        inner.index_entry(entry.clone());
-        inner.maybe_compact()?;
+        inner.index_entry(entry.clone())?;
+        inner.maybe_compact_best_effort();
         Ok(entry)
+    }
+
+    /// Remove a never-admitted reservation after canonical admission definitively failed. The
+    /// `(key, tx_id)` pair must still own the entry, so this cannot delete a later replacement.
+    pub fn release_reservation(&self, idempotency_key: &str, tx_id: &str) -> io::Result<bool> {
+        let mut inner = self.inner.lock();
+        let key = primary_key(Some(idempotency_key), tx_id);
+        inner.release_reservation(&key, tx_id)
+    }
+
+    /// Remove a locally-created signed reservation that the operator explicitly cancelled before
+    /// admission. This is intentionally separate from API-key release so the namespaces cannot
+    /// alias even when a caller chooses a transaction-looking key.
+    pub fn release_local_reservation(&self, tx_id: &str) -> io::Result<bool> {
+        let mut inner = self.inner.lock();
+        let key = primary_key(None, tx_id);
+        inner.release_reservation(&key, tx_id)
     }
 
     /// Update the recorded state of a transaction after observing an admission or confirmation
@@ -373,7 +460,7 @@ impl WalletLedger {
             entry.state = state;
             entry.updated_at = now;
         }
-        inner.maybe_compact()?;
+        inner.maybe_compact_best_effort();
         Ok(())
     }
 
@@ -381,7 +468,10 @@ impl WalletLedger {
     pub fn find_by_key(&self, idempotency_key: &str, now: u64) -> Option<LedgerEntry> {
         let mut inner = self.inner.lock();
         inner.refresh_expiry(now);
-        inner.entries.get(idempotency_key).cloned()
+        inner
+            .entries
+            .get(&primary_key(Some(idempotency_key), ""))
+            .cloned()
     }
 
     /// Look up an entry by transaction id, refreshing expiry first.
@@ -396,77 +486,174 @@ impl WalletLedger {
     pub fn prune(&self, now: u64) -> io::Result<usize> {
         let mut inner = self.inner.lock();
         inner.refresh_expiry(now);
-        let removed = inner.prune(now);
-        if removed > 0 {
-            inner.compact()?;
-        }
-        Ok(removed)
+        inner.recalculate_live_bytes()?;
+        let target = inner.config.max_entries;
+        let target_bytes = inner.config.max_live_bytes;
+        inner.prune_durable(now, target, target_bytes)
     }
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
         self.inner.lock().entries.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_data_path_for_test(&self, path: PathBuf) {
+        self.inner.lock().path = path;
+    }
 }
 
 impl Inner {
+    fn release_reservation(&mut self, key: &str, tx_id: &str) -> io::Result<bool> {
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(false);
+        };
+        if entry.tx_id != tx_id || !matches!(entry.state, EntryState::Reserved) {
+            return Ok(false);
+        }
+        self.append(&LogRecord::Delete {
+            key: key.to_string(),
+            tx_id: tx_id.to_string(),
+        })?;
+        self.remove_entry(key);
+        self.maybe_compact_best_effort();
+        Ok(true)
+    }
     fn load(&mut self) -> io::Result<()> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => {
+                // Upgrade ledgers created by older releases to the same operator-only mode used
+                // for new files. Withdrawal identifiers are operationally sensitive even though
+                // the signed transactions themselves are public.
+                set_restrictive_permissions(&self.path)?;
+                bytes
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
-        let reader = io::BufReader::new(file);
-        let mut pending: Vec<LogRecord> = Vec::new();
-        let mut total_bytes: u64 = 0;
-        let mut lines = reader.lines().peekable();
-        while let Some(line) = lines.next() {
-            let line = line?;
-            total_bytes = total_bytes.saturating_add(line.len() as u64 + 1);
-            if line.is_empty() {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            if let Some(relative_end) = bytes[offset..].iter().position(|byte| *byte == b'\n') {
+                let end = offset + relative_end;
+                let line = &bytes[offset..end];
+                offset = end + 1;
+                if line.is_empty() {
+                    continue;
+                }
+                let record = serde_json::from_slice::<LogRecord>(line).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("corrupt complete wallet-ledger record: {error}"),
+                    )
+                })?;
+                self.apply(record)?;
                 continue;
             }
-            match serde_json::from_str::<LogRecord>(&line) {
-                Ok(record) => pending.push(record),
-                Err(_) if lines.peek().is_none() => {
-                    // Only the final line may be a torn interrupted append; drop it and stop.
-                    log::warn!("wallet ledger: discarding torn final log record");
-                    break;
-                }
-                Err(e) => {
-                    // A corrupt record before the end is not a clean interruption. Keep everything
-                    // decoded so far and refuse to silently reinterpret the remainder.
-                    log::error!("wallet ledger: stopping replay at unreadable record: {e}");
-                    break;
+
+            // A final record without a newline is either complete (the crash landed between the
+            // JSON and newline writes) or torn. Accept and repair a complete record; truncate only
+            // an invalid unterminated tail. A malformed newline-terminated final record above is
+            // corruption and fails open(), never masquerading as a recoverable tear.
+            let tail = &bytes[offset..];
+            if !tail.is_empty() {
+                match serde_json::from_slice::<LogRecord>(tail) {
+                    Ok(record) => {
+                        self.apply(record)?;
+                        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+                        file.write_all(b"\n")?;
+                        file.sync_all()?;
+                        offset = bytes.len().saturating_add(1);
+                    }
+                    Err(_) => {
+                        log::warn!("wallet ledger: repairing torn final log record");
+                        let file = OpenOptions::new().write(true).open(&self.path)?;
+                        file.set_len(offset as u64)?;
+                        file.sync_all()?;
+                    }
                 }
             }
+            break;
         }
-        for record in pending {
-            self.apply(record);
-        }
-        self.log_len_bytes = total_bytes;
+        self.uncompacted_bytes = offset as u64;
+        self.recalculate_live_bytes()?;
         Ok(())
     }
 
-    fn apply(&mut self, record: LogRecord) {
+    fn apply(&mut self, record: LogRecord) -> io::Result<()> {
         match record {
-            LogRecord::Upsert { entry } => self.index_entry(entry),
+            LogRecord::Upsert { mut entry } => {
+                // Normalize records written by the initial release, which used un-namespaced map
+                // keys. Namespaces prevent a caller-chosen idempotency key from aliasing a local
+                // transaction-id key.
+                entry.key = primary_key(entry.idempotency_key.as_deref(), &entry.tx_id);
+                if self
+                    .entries
+                    .get(&entry.key)
+                    .is_some_and(|existing| existing.tx_id != entry.tx_id)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wallet ledger key is bound to multiple transactions",
+                    ));
+                }
+                if self
+                    .tx_index
+                    .get(&entry.tx_id)
+                    .is_some_and(|owner| owner != &entry.key)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wallet ledger transaction is bound to multiple keys",
+                    ));
+                }
+                self.index_entry(entry)?;
+            }
             LogRecord::State {
                 tx_id,
                 state,
                 updated_at,
             } => {
-                if let Some(key) = self.tx_index.get(&tx_id).cloned() {
-                    if let Some(entry) = self.entries.get_mut(&key) {
-                        entry.state = state;
-                        entry.updated_at = updated_at;
-                    }
+                let key = self.tx_index.get(&tx_id).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wallet ledger state record references an unknown transaction",
+                    )
+                })?;
+                let entry = self.entries.get_mut(&key).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wallet ledger transaction index references an unknown entry",
+                    )
+                })?;
+                entry.state = state;
+                entry.updated_at = updated_at;
+            }
+            LogRecord::Delete { key, tx_id } => {
+                let key = if key.starts_with("idempotency:") || key.starts_with("transaction:") {
+                    key
+                } else if self
+                    .entries
+                    .get(&key)
+                    .and_then(|entry| entry.idempotency_key.as_ref())
+                    .is_some()
+                {
+                    format!("idempotency:{key}")
+                } else {
+                    format!("transaction:{key}")
+                };
+                if self
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.tx_id == tx_id)
+                {
+                    self.remove_entry(&key);
                 }
             }
         }
+        Ok(())
     }
 
-    fn index_entry(&mut self, entry: LedgerEntry) {
+    fn index_entry(&mut self, entry: LedgerEntry) -> io::Result<()> {
         let last = self
             .tuple_last_ts
             .get(&entry.tuple)
@@ -476,10 +663,23 @@ impl Inner {
         self.tuple_last_ts.insert(entry.tuple.clone(), last);
         // First-writer-wins: the transaction's owning key is the one that recorded it first. Never
         // overwrite it, or the collision signal (a repeat transaction under a new key) is lost.
-        self.tx_index
-            .entry(entry.tx_id.clone())
-            .or_insert_with(|| entry.key.clone());
+        let encoded_len = encoded_upsert_len(&entry)?;
+        if let Some(previous) = self.entries.get(&entry.key) {
+            self.live_bytes = self
+                .live_bytes
+                .saturating_sub(encoded_upsert_len(previous)?);
+        }
+        self.tx_index.insert(entry.tx_id.clone(), entry.key.clone());
         self.entries.insert(entry.key.clone(), entry);
+        self.live_bytes = self.live_bytes.saturating_add(encoded_len);
+        Ok(())
+    }
+
+    fn recalculate_live_bytes(&mut self) -> io::Result<()> {
+        self.live_bytes = self.entries.values().try_fold(0usize, |total, entry| {
+            encoded_upsert_len(entry).map(|encoded_len| total.saturating_add(encoded_len))
+        })?;
+        Ok(())
     }
 
     /// Transition still-pending entries whose transaction can no longer be valid to `Expired`. In
@@ -488,7 +688,7 @@ impl Inner {
     fn refresh_expiry(&mut self, now: u64) {
         let horizon = self.config.tx_age_limit_secs;
         for entry in self.entries.values_mut() {
-            if matches!(entry.state, EntryState::Pending)
+            if matches!(entry.state, EntryState::Reserved | EntryState::Pending)
                 && entry.timestamp.saturating_add(horizon) < now
             {
                 entry.state = EntryState::Expired;
@@ -497,41 +697,101 @@ impl Inner {
         }
     }
 
-    fn prune(&mut self, now: u64) -> usize {
+    fn prune_keys(
+        &self,
+        now: u64,
+        target_max_entries: usize,
+        target_max_bytes: usize,
+    ) -> io::Result<HashSet<String>> {
         let retention = self.config.retention_secs;
-        let before = self.entries.len();
-
-        // Drop terminal entries past the retention window.
-        let expired_keys: Vec<String> = self
+        let mut removed: HashSet<String> = self
             .entries
             .values()
             .filter(|e| e.state.is_terminal() && e.updated_at.saturating_add(retention) < now)
             .map(|e| e.key.clone())
             .collect();
-        for key in expired_keys {
-            self.remove_entry(&key);
-        }
 
-        // Enforce the hard count cap by dropping oldest terminal entries first; never evict a
-        // pending entry, which still needs its idempotency guarantee.
-        if self.entries.len() > self.config.max_entries {
+        let remaining = self.entries.len().saturating_sub(removed.len());
+        if remaining > target_max_entries {
             let mut terminal: Vec<(u64, String)> = self
                 .entries
                 .values()
-                .filter(|e| e.state.is_terminal())
+                .filter(|e| e.state.is_terminal() && !removed.contains(&e.key))
                 .map(|e| (e.updated_at, e.key.clone()))
                 .collect();
             terminal.sort_by_key(|(updated, _)| *updated);
-            let overflow = self.entries.len() - self.config.max_entries;
+            let overflow = remaining - target_max_entries;
             for (_, key) in terminal.into_iter().take(overflow) {
-                self.remove_entry(&key);
+                removed.insert(key);
             }
         }
-        before - self.entries.len()
+
+        let mut remaining_bytes = self.live_bytes;
+        for key in &removed {
+            if let Some(entry) = self.entries.get(key) {
+                remaining_bytes = remaining_bytes.saturating_sub(encoded_upsert_len(entry)?);
+            }
+        }
+        if remaining_bytes > target_max_bytes {
+            let mut terminal: Vec<(u64, String)> = self
+                .entries
+                .values()
+                .filter(|entry| entry.state.is_terminal() && !removed.contains(&entry.key))
+                .map(|entry| (entry.updated_at, entry.key.clone()))
+                .collect();
+            terminal.sort_by_key(|(updated, _)| *updated);
+            for (_, key) in terminal {
+                if remaining_bytes <= target_max_bytes {
+                    break;
+                }
+                if let Some(entry) = self.entries.get(&key) {
+                    remaining_bytes = remaining_bytes.saturating_sub(encoded_upsert_len(entry)?);
+                    removed.insert(key);
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    fn prune_durable(
+        &mut self,
+        now: u64,
+        target_max_entries: usize,
+        target_max_bytes: usize,
+    ) -> io::Result<usize> {
+        let removed = self.prune_keys(now, target_max_entries, target_max_bytes)?;
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        // Persist each deletion before applying it in memory. Rewriting a snapshot that excludes
+        // all victims first would create disk/memory disagreement if rename succeeded but the
+        // parent-directory fsync reported failure. Partial pruning is harmless and replayable;
+        // admitting a new payment waits until the entire requested capacity operation succeeds.
+        let mut removed = removed.into_iter().collect::<Vec<_>>();
+        removed.sort_unstable();
+        let mut count = 0usize;
+        for key in removed {
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            let tx_id = entry.tx_id.clone();
+            self.append(&LogRecord::Delete {
+                key: key.clone(),
+                tx_id,
+            })?;
+            self.remove_entry(&key);
+            count = count.saturating_add(1);
+        }
+        self.tuple_last_ts.retain(|_, timestamp| *timestamp >= now);
+        self.maybe_compact_best_effort();
+        Ok(count)
     }
 
     fn remove_entry(&mut self, key: &str) {
         if let Some(entry) = self.entries.remove(key) {
+            if let Ok(encoded_len) = encoded_upsert_len(&entry) {
+                self.live_bytes = self.live_bytes.saturating_sub(encoded_len);
+            }
             self.tx_index.remove(&entry.tx_id);
             // Keep tuple_last_ts: forgetting the last allocated timestamp for a tuple could let a
             // later same-tuple payment reuse a just-freed timestamp. It is bounded by distinct
@@ -543,37 +803,90 @@ impl Inner {
         let mut line = serde_json::to_vec(record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
+        let file_existed = match std::fs::metadata(&self.path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
         let mut file = open_append(&self.path)?;
         file.write_all(&line)?;
         file.flush()?;
         file.sync_all()?;
-        self.log_len_bytes = self.log_len_bytes.saturating_add(line.len() as u64);
+        // fsyncing a newly-created file does not by itself make its directory entry durable. The
+        // first reservation must survive power loss before a caller is ever told it was accepted.
+        if !file_existed {
+            sync_parent_directory(&self.path)?;
+        }
+        self.uncompacted_bytes = self.uncompacted_bytes.saturating_add(line.len() as u64);
         Ok(())
     }
 
-    fn maybe_compact(&mut self) -> io::Result<()> {
-        if self.log_len_bytes > self.config.compaction_threshold_bytes {
-            self.compact()?;
+    fn maybe_compact_best_effort(&mut self) {
+        if self.uncompacted_bytes > self.config.compaction_threshold_bytes {
+            if let Err(error) = self.compact() {
+                // The append/state transition is already fsynced and authoritative. Returning an
+                // error now would falsely tell a caller the operation failed and could induce a
+                // second payment. Compaction is maintenance; surface it loudly without lying about
+                // the committed mutation.
+                log::error!("wallet ledger compaction failed after committed append: {error}");
+            }
         }
-        Ok(())
     }
 
     /// Rewrite the log as exactly one `Upsert` per live entry, atomically. Collapses superseded
     /// records and applies in-memory expiry transitions to the durable form.
     fn compact(&mut self) -> io::Result<()> {
-        let mut buf = Vec::new();
-        for entry in self.entries.values() {
-            let mut line = serde_json::to_vec(&LogRecord::Upsert {
-                entry: entry.clone(),
-            })
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            line.push(b'\n');
-            buf.extend_from_slice(&line);
-        }
-        atomic_write(&self.path, &buf)?;
-        self.log_len_bytes = buf.len() as u64;
+        let path = self.path.clone();
+        atomic_replace(&path, |file| {
+            for entry in self.entries.values() {
+                serde_json::to_writer(
+                    &mut *file,
+                    &LogRecord::Upsert {
+                        entry: entry.clone(),
+                    },
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                file.write_all(b"\n")?;
+            }
+            Ok(())
+        })?;
+        self.uncompacted_bytes = 0;
         Ok(())
     }
+}
+
+fn primary_key(idempotency_key: Option<&str>, tx_id: &str) -> String {
+    match idempotency_key {
+        Some(key) => format!("idempotency:{key}"),
+        None => format!("transaction:{tx_id}"),
+    }
+}
+
+fn encoded_upsert_len(entry: &LedgerEntry) -> io::Result<usize> {
+    serde_json::to_vec(&LogRecord::Upsert {
+        entry: entry.clone(),
+    })
+    .map(|encoded| encoded.len().saturating_add(1))
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    set_restrictive_permissions(path)?;
+    Ok(file)
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -584,12 +897,40 @@ fn open_append(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    set_restrictive_permissions(path)?;
+    Ok(file)
 }
 
-/// Atomic full-file replace: write a temp file, fsync it, rename over the target, then fsync the
-/// parent directory so the rename itself survives power loss.
-fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+fn set_restrictive_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Atomic full-file replace: stream a temp file, fsync it, rename over the target, then fsync the
+/// parent directory so the rename itself survives power loss. Streaming avoids allocating a second
+/// in-memory copy of the bounded-but-potentially-large live ledger.
+fn atomic_replace<F>(path: &Path, write_contents: F) -> io::Result<()>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
     let tmp = path.with_extension("tmp");
     {
         let mut options = OpenOptions::new();
@@ -600,22 +941,13 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&tmp)?;
-        file.write_all(data)?;
+        set_restrictive_permissions(&tmp)?;
+        write_contents(&mut file)?;
         file.flush()?;
         file.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        if let Ok(dir) = File::open(&parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -640,7 +972,13 @@ mod tests {
             name
         ));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(lock_path_for(&path));
         path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(lock_path_for(path));
     }
 
     // Regression guard: the tagged `LogRecord` decodes its content through serde's `Content`
@@ -866,7 +1204,225 @@ mod tests {
         let reopened = ledger(&path);
         assert!(reopened.find_by_key("good", 4_100).is_some());
         assert_eq!(reopened.entry_count(), 1);
-        let _ = std::fs::remove_file(&path);
+        // The repair must truncate the bad tail, not merely ignore it in memory. A later append and
+        // second restart must therefore preserve both valid records.
+        reopened
+            .record(
+                Some("after-repair".into()),
+                tuple(2, 10_000),
+                4_001,
+                "alice:bob:0.00000002:0.00010000:4001".into(),
+                None,
+                4_001,
+            )
+            .unwrap();
+        drop(reopened);
+        let second_restart = ledger(&path);
+        assert!(second_restart.find_by_key("good", 4_100).is_some());
+        assert!(second_restart.find_by_key("after-repair", 4_100).is_some());
+        drop(second_restart);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn complete_corrupt_record_fails_closed_including_at_end_of_file() {
+        let path = temp_path("complete-corrupt");
+        std::fs::write(&path, b"{not-json}\n").unwrap();
+        let error = WalletLedger::open(&path, LedgerConfig::default()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_complete_final_record_without_newline_is_accepted_and_repaired() {
+        let path = temp_path("complete-no-newline");
+        let entry = LedgerEntry {
+            key: "legacy-key".into(),
+            idempotency_key: Some("complete-key".into()),
+            tuple: tuple(1, 10_000),
+            timestamp: 4_000,
+            tx_id: "complete-tx".into(),
+            signed_tx: None,
+            state: EntryState::Pending,
+            created_at: 4_000,
+            updated_at: 4_000,
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&LogRecord::Upsert { entry }).unwrap(),
+        )
+        .unwrap();
+        let opened = ledger(&path);
+        assert!(opened.find_by_key("complete-key", 4_001).is_some());
+        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+        drop(opened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_second_process_handle_cannot_open_the_same_ledger() {
+        let path = temp_path("exclusive-lock");
+        let first = ledger(&path);
+        let error = WalletLedger::open(&path, LedgerConfig::default()).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Other
+        ));
+        drop(first);
+        assert!(WalletLedger::open(&path, LedgerConfig::default()).is_ok());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn idempotency_and_local_transaction_keys_have_disjoint_namespaces() {
+        let path = temp_path("key-namespace");
+        let ledger = ledger(&path);
+        let local_tx_id = "caller-controlled-looking-key";
+        ledger
+            .record(None, tuple(1, 10_000), 10, local_tx_id.into(), None, 10)
+            .unwrap();
+        ledger
+            .record(
+                Some(local_tx_id.into()),
+                tuple(2, 10_000),
+                11,
+                "different-tx".into(),
+                None,
+                11,
+            )
+            .unwrap();
+        assert_eq!(ledger.entry_count(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_path_enforces_the_hard_entry_cap_without_evicting_live_operations() {
+        let path = temp_path("entry-cap");
+        let config = LedgerConfig {
+            max_entries: 2,
+            ..Default::default()
+        };
+        let ledger = WalletLedger::open(&path, config).unwrap();
+        for index in 0..2 {
+            ledger
+                .record(
+                    Some(format!("key-{index}")),
+                    tuple(index, 10_000),
+                    100 + index as u64,
+                    format!("tx-{index}"),
+                    None,
+                    100,
+                )
+                .unwrap();
+        }
+        let error = ledger
+            .record(
+                Some("key-overflow".into()),
+                tuple(9, 10_000),
+                109,
+                "tx-overflow".into(),
+                None,
+                100,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(ledger.entry_count(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn write_path_enforces_the_live_byte_cap_and_evicts_only_terminal_entries() {
+        let path = temp_path("byte-cap");
+        let first_key = "idempotency:first".to_string();
+        let second_key = "idempotency:second".to_string();
+        let first_tx = "tx-first".to_string();
+        let second_tx = "tx-second".to_string();
+        let first = LedgerEntry {
+            key: first_key,
+            idempotency_key: Some("first".into()),
+            tuple: tuple(1, 10_000),
+            timestamp: 100,
+            tx_id: first_tx.clone(),
+            signed_tx: Some("x".repeat(512)),
+            state: EntryState::Reserved,
+            created_at: 100,
+            updated_at: 100,
+        };
+        let second = LedgerEntry {
+            key: second_key,
+            idempotency_key: Some("second".into()),
+            tuple: tuple(2, 10_000),
+            timestamp: 101,
+            tx_id: second_tx.clone(),
+            signed_tx: Some("y".repeat(512)),
+            state: EntryState::Reserved,
+            created_at: 101,
+            updated_at: 101,
+        };
+        let max_live_bytes = encoded_upsert_len(&first)
+            .unwrap()
+            .max(encoded_upsert_len(&second).unwrap());
+        let config = LedgerConfig {
+            // Either entry fits alone; the pair cannot fit together.
+            max_live_bytes,
+            ..Default::default()
+        };
+        let ledger = WalletLedger::open(&path, config).unwrap();
+        ledger
+            .record(
+                Some("first".into()),
+                first.tuple.clone(),
+                first.timestamp,
+                first_tx.clone(),
+                first.signed_tx.clone(),
+                first.created_at,
+            )
+            .unwrap();
+
+        // A live reservation is never evicted just to make capacity.
+        let full = ledger
+            .record(
+                Some("second".into()),
+                second.tuple.clone(),
+                second.timestamp,
+                second_tx.clone(),
+                second.signed_tx.clone(),
+                second.created_at,
+            )
+            .unwrap_err();
+        assert_eq!(full.kind(), io::ErrorKind::StorageFull);
+        assert!(ledger.find_by_key("first", 101).is_some());
+
+        // Once terminal, the oldest entry may be durably pruned and the new reservation admitted.
+        ledger
+            .update_state(&first_tx, EntryState::Confirmed { height: 1 }, 101)
+            .unwrap();
+        ledger
+            .record(
+                Some("second".into()),
+                second.tuple,
+                second.timestamp,
+                second_tx,
+                second.signed_tx,
+                second.created_at,
+            )
+            .unwrap();
+        assert!(ledger.find_by_key("first", 101).is_none());
+        assert!(ledger.find_by_key("second", 101).is_some());
+        drop(ledger);
+
+        let reopened = WalletLedger::open(
+            &path,
+            LedgerConfig {
+                max_live_bytes,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(reopened.find_by_key("first", 101).is_none());
+        assert!(reopened.find_by_key("second", 101).is_some());
+        drop(reopened);
+        cleanup(&path);
     }
 
     #[test]
@@ -904,6 +1460,7 @@ mod tests {
             "compaction must collapse the append trail to one record"
         );
 
+        drop(ledger);
         let reopened = ledger_from(&path, 1);
         assert_eq!(
             reopened.find_by_key("c-1", 5_100).unwrap().state,
@@ -940,18 +1497,34 @@ mod tests {
             .record(
                 Some("live".into()),
                 tuple(2, 10_000),
-                9_000,
-                "alice:bob:0.00000002:0.00010000:9000".into(),
+                6_001,
+                "alice:bob:0.00000002:0.00010000:6001".into(),
                 None,
-                9_000,
+                6_001,
             )
             .unwrap();
+        let ambiguous_tx = "alice:bob:0.00000003:0.00010000:6002".to_string();
+        ledger
+            .record(
+                Some("ambiguous".into()),
+                tuple(3, 10_000),
+                6_002,
+                ambiguous_tx.clone(),
+                None,
+                6_002,
+            )
+            .unwrap();
+        ledger
+            .update_state(&ambiguous_tx, EntryState::AmbiguousExisting, 6_002)
+            .unwrap();
 
-        // Well past the confirmed entry's retention window, but the pending one is always kept.
+        // Well past the confirmed entry's retention window, but live and ambiguous operations are
+        // always kept because either may still represent a payment.
         let removed = ledger.prune(6_000 + 1_000).unwrap();
         assert_eq!(removed, 1);
         assert!(ledger.find_by_key("old", 7_100).is_none());
         assert!(ledger.find_by_key("live", 7_100).is_some());
+        assert!(ledger.find_by_key("ambiguous", 7_100).is_some());
         let _ = std::fs::remove_file(&path);
     }
 
