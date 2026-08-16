@@ -684,9 +684,12 @@ async fn async_main() -> Result<()> {
                 return Err(format!("interrupted DB rotation needs attention: {}", e).into());
             }
         }
-        // Offline maintenance mode: rebuild + rotate under the startup lock
-        // instead of launching the node.
-        if env_flag_enabled("ALPHANUMERIC_REBUILD_DB") {
+        // Offline maintenance mode: `alphanumeric rebuild-db` rebuilds + rotates
+        // under the startup lock instead of launching the node. Deliberately an
+        // argv subcommand and NOT an environment variable: a one-shot action
+        // triggered by ambient state left in a service unit or .env would turn
+        // every restart into a refused rebuild and keep the node down.
+        if std::env::args().nth(1).as_deref() == Some("rebuild-db") {
             pb.finish_and_clear();
             return run_offline_db_rebuild(&db_path).map_err(|e| e.into());
         }
@@ -4776,7 +4779,7 @@ fn open_chain_db_aux(db_path: &str) -> std::result::Result<sled::Db, sled::Error
 // full rebuild into a fresh sibling directory, verified byte-for-byte at the
 // logical level, then swapped in with a journaled two-rename so an interruption
 // at ANY point leaves either the old verified database or the new verified
-// database — never a partial one. Runs only offline (ALPHANUMERIC_REBUILD_DB=1
+// database — never a partial one. Runs only offline (`alphanumeric rebuild-db`
 // under the exclusive startup lock); the node repairs an interrupted swap at
 // every boot before anything reads the DB directory.
 // ---------------------------------------------------------------------------
