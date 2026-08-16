@@ -196,8 +196,12 @@ one key per item. Keys must be 16–128 printable-ASCII characters and **unguess
 scoped to an authenticated client — a predictable key on a reachable endpoint lets someone pre-claim
 it and deny your withdrawal.
 
+The key/transaction binding is fsynced **before** admission. If that durable reservation fails, the
+node returns `503 ledger_unavailable` and does not admit the transaction. Replays are reconciled
+against current canonical pending/confirmed state rather than trusting a cached ledger status.
+
 Beyond the legacy `accepted` / `already_pending` / `already_confirmed` statuses (a replay also carries
-`idempotent_replay: true`), the protected path adds two `409` outcomes:
+`idempotent_replay: true`), the protected path adds four `409` outcomes:
 
     409 {"status":"idempotency_conflict","original_tx_id":"…"}
         the key is already bound to a DIFFERENT transaction — reuse a key only to retry the exact
@@ -205,12 +209,30 @@ Beyond the legacy `accepted` / `already_pending` / `already_confirmed` statuses 
     409 {"status":"transaction_collision","colliding_tx_id":"…"}
         another withdrawal key already submitted byte-identical transaction bytes; two distinct
         withdrawals collided — rebuild and re-sign THIS one with a new timestamp, then resubmit
+    409 {"status":"existing_transaction_unattributed","tx_id":"…"}
+        the identical transaction was already pending/confirmed through legacy HTTP, P2P, or another
+        path before v2 could bind it to this key; do not mark paid and do not re-sign blindly —
+        reconcile it against your withdrawal records
+    409 {"status":"historical_outcome_unavailable","last_observed_height":123}
+        the ledger previously observed confirmation, but the bounded canonical replay index no
+        longer retains this old transaction; verify it in your own durable withdrawal history
 
-    503 {"error":"ledger_unavailable"}   the operator payment ledger could not be opened; the
+    503 {"status":"ledger_unavailable"}  the operator payment ledger could not be opened; the
         legacy endpoints still work, but protected submission is disabled until it can
 
-On either `409`, do not mark the withdrawal paid. The endpoints require the ledger; if it cannot be
-opened they return `503` rather than admit a payment without the guarantee.
+On any `409`, do not mark the withdrawal paid automatically. The endpoints require the ledger; if it
+cannot be opened or a new reservation cannot be fsynced they return `503` without admitting a new
+payment. A `503 submission_outcome_unknown` is stricter: retry only the exact same key and signed
+transaction until reconciled; never re-sign in response to it.
+
+The node ledger is a safety layer, not the exchange's permanent withdrawal database. Terminal
+bindings are retained for seven days and may be pruned earlier under the hard 100,000-entry / 256 MiB
+live-state limits; pending, reserved, or ambiguous payments are never evicted to make room, and new
+protected submissions fail closed if only non-terminal entries remain. Persist every
+withdrawal-to-key-to-transaction mapping in your own database and never reuse a key. Once a terminal
+binding is pruned, the node no longer promises idempotency history for it. Separately, the canonical
+replay index retains only the transaction-validity window; a bound confirmation older than that
+returns `historical_outcome_unavailable` instead of trusting a stale cached result.
 
 **Backpressure is a `429`; a terminal rejection is a `400`.** Admission backpressure —
 the per-address pending cap, the per-sender submission rate, and a full mempool — is

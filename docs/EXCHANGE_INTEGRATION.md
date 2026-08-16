@@ -134,16 +134,49 @@ The node evaluates four cases and answers unambiguously:
 
 | Your submission | `status` | Meaning |
 |---|---|---|
-| new key, new transaction | `accepted` (or `already_pending`/`already_confirmed`) | admitted |
-| same key, same transaction | `already_pending`/`already_confirmed`, `idempotent_replay: true` | safe retry — the original result, never a second payment |
+| new key, transaction absent before v2 reservation | `accepted` | admitted and attributed to this key |
+| same key, same recent transaction | `already_pending`/`already_confirmed`, `idempotent_replay: true` | safe retry — canonically reconciled, never a second payment |
+| same key, cached confirmation older than the canonical replay window | `historical_outcome_unavailable` (HTTP 409) | the node will not trust stale cached state — reconcile from your withdrawal database |
 | same key, different transaction | `idempotency_conflict` (HTTP 409) | you reused a withdrawal id for a different transaction — refused |
 | different key, identical transaction | `transaction_collision` (HTTP 409) | two of your withdrawals produced identical bytes and collided |
+| new key, transaction already present outside v2 | `existing_transaction_unattributed` (HTTP 409) | the node cannot safely attribute the pre-existing payment to this withdrawal |
 
 The last row is the case you could not previously detect: two byte-identical transactions carrying
 two different withdrawal ids are two distinct payments, and without the two ids the node cannot tell
 them from one transaction submitted twice. On `transaction_collision`, re-sign the colliding
 withdrawal (advance its timestamp by one second or change the fee by one unit) and resubmit it under
-its own key. On any `409`, do **not** mark the withdrawal paid until you resolve it.
+its own key. The rejected collision attempt does not claim that key, so this corrected resubmission is
+allowed. On any `409`, do **not** mark the withdrawal paid until you resolve it.
+
+`existing_transaction_unattributed` is deliberately conservative. It occurs when the identical
+transaction reached this node through the legacy endpoint, P2P, or another path before the protected
+endpoint could durably associate it with your key. It may be your earlier submission, or it may be a
+distinct colliding withdrawal. Do not re-sign blindly (both transactions could then confirm); compare
+the transaction with your durable withdrawal history and resolve the attribution first. For the full
+guarantee, send a withdrawal through v2 on its **first** submission and retry that same node/key/tx.
+
+The node fsyncs the key-to-transaction reservation before canonical admission. A reservation failure
+returns `503 ledger_unavailable` without admitting a new transaction. Replays are reconciled with
+the node's current confirmed and durable/in-memory pending state while those canonical indexes retain
+the transaction; old cached confirmations fail closed as described below. If an admission error
+cannot be reconciled, the node returns
+`503 submission_outcome_unknown`; retry only the exact same key and signed transaction and never
+re-sign until the outcome is known.
+
+The node ledger is a bounded safety layer, not your permanent withdrawal database. Terminal bindings
+are retained for seven days and can be pruned earlier under the hard 100,000-entry / 256 MiB live-state
+limits; reserved, pending, and ambiguous payments are never evicted to make room, and new protected
+submissions fail closed if capacity is exhausted by non-terminal operations. Keep the withdrawal id,
+key, signed transaction, and final outcome in your own durable store and never reuse a key. Once a
+terminal binding is pruned, the node no longer provides idempotency history for it. Separately, the
+canonical replay index retains only the transaction-validity window; if the ledger remembers an older
+confirmation that the index can no longer prove, the endpoint returns
+`historical_outcome_unavailable` for manual reconciliation instead of trusting stale cached state.
+
+A transaction that was definitively not admitted does not retain a binding, so a corrected
+transaction (including a higher-fee rebuild after `mempool_full`) may reuse that withdrawal's key.
+Once a key has a live, confirmed, or ambiguous binding, a different transaction under it is an
+`idempotency_conflict`.
 
 **Security — keys must be unguessable.** The submission endpoint may be reachable by more than your
 backend. A predictable key such as `withdrawal-1234` lets someone else claim it first and make your
@@ -173,12 +206,17 @@ def submit_withdrawal(node_url, signed_tx, withdrawal_id=None):
     body = requests.post(f"{node_url}/explorer/v2/submit-tx",
                          json={"idempotency_key": key, "transaction": signed_tx}).json()
     status = body.get("status")
-    if status in ("accepted", "already_pending", "already_confirmed"):
-        return "paid", key, body            # already_* is an idempotent retry — safe to mark paid
+    if status in ("accepted", "already_pending"):
+        return "submitted", key, body       # safe association; wait for normal confirmation policy
+    if status == "already_confirmed":
+        return "confirmed", key, body
     if status == "transaction_collision":
         return "rebuild", key, body         # re-sign with a new timestamp, resubmit under the same id
     if status == "idempotency_conflict":
         return "conflict", key, body        # you reused an id for a different tx — investigate
+    if status in ("existing_transaction_unattributed", "historical_outcome_unavailable",
+                  "submission_outcome_unknown"):
+        return "manual_reconcile", key, body # never re-sign while the original may be live
     return "retry_or_reject", key, body     # backpressure (retry) or terminal rejection — inspect body
 ```
 

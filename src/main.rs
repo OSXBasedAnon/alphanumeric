@@ -25,7 +25,8 @@ use std::path::Path;
 use alphanumeric::a9::codec;
 use alphanumeric::a9::{
     blockchain::{
-        Block, Blockchain, RateLimiter, Transaction, FEE_ESTIMATE_ANCHOR_UNITS, MIN_RELAY_FEE_UNITS,
+        Block, Blockchain, RateLimiter, Transaction, FEE_ESTIMATE_ANCHOR_UNITS,
+        MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS, MIN_RELAY_FEE_UNITS,
     },
     bpos::{BPoSSentinel, ValidatorTier},
     mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
@@ -40,16 +41,16 @@ use alphanumeric::a9::{
         ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
         UI_ORANGE, UI_PINK, UI_RULE,
     },
-    wallet_ledger::{LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
+    wallet_ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
 };
 
 #[cfg(test)]
 use alphanumeric::a9::blockchain::{
     CONSENSUS_HEADER_RULES_VERSION, FEE_ACCOUNTING_RULES_VERSION, FEE_SYSTEM_ACTIVATION_HEIGHT,
-    LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_FUTURE_TIME, MAX_BLOCK_WEIGHT_BYTES, MINT_CLIP,
-    NETWORK_FEE, REWARD_CURVE_RULES_VERSION, REWARD_CURVE_V2_ACTIVATION_HEIGHT,
-    REWARD_V2_MINER_FEE_DENOMINATOR, REWARD_V2_MINER_FEE_NUMERATOR, TARGET_BLOCK_TIME,
+    LOW_FEE_COMPATIBILITY_ENVELOPE_UNITS, MAX_BLOCK_WEIGHT_BYTES, MINT_CLIP, NETWORK_FEE,
+    REWARD_CURVE_RULES_VERSION, REWARD_CURVE_V2_ACTIVATION_HEIGHT, REWARD_V2_MINER_FEE_DENOMINATOR,
+    REWARD_V2_MINER_FEE_NUMERATOR, TARGET_BLOCK_TIME,
 };
 use alphanumeric::config::AppConfig;
 
@@ -901,8 +902,13 @@ async fn async_main() -> Result<()> {
         // collision between them goes undetected. Failure to open is not fatal to the node — mining,
         // serving and the legacy endpoints run regardless — but every payment path that depends on
         // it fails closed rather than fall back to unsafe timestamp reuse.
+        let ledger_config = LedgerConfig {
+            tx_age_limit_secs: MAX_TX_AGE_SECS,
+            future_allocation_margin_secs: MAX_BLOCK_FUTURE_TIME,
+            ..LedgerConfig::default()
+        };
         let wallet_ledger =
-            match WalletLedger::open(DEFAULT_LEDGER_FILENAME, LedgerConfig::default()) {
+            match WalletLedger::open(DEFAULT_LEDGER_FILENAME, ledger_config) {
                 Ok(ledger) => Some(Arc::new(ledger)),
                 Err(error) => {
                     error!(
@@ -3608,6 +3614,12 @@ continue;
             }
         };
 
+        let Some(payment_ledger) = wallet_ledger.as_ref() else {
+            drop(blockchain_guard);
+            println!("error: payment ledger unavailable; refusing to sign a whisper without collision-safe reservation");
+            continue;
+        };
+
         let base_tx = Transaction::new(
             sender_wallet.address.clone(),
             recipient.to_string(),
@@ -3626,6 +3638,7 @@ match whisper.create_whisper_transaction(
     message,
     sender_wallet,
     sender_balance,
+    payment_ledger,
 ).await {
 Ok(whisper_tx) => {
     // Drop blockchain guard before getting write lock
@@ -3738,6 +3751,14 @@ Ok(whisper_tx) => {
         let _ = std::io::stdin().read_line(&mut answer);
         out.reset()?;
         if !answer.trim().eq_ignore_ascii_case("y") {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            match tokio::task::spawn_blocking(move || ledger.release_local_reservation(&tx_id)).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => eprintln!("warning: cancelled whisper reservation was already finalized"),
+                Ok(Err(error)) => eprintln!("warning: could not release cancelled whisper reservation: {error}"),
+                Err(error) => eprintln!("warning: cancelled whisper ledger task failed: {error}"),
+            }
             println!("Cancelled — nothing was broadcast.");
             continue;
         }
@@ -3746,12 +3767,20 @@ Ok(whisper_tx) => {
     // IO and (since v7.6.8) network gossip, and holding a chain write guard across
     // awaits is the known wedge class.
     let submit_res = {
-        let blockchain_guard = blockchain.write().await;
+        let blockchain_guard = blockchain.read().await;
         // No wallet registry needed - transactions are self-contained with public keys
-        blockchain_guard.add_transaction(whisper_tx.clone()).await
+        blockchain_guard.admit_transaction(whisper_tx.clone()).await
     };
     match submit_res {
-        Ok(_) => {
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+let ledger = Arc::clone(payment_ledger);
+let tx_id = whisper_tx.get_tx_id();
+let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, EntryState::Pending, state_time)).await {
+    Ok(Ok(())) => {}
+    Ok(Err(error)) => eprintln!("warning: whisper is pending but its payment-ledger update failed: {error}"),
+    Err(error) => eprintln!("warning: whisper is pending but its payment-ledger state task failed: {error}"),
+}
 // Announce like any other tx: whispers ride the same mempool/gossip path, and
 // without this only the sender could ever mine the whisper into a block.
 node.gossip_transaction(&whisper_tx).await;
@@ -3783,7 +3812,54 @@ writeln!(stdout, "  Message: {}\n", message)?;
 stdout.reset()?;
 
         },
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, EntryState::AmbiguousExisting, state_time)
+            }).await;
+            println!("error: an identical whisper transaction already exists; do not create a replacement until it is reconciled");
+        }
+        Ok(alphanumeric::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, EntryState::Confirmed { height }, state_time)
+            }).await;
+            println!("The identical whisper transaction is already confirmed at block {height}; it was not submitted again.");
+        }
         Err(e) => {
+            let presence = {
+                let chain = blockchain.read().await;
+                chain.transaction_presence(&whisper_tx.get_tx_id()).await
+            };
+            let ledger = Arc::clone(payment_ledger);
+            let tx_id = whisper_tx.get_tx_id();
+            let state_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let state = match presence {
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Pending) => {
+                    eprintln!("warning: whisper submission returned an error but the transaction is pending; do not re-sign it");
+                    Some(EntryState::AmbiguousExisting)
+                }
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Confirmed(height)) => {
+                    eprintln!("warning: whisper submission returned an error but the transaction is confirmed at block {height}; do not retry it");
+                    Some(EntryState::Confirmed { height })
+                }
+                Ok(alphanumeric::a9::blockchain::TransactionPresence::Absent) => {
+                    Some(EntryState::Rejected { reason: e.to_string() })
+                }
+                Err(state_error) => {
+                    eprintln!("warning: whisper submission outcome could not be reconciled ({state_error}); do not create a replacement");
+                    None
+                }
+            };
+            if let Some(state) = state {
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.update_state(&tx_id, state, state_time)
+            }).await;
+            }
             let mut error_style = ColorSpec::new();
             error_style.set_fg(Some(Color::Red)).set_bold(true);
             stdout.set_color(&error_style)?;

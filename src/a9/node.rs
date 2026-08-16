@@ -55,8 +55,9 @@ use tokio::{
 };
 
 use crate::a9::blockchain::{
-    Block, Blockchain, BlockchainError, RateLimiter, Transaction, FEE_SYSTEM_ACTIVATION_HEIGHT,
-    MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES, MIN_RELAY_FEE_UNITS, SYSTEM_ADDRESSES,
+    Block, Blockchain, BlockchainError, RateLimiter, Transaction, TransactionPresence,
+    FEE_SYSTEM_ACTIVATION_HEIGHT, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT_BYTES, MIN_RELAY_FEE_UNITS,
+    SYSTEM_ADDRESSES,
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
@@ -2303,17 +2304,15 @@ struct ExplorerState {
     read_bucket: Arc<PLMutex<(Instant, f64)>>,
     // The one shared operator payment ledger; None disables the protected (v2) endpoints.
     wallet_ledger: Option<Arc<WalletLedger>>,
-    // Serializes the whole check -> admit -> record critical section of a protected submission, so
-    // two concurrent requests cannot interleave admission and ledger binding and mis-attribute a
+    // Serializes the whole check -> durable reserve -> admit -> classify critical section of a
+    // protected submission, so two concurrent requests cannot interleave and mis-attribute a
     // collision. Protected throughput is deliberately serial (as the batch endpoint already is);
     // exchanges wanting throughput use the batch endpoint, which is itself one-at-a-time.
     idempotent_submit_lock: Arc<Mutex<()>>,
 }
 
 /// Structured outcome of canonical admission, so both the legacy and protected endpoints classify a
-/// result the same way without re-parsing rendered JSON. Only the first three represent a payment
-/// the node now knows about and will bind an idempotency key to; `NotAdmitted` covers backpressure,
-/// chain-busy, and terminal rejection, none of which bind a key (the caller retries or re-signs).
+/// result the same way without re-parsing rendered JSON.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmissionClass {
     Accepted,
@@ -7655,16 +7654,21 @@ impl Node {
         )
     }
 
-    /// Render an idempotent replay (a `Duplicate`) from the stored entry, reporting the payment's
-    /// current known state rather than re-admitting it.
+    /// Render a terminal stored state. Live states are reconciled against canonical chain/pending
+    /// state before they are ever returned, so this helper is deliberately not the source of truth
+    /// for `Pending` or `Confirmed`.
     fn explorer_v2_idempotent_replay(entry: &LedgerEntry) -> (StatusCode, Json<Value>) {
         let mut body = match &entry.state {
+            EntryState::Reserved => json!({ "status": "submission_reserved" }),
             EntryState::Pending => json!({ "status": "already_pending" }),
             EntryState::Confirmed { height } => {
                 json!({ "status": "already_confirmed", "height": height })
             }
             EntryState::Rejected { reason } => json!({ "status": "rejected", "reason": reason }),
             EntryState::Expired => json!({ "status": "expired" }),
+            EntryState::AmbiguousExisting => {
+                json!({ "status": "existing_transaction_unattributed" })
+            }
         };
         if let Some(object) = body.as_object_mut() {
             // ok reflects whether the payment is progressing or done, not merely that the lookup
@@ -7683,11 +7687,137 @@ impl Node {
         (StatusCode::OK, Json(body))
     }
 
-    /// The shared check -> admit -> record core of a protected submission. Serialized by
-    /// `idempotent_submit_lock` so admission and ledger binding cannot interleave across concurrent
-    /// requests and mis-attribute a collision. Returns the response plus whether this call newly
-    /// accepted the transaction (so the caller can announce it once, keeping network I/O out of the
-    /// lock).
+    async fn explorer_v2_transaction_presence(
+        state: &ExplorerState,
+        idempotency_key: &str,
+        tx_id: &str,
+    ) -> Result<TransactionPresence, (StatusCode, Json<Value>)> {
+        match timeout(Duration::from_secs(3), async {
+            let chain = state.blockchain.read().await;
+            chain.transaction_presence(tx_id).await
+        })
+        .await
+        {
+            Ok(Ok(presence)) => Ok(presence),
+            Ok(Err(error)) => Err(Self::explorer_v2_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                idempotency_key,
+                "canonical_state_unavailable",
+                &format!("could not reconcile transaction state: {error}"),
+            )),
+            Err(_) => Err(Self::explorer_v2_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                idempotency_key,
+                "canonical_state_unavailable",
+                "timed out while reconciling transaction state",
+            )),
+        }
+    }
+
+    fn explorer_v2_known_transaction(
+        idempotency_key: &str,
+        tx_id: &str,
+        presence: TransactionPresence,
+        idempotent_replay: bool,
+    ) -> (StatusCode, Json<Value>) {
+        let mut body = match presence {
+            TransactionPresence::Pending => json!({
+                "ok": true,
+                "status": "already_pending",
+                "tx_id": tx_id,
+            }),
+            TransactionPresence::Confirmed(height) => json!({
+                "ok": true,
+                "status": "already_confirmed",
+                "tx_id": tx_id,
+                "height": height,
+            }),
+            TransactionPresence::Absent => unreachable!("absence is not a known transaction"),
+        };
+        if let Some(object) = body.as_object_mut() {
+            object.insert("idempotency_key".into(), json!(idempotency_key));
+            object.insert("idempotent_replay".into(), json!(idempotent_replay));
+        }
+        (StatusCode::OK, Json(body))
+    }
+
+    fn explorer_v2_unattributed_existing(
+        idempotency_key: &str,
+        tx_id: &str,
+        presence: TransactionPresence,
+    ) -> (StatusCode, Json<Value>) {
+        let existing_status = match presence {
+            TransactionPresence::Pending => "pending",
+            TransactionPresence::Confirmed(_) => "confirmed",
+            TransactionPresence::Absent => "absent",
+        };
+        let height = match presence {
+            TransactionPresence::Confirmed(height) => Some(height),
+            _ => None,
+        };
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "status": "existing_transaction_unattributed",
+                "idempotency_key": idempotency_key,
+                "tx_id": tx_id,
+                "existing_status": existing_status,
+                "height": height,
+                "error": "the identical transaction already existed before this node could attribute it to this withdrawal key; do not mark paid and do not re-sign blindly — reconcile it against your withdrawal history",
+            })),
+        )
+    }
+
+    fn explorer_v2_historical_outcome_unknown(
+        idempotency_key: &str,
+        tx_id: &str,
+        observed_height: u32,
+    ) -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "status": "historical_outcome_unavailable",
+                "idempotency_key": idempotency_key,
+                "tx_id": tx_id,
+                "last_observed_height": observed_height,
+                "error": "this ledger previously observed the transaction as confirmed, but the canonical replay index no longer retains transactions outside the validity window; verify the withdrawal in your own durable history before taking action",
+            })),
+        )
+    }
+
+    async fn explorer_v2_update_ledger_state(
+        ledger: &Arc<WalletLedger>,
+        tx_id: &str,
+        state: EntryState,
+        now: u64,
+    ) -> bool {
+        let ledger = Arc::clone(ledger);
+        let tx_id = tx_id.to_string();
+        match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, state, now)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                error!("protected submission ledger state update failed: {error}");
+                false
+            }
+            Err(error) => {
+                error!("protected submission ledger state task failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn explorer_v2_echo_key(payload: &mut Value, idempotency_key: &str) {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("idempotency_key".into(), json!(idempotency_key));
+        }
+    }
+
+    /// The shared durable-reserve -> admit -> reconcile core. The key/transaction binding is fsynced
+    /// before admission, closing the dangerous failure window where a payment was live but the API
+    /// reported a ledger error and induced the caller to re-sign. Every duplicate is reconciled with
+    /// canonical pending/confirmed state instead of trusting a stale cached lifecycle value.
     async fn submit_with_idempotency(
         state: &ExplorerState,
         ledger: &Arc<WalletLedger>,
@@ -7702,11 +7832,10 @@ impl Node {
 
         let _guard = state.idempotent_submit_lock.lock().await;
 
-        // 1. Four-case contract (in-memory; no fsync).
-        match ledger.check_submission(idempotency_key, &tx_id, now) {
-            SubmissionCheck::Duplicate(entry) => {
-                return (Self::explorer_v2_idempotent_replay(&entry), false);
-            }
+        // 1. Four-case contract. Conflicts and cross-key collisions are terminal at this boundary.
+        //    A duplicate continues below so its cached state can be reconciled against the chain.
+        let existing = match ledger.check_submission(idempotency_key, &tx_id, now) {
+            SubmissionCheck::Duplicate(entry) => Some(entry),
             SubmissionCheck::Conflict(entry) => {
                 return (
                     (
@@ -7738,22 +7867,108 @@ impl Node {
                     false,
                 );
             }
-            SubmissionCheck::New => {}
+            SubmissionCheck::New => None,
+        };
+
+        // 2. Read canonical state before reserving a new key. If the transaction arrived through
+        //    legacy HTTP, P2P, or another node first, it is impossible to attribute it safely to
+        //    this business operation. Never turn that ambiguity into a successful payout response.
+        let presence =
+            match Self::explorer_v2_transaction_presence(state, idempotency_key, &tx_id).await {
+                Ok(presence) => presence,
+                Err(response) => return (response, false),
+            };
+
+        if let Some(entry) = existing.as_ref() {
+            if matches!(entry.state, EntryState::AmbiguousExisting) {
+                return (
+                    Self::explorer_v2_unattributed_existing(idempotency_key, &tx_id, presence),
+                    false,
+                );
+            }
+            if matches!(entry.state, EntryState::Reserved)
+                && !matches!(presence, TransactionPresence::Absent)
+            {
+                let _ = Self::explorer_v2_update_ledger_state(
+                    ledger,
+                    &tx_id,
+                    EntryState::AmbiguousExisting,
+                    now,
+                )
+                .await;
+                return (
+                    Self::explorer_v2_unattributed_existing(idempotency_key, &tx_id, presence),
+                    false,
+                );
+            }
+            match presence {
+                TransactionPresence::Pending => {
+                    let _ = Self::explorer_v2_update_ledger_state(
+                        ledger,
+                        &tx_id,
+                        EntryState::Pending,
+                        now,
+                    )
+                    .await;
+                    return (
+                        Self::explorer_v2_known_transaction(
+                            idempotency_key,
+                            &tx_id,
+                            presence,
+                            true,
+                        ),
+                        false,
+                    );
+                }
+                TransactionPresence::Confirmed(height) => {
+                    let _ = Self::explorer_v2_update_ledger_state(
+                        ledger,
+                        &tx_id,
+                        EntryState::Confirmed { height },
+                        now,
+                    )
+                    .await;
+                    return (
+                        Self::explorer_v2_known_transaction(
+                            idempotency_key,
+                            &tx_id,
+                            presence,
+                            true,
+                        ),
+                        false,
+                    );
+                }
+                TransactionPresence::Absent => {
+                    if let EntryState::Confirmed { height } = &entry.state {
+                        return (
+                            Self::explorer_v2_historical_outcome_unknown(
+                                idempotency_key,
+                                &tx_id,
+                                *height,
+                            ),
+                            false,
+                        );
+                    }
+                    if matches!(
+                        entry.state,
+                        EntryState::Rejected { .. } | EntryState::Expired
+                    ) {
+                        return (Self::explorer_v2_idempotent_replay(entry), false);
+                    }
+                }
+            }
+        } else if !matches!(presence, TransactionPresence::Absent) {
+            return (
+                Self::explorer_v2_unattributed_existing(idempotency_key, &tx_id, presence),
+                false,
+            );
         }
 
-        // 2. Admit through the canonical path.
-        let ((status, Json(mut payload)), class) =
-            Self::explorer_admit_transaction(state, tx).await;
-
-        // 3. Bind the key ONLY for an admitted/known payment. Backpressure and terminal rejects do
-        //    not bind — the caller retries (same key) or re-signs (a new key) — so they pass through.
-        let entry_state = match class {
-            AdmissionClass::Accepted | AdmissionClass::AlreadyPending => Some(EntryState::Pending),
-            AdmissionClass::AlreadyConfirmed(height) => Some(EntryState::Confirmed { height }),
-            AdmissionClass::NotAdmitted => None,
-        };
-        if let Some(entry_state) = entry_state {
-            let ledger = Arc::clone(ledger);
+        // 3. Persist a new binding BEFORE canonical admission. API callers retain their signed
+        //    transaction, so only the compact identity metadata is stored here.
+        let freshly_reserved = existing.is_none();
+        if freshly_reserved {
+            let ledger_for_record = Arc::clone(ledger);
             let key = idempotency_key.to_string();
             let tuple = PaymentTuple::new(
                 tx.sender.clone(),
@@ -7763,41 +7978,68 @@ impl Node {
             );
             let ts = tx.timestamp;
             let txid = tx_id.clone();
-            let signed = serde_json::to_string(tx).ok();
             let record = tokio::task::spawn_blocking(move || {
-                ledger.record(Some(key), tuple, ts, txid.clone(), signed, now)?;
-                if !matches!(entry_state, EntryState::Pending) {
-                    ledger.update_state(&txid, entry_state, now)?;
-                }
-                Ok::<(), std::io::Error>(())
+                ledger_for_record.record(Some(key), tuple, ts, txid, None, now)
             })
             .await;
             match record {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    // A concurrent submission bound this exact transaction to a different key
-                    // between our check and record: report it as the collision it is. The payment
-                    // itself is admitted once (admission is idempotent); this caller must re-sign.
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    // A local signing path shares this ledger but not the HTTP serialization lock.
+                    // Re-evaluate an AlreadyExists race so it is reported as the precise conflict.
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        match ledger.check_submission(idempotency_key, &tx_id, now) {
+                            SubmissionCheck::Conflict(entry) => {
+                                return (
+                                    (
+                                        StatusCode::CONFLICT,
+                                        Json(json!({
+                                            "ok": false,
+                                            "status": "idempotency_conflict",
+                                            "idempotency_key": idempotency_key,
+                                            "original_tx_id": entry.tx_id,
+                                        })),
+                                    ),
+                                    false,
+                                );
+                            }
+                            SubmissionCheck::Collision(entry) => {
+                                return (
+                                    (
+                                        StatusCode::CONFLICT,
+                                        Json(json!({
+                                            "ok": false,
+                                            "status": "transaction_collision",
+                                            "idempotency_key": idempotency_key,
+                                            "colliding_tx_id": entry.tx_id,
+                                            "colliding_idempotency_key": entry.idempotency_key,
+                                        })),
+                                    ),
+                                    false,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     return (
-                        (
-                            StatusCode::CONFLICT,
-                            Json(json!({
-                                "ok": false,
-                                "status": "transaction_collision",
-                                "idempotency_key": idempotency_key,
-                                "error": "another withdrawal key concurrently submitted identical transaction bytes; rebuild and re-sign this withdrawal with a new timestamp",
-                            })),
+                        Self::explorer_v2_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            idempotency_key,
+                            "ledger_unavailable",
+                            &format!(
+                                "could not durably reserve submission before admission: {error}"
+                            ),
                         ),
                         false,
                     );
                 }
-                Err(_) => {
+                Err(error) => {
                     return (
                         Self::explorer_v2_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             idempotency_key,
                             "internal_error",
-                            "payment ledger task failed",
+                            &format!("payment ledger task failed before admission: {error}"),
                         ),
                         false,
                     );
@@ -7805,14 +8047,148 @@ impl Node {
             }
         }
 
-        // 4. Echo the key on the response for correlation.
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("idempotency_key".into(), json!(idempotency_key));
+        // 4. Admit only after the binding is durable.
+        let ((status, Json(mut payload)), class) =
+            Self::explorer_admit_transaction(state, tx).await;
+        match class {
+            AdmissionClass::Accepted => {
+                let persisted =
+                    Self::explorer_v2_update_ledger_state(ledger, &tx_id, EntryState::Pending, now)
+                        .await;
+                Self::explorer_v2_echo_key(&mut payload, idempotency_key);
+                if !persisted {
+                    if let Some(object) = payload.as_object_mut() {
+                        // The Reserved binding was already fsynced, so retrying this exact key/tx is
+                        // safe and will reconcile. Never turn this auxiliary state-write failure
+                        // into a false rejection after the payment is live.
+                        object.insert("ledger_state_persisted".into(), json!(false));
+                    }
+                }
+                ((status, Json(payload)), true)
+            }
+            AdmissionClass::AlreadyPending | AdmissionClass::AlreadyConfirmed(_) => {
+                let presence =
+                    match Self::explorer_v2_transaction_presence(state, idempotency_key, &tx_id)
+                        .await
+                    {
+                        Ok(presence) => presence,
+                        Err(response) => return (response, false),
+                    };
+                if matches!(presence, TransactionPresence::Absent) {
+                    return (
+                        Self::explorer_v2_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            idempotency_key,
+                            "submission_outcome_unknown",
+                            "admission reported an existing transaction but canonical state changed before reconciliation; retry only the exact same key and transaction",
+                        ),
+                        false,
+                    );
+                }
+                // A previously Pending/Confirmed binding established attribution. A fresh or merely
+                // Reserved binding did not; another ingress path may have won the race.
+                let attributed = existing.as_ref().is_some_and(|entry| {
+                    matches!(
+                        entry.state,
+                        EntryState::Pending | EntryState::Confirmed { .. }
+                    )
+                });
+                if !attributed {
+                    let _ = Self::explorer_v2_update_ledger_state(
+                        ledger,
+                        &tx_id,
+                        EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
+                    return (
+                        Self::explorer_v2_unattributed_existing(idempotency_key, &tx_id, presence),
+                        false,
+                    );
+                }
+                let state_value = match presence {
+                    TransactionPresence::Confirmed(height) => EntryState::Confirmed { height },
+                    _ => EntryState::Pending,
+                };
+                let _ =
+                    Self::explorer_v2_update_ledger_state(ledger, &tx_id, state_value, now).await;
+                (
+                    Self::explorer_v2_known_transaction(idempotency_key, &tx_id, presence, true),
+                    false,
+                )
+            }
+            AdmissionClass::NotAdmitted => {
+                // Admission can fail after touching one pending store. Reconcile before telling the
+                // caller it is safe to re-sign; if either store contains the tx, the outcome is live
+                // or ambiguous and must remain bound.
+                let after = match Self::explorer_v2_transaction_presence(
+                    state,
+                    idempotency_key,
+                    &tx_id,
+                )
+                .await
+                {
+                    Ok(presence) => presence,
+                    Err(_) => {
+                        return (
+                            Self::explorer_v2_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                idempotency_key,
+                                "submission_outcome_unknown",
+                                "admission returned an error and canonical state could not be reconciled; retry only the exact same key and transaction — do not re-sign",
+                            ),
+                            false,
+                        )
+                    }
+                };
+                if !matches!(after, TransactionPresence::Absent) {
+                    let _ = Self::explorer_v2_update_ledger_state(
+                        ledger,
+                        &tx_id,
+                        EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
+                    return (
+                        Self::explorer_v2_unattributed_existing(idempotency_key, &tx_id, after),
+                        false,
+                    );
+                }
+
+                // A never-admitted reservation may be released so the caller can correct/re-sign
+                // under the same business key. A transaction known to have been admitted earlier
+                // keeps its binding even if a later exact re-admission is rejected.
+                let may_release = freshly_reserved
+                    || existing
+                        .as_ref()
+                        .is_some_and(|entry| matches!(entry.state, EntryState::Reserved));
+                if may_release {
+                    let ledger = Arc::clone(ledger);
+                    let key = idempotency_key.to_string();
+                    let txid = tx_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        ledger.release_reservation(&key, &txid)
+                    })
+                    .await
+                    {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) | Ok(Err(_)) | Err(_) => {
+                            return (
+                                Self::explorer_v2_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    idempotency_key,
+                                    "ledger_unavailable",
+                                    "transaction was not admitted, but its reservation could not be durably released; retry only the exact same key and transaction until reconciled",
+                                ),
+                                false,
+                            )
+                        }
+                    }
+                }
+                Self::explorer_v2_echo_key(&mut payload, idempotency_key);
+                ((status, Json(payload)), false)
+            }
         }
-        (
-            (status, Json(payload)),
-            matches!(class, AdmissionClass::Accepted),
-        )
     }
 
     /// Protected single submission: requires an idempotency key, applies the full four-case
@@ -19546,6 +19922,7 @@ mod tests {
             updated_at: 1,
         };
         let cases = [
+            (EntryState::Reserved, "submission_reserved", false),
             (EntryState::Pending, "already_pending", true),
             (
                 EntryState::Confirmed { height: 9 },
@@ -19560,6 +19937,11 @@ mod tests {
                 false,
             ),
             (EntryState::Expired, "expired", false),
+            (
+                EntryState::AmbiguousExisting,
+                "existing_transaction_unattributed",
+                false,
+            ),
         ];
         for (state, expected_status, expected_ok) in cases {
             let mut entry = base.clone();
@@ -19576,6 +19958,380 @@ mod tests {
                 Some(true)
             );
         }
+
+        let (code, Json(body)) = Node::explorer_v2_historical_outcome_unknown("key", "tx", 9);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("historical_outcome_unavailable")
+        );
+        assert_eq!(
+            body.get("last_observed_height").and_then(Value::as_u64),
+            Some(9)
+        );
+    }
+
+    async fn protected_test_state(ledger: Arc<WalletLedger>) -> ExplorerState {
+        use crate::a9::blockchain::FEE_PERCENTAGE;
+        use ring::rand::SystemRandom;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let db = sled::Config::new()
+            .temporary(true)
+            .open()
+            .expect("temporary protected-submit database");
+        let blockchain = Blockchain::new(
+            db.clone(),
+            FEE_PERCENTAGE,
+            50.0,
+            100,
+            5,
+            Arc::new(RateLimiter::new(60, 10_000)),
+            Arc::new(Mutex::new(0)),
+        );
+        blockchain
+            .create_genesis_block()
+            .await
+            .expect("protected-submit genesis");
+        blockchain
+            .initialize()
+            .await
+            .expect("protected-submit init");
+        let rng = SystemRandom::new();
+        let key = Ed25519KeyPair::generate_pkcs8(&rng)
+            .expect("handshake key")
+            .as_ref()
+            .to_vec();
+        let blockchain = Arc::new(RwLock::new(blockchain));
+        let node = Node::new(
+            Arc::new(db),
+            Arc::clone(&blockchain),
+            key,
+            NodeRuntimeConfig {
+                bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                velocity_enabled: false,
+                max_peers: 4,
+                max_connections: 8,
+                seed_nodes: Vec::new(),
+                data_dir: None,
+                wallet_ledger: Some(Arc::clone(&ledger)),
+            },
+        )
+        .await
+        .expect("protected-submit node");
+        ExplorerState {
+            blockchain,
+            node,
+            start_time: 0,
+            network_id: [0; 32],
+            submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
+            batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
+            read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
+            wallet_ledger: Some(ledger),
+            idempotent_submit_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_submit_never_admits_when_the_durable_reservation_fails() {
+        let base = std::env::temp_dir().join(format!(
+            "a9-protected-ledger-order-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&base);
+        let ledger = Arc::new(
+            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+                .expect("open test ledger"),
+        );
+        // Deterministic write fault after open: the lock remains valid, but every data append now
+        // targets a parent that does not exist.
+        ledger.set_data_path_for_test(base.join("missing-parent").join("ledger.log"));
+        let state = protected_test_state(Arc::clone(&ledger)).await;
+        let tx = Transaction::new("sender".into(), "recipient".into(), 1.0, 0.0001, 1, None);
+        let tx_id = tx.get_tx_id();
+        let key = "00000000-0000-4000-8000-000000000001";
+        let (response, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.1 .0.get("status").and_then(Value::as_str),
+            Some("ledger_unavailable")
+        );
+        assert_eq!(
+            state
+                .blockchain
+                .read()
+                .await
+                .transaction_presence(&tx_id)
+                .await
+                .unwrap(),
+            TransactionPresence::Absent,
+            "no canonical admission may occur before the reservation is durable"
+        );
+        assert_eq!(
+            ledger.check_submission(key, &tx_id, 1),
+            SubmissionCheck::New
+        );
+        drop(state);
+        drop(ledger);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(format!("{}.lock", base.display()));
+    }
+
+    #[tokio::test]
+    async fn protected_submit_never_attributes_a_preexisting_untracked_transaction() {
+        let base = std::env::temp_dir().join(format!(
+            "a9-protected-unattributed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Arc::new(
+            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+                .expect("open test ledger"),
+        );
+        let state = protected_test_state(Arc::clone(&ledger)).await;
+        let tx = Transaction::new("sender".into(), "recipient".into(), 1.0, 0.0001, 2, None);
+        let tx_id = tx.get_tx_id();
+        {
+            let chain = state.blockchain.read().await;
+            chain
+                .db
+                .open_tree("pending_transactions")
+                .unwrap()
+                .insert(tx_id.as_bytes(), b"preexisting".as_slice())
+                .unwrap();
+        }
+        let key = "00000000-0000-4000-8000-000000000002";
+        let (response, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(response.0, StatusCode::CONFLICT);
+        assert_eq!(
+            response.1 .0.get("status").and_then(Value::as_str),
+            Some("existing_transaction_unattributed")
+        );
+        assert_eq!(
+            ledger.check_submission(key, &tx_id, 2),
+            SubmissionCheck::New,
+            "an ambiguous preexisting tx must not become a trusted key binding"
+        );
+        drop(state);
+        drop(ledger);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(format!("{}.lock", base.display()));
+    }
+
+    #[tokio::test]
+    async fn protected_submit_releases_a_definitively_not_admitted_reservation() {
+        let base = std::env::temp_dir().join(format!(
+            "a9-protected-release-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Arc::new(
+            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+                .expect("open test ledger"),
+        );
+        let state = protected_test_state(Arc::clone(&ledger)).await;
+        let tx = Transaction::new("sender".into(), "recipient".into(), 1.0, 0.0001, 3, None);
+        let tx_id = tx.get_tx_id();
+        let key = "00000000-0000-4000-8000-000000000003";
+        let (response, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .blockchain
+                .read()
+                .await
+                .transaction_presence(&tx_id)
+                .await
+                .unwrap(),
+            TransactionPresence::Absent
+        );
+        assert_eq!(
+            ledger.check_submission(key, &tx_id, 3),
+            SubmissionCheck::New,
+            "a transaction proven absent may be corrected and resubmitted under the same business key"
+        );
+        drop(state);
+        drop(ledger);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(format!("{}.lock", base.display()));
+    }
+
+    #[tokio::test]
+    async fn protected_submit_never_trusts_an_unverifiable_cached_confirmation() {
+        let base = std::env::temp_dir().join(format!(
+            "a9-protected-historical-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Arc::new(
+            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+                .expect("open test ledger"),
+        );
+        let state = protected_test_state(Arc::clone(&ledger)).await;
+        let tx = Transaction::new("sender".into(), "recipient".into(), 1.0, 0.0001, 4, None);
+        let tx_id = tx.get_tx_id();
+        let key = "00000000-0000-4000-8000-000000000006";
+        ledger
+            .record(
+                Some(key.into()),
+                PaymentTuple::new(
+                    tx.sender.clone(),
+                    tx.recipient.clone(),
+                    tx.amount_units,
+                    tx.fee_units,
+                ),
+                tx.timestamp,
+                tx_id.clone(),
+                None,
+                4,
+            )
+            .unwrap();
+        ledger
+            .update_state(&tx_id, EntryState::Confirmed { height: 9 }, 4)
+            .unwrap();
+
+        let (response, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(response.0, StatusCode::CONFLICT);
+        assert_eq!(
+            response.1 .0.get("status").and_then(Value::as_str),
+            Some("historical_outcome_unavailable")
+        );
+        assert_eq!(
+            state
+                .blockchain
+                .read()
+                .await
+                .transaction_presence(&tx_id)
+                .await
+                .unwrap(),
+            TransactionPresence::Absent
+        );
+        drop(state);
+        drop(ledger);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(format!("{}.lock", base.display()));
+    }
+
+    #[tokio::test]
+    async fn protected_submit_accepts_replays_and_rejects_a_second_key_for_one_transaction() {
+        use crate::a9::wallet::Wallet;
+
+        let base = std::env::temp_dir().join(format!(
+            "a9-protected-four-case-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Arc::new(
+            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+                .expect("open test ledger"),
+        );
+        let state = protected_test_state(Arc::clone(&ledger)).await;
+        let wallet = Wallet::new(None).expect("test wallet");
+        {
+            let chain = state.blockchain.read().await;
+            chain
+                .db
+                .open_tree("balances")
+                .unwrap()
+                .insert(
+                    wallet.address.as_bytes(),
+                    codec::serialize(&10_000_000_000i128).unwrap(),
+                )
+                .unwrap();
+        }
+        let recipient = "0000000000000000000000000000000000000001".to_string();
+        let amount = 1.0;
+        let fee = 0.0001;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let message = format!(
+            "{}:{}:{amount:.8}:{fee:.8}:{timestamp}",
+            wallet.address, recipient
+        );
+        let signature = wallet
+            .sign_transaction(message.as_bytes())
+            .await
+            .expect("sign protected tx");
+        let mut tx = Transaction::new(
+            wallet.address.clone(),
+            recipient,
+            amount,
+            fee,
+            timestamp,
+            Some(signature),
+        );
+        tx.pub_key = wallet.get_public_key_hex().await;
+        let key_a = "00000000-0000-4000-8000-000000000004";
+        let key_b = "00000000-0000-4000-8000-000000000005";
+
+        let (accepted, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key_a, &tx).await;
+        assert!(newly_accepted);
+        assert_eq!(accepted.0, StatusCode::OK);
+        assert_eq!(
+            accepted.1 .0.get("status").and_then(Value::as_str),
+            Some("accepted")
+        );
+
+        let (replay, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key_a, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(replay.0, StatusCode::OK);
+        assert_eq!(
+            replay.1 .0.get("status").and_then(Value::as_str),
+            Some("already_pending")
+        );
+        assert_eq!(
+            replay
+                .1
+                 .0
+                .get("idempotent_replay")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // A stale cached lifecycle value must never override canonical truth on replay.
+        ledger
+            .update_state(&tx.get_tx_id(), EntryState::Expired, timestamp)
+            .unwrap();
+        let (reconciled, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key_a, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(
+            reconciled.1 .0.get("status").and_then(Value::as_str),
+            Some("already_pending")
+        );
+        assert_eq!(
+            ledger
+                .find_by_key(key_a, timestamp)
+                .expect("bound entry")
+                .state,
+            EntryState::Pending
+        );
+
+        let (collision, newly_accepted) =
+            Node::submit_with_idempotency(&state, &ledger, key_b, &tx).await;
+        assert!(!newly_accepted);
+        assert_eq!(collision.0, StatusCode::CONFLICT);
+        assert_eq!(
+            collision.1 .0.get("status").and_then(Value::as_str),
+            Some("transaction_collision")
+        );
+        drop(state);
+        drop(ledger);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(format!("{}.lock", base.display()));
     }
 
     #[test]

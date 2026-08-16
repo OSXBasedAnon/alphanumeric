@@ -83,6 +83,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "env_logger",
+ "fs2",
  "futures",
  "futures-util",
  "get_if_addrs",

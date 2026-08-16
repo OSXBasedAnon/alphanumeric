@@ -26,7 +26,8 @@ use crate::a9::ui::{
 use crate::a9::whisper::max_non_whisper_fee_units;
 use crate::a9::{
     blockchain::{
-        Block, Blockchain, BlockchainError, Transaction, MINING_REWARD_MATURITY, TARGET_BLOCK_TIME,
+        Block, Blockchain, BlockchainError, Transaction, TransactionPresence,
+        MINING_REWARD_MATURITY, TARGET_BLOCK_TIME,
     },
     miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
@@ -514,8 +515,7 @@ fn select_new_wallet_name(
 pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
     /// Durable operator-side payment ledger for collision-free timestamps and honest retries.
-    /// `None` only if the ledger file could not be opened, in which case the signing path warns
-    /// once and falls back to raw wall-clock timestamps (the pre-ledger behavior).
+    /// `None` only if the ledger file could not be opened, in which case signing fails closed.
     wallet_ledger: Option<Arc<WalletLedger>>,
 }
 
@@ -649,6 +649,28 @@ impl Mgmt {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .map_err(|e| format!("Failed to get current timestamp: {}", e).into())
+    }
+
+    async fn update_wallet_ledger_state(
+        &self,
+        tx_id: String,
+        state: crate::a9::wallet_ledger::EntryState,
+        now: u64,
+    ) -> bool {
+        let Some(ledger) = self.wallet_ledger.as_ref().cloned() else {
+            return false;
+        };
+        match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, state, now)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                log::error!("wallet payment ledger state update failed: {error}");
+                false
+            }
+            Err(error) => {
+                log::error!("wallet payment ledger state task failed: {error}");
+                false
+            }
+        }
     }
 
     pub async fn create_new_wallet(
@@ -1582,9 +1604,11 @@ impl Mgmt {
             let ledger = Arc::clone(ledger);
             let tuple = payment_tuple.clone();
             let tx_id = transaction.get_tx_id();
-            let signed_tx = serde_json::to_string(&transaction).ok();
+            let signed_tx = serde_json::to_string(&transaction).map_err(|error| {
+                format!("could not serialize signed transaction for recovery: {error}")
+            })?;
             match tokio::task::spawn_blocking(move || {
-                ledger.record(None, tuple, timestamp, tx_id, signed_tx, now)
+                ledger.record(None, tuple, timestamp, tx_id, Some(signed_tx), now)
             })
             .await
             {
@@ -1616,9 +1640,23 @@ impl Mgmt {
             let chain = blockchain.read().await;
             chain.admit_transaction(transaction.clone()).await
         };
+        let tx_id = transaction.get_tx_id();
         match submit_result {
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
+                let state_persisted = self
+                    .update_wallet_ledger_state(
+                        tx_id,
+                        crate::a9::wallet_ledger::EntryState::Pending,
+                        now,
+                    )
+                    .await;
                 writeln!(stdout, "Done")?;
+                if !state_persisted {
+                    writeln!(
+                        stdout,
+                        "warning: transaction is pending, but its ledger lifecycle update failed; do not create a replacement — reconcile this exact transaction"
+                    )?;
+                }
 
                 // Get final balances
                 let new_sender_balance = blockchain
@@ -1646,17 +1684,31 @@ impl Mgmt {
                 Ok(CreateTransactionOutcome::Submitted(transaction))
             }
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyPending) => {
+                let _ = self
+                    .update_wallet_ledger_state(
+                        tx_id,
+                        crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
                 writeln!(
                     stdout,
                     "Not submitted: an identical transaction is already pending."
                 )?;
                 writeln!(
                     stdout,
-                    "To make a distinct payment, change the amount or fee, or retry in the next second."
+                    "Do not create a replacement until you reconcile whether this pending transaction is the payment you intended."
                 )?;
                 Ok(CreateTransactionOutcome::AlreadyPending)
             }
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::AlreadyConfirmed(height)) => {
+                let _ = self
+                    .update_wallet_ledger_state(
+                        tx_id,
+                        crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                        now,
+                    )
+                    .await;
                 writeln!(
                     stdout,
                     "Not submitted: an identical transaction is already confirmed at block {}.",
@@ -1664,11 +1716,69 @@ impl Mgmt {
                 )?;
                 writeln!(
                     stdout,
-                    "To make a distinct payment, change the amount or fee, or retry in the next second."
+                    "Do not create a replacement; reconcile this confirmed transaction against the intended payment."
                 )?;
                 Ok(CreateTransactionOutcome::AlreadyConfirmed(height))
             }
             Err(e) => {
+                // Admission may touch an in-memory pending store before a later durable write
+                // fails. Reconcile before telling the operator it is safe to create a replacement.
+                let presence = {
+                    let chain = blockchain.read().await;
+                    chain.transaction_presence(&tx_id).await
+                };
+                match presence {
+                    Ok(TransactionPresence::Pending) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                                now,
+                            )
+                            .await;
+                        writeln!(stdout)?;
+                        stdout
+                            .set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
+                        write!(stdout, "warning")?;
+                        stdout.reset()?;
+                        writeln!(
+                            stdout,
+                            ": submission returned an error, but the transaction is present in pending state; do not re-sign or retry as a new payment: {e}"
+                        )?;
+                        return Ok(CreateTransactionOutcome::AlreadyPending);
+                    }
+                    Ok(TransactionPresence::Confirmed(height)) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::wallet_ledger::EntryState::Confirmed { height },
+                                now,
+                            )
+                            .await;
+                        writeln!(
+                            stdout,
+                            "Submission returned an error, but the exact transaction is confirmed at block {height}; do not retry."
+                        )?;
+                        return Ok(CreateTransactionOutcome::AlreadyConfirmed(height));
+                    }
+                    Ok(TransactionPresence::Absent) => {
+                        let _ = self
+                            .update_wallet_ledger_state(
+                                tx_id,
+                                crate::a9::wallet_ledger::EntryState::Rejected {
+                                    reason: e.to_string(),
+                                },
+                                now,
+                            )
+                            .await;
+                    }
+                    Err(state_error) => {
+                        writeln!(
+                            stdout,
+                            "warning: submission failed and canonical state could not be reconciled ({state_error}); do not create a replacement until the transaction is checked"
+                        )?;
+                    }
+                }
                 writeln!(stdout)?;
                 stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true))?;
                 write!(stdout, "error")?;
