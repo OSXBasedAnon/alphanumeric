@@ -4692,11 +4692,24 @@ fn open_chain_db(db_path: &str) -> std::result::Result<sled::Db, sled::Error> {
             cache_bytes / (1024 * 1024)
         );
     });
-    sled::Config::new()
+    let db = sled::Config::new()
         .path(db_path)
         .flush_every_ms(Some(1000))
         .cache_capacity(cache_bytes)
-        .open()
+        .open()?;
+    // Physical footprint at boot: the raw input to the space-amplification
+    // invariant (the publisher logs the aged-vs-fresh-import ratio each
+    // publish). sled's #1 pathology is unbounded space growth; watch it.
+    static LOG_SIZE_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_SIZE_ONCE.call_once(|| {
+        if let Ok(bytes) = db.size_on_disk() {
+            log::info!(
+                "chain DB physical size: {} MiB on disk",
+                bytes / (1024 * 1024)
+            );
+        }
+    });
+    Ok(db)
 }
 
 /// SHA-256 and exact size of a file through a bounded read, so hashing a snapshot
@@ -4795,8 +4808,23 @@ fn quarantine_db(path: &str) -> std::io::Result<()> {
         .unwrap_or_default()
         .as_secs();
     let quarantine_path = format!("{}.corrupt.{}", path, ts);
-    std::fs::rename(dir, quarantine_path)?;
+    std::fs::rename(dir, &quarantine_path)?;
+    // The rename is only crash-durable once the parent's dirents are synced;
+    // an un-fsynced quarantine that reappears as the live path after power
+    // loss would re-feed the corrupt DB to the next boot.
+    fsync_parent_dir(std::path::Path::new(&quarantine_path))?;
     Ok(())
+}
+
+/// Directory-entry durability: renames/unlinks are only crash-durable once the
+/// parent directory itself is fsynced. sled 0.34 never fsyncs directories, so
+/// the repo's own directory-level milestones must do it themselves.
+fn fsync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
 }
 
 fn ensure_db_lock(path: &str) -> std::io::Result<()> {
@@ -5873,6 +5901,10 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         }
         match std::fs::rename(&temp_extract_path, final_path) {
             Ok(()) => {
+                // Make the rename durable BEFORE deleting the backup: a crash
+                // that loses the un-fsynced rename but keeps the unlink would
+                // leave neither the new DB nor the old one.
+                fsync_parent_dir(final_path)?;
                 if std::path::Path::new(&backup_path).exists() {
                     let _ = std::fs::remove_dir_all(&backup_path);
                 }
@@ -6847,6 +6879,30 @@ async fn publish_bootstrap_snapshot(
     // is actually in flight. The path is this attempt's unique temp file; nothing
     // else writes it between hashing and upload.
     let (sha256, compressed_bytes) = hash_file_streaming(std::path::Path::new(&zip_path)).await?;
+
+    // Space-amplification invariant, measured once per publish: the aged live
+    // DB against the fresh import this cycle just produced. Steady-state has
+    // been AT OR BELOW 1.0 (sled's LowSpace GC plus the fleet inheriting
+    // compacted snapshots); a sustained climb is sled's number-one pathology
+    // arriving, and the alarm threshold is set well before recovery times or
+    // disk become a problem.
+    if let Ok(live_physical) = db.size_on_disk() {
+        let fresh_physical = archive_stats.extracted_bytes.max(1);
+        let ratio = live_physical as f64 / fresh_physical as f64;
+        log::info!(
+            "publisher DB physical {} MiB vs fresh-import {} MiB (amplification {:.2}x)",
+            live_physical / (1024 * 1024),
+            fresh_physical / (1024 * 1024),
+            ratio
+        );
+        if ratio > 3.0 {
+            log::warn!(
+                "chain DB space amplification {:.2}x exceeds the 3x alarm — sled is no longer \
+                 reclaiming segments; investigate before recovery times and disk degrade",
+                ratio
+            );
+        }
+    }
 
     // SOAK SAFETY (env-gated, OFF in production): the upload target is hardcoded to the real
     // gateway, so an isolated soak node must never push to it. The full build (export/import
