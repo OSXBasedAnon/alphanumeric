@@ -898,6 +898,125 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // The resume-key semantics under scan-while-mutating: deleting entries
+    // behind AND ahead of the cursor must never skip or double-visit a
+    // surviving key (the witness-prune pattern).
+    #[test]
+    fn lazy_scan_survives_deletions_during_the_walk() {
+        let store = Store::temporary().unwrap();
+        let tree = store.open_tree("t").unwrap();
+        for i in 0..3000u32 {
+            tree.insert(i.to_be_bytes(), b"v").unwrap();
+        }
+        let mut seen = Vec::new();
+        for (n, item) in tree.iter().enumerate() {
+            let (k, _) = item.unwrap();
+            seen.push(u32::from_be_bytes(k[..4].try_into().unwrap()));
+            if n == 1500 {
+                // Behind the cursor and ahead of it, spanning page boundaries.
+                for d in [0u32, 1, 2, 2000, 2001, 2002] {
+                    tree.remove(d.to_be_bytes()).unwrap();
+                }
+            }
+        }
+        // No duplicates ever.
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "no key visited twice");
+        // Every key that was NEVER deleted must have been visited.
+        let deleted: std::collections::HashSet<u32> = [0, 1, 2, 2000, 2001, 2002].into();
+        for i in 0..3000u32 {
+            if !deleted.contains(&i) {
+                assert!(seen.contains(&i), "surviving key {i} skipped");
+            }
+        }
+    }
+
+    #[test]
+    fn update_and_fetch_is_atomic_across_threads() {
+        let store = Store::temporary().unwrap();
+        let tree = store.open_tree("t").unwrap();
+        tree.insert(b"n", 0u64.to_le_bytes()).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let tree = tree.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    tree.update_and_fetch(b"n", |old| {
+                        let cur = old
+                            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap()))
+                            .unwrap_or(0);
+                        Some((cur + 1).to_le_bytes().to_vec())
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let v = tree.get(b"n").unwrap().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(v[..8].try_into().unwrap()),
+            400,
+            "8 threads x 50 read-modify-writes lost none"
+        );
+    }
+
+    // A garbage (non-truncated) store file must classify as corruption so the
+    // launch recovery ladder engages — this is the clobbered-magic-number
+    // class the review flagged (F1), distinct from the pre-open truncation
+    // guard.
+    #[test]
+    fn garbage_store_file_classifies_as_corruption() {
+        let path =
+            std::env::temp_dir().join(format!("a9store-garbage-{}.redb", std::process::id()));
+        let junk: Vec<u8> = (0..16_384u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, junk).unwrap();
+        let err = Store::open(&path, 8 * 1024 * 1024).unwrap_err();
+        assert!(
+            err.is_corruption(),
+            "a clobbered store must route to the recovery ladder: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The snapshot copy is a sealed point-in-time state: later writes to the
+    // source must never appear in it, and it must open cleanly on its own.
+    #[test]
+    fn snapshot_file_is_a_sealed_point_in_time_copy() {
+        let store = Store::temporary().unwrap();
+        let tree = store.open_tree("t").unwrap();
+        tree.insert(b"before", b"1").unwrap();
+        let dest = std::env::temp_dir().join(format!("a9store-snap-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        store.snapshot_file_to(&dest).unwrap();
+        tree.insert(b"after", b"2").unwrap();
+        store.flush().unwrap();
+
+        let copy = Store::open(&dest, 8 * 1024 * 1024).unwrap();
+        let copy_tree = copy.open_tree("t").unwrap();
+        assert_eq!(copy_tree.get(b"before").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            copy_tree.get(b"after").unwrap(),
+            None,
+            "post-snapshot writes must not leak into the sealed copy"
+        );
+        assert_eq!(tree.get(b"after").unwrap(), Some(b"2".to_vec()));
+        drop(copy);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    // The sled-parity Deref: Store IS its default tree for reads and writes,
+    // and the default tree is visible in the listing under its own name.
+    #[test]
+    fn store_derefs_to_a_real_default_tree() {
+        let store = Store::temporary().unwrap();
+        store.insert(b"k", b"v").unwrap();
+        assert_eq!(store.get(b"k").unwrap(), Some(b"v".to_vec()));
+        let names = store.tree_names().unwrap();
+        assert!(names.contains(&DEFAULT_TREE.as_bytes().to_vec()));
+    }
+
     #[test]
     fn temporary_store_removes_its_file() {
         let path;
