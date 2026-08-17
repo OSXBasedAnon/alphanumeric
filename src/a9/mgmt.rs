@@ -1237,12 +1237,25 @@ impl Mgmt {
                 // mine_block's template builder always inserts the coinbase first,
                 // so the fallback is unreachable in practice (kept only so a
                 // malformed block can't panic the display path).
-                let mining_reward = mined_block
+                let coinbase = mined_block
                     .transactions
                     .first()
-                    .filter(|tx| tx.sender == "MINING_REWARDS")
-                    .map(|tx| tx.amount())
-                    .unwrap_or_default();
+                    .filter(|tx| tx.sender == "MINING_REWARDS");
+                let mining_reward = coinbase.map(|tx| tx.amount()).unwrap_or_default();
+                // Under coinbase payout rotation the reward went to the schedule
+                // address, not this wallet — say so, or the unchanged balance below
+                // reads as a lost reward. The chain ledger is authoritative either way.
+                let rotated_recipient = coinbase
+                    .map(|tx| tx.recipient.as_str())
+                    .filter(|r| !r.eq_ignore_ascii_case(&miner_wallet.address))
+                    .map(str::to_owned);
+                if let Some(recipient) = &rotated_recipient {
+                    writeln!(
+                        stdout,
+                        "Mining reward: {:.8} ♦ → {} (payout rotation)",
+                        mining_reward, recipient
+                    )?;
+                }
 
                 let breakdown = {
                     let blockchain_guard = blockchain.read().await;
@@ -1251,7 +1264,11 @@ impl Mgmt {
                         .await?
                 };
 
-                if breakdown.maturing.is_empty() {
+                if rotated_recipient.is_some() {
+                    // Reward lines already printed above with the schedule recipient;
+                    // the maturity countdown belongs to that address, not this wallet.
+                    writeln!(stdout, "Operator balance: {}", breakdown.spendable)?;
+                } else if breakdown.maturing.is_empty() {
                     // Below the M06 activation height the reward is spendable at once.
                     writeln!(stdout, "Mining reward: {:.8} ♦", mining_reward)?;
                     writeln!(stdout, "New balance: {}", breakdown.spendable)?;
