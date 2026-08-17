@@ -638,6 +638,30 @@ mod tests {
         }
     }
 
+    // THE decoupling guarantee behind the feed raise: a transaction larger
+    // than the per-tx admission cap must be rejected even though it would fit
+    // the (larger) block feed — otherwise raising the feed would let one
+    // transaction fill an entire block.
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // Named invariant: the regression is meaningful only while feed > per-tx cap.
+    fn per_tx_admission_is_decoupled_from_the_feed_cap() {
+        assert!(
+            MAX_BLOCK_SIZE > MAX_MEMPOOL_TX_BYTES,
+            "this regression only means something while the feed exceeds the per-tx cap"
+        );
+        let mut mp = Mempool::new();
+        let mut oversize = tx_with("senderZ", 1, 1.0, 0.5);
+        oversize.signature = Some("ab".repeat(MAX_MEMPOOL_TX_BYTES / 2 + 1_000));
+        let res = mp.add_transaction(oversize);
+        assert!(
+            matches!(res, Err(BlockchainError::InvalidTransaction)),
+            "above the per-tx cap must reject even though it fits the raised feed, got {:?}",
+            res
+        );
+        mp.add_transaction(tx_with("senderZ", 2, 1.0, 0.5))
+            .expect("a normal transaction still admits");
+    }
+
     #[test]
     fn fee_per_byte_orders_highest_fee_first() {
         let low = rate(1, 1);

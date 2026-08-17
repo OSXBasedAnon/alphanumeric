@@ -7947,6 +7947,35 @@ mod tests {
     // The sled caches are now explicit and operator-tunable rather than sled's implicit 1 GiB
     // default: conservative role-specific defaults, invalid input ignored, and hard clamps so a
     // typo cannot set a 4 MiB cache that thrashes or a 1 TiB cache that OOMs the box.
+    // The migration-window slot preference: a response carrying both slots
+    // must select the redb manifest; legacy-only falls back (still valid for
+    // tip reconcile); the format gate downstream governs artifacts. Legacy
+    // binaries never see the new field (no deny_unknown_fields anywhere).
+    #[test]
+    fn manifest_response_prefers_the_redb_slot() {
+        let both: BootstrapManifestResponse = serde_json::from_str(
+            r#"{"ok":true,
+                "manifest":{"url":"https://x/legacy.zip","publisher_pubkey":"","manifest_sig":"","updated_at":1},
+                "manifest_redb":{"url":"https://x/redb.zip","format":"redb","publisher_pubkey":"","manifest_sig":"","updated_at":2}}"#,
+        )
+        .unwrap();
+        let chosen = both.manifest_redb.or(both.manifest).unwrap();
+        assert_eq!(chosen.url, "https://x/redb.zip");
+        assert_eq!(chosen.format.as_deref(), Some("redb"));
+
+        let legacy_only: BootstrapManifestResponse = serde_json::from_str(
+            r#"{"ok":true,
+                "manifest":{"url":"https://x/legacy.zip","publisher_pubkey":"","manifest_sig":"","updated_at":1}}"#,
+        )
+        .unwrap();
+        let chosen = legacy_only.manifest_redb.or(legacy_only.manifest).unwrap();
+        assert_eq!(chosen.url, "https://x/legacy.zip");
+        assert_eq!(chosen.format, None, "legacy manifests carry no format");
+
+        let neither: BootstrapManifestResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(neither.manifest_redb.or(neither.manifest).is_none());
+    }
+
     #[test]
     fn db_cache_mib_defaults_and_clamps() {
         assert_eq!(
