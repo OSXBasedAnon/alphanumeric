@@ -175,6 +175,15 @@ impl PayoutSchedule {
         if slots.is_empty() {
             return Err("no payout entries".to_string());
         }
+        // Heights are u32: a cumulative weight beyond u32::MAX would make the
+        // tail entries permanently unreachable (height % total never lands in
+        // their slots). Refuse outright rather than starve silently.
+        if cumulative > u64::from(u32::MAX) {
+            return Err(format!(
+                "total weight {} exceeds the u32 height range — tail entries would never be paid",
+                cumulative
+            ));
+        }
         Ok(PayoutSchedule {
             total_weight: cumulative,
             slots,
@@ -188,11 +197,17 @@ impl PayoutSchedule {
     }
 
     /// Load from `ALPHANUMERIC_COINBASE_PAYOUTS` if set. `Ok(None)` = feature
-    /// unused; `Err` = configured but invalid (callers must refuse to mine).
+    /// unused; `Err` = configured but invalid (callers must refuse to mine —
+    /// including a non-UTF-8 value, which is configured-and-broken, never a
+    /// silent fallback to the default wallet).
     pub fn from_env() -> Result<Option<PayoutSchedule>, String> {
         match std::env::var("ALPHANUMERIC_COINBASE_PAYOUTS") {
             Ok(path) if !path.trim().is_empty() => Self::load(path.trim()).map(Some),
-            _ => Ok(None),
+            Ok(_) => Ok(None),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err("ALPHANUMERIC_COINBASE_PAYOUTS is set but not valid UTF-8".to_string())
+            }
         }
     }
 
