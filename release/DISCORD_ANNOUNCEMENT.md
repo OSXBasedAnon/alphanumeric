@@ -1,21 +1,36 @@
-**Alphanumeric v7.9.4 — required upgrade before block 569,423**
+**Alphanumeric v8.0.0 — new storage engine, smaller bootstrap, optional upgrade**
 
-Version 7.9.4 is a scheduled consensus compatibility release. Reward accounting
-V2 activates at block **569,423**.
+Version 8.0.0 replaces the node's embedded database (`sled` → `redb`). **Block
+validity rules do not change.** 8.0.0 and 7.9.x nodes stay on the same chain and
+accept each other's blocks, so there is no activation height and no deadline —
+upgrade whenever suits you.
+
+### What changes for you
+- Bootstrap download drops from ~170 MB to ~100 MB, and from ~1.9 GB across 70
+  files to a single ~1.1 GB `chain.redb`.
+- Faster commits, steadier disk usage under sustained load, instant startup after
+  heavy write periods.
+- Block feed limit rises 1 MB → 2 MB, roughly doubling sustained throughput.
+  Producer-side only; not a consensus change.
 
 ### Operator action
-- Upgrade miners, pools, public nodes, and other validating deployments before
-  block 569,423.
-- Confirm the restarted process reports version 7.9.4.
-- Do not run an older miner past the activation boundary.
+- Replace the binary and restart. Confirm it reports version 8.0.0 and the banner
+  reads `Database: redb`.
+- It fetches a current bootstrap in the new format on first start. Wallet keys,
+  node identity, and configuration are untouched.
+- Your data folder is unchanged: `blockchain.db` stays a directory, with
+  `chain.redb` inside it.
+- The old engine's files are left in place, so downgrading is just running the
+  old binary. Delete everything in `blockchain.db` except `chain.redb` once you
+  are satisfied.
 
-Blocks below the activation height retain the existing rules. Compatible nodes
-use the updated reward-accounting rules from block 569,423 onward. The release
-also adds advisory consensus-fingerprint telemetry so rollout compatibility can
-be monitored directly.
+### New for pools (opt-in)
+The miner can pay each block's reward straight to the participant owed it, using
+a weighted schedule file — replacing batch payout transactions entirely. Off
+unless you set `ALPHANUMERIC_COINBASE_PAYOUTS`. Guide: `docs/POOL_PAYOUTS.md`.
 
-This is a drop-in binary replacement: no database migration, wallet migration,
-resync, transaction-format change, or network-message change.
+Source builds now require rustc 1.89 or newer (`rustup update`). No new system
+dependencies — still pure Rust, so Linux and Windows build from the tag as before.
 
-macOS release artifacts and SHA-256 checksums will be published from the reviewed
-v7.9.4 tag. Linux and Windows operators can build the same tag from source.
+macOS release artifacts and SHA-256 checksums are published from the reviewed
+v8.0.0 tag.

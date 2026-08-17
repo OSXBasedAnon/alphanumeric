@@ -1,3 +1,86 @@
+# alphanumeric v8.0.0
+
+Storage engine release. The node's embedded database moves from `sled` to
+`redb`. **No change to block validity rules** — 8.0.0 and 7.9.x nodes stay on
+the same chain, follow each other, accept each other's blocks, and can be
+upgraded in any order and at any pace. There is no activation height and no
+deadline.
+
+The chain data itself is unchanged. What changes is the file format it is
+stored in locally, and the size of what you download to get started.
+
+## What you get
+
+- **Bootstrap downloads are roughly 40% smaller** — about 100 MB instead of
+  about 170 MB — and extract to a single database file of about 1.1 GB instead
+  of about 1.9 GB spread over 70 files.
+- **Faster and steadier writes.** Commits are quicker, and the disk footprint no
+  longer grows well beyond the data it holds during sustained activity.
+- **Instant startup after heavy write periods**, where the previous engine could
+  spend seconds reopening its files.
+- The database is a single file, `chain.redb`, which makes backups, copies, and
+  disk accounting straightforward.
+
+## Operator action
+
+Replace the binary and restart. Confirm the process reports version `8.0.0` and
+that the startup banner reads `Database: redb`.
+
+On first start, the node fetches a current bootstrap in the new format and
+resumes normally; a node that prefers to sync from peers instead may do so. Your
+wallet keys, node identity, and configuration are untouched — those files are
+separate from the chain database and are read exactly as before.
+
+Your data folder keeps the same name and location. `blockchain.db` remains a
+directory; the new engine stores `blockchain.db/chain.redb` inside it. Set
+`ALPHANUMERIC_DB_PATH` exactly as before if you use a custom location.
+
+**The previous engine's files are left in place, untouched.** That is deliberate:
+until you delete them, downgrading is nothing more than running the old binary
+again. Once you are satisfied with 8.0.0, you can reclaim that space by deleting
+everything in `blockchain.db` except `chain.redb`.
+
+Operators who would rather convert an existing database in place than download a
+bootstrap can build with `--features sled-convert` and run
+`alphanumeric convert-sled-db <old-db-dir> <new-db-dir>`. Conversion verifies
+every record it writes and leaves the source database untouched.
+
+## Building from source
+
+Source builds now require **rustc 1.89 or newer**. An older toolchain stops with
+a clear message from cargo rather than producing a binary; run `rustup update` if
+you see it. There is no new system dependency — the new engine is pure Rust, so
+Linux and Windows builds still need nothing beyond the Rust toolchain.
+
+## Block capacity
+
+The block feed limit rises from 1 MB to 2 MB, roughly doubling sustained
+transaction throughput. This is a producer-side limit on how much a node feeds
+into the blocks it builds; it is not a consensus change, and blocks from any
+version remain valid to every version. Fees, the fee estimator, and per-sender
+mempool limits are unchanged in behaviour.
+
+## Pool payouts without payout transactions (opt-in)
+
+The miner can now pay each block's reward directly to the participant it is owed
+to, replacing batched payout transactions entirely. Set
+`ALPHANUMERIC_COINBASE_PAYOUTS` to a file of addresses and share weights; the
+recipient for each block is a deterministic, auditable function of the file and
+the block height. Misconfiguration refuses to mine rather than quietly paying the
+wrong address.
+
+**This is off unless you set that variable**, and with it unset the miner behaves
+exactly as it always has. Full guide: `docs/POOL_PAYOUTS.md`.
+
+## Notes
+
+There is no wallet migration, no transaction-format change, and no
+network-message change. Release artifacts and their SHA-256 checksums must be
+generated from the reviewed `8.0.0` tag; checksums from earlier releases do not
+apply.
+
+---
+
 # alphanumeric v7.9.4
 
 Scheduled consensus compatibility release. Reward accounting V2 activates at
