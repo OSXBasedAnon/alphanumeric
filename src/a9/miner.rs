@@ -1430,6 +1430,32 @@ mod tests {
     }
 
     #[test]
+    fn payout_schedule_normalizes_case_allows_duplicates_and_bounds_entries() {
+        // Uppercase hex is accepted and normalized (addresses are lowercase
+        // on-chain).
+        let upper = "A".repeat(40);
+        let s = PayoutSchedule::parse(&upper).unwrap();
+        assert_eq!(s.recipient_for(0), "a".repeat(40));
+
+        // Duplicate addresses accumulate slots — a legitimate way to express
+        // weight across file edits, documented by this test.
+        let addr = "b".repeat(40);
+        let dup = PayoutSchedule::parse(&format!("{addr} 1\n{addr} 2\n")).unwrap();
+        assert_eq!(dup.total_weight(), 3);
+        for h in 0..3u32 {
+            assert_eq!(dup.recipient_for(h), addr);
+        }
+
+        // The entry bound refuses unreasonable files outright.
+        let mut big = String::new();
+        for _ in 0..10_001 {
+            big.push_str(&"c".repeat(40));
+            big.push('\n');
+        }
+        assert!(PayoutSchedule::parse(&big).is_err());
+    }
+
+    #[test]
     fn payout_rotation_is_deterministic_and_weight_proportional() {
         let addr_a = "a".repeat(40);
         let addr_b = "b".repeat(40);
