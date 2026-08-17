@@ -10,9 +10,29 @@ use crate::a9::codec;
 
 const MEMPOOL_MAX_BYTES: usize = 50_000_000;
 const MEMPOOL_MAX_TRANSACTIONS: usize = 50_000;
-const MEMPOOL_MAX_PER_ADDRESS: usize = 100;
+/// Per-sender queue depth. 250 lets a 200-recipient pool payout admit in one
+/// batch call instead of two-blocks-with-retries; blast radius stays bounded
+/// (250 x ~14.6 KB ≈ 3.7 MB queueable per sender against the 50 MB
+/// fee-per-byte-priced pool).
+const MEMPOOL_MAX_PER_ADDRESS: usize = 250;
 
-pub const MAX_BLOCK_SIZE: usize = 1_000_000;
+/// Producer FEED cap: how many transaction bytes the template selector feeds
+/// into one block. Policy, not consensus — consensus has accepted
+/// MAX_BLOCK_WEIGHT_BYTES (3.5 MB) since genesis, so every deployed node
+/// validates these blocks natively and mixed producer settings coexist.
+/// Raised 1 MB -> 2 MB (step 1 of the staged program; ~30 TPS ceiling) with
+/// deliberate margin kept below the consensus cap: the operating limit never
+/// runs AT the design limit. Step 2 (3.5 MB) stays in reserve behind the
+/// program's gates: clean synthetic full-block campaigns (orphan rate,
+/// propagation, compact-reconstruction hit rate) and sustained organic demand.
+/// Reversible by restarting producers with the old constant.
+pub const MAX_BLOCK_SIZE: usize = 2_000_000;
+/// Per-TRANSACTION admission cap, deliberately decoupled from the feed cap
+/// above: raising the feed must never raise what one transaction may occupy
+/// (a single feed-sized transaction could otherwise fill an entire block).
+/// Held at the historical 1 MB — orders of magnitude above any legitimate
+/// payment (~14.6 KB) — so admission behavior is unchanged by the feed raise.
+pub const MAX_MEMPOOL_TX_BYTES: usize = 1_000_000;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 2_000;
 
 // Exact fee-per-byte ordering key: compares as the rational fee_units / size_bytes via
@@ -165,7 +185,9 @@ impl Mempool {
             .map_err(|e| BlockchainError::SerializationError(Box::new(e)))?
             .len();
 
-        if tx_size > MAX_BLOCK_SIZE {
+        // Admission uses the PER-TRANSACTION cap, not the block feed cap —
+        // decoupled so feed raises can never widen single-transaction size.
+        if tx_size > MAX_MEMPOOL_TX_BYTES {
             return Err(BlockchainError::InvalidTransaction);
         }
 
