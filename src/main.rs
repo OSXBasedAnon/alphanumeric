@@ -6899,6 +6899,15 @@ fn write_bootstrap_archive_zip(
     Ok(stats)
 }
 
+/// Attempts for the final pointer POST (see the retry loop in the publish path).
+/// Small on purpose: this covers an edge blip, not an outage. A genuinely down
+/// endpoint should fall through to the caller's backoff, not be hammered here.
+#[cfg(feature = "bootstrap_publisher")]
+const PUBLISH_POINTER_ATTEMPTS: u32 = 3;
+
+#[cfg(feature = "bootstrap_publisher")]
+const PUBLISH_POINTER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(feature = "bootstrap_publisher")]
 // These are distinct authenticated publication capabilities and signed snapshot metadata. A
 // context wrapper would only hide the boundary without reducing ownership or synchronization risk.
@@ -7282,16 +7291,59 @@ async fn publish_bootstrap_snapshot(
         u.query_pairs_mut().append_pair("blob_url", blob_url);
         upload_url = u.to_string();
     }
-    let request = client
-        .post(&upload_url)
-        .header("authorization", format!("Bearer {}", token))
-        .header("content-type", "application/zip");
-    let resp = if direct_blob_url.is_some() {
-        request.send().await?
-    } else {
-        // Legacy full-body publish: replay the archive by reopening the completed
-        // file, not by having retained it in memory across the direct attempt.
-        request.body(fs::read(&zip_path).await?).send().await?
+    // RETRY THE POINTER POST BEFORE THROWING THE ARTIFACT AWAY. In self-host mode
+    // the expensive work is already finished and durable by this point: writers were
+    // quiesced for the snapshot, the archive was built, and the whole zip was uploaded
+    // to the local blob target. All that remains is a few-hundred-byte authenticated
+    // POST — and that is the only part of the publish that traverses Cloudflare, so a
+    // transient edge 5xx there used to discard the finished artifact and force a
+    // complete re-snapshot/re-zip/re-upload cycle (observed ~5x/day). Retry the cheap
+    // request instead. Auth, redirect, and 4xx outcomes are NOT retried: those are
+    // configuration, and repeating them just spams the endpoint.
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        attempt += 1;
+        let request = client
+            .post(&upload_url)
+            .header("authorization", format!("Bearer {}", token))
+            .header("content-type", "application/zip");
+        let sent = if direct_blob_url.is_some() {
+            request.send().await
+        } else {
+            // Legacy full-body publish: replay the archive by reopening the completed
+            // file, not by having retained it in memory across the direct attempt.
+            request.body(fs::read(&zip_path).await?).send().await
+        };
+        // Only the manifest-only shape is cheap enough to be worth replaying; the
+        // legacy full-body path re-reads and re-sends the entire zip, so leave its
+        // single-attempt behavior alone.
+        let retriable_shape = direct_blob_url.is_some();
+        let retries_left = attempt < PUBLISH_POINTER_ATTEMPTS;
+        match sent {
+            Ok(r) => {
+                let retriable_status = r.status().is_server_error();
+                if retriable_shape && retriable_status && retries_left {
+                    warn!(
+                        "bootstrap pointer POST attempt {}/{} failed ({}); retrying in {:?} (artifact retained)",
+                        attempt, PUBLISH_POINTER_ATTEMPTS, r.status(), PUBLISH_POINTER_RETRY_DELAY
+                    );
+                    tokio::time::sleep(PUBLISH_POINTER_RETRY_DELAY).await;
+                    continue;
+                }
+                break r;
+            }
+            Err(e) => {
+                if retriable_shape && retries_left {
+                    warn!(
+                        "bootstrap pointer POST attempt {}/{} errored ({}); retrying in {:?} (artifact retained)",
+                        attempt, PUBLISH_POINTER_ATTEMPTS, e, PUBLISH_POINTER_RETRY_DELAY
+                    );
+                    tokio::time::sleep(PUBLISH_POINTER_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
     };
 
     if resp.status().is_redirection() {
