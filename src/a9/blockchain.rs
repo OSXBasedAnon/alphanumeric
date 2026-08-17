@@ -11748,12 +11748,16 @@ mod tests {
     #[test]
     fn fee_estimate_prices_one_unit_over_the_marginal_fee_under_congestion() {
         let bc = test_blockchain();
-        // Three ~480 KB transactions against the mempool feed's 1 MB byte
-        // budget (the binding constraint pre-activation): the two highest fees
+        // Three transactions each ~48% of the mempool feed byte budget (the
+        // binding constraint pre-activation): the two highest fees
         // fit, the third is excluded, so the recommendation must beat the
         // weakest INCLUDED fee by exactly one unit (the oldest-first tiebreak
         // means merely matching it loses).
-        let sig_bytes = 240_000;
+        // Constant-relative: each tx serializes to ~2x sig_bytes, so 0.24x the
+        // feed cap yields exactly two fitting + a third excluded at ANY feed
+        // size — the fixtures follow future feed steps instead of hardcoding
+        // the 1 MB era.
+        let sig_bytes = crate::a9::mempool::MAX_BLOCK_SIZE * 24 / 100;
         let estimate = bc.fee_estimate_from_candidates(
             vec![
                 estimator_tx(50_000, ESTIMATOR_NOW - 30, sig_bytes),
@@ -11777,7 +11781,11 @@ mod tests {
         // clamp binds. This is the bound that keeps a hostile (or merely rich)
         // mempool from spending a default user's balance, and it caps the payoff
         // of deliberately fee-pumping the estimator.
-        let sig_bytes = 240_000;
+        // Constant-relative: each tx serializes to ~2x sig_bytes, so 0.24x the
+        // feed cap yields exactly two fitting + a third excluded at ANY feed
+        // size — the fixtures follow future feed steps instead of hardcoding
+        // the 1 MB era.
+        let sig_bytes = crate::a9::mempool::MAX_BLOCK_SIZE * 24 / 100;
         let estimate = bc.fee_estimate_from_candidates(
             vec![
                 estimator_tx(WALLET_FEE_SAFETY_LIMIT_UNITS, ESTIMATOR_NOW - 30, sig_bytes),
@@ -11799,9 +11807,10 @@ mod tests {
         // estimate exists to price THAT transfer, so this must read congested
         // (the pre-fix code called it quiet and recommended the anchor, which
         // would have been outbid by every incumbent).
-        // Two ~494 KB transactions leave under TYPICAL_FULL_WITNESS_TX_BYTES of
-        // the 1 MB feed budget free.
-        let sig_bytes = 247_000;
+        // Two transactions sized so the remaining feed headroom is ~11 KB —
+        // absolute, under TYPICAL_FULL_WITNESS_TX_BYTES at ANY feed size
+        // (each serializes to ~2x sig_bytes + ~200B overhead).
+        let sig_bytes = crate::a9::mempool::MAX_BLOCK_SIZE / 4 - 2_900;
         let estimate = bc.fee_estimate_from_candidates(
             vec![
                 estimator_tx(60_000, ESTIMATOR_NOW - 30, sig_bytes),
@@ -11826,11 +11835,15 @@ mod tests {
         // Truncated-witness readmits are the real-world shape: high fee, tiny,
         // never templatable.
         let junk_sig = 64; // stored/truncated witness -> not a template candidate
-        let mut candidates = vec![estimator_tx(80_000, ESTIMATOR_NOW - 60, 245_000)];
+                           // The two real transfers leave only a few KB of feed headroom; the
+                           // junk's bytes are what tip the walk past the budget — absolute
+                           // margins so the fixture holds at any feed size.
+        let real_sig = crate::a9::mempool::MAX_BLOCK_SIZE / 4 - 1_000;
+        let mut candidates = vec![estimator_tx(80_000, ESTIMATOR_NOW - 60, real_sig)];
         for i in 0..40 {
             candidates.push(estimator_tx(90_000, ESTIMATOR_NOW - 50 + i, junk_sig));
         }
-        candidates.push(estimator_tx(70_000, ESTIMATOR_NOW - 5, 245_000));
+        candidates.push(estimator_tx(70_000, ESTIMATOR_NOW - 5, real_sig));
 
         let estimate = bc.fee_estimate_from_candidates(candidates, ESTIMATOR_NOW);
         assert_eq!(
@@ -11850,7 +11863,11 @@ mod tests {
         // budget is spent. With ~480 KB transactions the 1 MB feed byte cap is
         // reached after 3, so the remaining thousands are never serialized —
         // this is what keeps the unauthenticated estimate endpoint cheap.
-        let sig_bytes = 240_000;
+        // Constant-relative: each tx serializes to ~2x sig_bytes, so 0.24x the
+        // feed cap yields exactly two fitting + a third excluded at ANY feed
+        // size — the fixtures follow future feed steps instead of hardcoding
+        // the 1 MB era.
+        let sig_bytes = crate::a9::mempool::MAX_BLOCK_SIZE * 24 / 100;
         let candidates: Vec<Transaction> = (0..4_000)
             .map(|i| estimator_tx(50_000 + i as i128, ESTIMATOR_NOW - 100, sig_bytes))
             .collect();

@@ -134,6 +134,113 @@ pub(crate) fn attempt_nonce_base() -> u64 {
     (x ^ (x >> 31)) & ((1u64 << 62) - 1)
 }
 
+/// Coinbase payout rotation for pools/farms: point each mined block's reward
+/// directly at the miner it is owed to, deleting the separate on-chain payout
+/// transactions entirely (they are the majority of chain traffic). The
+/// coinbase recipient has never been constrained by consensus, so this is
+/// pure producer-side policy.
+///
+/// Schedule file (`ALPHANUMERIC_COINBASE_PAYOUTS=<path>`): one entry per
+/// line, `<40-hex-address> [weight]` (weight = integer share count, default
+/// 1); `#` comments and blank lines ignored. Selection is STATELESS and
+/// AUDITABLE: the recipient for block height H is the owner of slot
+/// `H % total_weight` in the cumulative weight table — deterministic from
+/// the file alone, proportional to weights over any full cycle, unaffected
+/// by restarts, and verifiable by every participant from the chain itself.
+///
+/// Fail-closed: a configured-but-invalid file refuses to mine rather than
+/// silently paying the default wallet.
+#[derive(Debug, Clone)]
+pub struct PayoutSchedule {
+    /// (address, cumulative weight upper bound), ascending.
+    slots: Vec<(String, u64)>,
+    total_weight: u64,
+}
+
+impl PayoutSchedule {
+    pub fn parse(contents: &str) -> Result<PayoutSchedule, String> {
+        const MAX_ENTRIES: usize = 10_000;
+        let mut slots = Vec::new();
+        let mut cumulative: u64 = 0;
+        for (lineno, raw) in contents.lines().enumerate() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let address = parts.next().unwrap_or("").to_ascii_lowercase();
+            if address.len() != 40 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "line {}: '{}' is not a 40-hex address",
+                    lineno + 1,
+                    address
+                ));
+            }
+            let weight: u64 = match parts.next() {
+                None => 1,
+                Some(w) => w.parse().ok().filter(|w| *w >= 1).ok_or_else(|| {
+                    format!("line {}: weight must be an integer >= 1", lineno + 1)
+                })?,
+            };
+            if let Some(extra) = parts.next() {
+                return Err(format!(
+                    "line {}: unexpected trailing token '{}'",
+                    lineno + 1,
+                    extra
+                ));
+            }
+            cumulative = cumulative
+                .checked_add(weight)
+                .ok_or_else(|| format!("line {}: total weight overflows", lineno + 1))?;
+            slots.push((address, cumulative));
+            if slots.len() > MAX_ENTRIES {
+                return Err(format!("more than {} entries", MAX_ENTRIES));
+            }
+        }
+        if slots.is_empty() {
+            return Err("no payout entries".to_string());
+        }
+        Ok(PayoutSchedule {
+            total_weight: cumulative,
+            slots,
+        })
+    }
+
+    pub fn load(path: &str) -> Result<PayoutSchedule, String> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read payout schedule {}: {}", path, e))?;
+        Self::parse(&contents).map_err(|e| format!("payout schedule {}: {}", path, e))
+    }
+
+    /// Load from `ALPHANUMERIC_COINBASE_PAYOUTS` if set. `Ok(None)` = feature
+    /// unused; `Err` = configured but invalid (callers must refuse to mine).
+    pub fn from_env() -> Result<Option<PayoutSchedule>, String> {
+        match std::env::var("ALPHANUMERIC_COINBASE_PAYOUTS") {
+            Ok(path) if !path.trim().is_empty() => Self::load(path.trim()).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The coinbase recipient for a block at `height` — pure function of the
+    /// schedule and the height.
+    pub fn recipient_for(&self, height: u32) -> &str {
+        let slot = u64::from(height) % self.total_weight;
+        // First entry whose cumulative bound exceeds the slot.
+        let idx = self
+            .slots
+            .partition_point(|(_, cumulative)| *cumulative <= slot);
+        &self.slots[idx.min(self.slots.len() - 1)].0
+    }
+
+    pub fn entries(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn total_weight(&self) -> u64 {
+        self.total_weight
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProgPowHeader {
     pub number: u32,
@@ -209,6 +316,23 @@ impl MiningManager {
         // rebuild below selects from the LIVE mempool every pass, so txs that
         // confirm mid-grind leave the template and new arrivals enter it.
         let _ = transactions;
+
+        // Coinbase payout rotation (pool/farm feature): re-read per block
+        // attempt so an operator can update the owed-list without restarting
+        // (edit atomically: write temp + rename). Configured-but-invalid
+        // refuses to mine — never a silent fallback to the default wallet.
+        let payout_schedule = PayoutSchedule::from_env().map_err(MiningError::MiningFailed)?;
+        if let Some(schedule) = &payout_schedule {
+            static ANNOUNCE_ONCE: std::sync::Once = std::sync::Once::new();
+            ANNOUNCE_ONCE.call_once(|| {
+                log::info!(
+                    "coinbase payout rotation active: {} recipients, {} weight slots \
+                     (recipient = schedule slot at height % total_weight)",
+                    schedule.entries(),
+                    schedule.total_weight()
+                );
+            });
+        }
 
         let found = Arc::new(AtomicBool::new(false));
         let abort_for_tip_change = Arc::new(AtomicBool::new(false));
@@ -616,9 +740,16 @@ impl MiningManager {
                 };
                 let reward_amount = blockchain_lock.calculate_block_reward(&reward_template)?;
                 let reward_timestamp = template_timestamp;
+                // Rotation: the recipient is a pure function of the height
+                // being mined; without a schedule, the operator's wallet as
+                // always.
+                let coinbase_recipient = match &payout_schedule {
+                    Some(schedule) => schedule.recipient_for(header.number).to_string(),
+                    None => miner_address.clone(),
+                };
                 let reward_tx = Transaction::new(
                     "MINING_REWARDS".to_string(),
-                    miner_address.clone(),
+                    coinbase_recipient,
                     reward_amount,
                     NETWORK_FEE,
                     reward_timestamp,
@@ -1272,6 +1403,53 @@ pub struct BlockHeader {
 
 #[cfg(test)]
 mod tests {
+    use super::PayoutSchedule;
+
+    #[test]
+    fn payout_schedule_parses_weights_comments_and_rejects_garbage() {
+        let addr_a = "a".repeat(40);
+        let addr_b = "b".repeat(40);
+        let file = format!("# owed list\n{addr_a} 3\n\n{addr_b}   # default weight 1\n");
+        let s = PayoutSchedule::parse(&file).unwrap();
+        assert_eq!(s.entries(), 2);
+        assert_eq!(s.total_weight(), 4);
+
+        assert!(PayoutSchedule::parse("").is_err(), "empty file refuses");
+        assert!(
+            PayoutSchedule::parse("nothex").is_err(),
+            "short/non-hex address refuses"
+        );
+        assert!(
+            PayoutSchedule::parse(&format!("{addr_a} 0")).is_err(),
+            "zero weight refuses"
+        );
+        assert!(
+            PayoutSchedule::parse(&format!("{addr_a} 1 extra")).is_err(),
+            "trailing tokens refuse"
+        );
+    }
+
+    #[test]
+    fn payout_rotation_is_deterministic_and_weight_proportional() {
+        let addr_a = "a".repeat(40);
+        let addr_b = "b".repeat(40);
+        let addr_c = "c".repeat(40);
+        let s = PayoutSchedule::parse(&format!("{addr_a} 3\n{addr_b} 1\n{addr_c} 2\n")).unwrap();
+        assert_eq!(s.total_weight(), 6);
+        // One full cycle pays exactly by weight, from height alone.
+        let mut counts = std::collections::HashMap::new();
+        for h in 600u32..606 {
+            *counts.entry(s.recipient_for(h).to_string()).or_insert(0u32) += 1;
+        }
+        assert_eq!(counts[&addr_a], 3);
+        assert_eq!(counts[&addr_b], 1);
+        assert_eq!(counts[&addr_c], 2);
+        // Deterministic: same height, same recipient, always.
+        assert_eq!(s.recipient_for(12), s.recipient_for(12));
+        // Cycle-aligned: height h and h + total_weight pay the same slot.
+        assert_eq!(s.recipient_for(7), s.recipient_for(13));
+    }
+
     use super::{
         candidate_timestamp, coinbase_matches_reward_schedule, Block, Blockchain, Transaction,
         NETWORK_FEE,
