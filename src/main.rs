@@ -3770,13 +3770,38 @@ Ok(whisper_tx) => {
         ui_seg(&mut out, spec, UI_DIM, false,
             " the message IS the fee — a plain payment of this amount would cost only the network fee\n")?;
         writeln!(out)?;
+        // Enter is the confirm: the draft above IS the review, so once it reads back
+        // as typed the decision has already been made and a second keystroke adds
+        // nothing. `y` still works for the old reflex and for piped input. The one
+        // exception is a CHANGED round-trip — there the chain would carry something
+        // other than what was typed, so that case keeps the fail-safe and demands an
+        // explicit `y`. Anything unrecognised cancels either way: an unsent whisper
+        // costs a retype, a wrongly-sent one is permanent.
         ui_seg(&mut out, spec, UI_LABEL, false, " send?  ")?;
-        ui_seg(&mut out, spec, UI_DIM, false, "y signs and broadcasts · anything else cancels: ")?;
+        ui_seg(
+            &mut out,
+            spec,
+            UI_DIM,
+            false,
+            if round_trip_ok {
+                "enter sends · n cancels: "
+            } else {
+                "type y to send it CHANGED · n cancels: "
+            },
+        )?;
         out.flush()?;
         let mut answer = String::new();
         let _ = std::io::stdin().read_line(&mut answer);
         out.reset()?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
+        let answer = answer.trim();
+        let confirmed = if round_trip_ok {
+            answer.is_empty()
+                || answer.eq_ignore_ascii_case("y")
+                || answer.eq_ignore_ascii_case("yes")
+        } else {
+            answer.eq_ignore_ascii_case("y")
+        };
+        if !confirmed {
             let ledger = Arc::clone(payment_ledger);
             let tx_id = whisper_tx.get_tx_id();
             match tokio::task::spawn_blocking(move || ledger.release_local_reservation(&tx_id)).await {
