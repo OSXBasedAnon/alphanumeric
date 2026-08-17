@@ -47,6 +47,7 @@ curve. This single binary is the full node, wallet and miner for macOS/OSX, Linu
 
 - deterministic local chain-state persistence (`redb`)
 - bounded, framed P2P messaging with peer lifecycle management
+- pool payouts with zero on-chain transactions via coinbase rotation (see `docs/POOL_PAYOUTS.md`)
 - block/transaction propagation and sync workflows
 - integrated mining path
 - wallet/key workflows plus operator CLI
