@@ -106,6 +106,18 @@ webrtc_mesh = ["dep:webrtc", "dep:bytes"]
 # that do heavy filesystem + networking (like bootstrap publish). Keep symbols and avoid
 # aggressive LTO/stripping in release builds until the binary is code-signed.
 [profile.release]
+# Integer overflow PANICS in release, it does not wrap.
+#
+# Rust's default release profile wraps silently, which means an overflow bug is loud
+# in every test run and silent in production, on a codebase whose whole job is exact
+# integer money and consensus arithmetic. A wrap there is not a crash, it is a wrong
+# balance or a divergent block that every node then agrees on forever. A panic is a
+# stopped node an operator restarts.
+#
+# Measured before enabling: the full suite passes in release with checks on (528/528),
+# and the mining hot loop is unaffected (10.74/10.88 MH/s off vs 10.72/10.82 on, inside
+# run-to-run noise) because BLAKE3 does its own explicit wrapping arithmetic internally.
+overflow-checks = true
 debug = 1
 strip = "none"
 lto = false
