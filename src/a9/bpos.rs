@@ -284,12 +284,18 @@ impl BPoSSentinel {
 
     fn start_memory_management(&self) {
         let sentinel = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Hourly cleanup
-            loop {
-                interval.tick().await;
-                if let Err(e) = sentinel.cleanup_memory().await {
-                    error!("Memory cleanup error: {}", e);
+        // SUPERVISED: this is the only thing bounding header_cache and
+        // verified_headers. A panic in a plain spawn dies into an unread JoinError,
+        // and the node then grows both maps forever while looking perfectly healthy.
+        crate::a9::node::spawn_supervised("bpos-memory-cleanup", move || {
+            let sentinel = sentinel.clone();
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Hourly cleanup
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = sentinel.cleanup_memory().await {
+                        error!("Memory cleanup error: {}", e);
+                    }
                 }
             }
         });
@@ -1145,7 +1151,11 @@ impl BPoSSentinel {
         // Verify block times
         let recent_blocks: Vec<_> = blocks.iter().rev().take(10).collect();
         for window in recent_blocks.windows(2) {
-            let time_diff = window[0].timestamp - window[1].timestamp;
+            // saturating: block timestamps are not guaranteed strictly increasing between
+            // neighbours, so a bare subtraction underflows here. Under release
+            // overflow-checks that is a panic rather than a wrap, and this function is
+            // currently unreferenced — the hazard would arrive with whoever revives it.
+            let time_diff = window[0].timestamp.saturating_sub(window[1].timestamp);
             if time_diff > 3 || time_diff == 0 {
                 return false; // Block time violation
             }
