@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
-use crate::a9::blockchain::{Block, Blockchain, BlockchainError, Transaction};
+use crate::a9::blockchain::{Block, Blockchain, BlockchainError};
 use crate::a9::codec;
 use crate::a9::mldsa;
 use crate::a9::node::NetworkMessage;
@@ -115,13 +115,18 @@ pub struct BPoSSentinel {
     initialized: Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[allow(dead_code)]
 impl BPoSSentinel {
     /// A header may be at most this many seconds old (3 block times) to be
     /// considered temporally consistent, and at most this many seconds ahead of
     /// local time. Both bound a PEER-SUPPLIED timestamp, so both are enforced
     /// saturating.
+    /// Kept though nothing in the crate calls it: this is the header-timestamp
+    /// admission policy, it has direct test coverage, and the header path is
+    /// where it belongs when that path next needs bounding. Marked here rather
+    /// than blanket-allowing the impl, so anything else that dies gets reported.
+    #[allow(dead_code)]
     const MAX_HEADER_AGE_SECS: u64 = 6;
+    #[allow(dead_code)]
     const MAX_HEADER_SKEW_SECS: u64 = 2;
 
     // Memory constants
@@ -280,25 +285,6 @@ impl BPoSSentinel {
         }
 
         Ok(())
-    }
-
-    fn start_memory_management(&self) {
-        let sentinel = self.clone();
-        // SUPERVISED: this is the only thing bounding header_cache and
-        // verified_headers. A panic in a plain spawn dies into an unread JoinError,
-        // and the node then grows both maps forever while looking perfectly healthy.
-        crate::a9::node::spawn_supervised("bpos-memory-cleanup", move || {
-            let sentinel = sentinel.clone();
-            async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Hourly cleanup
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = sentinel.cleanup_memory().await {
-                        error!("Memory cleanup error: {}", e);
-                    }
-                }
-            }
-        });
     }
 
     async fn cleanup_memory(&self) -> Result<(), String> {
@@ -1018,22 +1004,6 @@ impl BPoSSentinel {
         Ok(())
     }
 
-    async fn calculate_cooldown_remaining(&self, address: &str) -> Option<u64> {
-        if let Some(metrics) = self.node_metrics.get(address) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            if now > metrics.last_withdrawal + WITHDRAWAL_COOLDOWN {
-                return Some(0);
-            }
-
-            return Some(metrics.last_withdrawal + WITHDRAWAL_COOLDOWN - now);
-        }
-        None
-    }
-
     pub async fn register_wallet_metrics(&self, address: &str, balance: f64) -> Result<(), String> {
         let metrics = NodeMetrics::new(address.to_string(), balance);
         self.node_metrics.insert(address.to_string(), metrics);
@@ -1101,27 +1071,6 @@ impl BPoSSentinel {
         Ok(())
     }
 
-    async fn verify_temporal_consistency(&self, header: &BlockHeaderInfo) -> bool {
-        let blockchain = self.blockchain.read().await;
-        let current_height = blockchain.get_latest_block_index() as u32;
-
-        // Must be within 2 blocks of current height
-        if header.height > current_height + 2 || header.height < current_height.saturating_sub(2) {
-            return false;
-        }
-
-        // Verify timestamp is within 6 seconds (3 block times)
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if !Self::header_timestamp_is_temporally_consistent(now, header.timestamp) {
-            return false;
-        }
-
-        true
-    }
-
     /// Temporal admissibility of a PEER-SUPPLIED header timestamp against a
     /// reference clock: at most `MAX_HEADER_AGE_SECS` old (3 block times) and at
     /// most `MAX_HEADER_SKEW_SECS` ahead.
@@ -1134,98 +1083,10 @@ impl BPoSSentinel {
     /// which meant the behaviour depended on release wrapping semantics and would
     /// have panicked under overflow checks. The skew clause is what rejects them
     /// now, deliberately.
+    #[allow(dead_code)]
     fn header_timestamp_is_temporally_consistent(now: u64, timestamp: u64) -> bool {
         now.saturating_sub(timestamp) <= Self::MAX_HEADER_AGE_SECS
             && timestamp <= now.saturating_add(Self::MAX_HEADER_SKEW_SECS)
-    }
-
-    async fn verify_chain_health(&self) -> bool {
-        let blockchain = self.blockchain.read().await;
-
-        // Get last few blocks
-        let blocks = blockchain.get_blocks();
-        if blocks.len() < 2 {
-            return true; // Not enough blocks to check
-        }
-
-        // Verify block times
-        let recent_blocks: Vec<_> = blocks.iter().rev().take(10).collect();
-        for window in recent_blocks.windows(2) {
-            // saturating: block timestamps are not guaranteed strictly increasing between
-            // neighbours, so a bare subtraction underflows here. Under release
-            // overflow-checks that is a panic rather than a wrap, and this function is
-            // currently unreferenced — the hazard would arrive with whoever revives it.
-            let time_diff = window[0].timestamp.saturating_sub(window[1].timestamp);
-            if time_diff > 3 || time_diff == 0 {
-                return false; // Block time violation
-            }
-        }
-
-        // Verify hash chain
-        let mut prev_hash = recent_blocks[0].hash;
-        for block in recent_blocks.iter().skip(1) {
-            if block.previous_hash != prev_hash {
-                return false; // Hash chain broken
-            }
-            prev_hash = block.hash;
-        }
-
-        true
-    }
-
-    async fn repair_chain(&self) -> Result<(), String> {
-        // Snapshot-then-drop BOTH guards: the old shape held the chain read guard
-        // AND the peers guard across a serial per-peer request_blocks loop —
-        // worst case minutes of both core locks starved (the watchdog wedge
-        // class), safe only while this path stays unreachable.
-        let current_height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
-        };
-        let addrs: Vec<std::net::SocketAddr> = {
-            let peers = self.node.peers.read().await;
-            peers.keys().copied().take(8).collect()
-        };
-        let mut peer_blocks = Vec::new();
-
-        for addr in addrs {
-            if let Ok(blocks) = self
-                .node
-                .request_blocks(addr, current_height.saturating_sub(10), current_height)
-                .await
-            {
-                peer_blocks.push(blocks);
-            }
-        }
-
-        // Find consensus chain
-        let consensus_chain = self.find_consensus_chain(peer_blocks).await?;
-
-        // Replace broken chain section
-        self.replace_chain_section(consensus_chain).await?;
-
-        Ok(())
-    }
-
-    async fn get_competing_blocks(&self, block_height: u32) -> Result<Vec<Block>, String> {
-        let mut competing_blocks = Vec::new();
-        // Snapshot-then-drop (see repair_chain).
-        let addrs: Vec<std::net::SocketAddr> = {
-            let peers = self.node.peers.read().await;
-            peers.keys().copied().take(8).collect()
-        };
-
-        for addr in addrs {
-            if let Ok(blocks) = self
-                .node
-                .request_blocks(addr, block_height, block_height)
-                .await
-            {
-                competing_blocks.extend(blocks);
-            }
-        }
-
-        Ok(competing_blocks)
     }
 
     async fn get_block_from_network(&self, hash: [u8; 32]) -> Result<Option<Block>, String> {
@@ -1245,29 +1106,6 @@ impl BPoSSentinel {
         Ok(None)
     }
 
-    async fn determine_canonical_block(&self, blocks: Vec<Block>) -> Result<Block, String> {
-        if blocks.is_empty() {
-            return Err("No blocks to analyze".to_string());
-        }
-
-        // Group blocks by hash and count occurrences
-        let mut block_counts: HashMap<[u8; 32], (usize, Block)> = HashMap::new();
-
-        for block in blocks {
-            block_counts
-                .entry(block.hash)
-                .and_modify(|(count, _)| *count += 1)
-                .or_insert((1, block));
-        }
-
-        // Find the block with the most attestations
-        block_counts
-            .into_iter()
-            .max_by_key(|(_, (count, _))| *count)
-            .map(|(_, (_, block))| block)
-            .ok_or_else(|| "Failed to determine canonical block".to_string())
-    }
-
     async fn enforce_canonical_chain(&self, canonical: Block) -> Result<(), String> {
         // Simple enforcement - just save the canonical block
         let blockchain = self.blockchain.read().await;
@@ -1276,149 +1114,6 @@ impl BPoSSentinel {
             .await
             .map_err(|e| format!("Failed to save canonical block: {}", e))?;
         Ok(())
-    }
-
-    async fn request_headers(&self, addr: SocketAddr) -> Result<(), String> {
-        let current_height = {
-            let blockchain = self.blockchain.read().await;
-            blockchain.get_latest_block_index() as u32
-        };
-
-        let message = NetworkMessage::GetHeaders {
-            start_height: current_height.saturating_sub(1000),
-            end_height: current_height,
-        };
-
-        self.node
-            .send_message(addr, &message)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn broadcast_verification(
-        &self,
-        addr: SocketAddr,
-        header: &BlockHeaderInfo,
-        signature: &[u8],
-    ) -> Result<(), String> {
-        self.node
-            .advertise_mldsa_key(addr)
-            .await
-            .map_err(|e| e.to_string())?;
-        let message = NetworkMessage::HeaderVerification {
-            header: header.clone(),
-            node_id: self.node.id().to_string(), // Using accessor method instead of direct field access
-            signature: signature.to_vec(),
-        };
-
-        self.node
-            .send_message(addr, &message)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn find_consensus_chain(
-        &self,
-        peer_blocks: Vec<Vec<Block>>,
-    ) -> Result<Vec<Block>, String> {
-        if peer_blocks.is_empty() {
-            return Err("No peer blocks available".to_string());
-        }
-
-        // Count block occurrences
-        let mut block_counts: HashMap<[u8; 32], (usize, Block)> = HashMap::new();
-
-        for chain in &peer_blocks {
-            for block in chain {
-                block_counts
-                    .entry(block.hash)
-                    .and_modify(|(count, _)| *count += 1)
-                    .or_insert((1, block.clone()));
-            }
-        }
-
-        // Find most common chain
-        let mut consensus_chain: Vec<_> = block_counts
-            .into_iter()
-            .filter(|(_, (count, _))| *count >= peer_blocks.len().div_ceil(2))
-            .map(|(_, (_, block))| block)
-            .collect();
-
-        // Sort by height
-        consensus_chain.sort_by_key(|block| block.index);
-
-        Ok(consensus_chain)
-    }
-
-    async fn replace_chain_section(&self, consensus_chain: Vec<Block>) -> Result<(), String> {
-        let blockchain = self.blockchain.read().await;
-
-        // Verify chain section
-        for window in consensus_chain.windows(2) {
-            if window[1].previous_hash != window[0].hash {
-                return Err("Invalid chain section".to_string());
-            }
-        }
-
-        // Replace blocks
-        for block in consensus_chain {
-            blockchain
-                .save_block(&block)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        Ok(())
-    }
-
-    async fn calculate_consensus_participation(&self) -> Result<f64, String> {
-        let total_nodes = self.node_metrics.len();
-        if total_nodes == 0 {
-            return Ok(0.0);
-        }
-
-        let participating = self
-            .node_metrics
-            .iter()
-            .filter(|m| {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                m.last_active + SENTINEL_CHECK_INTERVAL > now && m.blocks_verified > 0
-            })
-            .count();
-
-        Ok(participating as f64 / total_nodes as f64)
-    }
-
-    async fn calculate_network_load(&self) -> Result<f64, String> {
-        // Take a single atomic read of both blockchain and headers
-        let headers_guard = self.header_cache.read().await;
-
-        // Early return if no blocks to analyze
-        if headers_guard.is_empty() {
-            return Ok(0.0);
-        }
-
-        // Consider only recent blocks for more accurate current load
-        let recent_blocks: Vec<_> = headers_guard
-            .iter()
-            .rev()
-            .take(100) // Look at last 100 blocks for stable average
-            .collect();
-
-        if recent_blocks.is_empty() {
-            return Ok(0.0);
-        }
-
-        // Use iterator adaptors for efficient computation
-        let total_txs: usize = recent_blocks.iter().map(|b| b.transactions.len()).sum();
-
-        let avg_txs = (total_txs as f64) / (recent_blocks.len() as f64);
-        let capacity_usage = (avg_txs / MAX_BLOCK_SIZE as f64).min(1.0);
-
-        Ok(capacity_usage)
     }
 
     async fn verify_chain_state(&self) -> Result<(), String> {
@@ -1549,25 +1244,6 @@ impl BPoSSentinel {
             return Ok(false);
         }
 
-        Ok(true)
-    }
-
-    async fn verify_transaction(&self, tx: &Transaction) -> Result<bool, String> {
-        // For transactions in confirmed blocks, we only need to verify structural integrity
-        // Balance and signature verification was already done when the block was mined
-
-        // Basic sanity checks for confirmed transactions
-        if tx.amount_units < 0 || tx.fee_units < 0 {
-            return Ok(false);
-        }
-
-        // System addresses are always valid in confirmed blocks
-        if tx.sender == "MINING_REWARDS" {
-            return Ok(true);
-        }
-
-        // For regular transactions in confirmed blocks, assume they were valid when confirmed
-        // The fact that they're in a confirmed block means they passed validation when created
         Ok(true)
     }
 
@@ -2892,6 +2568,9 @@ impl From<BlockchainError> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests construct transactions now that the dead verify_transaction
+    // is gone; importing here keeps the lib build free of an unused import.
+    use crate::a9::blockchain::Transaction;
     use std::collections::HashSet;
 
     // The cursor must advance to exactly what was sent — never past it — so nothing inside the
