@@ -41,7 +41,18 @@ crossbeam-channel = "0.5.15"
 parking_lot = "0.12.1"
 lru = "0.8"
 reed-solomon-erasure = "6.0.0"
-ml-dsa = "=0.1.1"   # EXACT pin: consensus signature crate — a silent patch bump could change signature bytes (fork). Bump deliberately only, verifying SIGNING_SPEC.md test vector still matches.
+# EXACT pin, and the reason is VERIFICATION, not signing. Signature validity is
+# standardised, so a conformant signature verifies under any conformant version —
+# but the ACCEPTANCE SET at the edges is where implementations differ: whether a
+# repeated hint index, non-zero hint padding or an off-length encoding is rejected.
+# tests/mldsa_rejection.rs pins exactly those cases because a patch bump that
+# tightened or loosened any of them would have two nodes disagree on whether one
+# block's signature is valid, which is a chain split, not a compatibility note.
+# Secondary: sign() is deterministic here (a fixed seed yields a fixed signature —
+# see the published_test_vector_still_holds vector), and SIGNING_SPEC.md publishes
+# that vector for third-party implementers, so changed output breaks interop too.
+# Bump deliberately only, re-running the rejection tests and the published vector.
+ml-dsa = "=0.1.1"
 aes-gcm = "0.10"
 zeroize = "1"
 # WebRTC DataChannel transport for the NAT-traversal mesh (feature `webrtc_mesh`). Optional so the
