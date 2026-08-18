@@ -10862,7 +10862,6 @@ impl Node {
                 peer_ratings.sort_by_key(|&(_, score)| score);
 
                 // Keep the best max_per_subnet, remove the rest
-                let _excess_count = count - max_per_subnet;
                 let peers_to_remove = peer_ratings.len().saturating_sub(max_per_subnet);
 
                 for i in (peer_ratings.len() - peers_to_remove)..peer_ratings.len() {
@@ -15476,21 +15475,29 @@ impl Node {
             let mesh = mesh.clone();
             let store = self.webrtc_mesh.clone();
             let enabled = enabled.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    // Fail-safe: only an explicit gateway `mesh_enabled: false` disables the mesh.
-                    if !node.fetch_mesh_enabled().await {
-                        // error-level: this permanently disables the mesh for the
-                        // process lifetime, and the default field filter must show it.
-                        error!(
+            // Supervised: a panic here would silently strand the mesh kill switch,
+            // leaving the node unable to honour a network-wide mesh disable.
+            spawn_supervised("mesh-kill-switch", move || {
+                let node = node.clone();
+                let mesh = mesh.clone();
+                let store = store.clone();
+                let enabled = enabled.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        // Fail-safe: only an explicit gateway `mesh_enabled: false` disables the mesh.
+                        if !node.fetch_mesh_enabled().await {
+                            // error-level: this permanently disables the mesh for the
+                            // process lifetime, and the default field filter must show it.
+                            error!(
                             "WebRTC mesh disabled by gateway kill switch — shutting the mesh down (restart the node to re-enable)"
                         );
-                        enabled.store(false, std::sync::atomic::Ordering::Relaxed);
-                        *store.write().await = None; // stop mesh_gossip immediately
-                        mesh.wake(); // break the poll loop out of its sleep so it exits promptly
-                        mesh.shutdown().await; // close all direct connections
-                        return;
+                            enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                            *store.write().await = None; // stop mesh_gossip immediately
+                            mesh.wake(); // break the poll loop out of its sleep so it exits promptly
+                            mesh.shutdown().await; // close all direct connections
+                            return;
+                        }
                     }
                 }
             });
@@ -15498,28 +15505,33 @@ impl Node {
         {
             let mesh = mesh.clone();
             let enabled = enabled.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    let _ = mesh.poll_signals().await;
-                    // EVENT-DRIVEN cadence: poll fast only while a handshake is actually forming, or
-                    // signaling was recently active / expected (a dial, an inbound offer, a directory
-                    // change, or a lost lower-id link — all of which call touch()). Otherwise fall to a
-                    // cheap safety-net cadence. A settled node in a stable network barely touches the
-                    // gateway, so Redis cost scales with CHURN, not with N*time — the free-tier budget
-                    // stops being the scaling constraint. The directory it watches is edge-cached (~0
-                    // Redis), so detecting "a new peer might dial me" costs nothing.
-                    let active = mesh.has_forming_conns().await
-                        || mesh.quiet_for().await < Duration::from_secs(25);
-                    let delay_ms = if active { 2_500 } else { 180_000 };
-                    // Interruptible: a touch() (dial, inbound offer, directory change, lost lower-id
-                    // link) or the kill switch wakes us out of the long safety-net sleep at once, so
-                    // event-driven draining is actually prompt — not delayed up to 180s.
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
-                        _ = mesh.wait_for_wake() => {}
+            // Supervised: signal polling is how a mesh handshake completes at all.
+            spawn_supervised("mesh-signal-poll", move || {
+                let mesh = mesh.clone();
+                let enabled = enabled.clone();
+                async move {
+                    loop {
+                        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let _ = mesh.poll_signals().await;
+                        // EVENT-DRIVEN cadence: poll fast only while a handshake is actually forming, or
+                        // signaling was recently active / expected (a dial, an inbound offer, a directory
+                        // change, or a lost lower-id link — all of which call touch()). Otherwise fall to a
+                        // cheap safety-net cadence. A settled node in a stable network barely touches the
+                        // gateway, so Redis cost scales with CHURN, not with N*time — the free-tier budget
+                        // stops being the scaling constraint. The directory it watches is edge-cached (~0
+                        // Redis), so detecting "a new peer might dial me" costs nothing.
+                        let active = mesh.has_forming_conns().await
+                            || mesh.quiet_for().await < Duration::from_secs(25);
+                        let delay_ms = if active { 2_500 } else { 180_000 };
+                        // Interruptible: a touch() (dial, inbound offer, directory change, lost lower-id
+                        // link) or the kill switch wakes us out of the long safety-net sleep at once, so
+                        // event-driven draining is actually prompt — not delayed up to 180s.
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                            _ = mesh.wait_for_wake() => {}
+                        }
                     }
                 }
             });
@@ -15528,36 +15540,42 @@ impl Node {
             let node = self.clone();
             let mesh = mesh.clone();
             let enabled = enabled.clone();
-            tokio::spawn(async move {
-                use crate::a9::webrtc::select_dial_targets;
-                let mut prev_ids: Vec<String> = Vec::new();
-                loop {
-                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
+            // Supervised: this is the loop that discovers and dials mesh peers.
+            spawn_supervised("mesh-dial", move || {
+                let node = node.clone();
+                let mesh = mesh.clone();
+                let enabled = enabled.clone();
+                async move {
+                    use crate::a9::webrtc::select_dial_targets;
+                    let mut prev_ids: Vec<String> = Vec::new();
+                    loop {
+                        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        // Keep-last-good: a failed fetch (gateway outage) keeps the previous
+                        // directory instead of blanking it — see fetch_mesh_peer_ids.
+                        let ids = node
+                            .fetch_mesh_peer_ids()
+                            .await
+                            .unwrap_or_else(|| prev_ids.clone());
+                        // A directory change (fetched from the ~free edge-cached /api/peers) may mean a new
+                        // peer will dial us — wake the signaling poll so it drains promptly instead of
+                        // waiting out the slow safety cadence. This is what makes draining event-driven.
+                        if ids != prev_ids {
+                            mesh.touch().await;
+                            prev_ids = ids.clone();
+                        }
+                        // Publish the directory so inbound offers can be gated to real, announced peers.
+                        mesh.set_known_peers(&ids).await;
+                        // Dial targets chosen RELATIVE to our own id (nearest higher-id successors +
+                        // spread), so every node forms edges and the whole network meshes — not just the
+                        // ~13 lowest-id nodes that the old "take the 12 smallest ids" rule connected.
+                        let local = mesh.local_id().to_string();
+                        for id in select_dial_targets(&local, &ids, MESH_DEGREE) {
+                            let _ = mesh.dial(&id).await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(15)).await;
                     }
-                    // Keep-last-good: a failed fetch (gateway outage) keeps the previous
-                    // directory instead of blanking it — see fetch_mesh_peer_ids.
-                    let ids = node
-                        .fetch_mesh_peer_ids()
-                        .await
-                        .unwrap_or_else(|| prev_ids.clone());
-                    // A directory change (fetched from the ~free edge-cached /api/peers) may mean a new
-                    // peer will dial us — wake the signaling poll so it drains promptly instead of
-                    // waiting out the slow safety cadence. This is what makes draining event-driven.
-                    if ids != prev_ids {
-                        mesh.touch().await;
-                        prev_ids = ids.clone();
-                    }
-                    // Publish the directory so inbound offers can be gated to real, announced peers.
-                    mesh.set_known_peers(&ids).await;
-                    // Dial targets chosen RELATIVE to our own id (nearest higher-id successors +
-                    // spread), so every node forms edges and the whole network meshes — not just the
-                    // ~13 lowest-id nodes that the old "take the 12 smallest ids" rule connected.
-                    let local = mesh.local_id().to_string();
-                    for id in select_dial_targets(&local, &ids, MESH_DEGREE) {
-                        let _ = mesh.dial(&id).await;
-                    }
-                    tokio::time::sleep(Duration::from_secs(15)).await;
                 }
             });
         }
@@ -15567,13 +15585,19 @@ impl Node {
             // no Drop, so this is also what actually releases the ICE agent + UDP socket.
             let mesh = mesh.clone();
             let enabled = enabled.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
+            // Supervised: reaping stale links is what stops the mesh accumulating
+            // dead peers (and the ICE agents / UDP sockets they hold).
+            spawn_supervised("mesh-reap", move || {
+                let mesh = mesh.clone();
+                let enabled = enabled.clone();
+                async move {
+                    loop {
+                        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        mesh.reap_stale().await;
                     }
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-                    mesh.reap_stale().await;
                 }
             });
         }
@@ -15582,15 +15606,22 @@ impl Node {
             // peer links are up (vs. relay fallback). Only logs when at least one link is up.
             let mesh = mesh.clone();
             let enabled = enabled.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    let peers = mesh.connected_peers().await;
-                    if !peers.is_empty() {
-                        info!("mesh: {} direct peer link(s) up", peers.len());
+            // Supervised for consistency with the other mesh loops; this one is
+            // operator visibility only, so a silent death would hide the mesh degree
+            // exactly when a rollout is being watched.
+            spawn_supervised("mesh-heartbeat", move || {
+                let mesh = mesh.clone();
+                let enabled = enabled.clone();
+                async move {
+                    loop {
+                        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        let peers = mesh.connected_peers().await;
+                        if !peers.is_empty() {
+                            info!("mesh: {} direct peer link(s) up", peers.len());
+                        }
                     }
                 }
             });
