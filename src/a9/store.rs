@@ -66,6 +66,19 @@ pub struct SpaceStats {
     pub fragmented_bytes: u64,
 }
 
+// CACHE SIZING IS DELIBERATELY UNINSTRUMENTED.
+//
+// redb exposes hit/miss/eviction counters via ReadableDatabase::cache_stats(), which
+// would answer whether the 512 MiB budget matches the working set — the cache is the
+// dominant term in a warm node's RSS. They are collected ONLY under redb's
+// `cache_metrics` feature, which we do not enable: without it the accessor still
+// exists and reports zeros, so wiring it up unconditionally would ship telemetry that
+// looks like data and is not.
+//
+// Sizing the cache is a one-off question, not a continuous one, so it does not justify
+// paying counter overhead on every cache access forever. To answer it, build once with
+// `--features redb/cache_metrics`, run a representative workload, and read cache_stats().
+
 /// Table definitions require `&'static str` names; the chain's tree names are a
 /// small fixed set, so leak-once interning is bounded and permanent by design.
 fn interned(name: &str) -> &'static str {
@@ -191,8 +204,27 @@ impl Store {
                 pre_existing_len
             )));
         }
+        // A repair only runs after an unclean shutdown, and on a multi-GB chain it can
+        // take long enough that an operator reasonably concludes the node has hung and
+        // kills it — which is the one thing that turns a recoverable open into a real
+        // problem. redb will tell us how far along it is, so say so. Logged at most
+        // once every 5% so a slow repair does not become a log flood.
+        // Fn, not FnMut, so the throttle state needs interior mutability. Holds the
+        // last reported 5% bucket.
+        let last_bucket = AtomicU64::new(u64::MAX);
         let db = redb::Builder::new()
             .set_cache_size(cache_bytes)
+            .set_repair_callback(move |session| {
+                let pct = (session.progress() * 100.0) as u64;
+                let bucket = pct / 5;
+                if last_bucket.swap(bucket, Ordering::Relaxed) != bucket {
+                    log::warn!(
+                        "chain DB repair in progress: {}% — normal after an unclean \
+                         shutdown, do NOT kill the process",
+                        pct
+                    );
+                }
+            })
             .create(&path)
             .map_err(|e| classify_open_error(e, pre_existing_len > 0))?;
         let store = Store {
