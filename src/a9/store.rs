@@ -360,8 +360,7 @@ impl Store {
     }
 }
 
-/// A batch of writes applied in one all-or-nothing transaction. Drop-in for
-/// `sled::Batch`.
+/// A batch of writes applied in one all-or-nothing transaction.
 #[derive(Default, Clone)]
 pub struct Batch {
     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -1047,6 +1046,125 @@ mod tests {
         assert_eq!(store.get(b"k").unwrap(), Some(b"v".to_vec()));
         let names = store.tree_names().unwrap();
         assert!(names.contains(&DEFAULT_TREE.as_bytes().to_vec()));
+    }
+
+    /// Differential model test: an arbitrary interleaving of every mutating and
+    /// reading operation, checked against a BTreeMap oracle.
+    ///
+    /// The engine swap replaced the implementation under this module while promising
+    /// unchanged semantics to ~120 call sites. The other tests here cover the shapes
+    /// we thought to write down; this covers interleavings we did not. The failure
+    /// class it exists for is silent: a wrapper that returns the wrong previous value
+    /// from insert, drops a key from a prefix scan, or leaves entries behind after
+    /// clear does not crash — it corrupts chain state while the node keeps running.
+    ///
+    /// Deterministic (fixed-seed LCG) so a failure reproduces exactly rather than
+    /// showing up once in CI and never again. `tests/fuzz/fuzz_targets/store_ops.rs`
+    /// runs the same model under libFuzzer for unbounded exploration.
+    #[test]
+    fn operations_match_a_btreemap_model_under_arbitrary_interleaving() {
+        use std::collections::BTreeMap;
+
+        let store = Store::temporary().expect("temp store");
+        let tree = store.open_tree(b"model").expect("open tree");
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        // Small key space on purpose: collisions are where overwrite,
+        // delete-then-read and previous-value semantics actually get exercised.
+        const KEY_SPACE: u8 = 16;
+        let key_of = |b: u8| vec![b % KEY_SPACE, b];
+
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u8
+        };
+
+        for _ in 0..4000 {
+            let op = next() % 8;
+            let arg = next();
+            match op {
+                0 => {
+                    let (k, v) = (key_of(arg), vec![arg; 1 + (arg as usize % 24)]);
+                    let got = tree.insert(&k, &v).expect("insert");
+                    assert_eq!(got, model.insert(k, v), "insert previous value");
+                }
+                1 => {
+                    let k = key_of(arg);
+                    let got = tree.remove(&k).expect("remove");
+                    assert_eq!(got, model.remove(&k), "remove previous value");
+                }
+                2 => {
+                    let k = key_of(arg);
+                    assert_eq!(tree.get(&k).expect("get"), model.get(&k).cloned(), "get");
+                }
+                3 => {
+                    let k = key_of(arg);
+                    assert_eq!(
+                        tree.contains_key(&k).expect("contains_key"),
+                        model.contains_key(&k),
+                        "contains_key"
+                    );
+                }
+                4 => {
+                    let mut batch = Batch::default();
+                    let mut staged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+                    for j in 0..1 + (arg as usize % 6) {
+                        let kb = arg.wrapping_add(j as u8);
+                        let k = key_of(kb);
+                        if kb % 3 == 0 {
+                            batch.remove(&k);
+                            staged.push((k, None));
+                        } else {
+                            let v = vec![kb; 1 + (kb as usize % 8)];
+                            batch.insert(&k, &v);
+                            staged.push((k, Some(v)));
+                        }
+                    }
+                    tree.apply_batch(batch).expect("apply_batch");
+                    for (k, v) in staged {
+                        match v {
+                            Some(v) => model.insert(k, v),
+                            None => model.remove(&k),
+                        };
+                    }
+                }
+                5 => {
+                    let got: Vec<KvPair> = tree.iter().map(|r| r.expect("scan")).collect();
+                    let expected: Vec<KvPair> =
+                        model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    assert_eq!(got, expected, "full scan");
+                    assert_eq!(tree.len().expect("len") as usize, model.len(), "len");
+                }
+                6 => {
+                    let prefix = vec![arg % KEY_SPACE];
+                    let got: Vec<KvPair> = tree
+                        .scan_prefix(&prefix)
+                        .map(|r| r.expect("scan"))
+                        .collect();
+                    let expected: Vec<KvPair> = model
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    assert_eq!(got, expected, "prefix scan");
+                }
+                _ => {
+                    tree.clear().expect("clear");
+                    model.clear();
+                    assert!(tree.is_empty().expect("is_empty"), "clear left entries");
+                    assert_eq!(tree.first().expect("first"), None, "clear left a first key");
+                }
+            }
+        }
+
+        let final_scan: Vec<KvPair> = tree.iter().map(|r| r.expect("scan")).collect();
+        let final_model: Vec<KvPair> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(final_scan, final_model, "final state");
+        assert_eq!(tree.first().expect("first"), final_model.first().cloned());
+        assert_eq!(tree.last().expect("last"), final_model.last().cloned());
     }
 
     #[test]

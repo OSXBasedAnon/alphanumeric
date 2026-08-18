@@ -31,3 +31,10 @@ path = "fuzz_targets/block_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store_ops"
+path = "fuzz_targets/store_ops.rs"
+test = false
+doc = false
+bench = false
