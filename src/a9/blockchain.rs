@@ -1427,7 +1427,7 @@ pub struct Blockchain {
     /// trusted_checkpoint_height).
     last_known_checkpoint: Arc<AtomicU64>,
     /// Genesis timestamp memo (genesis is immutable): calculate_block_reward used
-    /// to do a sled get + full block deserialize on EVERY call — and the template
+    /// to do a store get + full block deserialize on EVERY call — and the template
     /// packer calls it 4x per admitted candidate.
     genesis_timestamp: Arc<std::sync::OnceLock<u64>>,
     state_mutation_lock: Arc<Mutex<()>>,
@@ -2083,9 +2083,11 @@ impl Blockchain {
     /// `commit_receipt_batch`, instead of the 4-5 full-DB fsyncs each block
     /// pays outside a window (the 11-13 blk/s catch-up ceiling). Inside the
     /// window the per-apply helpers (mark/clear/reconcile, the persist flush
-    /// block, the checkpoint-raise flush) become in-memory bookkeeping, with
-    /// sled's background flush cadence bounding mid-window loss; a window
-    /// that applies nothing costs zero fsyncs. Correctness under a mid-window
+    /// block, the checkpoint-raise flush) become in-memory bookkeeping. Under
+    /// redb those non-durable commits are visible but not fsynced, so a crash
+    /// mid-window loses back to the last durable commit — bounded by the 30s
+    /// flush loop rather than by any engine-internal cadence; a window that
+    /// applies nothing costs zero fsyncs. Correctness under a mid-window
     /// crash is unchanged: the marker is durable BEFORE any window mutation
     /// can persist, so startup/next-apply recovery runs the same full rebuild
     /// it runs today. An apply that fails after its mutation point is healed
@@ -2380,7 +2382,7 @@ impl Blockchain {
 
     /// Raise the trusted checkpoint to `height`. Monotonic — a lower value is
     /// ignored, so finality can never regress. The compare-and-raise runs inside
-    /// sled's update_and_fetch so two concurrent sync tasks (relay + p2p) cannot
+    /// the store's update_and_fetch so two concurrent sync tasks (relay + p2p) cannot
     /// race a stale read and clobber a higher committed value.
     ///
     /// CLAMPED TO trail OUR OWN TIP by the reorg margin. Two invariants, one clamp:
@@ -2532,7 +2534,7 @@ impl Blockchain {
             .filter(|tx| self.confirmed_tx_index(&tx.get_tx_id()).is_some())
             .collect();
         // ALSO sweep the persisted pending tree: `info`, the re-announce, and
-        // sync_mempool_with_sled (which REBUILDS the in-memory mempool from sled)
+        // sync_mempool_with_store (which REBUILDS the in-memory mempool from the store)
         // all read the tree, so clearing memory alone lets the very next sync
         // re-poison it — the "mempool still shows 1 pending after a clean mine"
         // symptom. The tree can also hold confirmed txs the in-memory set never
@@ -2560,8 +2562,8 @@ impl Blockchain {
         // sidecar + pending-debit index) by tx_id — the same path block
         // confirmation uses, so hygiene cannot diverge from it.
         //
-        // `stale` (in-memory) and `tree_stale` (sled) OVERLAP: add_transaction writes both the
-        // mempool and the pending tree, and sync_mempool_with_sled rebuilds the mempool FROM the
+        // `stale` (in-memory) and `tree_stale` (on-disk) OVERLAP: add_transaction writes both the
+        // mempool and the pending tree, and sync_mempool_with_store rebuilds the mempool FROM the
         // tree, so a confirmed tx is normally present in both. clear_processed_transactions
         // subtracts each tx's pending debit PER occurrence (saturating), so listing a tx twice
         // would double-subtract and wipe the reservation still held by the sender's OTHER pending
@@ -2620,7 +2622,7 @@ impl Blockchain {
         }
         tree.apply_batch(batch)?;
         index.apply_batch(index_batch)?;
-        // No per-tree flush: in sled, Tree::flush() IS a full-database
+        // No per-tree flush: a tree flush IS a full-database
         // pagecache flush + fsync, and every caller of this path ends its dirty
         // window with one authoritative db.flush() (persist/reorg tails). The
         // intermediate flushes multiplied whole-DB fsyncs per applied block for
@@ -3087,7 +3089,7 @@ impl Blockchain {
             batch.insert(key, value);
         }
         tree.apply_batch(batch)?;
-        // No per-tree flush (a full-DB fsync in sled): the commit sites' tail
+        // No per-tree flush (it is a full-DB fsync): the commit sites' tail
         // db.flush() covers durability, and the boot-time catch-up loop calls this
         // once per block — the flush made a day of offline catch-up cost one
         // whole-DB fsync per height.
@@ -3808,9 +3810,9 @@ impl Blockchain {
     /// into the pending tree (compact storage form) and the full-signature sidecar,
     /// exactly as add_transaction persists a fresh submission. Without this the
     /// re-queue lived only in the in-memory mempool — and the next
-    /// sync_mempool_with_sled (any `account`/`info` command, the 45s gossip
+    /// sync_mempool_with_store (any `account`/`info` command, the 45s gossip
     /// re-announce, or a restart) wiped the mempool, rebuilt it exclusively from
-    /// the sled pending tree, and silently destroyed the payment. No re-validation
+    /// the pending tree, and silently destroyed the payment. No re-validation
     /// here: the tx was consensus-valid in a mined block and
     /// rehydrate_reverted_tx restored its full witness; the periodic pending
     /// re-verification passes prune anything that has gone stale since.
@@ -3921,7 +3923,7 @@ impl Blockchain {
         // Memoise canonical work per fork height for this attempt. tip.index is
         // fixed, so canonical_work_range(fork, tip) depends only on `fork`; many
         // competing branches share a fork height and would otherwise re-read the
-        // same [fork..=tip] slice from sled on every branch. Precompute the suffix
+        // same [fork..=tip] slice from the store on every branch. Precompute the suffix
         // sum in a single walk down from the tip so each lookup is O(1) and total
         // canonical block reads are bounded by the reorg window, not branches × span.
         let mut canonical_suffix: HashMap<u32, BigUint> = HashMap::new();
@@ -4345,9 +4347,9 @@ impl Blockchain {
                     Some(full) => {
                         // DURABILITY FIRST (the other half of M14): the in-memory
                         // readmit alone did not survive the next
-                        // sync_mempool_with_sled — any `account`/`info` command,
+                        // sync_mempool_with_store — any `account`/`info` command,
                         // the gossip re-announce, or a restart wiped the mempool
-                        // and rebuilt it from the sled pending tree, where this tx
+                        // and rebuilt it from the pending tree, where this tx
                         // no longer existed: the payment vanished without trace.
                         // Persist the pending row + full-signature sidecar; the
                         // debit/credit reservations are recomputed in one pass
@@ -4377,7 +4379,7 @@ impl Blockchain {
         if readmitted > 0 {
             // One pass recomputes the pending debit/credit reservations from the
             // now-complete pending tree — identical to what the next
-            // sync_mempool_with_sled derives, but without waiting for one.
+            // sync_mempool_with_store derives, but without waiting for one.
             if let Err(e) = self.rebuild_pending_debits_index().await {
                 warn!("Reorg: pending debit index rebuild failed: {}", e);
             }
@@ -4727,7 +4729,7 @@ impl Blockchain {
         // durability is the window's begin-marker + commit flush, and the
         // gated clear below only balances the window's mark/clear pair.
         if !self.apply_batch_open() {
-            // One authoritative fsync. Tree::flush() is a full-DB fsync in sled
+            // One authoritative fsync. A tree flush is a full-DB fsync
             // (single shared log), so the balances/chain-meta tree flushes that
             // used to follow were pure repeats — same fix, same reason as the
             // finalize-path tail.
@@ -5494,9 +5496,9 @@ impl Blockchain {
         // Get and set the network difficulty first
         self.get_network_difficulty().await?;
 
-        // Sync mempool with sled
+        // Sync mempool with the store
         let _ = self.prune_pending_transactions();
-        self.sync_mempool_with_sled().await?;
+        self.sync_mempool_with_store().await?;
         self.pending_rules_complete.store(
             self.next_block_index() >= FEE_SYSTEM_ACTIVATION_HEIGHT,
             Ordering::Release,
@@ -7535,7 +7537,7 @@ impl Blockchain {
         const SECONDS_IN_SIX_MONTHS: u64 = 15_768_000; // 182.5 days
 
         // Calculate periods since genesis for halving. Genesis is immutable, so
-        // its timestamp is memoized after the first read (this used to be a sled
+        // its timestamp is memoized after the first read (this used to be a store
         // get + full block deserialize per reward calculation, on the validation
         // hot path AND 4x per template-packer candidate).
         let genesis_ts = match self.genesis_timestamp.get() {
@@ -7913,8 +7915,8 @@ impl Blockchain {
             })
     }
 
-    pub async fn sync_mempool_with_sled(&self) -> Result<(), BlockchainError> {
-        self.sync_mempool_with_sled_at(FEE_SYSTEM_ACTIVATION_HEIGHT)
+    pub async fn sync_mempool_with_store(&self) -> Result<(), BlockchainError> {
+        self.sync_mempool_with_store_at(FEE_SYSTEM_ACTIVATION_HEIGHT)
             .await
     }
 
@@ -7954,7 +7956,7 @@ impl Blockchain {
         #[cfg(test)]
         self.pending_rules_revalidation_runs
             .fetch_add(1, Ordering::AcqRel);
-        self.sync_mempool_with_sled().await?;
+        self.sync_mempool_with_store().await?;
 
         if self.next_block_index() >= FEE_SYSTEM_ACTIVATION_HEIGHT {
             self.pending_rules_complete.store(true, Ordering::Release);
@@ -7964,7 +7966,7 @@ impl Blockchain {
         Ok(())
     }
 
-    async fn sync_mempool_with_sled_at(
+    async fn sync_mempool_with_store_at(
         &self,
         activation_height: u32,
     ) -> Result<(), BlockchainError> {
@@ -7972,12 +7974,12 @@ impl Blockchain {
         // Clear existing mempool
         let mut mempool = self.mempool.write().await;
 
-        // Get pending transactions from sled
+        // Get pending transactions from the store
         let _ = self.prune_pending_transactions();
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
 
-        // Collect all transactions from sled, removing any stale malformed rows so
+        // Collect all transactions from the store, removing any stale malformed rows so
         // pending indexes and future mining attempts cannot stay poisoned.
         let mut transactions = Vec::new();
         let mut invalid_txs = Vec::new();
@@ -8076,13 +8078,13 @@ impl Blockchain {
 
         // Reset mempool and rebuild from the durable pending set. Admission is
         // BEST-EFFORT: the in-memory caps (per-sender / pool size / bytes) are soft
-        // admission-control limits, but the sled pending tree is the source of truth
+        // admission-control limits, but the pending tree is the source of truth
         // and can legitimately exceed them across the eviction and TTL windows. A
         // fatal `?` here aborts the whole sync — and on the initialize() path the
         // whole process — the instant the durable set overflows a cap, turning a tx
         // flood into a boot-time DoS (the node then cannot start until the rows age
         // past the 7200s prune). Drop the overflow from memory and keep going;
-        // get_pending_transactions reads the sled tree directly, so nothing is lost.
+        // get_pending_transactions reads the pending tree directly, so nothing is lost.
         *mempool = Mempool::new();
         for tx in transactions {
             let _ = mempool.add_transaction(tx);
@@ -8094,11 +8096,11 @@ impl Blockchain {
     }
 
     pub async fn get_pending_transactions(&self) -> Result<Vec<Transaction>, BlockchainError> {
-        // Pure read, straight from the sled pending tree. This used to call
-        // sync_mempool_with_sled first — taking the state_mutation_lock (the SAME
+        // Pure read, straight from the pending tree. This used to call
+        // sync_mempool_with_store first — taking the state_mutation_lock (the SAME
         // lock every block apply holds), re-verifying every pending signature,
         // fsyncing twice and rebuilding the whole in-memory mempool — for a
-        // DISPLAY read (`account`, `info`) that then read the sled tree directly
+        // DISPLAY read (`account`, `info`) that then read the pending tree directly
         // anyway. During a deep sync that turned a balance query into a silent
         // multi-minute hang one layer below the caller's timeout. The periodic
         // re-verification paths (initialize, the gossip re-announce) still prune
@@ -8118,15 +8120,15 @@ impl Blockchain {
 
     /// Pending transactions carrying their FULL signatures — for the gossip / re-announce path,
     /// which must broadcast peer-verifiable transactions. get_pending_transactions returns the
-    /// persisted sled records, which hold a TRUNCATED signature (the full signature lives in the
+    /// persisted records, which hold a TRUNCATED signature (the full signature lives in the
     /// PENDING_FULL_SIGNATURES_TREE sidecar); re-announcing those would gossip unverifiable txs that
     /// peers defer — the truncated-witness pathology. The in-memory mempool holds the full signature,
-    /// so sync from sled first (which rehydrates the full signature and skips any tx whose sidecar
+    /// so sync from the store first (which rehydrates the full signature and skips any tx whose sidecar
     /// copy is missing, rather than gossiping it truncated) and read the mempool.
     pub async fn get_pending_transactions_with_full_signatures(
         &self,
     ) -> Result<Vec<Transaction>, BlockchainError> {
-        self.sync_mempool_with_sled().await?;
+        self.sync_mempool_with_store().await?;
         self.get_mempool_transactions().await
     }
 
@@ -8281,7 +8283,7 @@ impl Blockchain {
                     )?;
                 }
             }
-            // No per-tree flushes here (each was a full-DB fsync in sled): this
+            // No per-tree flushes here (each was a full-DB fsync): this
             // runs inside the block-apply dirty window, which both persist tails
             // close with one authoritative db.flush(). Five redundant whole-DB
             // fsyncs per applied block deleted.
@@ -8403,7 +8405,7 @@ impl Blockchain {
             // invoked with `?` before the block store and tip write, so a failure here aborts the
             // block commit while the dirty marker stays set, and recovery re-retains — from this
             // same store or the pending sidecar — once the underlying fault (disk full, transient
-            // sled error) clears. Halting is the correct response to being unable to keep evidence
+            // store error) clears. Halting is the correct response to being unable to keep evidence
             // we are obligated to serve; the alternative is a silently witness-short frontier.
             //
             // The object is content-equivalent per tx_id (the same signed transaction re-mined
@@ -8654,7 +8656,8 @@ impl Blockchain {
             // Index is current and the address has no entry, so its confirmed balance is 0.
             // Do NOT persist a 0-entry here: this is the read path (explorer / RPC balance
             // queries for arbitrary addresses), and writing on read grows the balances tree
-            // without bound (sled never reclaims freed keys). Every later read of this address
+            // without bound: one key per address ever queried, and deleting them later
+            // reclaims pages but never un-writes the keys. Every later read of this address
             // hits this same branch and returns 0 without a slow-path recompute; the consensus
             // writer persists real entries for every address a block actually touches.
             return Ok(0);
@@ -10634,7 +10637,7 @@ mod tests {
 
         bc.persist_readmitted_pending_tx(&full).unwrap();
 
-        // The pending row exists (this is what sync_mempool_with_sled rebuilds
+        // The pending row exists (this is what sync_mempool_with_store rebuilds
         // from — before the fix the re-queue lived only in memory and the next
         // rebuild silently destroyed the payment) and stores the COMPACT form.
         let pending = bc.db.open_tree(PENDING_TRANSACTIONS_TREE).unwrap();
@@ -11467,8 +11470,8 @@ mod tests {
 
     /// A confirmed-balance read for an absent address on a current-index chain returns 0
     /// WITHOUT persisting a phantom 0-entry. The old read-path write grew the balances tree
-    /// without bound (one key per explorer/RPC query of an arbitrary address; sled never
-    /// reclaims), while the returned value — and total supply — are unchanged.
+    /// without bound (one key per explorer/RPC query of an arbitrary address), while the
+    /// returned value — and total supply — are unchanged.
     #[tokio::test]
     async fn confirmed_balance_read_does_not_persist_phantom_zero_entries() {
         let bc = test_blockchain();
@@ -14546,13 +14549,13 @@ mod tests {
         assert_eq!(mempool.len(), 1);
     }
 
-    // #5: a confirmed tx lives in BOTH the in-memory mempool and the sled pending tree
+    // #5: a confirmed tx lives in BOTH the in-memory mempool and the pending tree
     // (add_transaction writes both), so drop_confirmed_mempool_txs' stale+tree_stale union lists it
     // twice. clear_processed_transactions subtracts the pending debit per occurrence, so without the
     // tx_id dedup the double-subtract saturates the sender's reservation to 0 and wipes the debit
     // still held by their OTHER pending tx. This asserts the surviving reservation.
     #[tokio::test]
-    async fn drop_confirmed_dedups_debit_across_memory_and_sled() {
+    async fn drop_confirmed_dedups_debit_across_memory_and_store() {
         let bc = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
         // Asymmetric amounts (delta_a < delta_b) so the pre-fix double-subtract lands on a specific
@@ -14577,7 +14580,7 @@ mod tests {
             "both pending txs reserve their debit"
         );
 
-        // Mark ONLY tx_a confirmed (it is in both the mempool and the sled tree); tx_b stays pending.
+        // Mark ONLY tx_a confirmed (it is in both the mempool and the pending tree); tx_b stays pending.
         let confirmed = bc.open_confirmed_tx_tree().expect("confirmed tx tree");
         confirmed
             .insert(tx_a.get_tx_id().as_bytes(), 0u32.to_le_bytes())
@@ -14648,7 +14651,7 @@ mod tests {
     async fn reannounce_accessor_returns_full_signatures() {
         let bc = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        // A fresh timestamp: sync_mempool_with_sled prunes pending rows older than the TTL.
+        // A fresh timestamp: sync_mempool_with_store prunes pending rows older than the TTL.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -14663,12 +14666,12 @@ mod tests {
         bc.add_transaction(tx.clone()).await.expect("tx admitted");
 
         // get_pending_transactions reads the SLED record -> TRUNCATED signature.
-        let sled_pending = bc.get_pending_transactions().await.unwrap();
-        assert_eq!(sled_pending.len(), 1);
-        let sled_sig = hex::decode(sled_pending[0].signature.as_ref().unwrap()).unwrap();
+        let store_pending = bc.get_pending_transactions().await.unwrap();
+        assert_eq!(store_pending.len(), 1);
+        let store_sig = hex::decode(store_pending[0].signature.as_ref().unwrap()).unwrap();
         assert!(
-            sled_sig.len() <= 64,
-            "sled pending record carries a truncated signature"
+            store_sig.len() <= 64,
+            "store pending record carries a truncated signature"
         );
 
         // The re-announce accessor rehydrates the FULL signature from the sidecar.
@@ -14677,7 +14680,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(full_pending.len(), 1);
-        assert_eq!(full_pending[0].get_tx_id(), sled_pending[0].get_tx_id());
+        assert_eq!(full_pending[0].get_tx_id(), store_pending[0].get_tx_id());
         let full_sig = hex::decode(full_pending[0].signature.as_ref().unwrap()).unwrap();
         assert_eq!(
             full_sig.len(),
@@ -16107,7 +16110,7 @@ mod tests {
             Transaction::to_units(1.0)
         );
 
-        bc.sync_mempool_with_sled_at(1)
+        bc.sync_mempool_with_store_at(1)
             .await
             .expect("activated pending revalidation should complete");
 
@@ -16309,11 +16312,11 @@ mod tests {
         tx.pub_key = wallet.get_public_key_hex().await;
         let tx_id = tx.get_tx_id();
 
-        // Staged DIRECTLY into sled rather than through add_transaction, because
+        // Staged DIRECTLY into the store rather than through add_transaction, because
         // admission now refuses a non-canonical recipient as relay policy. That
         // guard does not cover the case this test exists for: a transaction
-        // admitted by an OLDER node version, still sitting in the sled pending
-        // tree when the operator upgrades. sync_mempool_with_sled rebuilds the
+        // admitted by an OLDER node version, still sitting in the pending
+        // tree when the operator upgrades. sync_mempool_with_store rebuilds the
         // mempool from that tree without passing through admission, so the
         // activation-time eviction below is what actually removes it. Writing the
         // row directly reproduces that state exactly.
@@ -16328,7 +16331,7 @@ mod tests {
             bc.get_pending_debit_units(&wallet.address).await.unwrap() > 0,
             "the debit must be reserved before eviction, or the assertion below is vacuous"
         );
-        bc.sync_mempool_with_sled_at(1)
+        bc.sync_mempool_with_store_at(1)
             .await
             .expect("activation revalidation should complete");
 

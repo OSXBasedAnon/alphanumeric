@@ -2543,8 +2543,8 @@ impl Mgmt {
 
         // Mempool rows. get_mempool_transactions is a prune + clone; the old
         // code called get_pending_transactions ONCE PER WALLET, and each call
-        // ran sync_mempool_with_sled — state_mutation_lock, full signature
-        // re-verification of every pending tx, two sled flushes and a
+        // ran sync_mempool_with_store — state_mutation_lock, full signature
+        // re-verification of every pending tx, two store flushes and a
         // pending-debits rebuild. A read-only screen was doing N mempool
         // rebuilds under the chain guard.
         let mempool = guard.get_mempool_transactions().await.unwrap_or_default();
