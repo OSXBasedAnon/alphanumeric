@@ -817,17 +817,27 @@ async fn async_main() -> Result<()> {
         }
         {
             let db_for_flush = db.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    interval.tick().await;
-                    // Flush on the blocking pool, never a runtime worker: a synchronous sled
-                    // flush that stalls under storage contention must not pin a tokio worker.
-                    // All-4-worker pins on inline sled I/O are what froze the publisher runtime
-                    // (2026-07-16 park); off-worker => the runtime + watchdog stay alive.
-                    let dbf = db_for_flush.clone();
-                    let _ = tokio::task::spawn_blocking(move || dbf.flush()).await;
+            // SUPERVISED, because this loop IS the durability barrier. Ordinary
+            // mutations commit with Durability::None; `flush()` is the only
+            // Immediate two-phase commit the node ever makes. A panic in a plain
+            // spawn unwinds into a JoinError nobody reads, so the node would keep
+            // running and keep accepting blocks while nothing more reached disk —
+            // silently, until a crash discarded everything since the last tick.
+            alphanumeric::a9::node::spawn_supervised("db-flush", move || {
+                let db_for_flush = db_for_flush.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        // Flush on the blocking pool, never a runtime worker: a synchronous
+                        // flush that stalls under storage contention must not pin a tokio
+                        // worker. All-4-worker pins on inline store I/O are what froze the
+                        // publisher runtime (2026-07-16 park); off-worker => the runtime +
+                        // watchdog stay alive.
+                        let dbf = db_for_flush.clone();
+                        let _ = tokio::task::spawn_blocking(move || dbf.flush()).await;
+                    }
                 }
             });
         }
