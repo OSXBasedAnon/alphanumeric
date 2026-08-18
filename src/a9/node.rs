@@ -297,7 +297,7 @@ pub const REBOOTSTRAP_HARD_COOLDOWN_SECS: u64 = 300;
 
 /// Marker meaning "the runtime PROVED this chain cannot converge — re-bootstrap
 /// at next boot regardless of what the (possibly stale) manifest comparison
-/// says." Lives INSIDE the sled directory so removing the chain removes it, and
+/// says." Lives INSIDE the chain DB directory so removing the chain removes it, and
 /// proven convergence deletes it.
 pub fn force_rebootstrap_marker_path(db_dir: &str) -> std::path::PathBuf {
     std::path::Path::new(db_dir).join("force_rebootstrap")
@@ -3602,8 +3602,8 @@ impl Node {
     /// Peer-cache location: env override first, else INSIDE the chain-DB directory
     /// so the address book survives reboots, else the legacy OS temp-dir default.
     /// Inside the DB dir (not its parent) because that directory is guaranteed
-    /// writable — sled writes there continuously — while the parent can be
-    /// read-only (system-wide installs); sled ignores foreign files in its dir.
+    /// writable — the store writes there continuously — while the parent can be
+    /// read-only (system-wide installs); the store ignores foreign files in its dir.
     /// The temp dir was the original home and is wiped by OS cleaners on reboot —
     /// i.e. the cache vanished exactly in the scenario it exists for (restarting
     /// during a gateway outage).
@@ -4771,7 +4771,7 @@ impl Node {
                                 // Storage/serialization trouble is TRANSIENT — report it
                                 // as a stale view so the caller retries soon. BranchInvalid
                                 // here gets memoized lineage-dead and PROPAGATES to every
-                                // child, so one sled hiccup mid-append would sideline our
+                                // child, so one storage hiccup mid-append would sideline our
                                 // own live lineage for the whole 300s cooldown.
                                 early = Some(
                                     if e.contains("Database error") || e.contains("Serialization") {
@@ -14125,7 +14125,7 @@ impl Node {
                     // Read the range in bounded chunks, RELEASING the blockchain read
                     // lock and yielding between chunks. Blocks were fully validated when
                     // saved, so no verify_pow/rehash here (that was ~1000 rehashes on the
-                    // event loop); and holding one read guard across all ~256 sled reads
+                    // event loop); and holding one read guard across all ~256 store reads
                     // blocked a queued block-ingest write() for the whole range. Chunking
                     // lets ingest and other events interleave. Serving is best-effort: a
                     // block that changes across a chunk boundary is caught by the
@@ -14772,7 +14772,7 @@ impl Node {
                     // pass verify and still fail the save. Committing before the save left that
                     // hash poisoned on the `?` early return, and the read-only gate above then
                     // dropped every later delivery of it — the exact suppression that gate's own
-                    // comment warns about. A transient save failure (sled IO, reconcile error)
+                    // comment warns about. A transient save failure (store IO, reconcile error)
                     // did the same to a perfectly valid block. This widens the check-then-insert
                     // window by the save duration, which costs at most a duplicate save_block
                     // call — documented directly above as a safe no-op.
@@ -20875,7 +20875,7 @@ mod tests {
     /// Release canary for the transaction batching/inventory rollout. This intentionally does
     /// not call `Node::start`: only the explicit loopback listeners below run, so discovery,
     /// announce, relay, WebRTC, stats, explorer and bootstrap publisher tasks cannot start or
-    /// contact production services. Every sled database is temporary and every listener binds
+    /// contact production services. Every chain database is temporary and every listener binds
     /// 127.0.0.1:0; dropping the test runtime removes the databases and identity-lock files.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "hermetic release canary: signs and relays 221 ML-DSA transactions"]
@@ -21634,7 +21634,7 @@ mod tests {
     }
 
     // The peer cache must live INSIDE the chain-DB directory (reboot-safe AND
-    // guaranteed writable — sled writes there continuously; the parent dir can be
+    // guaranteed writable — the store writes there continuously; the parent dir can be
     // read-only in system-wide installs), not in the OS temp dir (wiped exactly
     // when the address book matters: restarting during a gateway outage). Env
     // override is tested implicitly by these branches running with the var unset.
