@@ -1467,7 +1467,15 @@ async fn async_main() -> Result<()> {
                                 if !announced.first_sighting(tx) {
                                     continue;
                                 }
-                                let from_short = short_addr(&tx.sender);
+                                // FULL sender, never abbreviated. A 10-character prefix
+                                // is 40 bits, which is minutes of GPU grinding to collide
+                                // deliberately — the address-poisoning shape, where a
+                                // lookalike sender gets trusted or copied out of history.
+                                // The sender is the attacker-controlled, actionable half,
+                                // so it is shown whole. The recipient stays short: it is
+                                // one of the operator's own addresses, from a set they
+                                // already know, and nothing is decided by reading it.
+                                let from_full = tx.sender.clone();
                                 let amount = Transaction::from_units(tx.amount_units);
                                 // A whisper carries a message in its fee. It is still a
                                 // payment: the amount travels with it and is reported
@@ -1477,11 +1485,11 @@ async fn async_main() -> Result<()> {
                                 // as some code). Reporting the code without the value
                                 // would hide real money behind a novelty.
                                 match whisper_module.decode_whisper_in_tx(tx) {
-                                    Some(code) => whispers.push((from_short, code, amount)),
+                                    Some(code) => whispers.push((from_full, code, amount)),
                                     None => payments.push((
                                         amount,
                                         short_addr(&tx.recipient),
-                                        from_short,
+                                        from_full,
                                     )),
                                 }
                             }
@@ -1497,19 +1505,16 @@ async fn async_main() -> Result<()> {
                             if whisper_action(whispers.len(), recent, !whisper_accum.is_empty())
                                 == WhisperAction::Verbose
                             {
-                                for (from_short, code, amount) in &whispers {
+                                for (from_full, code, amount) in &whispers {
                                     notify_async(format!(
-                                        "\n{}whisper{}   {}{}{}  {:.8} ♦  from {}…  {}block {}{}",
+                                        "\n{}whisper{}   {}{}{}  {:.8} ♦  from {}",
                                         EV_WHISPER,
                                         EV_OFF,
                                         EV_CODE,
                                         code,
                                         EV_OFF,
                                         amount,
-                                        from_short,
-                                        EV_DIM,
-                                        block.index,
-                                        EV_OFF
+                                        from_full,
                                     )).await;
                                 }
                             } else {
@@ -1548,17 +1553,13 @@ async fn async_main() -> Result<()> {
                                     EV_OFF
                                 )).await;
                             } else {
-                                for (amount, to_short, from_short) in &payments {
+                                for (amount, _to_short, from_full) in &payments {
                                     notify_async(format!(
-                                        "\n{}received{}  {:.8} ♦  to {}…  from {}…  {}block {}{}",
+                                        "\n{}received{}  {:.8} ♦  from {}",
                                         EV_RECEIVED,
                                         EV_OFF,
                                         amount,
-                                        to_short,
-                                        from_short,
-                                        EV_DIM,
-                                        block.index,
-                                        EV_OFF
+                                        from_full,
                                     )).await;
                                 }
                             }
