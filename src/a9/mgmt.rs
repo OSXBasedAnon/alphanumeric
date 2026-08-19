@@ -2506,6 +2506,9 @@ impl Mgmt {
 
         struct Entry {
             wallet: String,
+            // The wallet ADDRESS, not the display name: dedup keys on this so one
+            // address loaded under two wallet names cannot double-count.
+            address: String,
             counterparty: String,
             amount_units: i128,
             fee_units: i128,
@@ -2517,21 +2520,32 @@ impl Mgmt {
             timestamp: u64,
         }
 
+        // Per-wallet recent-activity window. history is a RECENT view, not a lifetime
+        // ledger — for lifetime-correct totals use `account <address>` (uncapped scan).
+        const HISTORY_WINDOW_PER_WALLET: usize = 50;
+
         let tip = guard.get_latest_block_index();
         let index_ready = guard.address_index_ready();
         let mut entries: Vec<Entry> = Vec::new();
+        // True if any wallet filled its window — then the loaded set is a floor, not a
+        // lifetime count, and the header marks the total with a trailing `+`.
+        let mut window_capped = false;
 
         if index_ready {
             for (name, wallet) in wallets {
                 let recent = guard
-                    .address_recent_txs(&wallet.address, 50, None)
+                    .address_recent_txs(&wallet.address, HISTORY_WINDOW_PER_WALLET, None)
                     .unwrap_or_default();
+                if recent.len() >= HISTORY_WINDOW_PER_WALLET {
+                    window_capped = true;
+                }
                 for e in recent {
                     // Read every flag BEFORE moving the counterparty string out.
                     let (sender, recipient) = (e.is_sender(), e.is_recipient());
                     let coinbase = recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
                     entries.push(Entry {
                         wallet: name.clone(),
+                        address: wallet.address.clone(),
                         counterparty: e.counterparty,
                         amount_units: e.amount_units,
                         fee_units: e.fee_units,
@@ -2554,6 +2568,12 @@ impl Mgmt {
         // rebuilds under the chain guard.
         let mempool = guard.get_mempool_transactions().await.unwrap_or_default();
         for tx in mempool {
+            // A mempool row that is ALREADY confirmed — re-entered via gossip echo or a
+            // reorg, since get_mempool_transactions prunes by TTL only — would otherwise
+            // be counted a second time next to its confirmed row. Drop the pending copy.
+            if guard.is_tx_confirmed(&tx.get_tx_id()) {
+                continue;
+            }
             for (name, wallet) in wallets {
                 let is_sender = tx.sender == wallet.address;
                 let is_recipient = tx.recipient == wallet.address;
@@ -2562,6 +2582,7 @@ impl Mgmt {
                 }
                 entries.push(Entry {
                     wallet: name.clone(),
+                    address: wallet.address.clone(),
                     counterparty: if is_sender {
                         tx.recipient.clone()
                     } else {
@@ -2590,7 +2611,10 @@ impl Mgmt {
                 .then_with(|| b.timestamp.cmp(&a.timestamp))
         });
         entries.dedup_by(|a, b| {
-            a.wallet == b.wallet
+            // Key on ADDRESS, not wallet name: one address loaded under two names must
+            // collapse to one row. `height.is_some()` keeps this to confirmed rows —
+            // two distinct pending txs both have (None, 0) and must NOT be merged.
+            a.address == b.address
                 && a.height == b.height
                 && a.position == b.position
                 && a.height.is_some()
@@ -2648,11 +2672,15 @@ impl Mgmt {
         writeln!(stdout)?;
 
         if index_ready && total > 0 {
+            // Sum over the SHOWN rows only, so every contributor to `net` is visible on
+            // screen — net can never fold in rows you cannot see. A self-transfer nets
+            // exactly its fee (it moves coins to yourself), never 0.
             let net: i128 = entries
                 .iter()
+                .take(shown)
                 .map(|e| {
                     if e.is_self {
-                        0
+                        -e.fee_units
                     } else if e.is_out {
                         -(e.amount_units + e.fee_units)
                     } else {
@@ -2660,20 +2688,18 @@ impl Mgmt {
                     }
                 })
                 .sum();
-            ui_seg(&mut stdout, spec, UI_DIM, false, " confirmed  ")?;
-            ui_seg(
-                &mut stdout,
-                spec,
-                UI_BLUE,
-                false,
-                &format!("{} of {}", shown, total),
-            )?;
-            ui_pad(
-                &mut stdout,
-                spec,
-                12 + format!("{} of {}", shown, total).chars().count(),
-                30,
-            )?;
+            // "recent", not "confirmed": this window can include pending rows (marked
+            // as such per-row and counted in the sub-header). A trailing `+` on the
+            // total means a wallet filled its window, so more history exists than shown.
+            ui_seg(&mut stdout, spec, UI_DIM, false, " recent  ")?;
+            let count = format!(
+                "{} of {}{}",
+                shown,
+                total,
+                if window_capped { "+" } else { "" }
+            );
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
+            ui_pad(&mut stdout, spec, 9 + count.chars().count(), 30)?;
             ui_seg(&mut stdout, spec, UI_DIM, false, "net  ")?;
             ui_seg(
                 &mut stdout,
