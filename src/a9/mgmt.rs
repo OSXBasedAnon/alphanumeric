@@ -146,20 +146,25 @@ fn blocks_until_mature(reward_height: u32, as_of_height: u64) -> u64 {
         .saturating_sub(as_of_height)
 }
 
-/// "47 blocks (≈3m55s)" — human ETA for a coinbase that becomes spendable `blocks_left`
-/// blocks from now, at the TARGET_BLOCK_TIME cadence. Display-only.
-fn format_maturity_eta(blocks_left: u64) -> String {
+/// "≈3m55s" — just the wait, for the width-constrained `bal` grid where the note
+/// column has no room for the block count. Display-only.
+fn maturity_eta_short(blocks_left: u64) -> String {
     let secs = blocks_left.saturating_mul(TARGET_BLOCK_TIME);
-    let eta = if secs >= 60 {
+    if secs >= 60 {
         format!("≈{}m{:02}s", secs / 60, secs % 60)
     } else {
         format!("≈{}s", secs)
-    };
+    }
+}
+
+/// "47 blocks (≈3m55s)" — human ETA for a coinbase that becomes spendable `blocks_left`
+/// blocks from now, at the TARGET_BLOCK_TIME cadence. Display-only.
+fn format_maturity_eta(blocks_left: u64) -> String {
     format!(
         "{} block{} ({})",
         blocks_left,
         if blocks_left == 1 { "" } else { "s" },
-        eta
+        maturity_eta_short(blocks_left)
     )
 }
 
@@ -2857,7 +2862,6 @@ impl Mgmt {
             address: String,
             spendable: f64,
             maturing: f64,
-            maturing_count: usize,
             next_unlock: u64,
             pending: f64,
             incoming: f64,
@@ -2885,7 +2889,6 @@ impl Mgmt {
                         address: wallet.address.clone(),
                         spendable: breakdown.spendable,
                         maturing,
-                        maturing_count: breakdown.maturing.len(),
                         next_unlock,
                         pending: breakdown.pending_debit,
                         incoming: breakdown.pending_credit,
@@ -2898,7 +2901,6 @@ impl Mgmt {
                     address: wallet.address.clone(),
                     spendable: 0.0,
                     maturing: 0.0,
-                    maturing_count: 0,
                     next_unlock: 0,
                     pending: 0.0,
                     incoming: 0.0,
@@ -3112,12 +3114,12 @@ impl Mgmt {
                     UI_ORANGE,
                     false,
                     None,
-                    &format!(
-                        "{} reward{} · next {}",
-                        row.maturing_count,
-                        if row.maturing_count == 1 { "" } else { "s" },
-                        format_maturity_eta(row.next_unlock)
-                    )
+                    // Just the wait. The full form ("1 reward · next 47 blocks
+                    // (≈3m36s)") runs ~34 characters past the note column and wraps
+                    // the row — worst on an unsynced wallet, where next_unlock is
+                    // measured against a stale height. The count and the block
+                    // number are not what someone typing `bal` is asking.
+                    &maturity_eta_short(row.next_unlock)
                 );
             }
             if row.pending > 0.0 {
