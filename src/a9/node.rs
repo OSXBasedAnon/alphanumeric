@@ -156,12 +156,36 @@ const BEACON_POLL_INTERVAL_SECS: u64 = 3;
 /// window plus the gateway's beacon TTL (~5 min), i.e. ~15 min, versus FOREVER before.
 const BEACON_HIGH_WATER_WINDOW_SECS: u64 = 600;
 
+/// Ed25519 public key(s) authorised to sign the tip beacon. A beacon's
+/// `public_key`/`node_id` must be one of these AND its signature must verify over the
+/// canonical message, or the beacon is treated as UNVERIFIED — receipt-trust is then
+/// NOT extended past this node's own finality floor (see `converge_to_canonical`'s
+/// ceiling, the `sync_full_history` committed-span fast path, and the beacon-height
+/// checkpoint raise). A SET, so a publisher identity rotation can ship in a client
+/// release AHEAD of the gateway signing with the new key, with no flag day. Value is
+/// the launch publisher node-identity key (== gateway LAUNCH_TRUSTED_NODE_KEYS and the
+/// live /api/tip node_id); it is NOT the bootstrap-manifest key (that one signs a
+/// different object and lives in main.rs).
+const TIP_BEACON_PUBKEYS: &[&str] =
+    &["647265665eccfdc18b8db3b783a2007240fac98c69588614b2a52488587ce132"];
+
 /// The canonical tip as advertised by the signed beacon (height, hash, version).
+///
+/// `verified` is true only when the beacon's Ed25519 signature was checked against a
+/// pinned `TIP_BEACON_PUBKEYS` key over the canonical message the publisher signed.
+/// It gates every place a beacon expands trust past our own floor: the receipt-trust
+/// ceiling, the deep committed-span fast path, and raising finality from the beacon
+/// height. An unverified anchor (a synthesised relay candidate, or a beacon whose
+/// signature did not verify) still drives convergence, but only ever receipt-trusts
+/// history at/below our own finalized floor — the frontier then demands full witnesses.
+/// (Receipt-trust skips per-transaction signature verification, so it may cover only
+/// history an authenticated anchor vouches for; an unauthenticated one must not widen it.)
 #[derive(Clone, Copy, Debug)]
 struct TipBeaconInfo {
     height: u32,
     hash: [u8; 32],
     version: u64,
+    verified: bool,
 }
 
 /// The gateway's relay-head hint: newest ACCEPTED block POST. A freshness/wake
@@ -4273,11 +4297,83 @@ impl Node {
         Ok(())
     }
 
+    /// Reconstruct the exact canonical message the publisher signed over the served
+    /// beacon fields and verify its Ed25519 signature against a pinned key. True only
+    /// when every signed field is present and well-typed, `node_id == public_key`,
+    /// `public_key` is a pinned `TIP_BEACON_PUBKEYS` key, and the signature verifies.
+    /// The message is rebuilt with `canonical_json_string(&json!)` — the SAME path the
+    /// publisher signs with in `post_tip_beacon` — so integers stay integers (a float
+    /// round-trip would reserialize differently, per the note there) and keys sort
+    /// identically. Pure over `body`; a malformed or unsigned beacon is just unverified.
+    fn verify_tip_beacon_signature(body: &serde_json::Value) -> bool {
+        let s = |field: &str| body.get(field).and_then(|v| v.as_str());
+        let u = |field: &str| body.get(field).and_then(|v| v.as_u64());
+        let (
+            Some(network_id),
+            Some(hash),
+            Some(prev_hash),
+            Some(node_id),
+            Some(public_key),
+            Some(signature),
+        ) = (
+            s("network_id"),
+            s("hash"),
+            s("prev_hash"),
+            s("node_id"),
+            s("public_key"),
+            s("signature"),
+        )
+        else {
+            return false;
+        };
+        let (Some(height), Some(block_time), Some(difficulty), Some(version)) =
+            (u("height"), u("block_time"), u("difficulty"), u("version"))
+        else {
+            return false;
+        };
+        // Bind the advertised identity to the key it proves possession of (mirrors the
+        // handshake bind and the gateway's own check), and require a PINNED signer: a
+        // beacon's self-reported key is never trusted on its own authority.
+        if node_id != public_key
+            || !TIP_BEACON_PUBKEYS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(public_key))
+        {
+            return false;
+        }
+        // Rebuild the signed message byte-for-byte: field set matches post_tip_beacon
+        // exactly and canonical_json_string key-sorts + compacts. block_time/difficulty
+        // stay u64 here (NOT f64) — a float parse would reserialize and fail the sig.
+        let message = json!({
+            "network_id": network_id,
+            "height": height,
+            "hash": hash,
+            "prev_hash": prev_hash,
+            "block_time": block_time,
+            "difficulty": difficulty,
+            "version": version,
+            "node_id": node_id,
+            "public_key": public_key,
+        });
+        let Ok(canonical) = Self::canonical_json_string(&message) else {
+            return false;
+        };
+        let (Ok(pub_bytes), Ok(sig_bytes)) = (hex::decode(public_key), hex::decode(signature))
+        else {
+            return false;
+        };
+        UnparsedPublicKey::new(&ED25519, &pub_bytes)
+            .verify(canonical.as_bytes(), &sig_bytes)
+            .is_ok()
+    }
+
     /// Read the tiny signed tip beacon (the live liveness signal). Served from the
     /// CDN edge, so this poll is essentially free at the origin. The beacon only
     /// tells us WHERE the tip is; the blocks it points to are still independently
-    /// validated (PoW + linkage + signatures) on apply, so a poisoned beacon can
-    /// at worst cause a wasted fetch, never a bad adoption.
+    /// validated (PoW + linkage + signatures) on apply, and the beacon's own signature
+    /// is verified against a pinned publisher key (`verify_tip_beacon_signature`) —
+    /// an unverified anchor never expands receipt-trust past our floor, so a poisoned
+    /// beacon can at worst cause a wasted fetch, never a bad adoption.
     async fn fetch_tip_beacon(&self) -> Option<TipBeaconInfo> {
         // ~1s TTL memo: bursts of callers (mine-prep rounds, the absorb wait, the
         // beacon-watch tick, converge STEP-4) each re-fetched the same edge-cached
@@ -4330,16 +4426,38 @@ impl Node {
             let Some(hash) = parse_hash("hash") else {
                 continue;
             };
+            // Authenticate the beacon: verify its Ed25519 signature against a pinned
+            // publisher key. Best-effort — a failure yields `verified = false`, never
+            // drops the beacon (the caller still converges, just floor-gated). Only a
+            // VERIFIED anchor may later expand receipt-trust past our own floor.
+            let verified = Self::verify_tip_beacon_signature(&body);
+            // A beacon that identifies OUR network yet fails signature verification is
+            // the visible symptom of a signing-regime break — a gateway serialization
+            // drift, or a publisher key rotated ahead of the pinned client set. The
+            // degrade is silent and safety-preserving (floor-gating), so surface it or
+            // the whole fleet quietly loses fast catch-up and the frozen-tip cure with
+            // no telemetry. Coalesced so a ~1/s poll can't spam the log.
+            if network_id_match == Some(true) && !verified {
+                static BEACON_VERIFY_FAIL_WARN: CoalescedWarn =
+                    CoalescedWarn::new(COALESCED_WARN_INTERVAL_SECS);
+                if let Some(folded) = BEACON_VERIFY_FAIL_WARN.should_emit() {
+                    warn!(
+                        "Tip beacon signature did not verify against the pinned publisher key; \
+                         receipt-trust floor-gated (check for a gateway/publisher signing change){}",
+                        CoalescedWarn::folded(folded)
+                    );
+                }
+            }
             // Remember the freshest beacon we ever saw: the mine-prep fail-open
             // consults this when the beacon is momentarily unreachable, so known
             // staleness can't be laundered into "mine the local tip anyway".
-            // Only a beacon that POSITIVELY identified our network is recorded: a
-            // cross-network or malformed read (no network_id) must not move the
-            // high-water. Recorded into the ROLLING window (not a forever-monotonic
-            // max) so a genuine canonical regression can eventually clear the guard
-            // (2026-07-12 audit) instead of pinning every miner into a permanent
-            // refuse-to-mine until restart.
-            if network_id_match == Some(true) {
+            // Only a VERIFIED beacon is recorded (verified implies our network_id and a
+            // pinned signer): a forged high beacon must not poison the high-water into a
+            // fleet-wide refuse-to-mine. Recorded into the ROLLING window (not a
+            // forever-monotonic max) so a genuine canonical regression can eventually
+            // clear the guard (2026-07-12 audit) instead of pinning every miner into a
+            // permanent refuse-to-mine until restart.
+            if verified {
                 self.record_beacon_observation(height as u32);
                 // Also feed the forever-monotonic high-water used by the unreachable
                 // fail-open bound (see field doc): it must NOT age out, or a total
@@ -4351,6 +4469,7 @@ impl Node {
                 height: height as u32,
                 hash,
                 version,
+                verified,
             };
             *self.beacon_memo.lock() = Some((Instant::now(), info));
             return Some(info);
@@ -4696,11 +4815,25 @@ impl Node {
                     // never inferred from a height — a height alone vouches for no
                     // particular body. The frontier (within the reorg margin of the
                     // beacon) still demands full witnesses, preserving S-01.
-                    let receipt_trust_ceiling = floor.max(
-                        beacon
-                            .height
-                            .saturating_sub(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN),
-                    );
+                    // The second (beacon-buried) clause is sound ONLY because the
+                    // anchor is authenticated: `beacon.hash` was signed by the pinned
+                    // publisher key (verified in fetch_tip_beacon), so the hash-by-hash
+                    // walk down from it proves burial against a signature we trust. An
+                    // UNVERIFIED anchor (a synthesised relay candidate, or a beacon whose
+                    // signature did not verify) collapses the ceiling to our own floor:
+                    // the frontier then demands full witnesses (receipt-trust skips
+                    // per-transaction signature checks, so an unauthenticated anchor must
+                    // not extend it), while honest truncated history at/below the floor is
+                    // still receipt-trusted.
+                    let receipt_trust_ceiling = if beacon.verified {
+                        floor.max(
+                            beacon
+                                .height
+                                .saturating_sub(crate::a9::blockchain::CHECKPOINT_REORG_MARGIN),
+                        )
+                    } else {
+                        floor
+                    };
                     // One dirty window per adopted chunk (≤CONVERGE_CHUNK):
                     // amortizes the per-block fsyncs. The loop's early exits
                     // are collected into `early` and returned only AFTER the
@@ -5209,10 +5342,16 @@ impl Node {
                 }
             }
             tried += 1;
+            // A relay-synthesised candidate is UNAUTHENTICATED (anyone may POST a
+            // relay block header), so it must never expand receipt-trust past our own
+            // floor. The publisher's frontier bodies carry full witnesses, so this
+            // floor-gates without regressing routine catch-up; genuine deep divergence
+            // routes to snapshot re-bootstrap, not a truncated-body receipt path.
             let target = TipBeaconInfo {
                 height,
                 hash,
                 version: 0,
+                verified: false,
             };
             let outcome =
                 match timeout(PER_CANDIDATE_TIMEOUT, self.converge_to_canonical(&target)).await {
@@ -17304,7 +17443,12 @@ impl Node {
                 (tip, bc.get_block(tip).ok().map(|b| b.hash))
             };
             let gap = target.saturating_sub(local_tip);
-            if gap > crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32 {
+            // Only an AUTHENTICATED beacon may drive the committed-span receipt fast
+            // path: it applies deep blocks WITHOUT full-witness verification, trusting
+            // only that each links down from beacon.hash. If the beacon signature did
+            // not verify, that hash is unauthenticated, so we skip this path and fall
+            // through to STEP 3, which floor-gates (full witnesses above the floor).
+            if beacon.verified && gap > crate::a9::blockchain::WITNESS_RETENTION_BLOCKS as u32 {
                 if let Some(tip_hash) = local_tip_hash {
                     if let Some(span) = self
                         .fetch_beacon_committed_span(peer, &beacon, local_tip, tip_hash, deadline)
@@ -17454,9 +17598,11 @@ impl Node {
         // STEP 4: confirm + finalize via the existing arbiter. converge_to_canonical returns
         // Converged/AtTipAhead only if our reconstructed tip hash == the beacon hash; ONLY then
         // do we trail the finality checkpoint (mirroring snapshot semantics). Peer data can
-        // never raise finality on its own.
+        // never raise finality on its own. And the beacon HEIGHT may raise finality only when
+        // the beacon is AUTHENTICATED: an unverified anchor never moves the checkpoint (a
+        // network-reported height vouches for no particular history — see finality invariant).
         let outcome = self.converge_to_canonical(&beacon).await;
-        if matches!(outcome, Converge::Converged | Converge::AtTipAhead) {
+        if beacon.verified && matches!(outcome, Converge::Converged | Converge::AtTipAhead) {
             let _ = self
                 .blockchain
                 .read()
@@ -18111,6 +18257,105 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A real tip beacon captured live from the gateway (2026-08-19, height 655947).
+    // Its signature was independently confirmed to verify against the pinned publisher
+    // key. This is the golden vector guarding byte-exact canonical reconstruction: if
+    // canonicalize_json / serde formatting ever drifts from the publisher's signer, the
+    // genuine-beacon assertion fails HERE — before a release could silently mark every
+    // honest beacon unverified and degrade the whole fleet to floor-gating.
+    fn golden_beacon() -> serde_json::Value {
+        json!({
+            "ok": true,
+            "network_id": "66b401a212ee9cddab38ff73176a3eeca1733ac81a912376b63aa11afdd1e78c",
+            "height": 655947,
+            "hash": "00000000000a8692cc0c41d502cc213ac81d3fd1308291d565fa0248f0500c5b",
+            "prev_hash": "00000000000a2c184cdd6731bb959727fad090a5d45b51985e266a6066e9b395",
+            "block_time": 1787158839,
+            "difficulty": 712,
+            "version": 272379,
+            "node_id": "647265665eccfdc18b8db3b783a2007240fac98c69588614b2a52488587ce132",
+            "public_key": "647265665eccfdc18b8db3b783a2007240fac98c69588614b2a52488587ce132",
+            "signature": "94c22086a8b2669d1069fd38847d765702d8277754a0b52b443efd440fff47c38368069301e1b31f8f5eb6e4698f43f26fabb5cec0f3175909b4d4746e844e0d"
+        })
+    }
+
+    #[test]
+    fn tip_beacon_signature_verifies_the_pinned_publisher() {
+        assert!(
+            Node::verify_tip_beacon_signature(&golden_beacon()),
+            "the genuine, pinned-key-signed beacon must verify; a failure means canonical \
+             reconstruction drifted from post_tip_beacon"
+        );
+        assert!(
+            TIP_BEACON_PUBKEYS
+                .contains(&"647265665eccfdc18b8db3b783a2007240fac98c69588614b2a52488587ce132"),
+            "the live beacon signer must stay pinned"
+        );
+    }
+
+    #[test]
+    fn tip_beacon_signature_rejects_every_tamper() {
+        // Any mutation of a signed field — or of the signature itself — breaks it.
+        for (field, val) in [
+            ("hash", json!("00000000000a8692cc0c41d502cc213ac81d3fd1308291d565fa0248f0500c5c")),
+            ("prev_hash", json!("0000000000000000000000000000000000000000000000000000000000000000")),
+            ("height", json!(655948)),
+            ("block_time", json!(1787158840)),
+            ("difficulty", json!(713)),
+            ("version", json!(272380)),
+            ("network_id", json!("00b401a212ee9cddab38ff73176a3eeca1733ac81a912376b63aa11afdd1e78c")),
+            // A well-formed but wrong signature (first nibble flipped) must fail.
+            ("signature", json!("04c22086a8b2669d1069fd38847d765702d8277754a0b52b443efd440fff47c38368069301e1b31f8f5eb6e4698f43f26fabb5cec0f3175909b4d4746e844e0d")),
+        ] {
+            let mut m = golden_beacon();
+            m[field] = val;
+            assert!(
+                !Node::verify_tip_beacon_signature(&m),
+                "a mutated `{field}` must fail verification"
+            );
+        }
+
+        // A well-formed signature from a signer that is NOT pinned must be rejected
+        // (here the bootstrap-manifest key, a real but wrong key for this object).
+        let mut m = golden_beacon();
+        m["node_id"] = json!("dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3");
+        m["public_key"] = json!("dc38ec5560c514d96d331244ae76a7ec7a47ece8d994ded09b6831164dd337b3");
+        assert!(
+            !Node::verify_tip_beacon_signature(&m),
+            "a non-pinned signer must fail even if internally consistent"
+        );
+
+        // node_id must be bound to public_key.
+        let mut m = golden_beacon();
+        m["node_id"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(
+            !Node::verify_tip_beacon_signature(&m),
+            "node_id != public_key must fail"
+        );
+
+        // Missing ANY signed field (or the signature) is unverified, never a panic
+        // (best-effort parse). "ok"/"received_at" are served but unsigned, so absent.
+        for field in [
+            "network_id",
+            "height",
+            "hash",
+            "prev_hash",
+            "block_time",
+            "difficulty",
+            "version",
+            "node_id",
+            "public_key",
+            "signature",
+        ] {
+            let mut m = golden_beacon();
+            m.as_object_mut().unwrap().remove(field);
+            assert!(
+                !Node::verify_tip_beacon_signature(&m),
+                "a beacon missing `{field}` must be unverified, not accepted"
+            );
+        }
+    }
 
     #[test]
     fn coalesced_warn_folds_repeats_within_the_interval() {
