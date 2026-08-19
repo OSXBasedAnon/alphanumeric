@@ -2072,7 +2072,16 @@ async fn async_main() -> Result<()> {
                 last_console_command = Some(command.clone());
             }
 
-            match command.split_whitespace().next() {
+            // Match the command VERB case-insensitively so `Send`, `HELP`, `Exit`
+            // work like their lowercase forms. Only the leading word is lowered;
+            // payload args (addresses, amounts, wallet names) are read from the
+            // original `command` and keep their case.
+            match command
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
                 Some("create") | Some("send") | Some("transfer") => {
                     // Handle the creation of the transaction
                     match mgmt
@@ -2089,8 +2098,10 @@ async fn async_main() -> Result<()> {
                         Ok(CreateTransactionOutcome::AlreadyPending)
                         | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
                         Err(e) => {
+                            // The handler already prints a styled error + usage; one
+                            // plain restatement here is plenty (this used to print the
+                            // same message twice on top of the handler's).
                             println!("Error: {}", e);
-                            println!("Failed to create transaction: {}", e);
                         }
                     }
                 }
@@ -3496,11 +3507,19 @@ if parts.len() == 1 {
                 let amount = match parts[2].parse::<f64>() {
                     Ok(a) if a.is_finite() && a >= alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT => a,
                     _ => {
+                        // The 4-token form is `whisper <recipient> <amount> <code>`, so
+                        // parts[2] is read as the AMOUNT. A stray word (a two-word
+                        // message, or a --fee borrowed from `send`) lands here and used
+                        // to draw a bare "minimum token" error that named neither the
+                        // real problem nor the offending token. Name it and show usage.
                         let mut error_style = ColorSpec::new();
                         error_style.set_fg(Some(Color::Red)).set_bold(true);
                         stdout.set_color(&error_style)?;
-                        println!("Minimum {} token required for whisper messages", 
-                            alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT);
+                        println!(
+                            "'{}' is not an amount. Usage: whisper <recipient> [amount] <code>  —  the code is one word up to {} a-z letters, and whisper takes no --fee (the code IS the fee).",
+                            parts[2],
+                            alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                        );
                         stdout.reset()?;
                         continue;
                     }
@@ -3535,7 +3554,7 @@ stdout.reset()?;
 
 
 writeln!(&mut stdout, "whisper (Displays recent whispers.)")?;
-writeln!(&mut stdout, "whisper <recipient> <amount> <message> Send a new whisper to <recipient>.")?;
+writeln!(&mut stdout, "whisper <recipient> [amount] <code> Send a new whisper to <recipient> (code = up to 4 a-z letters).")?;
 
 stdout.set_color(&section_style)?;
 write!(&mut stdout, "\n Whisper Code")?;
@@ -3551,6 +3570,23 @@ stdout.flush()?;
 continue;
 }
         };
+
+        // Validate the recipient BEFORE drafting/signing, exactly as `send` does — a
+        // wallet name, an uppercase address, or a wrong-length string used to be carried
+        // all the way through the "draft · confirm" preview and only rejected at
+        // admission with an opaque "fields are not canonically encoded", after the user
+        // had already confirmed a doomed broadcast.
+        if !alphanumeric::a9::blockchain::is_canonical_user_address(recipient) {
+            let mut error_style = ColorSpec::new();
+            error_style.set_fg(Some(Color::Red)).set_bold(true);
+            stdout.set_color(&error_style)?;
+            println!(
+                "recipient '{}' is not a valid address — it must be exactly 40 lowercase hexadecimal characters (whisper takes an address, not a wallet name).",
+                recipient
+            );
+            stdout.reset()?;
+            continue;
+        }
 
         // Deterministic payer: `wallets` is a HashMap, so .values().next() funded the whisper
         // from an ARBITRARY wallet each run (a mild fund-safety surprise). Pick the
@@ -4068,7 +4104,7 @@ Some("help") => {
     row!(" quick transfer", UI_BLUE, "<to> <amount>", "   sends from your default wallet");
     // The 4-character cap is the single thing people get wrong: anything longer is
     // REJECTED, not truncated, and only a-z survives the encoding.
-    row!(" send a whisper", UI_BLUE, "whisper ", "<address> <code>   max 4 letters");
+    row!(" send a whisper", UI_BLUE, "whisper ", "<address> [amount] <code>   code = 4 a-z");
     ui_pad(&mut stdout, spec, 0, CMD)?;
     ui_seg(
         &mut stdout,
@@ -4158,7 +4194,7 @@ Some("help") => {
 Some("version") => {
 print_ascii_intro();
 },
-Some("exit") => {
+Some("exit") | Some("quit") | Some("q") => {
 use std::process::Command;
  // Avoid spawning `cmd.exe` (common heuristic trigger). If you really want pause-on-exit
  // for double-click runs, opt in with `ALPHANUMERIC_PAUSE_ON_EXIT=true`.
