@@ -2051,8 +2051,30 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 if pending_stats.0 > 0 || pending_stats.1 > 0 {
-                    let pending_text = ui_money(pending_stats.2, 4);
-                    let pending_label = format!(" pending out · {}", pending_stats.0);
+                    // Show whichever direction(s) are actually pending. The old line
+                    // always read "pending out · {out}", so incoming-only pending
+                    // rendered a misleading "0.0000 pending out · 0".
+                    let (pending_amount, pending_label) =
+                        if pending_stats.0 > 0 && pending_stats.1 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(
+                                    " pending out · {} · in · {}",
+                                    pending_stats.0, pending_stats.1
+                                ),
+                            )
+                        } else if pending_stats.0 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(" pending out · {}", pending_stats.0),
+                            )
+                        } else {
+                            (
+                                pending_stats.3,
+                                format!(" pending in · {}", pending_stats.1),
+                            )
+                        };
+                    let pending_text = ui_money(pending_amount, 4);
                     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
                     ui_seg(&mut stdout, spec, UI_ORANGE, false, &pending_text)?;
                     ui_seg(&mut stdout, spec, UI_DIM, false, &pending_label)?;
