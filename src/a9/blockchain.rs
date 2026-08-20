@@ -1410,6 +1410,17 @@ impl SystemKeyDeriver {
     }
 }
 
+/// Supply memo slot. `entry` holds the memoized `(balances-height marker, total)`; `generation`
+/// advances on every writer invalidation (`invalidate_supply_memo`) so a reader that probed
+/// before an invalidation cannot commit its scan afterwards — even when the marker returns to
+/// the same value (forced rebuild at an unchanged covered height, genesis 0->0, equal-height
+/// reorg). Display-only surface: /explorer/supply and the CLI account view.
+#[derive(Debug, Default)]
+struct SupplyMemo {
+    generation: u64,
+    entry: Option<(u64, i128)>,
+}
+
 #[derive(Debug)]
 pub struct Blockchain {
     pub db: Store,
@@ -1458,7 +1469,8 @@ pub struct Blockchain {
     /// LIVENESS heartbeat, read WITHOUT the chain lock.
     ///
     /// Deliberately separate from `tip_change_counter`: that one means "the tip moved" and
-    /// invalidates miner templates and the tip/supply memos, so bumping it for mere progress
+    /// invalidates miner templates and the tip memo (the supply memo is generation-fenced by
+    /// its own writers via `invalidate_supply_memo`), so bumping it for mere progress
     /// would throw away a miner's work every time a balance index caught up. This one means
     /// only "the chain lock is being held by something that is still getting work done".
     ///
@@ -1474,10 +1486,14 @@ pub struct Blockchain {
     /// deserializing the tip block on every call; a version mismatch falls back to the validated
     /// current_chain_tip_metadata, so results are identical to the uncached path.
     chain_tip_cache: Arc<PLMutex<Option<(u64, ChainTipMetadata)>>>,
-    /// In-memory memo of total confirmed supply, keyed by `tip_change_counter`. Supply changes only
-    /// when a block is applied (which bumps the counter), so the opt-in /explorer/supply endpoint can
-    /// reuse the last full balances-tree scan within a tip while it stays unchanged.
-    supply_cache: Arc<PLMutex<Option<(u64, i128)>>>,
+    /// Memo of total confirmed supply, keyed on the balances-index height marker
+    /// (`BALANCES_HEIGHT_KEY`) — NOT `tip_change_counter`: catch-up and rebuild rewrite the
+    /// balances tree without bumping that counter. Every production balances writer commits the
+    /// marker in the same atomic batch as the content (block apply, reorg revert, catch-up,
+    /// rebuild — see the note above `set_balances_height`), and the writers' bump-and-clear
+    /// (`invalidate_supply_memo`) fences readers whose scan straddled a rewrite, including
+    /// same-value marker re-stamps the bracket alone cannot see.
+    supply_cache: Arc<PLMutex<SupplyMemo>>,
     tip_watch_tx: watch::Sender<ChainTipSignal>,
     /// (G) In-memory memo of reorg branches deferred by the S-01 frontier
     /// signature gate: a branch that is genuinely heavier but whose above-floor
@@ -1956,9 +1972,10 @@ impl Blockchain {
         meta_tree.insert(CHAIN_TIP_KEY, codec::serialize(&tip)?)?;
         // Invalidate the in-memory memos the moment the persisted tip changes — before the caller's
         // fallible flushes / notify_tip_changed — so a flush error between here and the counter bump
-        // can never leave a reader serving a tip staler than storage.
+        // can never leave a reader serving a tip staler than storage. The supply memo's
+        // bump-and-clear also fences any in-flight scan's later commit (generation check).
         *self.chain_tip_cache.lock() = None;
-        *self.supply_cache.lock() = None;
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -1966,7 +1983,7 @@ impl Blockchain {
         let meta_tree = self.open_chain_meta_tree()?;
         meta_tree.remove(CHAIN_TIP_KEY)?;
         *self.chain_tip_cache.lock() = None;
-        *self.supply_cache.lock() = None;
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -3331,16 +3348,24 @@ impl Blockchain {
     /// which double-counted transfers (a mined 50 sent onward counted as 100) and
     /// decoded the entire chain to do it. One cheap tree scan, no block loads.
     pub fn total_confirmed_supply_units(&self) -> Result<i128, BlockchainError> {
-        // Supply changes only when a block is applied (which bumps tip_change_counter); reuse the
-        // last full scan while the tip is unchanged instead of walking the whole balances tree per
-        // request. Falls through to a fresh scan on any tip change.
-        let version = self.tip_change_counter.load(Ordering::Acquire);
-        if let Some((cached_version, supply)) = *self.supply_cache.lock() {
-            if cached_version == version {
-                return Ok(supply);
-            }
-        }
+        // Memoized on the balances-index height marker, NOT tip_change_counter: catch-up and
+        // rebuild rewrite the balances tree without touching that counter, so a tip-keyed memo
+        // served reverted/pre-catch-up sums. Every production balances writer commits the marker
+        // atomically with the content, so a scan bracketed by an unchanged marker AND an
+        // unchanged invalidation generation read one consistent snapshot; anything else returns
+        // the fresh scan without memoizing. An absent marker (fresh DB, mid-rebuild) never
+        // touches the memo — no sentinel, no genesis-0 collision.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let marker_before = Self::get_balances_height(&balances_tree)?;
+        let generation_at_probe = {
+            let memo = self.supply_cache.lock();
+            if let (Some(marker), Some((cached_marker, supply))) = (marker_before, memo.entry) {
+                if cached_marker == marker {
+                    return Ok(supply);
+                }
+            }
+            memo.generation
+        };
         let mut total: i128 = 0;
         for item in balances_tree.iter() {
             let (key, value) = item?;
@@ -3365,8 +3390,56 @@ impl Blockchain {
                 })?;
             }
         }
-        *self.supply_cache.lock() = Some((version, total));
+        let marker_after = Self::get_balances_height(&balances_tree)?;
+        {
+            let mut memo = self.supply_cache.lock();
+            if let Some(marker) = Self::supply_memo_commit_key(
+                marker_before,
+                marker_after,
+                generation_at_probe,
+                memo.generation,
+            ) {
+                memo.entry = Some((marker, total));
+            }
+        }
+        // A refused commit still returns the fresh scan; readers never clear the memo —
+        // invalidation belongs to the writers' bump-and-clear sites. Residuals (display-only,
+        // self-healing): a scan racing a concurrent batch can return a torn one-off sum
+        // (pre-existing; never durably memoized under this guard), and a stale memo is servable
+        // only in the instruction window between a reader's commit and the adjacent writer's
+        // bump site.
         Ok(total)
+    }
+
+    /// Pure commit gate for the supply memo, truth-table tested: memoize only when the balances
+    /// marker was present and unmoved across the scan AND no writer invalidation elapsed since
+    /// the probe. Extracted because the scan has no injection seam — this fn IS the testable
+    /// guard.
+    fn supply_memo_commit_key(
+        marker_before: Option<u64>,
+        marker_after: Option<u64>,
+        generation_at_probe: u64,
+        generation_now: u64,
+    ) -> Option<u64> {
+        match (marker_before, marker_after) {
+            (Some(before), Some(after))
+                if before == after && generation_at_probe == generation_now =>
+            {
+                Some(before)
+            }
+            _ => None,
+        }
+    }
+
+    /// Writer-side invalidation: clear the memo AND advance the generation so an in-flight scan
+    /// that probed before this point is refused at commit even if the marker it brackets returns
+    /// to the same value (forced rebuild at an unchanged covered height, genesis 0->0,
+    /// equal-height reorg). Wrapping add: the counter is an equality fence — wrap is harmless,
+    /// and `+=` would be an overflow-checks panic site.
+    fn invalidate_supply_memo(&self) {
+        let mut memo = self.supply_cache.lock();
+        memo.generation = memo.generation.wrapping_add(1);
+        memo.entry = None;
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
@@ -4281,6 +4354,10 @@ impl Blockchain {
                 let fork_base = (fork_start as u64).saturating_sub(1);
                 batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&fork_base)?);
                 balances_tree.apply_batch(batch)?;
+                // The old branch's balances are gone the moment this batch lands; kill the memo
+                // BEFORE catch-up re-transits the same marker heights on the new branch, or a
+                // pre-reorg memo at a matching height would be served during the replay.
+                self.invalidate_supply_memo();
                 self.catch_up_balances_index(&balances_tree, fork_base, branch_tip.index as u64)
                     .await?;
             }
@@ -5023,9 +5100,10 @@ impl Blockchain {
             balances_tree.apply_batch(batch)?;
         }
         balances_tree.flush()?;
-        // The index just advanced at the current tip; drop the supply memo (keyed by tip version)
-        // so /explorer/supply doesn't serve a pre-catch-up partial sum until the next block.
-        *self.supply_cache.lock() = None;
+        // The index just advanced at the current tip; bump-and-clear the supply memo so a reader
+        // whose scan straddled this replay is refused at commit (generation fence) instead of
+        // re-memoizing a pre-catch-up sum under a still-current marker.
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -5103,9 +5181,11 @@ impl Blockchain {
         batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&covered_height)?);
         balances_tree.apply_batch(batch)?;
 
-        // The index was rebuilt fully current; drop the supply memo so /explorer/supply cannot keep
-        // serving a pre-rebuild partial sum. Covers every catch-up fallback and the direct rebuild.
-        *self.supply_cache.lock() = None;
+        // The index was rebuilt fully current; bump-and-clear the supply memo. The generation
+        // half fences a forced rebuild that re-stamps the SAME covered height (dirty-state
+        // recovery, ALPHANUMERIC_REBUILD_BALANCES) — the marker bracket alone cannot see that
+        // re-stamp.
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -5453,7 +5533,7 @@ impl Blockchain {
             tip_change_counter,
             chain_progress: Arc::new(AtomicU64::new(0)),
             chain_tip_cache: Arc::new(PLMutex::new(None)),
-            supply_cache: Arc::new(PLMutex::new(None)),
+            supply_cache: Arc::new(PLMutex::new(SupplyMemo::default())),
             tip_watch_tx,
             witness_blocked: Arc::new(PLMutex::new(HashMap::new())),
             orphan_index_reconciled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -16963,6 +17043,10 @@ mod tests {
     fn malformed_supply_rows_fail_without_caching_a_partial_total() {
         let bc = test_blockchain();
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        // Marker present, so a partial sum WOULD be committable — the no-cache asserts below must
+        // hold because the error paths bail before the commit block, not because the
+        // absent-marker gate refuses vacuously.
+        Blockchain::set_balances_height(&balances, 7).unwrap();
         balances
             .insert("alice".as_bytes(), codec::serialize(&123_i128).unwrap())
             .unwrap();
@@ -16970,7 +17054,7 @@ mod tests {
 
         assert!(bc.total_confirmed_supply_units().is_err());
         assert!(
-            bc.supply_cache.lock().is_none(),
+            bc.supply_cache.lock().entry.is_none(),
             "a failed scan must never cache the valid prefix as total supply"
         );
 
@@ -16979,9 +17063,89 @@ mod tests {
             .insert(vec![0xff], codec::serialize(&456_i128).unwrap())
             .unwrap();
         assert!(bc.total_confirmed_supply_units().is_err());
-        assert!(bc.supply_cache.lock().is_none());
+        assert!(bc.supply_cache.lock().entry.is_none());
 
         balances.remove(vec![0xff]).unwrap();
         assert_eq!(bc.total_confirmed_supply_units().unwrap(), 123);
+    }
+
+    #[test]
+    fn supply_memo_keys_on_the_balances_marker_not_the_tip_counter() {
+        let bc = test_blockchain();
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&100_i128).unwrap())
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 7).unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
+        assert_eq!(bc.supply_cache.lock().entry, Some((7, 100)));
+
+        // Real memo hit, not a coincidental rescan: mutate content WITHOUT moving the marker
+        // (impossible in production — every writer commits both in one batch) and observe the
+        // memoized value still served.
+        balances
+            .insert("bob".as_bytes(), codec::serialize(&50_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
+
+        // The catch-up/rebuild shape — marker moves, no tip change. The old tip-counter keying
+        // kept serving 100 here; the marker keying must rescan and re-memoize.
+        Blockchain::set_balances_height(&balances, 8).unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 150);
+        assert_eq!(bc.supply_cache.lock().entry, Some((8, 150)));
+
+        // Writer invalidation clears the entry and advances the generation; the next read
+        // rescans and re-memoizes under the current generation.
+        let generation_before = bc.supply_cache.lock().generation;
+        bc.invalidate_supply_memo();
+        assert_eq!(
+            bc.supply_cache.lock().generation,
+            generation_before.wrapping_add(1),
+            "the fence must advance — a cleared entry alone cannot refuse a straddling commit"
+        );
+        assert!(bc.supply_cache.lock().entry.is_none());
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 150);
+        assert_eq!(bc.supply_cache.lock().entry, Some((8, 150)));
+    }
+
+    #[test]
+    fn supply_memo_never_populates_without_a_marker() {
+        let bc = test_blockchain();
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&100_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
+        assert!(bc.supply_cache.lock().entry.is_none());
+        balances
+            .insert("bob".as_bytes(), codec::serialize(&11_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 111);
+        assert!(bc.supply_cache.lock().entry.is_none());
+    }
+
+    #[test]
+    fn supply_memo_commit_key_truth_table() {
+        assert_eq!(Blockchain::supply_memo_commit_key(None, None, 3, 3), None);
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), None, 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(None, Some(5), 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(6), 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(5), 3, 3),
+            Some(5)
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(5), 3, 4),
+            None
+        );
     }
 }
