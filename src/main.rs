@@ -4273,7 +4273,7 @@ Some("help") => {
     // resolves to `account`, so it takes the Wallet hue.
     row!(" paste an address", UI_CYAN, "<address>", "   on its own, looks it up");
     row!(" shorthand", UI_BLUE, "<from> <to> <amount>", "   also initiates a transfer");
-    row!(" end session", UI_PINK, "exit", "");
+    row!(" end session", UI_PINK, "exit", "   or quit / q");
     writeln!(stdout)?;
     stdout.reset()?;
 }
