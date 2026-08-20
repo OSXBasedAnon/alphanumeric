@@ -1267,11 +1267,11 @@ impl Mgmt {
                 if rotated_recipient.is_some() {
                     // Reward lines already printed above with the schedule recipient;
                     // the maturity countdown belongs to that address, not this wallet.
-                    writeln!(stdout, "Operator balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "Operator balance: {:.8} ♦", breakdown.spendable)?;
                 } else if breakdown.maturing.is_empty() {
                     // Below the M06 activation height the reward is spendable at once.
                     writeln!(stdout, "Mining reward: {:.8} ♦", mining_reward)?;
-                    writeln!(stdout, "New balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "New balance: {:.8} ♦", breakdown.spendable)?;
                 } else {
                     // M06: the coinbase is credited on-chain immediately but withheld from
                     // the spendable balance until buried MINING_REWARD_MATURITY deep.
@@ -1288,7 +1288,7 @@ impl Mgmt {
                         "Mining reward: {:.8} ♦ — credited, spendable in {}",
                         mining_reward, eta
                     )?;
-                    writeln!(stdout, "Spendable balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "Spendable balance: {:.8} ♦", breakdown.spendable)?;
                     stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))?;
                     writeln!(
                         stdout,
