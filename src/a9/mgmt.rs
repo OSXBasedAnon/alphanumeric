@@ -49,8 +49,7 @@ const MINING_NONCE_WINDOW: u64 = 67_108_864;
 /// the single source in blockchain.rs so the estimator and the --fee guard can
 /// never disagree.
 const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = WALLET_FEE_SAFETY_LIMIT_UNITS; // 0.01 ALPHA
-const CREATE_TRANSACTION_USAGE: &str =
-    "Usage: create <sender_address> <recipient_address> <amount> [--fee <ALPHA>]";
+const CREATE_TRANSACTION_USAGE: &str = "Usage: send <recipient> <amount>                     (spends from your default wallet)\n       send <sender> <recipient> <amount>  [--fee <ALPHA>]   (explicit sender)";
 
 /// The three counterparties worth printing in full: the most recent inbound, the most recent
 /// outbound, and the one appearing most often.
@@ -1850,6 +1849,31 @@ impl Mgmt {
         // a wallet NAME resolves too, because a name is what the operator actually remembers.
         // Anything else is passed through as a raw address.
         let requested = args.split_whitespace().nth(1);
+        let extra: Vec<&str> = args.split_whitespace().skip(2).collect();
+        if !extra.is_empty() {
+            // `account a b` used to look up only `a` and drop `b` silently.
+            println!(
+                "(`account` takes one address — ignoring `{}`)",
+                extra.join(" ")
+            );
+        }
+        // A supplied argument must be a known wallet NAME or a canonical address.
+        // Anything else is a typo — say so, rather than rendering a full (empty)
+        // account page for the literal string, which read like a real but unused
+        // on-chain account.
+        if let Some(arg) = requested {
+            if wallets.get(arg).is_none() && !crate::a9::blockchain::is_canonical_user_address(arg)
+            {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                writeln!(
+                    stdout,
+                    "No wallet named `{}`, and it is not an address (an address is 40 lowercase hexadecimal characters).",
+                    arg
+                )?;
+                stdout.reset()?;
+                return Ok(());
+            }
+        }
         let resolved: Option<String> = match requested {
             Some(arg) => Some(
                 wallets
