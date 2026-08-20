@@ -4009,7 +4009,7 @@ Some("history") => {
     }
 },
     Some(cmd) if cmd.starts_with("--") => {
-        if let Err(e) = handle_network_commands(&command, &node, &blockchain).await {
+        if let Err(e) = handle_network_commands(&command, &node).await {
             println!("Network command error: {}", e);
         }
     },
@@ -4273,7 +4273,7 @@ Some("help") => {
     // resolves to `account`, so it takes the Wallet hue.
     row!(" paste an address", UI_CYAN, "<address>", "   on its own, looks it up");
     row!(" shorthand", UI_BLUE, "<from> <to> <amount>", "   also initiates a transfer");
-    row!(" end session", UI_PINK, "exit", "   or quit / q");
+    row!(" end session", UI_PINK, "exit", "");
     writeln!(stdout)?;
     stdout.reset()?;
 }
@@ -4281,7 +4281,7 @@ Some("help") => {
 Some("version") => {
 print_ascii_intro();
 },
-Some("exit") | Some("quit") | Some("q") => {
+Some("exit") => {
 use std::process::Command;
  // Avoid spawning `cmd.exe` (common heuristic trigger). If you really want pause-on-exit
  // for double-click runs, opt in with `ALPHANUMERIC_PAUSE_ON_EXIT=true`.
@@ -4466,7 +4466,6 @@ async fn handle_chain_sync(
 async fn handle_network_commands(
     command: &str,
     node: &Node,
-    blockchain: &Arc<RwLock<Blockchain>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Changed from Result<(), NodeError>
     let parts: Vec<&str> = command.split_whitespace().collect();
@@ -4496,15 +4495,20 @@ async fn handle_network_commands(
             let uptime_hours = (uptime_secs % 86400) / 3600;
             let uptime_minutes = (uptime_secs % 3600) / 60;
 
+            // Connection Status reflects DIRECT p2p only. An empty direct-peer table is
+            // the NORMAL relay-mode case for a NAT'd node — it participates over the
+            // gateway relay, as `--getpeers` and `info` both show — so 0 direct peers
+            // must not read as "Offline", which sent operators troubleshooting a healthy
+            // node.
             println!(
                 "Connection Status: {}",
                 if !peers.is_empty() {
-                    "Online"
+                    "Online (direct p2p)"
                 } else {
-                    "Offline"
+                    "relay mode (no direct peers — normal for NAT'd nodes)"
                 }
             );
-            println!("Connected Peers: {}", peers.len());
+            println!("Direct P2P peers: {}", peers.len());
             println!("Node Address: {}", node.get_public_key());
             // The port actually BOUND, not the compile-time default — this line
             // is read while debugging NAT/firewall issues, which is exactly when an
@@ -4602,12 +4606,13 @@ async fn handle_network_commands(
                                     println!("\nAttempting initial sync...");
                                     if let Err(e) = handle_chain_sync(node).await {
                                         println!("Initial sync failed: {}", e);
-                                    } else {
-                                        if let Err(e) = node.publish_local_tip().await {
-                                            warn!("Post-sync publish failed: {}", e);
-                                        }
-                                        println!("✓ Initial sync completed");
+                                    } else if let Err(e) = node.publish_local_tip().await {
+                                        warn!("Post-sync publish failed: {}", e);
                                     }
+                                    // No blanket "Initial sync completed": handle_chain_sync
+                                    // already printed the true outcome (which may be "run
+                                    // --sync again to finish catching up"), and overwriting
+                                    // that with success misled the operator. Mirrors --discover.
                                     return Ok(());
                                 }
                                 Ok(Err(e)) => {
@@ -4767,11 +4772,12 @@ async fn handle_network_commands(
                     if let Err(e) = node.publish_local_tip().await {
                         warn!("Post-sync publish failed: {}", e);
                     }
-                    let blockchain = blockchain.read().await;
-                    pb.finish_with_message(format!(
-                        "Sync completed. Current height: {}",
-                        blockchain.get_latest_block_index()
-                    ));
+                    // handle_chain_sync already printed the authoritative per-outcome
+                    // message (Synced / "run --sync again to finish" / "re-bootstrap
+                    // required" / …). Don't stamp a blanket "Sync completed" over it —
+                    // for a partial or deferred convergence that flatly contradicted the
+                    // truthful line. Clear the redundant outer spinner instead.
+                    pb.finish_and_clear();
                 }
                 Err(e) => {
                     pb.finish_with_message(format!("Sync failed: {}", e));
