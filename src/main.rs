@@ -2083,25 +2083,60 @@ async fn async_main() -> Result<()> {
                 .as_deref()
             {
                 Some("create") | Some("send") | Some("transfer") => {
-                    // Handle the creation of the transaction
-                    match mgmt
-                        .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
-                        .await
-                    {
-                        Ok(CreateTransactionOutcome::Submitted(tx)) => {
-                            // Announce it: submission only reaches the LOCAL mempool, and
-                            // the gateway relay carries blocks, not transactions — without
-                            // this gossip no other miner ever hears about the tx and only
-                            // the sender could confirm it (pre-v7.6.8 behavior).
-                            node.gossip_transaction(&tx).await;
+                    // Accept the 2-arg default-sender form `send <recipient> <amount>` —
+                    // the verbless `<recipient> <amount>` shorthand already resolves the
+                    // default wallet, so typing the verb should not turn it into a hard
+                    // error demanding a pasted sender. Detected exactly as the shorthand
+                    // is (recipient is a canonical address, last token a positive amount);
+                    // the handler still performs the exact amount/address validation.
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    let two_arg = parts.len() == 3
+                        && alphanumeric::a9::blockchain::is_canonical_user_address(parts[1])
+                        && parts[2]
+                            .parse::<f64>()
+                            .map(|a| a.is_finite() && a > 0.0)
+                            .unwrap_or(false);
+                    let effective: Option<String> = if two_arg {
+                        match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain)
+                            .await
+                        {
+                            Some((name, address)) => {
+                                // Name the wallet being spent from, as the shorthand does.
+                                println!("Sending from {} ({})", name, address);
+                                Some(format!("create {} {} {}", address, parts[1], parts[2]))
+                            }
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                None
+                            }
                         }
-                        Ok(CreateTransactionOutcome::AlreadyPending)
-                        | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
-                        Err(e) => {
-                            // The handler already prints a styled error + usage; one
-                            // plain restatement here is plenty (this used to print the
-                            // same message twice on top of the handler's).
-                            println!("Error: {}", e);
+                    } else {
+                        Some(command.clone())
+                    };
+                    if let Some(cmd) = effective {
+                        // Handle the creation of the transaction
+                        match mgmt
+                            .handle_create_transaction(&cmd, &mut wallets, &blockchain, &db_arc)
+                            .await
+                        {
+                            Ok(CreateTransactionOutcome::Submitted(tx)) => {
+                                // Announce it: submission only reaches the LOCAL mempool, and
+                                // the gateway relay carries blocks, not transactions — without
+                                // this gossip no other miner ever hears about the tx and only
+                                // the sender could confirm it (pre-v7.6.8 behavior).
+                                node.gossip_transaction(&tx).await;
+                            }
+                            Ok(CreateTransactionOutcome::AlreadyPending)
+                            | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
+                            Err(e) => {
+                                // The handler already prints a styled error + usage; one
+                                // plain restatement here is plenty.
+                                println!("Error: {}", e);
+                            }
                         }
                     }
                 }
@@ -2707,12 +2742,34 @@ async fn async_main() -> Result<()> {
 },
 
 Some("balance") | Some("bal") | Some("wallet") => {
-    // Local atomic read of the node's beacon high-water — 0 when no beacon has
-    // been seen. Never a network call, so `balance` stays instant.
-    mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.get(1).copied() == Some("new") {
+        // `wallet` is a balance alias, so `wallet new` used to print balances and
+        // silently drop `new`. Point at the real command instead.
+        println!("`wallet` shows balances; to create a wallet use the `new` command.");
+    } else {
+        if parts.len() > 1 {
+            println!(
+                "(`{}` takes no arguments — ignoring `{}`)",
+                parts[0],
+                parts[1..].join(" ")
+            );
+        }
+        // Local atomic read of the node's beacon high-water — 0 when no beacon has
+        // been seen. Never a network call, so `balance` stays instant.
+        mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+    }
 },
 Some("new") => {
-let wallet_name = command.split_whitespace().nth(1).map(|s| s.to_string());
+let parts: Vec<&str> = command.split_whitespace().collect();
+if parts.len() > 2 {
+    // A wallet name is a single token; `new a b` used to create `a` and drop `b`.
+    println!(
+        "(`new` takes at most one name — ignoring `{}`; names cannot contain spaces)",
+        parts[2..].join(" ")
+    );
+}
+let wallet_name = parts.get(1).map(|s| s.to_string());
 if let Err(e) = mgmt
 .create_new_wallet(
     &mut wallets,
@@ -2770,9 +2827,14 @@ println!("Wallet renamed successfully");
                     // The wallet name is optional: a bare `mine` (or `mine -c`)
                     // mines to the default wallet, since naming it every time is
                     // pure friction for the common single-wallet case.
-                    let named = parts.get(1).filter(|part| !is_flag(part)).copied();
-                    let continuous = parts.iter().skip(1).any(|part| is_flag(part));
-                    let extra = parts.len() - 1 - usize::from(named.is_some()) - usize::from(continuous);
+                    // The wallet name is the FIRST non-flag token, so `mine -c name`
+                    // works as well as `mine name -c` (it used to read strictly parts[1],
+                    // so a leading flag hid the name and the command was rejected).
+                    let named = parts.iter().skip(1).find(|part| !is_flag(part)).copied();
+                    let flag_count = parts.iter().skip(1).filter(|part| is_flag(part)).count();
+                    let continuous = flag_count > 0;
+                    let extra = (parts.len() - 1)
+                        .saturating_sub(usize::from(named.is_some()) + flag_count);
                     if extra > 0 {
                         println!("Usage: mine [miner_wallet_name] [--continuous]");
                         continue;
@@ -3501,6 +3563,16 @@ if parts.len() == 1 {
                     stdout.reset()?;
                     continue;
                 }
+                // In the 2-arg form the second token is the CODE, and the amount
+                // defaults. A user who meant it as the amount would be surprised — and a
+                // number can't even be a code (the encoder keeps only a-z), so flag it.
+                if msg.parse::<f64>().is_ok() {
+                    println!(
+                        "note: read '{}' as the whisper code, not an amount — codes are up to {} a-z letters (a number isn't sent as text). To send an amount, use `whisper <recipient> <amount> <code>`.",
+                        msg,
+                        alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                    );
+                }
                 (&parts[1], alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT, msg)
             },
             4 => {
@@ -3588,21 +3660,36 @@ continue;
             continue;
         }
 
-        // Deterministic payer: `wallets` is a HashMap, so .values().next() funded the whisper
-        // from an ARBITRARY wallet each run (a mild fund-safety surprise). Pick the
-        // lowest-address wallet so the same one signs every time; the receipt prints it below.
-        let sender_wallet = match wallets.values().min_by(|a, b| a.address.cmp(&b.address)) {
-            Some(w) => w,
-            None => {
-                let mut error_style = ColorSpec::new();
-                error_style.set_fg(Some(Color::Red)).set_bold(true);
-                stdout.set_color(&error_style)?;
-                print!("error");
-                stdout.reset()?;
-                println!(": No wallet available to send message");
-                continue;
-            }
-        };
+        // Fund the whisper from the SAME wallet everything else spends from —
+        // resolve_default_wallet (the `default_wallet` key, else the highest-balance
+        // wallet), matching `send`, `mine`, and the quick-transfer shorthand. The old
+        // code picked the lowest-ADDRESS wallet, so a whisper could silently debit a
+        // different wallet than every other spend, invisible until the receipt. The
+        // chosen wallet is announced before the draft, exactly as the send shorthand does.
+        let sender_wallet =
+            match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
+                Some((name, address)) => match wallets.values().find(|w| w.address == address) {
+                    Some(w) => {
+                        println!("Sending from {} ({})", name, address);
+                        w
+                    }
+                    None => {
+                        // Resolved an address with no matching loaded wallet — should not
+                        // happen (the address came from `wallets`), but never sign blind.
+                        println!("error: could not resolve a wallet to send this whisper from");
+                        continue;
+                    }
+                },
+                None => {
+                    let mut error_style = ColorSpec::new();
+                    error_style.set_fg(Some(Color::Red)).set_bold(true);
+                    stdout.set_color(&error_style)?;
+                    print!("error");
+                    stdout.reset()?;
+                    println!(": No wallet available to send message");
+                    continue;
+                }
+            };
 
         let blockchain_guard = blockchain.read().await;
         let sender_balance = match blockchain_guard.get_wallet_balance(&sender_wallet.address).await {
@@ -4300,6 +4387,13 @@ Some(_) => {
                                 println!("Failed to create transaction: {}", e);
                             }
                         }
+                    } else if (2..=3).contains(&parts.len()) && is_amount(parts[parts.len() - 1]) {
+                        // A `<x> <amount>` or `<x> <y> <amount>` line that didn't match the
+                        // transfer shorthand above means an address slot is a wallet name or
+                        // otherwise not 40-hex. Say that, instead of a bare "unknown command".
+                        println!(
+                            "That looks like a transfer, but addresses must be 40 lowercase hex characters, not wallet names. Use `send <recipient-address> <amount>`, or `account <name>` to find an address."
+                        );
                     } else {
                         println!("Unknown command. Type `help` for the command list, or `info` for chain status.");
                     }
