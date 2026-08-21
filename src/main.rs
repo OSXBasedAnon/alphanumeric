@@ -4193,9 +4193,10 @@ Some("help") => {
     row!(UI_CYAN, "address book", "contacts ", "[all]");
     row!(UI_CYAN, "new wallet", "new ", "[name]");
     row!(UI_CYAN, "rename wallet", "rename ", "<name> <new name>");
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_CYAN, false, "\u{258f}")?;
-    ui_pad(&mut stdout, spec, 2, 5)?;
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 3)?;
     ui_seg(
         &mut stdout,
         spec,
@@ -4210,9 +4211,10 @@ Some("help") => {
     row!(UI_BLUE, "transfer", "create ", "<from> <to> <amount> [--fee <amount>]");
     row!(UI_BLUE, "quick transfer", "<to> <amount>", "   from your default wallet");
     row!(UI_BLUE, "send a whisper", "whisper ", "<address> [amount] <code>");
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_BLUE, false, "\u{258f}")?;
-    ui_pad(&mut stdout, spec, 2, 5)?;
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 3)?;
     ui_seg(
         &mut stdout,
         spec,
@@ -4227,9 +4229,10 @@ Some("help") => {
     row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
     row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
     row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous  (-c)");
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_GREEN, false, "\u{258f}")?;
-    ui_pad(&mut stdout, spec, 2, 5)?;
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 3)?;
     ui_seg(
         &mut stdout,
         spec,
