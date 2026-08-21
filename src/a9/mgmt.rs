@@ -3072,27 +3072,30 @@ impl Mgmt {
         // distinct ADDRESS makes duplicate wallet records free.
         let own = Self::wallet_addresses(wallets);
         let mut rows: Vec<crate::a9::blockchain::AddressTxEntry> = Vec::new();
+        // Per-address ceiling on the scan. This runs under the chain READ guard, and
+        // that lock is write-preferring: a long read delays block application
+        // node-wide (the 2026-07-16 publisher-park class that `balance` and
+        // `account` are both written to avoid). A miner's address accumulates one
+        // index row per block mined, so an unbounded "read this address's whole
+        // history" is exactly the pathology — 100k rows on a long-running miner.
+        // 20k rows is far past any real counterparty count while keeping the guard
+        // hold in the millisecond range, and hitting it is DISCLOSED rather than
+        // silently truncating the book.
+        const CONTACTS_SCAN_CAP_PER_ADDRESS: usize = 20_000;
+        let mut scan_capped = false;
         if index_ready {
             for address in &own {
-                // tx_count is the uncapped truth for this address; ask for exactly
-                // that many so the book is COMPLETE rather than a recent slice —
-                // an address book that forgot last month's counterparty would be
-                // worse than none. Zero-activity wallets cost nothing.
-                let want = guard
-                    .address_history_summary(address)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.tx_count)
-                    .unwrap_or(0);
-                if want == 0 {
-                    continue;
+                // ONE scan per address, newest-first. The earlier version also
+                // called address_history_summary just to size this — a second full
+                // prefix scan per address, under the same guard, for a number the
+                // scan itself yields.
+                let entries = guard
+                    .address_recent_txs(address, CONTACTS_SCAN_CAP_PER_ADDRESS, None)
+                    .unwrap_or_default();
+                if entries.len() >= CONTACTS_SCAN_CAP_PER_ADDRESS {
+                    scan_capped = true;
                 }
-                let want = usize::try_from(want).unwrap_or(usize::MAX);
-                rows.extend(
-                    guard
-                        .address_recent_txs(address, want, None)
-                        .unwrap_or_default(),
-                );
+                rows.extend(entries);
             }
         }
         drop(guard);
@@ -3116,10 +3119,14 @@ impl Mgmt {
         ui_seg(&mut stdout, spec, UI_CYAN, true, "contacts")?;
         if index_ready && total > 0 {
             ui_seg(&mut stdout, spec, UI_DIM, false, "   ")?;
+            // A trailing `+` means a wallet filled the per-address scan cap, so the
+            // book is a floor, not a lifetime count — the same honesty marker
+            // history puts on its own windowed total.
+            let more = if scan_capped { "+" } else { "" };
             let count = if show_all || total <= CONTACTS_DEFAULT_ROWS {
-                format!("all {}, most active first", total)
+                format!("all {}{}, most active first", total, more)
             } else {
-                format!("top {} of {}, most active first", shown, total)
+                format!("top {} of {}{}, most active first", shown, total, more)
             };
             ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
             if !show_all && total > CONTACTS_DEFAULT_ROWS {
