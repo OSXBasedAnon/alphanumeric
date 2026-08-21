@@ -1612,7 +1612,8 @@ impl Drop for ReceiptApplyBatch {
                 // Error, and this line is the trigger half of diagnosing a
                 // wedged/orphaned-miner report — it must be visible there.
                 error!(
-                    "Catch-up apply window dropped without commit; dirty marker left set for recovery"
+                    "Catch-up apply window dropped without commit; dirty marker left set — \
+                     derived state is rebuilt automatically on the next start"
                 );
             }
         }
@@ -2264,12 +2265,24 @@ impl Blockchain {
         if at_startup {
             let elapsed = started.elapsed();
             if elapsed >= Self::SLOW_RECOVERY_NOTICE {
+                // The cause sentence follows the REASON, because they are not the same
+                // event. A catch-up window is dropped un-committed whenever the node stops
+                // while it is behind — including a perfectly orderly `exit` — so telling
+                // that operator their shutdown was unclean is false, and being told a lie
+                // at error level is how an operator learns to stop reading error level.
+                // The other reasons genuinely do mean an apply was interrupted.
+                let cause = if marker.reason == "receipt_batch" {
+                    "Expected when the node is stopped while it is catching up"
+                } else {
+                    "Expected after an unclean shutdown"
+                };
                 error!(
                     "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
-                     Expected after an unclean shutdown; the chain itself was not damaged.",
+                     {}; the chain itself was not damaged.",
                     marker.reason,
                     marker.block_index,
-                    elapsed.as_secs_f64()
+                    elapsed.as_secs_f64(),
+                    cause
                 );
             } else {
                 log::info!(
@@ -2870,6 +2883,17 @@ impl Blockchain {
     /// must rederive the registry from the (now-consistent) canonical blocks. O(chain),
     /// but only on the rare recovery path.
     pub fn rebuild_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
+        // Un-stamp readiness BEFORE anything is cleared, exactly as rebuild_address_tx_index
+        // does for its own key. From here until the re-stamp at the end, the registry is or may
+        // be EMPTY, and a miss there reads as "this transaction is not confirmed" — which for a
+        // transaction that IS confirmed and final is the reading that costs a deposit. Removing
+        // the key first makes the window self-describing: callers can tell "unavailable, ask
+        // again" apart from "genuinely absent", and a rebuild torn mid-way is re-derived by the
+        // next ensure_confirmed_tx_index instead of standing as a half-filled registry stamped
+        // complete.
+        let meta = self.open_chain_meta_tree()?;
+        meta.remove(CONFIRMED_TX_BUILT_KEY)?;
+        meta.flush()?;
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let tree = self.open_confirmed_tx_tree()?;
         if let Some(tip) = self.highest_block_index() {
@@ -2930,7 +2954,6 @@ impl Blockchain {
         // Stamp the completion marker unconditionally — even for a chain with no blocks or no
         // indexable txs — so ensure_confirmed_tx_index does not re-derive on every startup. New
         // blocks keep the registry current incrementally (record_confirmed_txs on commit).
-        let meta = self.open_chain_meta_tree()?;
         meta.insert(CONFIRMED_TX_BUILT_KEY, vec![1u8])?;
         meta.flush()?;
         Ok(())
@@ -3136,6 +3159,21 @@ impl Blockchain {
     /// display paths use to distinguish "no activity" from "index unavailable".
     pub fn address_index_ready(&self) -> bool {
         matches!(self.address_index_meta(), Ok(Some(_)))
+    }
+
+    /// True once the confirmed-tx replay registry has completed a build and is not
+    /// mid-rebuild — the signal a lookup path needs to tell "this transaction is not
+    /// confirmed" apart from "I cannot answer that right now".
+    ///
+    /// `rebuild_confirmed_tx_index` un-stamps this before it clears and re-stamps it only
+    /// after the refill commits, so a false here means the registry is or may be empty for
+    /// reasons that say nothing about any particular transaction. Serving a miss as
+    /// "not_found" during that window is how a final transaction gets reported as though it
+    /// had been reorged away.
+    pub fn confirmed_tx_index_ready(&self) -> bool {
+        self.open_chain_meta_tree()
+            .and_then(|meta| Ok(meta.get(CONFIRMED_TX_BUILT_KEY)?.is_some()))
+            .unwrap_or(false)
     }
 
     /// Force-rebuild the address index from the canonical chain. Invalidates the
@@ -14804,6 +14842,40 @@ mod tests {
             .await
             .expect_err("invalid regular tx amount should be rejected before mining finalization");
         assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
+    }
+
+    /// A rebuild empties the replay registry before refilling it, and an empty registry
+    /// answers every lookup the same way an unknown transaction does. The readiness key is
+    /// what separates the two, so it must be FALSE for the whole window — otherwise a
+    /// confirmed, final transaction is reported as never having happened, which is the
+    /// reading that costs a deposit.
+    #[test]
+    fn a_rebuild_unstamps_readiness_before_it_clears_the_registry() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "miner", 1.0);
+        insert_raw_block(&bc, &b0);
+        bc.rebuild_confirmed_tx_index().expect("first build");
+        assert!(
+            bc.confirmed_tx_index_ready(),
+            "a completed build reports ready"
+        );
+
+        // Stand where a reader stands mid-rebuild: readiness cleared, registry emptied.
+        let meta = bc.open_chain_meta_tree().expect("meta tree");
+        meta.remove(CONFIRMED_TX_BUILT_KEY).expect("unstamp");
+        meta.flush().expect("flush");
+        assert!(
+            !bc.confirmed_tx_index_ready(),
+            "while the key is absent the registry must NOT be treated as authoritative — \
+             a miss here says nothing about any particular transaction"
+        );
+
+        // And a rebuild leaves it stamped again, so the window is bounded.
+        bc.rebuild_confirmed_tx_index().expect("rebuild");
+        assert!(
+            bc.confirmed_tx_index_ready(),
+            "readiness is restored once the refill commits"
+        );
     }
 
     // #8: on a chain with no NON-system transactions the confirmed-tx replay registry is
