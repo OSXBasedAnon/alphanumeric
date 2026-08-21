@@ -3122,7 +3122,7 @@ impl Mgmt {
                 spec,
                 UI_DIM,
                 false,
-                " no counterparties yet — coinbase rewards and transfers between your own wallets do not count",
+                " no counterparties yet — rewards and moves between your own wallets do not count",
             )?;
             writeln!(stdout)?;
             writeln!(stdout)?;
