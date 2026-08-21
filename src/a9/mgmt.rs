@@ -2914,6 +2914,44 @@ impl Mgmt {
         wallets.values().map(|w| w.address.as_str()).collect()
     }
 
+    /// Per-address ceiling on the contacts scan.
+    ///
+    /// The scan runs under the chain READ guard, and that lock is write-preferring:
+    /// a long read delays block application node-wide (the 2026-07-16 publisher-park
+    /// class that `balance` and `account` are both written to avoid). A miner's
+    /// address gains one index row per block mined, so an unbounded "read this
+    /// address's whole history" is exactly that pathology — six figures of rows.
+    /// 20k is far past any real counterparty count while keeping the guard hold in
+    /// the millisecond range, and reaching it is DISCLOSED (a trailing `+` on the
+    /// count) rather than silently shortening the book.
+    const CONTACTS_SCAN_CAP_PER_ADDRESS: usize = 20_000;
+
+    /// Read each address's rows exactly once, returning them with a flag for
+    /// "some address filled the cap".
+    ///
+    /// The fetch is a closure so this loop is testable without a chain: the bug this
+    /// exists to prevent is reading one address TWICE (it was iterating wallet
+    /// records, and two records can share an address), and a test can only catch a
+    /// regression there by observing what the loop actually asked for.
+    fn collect_contact_rows<F>(
+        addresses: &HashSet<&str>,
+        mut fetch: F,
+    ) -> (Vec<crate::a9::blockchain::AddressTxEntry>, bool)
+    where
+        F: FnMut(&str) -> Vec<crate::a9::blockchain::AddressTxEntry>,
+    {
+        let mut rows = Vec::new();
+        let mut capped = false;
+        for address in addresses {
+            let entries = fetch(address);
+            if entries.len() >= Self::CONTACTS_SCAN_CAP_PER_ADDRESS {
+                capped = true;
+            }
+            rows.extend(entries);
+        }
+        (rows, capped)
+    }
+
     /// Fold raw address-index rows into one entry per counterparty, newest-activity
     /// timestamp kept, ordered for display.
     ///
@@ -2990,9 +3028,11 @@ impl Mgmt {
     ///
     /// Derived live from the address index — there is no contacts file and no
     /// labels, because the address IS the identity. Deliberately different from
-    /// `history` in two ways: it aggregates over each wallet's WHOLE indexed
-    /// history rather than a recent window (an address book that forgot last
-    /// month's counterparty would be worse than none), and it keys on the
+    /// `history` in two ways: it aggregates over each address's indexed history up
+    /// to a generous per-address cap rather than a small recent window (an address
+    /// book that forgot last month's counterparty would be worse than none; a book
+    /// that pins the chain lock would be worse still, so the cap exists and is
+    /// disclosed), and it keys on the
     /// counterparty ADDRESS, so one address reached from two of your wallets is
     /// one contact, not two.
     ///
@@ -3071,33 +3111,19 @@ impl Mgmt {
         // `history` had to fix by keying on address instead of name. Scanning per
         // distinct ADDRESS makes duplicate wallet records free.
         let own = Self::wallet_addresses(wallets);
-        let mut rows: Vec<crate::a9::blockchain::AddressTxEntry> = Vec::new();
-        // Per-address ceiling on the scan. This runs under the chain READ guard, and
-        // that lock is write-preferring: a long read delays block application
-        // node-wide (the 2026-07-16 publisher-park class that `balance` and
-        // `account` are both written to avoid). A miner's address accumulates one
-        // index row per block mined, so an unbounded "read this address's whole
-        // history" is exactly the pathology — 100k rows on a long-running miner.
-        // 20k rows is far past any real counterparty count while keeping the guard
-        // hold in the millisecond range, and hitting it is DISCLOSED rather than
-        // silently truncating the book.
-        const CONTACTS_SCAN_CAP_PER_ADDRESS: usize = 20_000;
-        let mut scan_capped = false;
-        if index_ready {
-            for address in &own {
-                // ONE scan per address, newest-first. The earlier version also
-                // called address_history_summary just to size this — a second full
-                // prefix scan per address, under the same guard, for a number the
-                // scan itself yields.
-                let entries = guard
-                    .address_recent_txs(address, CONTACTS_SCAN_CAP_PER_ADDRESS, None)
-                    .unwrap_or_default();
-                if entries.len() >= CONTACTS_SCAN_CAP_PER_ADDRESS {
-                    scan_capped = true;
-                }
-                rows.extend(entries);
-            }
-        }
+        let (rows, scan_capped) = if index_ready {
+            Self::collect_contact_rows(&own, |address| {
+                // ONE scan per address, newest-first. An earlier version also called
+                // address_history_summary just to size this — a second full prefix
+                // scan per address, under the same guard, for a number the scan
+                // itself yields.
+                guard
+                    .address_recent_txs(address, Self::CONTACTS_SCAN_CAP_PER_ADDRESS, None)
+                    .unwrap_or_default()
+            })
+        } else {
+            (Vec::new(), false)
+        };
         drop(guard);
 
         let mut contacts = Self::aggregate_contacts(&rows, &own);
@@ -3891,6 +3917,47 @@ mod tests {
             "the scan list must collapse duplicate addresses, or every total doubles"
         );
         assert!(scanned.contains(addr));
+    }
+
+    /// The double-count bug lived in the SCAN LOOP, not in the dedup set: it
+    /// iterated wallet records, and two records can carry one address. This drives
+    /// the real loop and asserts on what it asked for, so reverting the loop to
+    /// per-record iteration fails here even if the dedup helper is untouched.
+    #[test]
+    fn the_scan_loop_reads_each_address_exactly_once() {
+        let a = "1111111111111111111111111111111111111111";
+        let b = "2222222222222222222222222222222222222222";
+        let own: HashSet<&str> = [a, b].into_iter().collect();
+
+        let mut asked: Vec<String> = Vec::new();
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |address| {
+            asked.push(address.to_string());
+            vec![contact_row("cc", ADDRESS_TX_FLAG_RECIPIENT, 5, 1)]
+        });
+
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![a.to_string(), b.to_string()],
+            "one fetch per address"
+        );
+        assert_eq!(rows.len(), 2, "every fetched row is kept");
+        assert!(!capped, "a one-row address is nowhere near the cap");
+    }
+
+    /// Reaching the per-address cap must be reported, not swallowed: the header
+    /// turns it into a trailing `+` so a truncated book never reads as complete.
+    #[test]
+    fn filling_the_scan_cap_is_reported_not_swallowed() {
+        let a = "3333333333333333333333333333333333333333";
+        let own: HashSet<&str> = [a].into_iter().collect();
+        let full = vec![
+            contact_row("dd", ADDRESS_TX_FLAG_RECIPIENT, 1, 1);
+            Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS
+        ];
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |_| full.clone());
+        assert_eq!(rows.len(), Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS);
+        assert!(capped, "a filled window must set the disclosure flag");
     }
 
     #[test]
