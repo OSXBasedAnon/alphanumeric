@@ -4094,9 +4094,11 @@ Some("help") => {
     macro_rules! row {
         ($hue:expr, $goal:expr, $cmd:expr, $args:expr) => {{
             let goal: &str = $goal;
-            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-            ui_seg(&mut stdout, spec, $hue, false, "\u{258f}")?;
-            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            // No rail glyph: the section header and the command's own colour already
+            // say which group a row belongs to, and a per-row marker on every line
+            // was one signal too many. The indent is kept so the columns are
+            // unchanged.
+            ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
             // Goals sit in MUTED, a step brighter than the old DIM: they are the
             // index you read down, not incidental text.
             ui_seg(&mut stdout, spec, UI_MUTED, false, goal)?;
