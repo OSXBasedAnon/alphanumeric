@@ -2901,6 +2901,19 @@ impl Mgmt {
         Ok(())
     }
 
+    /// The set of addresses `contacts` scans: one entry per DISTINCT address across
+    /// every loaded wallet.
+    ///
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses, so
+    /// the same address can appear under two wallet records. Scanning per record would
+    /// read that address's index twice and double every number in the book — the
+    /// double-count `history` had to fix by keying on address instead of name. The
+    /// same set doubles as the own-address exclusion, so both uses stay consistent by
+    /// construction.
+    fn wallet_addresses(wallets: &HashMap<String, Wallet>) -> HashSet<&str> {
+        wallets.values().map(|w| w.address.as_str()).collect()
+    }
+
     /// Fold raw address-index rows into one entry per counterparty, newest-activity
     /// timestamp kept, ordered for display.
     ///
@@ -3057,7 +3070,7 @@ impl Mgmt {
         // twice and double every number in the book — the same double-count
         // `history` had to fix by keying on address instead of name. Scanning per
         // distinct ADDRESS makes duplicate wallet records free.
-        let own: HashSet<&str> = wallets.values().map(|w| w.address.as_str()).collect();
+        let own = Self::wallet_addresses(wallets);
         let mut rows: Vec<crate::a9::blockchain::AddressTxEntry> = Vec::new();
         if index_ready {
             for address in &own {
@@ -3862,12 +3875,15 @@ mod tests {
             wallets.insert(name.to_string(), w);
         }
         assert_eq!(wallets.len(), 2, "two records, one address");
-        let own: HashSet<&str> = wallets.values().map(|w| w.address.as_str()).collect();
+        // Calls the PRODUCTION helper the scan loop uses — rebuilding the set here
+        // would only re-test the test.
+        let scanned = Mgmt::wallet_addresses(&wallets);
         assert_eq!(
-            own.len(),
+            scanned.len(),
             1,
             "the scan list must collapse duplicate addresses, or every total doubles"
         );
+        assert!(scanned.contains(addr));
     }
 
     #[test]
