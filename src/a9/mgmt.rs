@@ -3000,8 +3000,14 @@ impl Mgmt {
         // error-clarity rule).
         const CONTACTS_DEFAULT_ROWS: usize = 10;
         let mut show_all = false;
-        if let Some(arg) = args.split_whitespace().nth(1) {
-            if arg.eq_ignore_ascii_case("all") {
+        // Every token after the verb is checked, not just the first: `contacts all
+        // now` must not silently behave like `contacts all`, or the screen quietly
+        // teaches a syntax that does not exist.
+        let mut extra = args.split_whitespace().skip(1);
+        let arg = extra.next();
+        let trailing = extra.next().is_some();
+        if let Some(arg) = arg {
+            if arg.eq_ignore_ascii_case("all") && !trailing {
                 show_all = true;
             } else {
                 ui_seg(
@@ -3043,16 +3049,24 @@ impl Mgmt {
         let index_ready = guard.address_index_ready();
         // Your own addresses are not contacts: a transfer between two loaded
         // wallets is bookkeeping, not a counterparty relationship.
+        //
+        // This set is ALSO the scan list, and that is load-bearing:
+        // `validate_unique_wallet_names` enforces unique NAMES, not unique
+        // addresses, so one address loaded under two names appears twice in
+        // `wallets`. Scanning per wallet would then read that address's index
+        // twice and double every number in the book — the same double-count
+        // `history` had to fix by keying on address instead of name. Scanning per
+        // distinct ADDRESS makes duplicate wallet records free.
         let own: HashSet<&str> = wallets.values().map(|w| w.address.as_str()).collect();
         let mut rows: Vec<crate::a9::blockchain::AddressTxEntry> = Vec::new();
         if index_ready {
-            for wallet in wallets.values() {
+            for address in &own {
                 // tx_count is the uncapped truth for this address; ask for exactly
                 // that many so the book is COMPLETE rather than a recent slice —
                 // an address book that forgot last month's counterparty would be
                 // worse than none. Zero-activity wallets cost nothing.
                 let want = guard
-                    .address_history_summary(&wallet.address)
+                    .address_history_summary(address)
                     .ok()
                     .flatten()
                     .map(|s| s.tx_count)
@@ -3063,7 +3077,7 @@ impl Mgmt {
                 let want = usize::try_from(want).unwrap_or(usize::MAX);
                 rows.extend(
                     guard
-                        .address_recent_txs(&wallet.address, want, None)
+                        .address_recent_txs(address, want, None)
                         .unwrap_or_default(),
                 );
             }
@@ -3831,6 +3845,29 @@ mod tests {
         let out = Mgmt::aggregate_contacts(&rows, &own);
         assert_eq!(out[0].in_units, i128::MAX);
         assert_eq!(out[0].txs, 2);
+    }
+
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses,
+    /// so the same address can be loaded twice under different names. The scan must
+    /// walk distinct ADDRESSES — walking `wallets` would read that address's index
+    /// twice and double every number in the book. This pins the set the command
+    /// builds (`own`) as the deduplicating step.
+    #[test]
+    fn one_address_loaded_under_two_names_is_scanned_once() {
+        let addr = "9999999999999999999999999999999999999999";
+        let mut wallets: HashMap<String, Wallet> = HashMap::new();
+        for name in ["savings", "the same wallet again"] {
+            let mut w = Wallet::new(None).expect("test wallet");
+            w.address = addr.to_string();
+            wallets.insert(name.to_string(), w);
+        }
+        assert_eq!(wallets.len(), 2, "two records, one address");
+        let own: HashSet<&str> = wallets.values().map(|w| w.address.as_str()).collect();
+        assert_eq!(
+            own.len(),
+            1,
+            "the scan list must collapse duplicate addresses, or every total doubles"
+        );
     }
 
     #[test]
