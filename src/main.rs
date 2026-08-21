@@ -4153,7 +4153,20 @@ Some("help") => {
             " wallets loaded"
         },
     )?;
-    ui_pad(&mut stdout, spec, 46, 62)?;
+    // Pad from where the header text ACTUALLY ends: the wallet count is variable
+    // width, and a hardcoded origin drifts the hint (and overflows 80 columns once
+    // the count reaches four digits).
+    // 28 = " Help" + "   command reference · "; then the variable-width count and
+    // its noun. Measured, not guessed: ui_pad emits (end - start) spaces, so an
+    // origin that is off by n shifts the whole hint by n.
+    let header_end = 28
+        + wallets.len().to_string().chars().count()
+        + if wallets.len() == 1 {
+            " wallet loaded".chars().count()
+        } else {
+            " wallets loaded".chars().count()
+        };
+    ui_pad(&mut stdout, spec, header_end, header_end.max(62))?;
     ui_seg(&mut stdout, spec, UI_FAINT, false, "\u{2191} recalls previous")?;
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
@@ -4205,7 +4218,7 @@ Some("help") => {
         spec,
         UI_FAINT,
         false,
-        "fees are automatic, --fee overrides \u{b7} a code is 4 a-z, sent in the fee",
+        "fees are automatic \u{b7} a whisper rides in its fee, so it costs more",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
