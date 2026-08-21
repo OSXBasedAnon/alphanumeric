@@ -4080,12 +4080,7 @@ Some("help") => {
     // goal plus its gutter; the rail glyph and its space occupy the first two
     // cells of every row, so goals start at 3 and the keyword column accounts
     // for that lead-in rather than fighting it.
-    const CMD: usize = 32;
-    // Where a trailing description sits. Past the longest command on a described
-    // row ("<from> <to> <amount>"), but early enough that the longest row still
-    // lands inside 80 columns — a description that wraps is worse than one that
-    // sits a little tighter to its command.
-    const NOTE: usize = 56;
+    const CMD: usize = 19;
 
     // A row carries a rail in its section hue. The rail is what makes section
     // membership survive scrolling: a colour on the keyword alone disappears the
@@ -4098,11 +4093,11 @@ Some("help") => {
             // say which group a row belongs to, and a per-row marker on every line
             // was one signal too many. The indent is kept so the columns are
             // unchanged.
-            ui_seg(&mut stdout, spec, UI_LABEL, false, "   ")?;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
             // Goals sit in MUTED, a step brighter than the old DIM: they are the
             // index you read down, not incidental text.
             ui_seg(&mut stdout, spec, UI_MUTED, false, goal)?;
-            let goal_end = 3 + goal.chars().count();
+            let goal_end = 1 + goal.chars().count();
             ui_pad(&mut stdout, spec, goal_end, CMD.max(goal_end + 2))?;
             ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
             let cmd_end = CMD.max(goal_end + 2) + $cmd.chars().count();
@@ -4114,7 +4109,7 @@ Some("help") => {
                 // Syntax stays welded to the keyword in LABEL (it is typed); a
                 // description is a second column in FAINT and lines up like one.
                 if args.starts_with(' ') {
-                    ui_pad(&mut stdout, spec, cmd_end, NOTE.max(cmd_end + 2))?;
+                    ui_pad(&mut stdout, spec, cmd_end, cmd_end + 2)?;
                     ui_seg(&mut stdout, spec, UI_FAINT, false, args.trim_start())?;
                 } else {
                     ui_seg(&mut stdout, spec, UI_LABEL, false, args)?;
@@ -4169,7 +4164,10 @@ Some("help") => {
             " wallets loaded".chars().count()
         };
     ui_pad(&mut stdout, spec, header_end, header_end.max(62))?;
-    ui_seg(&mut stdout, spec, UI_FAINT, false, "\u{2191} recalls previous")?;
+    // The arrow is the only orange on this screen: it is the one thing here you can
+    // press rather than read, and a key you can press is worth exactly one accent.
+    ui_seg(&mut stdout, spec, UI_ORANGE, false, "\u{2191}")?;
+    ui_seg(&mut stdout, spec, UI_FAINT, false, " recalls previous")?;
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
@@ -4178,10 +4176,10 @@ Some("help") => {
     // with the typed token on the RIGHT there was nothing saying so — the left
     // column reads like a command list until you notice it isn't.
     {
-        let legend = "   what you want";
+        let legend = " operation";
         ui_seg(&mut stdout, spec, UI_DIM, false, legend)?;
         ui_pad(&mut stdout, spec, legend.chars().count(), CMD)?;
-        ui_seg(&mut stdout, spec, UI_ORANGE, false, "what you type")?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, "command")?;
         writeln!(stdout)?;
     }
     writeln!(stdout)?;
@@ -4198,7 +4196,7 @@ Some("help") => {
     // Section notes carry no rail: the rail marks a row you can type, and a
     // note is not one. Flush with the goals column so it reads as a caption
     // under the section rather than another entry in it.
-    ui_pad(&mut stdout, spec, 0, 3)?;
+    ui_pad(&mut stdout, spec, 0, 1)?;
     ui_seg(
         &mut stdout,
         spec,
@@ -4216,7 +4214,7 @@ Some("help") => {
     // Section notes carry no rail: the rail marks a row you can type, and a
     // note is not one. Flush with the goals column so it reads as a caption
     // under the section rather than another entry in it.
-    ui_pad(&mut stdout, spec, 0, 3)?;
+    ui_pad(&mut stdout, spec, 0, 1)?;
     ui_seg(
         &mut stdout,
         spec,
@@ -4234,7 +4232,7 @@ Some("help") => {
     // Section notes carry no rail: the rail marks a row you can type, and a
     // note is not one. Flush with the goals column so it reads as a caption
     // under the section rather than another entry in it.
-    ui_pad(&mut stdout, spec, 0, 3)?;
+    ui_pad(&mut stdout, spec, 0, 1)?;
     ui_seg(
         &mut stdout,
         spec,
