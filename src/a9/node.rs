@@ -7448,6 +7448,24 @@ impl Node {
             return (StatusCode::OK, Json(payload));
         }
 
+        // Before answering "no", make sure we are in a position to know. While the replay
+        // registry is mid-rebuild it is EMPTY, and an empty registry answers every lookup
+        // the same way a genuinely unknown transaction does. Reporting a confirmed, final
+        // transaction as not_found is the reading an integrator acts on as "reorged, never
+        // happened" — so say "ask again" instead, exactly as the address page refuses to
+        // serve an ambiguous empty history.
+        if !chain.confirmed_tx_index_ready() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "status": "unavailable",
+                    "tx_id": tx_id,
+                    "hint": "the confirmed-transaction index is rebuilding; retry shortly — this is not a statement about this transaction",
+                })),
+            );
+        }
+
         (
             StatusCode::NOT_FOUND,
             Json(json!({
