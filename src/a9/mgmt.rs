@@ -3090,9 +3090,9 @@ impl Mgmt {
         if index_ready && total > 0 {
             ui_seg(&mut stdout, spec, UI_DIM, false, "   ")?;
             let count = if show_all || total <= CONTACTS_DEFAULT_ROWS {
-                format!("all {} by net position", total)
+                format!("all {}, most active first", total)
             } else {
-                format!("top {} of {} by net position", shown, total)
+                format!("top {} of {}, most active first", shown, total)
             };
             ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
             if !show_all && total > CONTACTS_DEFAULT_ROWS {
@@ -3132,8 +3132,12 @@ impl Mgmt {
 
         // Three sections, ordered credits -> debits -> settled, each with the
         // subtotal of the net positions it contains. `net` is per-contact, so a
-        // contact appears exactly once and the three subtotals sum to the whole
-        // book's net — the property that makes this readable as a statement.
+        // contact appears exactly once and the three subtotals sum to exactly the
+        // rows ON SCREEN — the same rule history's net follows: a total may never
+        // fold in rows you cannot see. Under the default top-10 that means the
+        // subtotals describe the shown contacts, not the whole book; the header
+        // says "top 10 of N" precisely so the scope is never ambiguous, and
+        // `contacts all` makes them whole-book totals.
         let net_of = |c: &Contact| c.in_units.saturating_sub(c.out_units);
         let sections: [(&str, &str, Color); 3] = [
             ("▾ credits · received from", "credits", UI_GREEN),
