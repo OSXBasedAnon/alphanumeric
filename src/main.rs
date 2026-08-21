@@ -4213,7 +4213,7 @@ Some("help") => {
     section!(UI_GREEN, "Mining", "rewards mature after 100 blocks");
     row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
     row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
-    row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous");
+    row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous  (-c)");
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
     ui_seg(&mut stdout, spec, UI_GREEN, false, "\u{258f}")?;
     ui_pad(&mut stdout, spec, 2, 5)?;
