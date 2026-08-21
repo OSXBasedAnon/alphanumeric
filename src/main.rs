@@ -39,8 +39,8 @@ use alphanumeric::a9::{
     oracle::DifficultyOracle,
     ui::{
         ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
-        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
-        UI_ORANGE, UI_PINK, UI_RULE,
+        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_LABEL, UI_LAVENDER,
+        UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE,
     },
     wallet_ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
@@ -4022,6 +4022,15 @@ Some("history") => {
         }
     },
 
+Some("contacts") => {
+    if let Err(e) = mgmt
+        .handle_contacts_command(&command, &blockchain, &wallets)
+        .await
+    {
+        println!("Error: {}", e);
+    }
+},
+
 Some("debug") => {
     let blockchain_guard = blockchain.read().await;
     // Populate diagnostics from the canonical chain. A fresh, empty oracle
@@ -4067,51 +4076,61 @@ Some("help") => {
     // only). Weight is set explicitly on every run.
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
     let spec = &mut ColorSpec::new();
-    // Column where every command keyword starts.
-    // Wide enough for the LONGEST label plus its two-space gutter. At 17 the three
-    // 17-character labels ("mine to a wallet", "choose a backend", "paste an
-    // address") overflowed their own column and shoved their command two cells
-    // right, so the command column was ragged wherever a label ran long.
-    const CMD: usize = 19;
-    // Where a description sits when a row has one. 41 is UI_RIGHT_LABEL, the
-    // column the status grids put their right-hand pane on, and it is also the
-    // first column that clears the longest command on a described row
-    // ("<from> <to> <amount>") — so every description shares one column instead
-    // of breaking wherever its command happened to end.
-    const NOTE: usize = 41;
+    // Column where every command keyword starts. Wide enough for the LONGEST
+    // goal plus its gutter; the rail glyph and its space occupy the first two
+    // cells of every row, so goals start at 3 and the keyword column accounts
+    // for that lead-in rather than fighting it.
+    const CMD: usize = 32;
+    // Where a trailing description sits. Past the longest command on a described
+    // row ("<from> <to> <amount>"), but early enough that the longest row still
+    // lands inside 80 columns — a description that wraps is worse than one that
+    // sits a little tighter to its command.
+    const NOTE: usize = 56;
 
+    // A row carries a rail in its section hue. The rail is what makes section
+    // membership survive scrolling: a colour on the keyword alone disappears the
+    // moment the header scrolls off, and the eye then has to re-derive which
+    // group a line belongs to.
     macro_rules! row {
-        ($goal:expr, $hue:expr, $cmd:expr, $args:expr) => {{
+        ($hue:expr, $goal:expr, $cmd:expr, $args:expr) => {{
             let goal: &str = $goal;
-            ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
-            // max(): a goal as long as the column ("  mine to a wallet") must
-            // still be pushed clear of the keyword, or the two run together.
-            ui_pad(
-                &mut stdout,
-                spec,
-                goal.chars().count(),
-                CMD.max(goal.chars().count() + 2),
-            )?;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, $hue, false, "\u{258f}")?;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            // Goals sit in MUTED, a step brighter than the old DIM: they are the
+            // index you read down, not incidental text.
+            ui_seg(&mut stdout, spec, UI_MUTED, false, goal)?;
+            let goal_end = 3 + goal.chars().count();
+            ui_pad(&mut stdout, spec, goal_end, CMD.max(goal_end + 2))?;
             ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
-            let cmd_end = CMD.max(goal.chars().count() + 2) + $cmd.chars().count();
+            let cmd_end = CMD.max(goal_end + 2) + $cmd.chars().count();
             let args: &str = $args;
             if !args.is_empty() {
                 // Two kinds of trailing text, told apart by a leading space:
                 //   "account " + "<address>"        syntax — part of the command
                 //   "mine"     + "   rewards go…"   a description of it
-                // Syntax must stay welded to the keyword, but a description is a
-                // second column and has to line up like one. Emitting both the
-                // same way left every description hanging at whatever column its
-                // command happened to end on — "mine" broke at 21, the row under
-                // it at 22, `--getpeers` at 27 — which reads as ragged spacing
-                // rather than a table.
+                // Syntax stays welded to the keyword in LABEL (it is typed); a
+                // description is a second column in FAINT and lines up like one.
                 if args.starts_with(' ') {
                     ui_pad(&mut stdout, spec, cmd_end, NOTE.max(cmd_end + 2))?;
-                    ui_seg(&mut stdout, spec, UI_DIM, false, args.trim_start())?;
+                    ui_seg(&mut stdout, spec, UI_FAINT, false, args.trim_start())?;
                 } else {
-                    ui_seg(&mut stdout, spec, UI_DIM, false, args)?;
+                    ui_seg(&mut stdout, spec, UI_LABEL, false, args)?;
                 }
             }
+            writeln!(stdout)?;
+        }};
+    }
+
+    // Section header: name in the section hue, then the dim subtitle that says
+    // what the group is for. The subtitle is what turns a colour into a category.
+    macro_rules! section {
+        ($hue:expr, $name:expr, $subtitle:expr) => {{
+            let name: &str = $name;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, $hue, true, name)?;
+            ui_seg(&mut stdout, spec, UI_DIM, false, "  ")?;
+            ui_seg(&mut stdout, spec, UI_FAINT, false, $subtitle)?;
             writeln!(stdout)?;
         }};
     }
@@ -4119,11 +4138,7 @@ Some("help") => {
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
     ui_seg(&mut stdout, spec, UI_CYAN, true, "Help")?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference")?;
-    ui_pad(&mut stdout, spec, 39, 56)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "↑ recalls previous")?;
-    writeln!(stdout)?;
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference · ")?;
     // Colour the COUNT, never part of the word: splitting "wallet" from its
     // plural "s" put a colour boundary mid-word and read as a rendering fault.
     ui_seg(&mut stdout, spec, UI_CYAN, false, &wallets.len().to_string())?;
@@ -4138,6 +4153,8 @@ Some("help") => {
             " wallets loaded"
         },
     )?;
+    ui_pad(&mut stdout, spec, 46, 62)?;
+    ui_seg(&mut stdout, spec, UI_FAINT, false, "\u{2191} recalls previous")?;
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
@@ -4146,124 +4163,86 @@ Some("help") => {
     // with the typed token on the RIGHT there was nothing saying so — the left
     // column reads like a command list until you notice it isn't.
     {
-        let legend = " what you want";
+        let legend = "   what you want";
         ui_seg(&mut stdout, spec, UI_DIM, false, legend)?;
         ui_pad(&mut stdout, spec, legend.chars().count(), CMD)?;
         ui_seg(&mut stdout, spec, UI_ORANGE, false, "what you type")?;
         writeln!(stdout)?;
     }
-
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_CYAN, true, "Wallet")?;
-    ui_pad(&mut stdout, spec, 7, 68)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "account overview")?;
     writeln!(stdout)?;
-    row!(" balances", UI_CYAN, "balance", "");
-    row!(" address lookup", UI_CYAN, "account ", "<address>");
+
+    section!(UI_CYAN, "Wallet", "account overview");
+    row!(UI_CYAN, "balances", "balance", "");
+    row!(UI_CYAN, "address lookup", "account ", "<address>");
     // `history 50` already worked and was documented nowhere, so the default 12
-    // rows read as the whole ledger.
-    // The range and default are read, not skimmed — UI_DIM made them look
-    // unavailable rather than merely secondary.
-    ui_seg(&mut stdout, spec, UI_DIM, false, " transactions")?;
-    ui_pad(&mut stdout, spec, 13, CMD)?;
-    ui_seg(&mut stdout, spec, UI_CYAN, false, "history ")?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "[rows]")?;
-    ui_seg(&mut stdout, spec, UI_MUTED, false, "   1-50, default 12")?;
-    writeln!(stdout)?;
-    row!(" new wallet", UI_CYAN, "new ", "[name]");
-    row!(" rename wallet", UI_CYAN, "rename ", "<name> <new name>");
-    writeln!(stdout)?;
-
+    // looked like a hard cap. The range is part of the row, not a footnote.
+    row!(UI_CYAN, "transactions", "history ", "[rows]");
+    row!(UI_CYAN, "address book", "contacts ", "[all]");
+    row!(UI_CYAN, "new wallet", "new ", "[name]");
+    row!(UI_CYAN, "rename wallet", "rename ", "<name> <new name>");
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_BLUE, true, "Transfers")?;
-    ui_pad(&mut stdout, spec, 10, 39)?;
-    // The constraint that actually breaks a first send: create validates
-    // 40-hex addresses and rejects wallet names outright.
+    ui_seg(&mut stdout, spec, UI_CYAN, false, "\u{258f}")?;
+    ui_pad(&mut stdout, spec, 2, 5)?;
     ui_seg(
         &mut stdout,
         spec,
-        UI_ORANGE,
+        UI_FAINT,
         false,
-        "addresses are 40-hex, not wallet names",
-    )?;
-    writeln!(stdout)?;
-    row!(" transfer", UI_BLUE, "create ", "<from> <to> <amount> [--fee <amount>]");
-    row!(" quick transfer", UI_BLUE, "<to> <amount>", "   sends from your default wallet");
-    // The 4-character cap is the single thing people get wrong: anything longer is
-    // REJECTED, not truncated, and only a-z survives the encoding.
-    row!(" send a whisper", UI_BLUE, "whisper ", "<address> [amount] <code>   code = 4 a-z");
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "fees are automatic; --fee overrides",
-    )?;
-    writeln!(stdout)?;
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "a whisper rides in its fee, so it costs more",
+        "history shows 1-50 rows (default 12) \u{b7} contacts shows your top 10, or all",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
 
+    section!(UI_BLUE, "Transfers", "move coins \u{b7} addresses are 40-hex, not wallet names");
+    row!(UI_BLUE, "transfer", "create ", "<from> <to> <amount> [--fee <amount>]");
+    row!(UI_BLUE, "quick transfer", "<to> <amount>", "   from your default wallet");
+    row!(UI_BLUE, "send a whisper", "whisper ", "<address> [amount] <code>");
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_GREEN, true, "Mining")?;
-    ui_pad(&mut stdout, spec, 7, 46)?;
+    ui_seg(&mut stdout, spec, UI_BLUE, false, "\u{258f}")?;
+    ui_pad(&mut stdout, spec, 2, 5)?;
     ui_seg(
         &mut stdout,
         spec,
-        UI_ORANGE,
+        UI_FAINT,
         false,
-        "rewards mature after 100 blocks",
-    )?;
-    writeln!(stdout)?;
-    // `mine` took --continuous all along and help never said so, so the only
-    // documented form was the one that stops after a single block.
-    row!(" start mining", UI_GREEN, "mine", "   rewards go to your default wallet");
-    row!(" mine to a wallet", UI_GREEN, "mine ", "<wallet name>");
-    row!(" keep mining", UI_GREEN, "mine ", "[wallet] --continuous   (-c)");
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "one block unless --continuous; Enter stops it.",
+        "fees are automatic, --fee overrides \u{b7} a code is 4 a-z, sent in the fee",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
 
+    section!(UI_GREEN, "Mining", "rewards mature after 100 blocks");
+    row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
+    row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
+    row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous");
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_LAVENDER, true, "Network")?;
-    ui_pad(&mut stdout, spec, 8, 58)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "node and peer status")?;
+    ui_seg(&mut stdout, spec, UI_GREEN, false, "\u{258f}")?;
+    ui_pad(&mut stdout, spec, 2, 5)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_FAINT,
+        false,
+        "one block unless --continuous; Enter stops it",
+    )?;
     writeln!(stdout)?;
-    row!(" network status", UI_LAVENDER, "info", "");
-    row!(" connectivity", UI_LAVENDER, "--status", "");
-    row!(" peer discovery", UI_LAVENDER, "--getpeers", "   ·   --discover");
-    row!(" add peer", UI_LAVENDER, "--connect ", "<ip:port>");
-    row!(" resynchronise", UI_LAVENDER, "--sync", "");
-    row!(" diagnostics", UI_LAVENDER, "debug", "");
+    writeln!(stdout)?;
+
+    section!(UI_LAVENDER, "Network", "node and peer status");
+    row!(UI_LAVENDER, "network status", "info", "");
+    row!(UI_LAVENDER, "connectivity", "--status", "");
+    row!(UI_LAVENDER, "peer discovery", "--getpeers", "   or --discover");
+    row!(UI_LAVENDER, "add peer", "--connect ", "<ip:port>");
+    row!(UI_LAVENDER, "resynchronise", "--sync", "");
+    row!(UI_LAVENDER, "diagnostics", "debug", "");
+    writeln!(stdout)?;
+
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
-
-    // Aliases and the bare-address shorthand are reachable in the match arms
-    // but appeared on no surface, so nobody could discover them.
-    //
-    // Each group keeps the hue of the SECTION its command belongs to, rather than
-    // the whole block sharing one colour. Painting them all pink broke the rule the
-    // rest of the screen runs on — that hue answers "which section is this from"
-    // — so `balance` was cyan under Wallet and pink again down here.
+    // Aliases earn their line because a user who typed one needs to know it is
+    // the same command, not a different one.
     {
-        let goal = " aliases";
-        ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
-        ui_pad(&mut stdout, spec, goal.chars().count(), CMD)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "aliases  ")?;
         ui_seg(&mut stdout, spec, UI_BLUE, false, "create = send = transfer")?;
         ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
         ui_seg(&mut stdout, spec, UI_CYAN, false, "balance = bal = wallet")?;
@@ -4271,9 +4250,9 @@ Some("help") => {
     }
     // Pasting an address is the most natural thing a newcomer does with one. It
     // resolves to `account`, so it takes the Wallet hue.
-    row!(" paste an address", UI_CYAN, "<address>", "   on its own, looks it up");
-    row!(" shorthand", UI_BLUE, "<from> <to> <amount>", "   also initiates a transfer");
-    row!(" end session", UI_PINK, "exit", "");
+    row!(UI_CYAN, "paste an address", "<address>", "   looks it up");
+    row!(UI_BLUE, "shorthand", "<from> <to> <amount>", "   starts a transfer");
+    row!(UI_PINK, "end session", "exit", "");
     writeln!(stdout)?;
     stdout.reset()?;
 }
