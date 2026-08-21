@@ -3226,7 +3226,7 @@ impl Mgmt {
 
             // Section rule: title in the section hue, the subtotal right-aligned
             // on the same line so each group states its own position.
-            ui_seg(&mut stdout, spec, UI_FAINT, false, " ── ")?;
+            ui_seg(&mut stdout, spec, UI_HAIRLINE, false, " ── ")?;
             ui_seg(&mut stdout, spec, *hue, true, title)?;
             let used = 4 + title.chars().count();
             let subtotal_text = format!(
@@ -3237,7 +3237,13 @@ impl Mgmt {
             let rule_end = Self::CONTACTS_NET_END.saturating_sub(subtotal_text.chars().count());
             if rule_end > used + 1 {
                 let dashes: String = "─".repeat(rule_end.saturating_sub(used + 1));
-                ui_seg(&mut stdout, spec, UI_FAINT, false, &format!(" {}", dashes))?;
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_HAIRLINE,
+                    false,
+                    &format!(" {}", dashes),
+                )?;
             }
             ui_seg(
                 &mut stdout,
