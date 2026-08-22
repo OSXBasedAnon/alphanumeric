@@ -111,6 +111,16 @@ const CHAIN_META_TREE: &str = "chain_meta";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const CHAIN_TIP_KEY: &[u8] = b"tip";
 const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
+
+/// True once the operator has asked this process to stop — the typed `exit`, Ctrl-C,
+/// SIGTERM, or stdin closing. Set by the front-end, read here.
+///
+/// This flag tunes LOG SEVERITY ONLY, never behavior: a catch-up window dropped during
+/// an orderly stop is routine (the marker it leaves is the durability design working),
+/// while the same drop on a node that keeps running is the trigger half of diagnosing a
+/// wedged or orphaned miner and must stay loud. Nothing else may branch on this.
+pub static OPERATOR_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Highest block height treated as final. At/below it blocks are
 /// signature-trusted and cannot be reorged; above it every adopted block must
 /// pass full ML-DSA verification. Monotonic. See CHECKPOINT_REORG_MARGIN.
@@ -1611,10 +1621,20 @@ impl Drop for ReceiptApplyBatch {
                 // error-level deliberately: the default field log filter is
                 // Error, and this line is the trigger half of diagnosing a
                 // wedged/orphaned-miner report — it must be visible there.
-                error!(
-                    "Catch-up apply window dropped without commit; dirty marker left set — \
-                     derived state is rebuilt automatically on the next start"
-                );
+                if OPERATOR_SHUTDOWN.load(Ordering::Acquire) {
+                    // An orderly stop while behind: the window drop is a routine
+                    // consequence of exiting, not a fault. The next start explains
+                    // itself via the boot UI, so this stays out of the error channel.
+                    log::info!(
+                        "Catch-up apply window closed by shutdown; derived state is \
+                         rebuilt automatically on the next start"
+                    );
+                } else {
+                    error!(
+                        "Catch-up apply window dropped without commit; dirty marker left set — \
+                         derived state is rebuilt automatically on the next start"
+                    );
+                }
             }
         }
     }
@@ -2183,6 +2203,26 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Read-only peek at the pending recovery marker, for the boot UI: the reason and
+    /// the height it was marked at, or None when the last stop was clean. Never writes,
+    /// never recovers — `initialize` remains the only entry into recovery.
+    pub fn pending_recovery(&self) -> Option<(String, u32)> {
+        self.chain_state_dirty()
+            .ok()
+            .flatten()
+            .map(|m| (m.reason, m.block_index))
+    }
+
+    /// Rough wall-clock estimate for a startup recovery at `chain_height`, for the boot
+    /// UI's "about Ns" message. The rebuild is O(chain): four full passes measured at
+    /// ~17.5 us/block on the reference machine (11.9s at height 681,728). Estimated a
+    /// third high on purpose — finishing earlier than promised is fine, later is not —
+    /// and floored so a young chain still shows a sane number.
+    pub fn recovery_estimate_secs(chain_height: u64) -> u64 {
+        const PER_BLOCK_SECS: f64 = 17.5e-6 * 1.33;
+        ((chain_height as f64 * PER_BLOCK_SECS).ceil() as u64).max(3)
+    }
+
     fn chain_state_dirty(&self) -> Result<Option<ChainStateDirty>, BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
         let Some(raw) = meta_tree.get(CHAIN_STATE_DIRTY_KEY)? else {
@@ -2271,19 +2311,37 @@ impl Blockchain {
                 // that operator their shutdown was unclean is false, and being told a lie
                 // at error level is how an operator learns to stop reading error level.
                 // The other reasons genuinely do mean an apply was interrupted.
-                let cause = if marker.reason == "receipt_batch" {
-                    "Expected when the node is stopped while it is catching up"
+                // Severity follows the reason AND the audience. A receipt_batch
+                // marker means the process stopped while a catch-up window was open —
+                // and it CANNOT say whether that stop was orderly or a crash, because
+                // mark_chain_state_dirty collapses every in-window reason to
+                // receipt_batch. Both cases recover identically and need nothing from
+                // the operator, so on an interactive terminal (where the boot UI has
+                // already announced and confirmed the restore) the line rides warn.
+                // Headless, there is no boot UI and this line is the only breadcrumb
+                // a crash-during-sync leaves at the default Error filter, so it stays
+                // error there. The non-window reasons (persist_block, finalize_block,
+                // orphan_branch_reorg) are only ever written OUTSIDE a window and do
+                // mean an apply was interrupted mid-write: always error.
+                let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+                if marker.reason == "receipt_batch" && interactive {
+                    warn!(
+                        "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
+                         Expected when the node is stopped while it is catching up; the chain itself \
+                         was not damaged.",
+                        marker.reason,
+                        marker.block_index,
+                        elapsed.as_secs_f64()
+                    );
                 } else {
-                    "Expected after an unclean shutdown"
-                };
-                error!(
-                    "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
-                     {}; the chain itself was not damaged.",
-                    marker.reason,
-                    marker.block_index,
-                    elapsed.as_secs_f64(),
-                    cause
-                );
+                    error!(
+                        "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
+                         Expected after an unclean shutdown; the chain itself was not damaged.",
+                        marker.reason,
+                        marker.block_index,
+                        elapsed.as_secs_f64()
+                    );
+                }
             } else {
                 log::info!(
                     "Rebuilt derived chain state after an interrupted {} at block {} in {:.2}s",
@@ -9355,6 +9413,37 @@ mod tests {
         assert!(sentinel.is_block_verified(&block));
     }
 
+    /// Manual tool, not a test: plants a `receipt_batch` recovery marker in the redb
+    /// store named by `ALPHANUMERIC_PLANT_MARKER_DB`, so the boot restore UI can be
+    /// exercised on demand instead of racing a kill -9 against a catch-up window.
+    /// `#[ignore]` + env-gated: inert under `cargo test` and does nothing at all
+    /// unless the variable is set. Point it ONLY at a scratch node's store.
+    #[test]
+    #[ignore = "manual tool: plants a recovery marker for a live boot-UI test"]
+    fn plant_recovery_marker_in_external_db() {
+        let Some(path) = std::env::var_os("ALPHANUMERIC_PLANT_MARKER_DB") else {
+            return;
+        };
+        let db = store::Store::open(&path, 64 << 20).expect("open target store");
+        let bc = Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            TARGET_BLOCK_TIME as u32,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(Mutex::new(321)),
+        );
+        let tip = bc.highest_block_index().unwrap_or(0) as u32;
+        bc.write_dirty_marker(tip, "receipt_batch")
+            .expect("plant marker");
+        assert_eq!(
+            bc.pending_recovery(),
+            Some(("receipt_batch".to_string(), tip)),
+            "marker planted and visible to the boot peek"
+        );
+    }
+
     fn test_blockchain() -> Blockchain {
         let db = store::Store::temporary().expect("temporary store should open");
         Blockchain::new(
@@ -14875,6 +14964,60 @@ mod tests {
         assert!(
             bc.confirmed_tx_index_ready(),
             "readiness is restored once the refill commits"
+        );
+    }
+
+    /// The boot UI trusts this peek to decide whether to promise a restore and how
+    /// long to promise: a wrong None is a silent hang, a wrong Some announces work
+    /// that never happens. So pin the full round trip against the real marker.
+    #[test]
+    fn pending_recovery_reflects_the_marker_round_trip() {
+        let bc = test_blockchain();
+        assert_eq!(
+            bc.pending_recovery(),
+            None,
+            "clean chain has nothing pending"
+        );
+
+        bc.write_dirty_marker(42, "receipt_batch").unwrap();
+        assert_eq!(
+            bc.pending_recovery(),
+            Some(("receipt_batch".to_string(), 42)),
+            "the peek reports exactly what the marker says"
+        );
+
+        bc.clear_chain_state_dirty().unwrap();
+        assert_eq!(
+            bc.pending_recovery(),
+            None,
+            "cleared marker, nothing pending"
+        );
+    }
+
+    /// The estimate must never promise less than the measured reality: 11.9s was
+    /// measured at height 681,728, so the estimate there has to be at least that,
+    /// and the floor keeps a young chain from printing "about 0s".
+    #[test]
+    fn recovery_estimate_overpromises_never_underpromises() {
+        let at_measured = Blockchain::recovery_estimate_secs(681_728);
+        assert!(
+            at_measured >= 12,
+            "estimate at the measured height ({}s) must cover the measured 11.9s",
+            at_measured
+        );
+        assert!(
+            at_measured <= 30,
+            "estimate should stay the same order of magnitude, got {}s",
+            at_measured
+        );
+        assert!(
+            Blockchain::recovery_estimate_secs(0) >= 3,
+            "floor holds at genesis"
+        );
+        assert!(
+            Blockchain::recovery_estimate_secs(2_000_000)
+                > Blockchain::recovery_estimate_secs(1_000_000),
+            "estimate grows with the chain"
         );
     }
 

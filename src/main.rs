@@ -811,6 +811,7 @@ async fn async_main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                 }
                 shutdown_flag.store(true, Ordering::Release);
+                alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                 let _ = db_for_signal.flush();
                 eprintln!("Shutting down cleanly...");
             });
@@ -871,11 +872,48 @@ async fn async_main() -> Result<()> {
             blockchain.write().await.create_genesis_block().await?;
         }
 
-        // Set specific message for balance verification
-        pb.set_message("Verifying blockchain state...");
+        // If the last stop left a recovery marker, say so BEFORE the work starts —
+        // with an estimate — instead of sitting silent and reporting afterwards.
+        // The rebuild holds the chain write lock, so to a user this stretch is
+        // otherwise indistinguishable from a hang, and an unexplained hang next to
+        // the passphrase prompt is how an operator learns to force-kill the node
+        // (which, during recovery specifically, re-arms the identical work). This
+        // is a read-only peek; initialize() below remains the only entry into
+        // recovery.
+        let pending_recovery = blockchain.read().await.pending_recovery();
+        match &pending_recovery {
+            Some((reason, _)) => {
+                let est = alphanumeric::a9::blockchain::Blockchain::recovery_estimate_secs(
+                    blockchain.read().await.get_latest_block_index() as u64,
+                );
+                let what = if reason == "receipt_batch" {
+                    "an interrupted sync"
+                } else {
+                    "an interrupted write"
+                };
+                pb.set_message(format!(
+                    "Restoring state after {} — about {}s at this height...",
+                    what, est
+                ));
+            }
+            None => pb.set_message("Verifying blockchain state..."),
+        }
+        let init_started = std::time::Instant::now();
         if let Err(e) = blockchain.write().await.initialize().await {
             error!("Failed to initialize blockchain: {}", e);
             return Err(Box::new(e));
+        }
+        if pending_recovery.is_some() {
+            // The counterpart of the promise above: confirm the pause was the
+            // restore, and that it is over. Plain text on purpose — this is the
+            // routine outcome, not an event. The clock covers all of initialize,
+            // not just the rebuild, so say "verification" rather than promising
+            // the number measures the restore alone: on a first boot after an
+            // upgrade, one-time index work can legitimately dwarf the estimate.
+            pb.println(format!(
+                "  state restored — verification finished in {:.1}s",
+                init_started.elapsed().as_secs_f64()
+            ));
         }
         pb.inc(1);
 
@@ -1962,6 +2000,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -1975,6 +2014,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2011,6 +2051,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2023,6 +2064,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2035,6 +2077,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -4287,6 +4330,7 @@ use std::process::Command;
 // opened with flush_every_ms(1000) and the signal handler does not run for a TYPED command,
 // so returning here discards up to ~1s of writes. `exit` is the documented way to end a
 // session and was the only one of these paths that skipped it.
+alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
 let _ = db.flush();
 let _ = remove_db_lock(&format!("{}.lock", db_path));
 let _ = remove_instance_lock();
