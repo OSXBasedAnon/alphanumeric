@@ -1686,6 +1686,8 @@ async fn async_main() -> Result<()> {
                 // delta-sync gets its chance and strikes stay >= 20s apart.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut strikes = 0u32;
+
+                let mut progress_resets = 0;
                 let mut cooldown_logged = false;
                 let mut behind_logged = false;
                 loop {
@@ -1831,10 +1833,30 @@ async fn async_main() -> Result<()> {
                             // -> falls through). Mining-neutral: read-only convergence, no
                             // marker written, mine-prep's own reconcile untouched.
                             if !forked {
+                                // Tip before this converge cycle, for the progress check in
+                                // the fallthrough arm. Guard is a temporary — dropped at the
+                                // semicolon, never held across the sync await.
+                                let tip_before = node_recon
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .get_latest_block_index()
+                                    as u32;
                                 match node_recon.sync_full_history_from_peer(true).await {
-                                    Converge::Converged
+                                    verdict @ (Converge::Converged
                                     | Converge::AtTipAhead
-                                    | Converge::Progressed => {
+                                    | Converge::Progressed) => {
+                                        // Converged/AtTipAhead prove this generation reached
+                                        // the tip: the incident is over, so a FUTURE deep gap
+                                        // starts a fresh respawn budget. Progressed is still
+                                        // mid-heal and deliberately does not count.
+                                        if !matches!(verdict, Converge::Progressed) {
+                                            LINEAGE_HEALED.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            progress_resets = 0;
+                                        }
                                         strikes = 0;
                                         if !behind_logged {
                                             notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
@@ -1842,7 +1864,41 @@ async fn async_main() -> Result<()> {
                                         }
                                         continue;
                                     }
-                                    _ => {}
+                                    _ => {
+                                        // A failed VERDICT is not a failed HEAL: the bounded
+                                        // converge reports NeedsBootstrap for ANY residual gap,
+                                        // including the cycle that just applied thousands of
+                                        // blocks and ran out of deadline (expiry keeps a
+                                        // consistent prefix; the next cycle resumes from the
+                                        // advanced tip). Striking on that verdict killed nodes
+                                        // 5-10 minutes into a working catch-up. So the fuse
+                                        // resets on measured PROGRESS — the same rule mine-prep
+                                        // uses — and only a cycle that moved the tip nowhere
+                                        // counts toward the snapshot escape.
+                                        let tip_now = node_recon
+                                            .blockchain
+                                            .read()
+                                            .await
+                                            .get_latest_block_index()
+                                            as u32;
+                                        // Bounded: an eclipse peer could drip just enough
+                                        // real blocks to keep resetting the fuse while the
+                                        // node never actually gains on the network. The
+                                        // largest legitimate runtime heal is one keep-band
+                                        // (8192 blocks) plus slow pre-mesh retries — well
+                                        // inside 60 cycles — so past the budget the drip
+                                        // stops counting as health and the snapshot escape
+                                        // proceeds. Reset on any proven arrival at the tip.
+                                        if tip_now > tip_before && progress_resets < 60 {
+                                            progress_resets += 1;
+                                            strikes = 0;
+                                            if !behind_logged {
+                                                notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
+                                                behind_logged = true;
+                                            }
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                             behind_logged = false;
@@ -1887,6 +1943,35 @@ async fn async_main() -> Result<()> {
                                         marker.display(),
                                         e
                                     );
+                                }
+                                // Interactive sessions never die into a dead terminal:
+                                // the marker above already guarantees the next boot
+                                // re-bootstraps, so hand this same terminal a next boot.
+                                // Exec does not run Drop — identical semantics to the
+                                // exit(3) below, which is the point: the durable marker,
+                                // not teardown, is the recovery contract. Headless nodes
+                                // keep exit(3) byte-for-byte: supervisors depend on it,
+                                // and the other watchdogs already draw this same
+                                // interactive/headless line.
+                                let interactive = !env_flag_enabled("ALPHANUMERIC_HEADLESS")
+                                    && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                                if interactive {
+                                    println!(
+                                        "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
+                                        alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
+                                    );
+                                    let _ = db_for_recon.flush();
+                                    let _ = remove_db_lock(&format!(
+                                        "{}.lock",
+                                        db_path_recon
+                                    ));
+                                    let _ = remove_instance_lock();
+                                    let err = restart_in_place();
+                                    eprintln!(
+                                        "In-place restart unavailable ({}); exiting — relaunch the app to finish the re-bootstrap.",
+                                        err
+                                    );
+                                    std::process::exit(3);
                                 }
                                 println!(
                                     "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
@@ -4051,6 +4136,35 @@ Some("history") => {
         println!("Error: {}", e);
     }
 },
+    Some("--sync") if command.split_whitespace().nth(1) == Some("bootstrap") => {
+        // Typed consent for the in-place snapshot heal: writes the same durable
+        // marker the watchdog writes, then restarts this terminal into a boot
+        // that re-bootstraps unconditionally. Lives here rather than in
+        // handle_network_commands because the store handle and db path do.
+        println!("Re-bootstrapping from a fresh verified snapshot; restarting in place...");
+        let marker = force_rebootstrap_marker_path(&db_path);
+        if let Err(e) = alphanumeric::a9::node::write_durable(
+            &marker,
+            b"operator-requested re-bootstrap (--sync bootstrap)\n",
+        ) {
+            println!("Could not write the re-bootstrap marker ({}); nothing was changed.", e);
+        } else {
+            let _ = db.flush();
+            let _ = remove_db_lock(&format!("{}.lock", db_path));
+            let _ = remove_instance_lock();
+            let err = restart_in_place();
+            // Do NOT fall back into the menu: the pid locks are already removed and
+            // the wipe marker is armed, so a session that keeps running here is a
+            // second-instance hazard and a surprise wipe waiting for the next boot.
+            // The marker is durable and the store is flushed — exiting IS the safe
+            // state, exactly like the watchdog's own fallback.
+            println!(
+                "In-place restart unavailable ({}); exiting — relaunch the app and the snapshot will be applied at boot.",
+                err
+            );
+            std::process::exit(3);
+        }
+    },
     Some(cmd) if cmd.starts_with("--") => {
         if let Err(e) = handle_network_commands(&command, &node).await {
             println!("Network command error: {}", e);
@@ -4291,7 +4405,7 @@ Some("help") => {
     row!(UI_LAVENDER, "connectivity", "--status", "");
     row!(UI_LAVENDER, "peer discovery", "--getpeers", "   or --discover");
     row!(UI_LAVENDER, "add peer", "--connect ", "<ip:port>");
-    row!(UI_LAVENDER, "resynchronise", "--sync", "");
+    row!(UI_LAVENDER, "resynchronise", "--sync ", "[bootstrap]");
     row!(UI_LAVENDER, "diagnostics", "debug", "");
     writeln!(stdout)?;
 
@@ -4483,8 +4597,12 @@ async fn handle_chain_sync(
             Ok(())
         }
         Converge::NeedsBootstrap => {
+            // Overloaded verdict: a genuine fork below finality AND a gap too deep
+            // for the committed-span heal both land here. Either way the snapshot
+            // is the fix, so say so and name the command instead of leaving the
+            // operator with a diagnosis and no verb.
             status_pb.finish_with_message(
-                "Local chain diverged below the finality window; a re-bootstrap is required",
+                "Cannot reach the tip over peer sync (forked below finality, too far behind to heal over peers, or peer sync stalled repeatedly). Type --sync bootstrap to pull a fresh verified snapshot now.",
             );
             Ok(())
         }
@@ -5227,6 +5345,69 @@ fn ensure_instance_lock() -> std::io::Result<()> {
     ensure_pid_lock(INSTANCE_LOCK_PATH, "ALPHANUMERIC_IGNORE_INSTANCE_LOCK")
 }
 
+/// Budget guarding in-place restarts: carried through the environment so it
+/// survives the exec boundary. Three generations is far past any legitimate
+/// heal (one restart re-bootstraps and lands at the tip); if a third respawn is
+/// still stranded, something is wrong that restarting will not fix, and the
+/// process falls back to the supervised exit path.
+const RESPAWN_DEPTH_ENV: &str = "ALPHANUMERIC_RESPAWN_DEPTH";
+
+/// Restart this process in place, same terminal, same arguments. Unix: exec —
+/// the image is replaced and this function does not return on success. Any
+/// return value is the reason it could not happen, and the caller falls back
+/// to the plain exit it would have done anyway. Callers must have flushed the
+/// store and removed the db/instance locks first: exec does not run Drop, by
+/// design — the durable marker written before this is the recovery contract,
+/// exactly as it is for the supervised exit(3).
+/// True once THIS generation has verifiably reached the network tip (the idle
+/// loop's Converged/AtTipAhead verdicts). A generation that healed completely is
+/// a finished incident, so the next in-place restart starts a fresh respawn
+/// budget instead of inheriting the lineage's count — without this, three
+/// successful heals spread over weeks of one terminal session would exhaust a
+/// budget that exists only to stop a restart LOOP.
+static LINEAGE_HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn restart_in_place() -> std::io::Error {
+    let depth: u32 = std::env::var(RESPAWN_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if depth >= 3 {
+        return std::io::Error::other("in-place restart budget (3) exhausted");
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // A healed generation closes its incident: the child starts a fresh budget.
+    let next_depth = if LINEAGE_HEALED.load(std::sync::atomic::Ordering::Acquire) {
+        1
+    } else {
+        depth + 1
+    };
+    // Exec preserves TERMINAL state, not just process state: if this fires while
+    // rustyline holds the tty raw (ECHO/ICANON/ISIG off — true whenever the user
+    // is sitting at the prompt), the next generation boots with Ctrl-C dead and
+    // typing invisible, and its rustyline then adopts raw as "original", making
+    // the wedge permanent. Hand the child a sane line discipline first.
+    // Best-effort by design: a missing stty must not block the restart.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let _ = std::process::Command::new("stty").arg("sane").status();
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(RESPAWN_DEPTH_ENV, next_depth.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::Error::other("in-place restart is unix-only; relaunch the app manually")
+    }
+}
+
 fn remove_instance_lock() -> std::io::Result<()> {
     remove_db_lock(INSTANCE_LOCK_PATH)
 }
@@ -5246,7 +5427,11 @@ fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
             let _ = std::fs::remove_file(lock_path);
         } else if let Ok(pid_str) = std::fs::read_to_string(lock_path) {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                if !is_process_alive(pid) {
+                // A lock naming OUR OWN pid is stale by definition: exec keeps the
+                // pid, so a failed unlink before an in-place restart would otherwise
+                // make the fresh image refuse to boot against itself. No live
+                // FOREIGN process can hold our pid.
+                if pid == std::process::id() || !is_process_alive(pid) {
                     let _ = std::fs::remove_file(lock_path);
                 } else {
                     // Name the file, the PID, and the escape hatch: the old
@@ -6531,7 +6716,7 @@ fn canonical_reconcile_decision(
     // boot-time comparison — the manifest lags its publish cadence, so a fork AT
     // tip height reads as "in sync" against a stale manifest (the 2026-07-10
     // restart crash-loop). Honoring the marker is also what makes the wide
-    // STREAM_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
+    // PEER_HEAL_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
     // Checked only once the manifest verified (above): with the gateway down a
     // re-bootstrap is impossible anyway, so offline starts stay fail-open and the
     // marker simply persists for the next boot. remove_local_db clears it together
@@ -6616,16 +6801,14 @@ fn canonical_reconcile_decision(
     }
 
     // Plain BEHIND (anchor region on canonical, or no anchor to check). If the
-    // gap to the live tip is within STREAM_WINDOW, KEEP the local DB: the running
-    // node closes the gap in place via the idle-reconcile bulk delta-sync
-    // (sync_full_history_from_peer, which pulls [tip+1..=beacon] over GetBlocks
-    // from any full-history peer's complete DB — see STREAM_WINDOW's note). Do
-    // NOT nuke a valid canonical prefix and re-download the whole chain for a gap
-    // that normal syncing closes; that also avoids the ~3x bulk-import bloat a
-    // fresh snapshot leaves in sled. A near-empty DB has, by construction, a gap
-    // deeper than the window (live_height - tiny_tip), so it re-bootstraps here
-    // where the fixed-size snapshot is the faster tool.
-    if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
+    // gap to the live tip is within the runtime's PROVEN heal window, KEEP the
+    // local DB: the idle-reconcile loop closes the gap in place via the
+    // beacon-committed receipt span (see PEER_HEAL_WINDOW's note — the window is
+    // the verification bound, not a bandwidth preference). Beyond it, take the
+    // verified snapshot NOW: keeping a DB the runtime cannot heal only defers
+    // the same snapshot to a watchdog exit. A near-empty DB has, by
+    // construction, a gap deeper than the window, so it re-bootstraps here too.
+    if local_tip.saturating_add(PEER_HEAL_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
 
@@ -6659,30 +6842,24 @@ fn canonical_reconcile_decision(
 /// bounded by ORPHAN_REORG_DEPTH — a wider window booted "in sync" and then
 /// marker-exited ~40s later because the engine could not stream past 1024
 /// (review finding, 2026-07-11; an initial 2000 left the 1025..=2000 band
-/// deterministically taking the exit path). That bound no longer governs
-/// catch-up: the idle-reconcile loop now escalates a stalled converge to a bulk
-/// delta-sync (sync_full_history_from_peer), which pulls [tip+1..=beacon] in
-/// MAX_GETBLOCKS_SPAN batches from any full-history peer. GetBlocks is served
-/// straight from that peer's COMPLETE block DB (ChainRequest -> get_block; no
-/// 24h relay-retention limit — that limit is on gossip, not block serving), so
-/// a full peer serves any historical range and the delta-sync closes a gap of
-/// ANY size. The window is therefore now a stream-vs-snapshot tradeoff, not an
-/// engine bound: within it we keep the compact, incrementally-built DB and
-/// stream the tail (a snapshot re-bootstrap instead leaves ~3x bulk-import bloat
-/// in sled that never self-heals); a genuinely enormous gap (weeks abandoned)
-/// re-bootstraps, where the fixed-size snapshot download is decisively faster
-/// and there is proportionally little local prefix worth preserving.
+/// deterministically taking the exit path).
 ///
-/// Seven days of blocks at target cadence — comfortably covers any realistic
-/// close-and-reopen while bounding the worst-case boot catch-up (~120k blocks
-/// stream in ~1-2 min in the background while the client is already usable).
-/// Escapes are unchanged: a node NO peer can serve has its stalled delta-sync
-/// fall through to the 2-strike -> marker -> re-bootstrap path; a runtime-proven
-/// divergence drops the marker (honored unconditionally next boot); and a
-/// forked-at-checkpoint chain (hash mismatch above) never reaches this window
-/// and re-bootstraps immediately.
-const STREAM_WINDOW: u32 =
-    (7 * 24 * 60 * 60 / alphanumeric::a9::blockchain::TARGET_BLOCK_TIME) as u32;
+/// KEEP THE DB ONLY FOR A GAP THE RUNTIME CAN ACTUALLY HEAL. A previous version
+/// of this window was seven days, on the theory that the peer delta-sync
+/// "closes a gap of ANY size" because GetBlocks serves any range from a full
+/// peer's DB. Blocks are served, but they cannot be VERIFIED: peers retain full
+/// ML-DSA witnesses for only WITNESS_RETENTION_BLOCKS past confirmation, so the
+/// witness path stalls on the first tx-carrying block deeper than that, and the
+/// receipt path built for pruned history — the beacon-committed span — proves
+/// at most COMMITTED_SPAN_MAX_BLOCKS in one anchored walk. Every gap between
+/// that cap and seven days was therefore kept at boot and then deterministically
+/// killed at runtime (strikes -> marker -> exit): the 2026-07-11 band bug
+/// reintroduced one level up. Tying the boot promise to the runtime cap by
+/// construction closes the band: within it we keep the compact DB and stream
+/// the tail; beyond it we take the verified snapshot immediately, which is the
+/// faster tool for a deep gap anyway (fixed-size download, minutes, regardless
+/// of depth).
+const PEER_HEAL_WINDOW: u32 = alphanumeric::a9::node::COMMITTED_SPAN_MAX_BLOCKS;
 
 // Marker + cooldown live in a9::node (single source, shared by the runtime
 // divergence exit, mine-prep scheduling, and this boot-time reconcile):
@@ -9312,7 +9489,7 @@ mod tests {
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, local_tip),
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW), None, local_tip),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -9445,7 +9622,7 @@ mod tests {
         let db = reconcile_test_db("behind_big", &[(100, 7)]);
         let m = manifest_at(150, 9);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None, None),
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW + 1), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }
