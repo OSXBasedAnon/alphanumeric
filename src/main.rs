@@ -747,7 +747,7 @@ async fn async_main() -> Result<()> {
         } else {
             pb
         };
-        pb.set_message("Initializing database...");
+        pb.set_message("Preparing the database...");
         let db = match open_chain_db(&db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -845,7 +845,7 @@ async fn async_main() -> Result<()> {
         let db_arc = Arc::new(RwLock::new(db.clone()));
         pb.inc(1);
 
-        pb.set_message("Creating blockchain...");
+        pb.set_message("Loading the chain...");
         // Per-sender admission circuit breaker: catches a client stuck in a submit loop
         // without shaping legitimate concentrated traffic. It is NOT the inbound spam gate —
         // gossip is paced per-PEER before dispatch, and mempool occupancy is bounded
@@ -958,7 +958,7 @@ async fn async_main() -> Result<()> {
         }
 
         // Continue with rest of initialization
-        pb.set_message("Setting up management...");
+        pb.set_message("Preparing the console...");
         let (_transaction_fee, _mining_reward, _difficulty_adjustment_interval, _block_time) = {
             let blockchain_lock = blockchain.read().await;
             (
@@ -1006,7 +1006,7 @@ async fn async_main() -> Result<()> {
         pb.inc(1);
 
         // Then create the node (single instance)
-        pb.set_message("Creating node...");
+        pb.set_message("Starting the node...");
         let explicit_bind = std::env::var("ALPHANUMERIC_BIND_IP").is_ok()
             || std::env::var("ALPHANUMERIC_PORT").is_ok();
         let bind_addr = if explicit_bind {
@@ -4457,7 +4457,7 @@ async fn handle_chain_sync(
     let mp = MultiProgress::new();
     let status_pb = mp.add(ProgressBar::new_spinner());
     status_pb.enable_steady_tick(Duration::from_millis(120));
-    status_pb.set_message("Syncing to the network tip…");
+    status_pb.set_message("Syncing to the network tip...");
 
     let local_height = { node.blockchain.read().await.get_latest_block_index() as u32 };
     let outcome = node.sync_to_beacon().await;
@@ -4700,7 +4700,7 @@ async fn handle_network_commands(
 
         "--discover" => {
             let pb = ProgressBar::new_spinner();
-            pb.set_message("Discovering network nodes...");
+            pb.set_message("Discovering peers...");
 
             // Use the existing peer count as baseline
             let initial_peers = node.peers.read().await.len();
@@ -4791,7 +4791,7 @@ async fn handle_network_commands(
 
         "--sync" => {
             let pb = ProgressBar::new_spinner();
-            pb.set_message("Synchronizing with network...");
+            pb.set_message("Syncing with the network...");
 
             // First try to discover peers if needed. Snapshot the count in a scoped
             // block so the peers read guard is ALWAYS released before handle_chain_sync.
