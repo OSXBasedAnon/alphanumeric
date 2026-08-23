@@ -1123,6 +1123,7 @@ async fn async_main() -> Result<()> {
                             // huge value in release, firing false "sleep detected" resets every
                             // tick. Matches the sibling checks elsewhere in this monitor.
                             let last = activity_time.load(Ordering::Acquire);
+                            let mut now = now;
                             if now.saturating_sub(last) > SLEEP_THRESHOLD {
                                 debug!("Sleep detected, resetting network state");
                                 // Reset all counters
@@ -1142,6 +1143,22 @@ async fn async_main() -> Result<()> {
                                 if let Err(e) = node.discover_network_nodes().await {
                                     error!("Network rediscovery after wake failed: {}", e);
                                 }
+
+                                // A completed recovery IS activity. The reset plus the
+                                // inline rediscovery above take longer than
+                                // SLEEP_THRESHOLD themselves (measured 8-13s), so
+                                // stamping the PRE-recovery clock below made the very
+                                // next tick read another >10s gap and fire again — a
+                                // self-sustaining reset storm (measured live: nine
+                                // consecutive pool resets over two minutes, every
+                                // outbound TCP send failing throughout, after one
+                                // ordinary wake-from-sleep or a long passphrase
+                                // prompt starving this thread). Re-read the clock so
+                                // one stall costs exactly one reset.
+                                now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
                             }
                             activity_time.store(now, Ordering::Release);
 
