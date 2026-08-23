@@ -9,7 +9,7 @@ use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
 use crate::a9::wallet::Wallet;
-use crate::a9::wallet_ledger::{PaymentTuple, WalletLedger};
+use crate::a9::ledger::{PaymentTuple, WalletLedger};
 
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
 pub const MAX_FEE: f64 = 0.01;
@@ -286,7 +286,7 @@ impl WhisperModule {
         message: &str,
         wallet: &Wallet,
         sender_balance: f64,
-        wallet_ledger: &Arc<WalletLedger>,
+        ledger: &Arc<WalletLedger>,
     ) -> Result<Transaction, BlockchainError> {
         // Reject rather than silently truncate: only the first MAX_WHISPER_CHARS are encoded.
         if message.chars().count() > MAX_WHISPER_CHARS {
@@ -310,7 +310,7 @@ impl WhisperModule {
             Transaction::to_units(base_amount),
             Transaction::to_units(initial_fee),
         );
-        let timestamp = wallet_ledger
+        let timestamp = ledger
             .allocate_timestamp(&tuple, now)
             .map_err(|_| BlockchainError::InvalidTransaction)?;
         let total_fee = self.encode_message_as_fee(message, timestamp, base_amount);
@@ -342,7 +342,7 @@ impl WhisperModule {
         // Like ordinary wallet sends, persist before returning the signed transaction to a caller.
         // This keeps programmatic Whisper users collision-safe too, rather than protecting only the
         // interactive `create` command.
-        let ledger = Arc::clone(wallet_ledger);
+        let ledger = Arc::clone(ledger);
         let tx_id = tx.get_tx_id();
         let signed_tx = serde_json::to_string(&tx).map_err(BlockchainError::from)?;
         tokio::task::spawn_blocking(move || {
