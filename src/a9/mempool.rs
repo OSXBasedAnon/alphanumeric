@@ -27,6 +27,11 @@ const MEMPOOL_MAX_PER_ADDRESS: usize = 250;
 /// propagation, compact-reconstruction hit rate) and sustained organic demand.
 /// Reversible by restarting producers with the old constant.
 pub const MAX_BLOCK_SIZE: usize = 2_000_000;
+// The producer must never assemble a block heavier than consensus validation
+// accepts: a producer cap above the weight limit would mine permanently invalid
+// blocks. Pinned at compile time so the staged cap raise (see
+// docs/CONSENSUS_DECISIONS.md) cannot overshoot the envelope by edit error.
+const _: () = assert!(MAX_BLOCK_SIZE <= crate::a9::blockchain::MAX_BLOCK_WEIGHT_BYTES);
 /// Per-TRANSACTION admission cap, deliberately decoupled from the feed cap
 /// above: raising the feed must never raise what one transaction may occupy
 /// (a single feed-sized transaction could otherwise fill an entire block).
