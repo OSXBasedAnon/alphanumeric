@@ -785,35 +785,78 @@ async fn async_main() -> Result<()> {
         {
             let shutdown_flag = shutdown_requested.clone();
             let db_for_signal = db.clone();
+            let db_path_for_signal = db_path.clone();
             tokio::spawn(async move {
                 // Treat SIGTERM (systemd/docker `stop`) identically to SIGINT (Ctrl-C):
                 // without it, `systemctl stop` kills the node with no graceful flush and
                 // the last flush-window of non-marker writes would be lost
                 // (consensus state is marker-flushed per block; see a9::store).
+                //
+                // This task must OUTLIVE the first signal and must TERMINATE the
+                // process. The previous version fired once — set the flag, flushed,
+                // printed — and returned. Loops that poll the flag (mining) wound
+                // down; the REPL, blocked on stdin, polls nothing, so a node at the
+                // idle prompt absorbed SIGTERM and kept running until the
+                // supervisor's kill timeout — measured live: two SIGTERMs ignored
+                // at the menu. Now: first signal flags, flushes, and starts a short
+                // grace so an in-flight mining batch can finish, then removes the
+                // locks and exits; a second signal exits immediately.
                 #[cfg(unix)]
-                {
+                let mut term = {
                     use tokio::signal::unix::{signal, SignalKind};
                     match signal(SignalKind::terminate()) {
-                        Ok(mut term) => {
-                            tokio::select! {
-                                _ = tokio::signal::ctrl_c() => {}
-                                _ = term.recv() => {}
-                            }
-                        }
+                        Ok(t) => Some(t),
                         Err(e) => {
                             eprintln!("Failed to install SIGTERM handler ({e}); Ctrl-C only");
-                            let _ = tokio::signal::ctrl_c().await;
+                            None
                         }
                     }
+                };
+                let mut signals_seen = 0u32;
+                loop {
+                    #[cfg(unix)]
+                    {
+                        match term.as_mut() {
+                            Some(t) => {
+                                tokio::select! {
+                                    _ = tokio::signal::ctrl_c() => {}
+                                    _ = t.recv() => {}
+                                }
+                            }
+                            None => {
+                                let _ = tokio::signal::ctrl_c().await;
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                    signals_seen += 1;
+                    if signals_seen > 1 {
+                        eprintln!("Second signal: exiting immediately.");
+                        std::process::exit(1);
+                    }
+                    shutdown_flag.store(true, Ordering::Release);
+                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let _ = db_for_signal.flush();
+                    eprintln!("Shutting down cleanly...");
+                    let db = db_for_signal.clone();
+                    let lock_path = format!("{}.lock", db_path_for_signal);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&lock_path);
+                        let _ = remove_instance_lock();
+                        // Same terminal courtesy as restart_in_place: rustyline may
+                        // hold the tty raw, and exiting skips its restore.
+                        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                            let _ = std::process::Command::new("stty").arg("sane").status();
+                        }
+                        std::process::exit(0);
+                    });
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                shutdown_flag.store(true, Ordering::Release);
-                alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
-                let _ = db_for_signal.flush();
-                eprintln!("Shutting down cleanly...");
             });
         }
         {
