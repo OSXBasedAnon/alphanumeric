@@ -2,7 +2,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 const MAGIC: &[u8; 8] = b"A9MSG2\0\0";
 const VERSION: u16 = 2;
-const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u16>();
+pub const HEADER_LEN: usize = MAGIC.len() + std::mem::size_of::<u16>();
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {

@@ -9458,6 +9458,154 @@ mod tests {
     }
 
     // Fee-accounting probes: a regular (non-coinbase) transaction carrying `fee`.
+    /// GOLDEN BYTES — the consensus serialization contract.
+    ///
+    /// The Merkle leaf is SHA-256 over `codec::serialize` of a Transaction
+    /// (calculate_merkle_leaf_hash), so the rmp/rmp-serde encoding IS consensus.
+    /// These vectors pin it: if a dependency bump, a serde attribute, a field
+    /// reorder, or a struct change shifts one output byte, these fail before the
+    /// network does. Update them ONLY as a deliberate consensus decision — a
+    /// failing golden test is a chain split caught in CI, not a test to appease.
+    fn golden_full_tx() -> Transaction {
+        Transaction {
+            sender: "a".repeat(40),
+            recipient: "b".repeat(40),
+            fee_units: 12_345,
+            // Large-magnitude i128: exercises the widest integer encoding path.
+            amount_units: 9_223_372_036_854_775_807_000i128,
+            timestamp: 1_700_000_000,
+            signature: Some("cd".repeat(mldsa::SIGNATURE_BYTES)),
+            pub_key: Some("ef".repeat(mldsa::PUBLIC_KEY_BYTES)),
+            sig_hash: Some("12".repeat(32)),
+        }
+    }
+
+    fn golden_none_tx() -> Transaction {
+        Transaction {
+            sender: "c".repeat(40),
+            recipient: "d".repeat(40),
+            fee_units: 0,
+            amount_units: MIN_TRANSACTION_AMOUNT_UNITS,
+            timestamp: 1_700_000_001,
+            signature: None,
+            pub_key: None,
+            sig_hash: None,
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        hex::encode(h.finalize())
+    }
+
+    #[test]
+    fn golden_bytes_transaction_encoding_is_pinned() {
+        let full = codec::serialize(&golden_full_tx()).expect("serialize full");
+        let none = codec::serialize(&golden_none_tx()).expect("serialize none");
+        assert_eq!(
+            (full.len(), sha256_hex(&full).as_str()),
+            (PIN_FULL_LEN, PIN_FULL_SHA),
+            "full-witness Transaction encoding moved — this is a consensus change"
+        );
+        assert_eq!(
+            (none.len(), sha256_hex(&none).as_str()),
+            (PIN_NONE_LEN, PIN_NONE_SHA),
+            "optional-fields-None Transaction encoding moved — this is a consensus change"
+        );
+    }
+
+    #[test]
+    fn golden_bytes_block_and_merkle_leaf_are_pinned() {
+        let block = Block {
+            index: 7,
+            previous_hash: [0x11; 32],
+            timestamp: 1_700_000_002,
+            transactions: vec![golden_full_tx(), golden_none_tx()],
+            nonce: 42,
+            difficulty: 690,
+            hash: [0x22; 32],
+            merkle_root: [0x33; 32],
+        };
+        let enc = codec::serialize(&block).expect("serialize block");
+        assert_eq!(
+            (enc.len(), sha256_hex(&enc).as_str()),
+            (PIN_BLOCK_LEN, PIN_BLOCK_SHA),
+            "Block encoding moved — this is a consensus change"
+        );
+        let leaf = Blockchain::calculate_merkle_leaf_hash(&golden_full_tx()).expect("merkle leaf");
+        assert_eq!(
+            hex::encode(leaf),
+            PIN_LEAF_SHA,
+            "consensus Merkle leaf moved — this IS a chain split"
+        );
+    }
+
+    /// rmp-serde encodes structs as positional ARRAYS (DefaultConfig), so field
+    /// ORDER is consensus. This guard breaks if anyone switches the codec to a
+    /// map/named configuration (or to human-readable), which would re-encode
+    /// every struct and fork the caller off the network.
+    #[test]
+    fn codec_is_positional_binary_not_human_readable() {
+        let enc = codec::serialize(&golden_none_tx()).expect("serialize");
+        let body = &enc[codec::HEADER_LEN..];
+        // MessagePack fixarray tag for an 8-field struct is 0x98; a map-backed
+        // encoding would start 0x88 and a human-readable one would not be msgpack.
+        assert_eq!(
+            body.first().copied(),
+            Some(0x98),
+            "Transaction no longer encodes as an 8-field positional array"
+        );
+        // And hex must remain hex on this wire: the signature bytes appear as
+        // ASCII, exactly 2 chars per byte (the documented 2x the weight formula
+        // charges). A binary re-encode would shrink this dramatically.
+        let full = codec::serialize(&golden_full_tx()).expect("serialize full");
+        assert!(
+            full.len() > 2 * (mldsa::SIGNATURE_BYTES + mldsa::PUBLIC_KEY_BYTES),
+            "witness fields are no longer carried as hex text — consensus weight \
+             (x2) and the merkle leaf both assume hex; see CONSENSUS_DECISIONS.md"
+        );
+    }
+
+    // Pinned values. Generated once from the live codec (rmp-serde =1.3.1 /
+    // rmp =0.8.15) and asserted forever after.
+    const PIN_FULL_LEN: usize = 14628;
+    const PIN_FULL_SHA: &str = "22602098847342af97aec339a7c99bcd04fbf2cb31c9f8239818f1b35378d9da";
+    const PIN_NONE_LEN: usize = 121;
+    const PIN_NONE_SHA: &str = "7942256e72e3a6450fca0b3c08ae5c9d1a756a51eb7d94558301307ee9bd61d5";
+    const PIN_BLOCK_LEN: usize = 14856;
+    const PIN_BLOCK_SHA: &str = "55ff0db850459eed79190e5539d792e86be23a6df574ee2feff44e6ffdde2dcb";
+    const PIN_LEAF_SHA: &str = "37118cfc71cec7840eb95a96de4607cf8bf688f5137ce80967e0a04b6f8238cc";
+
+    /// One-time generator: run with `--ignored --nocapture` to print the pin
+    /// constants, then paste them above. Kept so future deliberate bumps can
+    /// regenerate with an audit trail.
+    #[test]
+    #[ignore = "generator for the golden pins above"]
+    fn print_golden_pins() {
+        let full = codec::serialize(&golden_full_tx()).unwrap();
+        let none = codec::serialize(&golden_none_tx()).unwrap();
+        let block = Block {
+            index: 7,
+            previous_hash: [0x11; 32],
+            timestamp: 1_700_000_002,
+            transactions: vec![golden_full_tx(), golden_none_tx()],
+            nonce: 42,
+            difficulty: 690,
+            hash: [0x22; 32],
+            merkle_root: [0x33; 32],
+        };
+        let benc = codec::serialize(&block).unwrap();
+        let leaf = Blockchain::calculate_merkle_leaf_hash(&golden_full_tx()).unwrap();
+        println!("PIN_FULL_LEN: usize = {};", full.len());
+        println!("PIN_FULL_SHA: \"{}\"", sha256_hex(&full));
+        println!("PIN_NONE_LEN: usize = {};", none.len());
+        println!("PIN_NONE_SHA: \"{}\"", sha256_hex(&none));
+        println!("PIN_BLOCK_LEN: usize = {};", benc.len());
+        println!("PIN_BLOCK_SHA: \"{}\"", sha256_hex(&benc));
+        println!("PIN_LEAF_SHA: \"{}\"", hex::encode(leaf));
+    }
+
     fn fee_tx(fee: f64, ts: u64) -> Transaction {
         Transaction {
             sender: "a".repeat(40),
