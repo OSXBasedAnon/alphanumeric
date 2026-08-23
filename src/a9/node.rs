@@ -496,6 +496,32 @@ const COMPACT_TRANSACTION_MAX_ENCODED_BYTES: usize = 1024 * 1024;
 /// consuming the full block-frame allowance.
 const COMPACT_ANNOUNCEMENT_MAX_BYTES: usize = 512 * 1024;
 const COMPACT_SAFE_ASSEMBLED_BYTES: usize = MAX_MESSAGE_SIZE - 64 * 1024;
+// Compile-time guards on the relationship between four independently editable
+// constants. A block that assembles over the frame ceiling is not "slow" — it is
+// permanently unservable (the outbound path refuses it), which at the serve site
+// turns into empty GetBlocks responses at that height for every syncing peer.
+// Editing any of these constants must consciously re-prove the margin.
+const _: () = assert!(COMPACT_SAFE_ASSEMBLED_BYTES < MAX_MESSAGE_SIZE);
+const _: () = assert!(
+    MAX_MESSAGE_SIZE - COMPACT_SAFE_ASSEMBLED_BYTES
+        >= OUTBOUND_AEAD_OVERHEAD + crate::a9::codec::HEADER_LEN + 1024,
+    "the 64 KiB assembled-frame margin no longer covers AEAD + codec envelope"
+);
+// The one that guards the chain itself: every block consensus can accept must fit
+// the network frame, or a validly mined block becomes permanently unservable and
+// every syncing peer sees empty responses at that height forever. The weight
+// formula over-charges serialized transaction bytes (constants at 2 bytes per hex
+// byte), so serialized block size <= weight + a small header slack; 4 KiB covers
+// it with orders of magnitude to spare. Raising MAX_BLOCK_WEIGHT_BYTES past this
+// bound requires raising the frame ceiling and re-proving delivery first.
+const _: () = assert!(
+    crate::a9::blockchain::MAX_BLOCK_WEIGHT_BYTES
+        + OUTBOUND_AEAD_OVERHEAD
+        + crate::a9::codec::HEADER_LEN
+        + 4096
+        <= MAX_MESSAGE_SIZE,
+    "consensus-valid blocks would exceed the network frame and become unservable"
+);
 const COMPACT_PENDING_CACHE_BYTE_BUDGET: usize = 24 * 1024 * 1024;
 const COMPACT_FULL_CACHE_BYTE_BUDGET: usize = 40 * 1024 * 1024;
 const COMPACT_GLOBAL_CACHE_BYTE_BUDGET: usize =
@@ -18257,6 +18283,236 @@ impl From<&Node> for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE WIRE CONTRACT IS THE VARIANT NAME (see the block comment on
+    /// NetworkMessage): rmp encodes a data variant as {"Name": [fields]} and a
+    /// unit variant as the bare name string. A rename refactor compiles cleanly
+    /// on both sides and silently splits un-upgraded peers off the network — no
+    /// round-trip test can catch that, because both sides use the renamed
+    /// symbol. This pins every variant's encoded name into the build: one
+    /// instance of each, serialized, with the pinned name literal asserted
+    /// present in the bytes. Adding a variant fails the exhaustive match below
+    /// at compile time; renaming one fails the byte assertion. Update only as a
+    /// deliberate wire-contract decision, under the rules in that comment.
+    fn wire_variant_name(m: &NetworkMessage) -> &'static str {
+        // Exhaustive on purpose — NO wildcard. A new variant must be added here
+        // (compile error otherwise), which forces it into the pin list below.
+        match m {
+            NetworkMessage::Version { .. } => "Version",
+            NetworkMessage::Block(..) => "Block",
+            NetworkMessage::Transaction(..) => "Transaction",
+            NetworkMessage::TxRequest { .. } => "TxRequest",
+            NetworkMessage::TxResponse { .. } => "TxResponse",
+            NetworkMessage::GetBlocks { .. } => "GetBlocks",
+            NetworkMessage::GetHeaders { .. } => "GetHeaders",
+            NetworkMessage::AlertMessage(..) => "AlertMessage",
+            NetworkMessage::HeaderVerification { .. } => "HeaderVerification",
+            NetworkMessage::HeaderSync { .. } => "HeaderSync",
+            NetworkMessage::MldsaKeyRegistration { .. } => "MldsaKeyRegistration",
+            NetworkMessage::Challenge(..) => "Challenge",
+            NetworkMessage::ChallengeResponse { .. } => "ChallengeResponse",
+            NetworkMessage::Shred(..) => "Shred",
+            NetworkMessage::ShredRequest(..) => "ShredRequest",
+            NetworkMessage::ShredResponse { .. } => "ShredResponse",
+            NetworkMessage::Blocks(..) => "Blocks",
+            NetworkMessage::GetPeers => "GetPeers",
+            NetworkMessage::Peers(..) => "Peers",
+            NetworkMessage::GetBlockHeight => "GetBlockHeight",
+            NetworkMessage::BlockHeight(..) => "BlockHeight",
+            NetworkMessage::WalletInfo { .. } => "WalletInfo",
+            NetworkMessage::GetWalletInfo { .. } => "GetWalletInfo",
+            NetworkMessage::WalletInfoResponse { .. } => "WalletInfoResponse",
+            NetworkMessage::Ping { .. } => "Ping",
+            NetworkMessage::Pong { .. } => "Pong",
+            NetworkMessage::RawData(..) => "RawData",
+            NetworkMessage::CompactBlockV1(..) => "CompactBlockV1",
+            NetworkMessage::GetCompactTransactionsV1 { .. } => "GetCompactTransactionsV1",
+            NetworkMessage::CompactTransactionsV1 { .. } => "CompactTransactionsV1",
+            NetworkMessage::GetCompactBlockV1 { .. } => "GetCompactBlockV1",
+            NetworkMessage::CompactBlockResponseV1 { .. } => "CompactBlockResponseV1",
+            NetworkMessage::TransactionInventoryV1 { .. } => "TransactionInventoryV1",
+            NetworkMessage::GetTransactionsV1 { .. } => "GetTransactionsV1",
+            NetworkMessage::TransactionsV1 { .. } => "TransactionsV1",
+        }
+    }
+
+    #[test]
+    fn every_network_message_variant_name_is_pinned_on_the_wire() {
+        fn tx0() -> Transaction {
+            Transaction {
+                sender: String::new(),
+                recipient: String::new(),
+                fee_units: 0,
+                amount_units: 0,
+                timestamp: 0,
+                signature: None,
+                pub_key: None,
+                sig_hash: None,
+            }
+        }
+        fn blk0() -> Block {
+            Block {
+                index: 0,
+                previous_hash: [0; 32],
+                timestamp: 0,
+                transactions: vec![],
+                nonce: 0,
+                difficulty: 0,
+                hash: [0; 32],
+                merkle_root: [0; 32],
+            }
+        }
+        let cb = CompactBlockV1 {
+            index: 0,
+            previous_hash: [0; 32],
+            timestamp: 0,
+            nonce: 0,
+            difficulty: 0,
+            hash: [0; 32],
+            merkle_root: [0; 32],
+            coinbase: tx0(),
+            transaction_hashes: vec![],
+        };
+        let hdr = crate::a9::bpos::BlockHeaderInfo {
+            height: 0,
+            hash: [0; 32],
+            prev_hash: [0; 32],
+            timestamp: 0,
+        };
+        let shred = crate::a9::velocity::Shred {
+            block_hash: [0; 32],
+            index: 0,
+            total_shreds: 0,
+            data: vec![],
+            subnet_hint: None,
+            timestamp: 0,
+            nonce: 0,
+        };
+        let cases: Vec<NetworkMessage> = vec![
+            NetworkMessage::Version {
+                version: 0,
+                blockchain_height: 0,
+                node_id: String::new(),
+            },
+            NetworkMessage::Block(blk0()),
+            NetworkMessage::Transaction(tx0()),
+            NetworkMessage::TxRequest {
+                tx_id: String::new(),
+            },
+            NetworkMessage::TxResponse {
+                tx_id: String::new(),
+                tx: None,
+            },
+            NetworkMessage::GetBlocks { start: 0, end: 0 },
+            NetworkMessage::GetHeaders {
+                start_height: 0,
+                end_height: 0,
+            },
+            NetworkMessage::AlertMessage(String::new()),
+            NetworkMessage::HeaderVerification {
+                header: hdr.clone(),
+                node_id: String::new(),
+                signature: vec![],
+            },
+            NetworkMessage::HeaderSync {
+                headers: vec![],
+                node_id: String::new(),
+                signature: vec![],
+            },
+            NetworkMessage::MldsaKeyRegistration {
+                node_id: String::new(),
+                mldsa_public_key: vec![],
+                ed25519_signature: vec![],
+            },
+            NetworkMessage::Challenge(vec![]),
+            NetworkMessage::ChallengeResponse {
+                signature: vec![],
+                node_id: String::new(),
+            },
+            NetworkMessage::Shred(shred),
+            NetworkMessage::ShredRequest(crate::a9::velocity::ShredRequestType::Missing {
+                block_hash: [0; 32],
+                indices: vec![],
+            }),
+            NetworkMessage::ShredResponse {
+                block_hash: [0; 32],
+                shreds: vec![],
+            },
+            NetworkMessage::Blocks(vec![]),
+            NetworkMessage::GetPeers,
+            NetworkMessage::Peers(vec![]),
+            NetworkMessage::GetBlockHeight,
+            NetworkMessage::BlockHeight(0),
+            NetworkMessage::WalletInfo {
+                address: String::new(),
+                public_key_hex: String::new(),
+                signature: vec![],
+            },
+            NetworkMessage::GetWalletInfo {
+                address: String::new(),
+            },
+            NetworkMessage::WalletInfoResponse {
+                address: String::new(),
+                exists: false,
+                public_key_hex: None,
+            },
+            NetworkMessage::Ping {
+                timestamp: 0,
+                node_id: String::new(),
+            },
+            NetworkMessage::Pong {
+                timestamp: 0,
+                node_id: String::new(),
+            },
+            NetworkMessage::RawData(vec![]),
+            NetworkMessage::CompactBlockV1(cb),
+            NetworkMessage::GetCompactTransactionsV1 {
+                block_hash: [0; 32],
+                indexes: vec![],
+                proxy_hops: 0,
+            },
+            NetworkMessage::CompactTransactionsV1 {
+                block_hash: [0; 32],
+                transactions: vec![],
+            },
+            NetworkMessage::GetCompactBlockV1 {
+                block_hash: [0; 32],
+                proxy_hops: 0,
+            },
+            NetworkMessage::CompactBlockResponseV1 {
+                block_hash: [0; 32],
+                block: None,
+            },
+            NetworkMessage::TransactionInventoryV1 {
+                keys: BoundedSequence::new(vec![]).unwrap(),
+            },
+            NetworkMessage::GetTransactionsV1 {
+                keys: BoundedSequence::new(vec![]).unwrap(),
+            },
+            NetworkMessage::TransactionsV1 {
+                transactions: BoundedSequence::new(vec![]).unwrap(),
+            },
+        ];
+        assert_eq!(
+            cases.len(),
+            35,
+            "variant count changed — extend this pin as a deliberate wire decision"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for msg in &cases {
+            let name = wire_variant_name(msg);
+            assert!(seen.insert(name), "duplicate case for {}", name);
+            let enc = crate::a9::codec::serialize(msg).expect("serialize");
+            let needle = name.as_bytes();
+            let found = enc.windows(needle.len()).any(|w| w == needle);
+            assert!(
+                found,
+                "variant {} no longer encodes under its pinned wire name — this is a \
+                 network-splitting rename, not a refactor",
+                name
+            );
+        }
+    }
 
     // A real tip beacon captured live from the gateway (2026-08-19, height 655947).
     // Its signature was independently confirmed to verify against the pinned publisher
