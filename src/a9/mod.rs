@@ -2,6 +2,7 @@ pub mod blockchain;
 pub mod blocknotify;
 pub mod bpos;
 pub mod codec;
+pub mod ledger;
 #[cfg(feature = "gpu_miner")]
 pub mod gpu_miner;
 pub mod mempool;
@@ -15,7 +16,6 @@ pub mod store;
 pub mod ui;
 pub mod velocity;
 pub mod wallet;
-pub mod wallet_ledger;
 #[cfg(feature = "webrtc_mesh")]
 pub mod webrtc;
 pub mod whisper;

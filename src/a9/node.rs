@@ -67,7 +67,7 @@ use crate::a9::outbound::{
     OutboundScheduler, Reservation as OutboundReservation, TrafficClass,
 };
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
-use crate::a9::wallet_ledger::{
+use crate::a9::ledger::{
     EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger,
 };
 
@@ -1833,7 +1833,7 @@ pub struct NodeRuntimeConfig {
     /// The one operator payment ledger, shared with the CLI signer. Backs the protected
     /// (idempotency-key-required) submission endpoints. `None` disables those endpoints and makes
     /// them report unavailable rather than admit a payment without the idempotency guarantee.
-    pub wallet_ledger: Option<Arc<WalletLedger>>,
+    pub ledger: Option<Arc<WalletLedger>>,
 }
 
 /// Byte budget for the transaction-witness memoization cache. The cache is also count-bounded
@@ -2061,8 +2061,8 @@ pub struct Node {
     /// paths schedule a force-re-bootstrap marker. None in tests/embedded uses.
     chain_data_dir: Option<Arc<str>>,
     /// The one operator payment ledger, shared with the CLI signer. Backs the protected
-    /// submission endpoints; `None` disables them. See [`NodeRuntimeConfig::wallet_ledger`].
-    wallet_ledger: Option<Arc<WalletLedger>>,
+    /// submission endpoints; `None` disables them. See [`NodeRuntimeConfig::ledger`].
+    ledger: Option<Arc<WalletLedger>>,
     /// PEX-learned dialable addresses -> unix time last learned (bounded by
     /// PEX_ADDR_BOOK_CAP, aged out after PEX_ADDR_TTL_SECS), merged into the
     /// persisted peer cache so the address book outgrows our own connections.
@@ -2436,7 +2436,7 @@ struct ExplorerState {
     // supply): a node-side flood guard for the opt-in explorer, independent of any upstream proxy.
     read_bucket: Arc<PLMutex<(Instant, f64)>>,
     // The one shared operator payment ledger; None disables the protected (v2) endpoints.
-    wallet_ledger: Option<Arc<WalletLedger>>,
+    ledger: Option<Arc<WalletLedger>>,
     // Serializes the whole check -> durable reserve -> admit -> classify critical section of a
     // protected submission, so two concurrent requests cannot interleave and mis-attribute a
     // collision. Protected throughput is deliberately serial (as the batch endpoint already is);
@@ -2563,7 +2563,7 @@ impl Node {
             max_connections,
             seed_nodes: configured_seed_nodes,
             data_dir,
-            wallet_ledger,
+            ledger,
         } = runtime_config;
         let (tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let keypair = Ed25519KeyPair::from_pkcs8(&handshake_key_bytes)
@@ -2767,7 +2767,7 @@ impl Node {
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
             chain_data_dir,
-            wallet_ledger,
+            ledger,
             pex_addr_book: Arc::new(RwLock::new(HashMap::new())),
             last_header_snapshot_at: Arc::new(AtomicU64::new(0)),
             last_header_snapshot_height: Arc::new(AtomicU64::new(0)),
@@ -8499,7 +8499,7 @@ impl Node {
                 message,
             );
         }
-        let Some(ledger) = state.wallet_ledger.clone() else {
+        let Some(ledger) = state.ledger.clone() else {
             return Self::explorer_v2_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &req.idempotency_key,
@@ -8534,7 +8534,7 @@ impl Node {
         if batch.transactions.as_slice().is_empty() {
             return Self::explorer_err(StatusCode::BAD_REQUEST, "empty transaction batch");
         }
-        let Some(ledger) = state.wallet_ledger.clone() else {
+        let Some(ledger) = state.ledger.clone() else {
             return Self::explorer_err(StatusCode::SERVICE_UNAVAILABLE, "ledger_unavailable");
         };
         let Ok(_batch_permit) = Arc::clone(&state.batch_submit_slots).try_acquire_owned() else {
@@ -8636,7 +8636,7 @@ impl Node {
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
             batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
-            wallet_ledger: self.wallet_ledger.clone(),
+            ledger: self.ledger.clone(),
             idempotent_submit_lock: Arc::new(Mutex::new(())),
         };
 
@@ -20816,7 +20816,7 @@ mod tests {
                 max_connections: 8,
                 seed_nodes: Vec::new(),
                 data_dir: None,
-                wallet_ledger: Some(Arc::clone(&ledger)),
+                ledger: Some(Arc::clone(&ledger)),
             },
         )
         .await
@@ -20829,7 +20829,7 @@ mod tests {
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
             batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
-            wallet_ledger: Some(ledger),
+            ledger: Some(ledger),
             idempotent_submit_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -20843,7 +20843,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&base);
         let ledger = Arc::new(
-            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+            WalletLedger::open(&base, crate::a9::ledger::LedgerConfig::default())
                 .expect("open test ledger"),
         );
         // Deterministic write fault after open: the lock remains valid, but every data append now
@@ -20890,7 +20890,7 @@ mod tests {
             line!()
         ));
         let ledger = Arc::new(
-            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+            WalletLedger::open(&base, crate::a9::ledger::LedgerConfig::default())
                 .expect("open test ledger"),
         );
         let state = protected_test_state(Arc::clone(&ledger)).await;
@@ -20933,7 +20933,7 @@ mod tests {
             line!()
         ));
         let ledger = Arc::new(
-            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+            WalletLedger::open(&base, crate::a9::ledger::LedgerConfig::default())
                 .expect("open test ledger"),
         );
         let state = protected_test_state(Arc::clone(&ledger)).await;
@@ -20973,7 +20973,7 @@ mod tests {
             line!()
         ));
         let ledger = Arc::new(
-            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+            WalletLedger::open(&base, crate::a9::ledger::LedgerConfig::default())
                 .expect("open test ledger"),
         );
         let state = protected_test_state(Arc::clone(&ledger)).await;
@@ -21033,7 +21033,7 @@ mod tests {
             line!()
         ));
         let ledger = Arc::new(
-            WalletLedger::open(&base, crate::a9::wallet_ledger::LedgerConfig::default())
+            WalletLedger::open(&base, crate::a9::ledger::LedgerConfig::default())
                 .expect("open test ledger"),
         );
         let state = protected_test_state(Arc::clone(&ledger)).await;
@@ -21451,7 +21451,7 @@ mod tests {
                     max_connections: 32,
                     seed_nodes: Vec::new(),
                     data_dir: None,
-                    wallet_ledger: None,
+                    ledger: None,
                 },
             )
             .await
@@ -21581,7 +21581,7 @@ mod tests {
             submit_bucket: Arc::new(PLMutex::new((Instant::now(), 20.0))),
             batch_submit_slots: Arc::new(Semaphore::new(EXPLORER_BATCH_CONCURRENCY)),
             read_bucket: Arc::new(PLMutex::new((Instant::now(), 30.0))),
-            wallet_ledger: None,
+            ledger: None,
             idempotent_submit_lock: Arc::new(Mutex::new(())),
         };
         let http_started = Instant::now();

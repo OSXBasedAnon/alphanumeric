@@ -42,7 +42,7 @@ use alphanumeric::a9::{
         ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
         UI_ORANGE, UI_PINK, UI_RULE,
     },
-    wallet_ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
+    ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
 };
 
@@ -943,7 +943,7 @@ async fn async_main() -> Result<()> {
             future_allocation_margin_secs: MAX_BLOCK_FUTURE_TIME,
             ..LedgerConfig::default()
         };
-        let wallet_ledger =
+        let ledger =
             match WalletLedger::open(DEFAULT_LEDGER_FILENAME, ledger_config) {
                 Ok(ledger) => Some(Arc::new(ledger)),
                 Err(error) => {
@@ -958,7 +958,7 @@ async fn async_main() -> Result<()> {
         let mgmt = Box::new(Mgmt::new(
             db.clone(),
             blockchain.clone(),
-            wallet_ledger.clone(),
+            ledger.clone(),
         ));
         pb.inc(1);
 
@@ -990,7 +990,7 @@ async fn async_main() -> Result<()> {
                 // Peer cache lives next to the chain DB so it survives reboots
                 // (the temp-dir default gets wiped exactly when it matters).
                 data_dir: Some(db_path.clone()),
-                wallet_ledger: wallet_ledger.clone(),
+                ledger: ledger.clone(),
             },
         )
         .await {
@@ -3651,7 +3651,7 @@ continue;
             }
         };
 
-        let Some(payment_ledger) = wallet_ledger.as_ref() else {
+        let Some(payment_ledger) = ledger.as_ref() else {
             drop(blockchain_guard);
             println!("error: payment ledger unavailable; refusing to sign a whisper without collision-safe reservation");
             continue;
