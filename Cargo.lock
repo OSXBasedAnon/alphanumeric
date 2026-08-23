@@ -117,6 +117,7 @@ dependencies = [
  "reed-solomon-erasure",
  "reqwest",
  "ring",
+ "rmp",
  "rmp-serde",
  "rustls",
  "rustyline",
