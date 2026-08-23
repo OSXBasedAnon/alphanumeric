@@ -31,7 +31,7 @@ use crate::a9::{
     },
     miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
-    wallet_ledger::{PaymentTuple, WalletLedger},
+    ledger::{PaymentTuple, WalletLedger},
 };
 
 const KEY_FILE_PATH: &str = "private.key";
@@ -520,7 +520,7 @@ pub struct Mgmt {
     pub blockchain: Arc<RwLock<Blockchain>>, // Just store the reference
     /// Durable operator-side payment ledger for collision-free timestamps and honest retries.
     /// `None` only if the ledger file could not be opened, in which case signing fails closed.
-    wallet_ledger: Option<Arc<WalletLedger>>,
+    ledger: Option<Arc<WalletLedger>>,
 }
 
 /// User-facing transaction creation result. Only `Submitted` authorizes gossip;
@@ -652,11 +652,11 @@ impl Mgmt {
     pub fn new(
         _db: Store,
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
-        wallet_ledger: Option<Arc<WalletLedger>>,
+        ledger: Option<Arc<WalletLedger>>,
     ) -> Self {
         Mgmt {
             blockchain,
-            wallet_ledger,
+            ledger,
         }
     }
 
@@ -670,10 +670,10 @@ impl Mgmt {
     async fn update_wallet_ledger_state(
         &self,
         tx_id: String,
-        state: crate::a9::wallet_ledger::EntryState,
+        state: crate::a9::ledger::EntryState,
         now: u64,
     ) -> bool {
-        let Some(ledger) = self.wallet_ledger.as_ref().cloned() else {
+        let Some(ledger) = self.ledger.as_ref().cloned() else {
             return false;
         };
         match tokio::task::spawn_blocking(move || ledger.update_state(&tx_id, state, now)).await {
@@ -1542,7 +1542,7 @@ impl Mgmt {
             amount_units,
             fee_units,
         );
-        let timestamp = match self.wallet_ledger.as_ref() {
+        let timestamp = match self.ledger.as_ref() {
             Some(ledger) => match ledger.allocate_timestamp(&payment_tuple, now) {
                 Ok(allocated) => {
                     if allocated != now {
@@ -1658,7 +1658,7 @@ impl Mgmt {
         // we crash before it, nothing was ever admitted. Fail closed: never submit a payment we
         // could not first record, or a crash could destroy the only evidence it was sent. The
         // fsync runs on a blocking thread so it never stalls the shared node runtime.
-        if let Some(ledger) = self.wallet_ledger.as_ref() {
+        if let Some(ledger) = self.ledger.as_ref() {
             let ledger = Arc::clone(ledger);
             let tuple = payment_tuple.clone();
             let tx_id = transaction.get_tx_id();
@@ -1704,7 +1704,7 @@ impl Mgmt {
                 let state_persisted = self
                     .update_wallet_ledger_state(
                         tx_id,
-                        crate::a9::wallet_ledger::EntryState::Pending,
+                        crate::a9::ledger::EntryState::Pending,
                         now,
                     )
                     .await;
@@ -1745,7 +1745,7 @@ impl Mgmt {
                 let _ = self
                     .update_wallet_ledger_state(
                         tx_id,
-                        crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                        crate::a9::ledger::EntryState::AmbiguousExisting,
                         now,
                     )
                     .await;
@@ -1763,7 +1763,7 @@ impl Mgmt {
                 let _ = self
                     .update_wallet_ledger_state(
                         tx_id,
-                        crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                        crate::a9::ledger::EntryState::AmbiguousExisting,
                         now,
                     )
                     .await;
@@ -1790,7 +1790,7 @@ impl Mgmt {
                         let _ = self
                             .update_wallet_ledger_state(
                                 tx_id,
-                                crate::a9::wallet_ledger::EntryState::AmbiguousExisting,
+                                crate::a9::ledger::EntryState::AmbiguousExisting,
                                 now,
                             )
                             .await;
@@ -1809,7 +1809,7 @@ impl Mgmt {
                         let _ = self
                             .update_wallet_ledger_state(
                                 tx_id,
-                                crate::a9::wallet_ledger::EntryState::Confirmed { height },
+                                crate::a9::ledger::EntryState::Confirmed { height },
                                 now,
                             )
                             .await;
@@ -1823,7 +1823,7 @@ impl Mgmt {
                         let _ = self
                             .update_wallet_ledger_state(
                                 tx_id,
-                                crate::a9::wallet_ledger::EntryState::Rejected {
+                                crate::a9::ledger::EntryState::Rejected {
                                     reason: e.to_string(),
                                 },
                                 now,
