@@ -17916,12 +17916,15 @@ impl Node {
     /// negotiation. Ping is already backward compatible and marks only the
     /// pooled stream that returned the matching Pong.
     async fn ensure_compact_v2_connection(&self, peer: SocketAddr) -> Result<(), NodeError> {
-        if !self.peer_supports_compact_v2(peer) {
-            return Err(NodeError::Retryable(format!(
-                "peer {} has no fresh compact V2 capability",
-                peer
-            )));
-        }
+        // The address-level capability cache is an OPTIMIZATION for peer
+        // selection, not the source of truth — disconnect cleanup and broadcast
+        // failure paths clear it, and either can race the Retryable retry in
+        // the compact send wrappers (seen as a CI-only canary failure: the
+        // retry's second ensure found the cache cleaned by the first attempt's
+        // failure path and refused a peer we had negotiated with moments
+        // before). A cache miss therefore falls through to the negotiation
+        // Ping below — a bounded probe whose Pong re-records the capability —
+        // and only a peer that then fails to advertise or negotiate is refused.
         if self.compact_v2_connection_is_negotiated(peer).await {
             return Ok(());
         }
