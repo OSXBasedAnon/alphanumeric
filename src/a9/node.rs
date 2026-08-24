@@ -22818,7 +22818,7 @@ mod tests {
             );
             let mut mining = tokio::spawn(async move {
                 manager
-                    .mine_block(&mut header, &[], 1u64 << 27, miner_address)
+                    .mine_block(&mut header, &[], 1u64 << 27, miner_address, false)
                     .await
             });
             match timeout(Duration::from_secs(360), &mut mining).await {
