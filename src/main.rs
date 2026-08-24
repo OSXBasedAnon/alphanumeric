@@ -39,8 +39,8 @@ use alphanumeric::a9::{
     oracle::DifficultyOracle,
     ui::{
         ui_address, ui_age, ui_grid_header, ui_grid_row, ui_pad, ui_right, ui_seg, ui_text,
-        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_GREEN, UI_LABEL, UI_LAVENDER, UI_MUTED,
-        UI_ORANGE, UI_PINK, UI_RULE,
+        ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_LABEL, UI_LAVENDER,
+        UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE,
     },
     ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
@@ -747,7 +747,7 @@ async fn async_main() -> Result<()> {
         } else {
             pb
         };
-        pb.set_message("Initializing database...");
+        pb.set_message("Preparing the database...");
         let db = match open_chain_db(&db_path) {
             Ok(db) => db,
             Err(e) => {
@@ -785,34 +785,78 @@ async fn async_main() -> Result<()> {
         {
             let shutdown_flag = shutdown_requested.clone();
             let db_for_signal = db.clone();
+            let db_path_for_signal = db_path.clone();
             tokio::spawn(async move {
                 // Treat SIGTERM (systemd/docker `stop`) identically to SIGINT (Ctrl-C):
                 // without it, `systemctl stop` kills the node with no graceful flush and
                 // the last flush-window of non-marker writes would be lost
                 // (consensus state is marker-flushed per block; see a9::store).
+                //
+                // This task must OUTLIVE the first signal and must TERMINATE the
+                // process. The previous version fired once — set the flag, flushed,
+                // printed — and returned. Loops that poll the flag (mining) wound
+                // down; the REPL, blocked on stdin, polls nothing, so a node at the
+                // idle prompt absorbed SIGTERM and kept running until the
+                // supervisor's kill timeout — measured live: two SIGTERMs ignored
+                // at the menu. Now: first signal flags, flushes, and starts a short
+                // grace so an in-flight mining batch can finish, then removes the
+                // locks and exits; a second signal exits immediately.
                 #[cfg(unix)]
-                {
+                let mut term = {
                     use tokio::signal::unix::{signal, SignalKind};
                     match signal(SignalKind::terminate()) {
-                        Ok(mut term) => {
-                            tokio::select! {
-                                _ = tokio::signal::ctrl_c() => {}
-                                _ = term.recv() => {}
-                            }
-                        }
+                        Ok(t) => Some(t),
                         Err(e) => {
                             eprintln!("Failed to install SIGTERM handler ({e}); Ctrl-C only");
-                            let _ = tokio::signal::ctrl_c().await;
+                            None
                         }
                     }
+                };
+                let mut signals_seen = 0u32;
+                loop {
+                    #[cfg(unix)]
+                    {
+                        match term.as_mut() {
+                            Some(t) => {
+                                tokio::select! {
+                                    _ = tokio::signal::ctrl_c() => {}
+                                    _ = t.recv() => {}
+                                }
+                            }
+                            None => {
+                                let _ = tokio::signal::ctrl_c().await;
+                            }
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                    signals_seen += 1;
+                    if signals_seen > 1 {
+                        eprintln!("Second signal: exiting immediately.");
+                        std::process::exit(1);
+                    }
+                    shutdown_flag.store(true, Ordering::Release);
+                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    let _ = db_for_signal.flush();
+                    eprintln!("Shutting down cleanly...");
+                    let db = db_for_signal.clone();
+                    let lock_path = format!("{}.lock", db_path_for_signal);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        let _ = db.flush();
+                        let _ = remove_db_lock(&lock_path);
+                        let _ = remove_instance_lock();
+                        // Same terminal courtesy as restart_in_place: rustyline may
+                        // hold the tty raw, and exiting skips its restore.
+                        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                            let _ = std::process::Command::new("stty").arg("sane").status();
+                        }
+                        std::process::exit(0);
+                    });
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                shutdown_flag.store(true, Ordering::Release);
-                let _ = db_for_signal.flush();
-                eprintln!("Shutting down cleanly...");
             });
         }
         {
@@ -844,7 +888,7 @@ async fn async_main() -> Result<()> {
         let db_arc = Arc::new(RwLock::new(db.clone()));
         pb.inc(1);
 
-        pb.set_message("Creating blockchain...");
+        pb.set_message("Loading the chain...");
         // Per-sender admission circuit breaker: catches a client stuck in a submit loop
         // without shaping legitimate concentrated traffic. It is NOT the inbound spam gate —
         // gossip is paced per-PEER before dispatch, and mempool occupancy is bounded
@@ -871,11 +915,48 @@ async fn async_main() -> Result<()> {
             blockchain.write().await.create_genesis_block().await?;
         }
 
-        // Set specific message for balance verification
-        pb.set_message("Verifying blockchain state...");
+        // If the last stop left a recovery marker, say so BEFORE the work starts —
+        // with an estimate — instead of sitting silent and reporting afterwards.
+        // The rebuild holds the chain write lock, so to a user this stretch is
+        // otherwise indistinguishable from a hang, and an unexplained hang next to
+        // the passphrase prompt is how an operator learns to force-kill the node
+        // (which, during recovery specifically, re-arms the identical work). This
+        // is a read-only peek; initialize() below remains the only entry into
+        // recovery.
+        let pending_recovery = blockchain.read().await.pending_recovery();
+        match &pending_recovery {
+            Some((reason, _)) => {
+                let est = alphanumeric::a9::blockchain::Blockchain::recovery_estimate_secs(
+                    blockchain.read().await.get_latest_block_index() as u64,
+                );
+                let what = if reason == "receipt_batch" {
+                    "an interrupted sync"
+                } else {
+                    "an interrupted write"
+                };
+                pb.set_message(format!(
+                    "Restoring state after {} — about {}s at this height...",
+                    what, est
+                ));
+            }
+            None => pb.set_message("Verifying blockchain state..."),
+        }
+        let init_started = std::time::Instant::now();
         if let Err(e) = blockchain.write().await.initialize().await {
             error!("Failed to initialize blockchain: {}", e);
             return Err(Box::new(e));
+        }
+        if pending_recovery.is_some() {
+            // The counterpart of the promise above: confirm the pause was the
+            // restore, and that it is over. Plain text on purpose — this is the
+            // routine outcome, not an event. The clock covers all of initialize,
+            // not just the rebuild, so say "verification" rather than promising
+            // the number measures the restore alone: on a first boot after an
+            // upgrade, one-time index work can legitimately dwarf the estimate.
+            pb.println(format!(
+                "  state restored — verification finished in {:.1}s",
+                init_started.elapsed().as_secs_f64()
+            ));
         }
         pb.inc(1);
 
@@ -920,7 +1001,7 @@ async fn async_main() -> Result<()> {
         }
 
         // Continue with rest of initialization
-        pb.set_message("Setting up management...");
+        pb.set_message("Preparing the console...");
         let (_transaction_fee, _mining_reward, _difficulty_adjustment_interval, _block_time) = {
             let blockchain_lock = blockchain.read().await;
             (
@@ -968,7 +1049,7 @@ async fn async_main() -> Result<()> {
         pb.inc(1);
 
         // Then create the node (single instance)
-        pb.set_message("Creating node...");
+        pb.set_message("Starting the node...");
         let explicit_bind = std::env::var("ALPHANUMERIC_BIND_IP").is_ok()
             || std::env::var("ALPHANUMERIC_PORT").is_ok();
         let bind_addr = if explicit_bind {
@@ -1085,6 +1166,7 @@ async fn async_main() -> Result<()> {
                             // huge value in release, firing false "sleep detected" resets every
                             // tick. Matches the sibling checks elsewhere in this monitor.
                             let last = activity_time.load(Ordering::Acquire);
+                            let mut now = now;
                             if now.saturating_sub(last) > SLEEP_THRESHOLD {
                                 debug!("Sleep detected, resetting network state");
                                 // Reset all counters
@@ -1104,6 +1186,22 @@ async fn async_main() -> Result<()> {
                                 if let Err(e) = node.discover_network_nodes().await {
                                     error!("Network rediscovery after wake failed: {}", e);
                                 }
+
+                                // A completed recovery IS activity. The reset plus the
+                                // inline rediscovery above take longer than
+                                // SLEEP_THRESHOLD themselves (measured 8-13s), so
+                                // stamping the PRE-recovery clock below made the very
+                                // next tick read another >10s gap and fire again — a
+                                // self-sustaining reset storm (measured live: nine
+                                // consecutive pool resets over two minutes, every
+                                // outbound TCP send failing throughout, after one
+                                // ordinary wake-from-sleep or a long passphrase
+                                // prompt starving this thread). Re-read the clock so
+                                // one stall costs exactly one reset.
+                                now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
                             }
                             activity_time.store(now, Ordering::Release);
 
@@ -1648,6 +1746,8 @@ async fn async_main() -> Result<()> {
                 // delta-sync gets its chance and strikes stay >= 20s apart.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut strikes = 0u32;
+
+                let mut progress_resets = 0;
                 let mut cooldown_logged = false;
                 let mut behind_logged = false;
                 loop {
@@ -1793,10 +1893,30 @@ async fn async_main() -> Result<()> {
                             // -> falls through). Mining-neutral: read-only convergence, no
                             // marker written, mine-prep's own reconcile untouched.
                             if !forked {
+                                // Tip before this converge cycle, for the progress check in
+                                // the fallthrough arm. Guard is a temporary — dropped at the
+                                // semicolon, never held across the sync await.
+                                let tip_before = node_recon
+                                    .blockchain
+                                    .read()
+                                    .await
+                                    .get_latest_block_index()
+                                    as u32;
                                 match node_recon.sync_full_history_from_peer(true).await {
-                                    Converge::Converged
+                                    verdict @ (Converge::Converged
                                     | Converge::AtTipAhead
-                                    | Converge::Progressed => {
+                                    | Converge::Progressed) => {
+                                        // Converged/AtTipAhead prove this generation reached
+                                        // the tip: the incident is over, so a FUTURE deep gap
+                                        // starts a fresh respawn budget. Progressed is still
+                                        // mid-heal and deliberately does not count.
+                                        if !matches!(verdict, Converge::Progressed) {
+                                            LINEAGE_HEALED.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            progress_resets = 0;
+                                        }
                                         strikes = 0;
                                         if !behind_logged {
                                             notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
@@ -1804,7 +1924,41 @@ async fn async_main() -> Result<()> {
                                         }
                                         continue;
                                     }
-                                    _ => {}
+                                    _ => {
+                                        // A failed VERDICT is not a failed HEAL: the bounded
+                                        // converge reports NeedsBootstrap for ANY residual gap,
+                                        // including the cycle that just applied thousands of
+                                        // blocks and ran out of deadline (expiry keeps a
+                                        // consistent prefix; the next cycle resumes from the
+                                        // advanced tip). Striking on that verdict killed nodes
+                                        // 5-10 minutes into a working catch-up. So the fuse
+                                        // resets on measured PROGRESS — the same rule mine-prep
+                                        // uses — and only a cycle that moved the tip nowhere
+                                        // counts toward the snapshot escape.
+                                        let tip_now = node_recon
+                                            .blockchain
+                                            .read()
+                                            .await
+                                            .get_latest_block_index()
+                                            as u32;
+                                        // Bounded: an eclipse peer could drip just enough
+                                        // real blocks to keep resetting the fuse while the
+                                        // node never actually gains on the network. The
+                                        // largest legitimate runtime heal is one keep-band
+                                        // (8192 blocks) plus slow pre-mesh retries — well
+                                        // inside 60 cycles — so past the budget the drip
+                                        // stops counting as health and the snapshot escape
+                                        // proceeds. Reset on any proven arrival at the tip.
+                                        if tip_now > tip_before && progress_resets < 60 {
+                                            progress_resets += 1;
+                                            strikes = 0;
+                                            if !behind_logged {
+                                                notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
+                                                behind_logged = true;
+                                            }
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                             behind_logged = false;
@@ -1849,6 +2003,35 @@ async fn async_main() -> Result<()> {
                                         marker.display(),
                                         e
                                     );
+                                }
+                                // Interactive sessions never die into a dead terminal:
+                                // the marker above already guarantees the next boot
+                                // re-bootstraps, so hand this same terminal a next boot.
+                                // Exec does not run Drop — identical semantics to the
+                                // exit(3) below, which is the point: the durable marker,
+                                // not teardown, is the recovery contract. Headless nodes
+                                // keep exit(3) byte-for-byte: supervisors depend on it,
+                                // and the other watchdogs already draw this same
+                                // interactive/headless line.
+                                let interactive = !env_flag_enabled("ALPHANUMERIC_HEADLESS")
+                                    && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                                if interactive {
+                                    println!(
+                                        "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
+                                        alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
+                                    );
+                                    let _ = db_for_recon.flush();
+                                    let _ = remove_db_lock(&format!(
+                                        "{}.lock",
+                                        db_path_recon
+                                    ));
+                                    let _ = remove_instance_lock();
+                                    let err = restart_in_place();
+                                    eprintln!(
+                                        "In-place restart unavailable ({}); exiting — relaunch the app to finish the re-bootstrap.",
+                                        err
+                                    );
+                                    std::process::exit(3);
                                 }
                                 println!(
                                     "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
@@ -1962,6 +2145,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -1975,6 +2159,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2011,6 +2196,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2023,6 +2209,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2035,6 +2222,7 @@ async fn async_main() -> Result<()> {
                         // these paths (rustyline consumes ^C itself and returns
                         // Interrupted), and exiting without it discards the last
                         // the flush-window of buffered store writes.
+                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                         let _ = db.flush();
                         let _ = remove_db_lock(&format!("{}.lock", db_path));
                         let _ = remove_instance_lock();
@@ -2072,25 +2260,71 @@ async fn async_main() -> Result<()> {
                 last_console_command = Some(command.clone());
             }
 
-            match command.split_whitespace().next() {
+            // Match the command VERB case-insensitively so `Send`, `HELP`, `Exit`
+            // work like their lowercase forms. Only the leading word is lowered;
+            // payload args (addresses, amounts, wallet names) are read from the
+            // original `command` and keep their case.
+            match command
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
                 Some("create") | Some("send") | Some("transfer") => {
-                    // Handle the creation of the transaction
-                    match mgmt
-                        .handle_create_transaction(&command, &mut wallets, &blockchain, &db_arc)
-                        .await
-                    {
-                        Ok(CreateTransactionOutcome::Submitted(tx)) => {
-                            // Announce it: submission only reaches the LOCAL mempool, and
-                            // the gateway relay carries blocks, not transactions — without
-                            // this gossip no other miner ever hears about the tx and only
-                            // the sender could confirm it (pre-v7.6.8 behavior).
-                            node.gossip_transaction(&tx).await;
+                    // Accept the 2-arg default-sender form `send <recipient> <amount>` —
+                    // the verbless `<recipient> <amount>` shorthand already resolves the
+                    // default wallet, so typing the verb should not turn it into a hard
+                    // error demanding a pasted sender. Detected exactly as the shorthand
+                    // is (recipient is a canonical address, last token a positive amount);
+                    // the handler still performs the exact amount/address validation.
+                    let parts: Vec<&str> = command.split_whitespace().collect();
+                    let two_arg = parts.len() == 3
+                        && alphanumeric::a9::blockchain::is_canonical_user_address(parts[1])
+                        && parts[2]
+                            .parse::<f64>()
+                            .map(|a| a.is_finite() && a > 0.0)
+                            .unwrap_or(false);
+                    let effective: Option<String> = if two_arg {
+                        match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain)
+                            .await
+                        {
+                            Some((name, address)) => {
+                                // Name the wallet being spent from, as the shorthand does.
+                                println!("Sending from {} ({})", name, address);
+                                Some(format!("create {} {} {}", address, parts[1], parts[2]))
+                            }
+                            None => {
+                                println!(
+                                    "No wallets are loaded. If private.key exists, the passphrase \
+                                     was wrong — restart and re-enter it. Otherwise create a wallet \
+                                     with `new`."
+                                );
+                                None
+                            }
                         }
-                        Ok(CreateTransactionOutcome::AlreadyPending)
-                        | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
-                        Err(e) => {
-                            println!("Error: {}", e);
-                            println!("Failed to create transaction: {}", e);
+                    } else {
+                        Some(command.clone())
+                    };
+                    if let Some(cmd) = effective {
+                        // Handle the creation of the transaction
+                        match mgmt
+                            .handle_create_transaction(&cmd, &mut wallets, &blockchain, &db_arc)
+                            .await
+                        {
+                            Ok(CreateTransactionOutcome::Submitted(tx)) => {
+                                // Announce it: submission only reaches the LOCAL mempool, and
+                                // the gateway relay carries blocks, not transactions — without
+                                // this gossip no other miner ever hears about the tx and only
+                                // the sender could confirm it (pre-v7.6.8 behavior).
+                                node.gossip_transaction(&tx).await;
+                            }
+                            Ok(CreateTransactionOutcome::AlreadyPending)
+                            | Ok(CreateTransactionOutcome::AlreadyConfirmed(_)) => {}
+                            Err(e) => {
+                                // The handler already prints a styled error + usage; one
+                                // plain restatement here is plenty.
+                                println!("Error: {}", e);
+                            }
                         }
                     }
                 }
@@ -2696,12 +2930,34 @@ async fn async_main() -> Result<()> {
 },
 
 Some("balance") | Some("bal") | Some("wallet") => {
-    // Local atomic read of the node's beacon high-water — 0 when no beacon has
-    // been seen. Never a network call, so `balance` stays instant.
-    mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.get(1).copied() == Some("new") {
+        // `wallet` is a balance alias, so `wallet new` used to print balances and
+        // silently drop `new`. Point at the real command instead.
+        println!("`wallet` shows balances; to create a wallet use the `new` command.");
+    } else {
+        if parts.len() > 1 {
+            println!(
+                "(`{}` takes no arguments — ignoring `{}`)",
+                parts[0],
+                parts[1..].join(" ")
+            );
+        }
+        // Local atomic read of the node's beacon high-water — 0 when no beacon has
+        // been seen. Never a network call, so `balance` stays instant.
+        mgmt.show_balances(&wallets, node.beacon_high_water_height()).await
+    }
 },
 Some("new") => {
-let wallet_name = command.split_whitespace().nth(1).map(|s| s.to_string());
+let parts: Vec<&str> = command.split_whitespace().collect();
+if parts.len() > 2 {
+    // A wallet name is a single token; `new a b` used to create `a` and drop `b`.
+    println!(
+        "(`new` takes at most one name — ignoring `{}`; names cannot contain spaces)",
+        parts[2..].join(" ")
+    );
+}
+let wallet_name = parts.get(1).map(|s| s.to_string());
 if let Err(e) = mgmt
 .create_new_wallet(
     &mut wallets,
@@ -2758,7 +3014,9 @@ println!("Wallet renamed successfully");
                     // Order-independent flags, and the wallet name is OPTIONAL:
                     // a bare `mine` (or `mine -c --gpu`) mines to the default
                     // wallet, since naming it every time is pure friction for the
-                    // common single-wallet case.
+                    // common single-wallet case. The wallet name is the FIRST
+                    // non-flag token, so `mine -c name` works as well as
+                    // `mine name -c`.
                     //
                     // A GPU build (feature gpu_miner) mines on the GPU by DEFAULT —
                     // that is the whole point of that binary — so `mine <wallet>`
@@ -2769,21 +3027,23 @@ println!("Wallet renamed successfully");
                     let is_flag = |s: &str| {
                         matches!(s, "--continuous" | "-c" | "--gpu" | "--cpu")
                     };
-                    let named = parts.get(1).filter(|part| !is_flag(part)).copied();
+                    let named = parts.iter().skip(1).find(|part| !is_flag(part)).copied();
+                    let flag_count = parts.iter().skip(1).filter(|part| is_flag(part)).count();
+                    let extra = (parts.len() - 1)
+                        .saturating_sub(usize::from(named.is_some()) + flag_count);
+                    if extra > 0 {
+                        println!("Usage: mine [miner_wallet_name] [--continuous] [--gpu|--cpu]");
+                        continue;
+                    }
                     let mut continuous = false;
                     let mut use_gpu = cfg!(feature = "gpu_miner");
-                    let mut bad_flag: Option<&str> = None;
-                    for flag in parts.iter().skip(1 + usize::from(named.is_some())) {
+                    for flag in parts.iter().skip(1).filter(|part| is_flag(part)) {
                         match *flag {
                             "--continuous" | "-c" => continuous = true,
                             "--gpu" => use_gpu = true,
                             "--cpu" => use_gpu = false,
-                            other => bad_flag = Some(other),
+                            _ => {}
                         }
-                    }
-                    if let Some(f) = bad_flag {
-                        println!("Unknown mine flag '{}'. Usage: mine [miner_wallet_name] [--continuous] [--gpu|--cpu]", f);
-                        continue;
                     }
                     // --gpu only does something in a binary built with the gpu_miner
                     // feature. In a default build (publisher / VPS / exchange nodes),
@@ -3088,7 +3348,11 @@ println!("Wallet renamed successfully");
                             break 'mining;
                         }
 
-                        let mining_manager = MiningManager::new(Arc::clone(&blockchain));
+                        let mining_manager = MiningManager::new(
+                            Arc::clone(&blockchain),
+                            shutdown_requested.clone(),
+                            stop_flag.clone(),
+                        );
                         let miner = Miner::new(blockchain.clone(), mining_manager);
                         // Announce a freshly-mined block the INSTANT it is finalized, ahead
                         // of the reporting that follows it inside handle_mine_command. Hands
@@ -3143,7 +3407,6 @@ println!("Wallet renamed successfully");
                                 &blockchain,
                                 &db_arc,
                                 use_gpu,
-                                Arc::clone(&stop_flag),
                                 &announce,
                             )
                             .await
@@ -3184,15 +3447,6 @@ println!("Wallet renamed successfully");
                                 //    continuous miners so their prep/poll cycles never
                                 //    line up into synchronized bursts against the
                                 //    free-tier gateway.
-                                // Say so first: this wait + jitter is up to ~25s
-                                // of otherwise-silent pause right after the
-                                // reward summary — the one spot a healthy miner
-                                // looked hung. No bar is alive here, so a plain
-                                // println is safe.
-                                println!(
-                                    "Waiting for the network to absorb block #{} before the next round…",
-                                    mined_height
-                                );
                                 // 500ms poll slice (was 2s): the FIRST poll fires
                                 // milliseconds after local finalize — before our
                                 // publish can possibly have round-tripped — so the
@@ -3202,6 +3456,13 @@ println!("Wallet renamed successfully");
                                 // safety property (anti-block-stacking) and stays;
                                 // the slice is only how fast we notice absorption.
                                 // Cost: a few extra edge-cached GETs per block.
+                                // Say so first: this wait can be up to ~20s of
+                                // otherwise-silent pause after the reward summary,
+                                // the one spot a healthy CPU miner looked hung.
+                                println!(
+                                    "Waiting for the network to absorb block #{} before the next round…",
+                                    mined_height
+                                );
                                 let absorb_deadline = Instant::now() + Duration::from_secs(20);
                                 loop {
                                     if stop_flag.load(Ordering::SeqCst)
@@ -3234,25 +3495,13 @@ println!("Wallet renamed successfully");
                                 .await;
                             }
                             Err(e) => {
-                                // USER STOP (Enter): a clean exit, not a fault.
-                                // handle_mine_command already printed "Mining
-                                // stopped."; just leave the loop without the
-                                // error path or backoff.
-                                // Match the TYPE, not the message. This used to test
-                                // `e.to_string().contains("stopped by user")`, which
-                                // couples clean-exit detection to the #[error(...)]
-                                // text on MiningError::Stopped — so rewording a
-                                // user-facing string, the most innocuous edit there
-                                // is, would silently send a deliberate stop down the
-                                // fault path with backoff and error counting toward
-                                // the permanent-error stop. mgmt.rs boxes the real
-                                // variant, so it survives the Box<dyn Error>.
-                                let user_stopped = e
-                                    .downcast_ref::<alphanumeric::a9::miner::MiningError>()
-                                    .is_some_and(|err| {
-                                        matches!(err, alphanumeric::a9::miner::MiningError::Stopped)
-                                    });
-                                if stop_flag.load(Ordering::SeqCst) || user_stopped {
+                                // Ctrl-C / SIGTERM / Enter-to-stop: the grind now returns
+                                // MiningError::Cancelled promptly instead of hanging. Exit the
+                                // mining loop cleanly — not a fault; don't print an error or
+                                // count it toward the permanent-error stop.
+                                if shutdown_requested.load(Ordering::SeqCst)
+                                    || stop_flag.load(Ordering::SeqCst)
+                                {
                                     break 'mining;
                                 }
                                 // LOST RACE, not a fault: we solved a height, but the
@@ -3559,17 +3808,35 @@ if parts.len() == 1 {
                     stdout.reset()?;
                     continue;
                 }
+                // In the 2-arg form the second token is the CODE, and the amount
+                // defaults. A user who meant it as the amount would be surprised — and a
+                // number can't even be a code (the encoder keeps only a-z), so flag it.
+                if msg.parse::<f64>().is_ok() {
+                    println!(
+                        "note: read '{}' as the whisper code, not an amount — codes are up to {} a-z letters (a number isn't sent as text). To send an amount, use `whisper <recipient> <amount> <code>`.",
+                        msg,
+                        alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                    );
+                }
                 (&parts[1], alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT, msg)
             },
             4 => {
                 let amount = match parts[2].parse::<f64>() {
                     Ok(a) if a.is_finite() && a >= alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT => a,
                     _ => {
+                        // The 4-token form is `whisper <recipient> <amount> <code>`, so
+                        // parts[2] is read as the AMOUNT. A stray word (a two-word
+                        // message, or a --fee borrowed from `send`) lands here and used
+                        // to draw a bare "minimum token" error that named neither the
+                        // real problem nor the offending token. Name it and show usage.
                         let mut error_style = ColorSpec::new();
                         error_style.set_fg(Some(Color::Red)).set_bold(true);
                         stdout.set_color(&error_style)?;
-                        println!("Minimum {} token required for whisper messages", 
-                            alphanumeric::a9::whisper::WHISPER_MIN_AMOUNT);
+                        println!(
+                            "'{}' is not an amount. Usage: whisper <recipient> [amount] <code>  —  the code is one word up to {} a-z letters, and whisper takes no --fee (the code IS the fee).",
+                            parts[2],
+                            alphanumeric::a9::whisper::MAX_WHISPER_CHARS
+                        );
                         stdout.reset()?;
                         continue;
                     }
@@ -3604,7 +3871,7 @@ stdout.reset()?;
 
 
 writeln!(&mut stdout, "whisper (Displays recent whispers.)")?;
-writeln!(&mut stdout, "whisper <recipient> <amount> <message> Send a new whisper to <recipient>.")?;
+writeln!(&mut stdout, "whisper <recipient> [amount] <code> Send a new whisper to <recipient> (code = up to 4 a-z letters).")?;
 
 stdout.set_color(&section_style)?;
 write!(&mut stdout, "\n Whisper Code")?;
@@ -3621,21 +3888,53 @@ continue;
 }
         };
 
-        // Deterministic payer: `wallets` is a HashMap, so .values().next() funded the whisper
-        // from an ARBITRARY wallet each run (a mild fund-safety surprise). Pick the
-        // lowest-address wallet so the same one signs every time; the receipt prints it below.
-        let sender_wallet = match wallets.values().min_by(|a, b| a.address.cmp(&b.address)) {
-            Some(w) => w,
-            None => {
-                let mut error_style = ColorSpec::new();
-                error_style.set_fg(Some(Color::Red)).set_bold(true);
-                stdout.set_color(&error_style)?;
-                print!("error");
-                stdout.reset()?;
-                println!(": No wallet available to send message");
-                continue;
-            }
-        };
+        // Validate the recipient BEFORE drafting/signing, exactly as `send` does — a
+        // wallet name, an uppercase address, or a wrong-length string used to be carried
+        // all the way through the "draft · confirm" preview and only rejected at
+        // admission with an opaque "fields are not canonically encoded", after the user
+        // had already confirmed a doomed broadcast.
+        if !alphanumeric::a9::blockchain::is_canonical_user_address(recipient) {
+            let mut error_style = ColorSpec::new();
+            error_style.set_fg(Some(Color::Red)).set_bold(true);
+            stdout.set_color(&error_style)?;
+            println!(
+                "recipient '{}' is not a valid address — it must be exactly 40 lowercase hexadecimal characters (whisper takes an address, not a wallet name).",
+                recipient
+            );
+            stdout.reset()?;
+            continue;
+        }
+
+        // Fund the whisper from the SAME wallet everything else spends from —
+        // resolve_default_wallet (the `default_wallet` key, else the highest-balance
+        // wallet), matching `send`, `mine`, and the quick-transfer shorthand. The old
+        // code picked the lowest-ADDRESS wallet, so a whisper could silently debit a
+        // different wallet than every other spend, invisible until the receipt. The
+        // chosen wallet is announced before the draft, exactly as the send shorthand does.
+        let sender_wallet =
+            match alphanumeric::a9::mgmt::resolve_default_wallet(&wallets, &blockchain).await {
+                Some((name, address)) => match wallets.values().find(|w| w.address == address) {
+                    Some(w) => {
+                        println!("Sending from {} ({})", name, address);
+                        w
+                    }
+                    None => {
+                        // Resolved an address with no matching loaded wallet — should not
+                        // happen (the address came from `wallets`), but never sign blind.
+                        println!("error: could not resolve a wallet to send this whisper from");
+                        continue;
+                    }
+                },
+                None => {
+                    let mut error_style = ColorSpec::new();
+                    error_style.set_fg(Some(Color::Red)).set_bold(true);
+                    stdout.set_color(&error_style)?;
+                    print!("error");
+                    stdout.reset()?;
+                    println!(": No wallet available to send message");
+                    continue;
+                }
+            };
 
         let blockchain_guard = blockchain.read().await;
         let sender_balance = match blockchain_guard.get_wallet_balance(&sender_wallet.address).await {
@@ -3954,8 +4253,37 @@ Some("history") => {
         println!("Error: {}", e);
     }
 },
+    Some("--sync") if command.split_whitespace().nth(1) == Some("bootstrap") => {
+        // Typed consent for the in-place snapshot heal: writes the same durable
+        // marker the watchdog writes, then restarts this terminal into a boot
+        // that re-bootstraps unconditionally. Lives here rather than in
+        // handle_network_commands because the store handle and db path do.
+        println!("Re-bootstrapping from a fresh verified snapshot; restarting in place...");
+        let marker = force_rebootstrap_marker_path(&db_path);
+        if let Err(e) = alphanumeric::a9::node::write_durable(
+            &marker,
+            b"operator-requested re-bootstrap (--sync bootstrap)\n",
+        ) {
+            println!("Could not write the re-bootstrap marker ({}); nothing was changed.", e);
+        } else {
+            let _ = db.flush();
+            let _ = remove_db_lock(&format!("{}.lock", db_path));
+            let _ = remove_instance_lock();
+            let err = restart_in_place();
+            // Do NOT fall back into the menu: the pid locks are already removed and
+            // the wipe marker is armed, so a session that keeps running here is a
+            // second-instance hazard and a surprise wipe waiting for the next boot.
+            // The marker is durable and the store is flushed — exiting IS the safe
+            // state, exactly like the watchdog's own fallback.
+            println!(
+                "In-place restart unavailable ({}); exiting — relaunch the app and the snapshot will be applied at boot.",
+                err
+            );
+            std::process::exit(3);
+        }
+    },
     Some(cmd) if cmd.starts_with("--") => {
-        if let Err(e) = handle_network_commands(&command, &node, &blockchain).await {
+        if let Err(e) = handle_network_commands(&command, &node).await {
             println!("Network command error: {}", e);
         }
     },
@@ -3967,6 +4295,15 @@ Some("history") => {
             println!("Error displaying account info: {}", e);
         }
     },
+
+Some("contacts") => {
+    if let Err(e) = mgmt
+        .handle_contacts_command(&command, &blockchain, &wallets)
+        .await
+    {
+        println!("Error: {}", e);
+    }
+},
 
 Some("debug") => {
     let blockchain_guard = blockchain.read().await;
@@ -4013,51 +4350,58 @@ Some("help") => {
     // only). Weight is set explicitly on every run.
     let mut stdout = StandardStream::stdout(ColorChoice::Auto);
     let spec = &mut ColorSpec::new();
-    // Column where every command keyword starts.
-    // Wide enough for the LONGEST label plus its two-space gutter. At 17 the three
-    // 17-character labels ("mine to a wallet", "choose a backend", "paste an
-    // address") overflowed their own column and shoved their command two cells
-    // right, so the command column was ragged wherever a label ran long.
+    // Column where every command keyword starts. Wide enough for the LONGEST
+    // goal plus its gutter; the rail glyph and its space occupy the first two
+    // cells of every row, so goals start at 3 and the keyword column accounts
+    // for that lead-in rather than fighting it.
     const CMD: usize = 19;
-    // Where a description sits when a row has one. 41 is UI_RIGHT_LABEL, the
-    // column the status grids put their right-hand pane on, and it is also the
-    // first column that clears the longest command on a described row
-    // ("<from> <to> <amount>") — so every description shares one column instead
-    // of breaking wherever its command happened to end.
-    const NOTE: usize = 41;
 
+    // A row carries a rail in its section hue. The rail is what makes section
+    // membership survive scrolling: a colour on the keyword alone disappears the
+    // moment the header scrolls off, and the eye then has to re-derive which
+    // group a line belongs to.
     macro_rules! row {
-        ($goal:expr, $hue:expr, $cmd:expr, $args:expr) => {{
+        ($hue:expr, $goal:expr, $cmd:expr, $args:expr) => {{
             let goal: &str = $goal;
-            ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
-            // max(): a goal as long as the column ("  mine to a wallet") must
-            // still be pushed clear of the keyword, or the two run together.
-            ui_pad(
-                &mut stdout,
-                spec,
-                goal.chars().count(),
-                CMD.max(goal.chars().count() + 2),
-            )?;
+            // No rail glyph: the section header and the command's own colour already
+            // say which group a row belongs to, and a per-row marker on every line
+            // was one signal too many. The indent is kept so the columns are
+            // unchanged.
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            // Goals sit in MUTED, a step brighter than the old DIM: they are the
+            // index you read down, not incidental text.
+            ui_seg(&mut stdout, spec, UI_MUTED, false, goal)?;
+            let goal_end = 1 + goal.chars().count();
+            ui_pad(&mut stdout, spec, goal_end, CMD.max(goal_end + 2))?;
             ui_seg(&mut stdout, spec, $hue, false, $cmd)?;
-            let cmd_end = CMD.max(goal.chars().count() + 2) + $cmd.chars().count();
+            let cmd_end = CMD.max(goal_end + 2) + $cmd.chars().count();
             let args: &str = $args;
             if !args.is_empty() {
                 // Two kinds of trailing text, told apart by a leading space:
                 //   "account " + "<address>"        syntax — part of the command
                 //   "mine"     + "   rewards go…"   a description of it
-                // Syntax must stay welded to the keyword, but a description is a
-                // second column and has to line up like one. Emitting both the
-                // same way left every description hanging at whatever column its
-                // command happened to end on — "mine" broke at 21, the row under
-                // it at 22, `--getpeers` at 27 — which reads as ragged spacing
-                // rather than a table.
+                // Syntax stays welded to the keyword in LABEL (it is typed); a
+                // description is a second column in FAINT and lines up like one.
                 if args.starts_with(' ') {
-                    ui_pad(&mut stdout, spec, cmd_end, NOTE.max(cmd_end + 2))?;
-                    ui_seg(&mut stdout, spec, UI_DIM, false, args.trim_start())?;
+                    ui_pad(&mut stdout, spec, cmd_end, cmd_end + 2)?;
+                    ui_seg(&mut stdout, spec, UI_FAINT, false, args.trim_start())?;
                 } else {
-                    ui_seg(&mut stdout, spec, UI_DIM, false, args)?;
+                    ui_seg(&mut stdout, spec, UI_LABEL, false, args)?;
                 }
             }
+            writeln!(stdout)?;
+        }};
+    }
+
+    // Section header: name in the section hue, then the dim subtitle that says
+    // what the group is for. The subtitle is what turns a colour into a category.
+    macro_rules! section {
+        ($hue:expr, $name:expr, $subtitle:expr) => {{
+            let name: &str = $name;
+            ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+            ui_seg(&mut stdout, spec, $hue, true, name)?;
+            ui_seg(&mut stdout, spec, UI_DIM, false, "  ")?;
+            ui_seg(&mut stdout, spec, UI_FAINT, false, $subtitle)?;
             writeln!(stdout)?;
         }};
     }
@@ -4065,11 +4409,7 @@ Some("help") => {
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
     ui_seg(&mut stdout, spec, UI_CYAN, true, "Help")?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference")?;
-    ui_pad(&mut stdout, spec, 39, 56)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "↑ recalls previous")?;
-    writeln!(stdout)?;
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+    ui_seg(&mut stdout, spec, UI_DIM, false, "   command reference · ")?;
     // Colour the COUNT, never part of the word: splitting "wallet" from its
     // plural "s" put a colour boundary mid-word and read as a rendering fault.
     ui_seg(&mut stdout, spec, UI_CYAN, false, &wallets.len().to_string())?;
@@ -4084,6 +4424,24 @@ Some("help") => {
             " wallets loaded"
         },
     )?;
+    // Pad from where the header text ACTUALLY ends: the wallet count is variable
+    // width, and a hardcoded origin drifts the hint (and overflows 80 columns once
+    // the count reaches four digits).
+    // 28 = " Help" + "   command reference · "; then the variable-width count and
+    // its noun. Measured, not guessed: ui_pad emits (end - start) spaces, so an
+    // origin that is off by n shifts the whole hint by n.
+    let header_end = 28
+        + wallets.len().to_string().chars().count()
+        + if wallets.len() == 1 {
+            " wallet loaded".chars().count()
+        } else {
+            " wallets loaded".chars().count()
+        };
+    ui_pad(&mut stdout, spec, header_end, header_end.max(62))?;
+    // The arrow is the only orange on this screen: it is the one thing here you can
+    // press rather than read, and a key you can press is worth exactly one accent.
+    ui_seg(&mut stdout, spec, UI_ORANGE, false, "\u{2191}")?;
+    ui_seg(&mut stdout, spec, UI_FAINT, false, " recalls previous")?;
     writeln!(stdout)?;
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
@@ -4092,139 +4450,105 @@ Some("help") => {
     // with the typed token on the RIGHT there was nothing saying so — the left
     // column reads like a command list until you notice it isn't.
     {
-        let legend = " what you want";
+        let legend = " operation";
         ui_seg(&mut stdout, spec, UI_DIM, false, legend)?;
         ui_pad(&mut stdout, spec, legend.chars().count(), CMD)?;
-        ui_seg(&mut stdout, spec, UI_ORANGE, false, "what you type")?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, "command")?;
         writeln!(stdout)?;
     }
-
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_CYAN, true, "Wallet")?;
-    ui_pad(&mut stdout, spec, 7, 68)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "account overview")?;
     writeln!(stdout)?;
-    row!(" balances", UI_CYAN, "balance", "");
-    row!(" address lookup", UI_CYAN, "account ", "<address>");
+
+    section!(UI_CYAN, "Wallet", "account overview");
+    row!(UI_CYAN, "balances", "balance", "");
+    row!(UI_CYAN, "address lookup", "account ", "<address>");
     // `history 50` already worked and was documented nowhere, so the default 12
-    // rows read as the whole ledger.
-    // The range and default are read, not skimmed — UI_DIM made them look
-    // unavailable rather than merely secondary.
-    ui_seg(&mut stdout, spec, UI_DIM, false, " transactions")?;
-    ui_pad(&mut stdout, spec, 13, CMD)?;
-    ui_seg(&mut stdout, spec, UI_CYAN, false, "history ")?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "[rows]")?;
-    ui_seg(&mut stdout, spec, UI_MUTED, false, "   1-50, default 12")?;
-    writeln!(stdout)?;
-    row!(" new wallet", UI_CYAN, "new ", "[name]");
-    row!(" rename wallet", UI_CYAN, "rename ", "<name> <new name>");
-    writeln!(stdout)?;
-
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_BLUE, true, "Transfers")?;
-    ui_pad(&mut stdout, spec, 10, 39)?;
-    // The constraint that actually breaks a first send: create validates
-    // 40-hex addresses and rejects wallet names outright.
+    // looked like a hard cap. The range is part of the row, not a footnote.
+    row!(UI_CYAN, "transactions", "history ", "[rows]");
+    row!(UI_CYAN, "address book", "contacts ", "[all]");
+    row!(UI_CYAN, "new wallet", "new ", "[name]");
+    row!(UI_CYAN, "rename wallet", "rename ", "<name> <new name>");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
     ui_seg(
         &mut stdout,
         spec,
-        UI_ORANGE,
+        UI_FAINT,
         false,
-        "addresses are 40-hex, not wallet names",
-    )?;
-    writeln!(stdout)?;
-    row!(" transfer", UI_BLUE, "create ", "<from> <to> <amount> [--fee <amount>]");
-    row!(" quick transfer", UI_BLUE, "<to> <amount>", "   sends from your default wallet");
-    // The 4-character cap is the single thing people get wrong: anything longer is
-    // REJECTED, not truncated, and only a-z survives the encoding.
-    row!(" send a whisper", UI_BLUE, "whisper ", "<address> <code>   max 4 letters");
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "fees are automatic; --fee overrides",
-    )?;
-    writeln!(stdout)?;
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "a whisper rides in its fee, so it costs more",
+        "history shows 1-50 rows (default 12) \u{b7} contacts shows your top 10, or all",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
 
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_GREEN, true, "Mining")?;
-    ui_pad(&mut stdout, spec, 7, 46)?;
+    section!(UI_BLUE, "Transfers", "move coins \u{b7} addresses are 40-hex, not wallet names");
+    row!(UI_BLUE, "transfer", "create ", "<from> <to> <amount> [--fee <amount>]");
+    row!(UI_BLUE, "quick transfer", "<to> <amount>", "   from your default wallet");
+    row!(UI_BLUE, "send a whisper", "whisper ", "<address> [amount] <code>");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
     ui_seg(
         &mut stdout,
         spec,
-        UI_ORANGE,
+        UI_FAINT,
         false,
-        "rewards mature after 100 blocks",
-    )?;
-    writeln!(stdout)?;
-    // `mine` took --continuous all along and help never said so, so the only
-    // documented form was the one that stops after a single block.
-    row!(" start mining", UI_GREEN, "mine", "   rewards go to your default wallet");
-    row!(" mine to a wallet", UI_GREEN, "mine ", "<wallet name>");
-    row!(" keep mining", UI_GREEN, "mine ", "[wallet] --continuous   (-c)");
-    // GPU build only — the flags do not exist on the standard binary, so this row
-    // lives on this branch alone rather than being cfg'd into a help screen that
-    // would then advertise a flag `main` rejects.
-    row!(" choose a backend", UI_GREEN, "mine ", "[wallet] --gpu   ·   --cpu");
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "one block unless --continuous; Enter stops it.",
-    )?;
-    // The newline this line is missing let the two notes run together into one
-    // over-long line that wrapped off the right edge of the screen.
-    writeln!(stdout)?;
-    ui_pad(&mut stdout, spec, 0, CMD)?;
-    ui_seg(
-        &mut stdout,
-        spec,
-        UI_DIM,
-        false,
-        "--gpu is default on this build; --cpu forces the CPU miner",
+        "fees are automatic \u{b7} a whisper rides in its fee, so it costs more",
     )?;
     writeln!(stdout)?;
     writeln!(stdout)?;
 
-    ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
-    ui_seg(&mut stdout, spec, UI_LAVENDER, true, "Network")?;
-    ui_pad(&mut stdout, spec, 8, 58)?;
-    ui_seg(&mut stdout, spec, UI_DIM, false, "node and peer status")?;
+    section!(UI_GREEN, "Mining", "rewards mature after 100 blocks");
+    row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
+    row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
+    row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous  (-c)");
+    // GPU build only: the flags do not exist on the standard binary, so the row
+    // is cfg'd out rather than advertising a flag the CPU build rejects.
+    #[cfg(feature = "gpu_miner")]
+    row!(UI_GREEN, "choose a backend", "mine ", "[wallet] --gpu  or  --cpu");
+    // Section notes carry no rail: the rail marks a row you can type, and a
+    // note is not one. Flush with the goals column so it reads as a caption
+    // under the section rather than another entry in it.
+    ui_pad(&mut stdout, spec, 0, 1)?;
+    ui_seg(
+        &mut stdout,
+        spec,
+        UI_FAINT,
+        false,
+        "one block unless --continuous; Enter stops it",
+    )?;
     writeln!(stdout)?;
-    row!(" network status", UI_LAVENDER, "info", "");
-    row!(" connectivity", UI_LAVENDER, "--status", "");
-    row!(" peer discovery", UI_LAVENDER, "--getpeers", "   ·   --discover");
-    row!(" add peer", UI_LAVENDER, "--connect ", "<ip:port>");
-    row!(" resynchronise", UI_LAVENDER, "--sync", "");
-    row!(" diagnostics", UI_LAVENDER, "debug", "");
+    #[cfg(feature = "gpu_miner")]
+    {
+        ui_pad(&mut stdout, spec, 0, 1)?;
+        ui_seg(
+            &mut stdout,
+            spec,
+            UI_FAINT,
+            false,
+            "--gpu is default on this build; --cpu forces the CPU miner",
+        )?;
+        writeln!(stdout)?;
+    }
+    writeln!(stdout)?;
+
+    section!(UI_LAVENDER, "Network", "node and peer status");
+    row!(UI_LAVENDER, "network status", "info", "");
+    row!(UI_LAVENDER, "connectivity", "--status", "");
+    row!(UI_LAVENDER, "peer discovery", "--getpeers", "   or --discover");
+    row!(UI_LAVENDER, "add peer", "--connect ", "<ip:port>");
+    row!(UI_LAVENDER, "resynchronise", "--sync ", "[bootstrap]");
+    row!(UI_LAVENDER, "diagnostics", "debug", "");
+    writeln!(stdout)?;
+
     ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
     writeln!(stdout)?;
-
-    // Aliases and the bare-address shorthand are reachable in the match arms
-    // but appeared on no surface, so nobody could discover them.
-    //
-    // Each group keeps the hue of the SECTION its command belongs to, rather than
-    // the whole block sharing one colour. Painting them all pink broke the rule the
-    // rest of the screen runs on — that hue answers "which section is this from"
-    // — so `balance` was cyan under Wallet and pink again down here.
+    // Aliases earn their line because a user who typed one needs to know it is
+    // the same command, not a different one.
     {
-        let goal = " aliases";
-        ui_seg(&mut stdout, spec, UI_DIM, false, goal)?;
-        ui_pad(&mut stdout, spec, goal.chars().count(), CMD)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, "aliases  ")?;
         ui_seg(&mut stdout, spec, UI_BLUE, false, "create = send = transfer")?;
         ui_seg(&mut stdout, spec, UI_DIM, false, " · ")?;
         ui_seg(&mut stdout, spec, UI_CYAN, false, "balance = bal = wallet")?;
@@ -4232,9 +4556,9 @@ Some("help") => {
     }
     // Pasting an address is the most natural thing a newcomer does with one. It
     // resolves to `account`, so it takes the Wallet hue.
-    row!(" paste an address", UI_CYAN, "<address>", "   on its own, looks it up");
-    row!(" shorthand", UI_BLUE, "<from> <to> <amount>", "   also initiates a transfer");
-    row!(" end session", UI_PINK, "exit", "");
+    row!(UI_CYAN, "paste an address", "<address>", "   looks it up");
+    row!(UI_BLUE, "shorthand", "<from> <to> <amount>", "   starts a transfer");
+    row!(UI_PINK, "end session", "exit", "");
     writeln!(stdout)?;
     stdout.reset()?;
 }
@@ -4253,6 +4577,7 @@ use std::process::Command;
 // opened with flush_every_ms(1000) and the signal handler does not run for a TYPED command,
 // so returning here discards up to ~1s of writes. `exit` is the documented way to end a
 // session and was the only one of these paths that skipped it.
+alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
 let _ = db.flush();
 let _ = remove_db_lock(&format!("{}.lock", db_path));
 let _ = remove_instance_lock();
@@ -4348,6 +4673,13 @@ Some(_) => {
                                 println!("Failed to create transaction: {}", e);
                             }
                         }
+                    } else if (2..=3).contains(&parts.len()) && is_amount(parts[parts.len() - 1]) {
+                        // A `<x> <amount>` or `<x> <y> <amount>` line that didn't match the
+                        // transfer shorthand above means an address slot is a wallet name or
+                        // otherwise not 40-hex. Say that, instead of a bare "unknown command".
+                        println!(
+                            "That looks like a transfer, but addresses must be 40 lowercase hex characters, not wallet names. Use `send <recipient-address> <amount>`, or `account <name>` to find an address."
+                        );
                     } else {
                         println!("Unknown command. Type `help` for the command list, or `info` for chain status.");
                     }
@@ -4372,7 +4704,7 @@ async fn handle_chain_sync(
     let mp = MultiProgress::new();
     let status_pb = mp.add(ProgressBar::new_spinner());
     status_pb.enable_steady_tick(Duration::from_millis(120));
-    status_pb.set_message("Syncing to the network tip…");
+    status_pb.set_message("Syncing to the network tip...");
 
     let local_height = { node.blockchain.read().await.get_latest_block_index() as u32 };
     let outcome = node.sync_to_beacon().await;
@@ -4398,8 +4730,12 @@ async fn handle_chain_sync(
             Ok(())
         }
         Converge::NeedsBootstrap => {
+            // Overloaded verdict: a genuine fork below finality AND a gap too deep
+            // for the committed-span heal both land here. Either way the snapshot
+            // is the fix, so say so and name the command instead of leaving the
+            // operator with a diagnosis and no verb.
             status_pb.finish_with_message(
-                "Local chain diverged below the finality window; a re-bootstrap is required",
+                "Cannot reach the tip over peer sync (forked below finality, too far behind to heal over peers, or peer sync stalled repeatedly). Type --sync bootstrap to pull a fresh verified snapshot now.",
             );
             Ok(())
         }
@@ -4420,7 +4756,6 @@ async fn handle_chain_sync(
 async fn handle_network_commands(
     command: &str,
     node: &Node,
-    blockchain: &Arc<RwLock<Blockchain>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Changed from Result<(), NodeError>
     let parts: Vec<&str> = command.split_whitespace().collect();
@@ -4450,15 +4785,20 @@ async fn handle_network_commands(
             let uptime_hours = (uptime_secs % 86400) / 3600;
             let uptime_minutes = (uptime_secs % 3600) / 60;
 
+            // Connection Status reflects DIRECT p2p only. An empty direct-peer table is
+            // the NORMAL relay-mode case for a NAT'd node — it participates over the
+            // gateway relay, as `--getpeers` and `info` both show — so 0 direct peers
+            // must not read as "Offline", which sent operators troubleshooting a healthy
+            // node.
             println!(
                 "Connection Status: {}",
                 if !peers.is_empty() {
-                    "Online"
+                    "Online (direct p2p)"
                 } else {
-                    "Offline"
+                    "relay mode (no direct peers — normal for NAT'd nodes)"
                 }
             );
-            println!("Connected Peers: {}", peers.len());
+            println!("Direct P2P peers: {}", peers.len());
             println!("Node Address: {}", node.get_public_key());
             // The port actually BOUND, not the compile-time default — this line
             // is read while debugging NAT/firewall issues, which is exactly when an
@@ -4556,12 +4896,13 @@ async fn handle_network_commands(
                                     println!("\nAttempting initial sync...");
                                     if let Err(e) = handle_chain_sync(node).await {
                                         println!("Initial sync failed: {}", e);
-                                    } else {
-                                        if let Err(e) = node.publish_local_tip().await {
-                                            warn!("Post-sync publish failed: {}", e);
-                                        }
-                                        println!("✓ Initial sync completed");
+                                    } else if let Err(e) = node.publish_local_tip().await {
+                                        warn!("Post-sync publish failed: {}", e);
                                     }
+                                    // No blanket "Initial sync completed": handle_chain_sync
+                                    // already printed the true outcome (which may be "run
+                                    // --sync again to finish catching up"), and overwriting
+                                    // that with success misled the operator. Mirrors --discover.
                                     return Ok(());
                                 }
                                 Ok(Err(e)) => {
@@ -4610,7 +4951,7 @@ async fn handle_network_commands(
 
         "--discover" => {
             let pb = ProgressBar::new_spinner();
-            pb.set_message("Discovering network nodes...");
+            pb.set_message("Discovering peers...");
 
             // Use the existing peer count as baseline
             let initial_peers = node.peers.read().await.len();
@@ -4701,7 +5042,7 @@ async fn handle_network_commands(
 
         "--sync" => {
             let pb = ProgressBar::new_spinner();
-            pb.set_message("Synchronizing with network...");
+            pb.set_message("Syncing with the network...");
 
             // First try to discover peers if needed. Snapshot the count in a scoped
             // block so the peers read guard is ALWAYS released before handle_chain_sync.
@@ -4721,11 +5062,12 @@ async fn handle_network_commands(
                     if let Err(e) = node.publish_local_tip().await {
                         warn!("Post-sync publish failed: {}", e);
                     }
-                    let blockchain = blockchain.read().await;
-                    pb.finish_with_message(format!(
-                        "Sync completed. Current height: {}",
-                        blockchain.get_latest_block_index()
-                    ));
+                    // handle_chain_sync already printed the authoritative per-outcome
+                    // message (Synced / "run --sync again to finish" / "re-bootstrap
+                    // required" / …). Don't stamp a blanket "Sync completed" over it —
+                    // for a partial or deferred convergence that flatly contradicted the
+                    // truthful line. Clear the redundant outer spinner instead.
+                    pb.finish_and_clear();
                 }
                 Err(e) => {
                     pb.finish_with_message(format!("Sync failed: {}", e));
@@ -5136,6 +5478,69 @@ fn ensure_instance_lock() -> std::io::Result<()> {
     ensure_pid_lock(INSTANCE_LOCK_PATH, "ALPHANUMERIC_IGNORE_INSTANCE_LOCK")
 }
 
+/// Budget guarding in-place restarts: carried through the environment so it
+/// survives the exec boundary. Three generations is far past any legitimate
+/// heal (one restart re-bootstraps and lands at the tip); if a third respawn is
+/// still stranded, something is wrong that restarting will not fix, and the
+/// process falls back to the supervised exit path.
+const RESPAWN_DEPTH_ENV: &str = "ALPHANUMERIC_RESPAWN_DEPTH";
+
+/// Restart this process in place, same terminal, same arguments. Unix: exec —
+/// the image is replaced and this function does not return on success. Any
+/// return value is the reason it could not happen, and the caller falls back
+/// to the plain exit it would have done anyway. Callers must have flushed the
+/// store and removed the db/instance locks first: exec does not run Drop, by
+/// design — the durable marker written before this is the recovery contract,
+/// exactly as it is for the supervised exit(3).
+/// True once THIS generation has verifiably reached the network tip (the idle
+/// loop's Converged/AtTipAhead verdicts). A generation that healed completely is
+/// a finished incident, so the next in-place restart starts a fresh respawn
+/// budget instead of inheriting the lineage's count — without this, three
+/// successful heals spread over weeks of one terminal session would exhaust a
+/// budget that exists only to stop a restart LOOP.
+static LINEAGE_HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn restart_in_place() -> std::io::Error {
+    let depth: u32 = std::env::var(RESPAWN_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if depth >= 3 {
+        return std::io::Error::other("in-place restart budget (3) exhausted");
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // A healed generation closes its incident: the child starts a fresh budget.
+    let next_depth = if LINEAGE_HEALED.load(std::sync::atomic::Ordering::Acquire) {
+        1
+    } else {
+        depth + 1
+    };
+    // Exec preserves TERMINAL state, not just process state: if this fires while
+    // rustyline holds the tty raw (ECHO/ICANON/ISIG off — true whenever the user
+    // is sitting at the prompt), the next generation boots with Ctrl-C dead and
+    // typing invisible, and its rustyline then adopts raw as "original", making
+    // the wedge permanent. Hand the child a sane line discipline first.
+    // Best-effort by design: a missing stty must not block the restart.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let _ = std::process::Command::new("stty").arg("sane").status();
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(RESPAWN_DEPTH_ENV, next_depth.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.exec()
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::Error::other("in-place restart is unix-only; relaunch the app manually")
+    }
+}
+
 fn remove_instance_lock() -> std::io::Result<()> {
     remove_db_lock(INSTANCE_LOCK_PATH)
 }
@@ -5155,7 +5560,11 @@ fn ensure_pid_lock(lock_path: &str, ignore_env: &str) -> std::io::Result<()> {
             let _ = std::fs::remove_file(lock_path);
         } else if let Ok(pid_str) = std::fs::read_to_string(lock_path) {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                if !is_process_alive(pid) {
+                // A lock naming OUR OWN pid is stale by definition: exec keeps the
+                // pid, so a failed unlink before an in-place restart would otherwise
+                // make the fresh image refuse to boot against itself. No live
+                // FOREIGN process can hold our pid.
+                if pid == std::process::id() || !is_process_alive(pid) {
                     let _ = std::fs::remove_file(lock_path);
                 } else {
                     // Name the file, the PID, and the escape hatch: the old
@@ -6440,7 +6849,7 @@ fn canonical_reconcile_decision(
     // boot-time comparison — the manifest lags its publish cadence, so a fork AT
     // tip height reads as "in sync" against a stale manifest (the 2026-07-10
     // restart crash-loop). Honoring the marker is also what makes the wide
-    // STREAM_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
+    // PEER_HEAL_WINDOW safe: a genuinely stuck node always has a guaranteed way out.
     // Checked only once the manifest verified (above): with the gateway down a
     // re-bootstrap is impossible anyway, so offline starts stay fail-open and the
     // marker simply persists for the next boot. remove_local_db clears it together
@@ -6525,16 +6934,14 @@ fn canonical_reconcile_decision(
     }
 
     // Plain BEHIND (anchor region on canonical, or no anchor to check). If the
-    // gap to the live tip is within STREAM_WINDOW, KEEP the local DB: the running
-    // node closes the gap in place via the idle-reconcile bulk delta-sync
-    // (sync_full_history_from_peer, which pulls [tip+1..=beacon] over GetBlocks
-    // from any full-history peer's complete DB — see STREAM_WINDOW's note). Do
-    // NOT nuke a valid canonical prefix and re-download the whole chain for a gap
-    // that normal syncing closes; that also avoids the ~3x bulk-import bloat a
-    // fresh snapshot leaves in sled. A near-empty DB has, by construction, a gap
-    // deeper than the window (live_height - tiny_tip), so it re-bootstraps here
-    // where the fixed-size snapshot is the faster tool.
-    if local_tip.saturating_add(STREAM_WINDOW) >= live_height {
+    // gap to the live tip is within the runtime's PROVEN heal window, KEEP the
+    // local DB: the idle-reconcile loop closes the gap in place via the
+    // beacon-committed receipt span (see PEER_HEAL_WINDOW's note — the window is
+    // the verification bound, not a bandwidth preference). Beyond it, take the
+    // verified snapshot NOW: keeping a DB the runtime cannot heal only defers
+    // the same snapshot to a watchdog exit. A near-empty DB has, by
+    // construction, a gap deeper than the window, so it re-bootstraps here too.
+    if local_tip.saturating_add(PEER_HEAL_WINDOW) >= live_height {
         return CanonicalReconcile::InSyncOrUnknown;
     }
 
@@ -6568,30 +6975,24 @@ fn canonical_reconcile_decision(
 /// bounded by ORPHAN_REORG_DEPTH — a wider window booted "in sync" and then
 /// marker-exited ~40s later because the engine could not stream past 1024
 /// (review finding, 2026-07-11; an initial 2000 left the 1025..=2000 band
-/// deterministically taking the exit path). That bound no longer governs
-/// catch-up: the idle-reconcile loop now escalates a stalled converge to a bulk
-/// delta-sync (sync_full_history_from_peer), which pulls [tip+1..=beacon] in
-/// MAX_GETBLOCKS_SPAN batches from any full-history peer. GetBlocks is served
-/// straight from that peer's COMPLETE block DB (ChainRequest -> get_block; no
-/// 24h relay-retention limit — that limit is on gossip, not block serving), so
-/// a full peer serves any historical range and the delta-sync closes a gap of
-/// ANY size. The window is therefore now a stream-vs-snapshot tradeoff, not an
-/// engine bound: within it we keep the compact, incrementally-built DB and
-/// stream the tail (a snapshot re-bootstrap instead leaves ~3x bulk-import bloat
-/// in sled that never self-heals); a genuinely enormous gap (weeks abandoned)
-/// re-bootstraps, where the fixed-size snapshot download is decisively faster
-/// and there is proportionally little local prefix worth preserving.
+/// deterministically taking the exit path).
 ///
-/// Seven days of blocks at target cadence — comfortably covers any realistic
-/// close-and-reopen while bounding the worst-case boot catch-up (~120k blocks
-/// stream in ~1-2 min in the background while the client is already usable).
-/// Escapes are unchanged: a node NO peer can serve has its stalled delta-sync
-/// fall through to the 2-strike -> marker -> re-bootstrap path; a runtime-proven
-/// divergence drops the marker (honored unconditionally next boot); and a
-/// forked-at-checkpoint chain (hash mismatch above) never reaches this window
-/// and re-bootstraps immediately.
-const STREAM_WINDOW: u32 =
-    (7 * 24 * 60 * 60 / alphanumeric::a9::blockchain::TARGET_BLOCK_TIME) as u32;
+/// KEEP THE DB ONLY FOR A GAP THE RUNTIME CAN ACTUALLY HEAL. A previous version
+/// of this window was seven days, on the theory that the peer delta-sync
+/// "closes a gap of ANY size" because GetBlocks serves any range from a full
+/// peer's DB. Blocks are served, but they cannot be VERIFIED: peers retain full
+/// ML-DSA witnesses for only WITNESS_RETENTION_BLOCKS past confirmation, so the
+/// witness path stalls on the first tx-carrying block deeper than that, and the
+/// receipt path built for pruned history — the beacon-committed span — proves
+/// at most COMMITTED_SPAN_MAX_BLOCKS in one anchored walk. Every gap between
+/// that cap and seven days was therefore kept at boot and then deterministically
+/// killed at runtime (strikes -> marker -> exit): the 2026-07-11 band bug
+/// reintroduced one level up. Tying the boot promise to the runtime cap by
+/// construction closes the band: within it we keep the compact DB and stream
+/// the tail; beyond it we take the verified snapshot immediately, which is the
+/// faster tool for a deep gap anyway (fixed-size download, minutes, regardless
+/// of depth).
+const PEER_HEAL_WINDOW: u32 = alphanumeric::a9::node::COMMITTED_SPAN_MAX_BLOCKS;
 
 // Marker + cooldown live in a9::node (single source, shared by the runtime
 // divergence exit, mine-prep scheduling, and this boot-time reconcile):
@@ -9221,7 +9622,7 @@ mod tests {
         ));
         // Gap right at the window edge still streams…
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW), None, local_tip),
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW), None, local_tip),
             CanonicalReconcile::InSyncOrUnknown
         ));
     }
@@ -9354,7 +9755,7 @@ mod tests {
         let db = reconcile_test_db("behind_big", &[(100, 7)]);
         let m = manifest_at(150, 9);
         assert!(matches!(
-            canonical_reconcile_decision(&db, &m, Some(100 + STREAM_WINDOW + 1), None, None),
+            canonical_reconcile_decision(&db, &m, Some(100 + PEER_HEAL_WINDOW + 1), None, None),
             CanonicalReconcile::Diverged { .. }
         ));
     }

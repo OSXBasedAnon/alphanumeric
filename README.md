@@ -216,6 +216,26 @@ Run:
 cargo run --release
 ```
 
+### Mining on GPU
+
+This branch mines on **CPU only**. The GPU backend is not a build flag or a runtime option
+here: it lives on the [`gpu-mining`](https://github.com/OSXBasedAnon/alphanumeric/tree/gpu-mining)
+branch, which carries the wgpu compute kernel and the extra dependencies that go with it.
+
+```bash
+git checkout gpu-mining
+cargo build --release --features gpu_miner
+```
+
+That build then selects the backend at runtime with `mine <wallet> --gpu` or `--cpu`. A build
+without the `gpu_miner` feature defaults to CPU and refuses `--gpu`. Setup and tuning are in
+[`docs/GPU_MINING.md`](https://github.com/OSXBasedAnon/alphanumeric/blob/gpu-mining/docs/GPU_MINING.md)
+on that branch.
+
+Both branches mine the same chain under the same consensus rules. `gpu-mining` adds the GPU
+miner on top of the node; it is maintained alongside `main` rather than merged from it, so
+take releases from the tags rather than assuming the two branches are identical.
+
 Run the built binary directly:
 
 ```bash

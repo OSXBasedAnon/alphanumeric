@@ -138,7 +138,7 @@ const WITNESS_RESOLVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// either bound falls through to the snapshot bootstrap, which is the cheaper
 /// recovery at that depth anyway. 8192 blocks is ~11 hours of chain at the 5s
 /// target, so an overnight-idle client heals in place.
-const COMMITTED_SPAN_MAX_BLOCKS: u32 = 8192;
+pub const COMMITTED_SPAN_MAX_BLOCKS: u32 = 8192;
 const COMMITTED_SPAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// How often a client polls the tiny edge-cached tip beacon. Cache HITS cost the
 /// origin/Redis nothing, so this stays O(1) in client count; a version change is
@@ -7472,6 +7472,24 @@ impl Node {
                 object.insert("status".into(), json!("pending"));
             }
             return (StatusCode::OK, Json(payload));
+        }
+
+        // Before answering "no", make sure we are in a position to know. While the replay
+        // registry is mid-rebuild it is EMPTY, and an empty registry answers every lookup
+        // the same way a genuinely unknown transaction does. Reporting a confirmed, final
+        // transaction as not_found is the reading an integrator acts on as "reorged, never
+        // happened" — so say "ask again" instead, exactly as the address page refuses to
+        // serve an ambiguous empty history.
+        if !chain.confirmed_tx_index_ready() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "status": "unavailable",
+                    "tx_id": tx_id,
+                    "hint": "the confirmed-transaction index is rebuilding; retry shortly — this is not a statement about this transaction",
+                })),
+            );
         }
 
         (
@@ -17232,7 +17250,17 @@ impl Node {
         if beacon.height <= local_tip {
             return None;
         }
-        if beacon.height.saturating_sub(local_tip) > COMMITTED_SPAN_MAX_BLOCKS {
+        let gap = beacon.height.saturating_sub(local_tip);
+        if gap > COMMITTED_SPAN_MAX_BLOCKS {
+            // This is the one predicate that decides "heal over peers" versus "needs a
+            // snapshot", and it used to say nothing. Every caller downstream reports a
+            // generic verdict, so if this refusal is silent the operator sees a node
+            // that "does not do much" and then exits — with no line anywhere naming why.
+            warn!(
+                "Catch-up gap of {} blocks exceeds the {}-block committed-span heal window; \
+                 a verified snapshot re-bootstrap is the only path back to the tip",
+                gap, COMMITTED_SPAN_MAX_BLOCKS
+            );
             return None;
         }
 
@@ -17271,6 +17299,13 @@ impl Node {
                 buffered_bytes = buffered_bytes
                     .saturating_add(codec::serialize(&block).map(|v| v.len()).unwrap_or(0));
                 if buffered_bytes > COMMITTED_SPAN_MAX_BYTES {
+                    // Same rule as the block-count cap above: this predicate decides
+                    // snapshot-vs-heal and must never fail silently.
+                    warn!(
+                        "Catch-up span exceeded the {}-byte committed-span buffer near height {} ({} bytes buffered); \
+                         a verified snapshot re-bootstrap is the only path back to the tip",
+                        COMMITTED_SPAN_MAX_BYTES, needed, buffered_bytes
+                    );
                     return None;
                 }
                 expected_hash = block.previous_hash;

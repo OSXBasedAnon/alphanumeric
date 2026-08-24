@@ -49,8 +49,7 @@ const MINING_NONCE_WINDOW: u64 = 67_108_864;
 /// the single source in blockchain.rs so the estimator and the --fee guard can
 /// never disagree.
 const EXPLICIT_FEE_SAFETY_LIMIT_UNITS: i128 = WALLET_FEE_SAFETY_LIMIT_UNITS; // 0.01 ALPHA
-const CREATE_TRANSACTION_USAGE: &str =
-    "Usage: create <sender_address> <recipient_address> <amount> [--fee <ALPHA>]";
+const CREATE_TRANSACTION_USAGE: &str = "Usage: send <recipient> <amount>                     (spends from your default wallet)\n       send <sender> <recipient> <amount>  [--fee <ALPHA>]   (explicit sender)";
 
 /// The three counterparties worth printing in full: the most recent inbound, the most recent
 /// outbound, and the one appearing most often.
@@ -637,6 +636,18 @@ fn load_error_is_first_run(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::NotFound
 }
 
+/// One counterparty in the `contacts` address book, folded from every index row
+/// your wallets share with that address. `in`/`out` are amounts only (see
+/// `aggregate_contacts`), so `in - out` is the net position with that party.
+#[derive(Debug, Clone, PartialEq)]
+struct Contact {
+    address: String,
+    txs: u64,
+    in_units: i128,
+    out_units: i128,
+    last_seen: u64,
+}
+
 impl Mgmt {
     pub fn new(
         _db: Store,
@@ -1141,7 +1152,6 @@ impl Mgmt {
         blockchain: &Arc<RwLock<Blockchain>>,
         _db_arc: &Arc<RwLock<Store>>,
         use_gpu: bool,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         announce: &dyn Fn(&Block),
     ) -> Result<Block> {
         if command.len() < 2 {
@@ -1212,7 +1222,6 @@ impl Mgmt {
                 MINING_NONCE_WINDOW,
                 miner_wallet.address.clone(),
                 use_gpu,
-                stop,
             )
             .await
         {
@@ -1272,11 +1281,11 @@ impl Mgmt {
                 if rotated_recipient.is_some() {
                     // Reward lines already printed above with the schedule recipient;
                     // the maturity countdown belongs to that address, not this wallet.
-                    writeln!(stdout, "Operator balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "Operator balance: {:.8} ♦", breakdown.spendable)?;
                 } else if breakdown.maturing.is_empty() {
                     // Below the M06 activation height the reward is spendable at once.
                     writeln!(stdout, "Mining reward: {:.8} ♦", mining_reward)?;
-                    writeln!(stdout, "New balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "New balance: {:.8} ♦", breakdown.spendable)?;
                 } else {
                     // M06: the coinbase is credited on-chain immediately but withheld from
                     // the spendable balance until buried MINING_REWARD_MATURITY deep.
@@ -1293,7 +1302,7 @@ impl Mgmt {
                         "Mining reward: {:.8} ♦ — credited, spendable in {}",
                         mining_reward, eta
                     )?;
-                    writeln!(stdout, "Spendable balance: {}", breakdown.spendable)?;
+                    writeln!(stdout, "Spendable balance: {:.8} ♦", breakdown.spendable)?;
                     stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(128, 128, 128))))?;
                     writeln!(
                         stdout,
@@ -1311,11 +1320,6 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 Ok(mined_block)
-            }
-            Err(crate::a9::miner::MiningError::Stopped) => {
-                // Clean user stop (Enter), not a fault — no red "error" line.
-                writeln!(stdout, "Mining stopped.")?;
-                Err(Box::new(crate::a9::miner::MiningError::Stopped))
             }
             Err(e) => {
                 // Deliberately silent: the CALLER classifies this error and prints the
@@ -1859,6 +1863,31 @@ impl Mgmt {
         // a wallet NAME resolves too, because a name is what the operator actually remembers.
         // Anything else is passed through as a raw address.
         let requested = args.split_whitespace().nth(1);
+        let extra: Vec<&str> = args.split_whitespace().skip(2).collect();
+        if !extra.is_empty() {
+            // `account a b` used to look up only `a` and drop `b` silently.
+            println!(
+                "(`account` takes one address — ignoring `{}`)",
+                extra.join(" ")
+            );
+        }
+        // A supplied argument must be a known wallet NAME or a canonical address.
+        // Anything else is a typo — say so, rather than rendering a full (empty)
+        // account page for the literal string, which read like a real but unused
+        // on-chain account.
+        if let Some(arg) = requested {
+            if wallets.get(arg).is_none() && !crate::a9::blockchain::is_canonical_user_address(arg)
+            {
+                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
+                writeln!(
+                    stdout,
+                    "No wallet named `{}`, and it is not an address (an address is 40 lowercase hexadecimal characters).",
+                    arg
+                )?;
+                stdout.reset()?;
+                return Ok(());
+            }
+        }
         let resolved: Option<String> = match requested {
             Some(arg) => Some(
                 wallets
@@ -2060,8 +2089,30 @@ impl Mgmt {
                 writeln!(stdout)?;
 
                 if pending_stats.0 > 0 || pending_stats.1 > 0 {
-                    let pending_text = ui_money(pending_stats.2, 4);
-                    let pending_label = format!(" pending out · {}", pending_stats.0);
+                    // Show whichever direction(s) are actually pending. The old line
+                    // always read "pending out · {out}", so incoming-only pending
+                    // rendered a misleading "0.0000 pending out · 0".
+                    let (pending_amount, pending_label) =
+                        if pending_stats.0 > 0 && pending_stats.1 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(
+                                    " pending out · {} · in · {}",
+                                    pending_stats.0, pending_stats.1
+                                ),
+                            )
+                        } else if pending_stats.0 > 0 {
+                            (
+                                pending_stats.2,
+                                format!(" pending out · {}", pending_stats.0),
+                            )
+                        } else {
+                            (
+                                pending_stats.3,
+                                format!(" pending in · {}", pending_stats.1),
+                            )
+                        };
+                    let pending_text = ui_money(pending_amount, 4);
                     ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
                     ui_seg(&mut stdout, spec, UI_ORANGE, false, &pending_text)?;
                     ui_seg(&mut stdout, spec, UI_DIM, false, &pending_label)?;
@@ -2515,6 +2566,9 @@ impl Mgmt {
 
         struct Entry {
             wallet: String,
+            // The wallet ADDRESS, not the display name: dedup keys on this so one
+            // address loaded under two wallet names cannot double-count.
+            address: String,
             counterparty: String,
             amount_units: i128,
             fee_units: i128,
@@ -2526,21 +2580,32 @@ impl Mgmt {
             timestamp: u64,
         }
 
+        // Per-wallet recent-activity window. history is a RECENT view, not a lifetime
+        // ledger — for lifetime-correct totals use `account <address>` (uncapped scan).
+        const HISTORY_WINDOW_PER_WALLET: usize = 50;
+
         let tip = guard.get_latest_block_index();
         let index_ready = guard.address_index_ready();
         let mut entries: Vec<Entry> = Vec::new();
+        // True if any wallet filled its window — then the loaded set is a floor, not a
+        // lifetime count, and the header marks the total with a trailing `+`.
+        let mut window_capped = false;
 
         if index_ready {
             for (name, wallet) in wallets {
                 let recent = guard
-                    .address_recent_txs(&wallet.address, 50, None)
+                    .address_recent_txs(&wallet.address, HISTORY_WINDOW_PER_WALLET, None)
                     .unwrap_or_default();
+                if recent.len() >= HISTORY_WINDOW_PER_WALLET {
+                    window_capped = true;
+                }
                 for e in recent {
                     // Read every flag BEFORE moving the counterparty string out.
                     let (sender, recipient) = (e.is_sender(), e.is_recipient());
                     let coinbase = recipient && SYSTEM_ADDRESSES.contains(&e.counterparty.as_str());
                     entries.push(Entry {
                         wallet: name.clone(),
+                        address: wallet.address.clone(),
                         counterparty: e.counterparty,
                         amount_units: e.amount_units,
                         fee_units: e.fee_units,
@@ -2563,6 +2628,12 @@ impl Mgmt {
         // rebuilds under the chain guard.
         let mempool = guard.get_mempool_transactions().await.unwrap_or_default();
         for tx in mempool {
+            // A mempool row that is ALREADY confirmed — re-entered via gossip echo or a
+            // reorg, since get_mempool_transactions prunes by TTL only — would otherwise
+            // be counted a second time next to its confirmed row. Drop the pending copy.
+            if guard.is_tx_confirmed(&tx.get_tx_id()) {
+                continue;
+            }
             for (name, wallet) in wallets {
                 let is_sender = tx.sender == wallet.address;
                 let is_recipient = tx.recipient == wallet.address;
@@ -2571,6 +2642,7 @@ impl Mgmt {
                 }
                 entries.push(Entry {
                     wallet: name.clone(),
+                    address: wallet.address.clone(),
                     counterparty: if is_sender {
                         tx.recipient.clone()
                     } else {
@@ -2599,7 +2671,10 @@ impl Mgmt {
                 .then_with(|| b.timestamp.cmp(&a.timestamp))
         });
         entries.dedup_by(|a, b| {
-            a.wallet == b.wallet
+            // Key on ADDRESS, not wallet name: one address loaded under two names must
+            // collapse to one row. `height.is_some()` keeps this to confirmed rows —
+            // two distinct pending txs both have (None, 0) and must NOT be merged.
+            a.address == b.address
                 && a.height == b.height
                 && a.position == b.position
                 && a.height.is_some()
@@ -2657,11 +2732,15 @@ impl Mgmt {
         writeln!(stdout)?;
 
         if index_ready && total > 0 {
+            // Sum over the SHOWN rows only, so every contributor to `net` is visible on
+            // screen — net can never fold in rows you cannot see. A self-transfer nets
+            // exactly its fee (it moves coins to yourself), never 0.
             let net: i128 = entries
                 .iter()
+                .take(shown)
                 .map(|e| {
                     if e.is_self {
-                        0
+                        -e.fee_units
                     } else if e.is_out {
                         -(e.amount_units + e.fee_units)
                     } else {
@@ -2669,20 +2748,18 @@ impl Mgmt {
                     }
                 })
                 .sum();
-            ui_seg(&mut stdout, spec, UI_DIM, false, " confirmed  ")?;
-            ui_seg(
-                &mut stdout,
-                spec,
-                UI_BLUE,
-                false,
-                &format!("{} of {}", shown, total),
-            )?;
-            ui_pad(
-                &mut stdout,
-                spec,
-                12 + format!("{} of {}", shown, total).chars().count(),
-                30,
-            )?;
+            // "recent", not "confirmed": this window can include pending rows (marked
+            // as such per-row and counted in the sub-header). A trailing `+` on the
+            // total means a wallet filled its window, so more history exists than shown.
+            ui_seg(&mut stdout, spec, UI_DIM, false, " recent  ")?;
+            let count = format!(
+                "{} of {}{}",
+                shown,
+                total,
+                if window_capped { "+" } else { "" }
+            );
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
+            ui_pad(&mut stdout, spec, 9 + count.chars().count(), 30)?;
             ui_seg(&mut stdout, spec, UI_DIM, false, "net  ")?;
             ui_seg(
                 &mut stdout,
@@ -2822,6 +2899,425 @@ impl Mgmt {
         }
 
         writeln!(stdout)?;
+        stdout.reset()?;
+        Ok(())
+    }
+
+    /// The set of addresses `contacts` scans: one entry per DISTINCT address across
+    /// every loaded wallet.
+    ///
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses, so
+    /// the same address can appear under two wallet records. Scanning per record would
+    /// read that address's index twice and double every number in the book — the
+    /// double-count `history` had to fix by keying on address instead of name. The
+    /// same set doubles as the own-address exclusion, so both uses stay consistent by
+    /// construction.
+    fn wallet_addresses(wallets: &HashMap<String, Wallet>) -> HashSet<&str> {
+        wallets.values().map(|w| w.address.as_str()).collect()
+    }
+
+    /// Per-address ceiling on the contacts scan.
+    ///
+    /// The scan runs under the chain READ guard, and that lock is write-preferring:
+    /// a long read delays block application node-wide (the 2026-07-16 publisher-park
+    /// class that `balance` and `account` are both written to avoid). A miner's
+    /// address gains one index row per block mined, so an unbounded "read this
+    /// address's whole history" is exactly that pathology — six figures of rows.
+    /// 20k is far past any real counterparty count while keeping the guard hold in
+    /// the millisecond range, and reaching it is DISCLOSED (a trailing `+` on the
+    /// count) rather than silently shortening the book.
+    const CONTACTS_SCAN_CAP_PER_ADDRESS: usize = 20_000;
+
+    /// Read each address's rows exactly once, returning them with a flag for
+    /// "some address filled the cap".
+    ///
+    /// The fetch is a closure so this loop is testable without a chain: the bug this
+    /// exists to prevent is reading one address TWICE (it was iterating wallet
+    /// records, and two records can share an address), and a test can only catch a
+    /// regression there by observing what the loop actually asked for.
+    fn collect_contact_rows<F>(
+        addresses: &HashSet<&str>,
+        mut fetch: F,
+    ) -> (Vec<crate::a9::blockchain::AddressTxEntry>, bool)
+    where
+        F: FnMut(&str) -> Vec<crate::a9::blockchain::AddressTxEntry>,
+    {
+        let mut rows = Vec::new();
+        let mut capped = false;
+        for address in addresses {
+            let entries = fetch(address);
+            if entries.len() >= Self::CONTACTS_SCAN_CAP_PER_ADDRESS {
+                capped = true;
+            }
+            rows.extend(entries);
+        }
+        (rows, capped)
+    }
+
+    /// Fold raw address-index rows into one entry per counterparty, newest-activity
+    /// timestamp kept, ordered for display.
+    ///
+    /// Pure and separately tested: this is where every judgement call in the view
+    /// lives (which rows are not counterparties, what "net" means, how ties break),
+    /// and the rendering path around it has no seam a test could reach.
+    ///
+    /// `own` is every address the caller holds — a transfer between two of your own
+    /// wallets is bookkeeping, not a relationship, and appears in BOTH wallets'
+    /// scans, so excluding it also prevents a double count.
+    fn aggregate_contacts(
+        rows: &[crate::a9::blockchain::AddressTxEntry],
+        own: &HashSet<&str>,
+    ) -> Vec<Contact> {
+        let mut book: HashMap<String, Contact> = HashMap::new();
+        for e in rows {
+            let (sender, recipient) = (e.is_sender(), e.is_recipient());
+            // Coinbase: the "counterparty" is the reward system, not a peer.
+            if SYSTEM_ADDRESSES.contains(&e.counterparty.as_str()) {
+                continue;
+            }
+            // Self-send, or a transfer to another wallet you hold.
+            if (sender && recipient) || own.contains(e.counterparty.as_str()) {
+                continue;
+            }
+            let contact = book
+                .entry(e.counterparty.clone())
+                .or_insert_with(|| Contact {
+                    address: e.counterparty.clone(),
+                    txs: 0,
+                    in_units: 0,
+                    out_units: 0,
+                    last_seen: 0,
+                });
+            // Saturating throughout: release builds panic on overflow, and a
+            // display path must never be the thing that stops a node.
+            contact.txs = contact.txs.saturating_add(1);
+            // AMOUNT ONLY, no fee — deliberately different from history's net, and
+            // the two are not in conflict. history answers "what did my balance
+            // do", so an out row costs amount + fee. contacts answers "what moved
+            // between me and THIS party", and the fee went to a miner, not to them:
+            // folding it in would overstate every relationship by its costs.
+            if sender {
+                contact.out_units = contact.out_units.saturating_add(e.amount_units);
+            } else if recipient {
+                contact.in_units = contact.in_units.saturating_add(e.amount_units);
+            }
+            contact.last_seen = contact.last_seen.max(e.timestamp);
+        }
+        let mut contacts: Vec<Contact> = book.into_values().collect();
+        // Frequency first — the address book question is "who do I deal with", not
+        // "who was most recent" (that is history's job). Recency then address break
+        // ties, so the ordering is TOTAL: the same book renders identically twice,
+        // which a HashMap's iteration order alone would not guarantee.
+        contacts.sort_by(|a, b| {
+            b.txs
+                .cmp(&a.txs)
+                .then(b.last_seen.cmp(&a.last_seen))
+                .then(a.address.cmp(&b.address))
+        });
+        contacts
+    }
+
+    /// Column right edges for `contacts`. The address is a fixed 40 hex chars, so
+    /// unlike history's goal-width geometry these are absolute: 1 (indent) + 40
+    /// (address) + gap. Section subtotals right-align on CONTACTS_NET_END too, so
+    /// every number in the view shares one decimal column.
+    const CONTACTS_TXS_END: usize = 47;
+    const CONTACTS_NET_END: usize = 68;
+    const CONTACTS_AGE_END: usize = 75;
+
+    /// Address book: every counterparty your wallets have transacted with, grouped
+    /// by the direction of the NET position with them.
+    ///
+    /// Derived live from the address index — there is no contacts file and no
+    /// labels, because the address IS the identity. Deliberately different from
+    /// `history` in two ways: it aggregates over each address's indexed history up
+    /// to a generous per-address cap rather than a small recent window (an address
+    /// book that forgot last month's counterparty would be worse than none; a book
+    /// that pins the chain lock would be worse still, so the cap exists and is
+    /// disclosed), and it keys on the
+    /// counterparty ADDRESS, so one address reached from two of your wallets is
+    /// one contact, not two.
+    ///
+    /// Coinbase rows are excluded (MINING_REWARDS is not a counterparty) and so
+    /// are self-sends between your own loaded wallets, which would otherwise
+    /// appear as a contact that is really just you.
+    pub async fn handle_contacts_command(
+        &self,
+        args: &str,
+        blockchain: &Arc<RwLock<Blockchain>>,
+        wallets: &HashMap<String, Wallet>,
+    ) -> Result<()> {
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        let spec = &mut ColorSpec::new();
+
+        // `contacts` -> top 10, `contacts all` -> the whole book. Anything else is
+        // a typo, and saying so beats silently showing the default (the whisper
+        // error-clarity rule).
+        const CONTACTS_DEFAULT_ROWS: usize = 10;
+        let mut show_all = false;
+        // Every token after the verb is checked, not just the first: `contacts all
+        // now` must not silently behave like `contacts all`, or the screen quietly
+        // teaches a syntax that does not exist.
+        let mut extra = args.split_whitespace().skip(1);
+        let arg = extra.next();
+        let trailing = extra.next().is_some();
+        if let Some(arg) = arg {
+            if arg.eq_ignore_ascii_case("all") && !trailing {
+                show_all = true;
+            } else {
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_DIM,
+                    false,
+                    " Usage: contacts [all]   ",
+                )?;
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_MUTED,
+                    false,
+                    "top 10 by default, all = every counterparty",
+                )?;
+                writeln!(stdout)?;
+                stdout.reset()?;
+                return Ok(());
+            }
+        }
+
+        // Same time-boxed acquisition as history/balance: an unbounded read here
+        // parks the write-preferring chain lock behind a blocked console.
+        let Ok(guard) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), blockchain.read()).await
+        else {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " chain busy (syncing/reorg in progress) — try contacts again shortly\n",
+            )?;
+            stdout.reset()?;
+            return Ok(());
+        };
+
+        let index_ready = guard.address_index_ready();
+        // Your own addresses are not contacts: a transfer between two loaded
+        // wallets is bookkeeping, not a counterparty relationship.
+        //
+        // This set is ALSO the scan list, and that is load-bearing:
+        // `validate_unique_wallet_names` enforces unique NAMES, not unique
+        // addresses, so one address loaded under two names appears twice in
+        // `wallets`. Scanning per wallet would then read that address's index
+        // twice and double every number in the book — the same double-count
+        // `history` had to fix by keying on address instead of name. Scanning per
+        // distinct ADDRESS makes duplicate wallet records free.
+        let own = Self::wallet_addresses(wallets);
+        let (rows, scan_capped) = if index_ready {
+            Self::collect_contact_rows(&own, |address| {
+                // ONE scan per address, newest-first. An earlier version also called
+                // address_history_summary just to size this — a second full prefix
+                // scan per address, under the same guard, for a number the scan
+                // itself yields.
+                guard
+                    .address_recent_txs(address, Self::CONTACTS_SCAN_CAP_PER_ADDRESS, None)
+                    .unwrap_or_default()
+            })
+        } else {
+            (Vec::new(), false)
+        };
+        drop(guard);
+
+        let mut contacts = Self::aggregate_contacts(&rows, &own);
+        let total = contacts.len();
+        let shown = if show_all {
+            total
+        } else {
+            total.min(CONTACTS_DEFAULT_ROWS)
+        };
+        contacts.truncate(shown);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+        ui_seg(&mut stdout, spec, UI_CYAN, true, "contacts")?;
+        if index_ready && total > 0 {
+            ui_seg(&mut stdout, spec, UI_DIM, false, "   ")?;
+            // A trailing `+` means a wallet filled the per-address scan cap, so the
+            // book is a floor, not a lifetime count — the same honesty marker
+            // history puts on its own windowed total.
+            let more = if scan_capped { "+" } else { "" };
+            let count = if show_all || total <= CONTACTS_DEFAULT_ROWS {
+                format!("all {}{}, most active first", total, more)
+            } else {
+                format!("top {} of {}{}, most active first", shown, total, more)
+            };
+            ui_seg(&mut stdout, spec, UI_BLUE, false, &count)?;
+            if !show_all && total > CONTACTS_DEFAULT_ROWS {
+                ui_seg(&mut stdout, spec, UI_FAINT, false, "   contacts all")?;
+            }
+        }
+        writeln!(stdout)?;
+        ui_seg(&mut stdout, spec, UI_DIM, false, UI_RULE)?;
+        writeln!(stdout)?;
+
+        if !index_ready {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_ORANGE,
+                false,
+                " contacts unavailable — the address index is still building; retry shortly",
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+        if total == 0 {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_DIM,
+                false,
+                " no counterparties yet — rewards and moves between your own wallets do not count",
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+            stdout.reset()?;
+            return Ok(());
+        }
+
+        // Three sections, ordered credits -> debits -> settled, each with the
+        // subtotal of the net positions it contains. `net` is per-contact, so a
+        // contact appears exactly once and the three subtotals sum to exactly the
+        // rows ON SCREEN — the same rule history's net follows: a total may never
+        // fold in rows you cannot see. Under the default top-10 that means the
+        // subtotals describe the shown contacts, not the whole book; the header
+        // says "top 10 of N" precisely so the scope is never ambiguous, and
+        // `contacts all` makes them whole-book totals.
+        let net_of = |c: &Contact| c.in_units.saturating_sub(c.out_units);
+        let sections: [(&str, &str, Color); 3] = [
+            ("▾ credits · received from", "credits", UI_GREEN),
+            ("▴ debits · paid to", "debits", UI_PINK),
+            ("↔ settled", "settled", UI_BLUE),
+        ];
+
+        for (index, (title, _key, hue)) in sections.iter().enumerate() {
+            let members: Vec<&Contact> = contacts
+                .iter()
+                .filter(|c| {
+                    let net = net_of(c);
+                    match index {
+                        0 => net > 0,
+                        1 => net < 0,
+                        _ => net == 0,
+                    }
+                })
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let subtotal = members
+                .iter()
+                .fold(0i128, |acc, c| acc.saturating_add(net_of(c)));
+
+            // Section rule: title in the section hue, the subtotal right-aligned
+            // on the same line so each group states its own position.
+            ui_seg(&mut stdout, spec, UI_HAIRLINE, false, " ── ")?;
+            ui_seg(&mut stdout, spec, *hue, true, title)?;
+            let used = 4 + title.chars().count();
+            let subtotal_text = format!(
+                "{}{:.8} ♦",
+                if subtotal < 0 { "−" } else { "+" },
+                Transaction::from_units(subtotal.saturating_abs())
+            );
+            let rule_end = Self::CONTACTS_NET_END.saturating_sub(subtotal_text.chars().count());
+            if rule_end > used + 1 {
+                let dashes: String = "─".repeat(rule_end.saturating_sub(used + 1));
+                ui_seg(
+                    &mut stdout,
+                    spec,
+                    UI_HAIRLINE,
+                    false,
+                    &format!(" {}", dashes),
+                )?;
+            }
+            ui_seg(
+                &mut stdout,
+                spec,
+                *hue,
+                false,
+                &format!(" {}", subtotal_text),
+            )?;
+            writeln!(stdout)?;
+
+            for c in members {
+                let net = net_of(c);
+                ui_seg(&mut stdout, spec, UI_LABEL, false, " ")?;
+                // FULL 40-hex address: this screen is the copy surface. A prefix
+                // would be the address-poisoning shape (see the whisper notice
+                // rule) and would defeat the point of the view.
+                ui_seg(&mut stdout, spec, UI_VALUE, false, &c.address)?;
+                let mut col = 1 + c.address.chars().count();
+                let count = format!("×{}", c.txs);
+                col = ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_TXS_END,
+                    UI_CYAN,
+                    false,
+                    &count,
+                )?;
+                let net_text = format!(
+                    "{}{:.8} ♦",
+                    if net < 0 { "−" } else { "+" },
+                    Transaction::from_units(net.saturating_abs())
+                );
+                col = ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_NET_END,
+                    *hue,
+                    false,
+                    &net_text,
+                )?;
+                let age = ui_age(now.saturating_sub(c.last_seen));
+                ui_right(
+                    &mut stdout,
+                    spec,
+                    col,
+                    Self::CONTACTS_AGE_END,
+                    UI_DIM,
+                    false,
+                    &age,
+                )?;
+                writeln!(stdout)?;
+            }
+            writeln!(stdout)?;
+        }
+
+        if !show_all && total > shown {
+            ui_seg(
+                &mut stdout,
+                spec,
+                UI_FAINT,
+                false,
+                &format!(
+                    " …{} more · contacts all → all {}",
+                    total.saturating_sub(shown),
+                    total
+                ),
+            )?;
+            writeln!(stdout)?;
+            writeln!(stdout)?;
+        }
         stdout.reset()?;
         Ok(())
     }
@@ -3299,8 +3795,184 @@ impl Mgmt {
 mod tests {
     use super::*;
     use crate::a9::blockchain::AddressTxEntry;
+    use crate::a9::blockchain::{ADDRESS_TX_FLAG_RECIPIENT, ADDRESS_TX_FLAG_SENDER};
     use crate::a9::codec;
     use std::io::{Error, ErrorKind};
+
+    /// One address-index row as `contacts` receives it: `flags` says whether the
+    /// scanned wallet was the sender, the recipient, or (self-send) both.
+    fn contact_row(
+        counterparty: &str,
+        flags: u8,
+        amount_units: i128,
+        timestamp: u64,
+    ) -> AddressTxEntry {
+        AddressTxEntry {
+            height: 1,
+            position: 0,
+            flags,
+            amount_units,
+            fee_units: 1_000,
+            timestamp,
+            counterparty: counterparty.to_string(),
+        }
+    }
+
+    #[test]
+    fn contacts_fold_one_entry_per_address_with_net_position() {
+        let own: HashSet<&str> = HashSet::new();
+        // Same counterparty, three rows: two in, one out. One contact, netted.
+        let rows = vec![
+            contact_row("aa", ADDRESS_TX_FLAG_RECIPIENT, 300, 10),
+            contact_row("aa", ADDRESS_TX_FLAG_RECIPIENT, 200, 30),
+            contact_row("aa", ADDRESS_TX_FLAG_SENDER, 100, 20),
+            contact_row("bb", ADDRESS_TX_FLAG_SENDER, 50, 5),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out.len(), 2, "one row per counterparty address");
+        let aa = &out[0];
+        assert_eq!(aa.address, "aa");
+        assert_eq!(aa.txs, 3);
+        assert_eq!(aa.in_units, 500);
+        assert_eq!(aa.out_units, 100);
+        assert_eq!(
+            aa.in_units - aa.out_units,
+            400,
+            "net is in - out, amounts only"
+        );
+        assert_eq!(
+            aa.last_seen, 30,
+            "last_seen is the NEWEST row, not the last"
+        );
+        // Frequency first: aa (3 txs) outranks bb (1) even though bb is older.
+        assert_eq!(out[1].address, "bb");
+    }
+
+    #[test]
+    fn contacts_exclude_coinbase_self_sends_and_your_own_wallets() {
+        let mine = "1111111111111111111111111111111111111111";
+        let own: HashSet<&str> = [mine].into_iter().collect();
+        let rows = vec![
+            // Coinbase: the counterparty is the reward system, not a peer.
+            contact_row("MINING_REWARDS", ADDRESS_TX_FLAG_RECIPIENT, 1_000, 10),
+            // Self-send: one row carrying BOTH flags.
+            contact_row(
+                "cc",
+                ADDRESS_TX_FLAG_SENDER | ADDRESS_TX_FLAG_RECIPIENT,
+                10,
+                11,
+            ),
+            // A transfer to another wallet this node holds.
+            contact_row(mine, ADDRESS_TX_FLAG_SENDER, 20, 12),
+            // The only real counterparty.
+            contact_row("dd", ADDRESS_TX_FLAG_SENDER, 30, 13),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out.len(), 1, "only genuine counterparties survive");
+        assert_eq!(out[0].address, "dd");
+        assert_eq!(out[0].out_units, 30);
+    }
+
+    #[test]
+    fn contacts_ordering_is_total_so_the_book_renders_identically_twice() {
+        let own: HashSet<&str> = HashSet::new();
+        // Two contacts tie on txs AND on last_seen; only the address breaks it.
+        let rows = vec![
+            contact_row("bbbb", ADDRESS_TX_FLAG_RECIPIENT, 1, 100),
+            contact_row("aaaa", ADDRESS_TX_FLAG_RECIPIENT, 1, 100),
+        ];
+        let first = Mgmt::aggregate_contacts(&rows, &own);
+        let second = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(first, second, "HashMap order must not leak into the view");
+        assert_eq!(first[0].address, "aaaa");
+    }
+
+    #[test]
+    fn contacts_saturate_instead_of_panicking_on_absurd_amounts() {
+        // Release builds panic on overflow: a display path must never be the
+        // thing that stops a node, however impossible the row looks.
+        let own: HashSet<&str> = HashSet::new();
+        let rows = vec![
+            contact_row("ee", ADDRESS_TX_FLAG_RECIPIENT, i128::MAX, 1),
+            contact_row("ee", ADDRESS_TX_FLAG_RECIPIENT, i128::MAX, 2),
+        ];
+        let out = Mgmt::aggregate_contacts(&rows, &own);
+        assert_eq!(out[0].in_units, i128::MAX);
+        assert_eq!(out[0].txs, 2);
+    }
+
+    /// `validate_unique_wallet_names` enforces unique NAMES, not unique addresses,
+    /// so the same address can be loaded twice under different names. The scan must
+    /// walk distinct ADDRESSES — walking `wallets` would read that address's index
+    /// twice and double every number in the book. This pins the set the command
+    /// builds (`own`) as the deduplicating step.
+    #[test]
+    fn one_address_loaded_under_two_names_is_scanned_once() {
+        let addr = "9999999999999999999999999999999999999999";
+        let mut wallets: HashMap<String, Wallet> = HashMap::new();
+        for name in ["savings", "the same wallet again"] {
+            let mut w = Wallet::new(None).expect("test wallet");
+            w.address = addr.to_string();
+            wallets.insert(name.to_string(), w);
+        }
+        assert_eq!(wallets.len(), 2, "two records, one address");
+        // Calls the PRODUCTION helper the scan loop uses — rebuilding the set here
+        // would only re-test the test.
+        let scanned = Mgmt::wallet_addresses(&wallets);
+        assert_eq!(
+            scanned.len(),
+            1,
+            "the scan list must collapse duplicate addresses, or every total doubles"
+        );
+        assert!(scanned.contains(addr));
+    }
+
+    /// The double-count bug lived in the SCAN LOOP, not in the dedup set: it
+    /// iterated wallet records, and two records can carry one address. This drives
+    /// the real loop and asserts on what it asked for, so reverting the loop to
+    /// per-record iteration fails here even if the dedup helper is untouched.
+    #[test]
+    fn the_scan_loop_reads_each_address_exactly_once() {
+        let a = "1111111111111111111111111111111111111111";
+        let b = "2222222222222222222222222222222222222222";
+        let own: HashSet<&str> = [a, b].into_iter().collect();
+
+        let mut asked: Vec<String> = Vec::new();
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |address| {
+            asked.push(address.to_string());
+            vec![contact_row("cc", ADDRESS_TX_FLAG_RECIPIENT, 5, 1)]
+        });
+
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![a.to_string(), b.to_string()],
+            "one fetch per address"
+        );
+        assert_eq!(rows.len(), 2, "every fetched row is kept");
+        assert!(!capped, "a one-row address is nowhere near the cap");
+    }
+
+    /// Reaching the per-address cap must be reported, not swallowed: the header
+    /// turns it into a trailing `+` so a truncated book never reads as complete.
+    #[test]
+    fn filling_the_scan_cap_is_reported_not_swallowed() {
+        let a = "3333333333333333333333333333333333333333";
+        let own: HashSet<&str> = [a].into_iter().collect();
+        let full = vec![
+            contact_row("dd", ADDRESS_TX_FLAG_RECIPIENT, 1, 1);
+            Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS
+        ];
+        let (rows, capped) = Mgmt::collect_contact_rows(&own, |_| full.clone());
+        assert_eq!(rows.len(), Mgmt::CONTACTS_SCAN_CAP_PER_ADDRESS);
+        assert!(capped, "a filled window must set the disclosure flag");
+    }
+
+    #[test]
+    fn contacts_on_an_empty_book_are_empty_not_a_panic() {
+        let own: HashSet<&str> = HashSet::new();
+        assert!(Mgmt::aggregate_contacts(&[], &own).is_empty());
+    }
 
     /// ON-DISK WALLET KEY FORMAT — FROZEN.
     ///

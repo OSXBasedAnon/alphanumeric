@@ -111,6 +111,16 @@ const CHAIN_META_TREE: &str = "chain_meta";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const CHAIN_TIP_KEY: &[u8] = b"tip";
 const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
+
+/// True once the operator has asked this process to stop — the typed `exit`, Ctrl-C,
+/// SIGTERM, or stdin closing. Set by the front-end, read here.
+///
+/// This flag tunes LOG SEVERITY ONLY, never behavior: a catch-up window dropped during
+/// an orderly stop is routine (the marker it leaves is the durability design working),
+/// while the same drop on a node that keeps running is the trigger half of diagnosing a
+/// wedged or orphaned miner and must stay loud. Nothing else may branch on this.
+pub static OPERATOR_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Highest block height treated as final. At/below it blocks are
 /// signature-trusted and cannot be reorged; above it every adopted block must
 /// pass full ML-DSA verification. Monotonic. See CHECKPOINT_REORG_MARGIN.
@@ -1410,6 +1420,17 @@ impl SystemKeyDeriver {
     }
 }
 
+/// Supply memo slot. `entry` holds the memoized `(balances-height marker, total)`; `generation`
+/// advances on every writer invalidation (`invalidate_supply_memo`) so a reader that probed
+/// before an invalidation cannot commit its scan afterwards — even when the marker returns to
+/// the same value (forced rebuild at an unchanged covered height, genesis 0->0, equal-height
+/// reorg). Display-only surface: /explorer/supply and the CLI account view.
+#[derive(Debug, Default)]
+struct SupplyMemo {
+    generation: u64,
+    entry: Option<(u64, i128)>,
+}
+
 #[derive(Debug)]
 pub struct Blockchain {
     pub db: Store,
@@ -1458,7 +1479,8 @@ pub struct Blockchain {
     /// LIVENESS heartbeat, read WITHOUT the chain lock.
     ///
     /// Deliberately separate from `tip_change_counter`: that one means "the tip moved" and
-    /// invalidates miner templates and the tip/supply memos, so bumping it for mere progress
+    /// invalidates miner templates and the tip memo (the supply memo is generation-fenced by
+    /// its own writers via `invalidate_supply_memo`), so bumping it for mere progress
     /// would throw away a miner's work every time a balance index caught up. This one means
     /// only "the chain lock is being held by something that is still getting work done".
     ///
@@ -1474,10 +1496,14 @@ pub struct Blockchain {
     /// deserializing the tip block on every call; a version mismatch falls back to the validated
     /// current_chain_tip_metadata, so results are identical to the uncached path.
     chain_tip_cache: Arc<PLMutex<Option<(u64, ChainTipMetadata)>>>,
-    /// In-memory memo of total confirmed supply, keyed by `tip_change_counter`. Supply changes only
-    /// when a block is applied (which bumps the counter), so the opt-in /explorer/supply endpoint can
-    /// reuse the last full balances-tree scan within a tip while it stays unchanged.
-    supply_cache: Arc<PLMutex<Option<(u64, i128)>>>,
+    /// Memo of total confirmed supply, keyed on the balances-index height marker
+    /// (`BALANCES_HEIGHT_KEY`) — NOT `tip_change_counter`: catch-up and rebuild rewrite the
+    /// balances tree without bumping that counter. Every production balances writer commits the
+    /// marker in the same atomic batch as the content (block apply, reorg revert, catch-up,
+    /// rebuild — see the note above `set_balances_height`), and the writers' bump-and-clear
+    /// (`invalidate_supply_memo`) fences readers whose scan straddled a rewrite, including
+    /// same-value marker re-stamps the bracket alone cannot see.
+    supply_cache: Arc<PLMutex<SupplyMemo>>,
     tip_watch_tx: watch::Sender<ChainTipSignal>,
     /// (G) In-memory memo of reorg branches deferred by the S-01 frontier
     /// signature gate: a branch that is genuinely heavier but whose above-floor
@@ -1595,9 +1621,20 @@ impl Drop for ReceiptApplyBatch {
                 // error-level deliberately: the default field log filter is
                 // Error, and this line is the trigger half of diagnosing a
                 // wedged/orphaned-miner report — it must be visible there.
-                error!(
-                    "Catch-up apply window dropped without commit; dirty marker left set for recovery"
-                );
+                if OPERATOR_SHUTDOWN.load(Ordering::Acquire) {
+                    // An orderly stop while behind: the window drop is a routine
+                    // consequence of exiting, not a fault. The next start explains
+                    // itself via the boot UI, so this stays out of the error channel.
+                    log::info!(
+                        "Catch-up apply window closed by shutdown; derived state is \
+                         rebuilt automatically on the next start"
+                    );
+                } else {
+                    error!(
+                        "Catch-up apply window dropped without commit; dirty marker left set — \
+                         derived state is rebuilt automatically on the next start"
+                    );
+                }
             }
         }
     }
@@ -1956,9 +1993,10 @@ impl Blockchain {
         meta_tree.insert(CHAIN_TIP_KEY, codec::serialize(&tip)?)?;
         // Invalidate the in-memory memos the moment the persisted tip changes — before the caller's
         // fallible flushes / notify_tip_changed — so a flush error between here and the counter bump
-        // can never leave a reader serving a tip staler than storage.
+        // can never leave a reader serving a tip staler than storage. The supply memo's
+        // bump-and-clear also fences any in-flight scan's later commit (generation check).
         *self.chain_tip_cache.lock() = None;
-        *self.supply_cache.lock() = None;
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -1966,7 +2004,7 @@ impl Blockchain {
         let meta_tree = self.open_chain_meta_tree()?;
         meta_tree.remove(CHAIN_TIP_KEY)?;
         *self.chain_tip_cache.lock() = None;
-        *self.supply_cache.lock() = None;
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -2165,6 +2203,26 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Read-only peek at the pending recovery marker, for the boot UI: the reason and
+    /// the height it was marked at, or None when the last stop was clean. Never writes,
+    /// never recovers — `initialize` remains the only entry into recovery.
+    pub fn pending_recovery(&self) -> Option<(String, u32)> {
+        self.chain_state_dirty()
+            .ok()
+            .flatten()
+            .map(|m| (m.reason, m.block_index))
+    }
+
+    /// Rough wall-clock estimate for a startup recovery at `chain_height`, for the boot
+    /// UI's "about Ns" message. The rebuild is O(chain): four full passes measured at
+    /// ~17.5 us/block on the reference machine (11.9s at height 681,728). Estimated a
+    /// third high on purpose — finishing earlier than promised is fine, later is not —
+    /// and floored so a young chain still shows a sane number.
+    pub fn recovery_estimate_secs(chain_height: u64) -> u64 {
+        const PER_BLOCK_SECS: f64 = 17.5e-6 * 1.33;
+        ((chain_height as f64 * PER_BLOCK_SECS).ceil() as u64).max(3)
+    }
+
     fn chain_state_dirty(&self) -> Result<Option<ChainStateDirty>, BlockchainError> {
         let meta_tree = self.open_chain_meta_tree()?;
         let Some(raw) = meta_tree.get(CHAIN_STATE_DIRTY_KEY)? else {
@@ -2247,13 +2305,43 @@ impl Blockchain {
         if at_startup {
             let elapsed = started.elapsed();
             if elapsed >= Self::SLOW_RECOVERY_NOTICE {
-                error!(
-                    "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
-                     Expected after an unclean shutdown; the chain itself was not damaged.",
-                    marker.reason,
-                    marker.block_index,
-                    elapsed.as_secs_f64()
-                );
+                // The cause sentence follows the REASON, because they are not the same
+                // event. A catch-up window is dropped un-committed whenever the node stops
+                // while it is behind — including a perfectly orderly `exit` — so telling
+                // that operator their shutdown was unclean is false, and being told a lie
+                // at error level is how an operator learns to stop reading error level.
+                // The other reasons genuinely do mean an apply was interrupted.
+                // Severity follows the reason AND the audience. A receipt_batch
+                // marker means the process stopped while a catch-up window was open —
+                // and it CANNOT say whether that stop was orderly or a crash, because
+                // mark_chain_state_dirty collapses every in-window reason to
+                // receipt_batch. Both cases recover identically and need nothing from
+                // the operator, so on an interactive terminal (where the boot UI has
+                // already announced and confirmed the restore) the line rides warn.
+                // Headless, there is no boot UI and this line is the only breadcrumb
+                // a crash-during-sync leaves at the default Error filter, so it stays
+                // error there. The non-window reasons (persist_block, finalize_block,
+                // orphan_branch_reorg) are only ever written OUTSIDE a window and do
+                // mean an apply was interrupted mid-write: always error.
+                let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+                if marker.reason == "receipt_batch" && interactive {
+                    warn!(
+                        "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
+                         Expected when the node is stopped while it is catching up; the chain itself \
+                         was not damaged.",
+                        marker.reason,
+                        marker.block_index,
+                        elapsed.as_secs_f64()
+                    );
+                } else {
+                    error!(
+                        "Rebuilt derived chain state after an interrupted {} at block {} — took {:.1}s. \
+                         Expected after an unclean shutdown; the chain itself was not damaged.",
+                        marker.reason,
+                        marker.block_index,
+                        elapsed.as_secs_f64()
+                    );
+                }
             } else {
                 log::info!(
                     "Rebuilt derived chain state after an interrupted {} at block {} in {:.2}s",
@@ -2853,6 +2941,17 @@ impl Blockchain {
     /// must rederive the registry from the (now-consistent) canonical blocks. O(chain),
     /// but only on the rare recovery path.
     pub fn rebuild_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
+        // Un-stamp readiness BEFORE anything is cleared, exactly as rebuild_address_tx_index
+        // does for its own key. From here until the re-stamp at the end, the registry is or may
+        // be EMPTY, and a miss there reads as "this transaction is not confirmed" — which for a
+        // transaction that IS confirmed and final is the reading that costs a deposit. Removing
+        // the key first makes the window self-describing: callers can tell "unavailable, ask
+        // again" apart from "genuinely absent", and a rebuild torn mid-way is re-derived by the
+        // next ensure_confirmed_tx_index instead of standing as a half-filled registry stamped
+        // complete.
+        let meta = self.open_chain_meta_tree()?;
+        meta.remove(CONFIRMED_TX_BUILT_KEY)?;
+        meta.flush()?;
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let tree = self.open_confirmed_tx_tree()?;
         if let Some(tip) = self.highest_block_index() {
@@ -2913,7 +3012,6 @@ impl Blockchain {
         // Stamp the completion marker unconditionally — even for a chain with no blocks or no
         // indexable txs — so ensure_confirmed_tx_index does not re-derive on every startup. New
         // blocks keep the registry current incrementally (record_confirmed_txs on commit).
-        let meta = self.open_chain_meta_tree()?;
         meta.insert(CONFIRMED_TX_BUILT_KEY, vec![1u8])?;
         meta.flush()?;
         Ok(())
@@ -3119,6 +3217,21 @@ impl Blockchain {
     /// display paths use to distinguish "no activity" from "index unavailable".
     pub fn address_index_ready(&self) -> bool {
         matches!(self.address_index_meta(), Ok(Some(_)))
+    }
+
+    /// True once the confirmed-tx replay registry has completed a build and is not
+    /// mid-rebuild — the signal a lookup path needs to tell "this transaction is not
+    /// confirmed" apart from "I cannot answer that right now".
+    ///
+    /// `rebuild_confirmed_tx_index` un-stamps this before it clears and re-stamps it only
+    /// after the refill commits, so a false here means the registry is or may be empty for
+    /// reasons that say nothing about any particular transaction. Serving a miss as
+    /// "not_found" during that window is how a final transaction gets reported as though it
+    /// had been reorged away.
+    pub fn confirmed_tx_index_ready(&self) -> bool {
+        self.open_chain_meta_tree()
+            .and_then(|meta| Ok(meta.get(CONFIRMED_TX_BUILT_KEY)?.is_some()))
+            .unwrap_or(false)
     }
 
     /// Force-rebuild the address index from the canonical chain. Invalidates the
@@ -3331,16 +3444,24 @@ impl Blockchain {
     /// which double-counted transfers (a mined 50 sent onward counted as 100) and
     /// decoded the entire chain to do it. One cheap tree scan, no block loads.
     pub fn total_confirmed_supply_units(&self) -> Result<i128, BlockchainError> {
-        // Supply changes only when a block is applied (which bumps tip_change_counter); reuse the
-        // last full scan while the tip is unchanged instead of walking the whole balances tree per
-        // request. Falls through to a fresh scan on any tip change.
-        let version = self.tip_change_counter.load(Ordering::Acquire);
-        if let Some((cached_version, supply)) = *self.supply_cache.lock() {
-            if cached_version == version {
-                return Ok(supply);
-            }
-        }
+        // Memoized on the balances-index height marker, NOT tip_change_counter: catch-up and
+        // rebuild rewrite the balances tree without touching that counter, so a tip-keyed memo
+        // served reverted/pre-catch-up sums. Every production balances writer commits the marker
+        // atomically with the content, so a scan bracketed by an unchanged marker AND an
+        // unchanged invalidation generation read one consistent snapshot; anything else returns
+        // the fresh scan without memoizing. An absent marker (fresh DB, mid-rebuild) never
+        // touches the memo — no sentinel, no genesis-0 collision.
         let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let marker_before = Self::get_balances_height(&balances_tree)?;
+        let generation_at_probe = {
+            let memo = self.supply_cache.lock();
+            if let (Some(marker), Some((cached_marker, supply))) = (marker_before, memo.entry) {
+                if cached_marker == marker {
+                    return Ok(supply);
+                }
+            }
+            memo.generation
+        };
         let mut total: i128 = 0;
         for item in balances_tree.iter() {
             let (key, value) = item?;
@@ -3365,8 +3486,56 @@ impl Blockchain {
                 })?;
             }
         }
-        *self.supply_cache.lock() = Some((version, total));
+        let marker_after = Self::get_balances_height(&balances_tree)?;
+        {
+            let mut memo = self.supply_cache.lock();
+            if let Some(marker) = Self::supply_memo_commit_key(
+                marker_before,
+                marker_after,
+                generation_at_probe,
+                memo.generation,
+            ) {
+                memo.entry = Some((marker, total));
+            }
+        }
+        // A refused commit still returns the fresh scan; readers never clear the memo —
+        // invalidation belongs to the writers' bump-and-clear sites. Residuals (display-only,
+        // self-healing): a scan racing a concurrent batch can return a torn one-off sum
+        // (pre-existing; never durably memoized under this guard), and a stale memo is servable
+        // only in the instruction window between a reader's commit and the adjacent writer's
+        // bump site.
         Ok(total)
+    }
+
+    /// Pure commit gate for the supply memo, truth-table tested: memoize only when the balances
+    /// marker was present and unmoved across the scan AND no writer invalidation elapsed since
+    /// the probe. Extracted because the scan has no injection seam — this fn IS the testable
+    /// guard.
+    fn supply_memo_commit_key(
+        marker_before: Option<u64>,
+        marker_after: Option<u64>,
+        generation_at_probe: u64,
+        generation_now: u64,
+    ) -> Option<u64> {
+        match (marker_before, marker_after) {
+            (Some(before), Some(after))
+                if before == after && generation_at_probe == generation_now =>
+            {
+                Some(before)
+            }
+            _ => None,
+        }
+    }
+
+    /// Writer-side invalidation: clear the memo AND advance the generation so an in-flight scan
+    /// that probed before this point is refused at commit even if the marker it brackets returns
+    /// to the same value (forced rebuild at an unchanged covered height, genesis 0->0,
+    /// equal-height reorg). Wrapping add: the counter is an equality fence — wrap is harmless,
+    /// and `+=` would be an overflow-checks panic site.
+    fn invalidate_supply_memo(&self) {
+        let mut memo = self.supply_cache.lock();
+        memo.generation = memo.generation.wrapping_add(1);
+        memo.entry = None;
     }
 
     async fn rebuild_pending_debits_index(&self) -> Result<(), BlockchainError> {
@@ -4281,6 +4450,10 @@ impl Blockchain {
                 let fork_base = (fork_start as u64).saturating_sub(1);
                 batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&fork_base)?);
                 balances_tree.apply_batch(batch)?;
+                // The old branch's balances are gone the moment this batch lands; kill the memo
+                // BEFORE catch-up re-transits the same marker heights on the new branch, or a
+                // pre-reorg memo at a matching height would be served during the replay.
+                self.invalidate_supply_memo();
                 self.catch_up_balances_index(&balances_tree, fork_base, branch_tip.index as u64)
                     .await?;
             }
@@ -5023,9 +5196,10 @@ impl Blockchain {
             balances_tree.apply_batch(batch)?;
         }
         balances_tree.flush()?;
-        // The index just advanced at the current tip; drop the supply memo (keyed by tip version)
-        // so /explorer/supply doesn't serve a pre-catch-up partial sum until the next block.
-        *self.supply_cache.lock() = None;
+        // The index just advanced at the current tip; bump-and-clear the supply memo so a reader
+        // whose scan straddled this replay is refused at commit (generation fence) instead of
+        // re-memoizing a pre-catch-up sum under a still-current marker.
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -5103,9 +5277,11 @@ impl Blockchain {
         batch.insert(BALANCES_HEIGHT_KEY, codec::serialize(&covered_height)?);
         balances_tree.apply_batch(batch)?;
 
-        // The index was rebuilt fully current; drop the supply memo so /explorer/supply cannot keep
-        // serving a pre-rebuild partial sum. Covers every catch-up fallback and the direct rebuild.
-        *self.supply_cache.lock() = None;
+        // The index was rebuilt fully current; bump-and-clear the supply memo. The generation
+        // half fences a forced rebuild that re-stamps the SAME covered height (dirty-state
+        // recovery, ALPHANUMERIC_REBUILD_BALANCES) — the marker bracket alone cannot see that
+        // re-stamp.
+        self.invalidate_supply_memo();
         Ok(())
     }
 
@@ -5453,7 +5629,7 @@ impl Blockchain {
             tip_change_counter,
             chain_progress: Arc::new(AtomicU64::new(0)),
             chain_tip_cache: Arc::new(PLMutex::new(None)),
-            supply_cache: Arc::new(PLMutex::new(None)),
+            supply_cache: Arc::new(PLMutex::new(SupplyMemo::default())),
             tip_watch_tx,
             witness_blocked: Arc::new(PLMutex::new(HashMap::new())),
             orphan_index_reconciled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9235,6 +9411,37 @@ mod tests {
 
         sentinel.add_block_verification(&block, "c".to_string());
         assert!(sentinel.is_block_verified(&block));
+    }
+
+    /// Manual tool, not a test: plants a `receipt_batch` recovery marker in the redb
+    /// store named by `ALPHANUMERIC_PLANT_MARKER_DB`, so the boot restore UI can be
+    /// exercised on demand instead of racing a kill -9 against a catch-up window.
+    /// `#[ignore]` + env-gated: inert under `cargo test` and does nothing at all
+    /// unless the variable is set. Point it ONLY at a scratch node's store.
+    #[test]
+    #[ignore = "manual tool: plants a recovery marker for a live boot-UI test"]
+    fn plant_recovery_marker_in_external_db() {
+        let Some(path) = std::env::var_os("ALPHANUMERIC_PLANT_MARKER_DB") else {
+            return;
+        };
+        let db = store::Store::open(&path, 64 << 20).expect("open target store");
+        let bc = Blockchain::new(
+            db,
+            0.0005,
+            1.0,
+            10,
+            TARGET_BLOCK_TIME as u32,
+            Arc::new(RateLimiter::new(60, 1_000)),
+            Arc::new(Mutex::new(321)),
+        );
+        let tip = bc.highest_block_index().unwrap_or(0) as u32;
+        bc.write_dirty_marker(tip, "receipt_batch")
+            .expect("plant marker");
+        assert_eq!(
+            bc.pending_recovery(),
+            Some(("receipt_batch".to_string(), tip)),
+            "marker planted and visible to the boot peek"
+        );
     }
 
     fn test_blockchain() -> Blockchain {
@@ -13557,8 +13764,16 @@ mod tests {
             merkle_root: [0u8; 32],
             difficulty: NETWORK_MIN_DIFFICULTY,
         };
-        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
-        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_a = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let mgr_b = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let (ha, hb) = (header(), header());
         let (ta, tb) = (vec![ptx.clone()], vec![ptx]);
 
@@ -13571,7 +13786,6 @@ mod tests {
                     1u64 << 26,
                     "miner_a".to_string(),
                     false,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
                 .await
         });
@@ -13584,7 +13798,6 @@ mod tests {
                     1u64 << 26,
                     "miner_b".to_string(),
                     false,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
                 .await
         });
@@ -13638,8 +13851,16 @@ mod tests {
         };
         let no_txs: Vec<ProgPowTransaction> = Vec::new();
 
-        let mgr_a = MiningManager::new(Arc::clone(&blockchain));
-        let mgr_b = MiningManager::new(Arc::clone(&blockchain));
+        let mgr_a = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let mgr_b = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let (ha, hb) = (header(), header());
         let (txs_a, txs_b) = (no_txs.clone(), no_txs);
 
@@ -13652,7 +13873,6 @@ mod tests {
                     1u64 << 26,
                     "miner_a".to_string(),
                     false,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
                 .await
         });
@@ -13665,7 +13885,6 @@ mod tests {
                     1u64 << 26,
                     "miner_b".to_string(),
                     false,
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 )
                 .await
         });
@@ -13686,6 +13905,141 @@ mod tests {
             joined.1.is_ok(),
             "miner B should complete: {:?}",
             joined.1.err()
+        );
+    }
+
+    // Backport validation (2026-07-25): PROVE the CPU miner — after the
+    // block-template / random-nonce-base / retarget backport from gpu-mining —
+    // produces a REAL, consensus-VALID block end to end, not just one that
+    // compiles and passes unit tests. We mine block #1 on a fresh genesis chain
+    // at the lowest difficulty a block can carry and still validate:
+    // NETWORK_MIN_DIFFICULTY (464). The miner derives difficulty from
+    // consensus_next_difficulty, and because genesis (difficulty 0, timestamp
+    // 2026-07-04) sits far behind the wall clock, the child's timestamp_diff is
+    // huge, so the retarget floors at 464 with no hand-pinning. mine_block
+    // itself runs the CANONICAL accept path (validate_new_block THEN
+    // finalize_block), so an Ok return already means the block validated AND was
+    // committed; we then independently re-check the floor+PoW and that the tip
+    // advanced onto exactly this block.
+    //   cargo test --release mines_a_valid_block_at_min_difficulty -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "real ProgPoW mining at the 464 floor (~2^29 hashes, tens of seconds); run with --ignored"]
+    async fn mines_a_valid_block_at_min_difficulty() {
+        use crate::a9::miner::{BlockHeader, MiningManager, ProgPowTransaction};
+        use std::time::{Duration, Instant};
+
+        // (a) fresh genesis chain.
+        let blockchain = Arc::new(RwLock::new(test_blockchain()));
+        let genesis = Blockchain::genesis_launch_block().expect("genesis builds");
+        {
+            let g = blockchain.read().await;
+            insert_raw_block(&g, &genesis);
+        }
+
+        // (b) MiningManager + a block #1 header over the genesis tip. The header's
+        // timestamp/difficulty fields are advisory only — mine_block recomputes
+        // both from the live tip + wall clock every pass, so the mined block's
+        // difficulty is whatever consensus dictates (the 464 floor here).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert!(
+            now > genesis.timestamp,
+            "this proof needs a wall clock past the genesis timestamp ({}) so the \
+             retarget floors difficulty at NETWORK_MIN_DIFFICULTY; clock reads {}",
+            genesis.timestamp,
+            now
+        );
+
+        let mut header = BlockHeader {
+            number: 1,
+            parent_hash: genesis.hash,
+            timestamp: now,
+            merkle_root: [0u8; 32],
+            difficulty: NETWORK_MIN_DIFFICULTY,
+        };
+        let manager = MiningManager::new(
+            Arc::clone(&blockchain),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        // (c) coinbase-only template (empty mempool). The PRIMARY gate is "mines a
+        // valid accepted block"; the live-mempool template path (freshness filter,
+        // confirmed_cache) is already covered by
+        // racing_miners_with_pending_tx_both_complete above.
+        let no_txs: Vec<ProgPowTransaction> = Vec::new();
+
+        // (d) grind. mine_block loops passes internally until it solves; bound the
+        // whole thing so a stall fails loudly instead of hanging.
+        let started = Instant::now();
+        let (nonce, hash_string, block) = tokio::time::timeout(
+            Duration::from_secs(180),
+            manager.mine_block(
+                &mut header,
+                &no_txs,
+                1u64 << 27,
+                "miner_proof".to_string(),
+                // CPU path: this test proves the CANONICAL accept path, and the
+                // GPU is only a nonce proposer feeding that same path.
+                false,
+            ),
+        )
+        .await
+        .expect("mining did not finish within 180s at the 464 floor")
+        .expect("mine_block must return a solved, validated, finalized block");
+        let elapsed = started.elapsed();
+
+        // (e) genuine validity.
+        // e1: correct height + pinned to the 464 floor.
+        assert_eq!(block.index, 1, "mined block must be #1");
+        assert_eq!(
+            block.difficulty, NETWORK_MIN_DIFFICULTY,
+            "mined block must carry the NETWORK_MIN_DIFFICULTY floor (464)"
+        );
+        // e2: PoW meets the floor AND the hash re-derived from the block's own
+        // header fields is <= target (verify_pow_meets_floor recomputes the hash
+        // from index/prev/timestamp/nonce/difficulty/merkle_root).
+        assert!(
+            block.verify_pow_meets_floor(),
+            "mined block PoW must satisfy verify_pow_meets_floor (hash <= target AND difficulty >= floor)"
+        );
+        // e3: explicit numeric hash <= target, independent of the returned string.
+        let target = pow_target_from_difficulty(block.difficulty);
+        let hash_int = BigUint::from_bytes_be(&block.hash);
+        assert!(
+            hash_int <= target,
+            "mined hash must be numerically <= the difficulty-464 target"
+        );
+        // e4: the returned hash string matches the block's committed hash bytes.
+        assert_eq!(
+            hash_string,
+            hex::encode(block.hash),
+            "returned hash string must match the block's committed hash"
+        );
+        // e5: CANONICAL ACCEPT — mine_block finalized the block onto the chain, so
+        // the tip must now BE this block. (mine_block already ran validate_new_block
+        // + finalize_block internally; an Ok return is proof both passed, and this
+        // confirms it is the committed tip, not merely a valid candidate.)
+        {
+            let g = blockchain.read().await;
+            let tip = g.get_last_block().expect("chain has a tip after mining");
+            assert_eq!(tip.index, 1, "chain tip must have advanced to block #1");
+            assert_eq!(
+                tip.hash, block.hash,
+                "committed tip must be exactly the mined block"
+            );
+        }
+
+        println!(
+            "ACCEPTED: block #{} mined & finalized at difficulty {} in {:.1}s\n  nonce  = {}\n  hash   = {}\n  target = {}",
+            block.index,
+            block.difficulty,
+            elapsed.as_secs_f64(),
+            nonce,
+            hash_string,
+            hex::encode(pow_target_bytes(&target)),
         );
     }
 
@@ -13714,6 +14068,46 @@ mod tests {
         assert_eq!(
             Block::consensus_next_difficulty(MAX_NETWORK_DIFFICULTY, 0, 9),
             MAX_NETWORK_DIFFICULTY
+        );
+    }
+
+    // Consensus property behind the miner's parent-timestamp clamp (miner::candidate_timestamp):
+    // a child clamped UP to a future-dated parent is valid under the UNCHANGED rules, so old and
+    // new binaries agree on it. Proves (a) the validator's difficulty (adjust_dynamic_difficulty)
+    // equals the miner's (consensus_next_difficulty) for the clamped delta=0 — they must, since the
+    // former delegates to the latter — and (b) validate_parent_timestamp accepts child==parent but
+    // still rejects the pre-clamp child<parent (the wasted-grind bug the clamp removes).
+    #[test]
+    fn clamped_child_is_consensus_valid_against_future_dated_parent() {
+        for parent_diff in [NETWORK_MIN_DIFFICULTY, 500, 10_000, MAX_NETWORK_DIFFICULTY] {
+            assert_eq!(
+                Block::adjust_dynamic_difficulty(
+                    parent_diff,
+                    0, // clamped delta: now < parent -> timestamp == parent -> diff input 0
+                    9,
+                    &mut DifficultyOracle::new(),
+                    1_000_000,
+                ),
+                Block::consensus_next_difficulty(parent_diff, 0, 9),
+                "validator and miner difficulty must agree for the clamped delta=0"
+            );
+        }
+
+        let mut parent = metadata_test_block(5, [0u8; 32], "miner", 1.0);
+        parent.timestamp = 2_000_000; // future-dated but valid parent
+        let mut child = metadata_test_block(6, parent.hash, "miner", 1.0);
+
+        // Clamped child (== parent): the exact block a behind-clock miner now produces — accepted.
+        child.timestamp = parent.timestamp;
+        assert!(
+            Blockchain::validate_parent_timestamp(&child, &parent).is_ok(),
+            "a child clamped to == its parent must be accepted (equal timestamps are valid)"
+        );
+        // Pre-clamp child (< parent): still rejected — this is the wasted-grind the clamp avoids.
+        child.timestamp = parent.timestamp - 1;
+        assert!(
+            Blockchain::validate_parent_timestamp(&child, &parent).is_err(),
+            "a child below its parent must be rejected (why the miner clamps)"
         );
     }
 
@@ -13779,46 +14173,6 @@ mod tests {
         assert!(
             bc.verify_transaction_signature(&no_hash).is_ok(),
             "a tx without a claimed sig_hash must still verify"
-        );
-    }
-
-    // Consensus property behind the miner's parent-timestamp clamp (miner::candidate_timestamp):
-    // a child clamped UP to a future-dated parent is valid under the UNCHANGED rules, so old and
-    // new binaries agree on it. Proves (a) the validator's difficulty (adjust_dynamic_difficulty)
-    // equals the miner's (consensus_next_difficulty) for the clamped delta=0 — they must, since the
-    // former delegates to the latter — and (b) validate_parent_timestamp accepts child==parent but
-    // still rejects the pre-clamp child<parent (the wasted-grind bug the clamp removes).
-    #[test]
-    fn clamped_child_is_consensus_valid_against_future_dated_parent() {
-        for parent_diff in [NETWORK_MIN_DIFFICULTY, 500, 10_000, MAX_NETWORK_DIFFICULTY] {
-            assert_eq!(
-                Block::adjust_dynamic_difficulty(
-                    parent_diff,
-                    0, // clamped delta: now < parent -> timestamp == parent -> diff input 0
-                    9,
-                    &mut DifficultyOracle::new(),
-                    1_000_000,
-                ),
-                Block::consensus_next_difficulty(parent_diff, 0, 9),
-                "validator and miner difficulty must agree for the clamped delta=0"
-            );
-        }
-
-        let mut parent = metadata_test_block(5, [0u8; 32], "miner", 1.0);
-        parent.timestamp = 2_000_000; // future-dated but valid parent
-        let mut child = metadata_test_block(6, parent.hash, "miner", 1.0);
-
-        // Clamped child (== parent): the exact block a behind-clock miner now produces — accepted.
-        child.timestamp = parent.timestamp;
-        assert!(
-            Blockchain::validate_parent_timestamp(&child, &parent).is_ok(),
-            "a child clamped to == its parent must be accepted (equal timestamps are valid)"
-        );
-        // Pre-clamp child (< parent): still rejected — this is the wasted-grind the clamp avoids.
-        child.timestamp = parent.timestamp - 1;
-        assert!(
-            Blockchain::validate_parent_timestamp(&child, &parent).is_err(),
-            "a child below its parent must be rejected (why the miner clamps)"
         );
     }
 
@@ -14757,6 +15111,94 @@ mod tests {
             .await
             .expect_err("invalid regular tx amount should be rejected before mining finalization");
         assert!(matches!(err, BlockchainError::InvalidTransactionAmount));
+    }
+
+    /// A rebuild empties the replay registry before refilling it, and an empty registry
+    /// answers every lookup the same way an unknown transaction does. The readiness key is
+    /// what separates the two, so it must be FALSE for the whole window — otherwise a
+    /// confirmed, final transaction is reported as never having happened, which is the
+    /// reading that costs a deposit.
+    #[test]
+    fn a_rebuild_unstamps_readiness_before_it_clears_the_registry() {
+        let bc = test_blockchain();
+        let b0 = metadata_test_block(0, [0u8; 32], "miner", 1.0);
+        insert_raw_block(&bc, &b0);
+        bc.rebuild_confirmed_tx_index().expect("first build");
+        assert!(
+            bc.confirmed_tx_index_ready(),
+            "a completed build reports ready"
+        );
+
+        // Stand where a reader stands mid-rebuild: readiness cleared, registry emptied.
+        let meta = bc.open_chain_meta_tree().expect("meta tree");
+        meta.remove(CONFIRMED_TX_BUILT_KEY).expect("unstamp");
+        meta.flush().expect("flush");
+        assert!(
+            !bc.confirmed_tx_index_ready(),
+            "while the key is absent the registry must NOT be treated as authoritative — \
+             a miss here says nothing about any particular transaction"
+        );
+
+        // And a rebuild leaves it stamped again, so the window is bounded.
+        bc.rebuild_confirmed_tx_index().expect("rebuild");
+        assert!(
+            bc.confirmed_tx_index_ready(),
+            "readiness is restored once the refill commits"
+        );
+    }
+
+    /// The boot UI trusts this peek to decide whether to promise a restore and how
+    /// long to promise: a wrong None is a silent hang, a wrong Some announces work
+    /// that never happens. So pin the full round trip against the real marker.
+    #[test]
+    fn pending_recovery_reflects_the_marker_round_trip() {
+        let bc = test_blockchain();
+        assert_eq!(
+            bc.pending_recovery(),
+            None,
+            "clean chain has nothing pending"
+        );
+
+        bc.write_dirty_marker(42, "receipt_batch").unwrap();
+        assert_eq!(
+            bc.pending_recovery(),
+            Some(("receipt_batch".to_string(), 42)),
+            "the peek reports exactly what the marker says"
+        );
+
+        bc.clear_chain_state_dirty().unwrap();
+        assert_eq!(
+            bc.pending_recovery(),
+            None,
+            "cleared marker, nothing pending"
+        );
+    }
+
+    /// The estimate must never promise less than the measured reality: 11.9s was
+    /// measured at height 681,728, so the estimate there has to be at least that,
+    /// and the floor keeps a young chain from printing "about 0s".
+    #[test]
+    fn recovery_estimate_overpromises_never_underpromises() {
+        let at_measured = Blockchain::recovery_estimate_secs(681_728);
+        assert!(
+            at_measured >= 12,
+            "estimate at the measured height ({}s) must cover the measured 11.9s",
+            at_measured
+        );
+        assert!(
+            at_measured <= 30,
+            "estimate should stay the same order of magnitude, got {}s",
+            at_measured
+        );
+        assert!(
+            Blockchain::recovery_estimate_secs(0) >= 3,
+            "floor holds at genesis"
+        );
+        assert!(
+            Blockchain::recovery_estimate_secs(2_000_000)
+                > Blockchain::recovery_estimate_secs(1_000_000),
+            "estimate grows with the chain"
+        );
     }
 
     // #8: on a chain with no NON-system transactions the confirmed-tx replay registry is
@@ -16996,6 +17438,10 @@ mod tests {
     fn malformed_supply_rows_fail_without_caching_a_partial_total() {
         let bc = test_blockchain();
         let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        // Marker present, so a partial sum WOULD be committable — the no-cache asserts below must
+        // hold because the error paths bail before the commit block, not because the
+        // absent-marker gate refuses vacuously.
+        Blockchain::set_balances_height(&balances, 7).unwrap();
         balances
             .insert("alice".as_bytes(), codec::serialize(&123_i128).unwrap())
             .unwrap();
@@ -17003,7 +17449,7 @@ mod tests {
 
         assert!(bc.total_confirmed_supply_units().is_err());
         assert!(
-            bc.supply_cache.lock().is_none(),
+            bc.supply_cache.lock().entry.is_none(),
             "a failed scan must never cache the valid prefix as total supply"
         );
 
@@ -17012,144 +17458,89 @@ mod tests {
             .insert(vec![0xff], codec::serialize(&456_i128).unwrap())
             .unwrap();
         assert!(bc.total_confirmed_supply_units().is_err());
-        assert!(bc.supply_cache.lock().is_none());
+        assert!(bc.supply_cache.lock().entry.is_none());
 
         balances.remove(vec![0xff]).unwrap();
         assert_eq!(bc.total_confirmed_supply_units().unwrap(), 123);
     }
-    // Backport validation (2026-07-25): PROVE the CPU miner — after the
-    // block-template / random-nonce-base / retarget backport from gpu-mining —
-    // produces a REAL, consensus-VALID block end to end, not just one that
-    // compiles and passes unit tests. We mine block #1 on a fresh genesis chain
-    // at the lowest difficulty a block can carry and still validate:
-    // NETWORK_MIN_DIFFICULTY (464). The miner derives difficulty from
-    // consensus_next_difficulty, and because genesis (difficulty 0, timestamp
-    // 2026-07-04) sits far behind the wall clock, the child's timestamp_diff is
-    // huge, so the retarget floors at 464 with no hand-pinning. mine_block
-    // itself runs the CANONICAL accept path (validate_new_block THEN
-    // finalize_block), so an Ok return already means the block validated AND was
-    // committed; we then independently re-check the floor+PoW and that the tip
-    // advanced onto exactly this block.
-    //   cargo test --release mines_a_valid_block_at_min_difficulty -- --ignored --nocapture
-    // Ported back from main after it was dropped here for a signature change,
-    // not a decision: this branch adds a SECOND block-proposal path (the GPU),
-    // so it is the branch that can least afford to lose the one test proving
-    // mine_block still yields a block the chain accepts and commits.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "real ProgPoW mining at the 464 floor (~2^29 hashes, tens of seconds); run with --ignored"]
-    async fn mines_a_valid_block_at_min_difficulty() {
-        use crate::a9::miner::{BlockHeader, MiningManager, ProgPowTransaction};
-        use std::time::{Duration, Instant};
 
-        // (a) fresh genesis chain.
-        let blockchain = Arc::new(RwLock::new(test_blockchain()));
-        let genesis = Blockchain::genesis_launch_block().expect("genesis builds");
-        {
-            let g = blockchain.read().await;
-            insert_raw_block(&g, &genesis);
-        }
+    #[test]
+    fn supply_memo_keys_on_the_balances_marker_not_the_tip_counter() {
+        let bc = test_blockchain();
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&100_i128).unwrap())
+            .unwrap();
+        Blockchain::set_balances_height(&balances, 7).unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
+        assert_eq!(bc.supply_cache.lock().entry, Some((7, 100)));
 
-        // (b) MiningManager + a block #1 header over the genesis tip. The header's
-        // timestamp/difficulty fields are advisory only — mine_block recomputes
-        // both from the live tip + wall clock every pass, so the mined block's
-        // difficulty is whatever consensus dictates (the 464 floor here).
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        assert!(
-            now > genesis.timestamp,
-            "this proof needs a wall clock past the genesis timestamp ({}) so the \
-             retarget floors difficulty at NETWORK_MIN_DIFFICULTY; clock reads {}",
-            genesis.timestamp,
-            now
-        );
+        // Real memo hit, not a coincidental rescan: mutate content WITHOUT moving the marker
+        // (impossible in production — every writer commits both in one batch) and observe the
+        // memoized value still served.
+        balances
+            .insert("bob".as_bytes(), codec::serialize(&50_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
 
-        let mut header = BlockHeader {
-            number: 1,
-            parent_hash: genesis.hash,
-            timestamp: now,
-            merkle_root: [0u8; 32],
-            difficulty: NETWORK_MIN_DIFFICULTY,
-        };
-        let manager = MiningManager::new(Arc::clone(&blockchain));
+        // The catch-up/rebuild shape — marker moves, no tip change. The old tip-counter keying
+        // kept serving 100 here; the marker keying must rescan and re-memoize.
+        Blockchain::set_balances_height(&balances, 8).unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 150);
+        assert_eq!(bc.supply_cache.lock().entry, Some((8, 150)));
 
-        // (c) coinbase-only template (empty mempool). The PRIMARY gate is "mines a
-        // valid accepted block"; the live-mempool template path (freshness filter,
-        // confirmed_cache) is already covered by
-        // racing_miners_with_pending_tx_both_complete above.
-        let no_txs: Vec<ProgPowTransaction> = Vec::new();
-
-        // (d) grind. mine_block loops passes internally until it solves; bound the
-        // whole thing so a stall fails loudly instead of hanging.
-        let started = Instant::now();
-        let (nonce, hash_string, block) = tokio::time::timeout(
-            Duration::from_secs(180),
-            manager.mine_block(
-                &mut header,
-                &no_txs,
-                1u64 << 27,
-                "miner_proof".to_string(),
-                // CPU path: this test proves the CANONICAL accept path, and the
-                // GPU is only a nonce proposer feeding that same path.
-                false,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ),
-        )
-        .await
-        .expect("mining did not finish within 180s at the 464 floor")
-        .expect("mine_block must return a solved, validated, finalized block");
-        let elapsed = started.elapsed();
-
-        // (e) genuine validity.
-        // e1: correct height + pinned to the 464 floor.
-        assert_eq!(block.index, 1, "mined block must be #1");
+        // Writer invalidation clears the entry and advances the generation; the next read
+        // rescans and re-memoizes under the current generation.
+        let generation_before = bc.supply_cache.lock().generation;
+        bc.invalidate_supply_memo();
         assert_eq!(
-            block.difficulty, NETWORK_MIN_DIFFICULTY,
-            "mined block must carry the NETWORK_MIN_DIFFICULTY floor (464)"
+            bc.supply_cache.lock().generation,
+            generation_before.wrapping_add(1),
+            "the fence must advance — a cleared entry alone cannot refuse a straddling commit"
         );
-        // e2: PoW meets the floor AND the hash re-derived from the block's own
-        // header fields is <= target (verify_pow_meets_floor recomputes the hash
-        // from index/prev/timestamp/nonce/difficulty/merkle_root).
-        assert!(
-            block.verify_pow_meets_floor(),
-            "mined block PoW must satisfy verify_pow_meets_floor (hash <= target AND difficulty >= floor)"
-        );
-        // e3: explicit numeric hash <= target, independent of the returned string.
-        let target = pow_target_from_difficulty(block.difficulty);
-        let hash_int = BigUint::from_bytes_be(&block.hash);
-        assert!(
-            hash_int <= target,
-            "mined hash must be numerically <= the difficulty-464 target"
-        );
-        // e4: the returned hash string matches the block's committed hash bytes.
-        assert_eq!(
-            hash_string,
-            hex::encode(block.hash),
-            "returned hash string must match the block's committed hash"
-        );
-        // e5: CANONICAL ACCEPT — mine_block finalized the block onto the chain, so
-        // the tip must now BE this block. (mine_block already ran validate_new_block
-        // + finalize_block internally; an Ok return is proof both passed, and this
-        // confirms it is the committed tip, not merely a valid candidate.)
-        {
-            let g = blockchain.read().await;
-            let tip = g.get_last_block().expect("chain has a tip after mining");
-            assert_eq!(tip.index, 1, "chain tip must have advanced to block #1");
-            assert_eq!(
-                tip.hash, block.hash,
-                "committed tip must be exactly the mined block"
-            );
-        }
+        assert!(bc.supply_cache.lock().entry.is_none());
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 150);
+        assert_eq!(bc.supply_cache.lock().entry, Some((8, 150)));
+    }
 
-        println!(
-            "ACCEPTED: block #{} mined & finalized at difficulty {} in {:.1}s\n  nonce  = {}\n  hash   = {}\n  target = {}",
-            block.index,
-            block.difficulty,
-            elapsed.as_secs_f64(),
-            nonce,
-            hash_string,
-            hex::encode(pow_target_bytes(&target)),
+    #[test]
+    fn supply_memo_never_populates_without_a_marker() {
+        let bc = test_blockchain();
+        let balances = bc.db.open_tree(BALANCES_TREE).unwrap();
+        balances
+            .insert("alice".as_bytes(), codec::serialize(&100_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 100);
+        assert!(bc.supply_cache.lock().entry.is_none());
+        balances
+            .insert("bob".as_bytes(), codec::serialize(&11_i128).unwrap())
+            .unwrap();
+        assert_eq!(bc.total_confirmed_supply_units().unwrap(), 111);
+        assert!(bc.supply_cache.lock().entry.is_none());
+    }
+
+    #[test]
+    fn supply_memo_commit_key_truth_table() {
+        assert_eq!(Blockchain::supply_memo_commit_key(None, None, 3, 3), None);
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), None, 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(None, Some(5), 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(6), 3, 3),
+            None
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(5), 3, 3),
+            Some(5)
+        );
+        assert_eq!(
+            Blockchain::supply_memo_commit_key(Some(5), Some(5), 3, 4),
+            None
         );
     }
 }
