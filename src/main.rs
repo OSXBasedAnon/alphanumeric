@@ -4505,10 +4505,6 @@ Some("help") => {
     row!(UI_GREEN, "start mining", "mine", "   to your default wallet");
     row!(UI_GREEN, "mine to a wallet", "mine ", "<wallet name>");
     row!(UI_GREEN, "keep mining", "mine ", "[wallet] --continuous  (-c)");
-    // GPU build only: the flags do not exist on the standard binary, so the row
-    // is cfg'd out rather than advertising a flag the CPU build rejects.
-    #[cfg(feature = "gpu_miner")]
-    row!(UI_GREEN, "choose a backend", "mine ", "[wallet] --gpu  or  --cpu");
     // Section notes carry no rail: the rail marks a row you can type, and a
     // note is not one. Flush with the goals column so it reads as a caption
     // under the section rather than another entry in it.
@@ -4529,7 +4525,7 @@ Some("help") => {
             spec,
             UI_FAINT,
             false,
-            "--gpu is default on this build; --cpu forces the CPU miner",
+            "this build mines on the GPU by default; add --cpu to use the CPU instead",
         )?;
         writeln!(stdout)?;
     }
