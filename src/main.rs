@@ -30,6 +30,7 @@ use alphanumeric::a9::{
         MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS, MIN_RELAY_FEE_UNITS,
     },
     bpos::{BPoSSentinel, ValidatorTier},
+    ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     mgmt::{CreateTransactionOutcome, Mgmt, WalletKeyData},
     miner::{Miner, MiningManager},
     node::{
@@ -42,7 +43,6 @@ use alphanumeric::a9::{
         ui_thousands, UI_BLUE, UI_CYAN, UI_DIM, UI_FAINT, UI_GREEN, UI_LABEL, UI_LAVENDER,
         UI_MUTED, UI_ORANGE, UI_PINK, UI_RULE,
     },
-    ledger::{EntryState, LedgerConfig, WalletLedger, DEFAULT_LEDGER_FILENAME},
     whisper::WhisperModule,
 };
 

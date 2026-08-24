@@ -9434,7 +9434,7 @@ mod tests {
             Arc::new(RateLimiter::new(60, 1_000)),
             Arc::new(Mutex::new(321)),
         );
-        let tip = bc.highest_block_index().unwrap_or(0) as u32;
+        let tip = bc.highest_block_index().unwrap_or(0);
         bc.write_dirty_marker(tip, "receipt_batch")
             .expect("plant marker");
         assert_eq!(
@@ -13780,25 +13780,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(
-                    &mut h,
-                    &ta,
-                    1u64 << 26,
-                    "miner_a".to_string(),
-                    false,
-                )
+                .mine_block(&mut h, &ta, 1u64 << 26, "miner_a".to_string(), false)
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(
-                    &mut h,
-                    &tb,
-                    1u64 << 26,
-                    "miner_b".to_string(),
-                    false,
-                )
+                .mine_block(&mut h, &tb, 1u64 << 26, "miner_b".to_string(), false)
                 .await
         });
 
@@ -13867,25 +13855,13 @@ mod tests {
         let task_a = tokio::spawn(async move {
             let mut h = ha;
             mgr_a
-                .mine_block(
-                    &mut h,
-                    &txs_a,
-                    1u64 << 26,
-                    "miner_a".to_string(),
-                    false,
-                )
+                .mine_block(&mut h, &txs_a, 1u64 << 26, "miner_a".to_string(), false)
                 .await
         });
         let task_b = tokio::spawn(async move {
             let mut h = hb;
             mgr_b
-                .mine_block(
-                    &mut h,
-                    &txs_b,
-                    1u64 << 26,
-                    "miner_b".to_string(),
-                    false,
-                )
+                .mine_block(&mut h, &txs_b, 1u64 << 26, "miner_b".to_string(), false)
                 .await
         });
 

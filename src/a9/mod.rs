@@ -3,9 +3,9 @@ pub mod blocknotify;
 pub mod bpos;
 pub mod codec;
 pub mod compact;
-pub mod ledger;
 #[cfg(feature = "gpu_miner")]
 pub mod gpu_miner;
+pub mod ledger;
 pub mod mempool;
 pub mod mgmt;
 pub mod miner;
