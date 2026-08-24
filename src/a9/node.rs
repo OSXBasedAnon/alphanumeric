@@ -61,15 +61,18 @@ use crate::a9::blockchain::{
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
+use crate::a9::compact::{
+    AnnounceEntry as CompactAnnounceEntry, AnnounceStatus as CompactAnnounceStatus,
+    CompactHandlerTimer, CompactMetrics, CompactMetricsSnapshot, PackedTransactionHashes,
+    ReceivedEvidence, RelayToken,
+};
+use crate::a9::ledger::{EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger};
 use crate::a9::mldsa;
 use crate::a9::outbound::{
     AdmissionError as OutboundAdmissionError, MessageCost as OutboundMessageCost,
     OutboundScheduler, Reservation as OutboundReservation, TrafficClass,
 };
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
-use crate::a9::ledger::{
-    EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger,
-};
 
 //----------------------------------------------------------------------
 // Constants
@@ -402,6 +405,7 @@ const SOLICIT_TTL: Duration = Duration::from_secs(120);
 const SOLICITED_PEERS_MAX_ENTRIES: usize = 256;
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB hard cap per frame
 const OUTBOUND_AEAD_OVERHEAD: usize = 12 + 16; // ChaCha20-Poly1305 nonce + authentication tag
+const TCP_FRAME_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 /// Optional mesh transaction gossip is independent from the canonical TCP scheduler. It must be
 /// bounded, but saturation may only drop the additive mesh copy — never consume TCP reservations.
 const MESH_TX_OUTBOUND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
@@ -461,6 +465,10 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 /// negotiates compact transport without changing NETWORK_VERSION or the signed
 /// handshake schema. New message variants are sent only after observing it.
 const COMPACT_BLOCK_V1_CAPABILITY_SUFFIX: &str = "|a9-compact-block-v1";
+/// Version 2 is a fresh wire contract: packed/bounded hashes, bounded body
+/// requests and a 128-bit per-announcement replay token.  V1 remains decode-only
+/// so an older beta binary can never be mistaken for a V2 peer.
+const COMPACT_BLOCK_V2_CAPABILITY_SUFFIX: &str = "|a9-compact-block-v2";
 /// Capability marker for the backward-compatible transaction inventory/request
 /// transport. Old peers ignore the Ping/Pong node-id suffix and continue to
 /// receive the unchanged full `Transaction` message.
@@ -478,6 +486,10 @@ const TX_INVENTORY_CAPABILITY_TTL: Duration = Duration::from_secs(15 * 60);
 /// reliability path.  WebRTC's local-only compact hint plus ordered full-frame
 /// fallback is separate and does not consult this gate.
 const TCP_COMPACT_V1_ENABLED: bool = false;
+/// GPU-miner beta transport.  This is deliberately a build-time release gate,
+/// not a network activation or a runtime switch.  Every failure path falls back
+/// to the unchanged `NetworkMessage::Block` transport.
+const TCP_COMPACT_V2_ENABLED: bool = true;
 /// Keep a transaction-body response comfortably below the 4 MiB frame ceiling
 /// even when every entry carries a full ML-DSA witness.
 const COMPACT_TX_BATCH_MAX: usize = 64;
@@ -538,6 +550,19 @@ const COMPACT_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 /// Covers compact body resolution, the normal witness-resolution deadline, and
 /// validation headroom. A stale claim can be replaced atomically after this.
 const COMPACT_INFLIGHT_TTL: Duration = Duration::from_secs(70);
+
+/// Compact work must decide whether it needs the full block within the cadence
+/// of the next block.  State may live longer for duplicate suppression, but an
+/// unresolved delivery cannot wait through six 5-second blocks as V1 did.
+const COMPACT_V2_RECOVERY_DEADLINE: Duration = Duration::from_secs(4);
+const COMPACT_V2_BODY_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+const COMPACT_V2_EVIDENCE_TTL: Duration = Duration::from_secs(20);
+const COMPACT_V2_EVIDENCE_MAX_ENTRIES: usize = 4096;
+const COMPACT_V2_BODY_ENVELOPE_ALLOWANCE: usize = 2048;
+/// Avoid changing transport for a negligible win.  A single ML-DSA payment is
+/// ~14.6 KiB, so every non-empty normal block clears both margins comfortably.
+const COMPACT_MIN_SAVINGS_BYTES: usize = 1024;
+const COMPACT_MIN_SAVINGS_PERCENT: usize = 5;
 
 /// How long a repeating degraded-state warning stays quiet between emissions.
 /// During an outage the condition fires once per block/prep cycle (~5s), and a
@@ -1042,8 +1067,228 @@ impl CompactBlockV1 {
     }
 }
 
+/// Version-2 compact announcement used by the TCP beta transport.
+///
+/// It carries the exact consensus header fields, the block-specific coinbase,
+/// and one packed full Merkle-leaf hash per user transaction.  Full hashes are
+/// intentional: at the current 3.5 MiB block-weight ceiling ML-DSA limits a
+/// block to only a few hundred payments, making collision-free identifiers a
+/// negligible fraction of the body while avoiding short-id collision logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactBlockAnnouncementV2 {
+    pub index: u32,
+    pub previous_hash: [u8; 32],
+    pub timestamp: u64,
+    pub nonce: u64,
+    pub difficulty: u64,
+    pub hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub coinbase: Transaction,
+    /// Ordered hashes for transactions 1..N; the receiver derives transaction
+    /// zero's hash from the full coinbase above.
+    pub transaction_hashes: PackedTransactionHashes,
+    /// Sender-provided cost hints.  They never participate in validity; the
+    /// receiver clamps and uses them only to choose bodies versus full fallback.
+    pub full_block_bytes: u32,
+    pub user_transaction_bytes: u32,
+    pub relay_token: RelayToken,
+}
+
+impl CompactBlockAnnouncementV2 {
+    fn from_block(block: &Block, relay_token: RelayToken) -> Result<Self, NodeError> {
+        if block.transactions.len() <= 1 {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 is not used for coinbase-only blocks".into(),
+            ));
+        }
+        if !Node::compact_block_transport_ok(block) {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 source is not transport eligible".into(),
+            ));
+        }
+        let coinbase = block
+            .transactions
+            .first()
+            .filter(|tx| tx.sender == "MINING_REWARDS")
+            .cloned()
+            .ok_or_else(|| NodeError::InvalidBlock("compact V2 source has no coinbase".into()))?;
+        if !CompactBlockV1::coinbase_transport_size_ok(&coinbase) {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 coinbase exceeds transport limit".into(),
+            ));
+        }
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(Blockchain::calculate_merkle_leaf_hash)
+            .collect::<Result<Vec<_>, _>>()?;
+        let transaction_hashes = PackedTransactionHashes::new(transaction_hashes)
+            .map_err(|message| NodeError::InvalidBlock(message.into()))?;
+        let full_block_bytes = codec::serialize(block)?.len();
+        let user_transaction_bytes =
+            block
+                .transactions
+                .iter()
+                .skip(1)
+                .try_fold(0usize, |total, transaction| {
+                    let bytes = codec::serialize(transaction)?.len();
+                    total.checked_add(bytes).ok_or_else(|| {
+                        NodeError::Serialization("compact V2 transaction-byte sum overflow".into())
+                    })
+                })?;
+
+        let announcement = Self {
+            index: block.index,
+            previous_hash: block.previous_hash,
+            timestamp: block.timestamp,
+            nonce: block.nonce,
+            difficulty: block.difficulty,
+            hash: block.hash,
+            merkle_root: block.merkle_root,
+            coinbase,
+            transaction_hashes,
+            full_block_bytes: u32::try_from(full_block_bytes).map_err(|_| {
+                NodeError::Serialization("compact V2 full-block size exceeds u32".into())
+            })?,
+            user_transaction_bytes: u32::try_from(user_transaction_bytes).map_err(|_| {
+                NodeError::Serialization("compact V2 transaction size exceeds u32".into())
+            })?,
+            relay_token,
+        };
+        if codec::serialize(&announcement)?.len() > COMPACT_ANNOUNCEMENT_MAX_BYTES {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 announcement exceeds transport limit".into(),
+            ));
+        }
+        Ok(announcement)
+    }
+
+    fn transaction_count(&self) -> usize {
+        self.transaction_hashes.len().saturating_add(1)
+    }
+
+    /// Compare the block-defining announcement material while deliberately
+    /// excluding the per-peer token and non-authoritative cost hints.
+    fn same_block_commitment(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.previous_hash == other.previous_hash
+            && self.timestamp == other.timestamp
+            && self.nonce == other.nonce
+            && self.difficulty == other.difficulty
+            && self.hash == other.hash
+            && self.merkle_root == other.merkle_root
+            && self.coinbase == other.coinbase
+            && self.transaction_hashes == other.transaction_hashes
+    }
+
+    fn transaction_hash_at(&self, index: u16) -> Option<[u8; 32]> {
+        match index {
+            0 => Blockchain::calculate_merkle_leaf_hash(&self.coinbase).ok(),
+            index => self
+                .transaction_hashes
+                .as_slice()
+                .get(index as usize - 1)
+                .copied(),
+        }
+    }
+
+    fn header_block(&self) -> Block {
+        Block {
+            index: self.index,
+            previous_hash: self.previous_hash,
+            timestamp: self.timestamp,
+            transactions: Vec::new(),
+            nonce: self.nonce,
+            difficulty: self.difficulty,
+            hash: self.hash,
+            merkle_root: self.merkle_root,
+        }
+    }
+
+    fn ordered_leaf_hashes(&self) -> Result<Vec<[u8; 32]>, NodeError> {
+        let coinbase_hash = Blockchain::calculate_merkle_leaf_hash(&self.coinbase)?;
+        let mut leaves = Vec::with_capacity(self.transaction_count());
+        leaves.push(coinbase_hash);
+        leaves.extend_from_slice(self.transaction_hashes.as_slice());
+        Ok(leaves)
+    }
+
+    fn validate_commitment(&self) -> bool {
+        let coinbase_bytes = match Node::compact_transaction_encoded_bytes(&self.coinbase) {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+        if self.coinbase.sender != "MINING_REWARDS"
+            || self.transaction_hashes.is_empty()
+            || self.transaction_count() > MAX_BLOCK_TX_COUNT
+            || !CompactBlockV1::coinbase_transport_size_ok(&self.coinbase)
+            || self.full_block_bytes as usize <= coinbase_bytes
+            || self.full_block_bytes as usize > COMPACT_SAFE_ASSEMBLED_BYTES
+            || self.user_transaction_bytes > self.full_block_bytes
+            || (!self.transaction_hashes.is_empty() && self.user_transaction_bytes == 0)
+        {
+            return false;
+        }
+        let leaves = match self.ordered_leaf_hashes() {
+            Ok(leaves) => leaves,
+            Err(_) => return false,
+        };
+        let root = match Blockchain::calculate_merkle_root_from_leaf_hashes(&leaves) {
+            Ok(root) => root,
+            Err(_) => return false,
+        };
+        if root != self.merkle_root {
+            return false;
+        }
+        let header = self.header_block();
+        header.validate_header().is_ok() && header.verify_pow_meets_floor()
+    }
+
+    fn reconstruct(&self, transactions: Vec<Transaction>) -> Result<Block, NodeError> {
+        if transactions.len() != self.transaction_count()
+            || transactions.first() != Some(&self.coinbase)
+        {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 transaction count/coinbase mismatch".into(),
+            ));
+        }
+        let expected = self.ordered_leaf_hashes()?;
+        for (transaction, expected_hash) in transactions.iter().zip(expected) {
+            if Blockchain::calculate_merkle_leaf_hash(transaction)? != expected_hash {
+                return Err(NodeError::InvalidBlock(
+                    "compact V2 transaction commitment mismatch".into(),
+                ));
+            }
+        }
+        let block = Block {
+            index: self.index,
+            previous_hash: self.previous_hash,
+            timestamp: self.timestamp,
+            transactions,
+            nonce: self.nonce,
+            difficulty: self.difficulty,
+            hash: self.hash,
+            merkle_root: self.merkle_root,
+        };
+        if block.calculate_hash_for_block() != block.hash {
+            return Err(NodeError::InvalidBlock(
+                "compact V2 reconstructed header mismatch".into(),
+            ));
+        }
+        Ok(block)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexedCompactTransactionV1 {
+    pub index: u16,
+    pub transaction: Transaction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IndexedCompactTransactionV2 {
     pub index: u16,
     pub transaction: Transaction,
 }
@@ -1259,6 +1504,32 @@ pub enum NetworkMessage {
     },
     TransactionsV1 {
         transactions: BoundedSequence<TransactionBodyV1, TX_RELAY_BATCH_MAX>,
+    },
+    /// V2 is independent from the dormant V1 fields and is sent only after the
+    /// exact peer connection advertised `a9-compact-block-v2`.
+    CompactBlockV2(CompactBlockAnnouncementV2),
+    GetCompactTransactionsV2 {
+        block_hash: [u8; 32],
+        relay_token: RelayToken,
+        indexes: BoundedSequence<u16, COMPACT_TX_BATCH_MAX>,
+    },
+    CompactTransactionsV2 {
+        block_hash: [u8; 32],
+        relay_token: RelayToken,
+        transactions: BoundedSequence<IndexedCompactTransactionV2, COMPACT_TX_BATCH_MAX>,
+    },
+    /// Receiver -> announcer: the exact committed body was reconstructed.
+    /// Consensus acceptance is deliberately separate; another copy of the same
+    /// bytes cannot repair a consensus-invalid block.
+    CompactBlockAckV2 {
+        block_hash: [u8; 32],
+        relay_token: RelayToken,
+    },
+    /// Receiver-driven recovery.  A valid request causes one ordinary full
+    /// `Block` frame to be pushed independently; no new validity path exists.
+    CompactBlockWantFullV2 {
+        block_hash: [u8; 32],
+        relay_token: RelayToken,
     },
 }
 
@@ -1979,7 +2250,18 @@ pub struct Node {
     /// Failed or never-selected peers remain eligible on a later relay pass; this
     /// bookkeeping is independent from full-block relay and acceptance dedup.
     compact_relay_delivered: Arc<PLMutex<LruCache<[u8; 32], HashSet<SocketAddr>>>>,
-    /// Peers that advertised CompactBlockV1 over the backward-compatible ping/pong
+    /// Announced-to evidence: which peers THIS node sent a CompactBlockV2 to,
+    /// with the token each must echo. WANT_FULL is served from here and only
+    /// from here (never from the capability map), at most once per entry.
+    compact_announce_state: Arc<PLMutex<CompactAnnounceState>>,
+    /// Received-from evidence: announcements THIS node received, keyed by
+    /// (block, sender), holding the token an outbound ACK/WANT_FULL must carry.
+    /// Egress of either message is legal ONLY against an entry here — direct
+    /// per-block evidence, never the (possibly stale) capability map.
+    compact_v2_evidence: Arc<DashMap<([u8; 32], SocketAddr), ReceivedEvidence>>,
+    compact_metrics: Arc<CompactMetrics>,
+    compact_metrics_last_log: Arc<PLMutex<CompactMetricsSnapshot>>,
+    /// Peers that advertised CompactBlockV2 over the backward-compatible ping/pong
     /// capability marker. Entries expire unless refreshed by health pings.
     compact_capable_peers: Arc<DashMap<SocketAddr, Instant>>,
     /// Peers eligible for transaction inventory/request relay. Kept separate
@@ -2000,6 +2282,9 @@ pub struct Node {
     /// Recent compact announcements and exact-hash-matched transaction bodies,
     /// retained so a cut-through relay can serve or proxy downstream batch requests.
     compact_pending: Arc<PLMutex<CompactPendingCache>>,
+    /// V2 has an independent pending cache so the decode-only V1 representation
+    /// can never be confused with the active packed-hash wire contract.
+    compact_v2_pending: Arc<PLMutex<CompactPendingCacheV2>>,
     /// Recent full bodies, bounded independently. Used for missing-body replies and
     /// explicit fallback; gateway and canonical storage remain unchanged.
     compact_full_blocks: Arc<PLMutex<CompactFullBlockCache>>,
@@ -2146,9 +2431,83 @@ struct PendingCompactRoute {
 }
 
 #[derive(Debug, Clone)]
+struct PendingCompactBlockV2 {
+    announcement: CompactBlockAnnouncementV2,
+    sources: Vec<SocketAddr>,
+    transactions: HashMap<u16, Transaction>,
+    transaction_sizes: HashMap<u16, usize>,
+    assembled_bytes: usize,
+    cache_bytes: usize,
+}
+
+type CompactAnnounceState =
+    LruCache<[u8; 32], std::collections::HashMap<SocketAddr, CompactAnnounceEntry>>;
+
+#[derive(Debug, Clone)]
 struct CompactInflight {
     started: Instant,
     sources: Vec<SocketAddr>,
+}
+
+/// Atomic lease over one received announcement token.  Removing the evidence
+/// before an ACK/WANT_FULL send prevents duplicate terminal actions; if the
+/// async send is cancelled or fails, Drop restores still-fresh evidence without
+/// overwriting a newer announcement from the same peer.
+struct CompactEvidenceLease {
+    evidence: Arc<DashMap<([u8; 32], SocketAddr), ReceivedEvidence>>,
+    key: ([u8; 32], SocketAddr),
+    value: ReceivedEvidence,
+    committed: bool,
+}
+
+impl CompactEvidenceLease {
+    fn token(&self) -> RelayToken {
+        self.value.token
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CompactEvidenceLease {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.value.received_at.elapsed() <= COMPACT_V2_EVIDENCE_TTL {
+            match self.evidence.entry(self.key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(self.value);
+                }
+                Entry::Occupied(_) => {}
+            }
+        }
+    }
+}
+
+enum CompactClaimV2 {
+    Claimed {
+        started: Instant,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Duplicate,
+    Saturated,
+    NotTipExtension,
+}
+
+struct CompactInflightLease {
+    inflight: Arc<DashMap<[u8; 32], CompactInflight>>,
+    block_hash: [u8; 32],
+    started: Instant,
+}
+
+impl Drop for CompactInflightLease {
+    fn drop(&mut self) {
+        self.inflight.remove_if(&self.block_hash, |_, current| {
+            current.started == self.started
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2165,9 +2524,16 @@ struct CompactPendingCache {
 }
 
 #[derive(Debug)]
+struct CompactPendingCacheV2 {
+    entries: LruCache<[u8; 32], PendingCompactBlockV2>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
 struct CompactFullBlockEntry {
     block: Arc<Block>,
     encoded_bytes: usize,
+    verified: bool,
 }
 
 #[derive(Debug)]
@@ -2213,8 +2579,43 @@ impl CompactPendingCache {
     }
 }
 
+impl CompactPendingCacheV2 {
+    fn insert(&mut self, block_hash: [u8; 32], entry: PendingCompactBlockV2) -> bool {
+        if entry.cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || entry.cache_bytes > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+        if let Some(previous) = self.entries.pop(&block_hash) {
+            self.bytes = self.bytes.saturating_sub(previous.cache_bytes);
+        }
+        while self.bytes.saturating_add(entry.cache_bytes) > COMPACT_PENDING_CACHE_BYTE_BUDGET {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.cache_bytes);
+        }
+        if self.bytes.saturating_add(entry.cache_bytes) > COMPACT_PENDING_CACHE_BYTE_BUDGET {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(entry.cache_bytes);
+        if let Some((_, evicted)) = self.entries.push(block_hash, entry) {
+            self.bytes = self.bytes.saturating_sub(evicted.cache_bytes);
+        }
+        true
+    }
+
+    fn remove(&mut self, block_hash: &[u8; 32]) -> Option<PendingCompactBlockV2> {
+        let removed = self.entries.pop(block_hash);
+        if let Some(ref entry) = removed {
+            self.bytes = self.bytes.saturating_sub(entry.cache_bytes);
+        }
+        removed
+    }
+}
+
 impl CompactFullBlockCache {
-    fn insert(&mut self, block_hash: [u8; 32], entry: CompactFullBlockEntry) -> bool {
+    fn insert(&mut self, block_hash: [u8; 32], mut entry: CompactFullBlockEntry) -> bool {
         if entry.encoded_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
             || entry.encoded_bytes > COMPACT_FULL_CACHE_BYTE_BUDGET
         {
@@ -2223,6 +2624,12 @@ impl CompactFullBlockCache {
 
         if let Some(previous) = self.entries.pop(&block_hash) {
             self.bytes = self.bytes.saturating_sub(previous.encoded_bytes);
+            // Never attach a prior verification verdict to replacement bytes.
+            // Keep the already-verified body until another body independently
+            // reaches the verified insertion path.
+            if previous.verified && !entry.verified {
+                entry = previous;
+            }
         }
         while self.bytes.saturating_add(entry.encoded_bytes) > COMPACT_FULL_CACHE_BYTE_BUDGET {
             let Some((_, evicted)) = self.entries.pop_lru() else {
@@ -2320,6 +2727,10 @@ struct OutboundConnection {
     /// holder that observes `exchange_armed == true` must discard the
     /// connection instead of using it.
     exchange_armed: bool,
+    /// Set only by a Pong read from this exact authenticated TCP stream.  A
+    /// reconnect starts false, preventing an address-level capability cached
+    /// from an older process from authorizing a new wire variant.
+    compact_v2_negotiated: bool,
 }
 
 /// A message encoded exactly once before outbound admission. Encryption remains per attempt
@@ -2713,6 +3124,13 @@ impl Node {
             compact_relay_delivered: Arc::new(PLMutex::new(LruCache::new(
                 NonZeroUsize::new(8192).expect("nonzero"),
             ))),
+            compact_announce_state: Arc::new(PLMutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(COMPACT_PENDING_CACHE_ENTRIES.max(1))
+                    .expect("nonzero cache size"),
+            ))),
+            compact_v2_evidence: Arc::new(DashMap::new()),
+            compact_metrics: Arc::new(CompactMetrics::default()),
+            compact_metrics_last_log: Arc::new(PLMutex::new(CompactMetricsSnapshot::default())),
             compact_capable_peers: Arc::new(DashMap::new()),
             transaction_inventory_capable_peers: Arc::new(DashMap::new()),
             compact_inflight: Arc::new(DashMap::new()),
@@ -2723,6 +3141,12 @@ impl Node {
                 COMPACT_FORK_FALLBACK_CONCURRENCY,
             )),
             compact_pending: Arc::new(PLMutex::new(CompactPendingCache {
+                entries: LruCache::new(
+                    NonZeroUsize::new(COMPACT_PENDING_CACHE_ENTRIES).expect("nonzero"),
+                ),
+                bytes: 0,
+            })),
+            compact_v2_pending: Arc::new(PLMutex::new(CompactPendingCacheV2 {
                 entries: LruCache::new(
                     NonZeroUsize::new(COMPACT_PENDING_CACHE_ENTRIES).expect("nonzero"),
                 ),
@@ -11146,6 +11570,9 @@ impl Node {
         if TCP_COMPACT_V1_ENABLED {
             advertised.push_str(COMPACT_BLOCK_V1_CAPABILITY_SUFFIX);
         }
+        if TCP_COMPACT_V2_ENABLED {
+            advertised.push_str(COMPACT_BLOCK_V2_CAPABILITY_SUFFIX);
+        }
         if TX_INVENTORY_V1_ENABLED {
             advertised.push_str(TX_INVENTORY_V1_CAPABILITY_SUFFIX);
         }
@@ -11153,8 +11580,12 @@ impl Node {
     }
 
     fn observe_tcp_capabilities(&self, addr: SocketAddr, advertised_node_id: &str) {
-        if Self::advertises_compact_v1(advertised_node_id) {
+        if Self::advertises_compact_v2(advertised_node_id) {
             self.compact_capable_peers.insert(addr, Instant::now());
+        } else {
+            // A fresh Pong without V2 is authoritative for this endpoint.  Do
+            // not let an older capability observation survive a downgrade.
+            self.compact_capable_peers.remove(&addr);
         }
         if Self::advertises_transaction_inventory_v1(advertised_node_id) {
             self.transaction_inventory_capable_peers
@@ -11162,6 +11593,7 @@ impl Node {
         }
     }
 
+    #[allow(dead_code)] // V1 decode tombstone; exercised by wire-compatibility tests.
     fn advertises_compact_v1(advertised_node_id: &str) -> bool {
         if !TCP_COMPACT_V1_ENABLED {
             return false;
@@ -11169,8 +11601,17 @@ impl Node {
         Self::compact_v1_marker_well_formed(advertised_node_id)
     }
 
+    #[allow(dead_code)] // V1 decode tombstone; exercised by wire-compatibility tests.
     fn compact_v1_marker_well_formed(advertised_node_id: &str) -> bool {
         Self::capability_marker_well_formed(advertised_node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX)
+    }
+
+    fn advertises_compact_v2(advertised_node_id: &str) -> bool {
+        TCP_COMPACT_V2_ENABLED
+            && Self::capability_marker_well_formed(
+                advertised_node_id,
+                COMPACT_BLOCK_V2_CAPABILITY_SUFFIX,
+            )
     }
 
     fn advertises_transaction_inventory_v1(advertised_node_id: &str) -> bool {
@@ -11198,10 +11639,10 @@ impl Node {
     }
 
     fn tcp_compact_peer_eligible(advertised_fresh: bool) -> bool {
-        TCP_COMPACT_V1_ENABLED && advertised_fresh
+        TCP_COMPACT_V2_ENABLED && advertised_fresh
     }
 
-    fn peer_supports_compact_v1(&self, addr: SocketAddr) -> bool {
+    fn peer_supports_compact_v2(&self, addr: SocketAddr) -> bool {
         let fresh = self
             .compact_capable_peers
             .get(&addr)
@@ -11215,6 +11656,12 @@ impl Node {
             }
             false
         }
+    }
+
+    fn peer_supports_compact_v1(&self, _addr: SocketAddr) -> bool {
+        // V1 remains a decode-only tombstone.  It must never inherit V2's peer
+        // capability merely because the implementations share local caches.
+        false
     }
 
     fn peer_supports_transaction_inventory_v1(&self, addr: SocketAddr) -> bool {
@@ -11278,6 +11725,47 @@ impl Node {
     }
 
     async fn prune_runtime_maps(&self) {
+        self.prune_compact_evidence();
+        // Per-node soak counters: one line only when something moved.  Include
+        // byte outcomes and reconstruction time so beta success is measurable,
+        // not inferred from the absence of errors.
+        let snapshot = self.compact_metrics.snapshot();
+        {
+            let mut previous = self.compact_metrics_last_log.lock();
+            if snapshot != *previous {
+                let average_micros = snapshot
+                    .reconstruction_micros
+                    .checked_div(snapshot.reconstructed.max(1))
+                    .unwrap_or(0);
+                let handler_average_micros = snapshot
+                    .handler_micros
+                    .checked_div(snapshot.handler_frames.max(1))
+                    .unwrap_or(0);
+                info!(
+                    "compact-v2: announced={} reconstructed={} missing_requests={} want_full_sent={} want_full_served={} fallback_received={} acks={} saturated={} invalid={} announcement_bytes={} v2_wire_bytes={} avoided_full_bytes={} fallback_bytes={} reconstruct_avg_us={} reconstruct_max_us={} handler_frames={} handler_avg_us={} handler_max_us={}",
+                    snapshot.announced,
+                    snapshot.reconstructed,
+                    snapshot.missing_requests,
+                    snapshot.want_full_sent,
+                    snapshot.want_full_served,
+                    snapshot.fallback_full_received,
+                    snapshot.ack_received,
+                    snapshot.saturated,
+                    snapshot.invalid,
+                    snapshot.compact_bytes_sent,
+                    snapshot.v2_wire_bytes_sent,
+                    snapshot.full_bytes_avoided,
+                    snapshot.fallback_bytes_sent,
+                    average_micros,
+                    snapshot.reconstruction_micros_max,
+                    snapshot.handler_frames,
+                    handler_average_micros,
+                    snapshot.handler_micros_max,
+                );
+                *previous = snapshot;
+            }
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -11783,6 +12271,7 @@ impl Node {
             last_used: Instant::now(),
             last_used_wall: SystemTime::now(),
             exchange_armed: false,
+            compact_v2_negotiated: false,
         }));
         let max_pool_size = (self
             .max_connections
@@ -11822,6 +12311,19 @@ impl Node {
             NetworkMessage::CompactBlockV1(compact) => {
                 (TrafficClass::Block, compact.transaction_hashes.len())
             }
+            NetworkMessage::CompactBlockV2(compact) => {
+                (TrafficClass::Block, compact.transaction_count())
+            }
+            NetworkMessage::GetCompactTransactionsV2 { indexes, .. } => {
+                (TrafficClass::Block, indexes.as_slice().len())
+            }
+            NetworkMessage::CompactTransactionsV2 { transactions, .. } => {
+                (TrafficClass::Block, transactions.as_slice().len())
+            }
+            // Control messages: one unit of block-class work each. ACK retires a
+            // tracked delivery; WANT_FULL authorizes one full-block push.
+            NetworkMessage::CompactBlockAckV2 { .. }
+            | NetworkMessage::CompactBlockWantFullV2 { .. } => (TrafficClass::Block, 1),
             NetworkMessage::HeaderVerification { .. } => (TrafficClass::Block, 1),
             NetworkMessage::Shred(_) => (TrafficClass::Block, 1),
             NetworkMessage::ShredRequest(ShredRequestType::Missing { indices, .. }) => {
@@ -11924,6 +12426,20 @@ impl Node {
         })
     }
 
+    fn note_compact_v2_wire_sent(&self, message: &NetworkMessage, encrypted_payload_bytes: usize) {
+        if Self::is_tcp_compact_v2_extension(message) {
+            self.compact_metrics.v2_wire_bytes_sent.fetch_add(
+                u64::try_from(encrypted_payload_bytes.saturating_add(TCP_FRAME_PREFIX_BYTES))
+                    .unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn prepared_tcp_frame_bytes(prepared: &PreparedOutboundMessage) -> usize {
+        prepared.cost.bytes.saturating_add(TCP_FRAME_PREFIX_BYTES)
+    }
+
     fn outbound_admission_error(error: OutboundAdmissionError) -> NodeError {
         let detail = error.to_string();
         match error {
@@ -11986,7 +12502,9 @@ impl Node {
             Duration::from_secs(8)
         };
 
-        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(message) {
+        if (!TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_v1_extension(message))
+            || (!TCP_COMPACT_V2_ENABLED && Self::is_tcp_compact_v2_extension(message))
+        {
             return Err(NodeError::Network(
                 "TCP compact transport is disabled".to_string(),
             ));
@@ -12031,6 +12549,14 @@ impl Node {
                 drop(dispatch);
                 continue;
             }
+            if Self::is_tcp_compact_v2_extension(message) && !stream_guard.compact_v2_negotiated {
+                drop(stream_guard);
+                drop(dispatch);
+                return Err(NodeError::Retryable(format!(
+                    "peer {} has not negotiated compact V2 on this connection",
+                    addr
+                )));
+            }
             stream_guard.exchange_armed = true;
             let result: Result<NetworkMessage, NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
@@ -12055,6 +12581,7 @@ impl Node {
                 })
                 .await
                 .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))??;
+                self.note_compact_v2_wire_sent(message, data.len());
 
                 let mut len_bytes = [0u8; 4];
                 tokio::time::timeout(
@@ -12086,6 +12613,13 @@ impl Node {
                 Ok(response)
             }
             .await;
+            if matches!(message, NetworkMessage::Ping { .. }) {
+                stream_guard.compact_v2_negotiated = matches!(
+                    &result,
+                    Ok(NetworkMessage::Pong { node_id, .. })
+                        if Self::advertises_compact_v2(node_id)
+                );
+            }
             // The exchange future COMPLETED (was not cancelled): the socket is either
             // clean (Ok) or about to be evicted (Err) — safe to disarm either way.
             stream_guard.exchange_armed = false;
@@ -12251,16 +12785,24 @@ impl Node {
             }
         };
 
+        // ML-DSA is CPU-bound. Run the whole resolved batch on Tokio's blocking
+        // pool, acquiring the chain's read side there, so a full compact block
+        // cannot pin an async runtime worker for hundreds of signatures. Return
+        // only plain data/bools: BlockchainError is intentionally not Send.
+        let blockchain = Arc::clone(&self.blockchain);
+        let (signatures_ok, resolved) = tokio::task::spawn_blocking(move || {
+            let blockchain = blockchain.blocking_read();
+            let valid = resolved
+                .iter()
+                .all(|transaction| blockchain.verify_transaction_signature(transaction).is_ok());
+            (valid, resolved)
+        })
+        .await
+        .map_err(|error| NodeError::Network(format!("ML-DSA validation worker failed: {error}")))?;
+        if !signatures_ok {
+            return Ok(false);
+        }
         for full_tx in &resolved {
-            let signature_ok = {
-                let blockchain = self.blockchain.read().await;
-                blockchain.verify_transaction_signature(full_tx).is_ok()
-            };
-
-            if !signature_ok {
-                return Ok(false);
-            }
-
             // Signature verified — safe to memoize so a sibling or later block carrying the same
             // transaction resolves it without another fetch. This is the only path that writes the
             // witness cache, which is precisely what lets the read side trust a cached entry.
@@ -12649,7 +13191,12 @@ impl Node {
     }
 
     fn remember_compact_full_block(&self, block: Arc<Block>, verified: bool) -> bool {
-        if !Self::compact_block_transport_ok(&block) {
+        if !Self::compact_block_transport_ok(&block)
+            || block.calculate_hash_for_block() != block.hash
+            || Blockchain::calculate_merkle_root(&block.transactions)
+                .map(|root| root != block.merkle_root)
+                .unwrap_or(true)
+        {
             return false;
         }
         let Some(encoded_bytes) = codec::serialize(block.as_ref())
@@ -12663,6 +13210,7 @@ impl Node {
             CompactFullBlockEntry {
                 block: Arc::clone(&block),
                 encoded_bytes,
+                verified,
             },
         );
         if verified {
@@ -12725,6 +13273,225 @@ impl Node {
                 cache_bytes,
             },
         )
+    }
+
+    fn remember_pending_compact_v2(
+        &self,
+        announcement: CompactBlockAnnouncementV2,
+        source: SocketAddr,
+    ) -> bool {
+        let mut pending = self.compact_v2_pending.lock();
+        if let Some(existing) = pending.entries.get_mut(&announcement.hash) {
+            if !existing.announcement.same_block_commitment(&announcement) {
+                return false;
+            }
+            if !existing.sources.contains(&source) {
+                if existing.sources.len() >= COMPACT_SOURCE_MAX {
+                    return false;
+                }
+                existing.sources.push(source);
+            }
+            return true;
+        }
+
+        let Some(announcement_bytes) = codec::serialize(&announcement)
+            .ok()
+            .map(|encoded| encoded.len())
+        else {
+            return false;
+        };
+        let Some(coinbase_bytes) = Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+        else {
+            return false;
+        };
+        let Some(cache_bytes) = announcement_bytes.checked_add(coinbase_bytes) else {
+            return false;
+        };
+        if announcement_bytes > COMPACT_ANNOUNCEMENT_MAX_BYTES
+            || coinbase_bytes > COMPACT_COINBASE_MAX_ENCODED_BYTES
+            || cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+        {
+            return false;
+        }
+
+        let mut transactions = HashMap::new();
+        transactions.insert(0, announcement.coinbase.clone());
+        let mut transaction_sizes = HashMap::new();
+        transaction_sizes.insert(0, coinbase_bytes);
+        let block_hash = announcement.hash;
+        pending.insert(
+            block_hash,
+            PendingCompactBlockV2 {
+                announcement,
+                sources: vec![source],
+                transactions,
+                transaction_sizes,
+                assembled_bytes: coinbase_bytes,
+                cache_bytes,
+            },
+        )
+    }
+
+    fn compact_sources_v2(&self, block_hash: &[u8; 32], primary: SocketAddr) -> Vec<SocketAddr> {
+        let mut sources = vec![primary];
+        if let Some(inflight) = self.compact_inflight.get(block_hash) {
+            for source in &inflight.sources {
+                Self::add_compact_source(&mut sources, *source);
+            }
+        }
+        if let Some(pending) = self.compact_v2_pending.lock().entries.peek(block_hash) {
+            for source in &pending.sources {
+                Self::add_compact_source(&mut sources, *source);
+            }
+        }
+        sources.retain(|source| {
+            self.compact_v2_evidence_token(block_hash, *source)
+                .is_some()
+        });
+        sources
+    }
+
+    fn cache_pending_compact_transaction_v2(
+        &self,
+        block_hash: &[u8; 32],
+        index: u16,
+        transaction: &Transaction,
+    ) -> bool {
+        if index == 0 || !Self::compact_transaction_has_full_bound_witness(transaction) {
+            return false;
+        }
+        let Some(encoded_bytes) = Self::compact_transaction_encoded_bytes(transaction) else {
+            return false;
+        };
+        if encoded_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+            return false;
+        }
+
+        let mut pending = self.compact_v2_pending.lock();
+        let Some((expected_hash, previous_bytes, old_assembled, old_cache_bytes)) =
+            pending.entries.peek(block_hash).and_then(|entry| {
+                entry
+                    .announcement
+                    .transaction_hash_at(index)
+                    .map(|expected| {
+                        (
+                            expected,
+                            entry.transaction_sizes.get(&index).copied().unwrap_or(0),
+                            entry.assembled_bytes,
+                            entry.cache_bytes,
+                        )
+                    })
+            })
+        else {
+            return false;
+        };
+        if !Blockchain::calculate_merkle_leaf_hash(transaction)
+            .map(|leaf| leaf == expected_hash)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        let new_assembled = old_assembled
+            .saturating_sub(previous_bytes)
+            .saturating_add(encoded_bytes);
+        let new_cache_bytes = old_cache_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(encoded_bytes);
+        let new_total_cache = pending
+            .bytes
+            .saturating_sub(old_cache_bytes)
+            .saturating_add(new_cache_bytes);
+        if new_assembled > COMPACT_SAFE_ASSEMBLED_BYTES
+            || new_cache_bytes > COMPACT_SAFE_ASSEMBLED_BYTES
+            || new_total_cache > COMPACT_PENDING_CACHE_BYTE_BUDGET
+        {
+            return false;
+        }
+
+        pending.bytes = new_total_cache;
+        let Some(entry) = pending.entries.get_mut(block_hash) else {
+            return false;
+        };
+        entry.assembled_bytes = new_assembled;
+        entry.cache_bytes = new_cache_bytes;
+        entry.transaction_sizes.insert(index, encoded_bytes);
+        entry.transactions.insert(index, transaction.clone());
+        true
+    }
+
+    /// Return only transaction bodies whose witness provenance is already
+    /// trusted locally. Leaf-matched bodies learned from another compact peer
+    /// stay useful to this node's reconstruction but are never proxied onward.
+    fn verified_compact_transactions_v2(
+        &self,
+        block_hash: &[u8; 32],
+        indexes: &[u16],
+    ) -> Vec<IndexedCompactTransactionV2> {
+        if let Some(block) = self
+            .compact_full_blocks
+            .lock()
+            .entries
+            .get(block_hash)
+            .and_then(|entry| entry.verified.then(|| Arc::clone(&entry.block)))
+        {
+            return indexes
+                .iter()
+                .filter_map(|index| {
+                    block
+                        .transactions
+                        .get(*index as usize)
+                        .cloned()
+                        .map(|transaction| IndexedCompactTransactionV2 {
+                            index: *index,
+                            transaction,
+                        })
+                })
+                .collect();
+        }
+
+        let announcement = self
+            .compact_v2_pending
+            .lock()
+            .entries
+            .peek(block_hash)
+            .map(|entry| entry.announcement.clone());
+        let Some(announcement) = announcement else {
+            return Vec::new();
+        };
+        indexes
+            .iter()
+            .filter_map(|index| {
+                announcement
+                    .transaction_hash_at(*index)
+                    .and_then(|leaf| self.lookup_verified_compact_transaction(&leaf))
+                    .map(|transaction| IndexedCompactTransactionV2 {
+                        index: *index,
+                        transaction,
+                    })
+            })
+            .collect()
+    }
+
+    fn pending_compact_transactions_v2(
+        &self,
+        block_hash: &[u8; 32],
+    ) -> Vec<IndexedCompactTransactionV2> {
+        self.compact_v2_pending
+            .lock()
+            .entries
+            .peek(block_hash)
+            .map(|entry| {
+                entry
+                    .transactions
+                    .iter()
+                    .map(|(index, transaction)| IndexedCompactTransactionV2 {
+                        index: *index,
+                        transaction: transaction.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn compact_sources(&self, block_hash: &[u8; 32], primary: SocketAddr) -> Vec<SocketAddr> {
@@ -13067,6 +13834,171 @@ impl Node {
         Ok(bounded)
     }
 
+    async fn request_compact_transaction_batch_v2(
+        &self,
+        addr: SocketAddr,
+        announcement: &CompactBlockAnnouncementV2,
+        indexes: Vec<u16>,
+        request_timeout: Duration,
+    ) -> Result<Vec<IndexedCompactTransactionV2>, NodeError> {
+        if indexes.is_empty() || indexes.len() > COMPACT_TX_BATCH_MAX {
+            return Err(NodeError::Network(
+                "Invalid compact V2 transaction request batch".into(),
+            ));
+        }
+        let requested: HashSet<u16> = indexes.iter().copied().collect();
+        if requested.len() != indexes.len()
+            || indexes
+                .iter()
+                .any(|index| *index == 0 || *index as usize >= announcement.transaction_count())
+        {
+            return Err(NodeError::Network(
+                "Invalid compact V2 transaction request index".into(),
+            ));
+        }
+        let relay_token = self
+            .compact_v2_evidence_token(&announcement.hash, addr)
+            .ok_or_else(|| {
+                NodeError::Retryable("No live compact V2 evidence for body request".into())
+            })?;
+        let request = NetworkMessage::GetCompactTransactionsV2 {
+            block_hash: announcement.hash,
+            relay_token,
+            indexes: BoundedSequence::new(indexes)
+                .map_err(|message| NodeError::Network(message.into()))?,
+        };
+        self.compact_metrics
+            .missing_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let response =
+            tokio::time::timeout(request_timeout.min(COMPACT_V2_RECOVERY_DEADLINE), async {
+                self.send_compact_v2_with_response(addr, &request).await
+            })
+            .await
+            .map_err(|_| NodeError::Timeout("Compact V2 transaction request timed out".into()))??;
+        let response_bytes = Self::prepare_outbound_message(&response)?.cost.bytes;
+        match response {
+            NetworkMessage::CompactTransactionsV2 {
+                block_hash,
+                relay_token: response_token,
+                transactions,
+            } if block_hash == announcement.hash && response_token == relay_token => {
+                let transactions = transactions.into_inner();
+                let mut seen = HashSet::with_capacity(transactions.len());
+                let valid = response_bytes <= COMPACT_RESPONSE_MAX_BYTES
+                    && transactions.iter().all(|item| {
+                        requested.contains(&item.index)
+                            && seen.insert(item.index)
+                            && Self::compact_transaction_has_full_bound_witness(&item.transaction)
+                            && Self::compact_transaction_encoded_bytes(&item.transaction)
+                                .is_some_and(|bytes| bytes <= COMPACT_TRANSACTION_MAX_ENCODED_BYTES)
+                            && announcement
+                                .transaction_hash_at(item.index)
+                                .and_then(|expected| {
+                                    Blockchain::calculate_merkle_leaf_hash(&item.transaction)
+                                        .ok()
+                                        .map(|actual| actual == expected)
+                                })
+                                .unwrap_or(false)
+                    });
+                if valid {
+                    Ok(transactions)
+                } else {
+                    self.record_peer_failure(addr).await;
+                    Err(NodeError::Network(
+                        "Invalid compact V2 transaction response".into(),
+                    ))
+                }
+            }
+            _ => {
+                self.record_peer_failure(addr).await;
+                Err(NodeError::Network(
+                    "Unexpected compact V2 transaction response".into(),
+                ))
+            }
+        }
+    }
+
+    fn serve_compact_transactions_v2(
+        &self,
+        requester: SocketAddr,
+        block_hash: [u8; 32],
+        relay_token: RelayToken,
+        indexes: BoundedSequence<u16, COMPACT_TX_BATCH_MAX>,
+    ) -> Result<BoundedSequence<IndexedCompactTransactionV2, COMPACT_TX_BATCH_MAX>, NodeError> {
+        let indexes = indexes.into_inner();
+        if indexes.is_empty() {
+            return Err(NodeError::Network(
+                "Empty compact V2 transaction request".into(),
+            ));
+        }
+        let requested: HashSet<u16> = indexes.iter().copied().collect();
+        if requested.len() != indexes.len()
+            || indexes
+                .iter()
+                .any(|index| *index == 0 || *index as usize >= MAX_BLOCK_TX_COUNT)
+        {
+            return Err(NodeError::Network(
+                "Invalid compact V2 transaction request index".into(),
+            ));
+        }
+        let rate_key = format!("compact_v2_tx_body:{}", requester);
+        let rate_cost = 1usize.saturating_add(indexes.len().div_ceil(16));
+        if !(0..rate_cost).all(|_| self.rate_limiter.check_limit(&rate_key)) {
+            return Err(NodeError::Network(
+                "Compact V2 transaction request rate limited".into(),
+            ));
+        }
+        if !self.admit_compact_body_request(&block_hash, requester, relay_token) {
+            return Err(NodeError::Network(
+                "Uncorrelated or repeated compact V2 transaction request".into(),
+            ));
+        }
+
+        let mut found = self.verified_compact_transactions_v2(&block_hash, &indexes);
+        found.sort_unstable_by_key(|item| item.index);
+        found.retain(|item| {
+            Self::compact_transaction_encoded_bytes(&item.transaction)
+                .is_some_and(|bytes| bytes <= COMPACT_TRANSACTION_MAX_ENCODED_BYTES)
+        });
+
+        // First apply a conservative additive bound, then verify the exact
+        // message bytes. The exact loop normally executes once; popping handles
+        // codec overhead changes without ever asking the writer to discover an
+        // oversized response after request admission.
+        let mut estimated = COMPACT_V2_BODY_ENVELOPE_ALLOWANCE;
+        found.retain(|item| {
+            let Some(item_bytes) = codec::serialize(item).ok().map(|bytes| bytes.len()) else {
+                return false;
+            };
+            let Some(next) = estimated.checked_add(item_bytes) else {
+                return false;
+            };
+            if next > COMPACT_RESPONSE_MAX_BYTES {
+                return false;
+            }
+            estimated = next;
+            true
+        });
+        loop {
+            let bounded = BoundedSequence::new(found.clone())
+                .map_err(|message| NodeError::Network(message.into()))?;
+            let candidate = NetworkMessage::CompactTransactionsV2 {
+                block_hash,
+                relay_token,
+                transactions: bounded.clone(),
+            };
+            if Self::prepare_outbound_message(&candidate)?.cost.bytes <= COMPACT_RESPONSE_MAX_BYTES
+            {
+                return Ok(bounded);
+            }
+            if found.pop().is_none() {
+                return BoundedSequence::new(Vec::new())
+                    .map_err(|message| NodeError::Network(message.into()));
+            }
+        }
+    }
+
     async fn request_compact_full_block(
         &self,
         addr: SocketAddr,
@@ -13209,6 +14141,263 @@ impl Node {
             .enumerate()
             .filter_map(|(idx, tx)| tx.is_none().then_some(idx as u16))
             .collect()
+    }
+
+    fn apply_compact_body_v2(
+        announcement: &CompactBlockAnnouncementV2,
+        transactions: &mut [Option<Transaction>],
+        assembled_bytes: &mut usize,
+        item: IndexedCompactTransactionV2,
+    ) -> Result<bool, NodeError> {
+        let idx = item.index as usize;
+        if item.index == 0 || idx >= transactions.len() || transactions[idx].is_some() {
+            return Ok(false);
+        }
+        if !Self::compact_transaction_has_full_bound_witness(&item.transaction) {
+            return Ok(false);
+        }
+        let Some(encoded_bytes) = Self::compact_transaction_encoded_bytes(&item.transaction) else {
+            return Ok(false);
+        };
+        if encoded_bytes > COMPACT_TRANSACTION_MAX_ENCODED_BYTES {
+            return Err(NodeError::Network(
+                "Compact V2 transaction body exceeds transport limit".into(),
+            ));
+        }
+        if !announcement
+            .transaction_hash_at(item.index)
+            .and_then(|expected| {
+                Blockchain::calculate_merkle_leaf_hash(&item.transaction)
+                    .ok()
+                    .map(|actual| actual == expected)
+            })
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let Some(next_bytes) = assembled_bytes.checked_add(encoded_bytes) else {
+            return Err(NodeError::Network(
+                "Compact V2 transaction assembly overflow".into(),
+            ));
+        };
+        if next_bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
+            return Err(NodeError::Network(
+                "Compact V2 transaction assembly exceeds transport limit".into(),
+            ));
+        }
+        *assembled_bytes = next_bytes;
+        transactions[idx] = Some(item.transaction);
+        Ok(true)
+    }
+
+    /// Compare the estimated missing-body response against the unchanged full
+    /// block. Cost hints are bounded transport hints, never validity inputs; an
+    /// exact response byte cap still protects the wire if a peer lies.
+    fn compact_v2_body_request_is_efficient(
+        announcement: &CompactBlockAnnouncementV2,
+        transactions: &[Option<Transaction>],
+    ) -> bool {
+        let missing = Self::missing_compact_indexes(transactions);
+        if missing.is_empty() {
+            return true;
+        }
+        if missing.len() > COMPACT_TX_BATCH_MAX || missing.contains(&0) {
+            return false;
+        }
+        let known_user_bytes = transactions
+            .iter()
+            .skip(1)
+            .filter_map(Option::as_ref)
+            .try_fold(0usize, |total, transaction| {
+                Self::compact_transaction_encoded_bytes(transaction)
+                    .and_then(|bytes| total.checked_add(bytes))
+            });
+        let Some(known_user_bytes) = known_user_bytes else {
+            return false;
+        };
+        let advertised_user_bytes = announcement.user_transaction_bytes as usize;
+        if known_user_bytes > advertised_user_bytes {
+            return false;
+        }
+        let estimated_response = advertised_user_bytes
+            .saturating_sub(known_user_bytes)
+            .saturating_add(COMPACT_V2_BODY_ENVELOPE_ALLOWANCE)
+            .saturating_add(missing.len().saturating_mul(8));
+        if estimated_response > COMPACT_RESPONSE_MAX_BYTES {
+            return false;
+        }
+        let full_bytes = announcement.full_block_bytes as usize;
+        let savings = full_bytes.saturating_sub(estimated_response);
+        savings >= COMPACT_MIN_SAVINGS_BYTES
+            && savings.saturating_mul(100) >= full_bytes.saturating_mul(COMPACT_MIN_SAVINGS_PERCENT)
+    }
+
+    async fn request_compact_v2_full_from_sources(
+        &self,
+        block_hash: [u8; 32],
+        primary_source: SocketAddr,
+        deadline: Instant,
+    ) -> bool {
+        for source in self.compact_sources_v2(&block_hash, primary_source) {
+            let Some(remaining) = Self::compact_deadline_remaining(deadline) else {
+                return false;
+            };
+            match tokio::time::timeout(
+                remaining,
+                self.send_compact_want_full_v2(block_hash, source),
+            )
+            .await
+            {
+                Ok(true) => return true,
+                Ok(false) | Err(_) => continue,
+            }
+        }
+        false
+    }
+
+    async fn reconstruct_compact_block_v2(
+        &self,
+        announcement: &CompactBlockAnnouncementV2,
+        primary_source: SocketAddr,
+    ) -> Result<Option<(Block, SocketAddr)>, NodeError> {
+        let deadline = Instant::now() + COMPACT_V2_RECOVERY_DEADLINE;
+        let mut transactions: Vec<Option<Transaction>> =
+            vec![None; announcement.transaction_count()];
+        transactions[0] = Some(announcement.coinbase.clone());
+        let mut assembled_bytes =
+            Self::compact_transaction_encoded_bytes(&announcement.coinbase)
+                .ok_or_else(|| NodeError::Network("Compact V2 coinbase encoding failed".into()))?;
+        if assembled_bytes > COMPACT_SAFE_ASSEMBLED_BYTES {
+            return Ok(None);
+        }
+
+        // Prefer locally verified witnesses, then reuse exact-leaf-matched bodies
+        // retained from an earlier attempt. Both still pass normal block-level
+        // ML-DSA validation before acceptance.
+        for (offset, leaf) in announcement
+            .transaction_hashes
+            .as_slice()
+            .iter()
+            .enumerate()
+        {
+            if let Some(transaction) = self.lookup_verified_compact_transaction(leaf) {
+                let item = IndexedCompactTransactionV2 {
+                    index: (offset + 1) as u16,
+                    transaction,
+                };
+                let _ = Self::apply_compact_body_v2(
+                    announcement,
+                    &mut transactions,
+                    &mut assembled_bytes,
+                    item,
+                )?;
+            }
+        }
+        for item in self.pending_compact_transactions_v2(&announcement.hash) {
+            let _ = Self::apply_compact_body_v2(
+                announcement,
+                &mut transactions,
+                &mut assembled_bytes,
+                item,
+            )?;
+        }
+
+        let mut witness_source = primary_source;
+        if transactions.iter().any(Option::is_none) {
+            if !Self::compact_v2_body_request_is_efficient(announcement, &transactions) {
+                self.request_compact_v2_full_from_sources(
+                    announcement.hash,
+                    primary_source,
+                    deadline,
+                )
+                .await;
+                return Ok(None);
+            }
+
+            let mut attempted = HashSet::new();
+            loop {
+                let missing = Self::missing_compact_indexes(&transactions);
+                if missing.is_empty() {
+                    break;
+                }
+                let source = self
+                    .compact_sources_v2(&announcement.hash, primary_source)
+                    .into_iter()
+                    .find(|source| attempted.insert(*source));
+                let Some(source) = source else {
+                    break;
+                };
+                let Some(remaining) = Self::compact_deadline_remaining(deadline) else {
+                    break;
+                };
+                let request_timeout = remaining.min(COMPACT_V2_BODY_REQUEST_DEADLINE);
+                let response = match self
+                    .request_compact_transaction_batch_v2(
+                        source,
+                        announcement,
+                        missing,
+                        request_timeout,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        debug!(
+                            "Compact V2 body request for block {} from {} failed: {}",
+                            announcement.index, source, error
+                        );
+                        continue;
+                    }
+                };
+                let mut applied = false;
+                for item in response {
+                    let index = item.index;
+                    if Self::apply_compact_body_v2(
+                        announcement,
+                        &mut transactions,
+                        &mut assembled_bytes,
+                        item,
+                    )? {
+                        if let Some(transaction) =
+                            transactions.get(index as usize).and_then(Option::as_ref)
+                        {
+                            self.cache_pending_compact_transaction_v2(
+                                &announcement.hash,
+                                index,
+                                transaction,
+                            );
+                        }
+                        applied = true;
+                    }
+                }
+                if applied {
+                    witness_source = source;
+                }
+                if transactions.iter().any(Option::is_none)
+                    && !Self::compact_v2_body_request_is_efficient(announcement, &transactions)
+                {
+                    break;
+                }
+            }
+        }
+
+        if transactions.iter().any(Option::is_none) {
+            self.request_compact_v2_full_from_sources(announcement.hash, primary_source, deadline)
+                .await;
+            return Ok(None);
+        }
+
+        let complete = transactions
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                NodeError::InvalidBlock("compact V2 reconstruction incomplete".into())
+            })?;
+        let block = announcement.reconstruct(complete)?;
+        if !Self::compact_block_transport_ok(&block) {
+            return Ok(None);
+        }
+        Ok(Some((block, witness_source)))
     }
 
     fn compact_deadline_remaining(deadline: Instant) -> Option<Duration> {
@@ -13376,6 +14565,137 @@ impl Node {
             return Ok(None);
         }
         Ok(Some((block, witness_source)))
+    }
+
+    async fn process_compact_block_v2(
+        &self,
+        announcement: CompactBlockAnnouncementV2,
+        primary_source: SocketAddr,
+        events: mpsc::Sender<NetworkEvent>,
+    ) -> Result<(), NodeError> {
+        let reconstruction_started = Instant::now();
+        let Some((block, witness_source)) = self
+            .reconstruct_compact_block_v2(&announcement, primary_source)
+            .await?
+        else {
+            debug!(
+                "Compact V2 block {} switched to ordinary full-block recovery",
+                announcement.index
+            );
+            return Ok(());
+        };
+        self.compact_metrics.observe_reconstruction(
+            reconstruction_started
+                .elapsed()
+                .as_micros()
+                .min(u64::MAX as u128) as u64,
+        );
+        let relay_sources: HashSet<_> = self
+            .compact_sources_v2(&block.hash, primary_source)
+            .into_iter()
+            .collect();
+
+        // ACK means the exact committed body was reconstructed; consensus and
+        // persistence remain independent. Another copy of identical bytes cannot
+        // fix an invalid signature or a local database failure, so acknowledge
+        // promptly without placing reverse-connection latency on validation.
+        let ack_node = self.clone();
+        let reconstructed_hash = block.hash;
+        spawn_logged("compact-v2-ack", async move {
+            let _ = ack_node
+                .send_compact_ack_v2(reconstructed_hash, witness_source)
+                .await;
+        });
+
+        let bloom_hit = self.network_bloom.check(&block.hash);
+        if bloom_hit {
+            let exact = self
+                .canonical_block_hash_matches(block.index, &block.hash)
+                .await;
+            if Self::block_dedup_should_skip(bloom_hit, exact) {
+                self.compact_v2_pending.lock().remove(&block.hash);
+                return Ok(());
+            }
+        }
+
+        let block = Arc::new(block);
+        self.remember_compact_full_block(Arc::clone(&block), false);
+        if !self
+            .verify_block_with_witness(&block, Some(witness_source))
+            .await?
+        {
+            self.compact_metrics.invalid.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        self.blockchain.write().await.save_block(&block).await?;
+        self.network_bloom.insert(&block.hash);
+        self.remember_compact_full_block(Arc::clone(&block), true);
+        self.compact_v2_pending.lock().remove(&block.hash);
+        self.publish_discovery_state("Accepted compact V2 block")
+            .await;
+        events
+            .send(NetworkEvent::NewBlock(Arc::clone(&block)))
+            .await
+            .map_err(|error| {
+                NodeError::Network(format!("Failed to send compact V2 block event: {error}"))
+            })?;
+
+        if self.claim_relay(&block.hash) {
+            let selected_peers = {
+                let peers = self.peers.read().await;
+                self.select_broadcast_peers(&peers, peers.len().min(16))
+            }
+            .into_iter()
+            .filter(|peer| !relay_sources.contains(peer))
+            .collect();
+            if let Err(error) = self
+                .broadcast_block(Arc::clone(&block), None, selected_peers, true)
+                .await
+            {
+                warn!("Post-accept compact V2 propagation failed: {}", error);
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_compact_v2_full_recovery(&self, block_hash: [u8; 32], source: SocketAddr) {
+        let started = Instant::now();
+        let Some(started) =
+            Self::claim_compact_inflight_in(&self.compact_inflight, block_hash, source, started)
+        else {
+            return;
+        };
+        let permit = match Arc::clone(&self.compact_fork_fallback_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.compact_inflight
+                    .remove_if(&block_hash, |_, current| current.started == started);
+                self.compact_metrics
+                    .saturated
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let node = self.clone();
+        spawn_logged("compact-v2-full-recovery", async move {
+            let _permit = permit;
+            let _inflight = CompactInflightLease {
+                inflight: Arc::clone(&node.compact_inflight),
+                block_hash,
+                started,
+            };
+            let deadline = Instant::now() + COMPACT_V2_RECOVERY_DEADLINE;
+            if !node
+                .request_compact_v2_full_from_sources(block_hash, source, deadline)
+                .await
+            {
+                debug!(
+                    "Compact V2 ordinary full recovery for {} could not be requested",
+                    hex::encode(block_hash)
+                );
+            }
+        });
     }
 
     async fn process_compact_block(
@@ -13621,6 +14941,52 @@ impl Node {
     ) -> Option<(Instant, tokio::sync::OwnedSemaphorePermit)> {
         let parent = self.blockchain.read().await.get_last_block()?;
         Self::try_claim_compact_reconstruction_in(
+            compact,
+            &parent,
+            &self.compact_inflight,
+            &self.compact_reconstruction_slots,
+            source,
+            Instant::now(),
+        )
+    }
+
+    fn try_claim_compact_reconstruction_v2_in(
+        compact: &CompactBlockAnnouncementV2,
+        parent: &Block,
+        inflight: &Arc<DashMap<[u8; 32], CompactInflight>>,
+        slots: &Arc<Semaphore>,
+        source: SocketAddr,
+        started: Instant,
+    ) -> CompactClaimV2 {
+        if !Self::compact_v2_header_extends_parent(compact, parent) {
+            return CompactClaimV2::NotTipExtension;
+        }
+        let Some(claimed) =
+            Self::claim_compact_inflight_in(inflight.as_ref(), compact.hash, source, started)
+        else {
+            return CompactClaimV2::Duplicate;
+        };
+        match Arc::clone(slots).try_acquire_owned() {
+            Ok(permit) => CompactClaimV2::Claimed {
+                started: claimed,
+                permit,
+            },
+            Err(_) => {
+                inflight.remove_if(&compact.hash, |_, current| current.started == claimed);
+                CompactClaimV2::Saturated
+            }
+        }
+    }
+
+    async fn try_claim_compact_reconstruction_v2(
+        &self,
+        compact: &CompactBlockAnnouncementV2,
+        source: SocketAddr,
+    ) -> CompactClaimV2 {
+        let Some(parent) = self.blockchain.read().await.get_last_block() else {
+            return CompactClaimV2::NotTipExtension;
+        };
+        Self::try_claim_compact_reconstruction_v2_in(
             compact,
             &parent,
             &self.compact_inflight,
@@ -13909,7 +15275,9 @@ impl Node {
         if !self.outbound_scheduler.is_enabled()
             && !matches!(
                 message,
-                NetworkMessage::Block(_) | NetworkMessage::CompactBlockV1(_)
+                NetworkMessage::Block(_)
+                    | NetworkMessage::CompactBlockV1(_)
+                    | NetworkMessage::CompactBlockV2(_)
             )
         {
             let rate_key = format!("send_to_{}", addr);
@@ -13939,7 +15307,9 @@ impl Node {
         const TIMEOUT: Duration = Duration::from_secs(5);
         const MAX_ATTEMPTS: u32 = 2;
 
-        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(message) {
+        if (!TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_v1_extension(message))
+            || (!TCP_COMPACT_V2_ENABLED && Self::is_tcp_compact_v2_extension(message))
+        {
             return Err(NodeError::Network(
                 "TCP compact transport is disabled".to_string(),
             ));
@@ -13981,6 +15351,14 @@ impl Node {
                 drop(dispatch);
                 continue;
             }
+            if Self::is_tcp_compact_v2_extension(message) && !stream_guard.compact_v2_negotiated {
+                drop(stream_guard);
+                drop(dispatch);
+                return Err(NodeError::Retryable(format!(
+                    "peer {} has not negotiated compact V2 on this connection",
+                    addr
+                )));
+            }
             stream_guard.exchange_armed = true;
             let result: Result<(), NodeError> = async {
                 let shared_secret = stream_guard.shared_secret.clone();
@@ -14005,7 +15383,9 @@ impl Node {
                 })
                 .await
                 .map_err(|_| NodeError::Network(format!("Send timeout to {}", addr)))?
-                .map_err(NodeError::from)
+                .map_err(NodeError::from)?;
+                self.note_compact_v2_wire_sent(message, data.len());
+                Ok(())
             }
             .await;
             // Completed (not cancelled): the frame either went out whole (Ok) or the
@@ -14152,13 +15532,20 @@ impl Node {
             }
 
             NetworkEvent::NewBlock(block) => {
-                // A bloom hit is read-only until validation succeeds.  Event
-                // sources include best-effort transports, so a transient permit
-                // or witness miss must not poison the hash and suppress a later
-                // unchanged full-block delivery.
+                // A Bloom hit is only a hint until exact canonical storage
+                // confirms it. Event sources include best-effort transports, so
+                // neither a false positive nor a transient validation miss may
+                // suppress a later unchanged full-block delivery.
                 let block_hash = block.calculate_hash_for_block();
-                if !Self::event_block_should_validate(&self.network_bloom, &block_hash) {
-                    return Ok(());
+                let bloom_hit =
+                    !Self::event_block_should_validate(&self.network_bloom, &block_hash);
+                if bloom_hit {
+                    let exact = self
+                        .canonical_block_hash_matches(block.index, &block_hash)
+                        .await;
+                    if Self::block_dedup_should_skip(bloom_hit, exact) {
+                        return Ok(());
+                    }
                 }
 
                 // Verify block before processing
@@ -14399,6 +15786,21 @@ impl Node {
         !network_bloom.check(block_hash)
     }
 
+    fn block_dedup_should_skip(bloom_hit: bool, exact_canonical_match: bool) -> bool {
+        // A Bloom hit is only a fast hint. False positives must never suppress
+        // the first delivery of a valid block or an ordinary compact fallback.
+        bloom_hit && exact_canonical_match
+    }
+
+    async fn canonical_block_hash_matches(&self, index: u32, hash: &[u8; 32]) -> bool {
+        self.blockchain
+            .read()
+            .await
+            .get_block(index)
+            .map(|block| block.hash == *hash)
+            .unwrap_or(false)
+    }
+
     fn commit_validated_event_block(network_bloom: &NetworkBloom, block_hash: &[u8; 32]) {
         let _ = network_bloom.insert(block_hash);
     }
@@ -14420,7 +15822,14 @@ impl Node {
         // Fail closed before dedup, rate accounting, cache access, reconstruction,
         // proxying, or response generation.  The extension variants remain
         // decodable for wire compatibility, but are inert in this release.
-        if !TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_extension(&message) {
+        if (!TCP_COMPACT_V1_ENABLED && Self::is_tcp_compact_v1_extension(&message))
+            || (!TCP_COMPACT_V2_ENABLED && Self::is_tcp_compact_v2_extension(&message))
+        {
+            return Ok(None);
+        }
+        if Self::is_tcp_compact_v2_extension(&message) && !self.peer_supports_compact_v2(addr) {
+            // Inbound V2 is legal only after this peer advertised V2.  The
+            // announcement itself is never allowed to manufacture capability.
             return Ok(None);
         }
         if Self::is_transaction_inventory_extension(&message)
@@ -14432,11 +15841,13 @@ impl Node {
             return Ok(None);
         }
 
-        // Deduplicate non-transaction gossip only. Transactions use the exact full-witness
-        // accepted/in-flight cache in their match arm below: a probabilistic Bloom hit must never
-        // suppress a first valid payment. Requests/responses must always be processed, otherwise
-        // one peer's GetBlocks/Ping/TxRequest can suppress another peer's identical request. Hash
-        // the CANONICAL re-serialization rather than wire bytes for the remaining gossip classes.
+        // Deduplicate only gossip classes for which a probabilistic false positive
+        // is harmless. Transactions use exact full-witness admission, and blocks
+        // require an exact canonical height/hash check in their ingress path; a
+        // shared Bloom must never suppress either first delivery. Requests and
+        // responses must always be processed, otherwise one peer's identical
+        // request can suppress another's. Hash the canonical re-serialization
+        // rather than wire bytes for the remaining gossip classes.
         if Self::should_dedup_message(&message) {
             let canonical = codec::serialize(&message)
                 .map_err(|_| NodeError::Network("Failed to serialize message".into()))?;
@@ -14812,6 +16223,162 @@ impl Node {
                 // Correlated fallback responses are consumed synchronously.
             }
 
+            NetworkMessage::CompactBlockV2(compact) => {
+                if raw.len()
+                    > COMPACT_ANNOUNCEMENT_MAX_BYTES
+                        .saturating_add(COMPACT_V2_BODY_ENVELOPE_ALLOWANCE)
+                    || !compact.validate_commitment()
+                {
+                    self.compact_metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                    return Err(NodeError::Network(
+                        "Invalid compact V2 block commitment".into(),
+                    ));
+                }
+                if !self.record_compact_v2_evidence(compact.hash, addr, compact.relay_token) {
+                    return Ok(None);
+                }
+
+                let bloom_hit = self.network_bloom.check(&compact.hash);
+                if bloom_hit {
+                    let exact = self
+                        .canonical_block_hash_matches(compact.index, &compact.hash)
+                        .await;
+                    if Self::block_dedup_should_skip(bloom_hit, exact) {
+                        let node = self.clone();
+                        let block_hash = compact.hash;
+                        spawn_logged("compact-v2-known-ack", async move {
+                            let _ = node.send_compact_ack_v2(block_hash, addr).await;
+                        });
+                        return Ok(None);
+                    }
+                }
+                if !self.remember_pending_compact_v2(compact.clone(), addr) {
+                    self.compact_v2_evidence.remove(&(compact.hash, addr));
+                    return Ok(None);
+                }
+
+                match self.compact_v2_ingress_route(&compact).await {
+                    CompactIngressRoute::ReconstructLocalTip => {
+                        match self
+                            .try_claim_compact_reconstruction_v2(&compact, addr)
+                            .await
+                        {
+                            CompactClaimV2::Claimed { started, permit } => {
+                                let node = self.clone();
+                                let events = tx.clone();
+                                let block_hash = compact.hash;
+                                spawn_logged("compact-v2-reconstruction", async move {
+                                    let _permit = permit;
+                                    let _inflight = CompactInflightLease {
+                                        inflight: Arc::clone(&node.compact_inflight),
+                                        block_hash,
+                                        started,
+                                    };
+                                    if let Err(error) =
+                                        node.process_compact_block_v2(compact, addr, events).await
+                                    {
+                                        warn!(
+                                            "Compact V2 block reconstruction from {} failed: {}",
+                                            addr, error
+                                        );
+                                    }
+                                });
+                            }
+                            CompactClaimV2::Duplicate => {}
+                            CompactClaimV2::Saturated => {
+                                self.compact_metrics
+                                    .saturated
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.spawn_compact_v2_full_recovery(compact.hash, addr);
+                            }
+                            CompactClaimV2::NotTipExtension => {
+                                if self.compact_v2_ingress_route(&compact).await
+                                    == CompactIngressRoute::FetchFullCompetitor
+                                {
+                                    self.spawn_compact_v2_full_recovery(compact.hash, addr);
+                                }
+                            }
+                        }
+                    }
+                    CompactIngressRoute::FetchFullCompetitor => {
+                        self.spawn_compact_v2_full_recovery(compact.hash, addr);
+                    }
+                    CompactIngressRoute::DeferToChainSync => {
+                        debug!(
+                            "Deferring compact V2 block {} to ordered chain sync",
+                            compact.index
+                        );
+                    }
+                }
+            }
+
+            NetworkMessage::GetCompactTransactionsV2 {
+                block_hash,
+                relay_token,
+                indexes,
+            } => {
+                let transactions =
+                    self.serve_compact_transactions_v2(addr, block_hash, relay_token, indexes)?;
+                return Ok(Some(NetworkMessage::CompactTransactionsV2 {
+                    block_hash,
+                    relay_token,
+                    transactions,
+                }));
+            }
+
+            NetworkMessage::CompactTransactionsV2 { .. } => {
+                // Correlated responses are consumed by the exact outbound
+                // request. Unsolicited bodies never enter reconstruction state.
+            }
+
+            NetworkMessage::CompactBlockAckV2 {
+                block_hash,
+                relay_token,
+            } => {
+                if self.consume_compact_ack(&block_hash, addr, relay_token) {
+                    self.compact_metrics
+                        .ack_received
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            NetworkMessage::CompactBlockWantFullV2 {
+                block_hash,
+                relay_token,
+            } => {
+                let full = self
+                    .compact_full_blocks
+                    .lock()
+                    .entries
+                    .get(&block_hash)
+                    .and_then(|entry| entry.verified.then(|| Arc::clone(&entry.block)));
+                if let Some(block) = full {
+                    if self.admit_compact_want_full(&block_hash, addr, relay_token) {
+                        let node = self.clone();
+                        spawn_logged("compact-v2-full-push", async move {
+                            let message = NetworkMessage::Block((*block).clone());
+                            let Ok(prepared) = Self::prepare_outbound_message(&message) else {
+                                return;
+                            };
+                            if node
+                                .send_prepared_outbound_message(addr, &message, &prepared)
+                                .await
+                                .is_ok()
+                            {
+                                node.compact_metrics
+                                    .want_full_served
+                                    .fetch_add(1, Ordering::Relaxed);
+                                node.compact_metrics.fallback_bytes_sent.fetch_add(
+                                    u64::try_from(Self::prepared_tcp_frame_bytes(&prepared))
+                                        .unwrap_or(u64::MAX),
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+
             NetworkMessage::Block(block) => {
                 let block_ref = Arc::new(block);
 
@@ -14829,8 +16396,21 @@ impl Node {
                 // witness would be dropped here, permanently suppressing a recoverable block.
                 // Truly-invalid blocks are still cheap to reject (the PoW-floor gate above and
                 // verify's internal negative-cache). Same rationale as the mesh ingest path.
-                if self.network_bloom.check(&block_hash) {
-                    return Ok(None);
+                let bloom_hit = self.network_bloom.check(&block_hash);
+                if block_ref.hash == block_hash && bloom_hit {
+                    let exact = self
+                        .canonical_block_hash_matches(block_ref.index, &block_hash)
+                        .await;
+                    if Self::block_dedup_should_skip(bloom_hit, exact) {
+                        if Self::compact_block_transport_ok(&block_ref)
+                            && Blockchain::calculate_merkle_root(&block_ref.transactions)
+                                .map(|root| root == block_ref.merkle_root)
+                                .unwrap_or(false)
+                        {
+                            self.note_compact_v2_full_received(&block_hash);
+                        }
+                        return Ok(None);
+                    }
                 }
 
                 // EARLY PROPAGATION, always ahead of the save lock:
@@ -14961,6 +16541,7 @@ impl Node {
                     // call — documented directly above as a safe no-op.
                     self.network_bloom.insert(&block_hash);
                     self.remember_compact_full_block(Arc::clone(&block_ref), true);
+                    self.note_compact_v2_full_received(&block_hash);
                     self.publish_discovery_state("Accepted block").await;
 
                     // Send network event
@@ -15274,7 +16855,7 @@ impl Node {
         Ok(None)
     }
 
-    fn is_tcp_compact_extension(message: &NetworkMessage) -> bool {
+    fn is_tcp_compact_v1_extension(message: &NetworkMessage) -> bool {
         matches!(
             message,
             NetworkMessage::CompactBlockV1(_)
@@ -15283,6 +16864,21 @@ impl Node {
                 | NetworkMessage::GetCompactBlockV1 { .. }
                 | NetworkMessage::CompactBlockResponseV1 { .. }
         )
+    }
+
+    fn is_tcp_compact_v2_extension(message: &NetworkMessage) -> bool {
+        matches!(
+            message,
+            NetworkMessage::CompactBlockV2(_)
+                | NetworkMessage::GetCompactTransactionsV2 { .. }
+                | NetworkMessage::CompactTransactionsV2 { .. }
+                | NetworkMessage::CompactBlockAckV2 { .. }
+                | NetworkMessage::CompactBlockWantFullV2 { .. }
+        )
+    }
+
+    fn is_tcp_compact_extension(message: &NetworkMessage) -> bool {
+        Self::is_tcp_compact_v1_extension(message) || Self::is_tcp_compact_v2_extension(message)
     }
 
     fn is_transaction_inventory_extension(message: &NetworkMessage) -> bool {
@@ -15297,8 +16893,7 @@ impl Node {
     fn should_dedup_message(message: &NetworkMessage) -> bool {
         matches!(
             message,
-            NetworkMessage::Block(_)
-                | NetworkMessage::AlertMessage(_)
+            NetworkMessage::AlertMessage(_)
                 | NetworkMessage::HeaderVerification { .. }
                 | NetworkMessage::HeaderSync { .. }
                 | NetworkMessage::MldsaKeyRegistration { .. }
@@ -16101,6 +17696,387 @@ impl Node {
         Ok((compact_frame, full_frame))
     }
 
+    /// Mint a CSPRNG-backed per-(block, peer) V2 replay token.
+    fn new_compact_relay_token() -> Result<RelayToken, NodeError> {
+        RelayToken::random().map_err(|error| {
+            NodeError::Network(format!("compact relay token generation failed: {error}"))
+        })
+    }
+
+    /// Record that WE announced `block_hash` to `peer` under `token`.
+    fn record_compact_announce(&self, block_hash: [u8; 32], peer: SocketAddr, token: RelayToken) {
+        let mut state = self.compact_announce_state.lock();
+        let entry = CompactAnnounceEntry {
+            token,
+            status: CompactAnnounceStatus::Pending,
+            body_served: false,
+            announced_at: Instant::now(),
+        };
+        match state.get_mut(&block_hash) {
+            Some(map) => {
+                map.insert(peer, entry);
+            }
+            None => {
+                let mut map = std::collections::HashMap::new();
+                map.insert(peer, entry);
+                state.put(block_hash, map);
+            }
+        }
+    }
+
+    fn cancel_compact_announce(&self, block_hash: &[u8; 32], peer: SocketAddr, token: RelayToken) {
+        let mut state = self.compact_announce_state.lock();
+        let remove_block = if let Some(map) = state.get_mut(block_hash) {
+            if map.get(&peer).is_some_and(|entry| entry.token == token) {
+                map.remove(&peer);
+            }
+            map.is_empty()
+        } else {
+            false
+        };
+        if remove_block {
+            state.pop(block_hash);
+        }
+    }
+
+    fn admit_compact_body_request(
+        &self,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+        token: RelayToken,
+    ) -> bool {
+        let mut state = self.compact_announce_state.lock();
+        let Some(entry) = state.get_mut(block_hash).and_then(|map| map.get_mut(&peer)) else {
+            return false;
+        };
+        Self::consume_compact_body_authorization(entry, token)
+    }
+
+    fn consume_compact_body_authorization(
+        entry: &mut CompactAnnounceEntry,
+        token: RelayToken,
+    ) -> bool {
+        if entry.token != token
+            || entry.status != CompactAnnounceStatus::Pending
+            || entry.body_served
+            || entry.announced_at.elapsed() > COMPACT_INFLIGHT_TTL
+        {
+            return false;
+        }
+        entry.body_served = true;
+        true
+    }
+
+    /// ACK bookkeeping: returns true only for the FIRST valid (token-matching)
+    /// ACK from a peer we actually announced to. Everything else is ignored.
+    fn transition_compact_announce(
+        entry: &mut CompactAnnounceEntry,
+        token: RelayToken,
+        next: CompactAnnounceStatus,
+    ) -> bool {
+        if entry.token != token || entry.status != CompactAnnounceStatus::Pending {
+            return false;
+        }
+        entry.status = next;
+        true
+    }
+
+    fn consume_compact_ack(
+        &self,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+        token: RelayToken,
+    ) -> bool {
+        let mut state = self.compact_announce_state.lock();
+        let Some(map) = state.get_mut(block_hash) else {
+            return false;
+        };
+        let Some(entry) = map.get_mut(&peer) else {
+            return false;
+        };
+        Self::transition_compact_announce(entry, token, CompactAnnounceStatus::Acked)
+    }
+
+    /// WANT_FULL admission: true at most ONCE per (block, peer), only against a
+    /// real announcement with a matching token. This is the single-shot gate
+    /// that keeps "push me the full block" from becoming a bandwidth amplifier
+    /// — without it, the per-peer rate budget alone would still permit hundreds
+    /// of megabytes per minute of full-block service to one malicious peer.
+    fn admit_compact_want_full(
+        &self,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+        token: RelayToken,
+    ) -> bool {
+        let mut state = self.compact_announce_state.lock();
+        let Some(map) = state.get_mut(block_hash) else {
+            return false;
+        };
+        let Some(entry) = map.get_mut(&peer) else {
+            return false;
+        };
+        Self::transition_compact_announce(entry, token, CompactAnnounceStatus::FullServed)
+    }
+
+    /// Record an announcement RECEIVED from `peer`, enabling exactly one
+    /// evidence-bound ACK/WANT_FULL back toward it.
+    fn record_compact_v2_evidence(
+        &self,
+        block_hash: [u8; 32],
+        peer: SocketAddr,
+        token: RelayToken,
+    ) -> bool {
+        let key = (block_hash, peer);
+        if self.compact_v2_evidence.len() >= COMPACT_V2_EVIDENCE_MAX_ENTRIES
+            && !self.compact_v2_evidence.contains_key(&key)
+        {
+            self.compact_v2_evidence
+                .retain(|_, evidence| evidence.received_at.elapsed() <= COMPACT_V2_EVIDENCE_TTL);
+            if self.compact_v2_evidence.len() >= COMPACT_V2_EVIDENCE_MAX_ENTRIES {
+                self.compact_metrics
+                    .saturated
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        self.compact_v2_evidence.insert(
+            key,
+            ReceivedEvidence {
+                token,
+                received_at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    fn compact_v2_evidence_token(
+        &self,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+    ) -> Option<RelayToken> {
+        self.compact_v2_evidence
+            .get(&(*block_hash, peer))
+            .filter(|entry| entry.received_at.elapsed() <= COMPACT_V2_EVIDENCE_TTL)
+            .map(|entry| entry.token)
+    }
+
+    /// Lease received evidence for one terminal ACK/WANT_FULL action. A failed
+    /// or cancelled send restores the evidence in Drop; success commits it.
+    fn take_compact_v2_evidence(
+        &self,
+        block_hash: &[u8; 32],
+        peer: SocketAddr,
+    ) -> Option<CompactEvidenceLease> {
+        let key = (*block_hash, peer);
+        let (_, value) = self.compact_v2_evidence.remove(&key)?;
+        if value.received_at.elapsed() > COMPACT_V2_EVIDENCE_TTL {
+            return None;
+        }
+        Some(CompactEvidenceLease {
+            evidence: Arc::clone(&self.compact_v2_evidence),
+            key,
+            value,
+            committed: false,
+        })
+    }
+
+    fn clear_compact_v2_received_state(&self, block_hash: &[u8; 32]) -> bool {
+        let pending = self.compact_v2_pending.lock().remove(block_hash).is_some();
+        let keys: Vec<_> = self
+            .compact_v2_evidence
+            .iter()
+            .filter_map(|entry| (entry.key().0 == *block_hash).then_some(*entry.key()))
+            .collect();
+        let evidence = !keys.is_empty();
+        for key in keys {
+            self.compact_v2_evidence.remove(&key);
+        }
+        pending || evidence
+    }
+
+    fn note_compact_v2_full_received(&self, block_hash: &[u8; 32]) {
+        if self.clear_compact_v2_received_state(block_hash) {
+            self.compact_metrics
+                .fallback_full_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn compact_v2_connection_is_negotiated(&self, peer: SocketAddr) -> bool {
+        let connection = self.outbound_connections.read().await.get(&peer).cloned();
+        let Some(connection) = connection else {
+            return false;
+        };
+        let negotiated = connection.lock().await.compact_v2_negotiated;
+        negotiated
+    }
+
+    /// The address-level capability cache selects peers; this exact-stream check
+    /// prevents a reconnect from inheriting an older process/connection's wire
+    /// negotiation. Ping is already backward compatible and marks only the
+    /// pooled stream that returned the matching Pong.
+    async fn ensure_compact_v2_connection(&self, peer: SocketAddr) -> Result<(), NodeError> {
+        if !self.peer_supports_compact_v2(peer) {
+            return Err(NodeError::Retryable(format!(
+                "peer {} has no fresh compact V2 capability",
+                peer
+            )));
+        }
+        if self.compact_v2_connection_is_negotiated(peer).await {
+            return Ok(());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let response = self
+            .send_message_with_response(
+                peer,
+                &NetworkMessage::Ping {
+                    timestamp: now,
+                    node_id: self.capability_node_id(),
+                },
+            )
+            .await?;
+        let NetworkMessage::Pong { node_id, .. } = response else {
+            return Err(NodeError::Network(format!(
+                "peer {} returned a non-Pong during compact negotiation",
+                peer
+            )));
+        };
+        self.observe_tcp_capabilities(peer, &node_id);
+        if !Self::advertises_compact_v2(&node_id)
+            || !self.compact_v2_connection_is_negotiated(peer).await
+        {
+            return Err(NodeError::Retryable(format!(
+                "peer {} did not negotiate compact V2",
+                peer
+            )));
+        }
+        Ok(())
+    }
+
+    async fn send_compact_v2_prepared(
+        &self,
+        peer: SocketAddr,
+        message: &NetworkMessage,
+        prepared: &PreparedOutboundMessage,
+    ) -> Result<(), NodeError> {
+        self.ensure_compact_v2_connection(peer).await?;
+        match self
+            .send_prepared_outbound_message(peer, message, prepared)
+            .await
+        {
+            Err(NodeError::Retryable(_)) => {
+                // A reconnect can race the check above. Negotiate the replacement
+                // stream and retry the already-serialized frame once.
+                self.ensure_compact_v2_connection(peer).await?;
+                self.send_prepared_outbound_message(peer, message, prepared)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_compact_v2_with_response(
+        &self,
+        peer: SocketAddr,
+        message: &NetworkMessage,
+    ) -> Result<NetworkMessage, NodeError> {
+        self.ensure_compact_v2_connection(peer).await?;
+        match self.send_message_with_response(peer, message).await {
+            Err(NodeError::Retryable(_)) => {
+                // The pooled stream can be replaced between negotiation and
+                // dispatch. Bind the replacement with a fresh Ping and retry
+                // once; no frame was written before this Retryable verdict.
+                self.ensure_compact_v2_connection(peer).await?;
+                self.send_message_with_response(peer, message).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_compact_ack_v2(&self, block_hash: [u8; 32], peer: SocketAddr) -> bool {
+        let Some(lease) = self.take_compact_v2_evidence(&block_hash, peer) else {
+            return false;
+        };
+        let message = NetworkMessage::CompactBlockAckV2 {
+            block_hash,
+            relay_token: lease.token(),
+        };
+        let result = async {
+            let prepared = Self::prepare_outbound_message(&message)?;
+            self.send_compact_v2_prepared(peer, &message, &prepared)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                lease.commit();
+                true
+            }
+            Err(error) => {
+                debug!("Compact V2 ACK to {} failed: {}", peer, error);
+                false
+            }
+        }
+    }
+
+    async fn send_compact_want_full_v2(&self, block_hash: [u8; 32], peer: SocketAddr) -> bool {
+        let Some(lease) = self.take_compact_v2_evidence(&block_hash, peer) else {
+            return false;
+        };
+        let message = NetworkMessage::CompactBlockWantFullV2 {
+            block_hash,
+            relay_token: lease.token(),
+        };
+        let result = async {
+            let prepared = Self::prepare_outbound_message(&message)?;
+            self.send_compact_v2_prepared(peer, &message, &prepared)
+                .await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                lease.commit();
+                self.compact_metrics
+                    .want_full_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(error) => {
+                debug!(
+                    "Compact V2 full fallback request to {} failed: {}",
+                    peer, error
+                );
+                false
+            }
+        }
+    }
+
+    /// TTL sweep for the evidence maps, driven by prune_runtime_maps. The
+    /// announce-state LRU is size-bounded already. No timer-driven full-block
+    /// transmission exists; only an authenticated WANT_FULL can authorize one.
+    fn prune_compact_evidence(&self) {
+        self.compact_v2_evidence
+            .retain(|_, evidence| evidence.received_at.elapsed() <= COMPACT_V2_EVIDENCE_TTL);
+
+        let mut state = self.compact_announce_state.lock();
+        let stale_blocks: Vec<[u8; 32]> = state
+            .iter()
+            .filter_map(|(block_hash, peers)| {
+                peers
+                    .values()
+                    .all(|entry| entry.announced_at.elapsed() > COMPACT_INFLIGHT_TTL)
+                    .then_some(*block_hash)
+            })
+            .collect();
+        for block_hash in stale_blocks {
+            state.pop(&block_hash);
+        }
+    }
+
     fn compact_targets_not_delivered(
         &self,
         block_hash: &[u8; 32],
@@ -16146,6 +18122,47 @@ impl Node {
             return false;
         };
         Self::compact_header_extends_parent(compact, &parent)
+    }
+
+    fn compact_v2_header_extends_parent(
+        compact: &CompactBlockAnnouncementV2,
+        parent: &Block,
+    ) -> bool {
+        if compact.index != parent.index.saturating_add(1)
+            || compact.previous_hash != parent.hash
+            || compact.timestamp < parent.timestamp
+        {
+            return false;
+        }
+        let expected_difficulty = Block::consensus_next_difficulty(
+            parent.difficulty,
+            compact.timestamp.saturating_sub(parent.timestamp),
+            compact.index,
+        );
+        compact.difficulty == expected_difficulty
+    }
+
+    fn compact_v2_ingress_route_against_tip(
+        compact: &CompactBlockAnnouncementV2,
+        tip: &Block,
+    ) -> CompactIngressRoute {
+        if Self::compact_v2_header_extends_parent(compact, tip) {
+            CompactIngressRoute::ReconstructLocalTip
+        } else if compact.index == tip.index || compact.index == tip.index.saturating_add(1) {
+            CompactIngressRoute::FetchFullCompetitor
+        } else {
+            CompactIngressRoute::DeferToChainSync
+        }
+    }
+
+    async fn compact_v2_ingress_route(
+        &self,
+        compact: &CompactBlockAnnouncementV2,
+    ) -> CompactIngressRoute {
+        let Some(tip) = self.blockchain.read().await.get_last_block() else {
+            return CompactIngressRoute::DeferToChainSync;
+        };
+        Self::compact_v2_ingress_route_against_tip(compact, &tip)
     }
 
     fn compact_ingress_route_against_tip(
@@ -16284,6 +18301,20 @@ impl Node {
                 .unwrap_or(false)
     }
 
+    fn compact_v2_wire_is_worthwhile(
+        transaction_count: usize,
+        full_wire_bytes: usize,
+        compact_wire_bytes: usize,
+    ) -> bool {
+        if transaction_count <= 1 {
+            return false;
+        }
+        let savings = full_wire_bytes.saturating_sub(compact_wire_bytes);
+        savings >= COMPACT_MIN_SAVINGS_BYTES
+            && savings.saturating_mul(100)
+                >= full_wire_bytes.saturating_mul(COMPACT_MIN_SAVINGS_PERCENT)
+    }
+
     async fn broadcast_block(
         &self,
         block: Arc<Block>,
@@ -16311,88 +18342,135 @@ impl Node {
             return Ok(0);
         }
 
-        // Snapshot each peer's capability exactly once. Besides avoiding a
-        // duplicate lookup, this prevents a simultaneous ping refresh from
-        // placing a peer in neither partition (or both).
-        let mut compact_targets = Vec::new();
-        let mut full_targets = Vec::new();
-        for addr in targets {
-            if self.peer_supports_compact_v1(addr) {
-                compact_targets.push(addr);
-            } else {
-                full_targets.push(addr);
-            }
-        }
-
-        let compact = (!compact_targets.is_empty())
-            .then(|| CompactBlockV1::from_block(&block).ok())
-            .flatten()
-            .map(Arc::new);
-
-        // If compact construction ever fails, preserve delivery by treating all
-        // targets as traditional full-block peers. Successful compact delivery is
-        // tracked per target; peers not actually reached remain eligible on every
-        // later relay pass.
-        let mut sends: Vec<(SocketAddr, bool)> =
-            full_targets.into_iter().map(|peer| (peer, false)).collect();
-        if compact.is_some() {
-            sends.extend(
-                self.compact_targets_not_delivered(&block.hash, compact_targets)
-                    .into_iter()
-                    .map(|peer| (peer, true)),
-            );
-        } else {
-            sends.extend(compact_targets.into_iter().map(|peer| (peer, false)));
-        }
-        if sends.is_empty() {
-            return Ok(0);
-        }
-
         // Full block bytes are identical for every target and compact fallback. Keep one canonical
         // transport object and one encoded plaintext behind Arcs; encryption remains per peer so
         // nonce/key isolation is unchanged. This removes up to ten simultaneous deep block clones
         // and MessagePack encodes from the broadcast hot path.
         let full_message = Arc::new(NetworkMessage::Block((*block).clone()));
         let full_prepared = Arc::new(Self::prepare_outbound_message(&full_message)?);
-        let compact_transport = compact
+
+        // Construct V2 only when there is at least one negotiated target and at
+        // least one user transaction. Coinbase-only blocks deliberately retain
+        // the ordinary full path: there is no large body to avoid transmitting.
+        let compact_capable_targets: HashSet<_> = targets
+            .iter()
+            .copied()
+            .filter(|peer| self.peer_supports_compact_v2(*peer))
+            .collect();
+        let compact_template =
+            if block.transactions.len() > 1 && !compact_capable_targets.is_empty() {
+                // The template is never sent. The fixed-width placeholder makes
+                // its exact wire-cost identical to every per-peer random token.
+                CompactBlockAnnouncementV2::from_block(
+                    &block,
+                    RelayToken([0; crate::a9::compact::RELAY_TOKEN_BYTES]),
+                )
+                .ok()
+                .and_then(|announcement| {
+                    let message = NetworkMessage::CompactBlockV2(announcement.clone());
+                    let prepared = Self::prepare_outbound_message(&message).ok()?;
+                    let worthwhile = Self::compact_v2_wire_is_worthwhile(
+                        block.transactions.len(),
+                        Self::prepared_tcp_frame_bytes(&full_prepared),
+                        Self::prepared_tcp_frame_bytes(&prepared),
+                    );
+                    worthwhile.then_some(announcement)
+                })
+            } else {
+                None
+            };
+
+        let compact_targets: HashSet<_> = compact_template
             .as_ref()
-            .map(|compact| {
-                let message = Arc::new(NetworkMessage::CompactBlockV1((**compact).clone()));
-                Self::prepare_outbound_message(&message)
-                    .map(|prepared| (message, Arc::new(prepared)))
+            .map(|_| {
+                self.compact_targets_not_delivered(
+                    &block.hash,
+                    compact_capable_targets.iter().copied(),
+                )
+                .into_iter()
+                .collect()
             })
-            .transpose()?;
+            .unwrap_or_default();
+
+        // `None` means ordinary full delivery. A compact tuple contains a
+        // per-peer token and exact prepared bytes; fixed-width binary token
+        // encoding guarantees every token has the same gate result while still
+        // preventing cross-peer replay.
+        let mut sends = Vec::with_capacity(targets.len());
+        for peer in targets {
+            if let Some(template) = compact_template
+                .as_ref()
+                .filter(|_| compact_targets.contains(&peer))
+            {
+                let token = match Self::new_compact_relay_token() {
+                    Ok(token) => token,
+                    Err(error) => {
+                        warn!(
+                            "Compact token generation failed for {}; using ordinary full block: {}",
+                            peer, error
+                        );
+                        sends.push((peer, None));
+                        continue;
+                    }
+                };
+                let mut announcement = template.clone();
+                announcement.relay_token = token;
+                let message = Arc::new(NetworkMessage::CompactBlockV2(announcement));
+                match Self::prepare_outbound_message(&message) {
+                    Ok(prepared) => sends.push((peer, Some((message, Arc::new(prepared), token)))),
+                    Err(_) => sends.push((peer, None)),
+                }
+            } else if compact_template.is_none() || !compact_capable_targets.contains(&peer) {
+                sends.push((peer, None));
+            }
+            // A target that already received this compact announcement is
+            // intentionally omitted rather than receiving a duplicate full body.
+        }
+        if sends.is_empty() {
+            return Ok(0);
+        }
 
         const MAX_CONCURRENT: usize = 10;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
-        let broadcast_futures = sends.into_iter().map(|(peer, use_compact)| {
+        let broadcast_futures = sends.into_iter().map(|(peer, compact_transport)| {
             let full_message = Arc::clone(&full_message);
             let full_prepared = Arc::clone(&full_prepared);
-            let compact_transport = compact_transport.clone();
             let permit = semaphore.clone().acquire_owned();
             let node = self.clone();
+            let block_hash = block.hash;
 
             async move {
-                let result = async {
+                let outcome: Result<bool, NodeError> = async {
                     let _permit = permit.await.map_err(|e| {
                         NodeError::Network(format!("Broadcast semaphore acquisition failed: {}", e))
                     })?;
-                    if use_compact {
-                        let (compact_message, compact_prepared) =
-                            compact_transport.ok_or_else(|| {
-                                NodeError::Network("Compact broadcast body unavailable".into())
-                            })?;
+                    if let Some((compact_message, compact_prepared, token)) = compact_transport {
+                        node.record_compact_announce(block_hash, peer, token);
                         match node
-                            .send_prepared_outbound_message(
-                                peer,
-                                &compact_message,
-                                &compact_prepared,
-                            )
+                            .send_compact_v2_prepared(peer, &compact_message, &compact_prepared)
                             .await
                         {
-                            Ok(()) => Ok(()),
+                            Ok(()) => {
+                                node.compact_metrics
+                                    .announced
+                                    .fetch_add(1, Ordering::Relaxed);
+                                node.compact_metrics.compact_bytes_sent.fetch_add(
+                                    u64::try_from(Self::prepared_tcp_frame_bytes(
+                                        &compact_prepared,
+                                    ))
+                                    .unwrap_or(u64::MAX),
+                                    Ordering::Relaxed,
+                                );
+                                node.compact_metrics.full_bytes_avoided.fetch_add(
+                                    u64::try_from(Self::prepared_tcp_frame_bytes(&full_prepared))
+                                        .unwrap_or(u64::MAX),
+                                    Ordering::Relaxed,
+                                );
+                                Ok(true)
+                            }
                             Err(compact_error) => {
+                                node.cancel_compact_announce(&block_hash, peer, token);
                                 node.compact_capable_peers.remove(&peer);
                                 debug!(
                                     "Compact broadcast to {} failed ({}); retrying full block",
@@ -16403,16 +18481,19 @@ impl Node {
                                     &full_message,
                                     &full_prepared,
                                 )
-                                .await
+                                .await?;
+                                Ok(false)
                             }
                         }
                     } else {
                         node.send_prepared_outbound_message(peer, &full_message, &full_prepared)
-                            .await
+                            .await?;
+                        Ok(false)
                     }
                 }
                 .await;
-                (peer, use_compact, result)
+                let compact_delivered = matches!(outcome, Ok(true));
+                (peer, compact_delivered, outcome.map(|_| ()))
             }
         });
 
@@ -16561,6 +18642,7 @@ impl Node {
             })
             .await
             .map_err(|_| NodeError::Network(format!("Response write timed out to {}", peer)))??;
+            self.note_compact_v2_wire_sent(message, data.len());
             Ok(())
         }
         .await;
@@ -16742,6 +18824,12 @@ impl Node {
                             break 'connection;
                         }
                     };
+
+                    // Spans both dispatch and any inline response write: the
+                    // connection cannot resume reading until both are complete.
+                    // Drop records cancellation/error paths too.
+                    let _compact_v2_handler_timer = Self::is_tcp_compact_v2_extension(&message)
+                        .then(|| CompactHandlerTimer::start(&self.compact_metrics));
 
                     // Process message; the plaintext bytes carry the dedup/length checks (no
                     // re-serialize, no second deserialize).
@@ -18368,6 +20456,11 @@ mod tests {
             NetworkMessage::TransactionInventoryV1 { .. } => "TransactionInventoryV1",
             NetworkMessage::GetTransactionsV1 { .. } => "GetTransactionsV1",
             NetworkMessage::TransactionsV1 { .. } => "TransactionsV1",
+            NetworkMessage::CompactBlockV2(..) => "CompactBlockV2",
+            NetworkMessage::GetCompactTransactionsV2 { .. } => "GetCompactTransactionsV2",
+            NetworkMessage::CompactTransactionsV2 { .. } => "CompactTransactionsV2",
+            NetworkMessage::CompactBlockAckV2 { .. } => "CompactBlockAckV2",
+            NetworkMessage::CompactBlockWantFullV2 { .. } => "CompactBlockWantFullV2",
         }
     }
 
@@ -18527,10 +20620,42 @@ mod tests {
             NetworkMessage::TransactionsV1 {
                 transactions: BoundedSequence::new(vec![]).unwrap(),
             },
+            NetworkMessage::CompactBlockV2(CompactBlockAnnouncementV2 {
+                index: 0,
+                previous_hash: [0; 32],
+                timestamp: 0,
+                nonce: 0,
+                difficulty: 0,
+                hash: [0; 32],
+                merkle_root: [0; 32],
+                coinbase: tx0(),
+                transaction_hashes: PackedTransactionHashes::new(vec![]).unwrap(),
+                full_block_bytes: 1,
+                user_transaction_bytes: 0,
+                relay_token: RelayToken([0; 16]),
+            }),
+            NetworkMessage::GetCompactTransactionsV2 {
+                block_hash: [0; 32],
+                relay_token: RelayToken([0; 16]),
+                indexes: BoundedSequence::new(vec![]).unwrap(),
+            },
+            NetworkMessage::CompactTransactionsV2 {
+                block_hash: [0; 32],
+                relay_token: RelayToken([0; 16]),
+                transactions: BoundedSequence::new(vec![]).unwrap(),
+            },
+            NetworkMessage::CompactBlockAckV2 {
+                block_hash: [0; 32],
+                relay_token: RelayToken([0; 16]),
+            },
+            NetworkMessage::CompactBlockWantFullV2 {
+                block_hash: [0; 32],
+                relay_token: RelayToken([0; 16]),
+            },
         ];
         assert_eq!(
             cases.len(),
-            35,
+            40,
             "variant count changed — extend this pin as a deliberate wire decision"
         );
         let mut seen = std::collections::HashSet::new();
@@ -19968,6 +22093,958 @@ mod tests {
     }
 
     #[test]
+    fn compact_v2_round_trip_packs_only_user_hashes_and_has_fixed_token_cost() {
+        let block = compact_test_block();
+        let compact = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([0x11; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .expect("V2 compact construction");
+        assert!(compact.validate_commitment());
+        assert_eq!(compact.transaction_count(), block.transactions.len());
+        assert_eq!(
+            compact.transaction_hashes.len(),
+            block.transactions.len() - 1
+        );
+        assert_eq!(
+            compact.transaction_hashes.as_slice()[0],
+            Blockchain::calculate_merkle_leaf_hash(&block.transactions[1]).unwrap()
+        );
+        let reconstructed = compact
+            .reconstruct(block.transactions.clone())
+            .expect("V2 exact bodies reconstruct");
+        assert_eq!(reconstructed.hash, block.hash);
+        assert_eq!(reconstructed.merkle_root, block.merkle_root);
+        assert_eq!(reconstructed.transactions, block.transactions);
+
+        let first = NetworkMessage::CompactBlockV2(compact.clone());
+        let mut other_token = compact;
+        other_token.relay_token = RelayToken([0xff; crate::a9::compact::RELAY_TOKEN_BYTES]);
+        let second = NetworkMessage::CompactBlockV2(other_token);
+        assert_eq!(
+            Node::prepare_outbound_message(&first).unwrap().cost.bytes,
+            Node::prepare_outbound_message(&second).unwrap().cost.bytes,
+            "random token values must not change the exact MessagePack gate"
+        );
+        let encoded = codec::serialize(&first).unwrap();
+        match codec::deserialize::<NetworkMessage>(&encoded).unwrap() {
+            NetworkMessage::CompactBlockV2(decoded) => {
+                assert_eq!(decoded.transaction_hashes.len(), 1);
+                assert_eq!(decoded.relay_token, RelayToken([0x11; 16]));
+            }
+            _ => panic!("wrong V2 announcement variant"),
+        }
+    }
+
+    #[test]
+    fn compact_v2_exact_wire_gate_skips_coinbase_only_and_marginal_savings() {
+        let block = compact_test_block();
+        let compact = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([1; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
+        let full = Node::prepare_outbound_message(&NetworkMessage::Block(block.clone())).unwrap();
+        let compact =
+            Node::prepare_outbound_message(&NetworkMessage::CompactBlockV2(compact)).unwrap();
+        let full_bytes = Node::prepared_tcp_frame_bytes(&full);
+        let compact_bytes = Node::prepared_tcp_frame_bytes(&compact);
+        assert!(Node::compact_v2_wire_is_worthwhile(
+            block.transactions.len(),
+            full_bytes,
+            compact_bytes
+        ));
+        assert!(!Node::compact_v2_wire_is_worthwhile(
+            1,
+            full_bytes,
+            compact_bytes
+        ));
+        assert!(!Node::compact_v2_wire_is_worthwhile(2, 10_000, 9_500));
+
+        let mut coinbase_only = block;
+        coinbase_only.transactions.truncate(1);
+        coinbase_only.merkle_root =
+            Blockchain::calculate_merkle_root(&coinbase_only.transactions).unwrap();
+        coinbase_only.hash = coinbase_only.calculate_hash_for_block();
+        assert!(CompactBlockAnnouncementV2::from_block(
+            &coinbase_only,
+            RelayToken([2; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .is_err());
+
+        // Constructor policy is mirrored at ingress: a peer cannot force the
+        // compact state machine to process a hand-built coinbase-only envelope.
+        let coinbase_only_wire = CompactBlockAnnouncementV2 {
+            index: coinbase_only.index,
+            previous_hash: coinbase_only.previous_hash,
+            timestamp: coinbase_only.timestamp,
+            nonce: coinbase_only.nonce,
+            difficulty: coinbase_only.difficulty,
+            hash: coinbase_only.hash,
+            merkle_root: coinbase_only.merkle_root,
+            coinbase: coinbase_only.transactions[0].clone(),
+            transaction_hashes: PackedTransactionHashes::new(Vec::new()).unwrap(),
+            full_block_bytes: codec::serialize(&coinbase_only).unwrap().len() as u32,
+            user_transaction_bytes: 0,
+            relay_token: RelayToken([2; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        };
+        assert!(!coinbase_only_wire.validate_commitment());
+    }
+
+    #[test]
+    fn compact_v2_recovery_uses_cost_not_a_fixed_miss_ratio() {
+        let mut block = compact_test_block();
+        for offset in 1..=2 {
+            let mut payment = block.transactions[1].clone();
+            payment.timestamp = payment.timestamp.saturating_add(offset);
+            block.transactions.push(payment);
+        }
+        block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
+        block.hash = block.calculate_hash_for_block();
+        let compact = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([2; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
+
+        let mut cold = vec![None; block.transactions.len()];
+        cold[0] = Some(block.transactions[0].clone());
+        assert!(
+            !Node::compact_v2_body_request_is_efficient(&compact, &cold),
+            "an entirely cold receiver should avoid an RTT for nearly the full body"
+        );
+
+        let mut partial = cold;
+        partial[1] = Some(block.transactions[1].clone());
+        assert!(
+            Node::compact_v2_body_request_is_efficient(&compact, &partial),
+            "one known ML-DSA body makes the bounded missing-body response materially cheaper"
+        );
+
+        let mut too_many = compact.clone();
+        too_many.transaction_hashes = PackedTransactionHashes::new(vec![[7; 32]; 65]).unwrap();
+        let mut over_batch = vec![None; 66];
+        over_batch[0] = Some(block.transactions[0].clone());
+        assert!(!Node::compact_v2_body_request_is_efficient(
+            &too_many,
+            &over_batch
+        ));
+    }
+
+    #[test]
+    fn compact_v2_body_application_rejects_coinbase_receipts_and_wrong_leaves() {
+        let block = compact_test_block();
+        let compact = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([3; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
+        let mut transactions = vec![None; block.transactions.len()];
+        transactions[0] = Some(block.transactions[0].clone());
+        let mut assembled =
+            Node::compact_transaction_encoded_bytes(&block.transactions[0]).unwrap();
+
+        assert!(!Node::apply_compact_body_v2(
+            &compact,
+            &mut transactions,
+            &mut assembled,
+            IndexedCompactTransactionV2 {
+                index: 0,
+                transaction: block.transactions[0].clone(),
+            }
+        )
+        .unwrap());
+
+        let receipt = block.transactions[1]
+            .with_truncated_signature(block.transactions[1].sig_hash.clone().unwrap());
+        assert!(!Node::apply_compact_body_v2(
+            &compact,
+            &mut transactions,
+            &mut assembled,
+            IndexedCompactTransactionV2 {
+                index: 1,
+                transaction: receipt,
+            }
+        )
+        .unwrap());
+
+        let mut wrong = block.transactions[1].clone();
+        wrong.pub_key = Some("ef".repeat(2_592));
+        assert!(!Node::apply_compact_body_v2(
+            &compact,
+            &mut transactions,
+            &mut assembled,
+            IndexedCompactTransactionV2 {
+                index: 1,
+                transaction: wrong,
+            }
+        )
+        .unwrap());
+        assert!(Node::apply_compact_body_v2(
+            &compact,
+            &mut transactions,
+            &mut assembled,
+            IndexedCompactTransactionV2 {
+                index: 1,
+                transaction: block.transactions[1].clone(),
+            }
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn compact_v2_terminal_state_is_token_bound_and_single_shot() {
+        let token = RelayToken([4; crate::a9::compact::RELAY_TOKEN_BYTES]);
+        let mut entry = CompactAnnounceEntry {
+            token,
+            status: CompactAnnounceStatus::Pending,
+            body_served: false,
+            announced_at: Instant::now(),
+        };
+        assert!(!Node::transition_compact_announce(
+            &mut entry,
+            RelayToken([5; crate::a9::compact::RELAY_TOKEN_BYTES]),
+            CompactAnnounceStatus::FullServed,
+        ));
+        assert_eq!(entry.status, CompactAnnounceStatus::Pending);
+        assert!(!Node::consume_compact_body_authorization(
+            &mut entry,
+            RelayToken([5; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        ));
+        assert!(Node::consume_compact_body_authorization(&mut entry, token));
+        assert!(!Node::consume_compact_body_authorization(&mut entry, token));
+        assert!(Node::transition_compact_announce(
+            &mut entry,
+            token,
+            CompactAnnounceStatus::Acked,
+        ));
+        assert!(!Node::transition_compact_announce(
+            &mut entry,
+            token,
+            CompactAnnounceStatus::FullServed,
+        ));
+        assert_eq!(entry.status, CompactAnnounceStatus::Acked);
+    }
+
+    #[test]
+    fn compact_v2_evidence_lease_is_cancellation_safe_and_generation_safe() {
+        let evidence = Arc::new(DashMap::new());
+        let key = ([7; 32], SocketAddr::from(([192, 0, 2, 7], 7_177)));
+        let first = ReceivedEvidence {
+            token: RelayToken([7; crate::a9::compact::RELAY_TOKEN_BYTES]),
+            received_at: Instant::now(),
+        };
+
+        evidence.insert(key, first);
+        let (_, leased) = evidence.remove(&key).unwrap();
+        drop(CompactEvidenceLease {
+            evidence: Arc::clone(&evidence),
+            key,
+            value: leased,
+            committed: false,
+        });
+        assert_eq!(evidence.get(&key).unwrap().token, first.token);
+
+        let (_, leased) = evidence.remove(&key).unwrap();
+        let cancelled = CompactEvidenceLease {
+            evidence: Arc::clone(&evidence),
+            key,
+            value: leased,
+            committed: false,
+        };
+        let newer = ReceivedEvidence {
+            token: RelayToken([8; crate::a9::compact::RELAY_TOKEN_BYTES]),
+            received_at: Instant::now(),
+        };
+        evidence.insert(key, newer);
+        drop(cancelled);
+        assert_eq!(
+            evidence.get(&key).unwrap().token,
+            newer.token,
+            "a cancelled old send must not overwrite a newer announcement token"
+        );
+
+        let (_, leased) = evidence.remove(&key).unwrap();
+        CompactEvidenceLease {
+            evidence: Arc::clone(&evidence),
+            key,
+            value: leased,
+            committed: false,
+        }
+        .commit();
+        assert!(
+            !evidence.contains_key(&key),
+            "a completed terminal send consumes its evidence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compact_v2_loopback_canary_negotiates_bodies_and_full_fallback() {
+        use crate::a9::blockchain::FEE_PERCENTAGE;
+        use ring::rand::SystemRandom;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        async fn node() -> Node {
+            let db = store::Store::temporary().expect("temporary compact canary store");
+            let blockchain = Blockchain::new(
+                db.clone(),
+                FEE_PERCENTAGE,
+                50.0,
+                100,
+                5,
+                Arc::new(RateLimiter::new(60, 10_000)),
+                Arc::new(Mutex::new(0)),
+            );
+            blockchain
+                .create_genesis_block()
+                .await
+                .expect("compact canary genesis");
+            blockchain
+                .initialize()
+                .await
+                .expect("compact canary chain init");
+            let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .expect("compact canary handshake key")
+                .as_ref()
+                .to_vec();
+            let mut node = Node::new(
+                Arc::new(db),
+                Arc::new(RwLock::new(blockchain)),
+                key,
+                NodeRuntimeConfig {
+                    bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                    velocity_enabled: false,
+                    max_peers: 4,
+                    max_connections: 8,
+                    seed_nodes: Vec::new(),
+                    data_dir: None,
+                    ledger: None,
+                },
+            )
+            .await
+            .expect("construct compact canary node");
+            node.bind_addr = node
+                .listener
+                .as_ref()
+                .expect("compact canary listener")
+                .local_addr()
+                .expect("compact canary listen address");
+            node
+        }
+
+        fn serve(node: &Node) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+            let listener = Arc::clone(node.listener.as_ref().expect("canary listener"));
+            let serving = node.clone();
+            let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+            let acceptor = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, address)) = listener.accept().await else {
+                        return;
+                    };
+                    let node = serving.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        let _ = node.handle_connection(stream, address, events).await;
+                    });
+                }
+            });
+            (acceptor, drain)
+        }
+
+        let sender = node().await;
+        let receiver = node().await;
+        let (sender_acceptor, sender_drain) = serve(&sender);
+        let (receiver_acceptor, receiver_drain) = serve(&receiver);
+
+        sender
+            .check_peer_health_internal(receiver.bind_addr)
+            .await
+            .expect("sender negotiates receiver capability");
+        receiver
+            .check_peer_health_internal(sender.bind_addr)
+            .await
+            .expect("receiver negotiates sender capability");
+        assert!(
+            sender
+                .compact_v2_connection_is_negotiated(receiver.bind_addr)
+                .await
+        );
+        assert!(
+            receiver
+                .compact_v2_connection_is_negotiated(sender.bind_addr)
+                .await
+        );
+
+        let block = Arc::new(compact_test_block());
+        let token = RelayToken([9; crate::a9::compact::RELAY_TOKEN_BYTES]);
+        let announcement = CompactBlockAnnouncementV2::from_block(&block, token).unwrap();
+        assert!(sender.remember_compact_full_block(Arc::clone(&block), true));
+        sender.record_compact_announce(block.hash, receiver.bind_addr, token);
+        assert!(receiver.record_compact_v2_evidence(block.hash, sender.bind_addr, token));
+
+        // Capability cached at the address is not enough: discard the exact
+        // stream and prove the body request negotiates its replacement before
+        // sending any extension frame.
+        receiver.remove_outbound_connection(sender.bind_addr).await;
+        assert!(
+            !receiver
+                .compact_v2_connection_is_negotiated(sender.bind_addr)
+                .await
+        );
+
+        let bodies = receiver
+            .request_compact_transaction_batch_v2(
+                sender.bind_addr,
+                &announcement,
+                vec![1],
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("bounded missing-body request round trip");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].transaction, block.transactions[1]);
+        assert!(sender
+            .compact_announce_state
+            .lock()
+            .peek(&block.hash)
+            .and_then(|peers| peers.get(&receiver.bind_addr))
+            .is_some_and(|entry| entry.body_served));
+
+        receiver.remove_outbound_connection(sender.bind_addr).await;
+        assert!(
+            receiver
+                .send_compact_want_full_v2(block.hash, sender.bind_addr)
+                .await
+        );
+        timeout(Duration::from_secs(5), async {
+            while sender
+                .compact_metrics
+                .want_full_served
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ordinary full-block fallback was pushed");
+        assert_eq!(
+            sender
+                .compact_metrics
+                .want_full_served
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(sender
+            .compact_announce_state
+            .lock()
+            .peek(&block.hash)
+            .and_then(|peers| peers.get(&receiver.bind_addr))
+            .is_some_and(|entry| entry.status == CompactAnnounceStatus::FullServed));
+        assert!(
+            sender
+                .compact_metrics
+                .v2_wire_bytes_sent
+                .load(Ordering::Relaxed)
+                > 0,
+            "the body response must be included in exact V2 wire accounting"
+        );
+        assert!(
+            sender
+                .compact_metrics
+                .handler_frames
+                .load(Ordering::Relaxed)
+                >= 2,
+            "body and WANT_FULL reader work must be visible to soak telemetry"
+        );
+        assert!(
+            receiver
+                .compact_metrics
+                .v2_wire_bytes_sent
+                .load(Ordering::Relaxed)
+                > 0,
+            "body/WANT requests must be included in exact V2 wire accounting"
+        );
+
+        sender_acceptor.abort();
+        sender_drain.abort();
+        receiver_acceptor.abort();
+        receiver_drain.abort();
+    }
+
+    /// Hermetic release canary for the complete CPU-miner -> compact relay ->
+    /// consensus-acceptance path in both directions.  This deliberately never
+    /// calls `Node::start` or `publish_block`: those are the production service
+    /// entry points that start discovery and the always-on gateway block relay.
+    /// Only the explicit loopback listeners below run, every database is a
+    /// process-owned temporary redb file, and every socket binds 127.0.0.1:0.
+    ///
+    /// Run explicitly (the real difficulty-464 grind is intentionally ignored):
+    /// `cargo test --release isolated_two_node_cpu_mining_compact_v2_canary -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "hermetic release canary: mines two real difficulty-floor blocks"]
+    async fn isolated_two_node_cpu_mining_compact_v2_canary() {
+        use crate::a9::blockchain::{FEE_PERCENTAGE, TARGET_BLOCK_TIME};
+        use crate::a9::miner::{BlockHeader, MiningManager};
+        use crate::a9::wallet::Wallet;
+        use ring::rand::SystemRandom;
+        use std::path::PathBuf;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        fn process_temp_stores() -> Vec<PathBuf> {
+            let prefix = format!("a9store-{}-", std::process::id());
+            let mut paths: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".redb"))
+                })
+                .collect();
+            paths.sort();
+            paths
+        }
+
+        async fn canary_node() -> (Node, Arc<RwLock<Blockchain>>) {
+            use crate::a9::blockchain::FEE_PERCENTAGE;
+
+            let db = store::Store::temporary().expect("temporary CPU compact canary store");
+            let blockchain = Blockchain::new(
+                db.clone(),
+                FEE_PERCENTAGE,
+                50.0,
+                100,
+                5,
+                Arc::new(RateLimiter::new(60, 10_000)),
+                Arc::new(Mutex::new(0)),
+            );
+            blockchain
+                .create_genesis_block()
+                .await
+                .expect("CPU compact canary genesis");
+            blockchain
+                .initialize()
+                .await
+                .expect("CPU compact canary chain initialization");
+            let blockchain = Arc::new(RwLock::new(blockchain));
+            let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .expect("CPU compact canary handshake key")
+                .as_ref()
+                .to_vec();
+            let mut node = Node::new(
+                Arc::new(db),
+                Arc::clone(&blockchain),
+                key,
+                NodeRuntimeConfig {
+                    bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                    velocity_enabled: false,
+                    max_peers: 4,
+                    max_connections: 8,
+                    seed_nodes: Vec::new(),
+                    data_dir: None,
+                    ledger: None,
+                },
+            )
+            .await
+            .expect("construct hermetic CPU compact canary node");
+            node.bind_addr = node
+                .listener
+                .as_ref()
+                .expect("CPU compact canary listener")
+                .local_addr()
+                .expect("CPU compact canary listen address");
+            assert!(node.bind_addr.ip().is_loopback());
+            (node, blockchain)
+        }
+
+        fn serve(node: &Node) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+            let listener = Arc::clone(node.listener.as_ref().expect("canary listener"));
+            let serving = node.clone();
+            let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+            let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+            let acceptor = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, address)) = listener.accept().await else {
+                        return;
+                    };
+                    assert!(address.ip().is_loopback());
+                    let node = serving.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        let _ = node.handle_connection(stream, address, events).await;
+                    });
+                }
+            });
+            (acceptor, drain)
+        }
+
+        async fn fund(chain: &Arc<RwLock<Blockchain>>, address: &str) {
+            let chain = chain.read().await;
+            chain
+                .db
+                .open_tree("balances")
+                .expect("canary balances tree")
+                .insert(
+                    address.as_bytes(),
+                    codec::serialize(&Transaction::to_units(10_000.0))
+                        .expect("serialize canary balance"),
+                )
+                .expect("fund canary wallet");
+        }
+
+        async fn signed_payment(
+            wallet: &Wallet,
+            recipient: String,
+            amount: f64,
+            timestamp: u64,
+        ) -> Transaction {
+            let fee = amount * FEE_PERCENTAGE;
+            let message = format!(
+                "{}:{}:{amount:.8}:{fee:.8}:{timestamp}",
+                wallet.address, recipient
+            );
+            let signature = wallet
+                .sign_transaction(message.as_bytes())
+                .await
+                .expect("sign CPU compact canary payment");
+            let signature_bytes =
+                hex::decode(&signature).expect("decode CPU compact canary signature");
+            let mut transaction = Transaction::new(
+                wallet.address.clone(),
+                recipient,
+                amount,
+                fee,
+                timestamp,
+                Some(signature),
+            );
+            transaction.pub_key = wallet.get_public_key_hex().await;
+            transaction.sig_hash = Some(Transaction::signature_hash_hex(&signature_bytes));
+            transaction
+        }
+
+        async fn wait_for_pending(
+            chain: &Arc<RwLock<Blockchain>>,
+            transaction: &Transaction,
+            label: &str,
+        ) {
+            let tx_id = transaction.get_tx_id();
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    if chain
+                        .read()
+                        .await
+                        .get_mempool_transaction_by_id(&tx_id)
+                        .await
+                        .is_some()
+                    {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not admit transaction {tx_id}"));
+        }
+
+        async fn wait_for_tip(chain: &Arc<RwLock<Blockchain>>, expected: &Block, label: &str) {
+            timeout(Duration::from_secs(30), async {
+                loop {
+                    if chain
+                        .read()
+                        .await
+                        .get_last_block()
+                        .is_some_and(|tip| tip.index == expected.index && tip.hash == expected.hash)
+                    {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{label} did not accept compact-relayed block #{} {}",
+                    expected.index,
+                    hex::encode(expected.hash)
+                )
+            });
+        }
+
+        async fn wait_for_ack(node: &Node, expected: u64, label: &str) {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if node.compact_metrics.snapshot().ack_received >= expected {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not receive compact ACK {expected}"));
+        }
+
+        async fn mine_real_block(
+            chain: Arc<RwLock<Blockchain>>,
+            miner_address: String,
+            label: &'static str,
+        ) -> Block {
+            let tip = chain
+                .read()
+                .await
+                .get_last_block()
+                .expect("CPU compact canary chain tip");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut header = BlockHeader {
+                number: tip.index.saturating_add(1),
+                parent_hash: tip.hash,
+                timestamp: now,
+                merkle_root: [0; 32],
+                difficulty: tip.difficulty,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let manager = MiningManager::new(
+                Arc::clone(&chain),
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&stop),
+            );
+            let mut mining = tokio::spawn(async move {
+                manager
+                    .mine_block(&mut header, &[], 1u64 << 27, miner_address)
+                    .await
+            });
+            match timeout(Duration::from_secs(360), &mut mining).await {
+                Ok(joined) => {
+                    joined
+                        .unwrap_or_else(|error| panic!("{label} mining task panicked: {error}"))
+                        .unwrap_or_else(|error| panic!("{label} mining failed: {error}"))
+                        .2
+                }
+                Err(_) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = timeout(Duration::from_secs(10), &mut mining).await;
+                    panic!("{label} did not mine within the 360-second hermetic bound");
+                }
+            }
+        }
+
+        let stores_before = process_temp_stores();
+        let (node_a, chain_a) = canary_node().await;
+        let (node_b, chain_b) = canary_node().await;
+        let lock_paths = [
+            PathBuf::from(node_a.identity_lock.path.as_str()),
+            PathBuf::from(node_b.identity_lock.path.as_str()),
+        ];
+        let (a_acceptor, a_drain) = serve(&node_a);
+        let (b_acceptor, b_drain) = serve(&node_b);
+
+        node_a
+            .check_peer_health_internal(node_b.bind_addr)
+            .await
+            .expect("A negotiates B compact capability");
+        node_b
+            .check_peer_health_internal(node_a.bind_addr)
+            .await
+            .expect("B negotiates A compact capability");
+        assert!(
+            node_a
+                .compact_v2_connection_is_negotiated(node_b.bind_addr)
+                .await
+        );
+        assert!(
+            node_b
+                .compact_v2_connection_is_negotiated(node_a.bind_addr)
+                .await
+        );
+
+        let wallet = Wallet::new(None).expect("CPU compact canary wallet");
+        fund(&chain_a, &wallet.address).await;
+        fund(&chain_b, &wallet.address).await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let payment_a = signed_payment(&wallet, "11".repeat(20), 1.0, now).await;
+        chain_a
+            .read()
+            .await
+            .add_transaction(payment_a.clone())
+            .await
+            .expect("A admits first payment");
+        node_a
+            .send_message(
+                node_b.bind_addr,
+                &NetworkMessage::Transaction(payment_a.clone()),
+            )
+            .await
+            .expect("A gossips first payment to B over loopback");
+        wait_for_pending(&chain_b, &payment_a, "B").await;
+
+        let block_one = mine_real_block(
+            Arc::clone(&chain_a),
+            wallet.address.clone(),
+            "node A block #1",
+        )
+        .await;
+        assert!(block_one.transactions.len() > 1);
+        assert!(block_one.verify_pow_meets_floor());
+        assert!(block_one
+            .transactions
+            .iter()
+            .any(|transaction| transaction.get_tx_id() == payment_a.get_tx_id()));
+        assert_eq!(
+            node_a
+                .broadcast_block(
+                    Arc::new(block_one.clone()),
+                    None,
+                    vec![node_b.bind_addr],
+                    false,
+                )
+                .await
+                .expect("A compact-relays mined block to B"),
+            1
+        );
+        wait_for_tip(&chain_b, &block_one, "B").await;
+        wait_for_ack(&node_a, 1, "A").await;
+
+        let wall_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let wait_secs = block_one
+            .timestamp
+            .saturating_add(TARGET_BLOCK_TIME)
+            .saturating_sub(wall_now);
+        if wait_secs > 0 {
+            sleep(Duration::from_secs(wait_secs)).await;
+        }
+
+        let second_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let payment_b = signed_payment(&wallet, "22".repeat(20), 2.0, second_timestamp).await;
+        chain_b
+            .read()
+            .await
+            .add_transaction(payment_b.clone())
+            .await
+            .expect("B admits second payment");
+        node_b
+            .send_message(
+                node_a.bind_addr,
+                &NetworkMessage::Transaction(payment_b.clone()),
+            )
+            .await
+            .expect("B gossips second payment to A over loopback");
+        wait_for_pending(&chain_a, &payment_b, "A").await;
+
+        let block_two = mine_real_block(
+            Arc::clone(&chain_b),
+            wallet.address.clone(),
+            "node B block #2",
+        )
+        .await;
+        assert!(block_two.transactions.len() > 1);
+        assert!(block_two.verify_pow_meets_floor());
+        assert!(block_two
+            .transactions
+            .iter()
+            .any(|transaction| transaction.get_tx_id() == payment_b.get_tx_id()));
+        assert_eq!(
+            node_b
+                .broadcast_block(
+                    Arc::new(block_two.clone()),
+                    None,
+                    vec![node_a.bind_addr],
+                    false,
+                )
+                .await
+                .expect("B compact-relays mined block to A"),
+            1
+        );
+        wait_for_tip(&chain_a, &block_two, "A").await;
+        wait_for_ack(&node_b, 1, "B").await;
+
+        let a_metrics = node_a.compact_metrics.snapshot();
+        let b_metrics = node_b.compact_metrics.snapshot();
+        for (label, metrics) in [("A", a_metrics), ("B", b_metrics)] {
+            assert_eq!(metrics.announced, 1, "{label} compact announcement count");
+            assert_eq!(metrics.reconstructed, 1, "{label} reconstruction count");
+            assert_eq!(metrics.ack_received, 1, "{label} ACK count");
+            assert_eq!(metrics.missing_requests, 0, "{label} warm-path misses");
+            assert_eq!(metrics.want_full_sent, 0, "{label} WANT_FULL count");
+            assert_eq!(metrics.want_full_served, 0, "{label} full fallback count");
+            assert_eq!(
+                metrics.fallback_full_received, 0,
+                "{label} fallback receive count"
+            );
+            assert_eq!(metrics.fallback_bytes_sent, 0, "{label} fallback bytes");
+            assert_eq!(metrics.invalid, 0, "{label} invalid compact count");
+            assert_eq!(metrics.saturated, 0, "{label} saturation count");
+            assert!(metrics.full_bytes_avoided > metrics.compact_bytes_sent);
+            assert!(metrics.v2_wire_bytes_sent > 0);
+        }
+        assert_eq!(
+            chain_a
+                .read()
+                .await
+                .get_last_block()
+                .map(|block| block.hash),
+            Some(block_two.hash)
+        );
+        assert_eq!(
+            chain_b
+                .read()
+                .await
+                .get_last_block()
+                .map(|block| block.hash),
+            Some(block_two.hash)
+        );
+
+        println!(
+            "HERMETIC_COMPACT_CPU_METRICS a={a_metrics:?} b={b_metrics:?} tip={}",
+            hex::encode(block_two.hash)
+        );
+
+        // Close every explicitly-created stream before stopping listeners so
+        // all connection-handler Node clones release their identity locks.
+        node_a.outbound_connections.write().await.clear();
+        node_b.outbound_connections.write().await.clear();
+        sleep(Duration::from_millis(200)).await;
+        for task in [a_acceptor, a_drain, b_acceptor, b_drain] {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(node_a);
+        drop(node_b);
+        drop(chain_a);
+        drop(chain_b);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if lock_paths.iter().all(|path| !path.exists())
+                    && process_temp_stores() == stores_before
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("hermetic node locks and temporary stores were not cleaned up");
+    }
+
+    #[test]
     fn compact_commitment_gate_rejects_mutation_and_oversized_lists() {
         let compact = CompactBlockV1::from_block(&compact_test_block()).unwrap();
 
@@ -20097,6 +23174,94 @@ mod tests {
             slots.available_permits(),
             COMPACT_RECONSTRUCTION_CONCURRENCY
         );
+    }
+
+    #[test]
+    fn compact_v2_claim_distinguishes_duplicate_saturation_and_off_tip_work() {
+        let mut parent = compact_test_block();
+        parent.index = 100;
+        parent.timestamp = 1_000;
+        parent.difficulty = 670;
+        parent.hash = parent.calculate_hash_for_block();
+
+        let mut compact = CompactBlockAnnouncementV2::from_block(
+            &compact_test_block(),
+            RelayToken([6; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
+        compact.index = parent.index + 1;
+        compact.previous_hash = parent.hash;
+        compact.timestamp = parent.timestamp + 5;
+        compact.difficulty = Block::consensus_next_difficulty(
+            parent.difficulty,
+            compact.timestamp - parent.timestamp,
+            compact.index,
+        );
+        compact.hash = compact.header_block().calculate_hash_for_block();
+
+        let inflight = Arc::new(DashMap::new());
+        let slots = Arc::new(Semaphore::new(1));
+        let first = SocketAddr::from(([192, 0, 2, 1], 8_001));
+        let second = SocketAddr::from(([192, 0, 2, 2], 8_002));
+
+        let mut off_tip = compact.clone();
+        off_tip.previous_hash[0] ^= 1;
+        assert!(matches!(
+            Node::try_claim_compact_reconstruction_v2_in(
+                &off_tip,
+                &parent,
+                &inflight,
+                &slots,
+                first,
+                Instant::now(),
+            ),
+            CompactClaimV2::NotTipExtension
+        ));
+        assert!(inflight.is_empty());
+
+        let (started, permit) = match Node::try_claim_compact_reconstruction_v2_in(
+            &compact,
+            &parent,
+            &inflight,
+            &slots,
+            first,
+            Instant::now(),
+        ) {
+            CompactClaimV2::Claimed { started, permit } => (started, permit),
+            _ => panic!("exact next block should claim the only slot"),
+        };
+        assert!(matches!(
+            Node::try_claim_compact_reconstruction_v2_in(
+                &compact,
+                &parent,
+                &inflight,
+                &slots,
+                second,
+                Instant::now(),
+            ),
+            CompactClaimV2::Duplicate
+        ));
+        assert_eq!(inflight.get(&compact.hash).unwrap().sources.len(), 2);
+        inflight.remove_if(&compact.hash, |_, current| current.started == started);
+        drop(permit);
+
+        let held = slots.clone().try_acquire_owned().unwrap();
+        assert!(matches!(
+            Node::try_claim_compact_reconstruction_v2_in(
+                &compact,
+                &parent,
+                &inflight,
+                &slots,
+                first,
+                Instant::now(),
+            ),
+            CompactClaimV2::Saturated
+        ));
+        assert!(
+            inflight.is_empty(),
+            "saturation must not leak an in-flight claim"
+        );
+        drop(held);
     }
 
     #[test]
@@ -20345,6 +23510,7 @@ mod tests {
                 CompactFullBlockEntry {
                     block: Arc::clone(&base_block),
                     encoded_bytes: full_entry_bytes,
+                    verified: true,
                 },
             ));
         }
@@ -20354,6 +23520,23 @@ mod tests {
         assert!(
             pending.bytes + full.bytes <= COMPACT_GLOBAL_CACHE_BYTE_BUDGET,
             "the independently enforced cache partitions cannot exceed the global cap"
+        );
+
+        let mut replacement_body = (*base_block).clone();
+        replacement_body.transactions[0].recipient = "44".repeat(20);
+        assert!(full.insert(
+            [11; 32],
+            CompactFullBlockEntry {
+                block: Arc::new(replacement_body),
+                encoded_bytes: full_entry_bytes / 2,
+                verified: false,
+            },
+        ));
+        let retained = full.entries.get(&[11; 32]).unwrap();
+        assert!(retained.verified);
+        assert!(
+            Arc::ptr_eq(&retained.block, &base_block),
+            "unverified replacement bytes must never inherit or displace a verified verdict"
         );
     }
 
@@ -20384,6 +23567,43 @@ mod tests {
         );
         assert!(valid_encoded <= COMPACT_SAFE_ASSEMBLED_BYTES);
         assert!(Node::compact_block_transport_ok_at(&block, block.index));
+
+        let compact_v2 = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([1; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
+        assert!(
+            codec::serialize(&NetworkMessage::CompactBlockV2(compact_v2.clone()))
+                .unwrap()
+                .len()
+                <= COMPACT_ANNOUNCEMENT_MAX_BYTES
+        );
+        let response_items: Vec<_> = block
+            .transactions
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(COMPACT_TX_BATCH_MAX)
+            .map(|(index, transaction)| IndexedCompactTransactionV2 {
+                index: index as u16,
+                transaction: transaction.clone(),
+            })
+            .collect();
+        assert_eq!(response_items.len(), COMPACT_TX_BATCH_MAX);
+        let response = NetworkMessage::CompactTransactionsV2 {
+            block_hash: block.hash,
+            relay_token: compact_v2.relay_token,
+            transactions: BoundedSequence::new(response_items).unwrap(),
+        };
+        assert!(
+            Node::prepare_outbound_message(&response)
+                .unwrap()
+                .cost
+                .bytes
+                <= COMPACT_RESPONSE_MAX_BYTES,
+            "a full 64-body realistic ML-DSA response must fit its transport budget"
+        );
 
         let mut over = block.clone();
         over.transactions.push(overflow_transaction);
@@ -20492,8 +23712,15 @@ mod tests {
         block.merkle_root = Blockchain::calculate_merkle_root(&block.transactions).unwrap();
         block.hash = block.calculate_hash_for_block();
         let compact = CompactBlockV1::from_block(&block).unwrap();
+        let compact_v2 = CompactBlockAnnouncementV2::from_block(
+            &block,
+            RelayToken([1; crate::a9::compact::RELAY_TOKEN_BYTES]),
+        )
+        .unwrap();
         let full_bytes = codec::serialize(&NetworkMessage::Block(block)).unwrap();
         let compact_bytes = codec::serialize(&NetworkMessage::CompactBlockV1(compact)).unwrap();
+        let compact_v2_bytes =
+            codec::serialize(&NetworkMessage::CompactBlockV2(compact_v2)).unwrap();
         assert!(
             compact_bytes.len() < 2 * 1024,
             "11-payment compact announcement unexpectedly large: {}",
@@ -20503,6 +23730,17 @@ mod tests {
             compact_bytes.len() * 100 < full_bytes.len(),
             "compact={} full={}",
             compact_bytes.len(),
+            full_bytes.len()
+        );
+        assert!(
+            compact_v2_bytes.len() < 2 * 1024,
+            "active V2 11-payment announcement unexpectedly large: {}",
+            compact_v2_bytes.len()
+        );
+        assert!(
+            compact_v2_bytes.len() * 100 < full_bytes.len(),
+            "compact_v2={} full={}",
+            compact_v2_bytes.len(),
             full_bytes.len()
         );
     }
@@ -20647,7 +23885,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_compact_extension_is_fail_closed_for_this_release() {
+    fn tcp_compact_v1_is_inert_while_v2_is_explicitly_advertised() {
         let node_id = "ab".repeat(32);
         assert!(!Node::advertises_compact_v1(&node_id));
         let marked = format!("{}{}", node_id, COMPACT_BLOCK_V1_CAPABILITY_SUFFIX);
@@ -20658,13 +23896,20 @@ mod tests {
         );
         assert_eq!(
             Node::tcp_capability_node_id(&node_id),
-            format!("{}{}", node_id, TX_INVENTORY_V1_CAPABILITY_SUFFIX),
-            "the local ping/pong id advertises transaction inventory but must not emit dormant compact capability"
+            format!(
+                "{}{}{}",
+                node_id, COMPACT_BLOCK_V2_CAPABILITY_SUFFIX, TX_INVENTORY_V1_CAPABILITY_SUFFIX
+            ),
+            "the local ping/pong id must advertise active V2 but not dormant V1"
         );
         assert!(
-            !Node::tcp_compact_peer_eligible(true),
-            "a fresh injected capability record still cannot enable TCP compact"
+            Node::tcp_compact_peer_eligible(true),
+            "a fresh V2 capability record enables only the active V2 path"
         );
+        assert!(Node::advertises_compact_v2(&format!(
+            "{}{}",
+            node_id, COMPACT_BLOCK_V2_CAPABILITY_SUFFIX
+        )));
         assert!(!Node::advertises_compact_v1(
             COMPACT_BLOCK_V1_CAPABILITY_SUFFIX
         ));
@@ -20700,7 +23945,7 @@ mod tests {
             extension_messages
                 .iter()
                 .all(Node::is_tcp_compact_extension),
-            "every compact request, response, and announcement must hit the inert ingress/egress gate"
+            "every V1 tombstone must still hit the inert ingress/egress gate"
         );
         assert!(!Node::is_tcp_compact_extension(&NetworkMessage::Block(
             compact_test_block()
@@ -22377,9 +25622,10 @@ mod tests {
     /// is what gets asserted — the same approach as
     /// `bpos_telemetry_cannot_reach_the_canonical_block_verdict` above.
     ///
-    /// The count assertion is the important half: it fails when a FOURTH block-ingress site
-    /// appears, which is exactly how the compact-block path was missed the first time (a grep for
-    /// `insert(&block_hash)` does not match `insert(&block.hash)`).
+    /// The count assertion is the important half: it fails when a FIFTH block-ingress site
+    /// appears. This is exactly how the first compact path was missed (a grep for
+    /// `insert(&block_hash)` does not match `insert(&block.hash)`), and V1/V2 are intentionally
+    /// counted independently while old beta peers may still decode the V1 tombstone.
     #[test]
     fn block_ingress_commits_the_dedup_bloom_only_after_the_save() {
         // Production code only: this test's own literals would otherwise match.
@@ -22411,7 +25657,7 @@ mod tests {
         }
 
         let commits = [
-            "self.network_bloom.insert(&block.hash);", // compact-block path
+            "self.network_bloom.insert(&block.hash);", // V1 and V2 compact-block paths
             "Self::commit_validated_event_block(&self.network_bloom, &block_hash);", // NewBlock
             "self.network_bloom.insert(&block_hash);", // TCP NetworkMessage::Block arm
         ];
@@ -22443,14 +25689,14 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 3,
-            "expected exactly 3 block-ingress dedup commits (TCP Block arm, NewBlock event arm, \
-             compact-block path); a new one must order its save before its commit"
+            checked, 4,
+            "expected exactly 4 block-ingress dedup commits (TCP Block arm, NewBlock event arm, \
+             V1 compact path, V2 compact path); a new one must order its save before its commit"
         );
     }
 
-    // All THREE block-ingress arms — the TCP `NetworkMessage::Block` arm, the
-    // `NetworkEvent::NewBlock` arm, and the compact-block path — commit the dedup hash only
+    // All FOUR block-ingress arms — the TCP `NetworkMessage::Block` arm, the
+    // `NetworkEvent::NewBlock` arm, and both compact paths — commit the dedup hash only
     // AFTER save_block returns Ok, never between verify and save. The two gates do not agree on
     // signature strictness (verify runs `validate_block`/AllowTruncatedStored, save_block opens
     // with `prevalidate_unattached_block_strict`/RequireFull), so a block can pass the first and
@@ -22587,6 +25833,16 @@ mod tests {
             ))),
             "transactions use exact full-witness dedupe, never the shared Bloom"
         );
+        assert!(
+            !Node::should_dedup_message(&NetworkMessage::Block(compact_test_block())),
+            "blocks require exact canonical dedupe, never probabilistic generic dedupe"
+        );
+        assert!(
+            !Node::block_dedup_should_skip(true, false),
+            "a forced Bloom false positive must not suppress a first block delivery"
+        );
+        assert!(Node::block_dedup_should_skip(true, true));
+        assert!(!Node::block_dedup_should_skip(false, true));
         assert!(!Node::should_dedup_message(&NetworkMessage::GetBlocks {
             start: 1,
             end: 2,

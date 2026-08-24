@@ -2,6 +2,7 @@ pub mod blockchain;
 pub mod blocknotify;
 pub mod bpos;
 pub mod codec;
+pub mod compact;
 pub mod ledger;
 #[cfg(feature = "gpu_miner")]
 pub mod gpu_miner;
