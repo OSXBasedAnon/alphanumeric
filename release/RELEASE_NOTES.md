@@ -7,10 +7,10 @@ no database migration, no wallet migration, no resync.
 
 ## What you get
 
-- **`contacts` — an address book you never fill in.** Derived from your own
-  transaction history in one bounded scan, sorted most active first, with a
-  zero-state screen that explains itself. `send` and `history` understand the
-  names it shows.
+- **`contacts` — an address book you never fill in.** Your counterparties,
+  folded from your own transaction history in one bounded scan: tx count, net
+  position, and last-seen per address, sorted most active first, with a
+  zero-state screen that explains itself.
 - **Wallet creation worthy of the keys it makes.** Both `new` and the
   first-run default wallet walk a staged checklist — each step resolves to a
   ✓ with what actually happened (`ml-dsa-87 · 2592-byte public key`,
