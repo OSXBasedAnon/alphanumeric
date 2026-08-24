@@ -39,16 +39,19 @@ no database migration, no wallet migration, no resync.
 - **Consensus encoding pinned.** The serialization crates are pinned exactly and
   the encoding is held by golden-byte tests; size-constant relationships and
   wire variant names are guarded so a refactor cannot silently change the wire.
+- **Compact block relay (v2).** Blocks announce with packed transaction hashes
+  and peers recover the bodies they already hold instead of re-downloading
+  them — a transport-only bandwidth reduction with bounded, versioned wire
+  types. Nothing in it participates in consensus or affects block validity.
 - **Warning-free source builds on Windows.**
 
 ## GPU mining build
 
-The GPU backend continues to live on the `gpu-mining` branch and ships as a
-separate `-gpu` artifact. The 8.0.1 GPU build mines on the GPU by default
-(`--cpu` opts out) and additionally carries the compact block relay (v2), a
-transport-only bandwidth reduction with no consensus impact. Build from source
-with `cargo build --release --features gpu_miner` on that branch. Guide:
-`docs/GPU_MINING.md` (gpu-mining branch).
+The GPU backend lives on the `gpu-mining` branch and ships as a separate
+`-gpu` artifact. The two branches carry identical code except the GPU backend
+itself; the 8.0.1 GPU build mines on the GPU by default (`--cpu` opts out).
+Build from source with `cargo build --release --features gpu_miner` on that
+branch. Guide: `docs/GPU_MINING.md` (gpu-mining branch).
 
 ## Operator action
 
