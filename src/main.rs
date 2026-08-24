@@ -2023,6 +2023,7 @@ async fn async_main() -> Result<()> {
                                         "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
                                         alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                     );
+                                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                                     let _ = db_for_recon.flush();
                                     let _ = remove_db_lock(&format!(
                                         "{}.lock",
@@ -4212,6 +4213,7 @@ Some("history") => {
         ) {
             println!("Could not write the re-bootstrap marker ({}); nothing was changed.", e);
         } else {
+            alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
             let _ = db.flush();
             let _ = remove_db_lock(&format!("{}.lock", db_path));
             let _ = remove_instance_lock();
