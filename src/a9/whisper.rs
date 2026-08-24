@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::a9::blockchain::{
     Block, Blockchain, BlockchainError, Transaction, FEE_PERCENTAGE, SYSTEM_ADDRESSES,
 };
-use crate::a9::wallet::Wallet;
 use crate::a9::ledger::{PaymentTuple, WalletLedger};
+use crate::a9::wallet::Wallet;
 
 pub const WHISPER_MIN_AMOUNT: f64 = 0.0001;
 pub const MAX_FEE: f64 = 0.01;

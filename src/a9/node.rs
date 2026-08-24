@@ -61,15 +61,13 @@ use crate::a9::blockchain::{
 };
 use crate::a9::bpos::{BlockHeaderInfo, HeaderSentinel, NetworkHealth};
 use crate::a9::codec;
+use crate::a9::ledger::{EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger};
 use crate::a9::mldsa;
 use crate::a9::outbound::{
     AdmissionError as OutboundAdmissionError, MessageCost as OutboundMessageCost,
     OutboundScheduler, Reservation as OutboundReservation, TrafficClass,
 };
 use crate::a9::velocity::{Shred, ShredRequest, ShredRequestType, VelocityError, VelocityManager};
-use crate::a9::ledger::{
-    EntryState, LedgerEntry, PaymentTuple, SubmissionCheck, WalletLedger,
-};
 
 //----------------------------------------------------------------------
 // Constants

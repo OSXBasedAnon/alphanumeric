@@ -9434,7 +9434,7 @@ mod tests {
             Arc::new(RateLimiter::new(60, 1_000)),
             Arc::new(Mutex::new(321)),
         );
-        let tip = bc.highest_block_index().unwrap_or(0) as u32;
+        let tip = bc.highest_block_index().unwrap_or(0);
         bc.write_dirty_marker(tip, "receipt_batch")
             .expect("plant marker");
         assert_eq!(

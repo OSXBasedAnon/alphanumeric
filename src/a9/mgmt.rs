@@ -29,9 +29,9 @@ use crate::a9::{
         Block, Blockchain, BlockchainError, Transaction, TransactionPresence,
         MINING_REWARD_MATURITY, TARGET_BLOCK_TIME,
     },
+    ledger::{PaymentTuple, WalletLedger},
     miner::{BlockHeader as ProgPowHeader, Miner},
     wallet::Wallet,
-    ledger::{PaymentTuple, WalletLedger},
 };
 
 const KEY_FILE_PATH: &str = "private.key";
@@ -654,10 +654,7 @@ impl Mgmt {
         blockchain: Arc<RwLock<Blockchain>>, // Take blockchain directly
         ledger: Option<Arc<WalletLedger>>,
     ) -> Self {
-        Mgmt {
-            blockchain,
-            ledger,
-        }
+        Mgmt { blockchain, ledger }
     }
 
     pub fn get_current_timestamp() -> Result<u64> {
@@ -1702,11 +1699,7 @@ impl Mgmt {
         match submit_result {
             Ok(crate::a9::blockchain::TransactionAdmissionOutcome::Inserted) => {
                 let state_persisted = self
-                    .update_wallet_ledger_state(
-                        tx_id,
-                        crate::a9::ledger::EntryState::Pending,
-                        now,
-                    )
+                    .update_wallet_ledger_state(tx_id, crate::a9::ledger::EntryState::Pending, now)
                     .await;
                 writeln!(stdout, "Done")?;
                 if !state_persisted {
