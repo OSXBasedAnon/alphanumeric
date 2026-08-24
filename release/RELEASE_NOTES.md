@@ -18,9 +18,9 @@ no database migration, no wallet migration, no resync.
   `argon2id`) — and the address reveals itself before a plain-language note on
   exactly what to back up. The old fake percent bar with invented "network
   propagation" stages is gone.
-- **Unlocking is not setting.** The startup passphrase prompt no longer demands
-  a confirmation re-type; entering an existing passphrase asks once.
-  Confirmation remains where it belongs, on first setting a passphrase.
+- **Passphrase prompts do the right thing.** Setting a passphrase still asks
+  twice to catch typos; unlocking at startup now asks once (it used to demand a
+  confirmation re-type there too).
 - **A help screen you can scan.** Rebuilt layout: named columns, tightened
   spacing, section rules instead of rails, and the `-c` short form documented.
 - **Status output that tells the truth.** Recovery explains the restore instead
