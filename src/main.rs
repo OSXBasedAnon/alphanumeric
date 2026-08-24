@@ -1418,8 +1418,11 @@ async fn async_main() -> Result<()> {
             println!("\nWallet(s) found. Enter passphrase (leave blank for unencrypted wallets):");
 
             let passphrase = zeroize::Zeroizing::new(
+                // Unlock, not set: this ENTERS an existing passphrase, so inquire's
+                // default confirmation re-ask is wrong here (mistype = retry loop).
                 Password::new("Passphrase:")
                     .with_display_mode(PasswordDisplayMode::Masked)
+                    .without_confirmation()
                     .prompt()
                     .unwrap_or_default(),
             );

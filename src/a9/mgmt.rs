@@ -604,6 +604,124 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
 /// so a swallowed write failure would lose the key on the next launch and permanently strand any
 /// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
 /// on this class; this closes the corresponding write side.
+
+// ─── wallet-creation checklist UI ──────────────────────────────────────────
+// The staged checklist the `new` command and the first-run default wallet
+// share. Each step is an indicatif spinner that resolves to a ✓ line whose
+// annotation states what ACTUALLY happened (sizes, algorithms, durability) —
+// the old flow printed a fake percent bar with invented "network propagation"
+// stages. Colors are the ui.rs palette; every effect degrades cleanly when
+// stdout is not a terminal (spinners hide, the address prints plainly).
+
+fn wc_rule(stdout: &mut StandardStream) -> Result<()> {
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_HAIRLINE)))?;
+    writeln!(stdout, "{}", crate::a9::ui::UI_RULE)?;
+    stdout.reset()?;
+    Ok(())
+}
+
+fn wc_step(stdout: &mut StandardStream, label: &str, annotation: &str) -> Result<()> {
+    // The spinner runs for a beat so the step is perceivable; the annotation is
+    // written only when the step is truly done, so a crash mid-flow never shows
+    // a ✓ for work that did not complete. Steps call this AFTER the real work.
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(format!("{:<26} {}", label, annotation));
+    pb.enable_steady_tick(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(280));
+    pb.finish_and_clear();
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_GREEN)))?;
+    write!(stdout, "  ✓ ")?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_LABEL)))?;
+    write!(stdout, "{:<26}", label)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, " {}", annotation)?;
+    stdout.reset()?;
+    Ok(())
+}
+
+/// Reveal the address by locking hex left-to-right out of noise. Pure display:
+/// the wallet exists and is persisted before this runs. Skipped when stdout is
+/// not a TTY (piped/captured output gets one plain line).
+fn wc_reveal_address(stdout: &mut StandardStream, address: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "\n  address")?;
+    stdout.reset()?;
+    if std::io::stdout().is_terminal() {
+        const HEX: &[u8] = b"0123456789abcdef";
+        // Deterministic tiny LCG — no rand dependency, no security relevance.
+        let mut seed: u32 = 0x9e37_79b9;
+        let frames = address.len() + 8;
+        for f in 0..=frames {
+            let locked = (address.len() * f / frames).min(address.len());
+            let mut line = String::with_capacity(address.len());
+            line.push_str(&address[..locked]);
+            for _ in locked..address.len() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                line.push(HEX[(seed >> 24) as usize & 0xf] as char);
+            }
+            stdout.set_color(ColorSpec::new().set_fg(Some(if locked == address.len() {
+                crate::a9::ui::UI_CYAN
+            } else {
+                crate::a9::ui::UI_FAINT
+            })))?;
+            write!(stdout, "\r  {}", line)?;
+            stdout.flush()?;
+            std::thread::sleep(Duration::from_millis(26));
+        }
+        writeln!(stdout)?;
+        stdout.reset()?;
+    } else {
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_CYAN)))?;
+        writeln!(stdout, "  {}", address)?;
+        stdout.reset()?;
+    }
+    Ok(())
+}
+
+fn wc_header(stdout: &mut StandardStream, title: &str) -> Result<()> {
+    writeln!(stdout)?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_CYAN)))?;
+    write!(stdout, "  {}", title)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "  ·  ml-dsa-87 · post-quantum")?;
+    stdout.reset()?;
+    wc_rule(stdout)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+fn wc_footer(stdout: &mut StandardStream, name: &str, is_encrypted: bool) -> Result<()> {
+    writeln!(stdout)?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_GREEN)))?;
+    write!(stdout, "  ✓ {} is ready", name)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    writeln!(stdout, "   ·   balance 0   ·   mine or receive to fund it")?;
+    stdout.reset()?;
+    wc_rule(stdout)?;
+    stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+    if is_encrypted {
+        writeln!(
+            stdout,
+            "  private.key + passphrase = your funds. lose both, lose the wallet — back them up now."
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "  private.key IS your funds — it is not encrypted. anyone who reads it can spend; back it up now."
+        )?;
+    }
+    stdout.reset()?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
 async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
     // Last-line invariant at the durable boundary: even if a future wallet-mutation path forgets
     // its own preflight check, it cannot persist a file in which one name aliases multiple keys.
@@ -716,84 +834,25 @@ impl Mgmt {
             }
         };
 
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-        writeln!(stdout, "\nInitializing wallet creation process...")?;
-        stdout.reset()?;
+        wc_header(&mut stdout, "NEW WALLET")?;
 
-        // Progress bar with async operations
-        let steps = 10;
-        for i in 0..=steps {
-            // Progress bar
-            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
-            write!(stdout, "\rProgress: [")?;
-            for j in 0..steps {
-                if j < i {
-                    write!(stdout, "=")?;
-                } else if j == i {
-                    write!(stdout, ">")?;
-                } else {
-                    write!(stdout, " ")?;
-                }
-            }
-            write!(stdout, "] {}%", (i as u32 * 100) / steps as u32)?;
-            stdout.flush()?;
-
-            // Status messages
-            match i {
-                2 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Generating cryptographic keys...")?;
-                }
-                4 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Initializing wallet structure...")?;
-                }
-                6 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Preparing network propagation...")?;
-                }
-                8 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Syncing with network peers...")?;
-                }
-                _ => {}
-            }
-            stdout.reset()?;
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        writeln!(stdout)?;
-
-        // Create the wallet with timeout
-        let wallet = match tokio::time::timeout(Duration::from_secs(5), async {
-            if is_encrypted {
-                Wallet::new(passphrase)
-            } else {
-                Wallet::new(None)
-            }
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
-                writeln!(
-                    stdout,
-                    "Wallet creation timed out, but proceeding with local setup..."
-                )?;
-                stdout.reset()?;
-                if is_encrypted {
-                    Wallet::new(passphrase)?
-                } else {
-                    Wallet::new(None)?
-                }
-            }
+        // Key generation is synchronous and local; the old 5s "network" timeout
+        // around it guarded nothing and is gone with the fake progress stages.
+        let wallet = if is_encrypted {
+            Wallet::new(passphrase)?
+        } else {
+            Wallet::new(None)?
         };
-
-        // Save key data with timeout
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-        writeln!(stdout, "\nSaving wallet data...")?;
-        stdout.reset()?;
+        wc_step(
+            &mut stdout,
+            "key pair generated",
+            "ml-dsa-87 · 2592-byte public key",
+        )?;
+        wc_step(
+            &mut stdout,
+            "address derived",
+            "sha256(public key) · 20 bytes",
+        )?;
 
         let key_data = WalletKeyData::new(
             name.clone(),
@@ -809,20 +868,21 @@ impl Mgmt {
         // here rather than handing back a wallet whose ML-DSA seed exists only in RAM (which the
         // next launch would not find, permanently stranding any funds sent to the address).
         persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
-
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
-        writeln!(stdout, "\n✓ Wallet created successfully!")?;
-        stdout.reset()?;
-
-        // Display wallet information
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)))?;
-        writeln!(stdout, "\nWallet Address: {}", wallet.address)?;
+        wc_step(
+            &mut stdout,
+            "private.key written",
+            "fsync'd — the key survives power loss",
+        )?;
         if is_encrypted {
-            writeln!(stdout, "Encryption: Enabled")?;
-        } else {
-            writeln!(stdout, "Encryption: Disabled")?;
+            wc_step(
+                &mut stdout,
+                "encrypted",
+                "argon2id — with the session passphrase",
+            )?;
         }
-        stdout.reset()?;
+
+        wc_reveal_address(&mut stdout, &wallet.address)?;
+        wc_footer(&mut stdout, &name, is_encrypted)?;
 
         // Register the wallet only after its key is durably persisted.
         wallets.insert(name, wallet.clone());
@@ -838,11 +898,17 @@ impl Mgmt {
         let mut wallets = HashMap::new();
         let default_wallet_name = "default_wallet".to_string();
 
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-        writeln!(stdout, "\nInitializing wallet creation process...")?;
-        stdout.reset()?;
+        wc_header(&mut stdout, "FIRST WALLET")?;
 
-        println!("\nWould you like to encrypt your wallet with a passphrase? (y/n): ");
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_DIM)))?;
+        write!(stdout, "  encrypt with a passphrase?  ")?;
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_LABEL)))?;
+        write!(stdout, "[y/n]")?;
+        stdout.set_color(ColorSpec::new().set_fg(Some(crate::a9::ui::UI_FAINT)))?;
+        writeln!(stdout, "  — recommended; protects private.key at rest")?;
+        stdout.reset()?;
+        write!(stdout, "  > ")?;
+        stdout.flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
@@ -869,87 +935,31 @@ impl Mgmt {
 
             if !pass.trim().is_empty() {
                 let pass_bytes = zeroize::Zeroizing::new(pass.trim().as_bytes().to_vec());
-                println!("\nImportant Security Information: Your passphrase and the private.key file are essential for accessing your wallet. If you lose either of these, your funds will be irretrievable. Store them securely and create backups.");
                 (Some(pass_bytes), true)
             } else {
-                println!("Creating unencrypted wallet...");
                 (None, false)
             }
         } else {
-            println!("Creating unencrypted wallet...");
-            println!("\nSecurity Risk: This wallet is unencrypted. Protect your private.key—loss is irreversible. Encryption is strongly advised to mitigate risk.");
             (None, false)
         };
-
-        // Progress bar with async operations
-        let steps = 10;
-        for i in 0..=steps {
-            // Progress bar
-            stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
-            write!(stdout, "\rProgress: [")?;
-            for j in 0..steps {
-                if j < i {
-                    write!(stdout, "=")?;
-                } else if j == i {
-                    write!(stdout, ">")?;
-                } else {
-                    write!(stdout, " ")?;
-                }
-            }
-            write!(stdout, "] {}%", (i * 100) / steps)?;
-            stdout.flush()?;
-
-            match i {
-                2 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Generating cryptographic keys...")?;
-                }
-                4 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Initializing wallet structure...")?;
-                }
-                6 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Preparing network propagation...")?;
-                }
-                8 => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-                    writeln!(stdout, " Syncing with network peers...")?;
-                }
-                _ => {}
-            }
-            stdout.reset()?;
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
         writeln!(stdout)?;
 
-        // Create the wallet with timeout
+        // Key generation is synchronous and local; the old 5s "network" timeout
+        // around it guarded nothing and is gone with the fake progress stages.
         let wallet = {
             let pass_slice = wallet_pass.as_deref();
-
-            match tokio::time::timeout(Duration::from_secs(5), async {
-                Wallet::new(pass_slice.map(Vec::as_slice))
-            })
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    stdout.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
-                    writeln!(
-                        stdout,
-                        "Wallet creation timed out, but proceeding with local setup..."
-                    )?;
-                    stdout.reset()?;
-                    Wallet::new(pass_slice.map(Vec::as_slice))?
-                }
-            }
+            Wallet::new(pass_slice.map(Vec::as_slice))?
         };
-
-        // Save key data with timeout
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(132, 132, 132))))?;
-        writeln!(stdout, "\nSaving wallet data...")?;
-        stdout.reset()?;
+        wc_step(
+            &mut stdout,
+            "key pair generated",
+            "ml-dsa-87 · 2592-byte public key",
+        )?;
+        wc_step(
+            &mut stdout,
+            "address derived",
+            "sha256(public key) · 20 bytes",
+        )?;
 
         let key_data = WalletKeyData::new(
             default_wallet_name.clone(),
@@ -966,22 +976,20 @@ impl Mgmt {
         // address and any funds it received. Fail loudly instead.
         persist_wallet_keys(KEY_FILE_PATH, &key_data_vec).await?;
 
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::Rgb(59, 242, 173))))?;
-        writeln!(stdout, "\n✓ Wallet created successfully!")?;
-        stdout.reset()?;
+        wc_step(
+            &mut stdout,
+            "private.key written",
+            "fsync'd — the key survives power loss",
+        )?;
+        if is_encrypted {
+            wc_step(&mut stdout, "encrypted", "argon2id")?;
+        }
 
-        // Display wallet information
-        stdout.set_color(ColorSpec::new().set_fg(Some(Color::White)))?;
-        writeln!(stdout, "\nWallet Address: {}", wallet.address)?;
-        stdout.reset()?;
+        wc_reveal_address(&mut stdout, &wallet.address)?;
+        wc_footer(&mut stdout, &default_wallet_name, is_encrypted)?;
 
         // Register the wallet only after its key is durably persisted.
         wallets.insert(default_wallet_name, wallet);
-
-        // Avoid self-relaunch: spawning a second copy of the executable is a common heuristic trigger
-        // for endpoint protection tools. The app can continue running; the newly-created wallet is
-        // already in memory, and callers can re-init any derived state without restarting.
-        println!("\nWallet created. If you need a clean re-init, restart the application.");
 
         Ok(wallets)
     }
