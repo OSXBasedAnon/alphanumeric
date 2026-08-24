@@ -22499,7 +22499,10 @@ mod tests {
                 sender.bind_addr,
                 &announcement,
                 vec![1],
-                Duration::from_secs(2),
+                // Generous on purpose: this deadline proves the request is BOUNDED,
+                // not that loopback is fast — 2s flaked on a loaded CI runner
+                // (fresh connect + negotiation + round trip under parallel tests).
+                Duration::from_secs(10),
             )
             .await
             .expect("bounded missing-body request round trip");
@@ -22518,7 +22521,7 @@ mod tests {
                 .send_compact_want_full_v2(block.hash, sender.bind_addr)
                 .await
         );
-        timeout(Duration::from_secs(5), async {
+        timeout(Duration::from_secs(30), async {
             while sender
                 .compact_metrics
                 .want_full_served
