@@ -8,13 +8,13 @@ command; see the setup sections below.
 
 The client stores its chain database, node identity, wallets, and lock files beside the folder you run it from unless you set a custom database path.
 
-## Required upgrade before block 569,423
+## Minimum version: 7.9.4 (Reward Accounting V2)
 
-Version 7.9.4 contains a scheduled reward-accounting update that activates at
-block `569,423`. Miners, pools, public nodes, and other validating operators must
-upgrade before that height. Blocks below the activation height are unchanged.
-The upgrade is a drop-in binary replacement: it requires no database migration,
-wallet migration, or resync.
+Reward Accounting V2 activated at block `569,423` (2026-08-13). Any build older
+than 7.9.4 cannot follow consensus past that height and will fall off the
+chain; 7.9.4 is therefore the floor, and the current release is what you should
+run. Upgrading is a drop-in binary replacement: no database migration, wallet
+migration, or resync.
 
 ## Setup — macOS (prebuilt download)
 

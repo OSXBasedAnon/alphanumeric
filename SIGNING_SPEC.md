@@ -161,6 +161,16 @@ SHA-256 matches; derive the sender from it and confirm it matches; sign the
 message and confirm the signature's SHA-256 matches. If all three match, your
 implementation is byte-compatible with the network.
 
+## Encoding stability
+
+As of 8.0.1 the crates that produce the byte encodings in this document are
+pinned to exact versions in the node, and golden-byte tests hold the signed
+message and wire encodings against any dependency or refactor drift: if a
+change would alter even one byte of what you sign or submit, the node's own
+test suite fails before it can ship. The formats below are therefore stable in
+the strongest sense available — byte-for-byte, enforced in CI — and any future
+intentional format change would arrive as a new spec revision, not silently.
+
 ## Notes
 
 - The submit endpoint runs the same validation the node applies to every
