@@ -598,13 +598,6 @@ async fn write_secret_file(path: &str, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Persist the serialized wallet key set to `key_file_path`, returning Err on either an I/O
-/// failure or the 5s timeout. Persisting the key is a PRECONDITION for treating a wallet as
-/// created: the ML-DSA seed lives only in RAM until this write, and `save_wallets` was removed,
-/// so a swallowed write failure would lose the key on the next launch and permanently strand any
-/// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
-/// on this class; this closes the corresponding write side.
-
 // ─── wallet-creation checklist UI ──────────────────────────────────────────
 // The staged checklist the `new` command and the first-run default wallet
 // share. Each step is an indicatif spinner that resolves to a ✓ line whose
@@ -722,6 +715,12 @@ fn wc_footer(stdout: &mut StandardStream, name: &str, is_encrypted: bool) -> Res
     Ok(())
 }
 
+/// Persist the serialized wallet key set to `key_file_path`, returning Err on either an I/O
+/// failure or the 5s timeout. Persisting the key is a PRECONDITION for treating a wallet as
+/// created: the ML-DSA seed lives only in RAM until this write, and `save_wallets` was removed,
+/// so a swallowed write failure would lose the key on the next launch and permanently strand any
+/// funds sent to the address. The read side (`load_wallets`) was already hardened to fail loudly
+/// on this class; this closes the corresponding write side.
 async fn persist_wallet_keys(key_file_path: &str, key_data_vec: &[WalletKeyData]) -> Result<()> {
     // Last-line invariant at the durable boundary: even if a future wallet-mutation path forgets
     // its own preflight check, it cannot persist a file in which one name aliases multiple keys.
