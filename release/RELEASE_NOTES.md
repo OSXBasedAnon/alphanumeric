@@ -1,3 +1,64 @@
+# alphanumeric v8.0.1
+
+Reliability and operator-experience release on top of 8.0.0. **No change to
+block validity rules** — 8.0.1, 8.0.0, and 7.9.x nodes stay on the same chain,
+follow each other, and accept each other's blocks. Drop-in binary replacement:
+no database migration, no wallet migration, no resync.
+
+## What you get
+
+- **`contacts` — an address book you never fill in.** Derived from your own
+  transaction history in one bounded scan, sorted most active first, with a
+  zero-state screen that explains itself. `send` and `history` understand the
+  names it shows.
+- **A help screen you can scan.** Rebuilt layout: named columns, tightened
+  spacing, section rules instead of rails, and the `-c` short form documented.
+- **Status output that tells the truth.** Recovery explains the restore instead
+  of alarming; the boot spinner speaks operator vocabulary rather than module
+  names; catch-up refusals name the reason instead of failing silently.
+- **Lookup correctness.** A confirmed transaction is never reported unknown
+  while the index rebuilds, and the supply estimate is keyed on the
+  balances-height marker with a writer generation fence, so it can neither
+  double-count nor go stale.
+- **Steadier under stress.** One sync stall costs one reset instead of a
+  self-sustaining storm, and the boot/runtime heal window no longer has a dead
+  band between what boot keeps and what runtime can repair.
+- **Clean shutdown.** SIGTERM terminates the node instead of being absorbed at
+  the interactive prompt, and an orderly stop or in-place restart no longer
+  prints a spurious error from an in-flight catch-up batch.
+- **Consensus encoding pinned.** The serialization crates are pinned exactly and
+  the encoding is held by golden-byte tests; size-constant relationships and
+  wire variant names are guarded so a refactor cannot silently change the wire.
+- **Warning-free source builds on Windows.**
+
+## GPU mining build
+
+The GPU backend continues to live on the `gpu-mining` branch and ships as a
+separate `-gpu` artifact. The 8.0.1 GPU build mines on the GPU by default
+(`--cpu` opts out) and additionally carries the compact block relay (v2), a
+transport-only bandwidth reduction with no consensus impact. Build from source
+with `cargo build --release --features gpu_miner` on that branch. Guide:
+`docs/GPU_MINING.md` (gpu-mining branch).
+
+## Operator action
+
+Replace the binary and restart. Confirm the process reports version `8.0.1`.
+Wallet keys, node identity, configuration, and the chain database are untouched.
+
+## Building from source
+
+Unchanged from 8.0.0: rustc 1.89 or newer, no system dependencies beyond the
+Rust toolchain.
+
+## Notes
+
+There is no wallet migration, no transaction-format change, and no
+network-message change. Release artifacts and their SHA-256 checksums must be
+generated from the reviewed `8.0.1` tag; checksums from earlier releases do not
+apply.
+
+---
+
 # alphanumeric v8.0.0
 
 Storage engine release. The node's embedded database moves from `sled` to
