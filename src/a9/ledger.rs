@@ -908,6 +908,10 @@ fn set_restrictive_permissions(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
+    // Windows: NTFS ACLs are not applied here (same as the wallet key helper);
+    // the parameter is only consumed on unix, so name the fact for the linter.
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -921,6 +925,9 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
             .unwrap_or_else(|| PathBuf::from("."));
         File::open(parent)?.sync_all()?;
     }
+    // Windows has no directory fsync; the rename is already durable enough there.
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
