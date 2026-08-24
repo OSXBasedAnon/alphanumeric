@@ -11,6 +11,16 @@ no database migration, no wallet migration, no resync.
   transaction history in one bounded scan, sorted most active first, with a
   zero-state screen that explains itself. `send` and `history` understand the
   names it shows.
+- **Wallet creation worthy of the keys it makes.** Both `new` and the
+  first-run default wallet walk a staged checklist — each step resolves to a
+  ✓ with what actually happened (`ml-dsa-87 · 2592-byte public key`,
+  `sha256(public key) · 20 bytes`, `fsync'd — the key survives power loss`,
+  `argon2id`) — and the address reveals itself before a plain-language note on
+  exactly what to back up. The old fake percent bar with invented "network
+  propagation" stages is gone.
+- **Unlocking is not setting.** The startup passphrase prompt no longer demands
+  a confirmation re-type; entering an existing passphrase asks once.
+  Confirmation remains where it belongs, on first setting a passphrase.
 - **A help screen you can scan.** Rebuilt layout: named columns, tightened
   spacing, section rules instead of rails, and the `-c` short form documented.
 - **Status output that tells the truth.** Recovery explains the restore instead
