@@ -1,3 +1,60 @@
+# alphanumeric v8.0.2
+
+Resilience release on top of 8.0.1. **No change to block validity rules** —
+8.0.2, 8.0.1, 8.0.0 and 7.9.x nodes stay on the same chain, follow each other,
+and accept each other's blocks. Drop-in binary replacement: no database
+migration, no wallet migration, no resync.
+
+## What you get
+
+- **Boots in seconds, not minutes.** The tip is read from the persisted tip
+  pointer (validated) instead of a scan that copied every block body, and the start-up
+  structural walk resumes from a durable mark instead of re-reading the chain
+  from genesis on every clean start (~11 min at 1.8M blocks). The mark is
+  retracted below any reorg before slots are rewritten and re-stamped after a
+  dirty recovery, so it never vouches for a rewritten row. A long walk (after a
+  bootstrap or an unclean stop) now says so and reports progress.
+  `ALPHANUMERIC_VERIFY_FULL_CHAIN=true` forces the from-genesis audit.
+- **A bad block no longer costs a rebuild.** A block that overspends is
+  rejected before the dirty marker is written, so the next apply is not forced
+  through the full derived-state rebuild.
+- **Heals a lost race on its own.** When a sync batch does not link onto the
+  local chain, the node re-requests from a widening window below its tip (1, 2,
+  4 … 64 blocks) so the competing branch reaches the reorg path, and blocks it
+  parks keep the witnesses it just verified so that branch can actually be
+  adopted. (The 11-02 1.5 h stall.)
+- **A full disk restarts the node instead of wedging it.** The storage engine's
+  "dead until reopened" state is recognised at the error boundary; a headless
+  node exits with status 4 so its supervisor reopens the store. A store that
+  merely failed to open (lock held, permissions, disk full) now stops the boot
+  with the cause instead of being set aside or deleted.
+- **Mempool refuses what can never confirm.** A transaction stamped more than 5
+  minutes ahead or already past the 6 h freshness window is rejected at
+  admission and swept from pending, so a stray millisecond timestamp can no
+  longer reserve the sender's funds indefinitely.
+- **Miner templates respect reward maturity**, so a solve is never burned on
+  a template the chain would refuse.
+- **Publisher:** the snapshot export checks free space before cloning, backs
+  off across consecutive failures, and sweeps artifacts left by killed
+  processes.
+- **Explorer API:** every read endpoint shares the read budget and the HTTP
+  servers close connections that never finish their headers.
+- **Wallet `new`** asks for (and confirms) a passphrase when the session's
+  passphrase was never proven against an existing encrypted wallet.
+- **Reorg replay detection (staged).** A branch that confirms the same
+  transaction twice is now detected and logged; rejection is scheduled behind
+  `REORG_TX_DEDUPE_ACTIVATION_HEIGHT` and activates in a later release once
+  the network's miners carry it.
+- Dependency refresh: rustls, rustls-webpki, webpki-root-certs, tokio, zstd.
+
+## Operator action
+
+Replace the binary and restart. Confirm the process reports version `8.0.2`.
+Supervisors should treat exit status 4 like exit status 3: restart. Wallet
+keys, node identity, configuration, and the chain database are untouched.
+
+---
+
 # alphanumeric v8.0.1
 
 Reliability and operator-experience release on top of 8.0.0. **No change to
