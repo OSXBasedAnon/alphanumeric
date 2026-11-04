@@ -6544,8 +6544,14 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                     b.set_position(i as u64);
                 }
                 let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-                let entry_name = file.name();
-                let relative = std::path::Path::new(entry_name);
+                // zip 9 validates the stored name (UTF-8, no NUL) before handing
+                // it out; an entry whose name cannot be read is a malformed
+                // archive, not a file to create.
+                let entry_name = file
+                    .name()
+                    .map_err(|e| format!("Unreadable bootstrap archive entry name: {}", e))?
+                    .into_owned();
+                let relative = std::path::Path::new(&entry_name);
                 if relative.is_absolute()
                     || relative
                         .components()
@@ -6572,7 +6578,7 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                         entry_name
                     ));
                 }
-                if file.name().ends_with('/') {
+                if entry_name.ends_with('/') {
                     std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
                 } else {
                     let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
@@ -7306,7 +7312,11 @@ fn sweep_abandoned_bootstrap_exports(tmp: &Path) -> usize {
             std::fs::remove_file(&path).is_ok()
         };
         if gone {
-            warn!("removed abandoned bootstrap export artifact {} (pid {} is gone)", path.display(), pid);
+            warn!(
+                "removed abandoned bootstrap export artifact {} (pid {} is gone)",
+                path.display(),
+                pid
+            );
             removed += 1;
         }
     }
@@ -8650,25 +8660,49 @@ mod tests {
         let (needed, free) = super::export_space_shortfall(2 * gib, Some(2 * gib)).unwrap();
         assert_eq!(free, 2 * gib);
         assert_eq!(needed, 2 * gib + gib / 4 + 256 * 1024 * 1024);
-        assert_eq!(super::export_space_shortfall(2 * gib, None), None, "unknown = proceed");
+        assert_eq!(
+            super::export_space_shortfall(2 * gib, None),
+            None,
+            "unknown = proceed"
+        );
 
         assert_eq!(super::publish_retry_backoff_secs("boom", 0), 120);
         assert_eq!(super::publish_retry_backoff_secs("boom", 1), 240);
         assert_eq!(super::publish_retry_backoff_secs("boom", 4), 1_920);
         assert_eq!(super::publish_retry_backoff_secs("boom", 5), 3_600);
-        assert_eq!(super::publish_retry_backoff_secs("boom", 40), 3_600, "capped, no overflow");
-        assert_eq!(super::publish_retry_backoff_secs("HTTP 401 unauthorized", 0), 600);
+        assert_eq!(
+            super::publish_retry_backoff_secs("boom", 40),
+            3_600,
+            "capped, no overflow"
+        );
+        assert_eq!(
+            super::publish_retry_backoff_secs("HTTP 401 unauthorized", 0),
+            600
+        );
         assert_eq!(super::publish_retry_backoff_secs("redirected", 3), 3_600);
     }
 
     #[test]
     fn bootstrap_temp_artifact_names_yield_their_pid_only() {
         use super::bootstrap_temp_artifact_pid as pid_of;
-        assert_eq!(pid_of("alphanumeric-bootstrap-1848429-1793803839-85402.zip"), Some(85402));
-        assert_eq!(pid_of("alphanumeric-bootstrap-export-1848429-1793803839-85402"), Some(85402));
-        assert_eq!(pid_of("alphanumeric-bootstrap-export-1848429-1793803839-"), None);
+        assert_eq!(
+            pid_of("alphanumeric-bootstrap-1848429-1793803839-85402.zip"),
+            Some(85402)
+        );
+        assert_eq!(
+            pid_of("alphanumeric-bootstrap-export-1848429-1793803839-85402"),
+            Some(85402)
+        );
+        assert_eq!(
+            pid_of("alphanumeric-bootstrap-export-1848429-1793803839-"),
+            None
+        );
         assert_eq!(pid_of("alphanumeric-bootstrap-notes.txt"), None);
-        assert_eq!(pid_of("blockchain.db.bootstrap_tmp_123"), None, "client extraction dirs are not ours");
+        assert_eq!(
+            pid_of("blockchain.db.bootstrap_tmp_123"),
+            None,
+            "client extraction dirs are not ours"
+        );
         assert_eq!(pid_of("com.apple.launchd.xyz"), None);
     }
 
@@ -8679,16 +8713,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
         // Ours (live), a dead pid (u32::MAX is never a live pid), and a foreign file.
-        std::fs::create_dir_all(dir.join(format!("alphanumeric-bootstrap-export-1-2-{me}"))).unwrap();
+        std::fs::create_dir_all(dir.join(format!("alphanumeric-bootstrap-export-1-2-{me}")))
+            .unwrap();
         std::fs::write(dir.join("alphanumeric-bootstrap-1-2-4294967295.zip"), b"x").unwrap();
         std::fs::create_dir_all(dir.join("alphanumeric-bootstrap-export-1-2-4294967295")).unwrap();
         std::fs::write(dir.join("unrelated.zip"), b"x").unwrap();
 
         assert_eq!(super::sweep_abandoned_bootstrap_exports(&dir), 2);
-        assert!(dir.join(format!("alphanumeric-bootstrap-export-1-2-{me}")).exists());
+        assert!(dir
+            .join(format!("alphanumeric-bootstrap-export-1-2-{me}"))
+            .exists());
         assert!(dir.join("unrelated.zip").exists());
-        assert!(!dir.join("alphanumeric-bootstrap-1-2-4294967295.zip").exists());
-        assert!(!dir.join("alphanumeric-bootstrap-export-1-2-4294967295").exists());
+        assert!(!dir
+            .join("alphanumeric-bootstrap-1-2-4294967295.zip")
+            .exists());
+        assert!(!dir
+            .join("alphanumeric-bootstrap-export-1-2-4294967295")
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9531,7 +9572,7 @@ mod tests {
             let mut archive = zip::ZipArchive::new(f).unwrap();
             for i in 0..archive.len() {
                 let mut zf = archive.by_index(i).unwrap();
-                let rel = zf.name().to_string();
+                let rel = zf.name().unwrap().into_owned();
                 let outpath = out_dir.join(&rel);
                 if rel.ends_with('/') {
                     std::fs::create_dir_all(&outpath).unwrap();
@@ -9632,7 +9673,7 @@ mod tests {
             let mut archive = zip::ZipArchive::new(f).unwrap();
             for i in 0..archive.len() {
                 let mut zf = archive.by_index(i).unwrap();
-                let rel = zf.name().to_string();
+                let rel = zf.name().unwrap().into_owned();
                 let outpath = out_dir.join(&rel);
                 if rel.ends_with('/') {
                     std::fs::create_dir_all(&outpath).unwrap();

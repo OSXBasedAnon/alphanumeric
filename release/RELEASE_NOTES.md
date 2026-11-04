@@ -45,7 +45,14 @@ migration, no wallet migration, no resync.
   transaction twice is now detected and logged; rejection is scheduled behind
   `REORG_TX_DEDUPE_ACTIVATION_HEIGHT` and activates in a later release once
   the network's miners carry it.
-- Dependency refresh: rustls, rustls-webpki, webpki-root-certs, tokio, zstd.
+- Dependency refresh: rustls, rustls-webpki, webpki-root-certs, tokio; zip 6 → 9
+  (RUSTSEC-2026-0367/0368/0369/0429 — none reachable, the bootstrap restore never
+  calls `extract()`, but the gate is mandatory) trimmed to the Deflated/Stored
+  shape the archives use, which drops the aes/bzip2/lzma/ppmd/xz/zstd decoders
+  from the binary; ctutils, der and clipboard-win off yanked/advisory releases.
+  The one advisory that cannot be fixed without a webrtc major (crypto-bigint
+  0.5.5, RUSTSEC-2026-0387: per-connection ephemeral DTLS key only) is carried
+  as a reviewed, time-bounded exception in `deny.toml` / `osv-scanner.toml`.
 
 ## Operator action
 

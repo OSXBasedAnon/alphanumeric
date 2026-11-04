@@ -96,7 +96,10 @@ sled = { version = "0.34.0", optional = true }
 redb = "4.1"
 env_logger = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-zip = "6"
+# Only the shipped archive shape: Deflated/Stored entries with timestamps. The
+# default feature set drags in aes/bzip2/lzma/ppmd/xz/zstd decoders the
+# bootstrap path never reads — less surface, fewer advisories to carry.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 axum = "0.6"
 ctrlc = "3.4"
