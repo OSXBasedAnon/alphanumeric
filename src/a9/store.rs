@@ -1178,3 +1178,4 @@ mod tests {
         assert!(!path.exists(), "temp store file removed on drop");
     }
 }
+
