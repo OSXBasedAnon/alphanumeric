@@ -108,9 +108,15 @@ pub const MATURITY_ACTIVATION_HEIGHT: u32 = 1500;
 /// enforces it before the rest of the network does can refuse a branch the
 /// network adopts. Until this height the branch is accepted and the replay is
 /// logged at error level so operators can see whether it ever happens live.
-/// Staged exactly like MATURITY_ACTIVATION_HEIGHT: set it when the network's
-/// miners run a build that carries this rule.
-pub const REORG_TX_DEDUPE_ACTIVATION_HEIGHT: u32 = u32::MAX;
+/// Staged like MATURITY_ACTIVATION_HEIGHT: `None` = detect and log only; set
+/// `Some(height)` in the release the network's miners run with this rule.
+pub const REORG_TX_DEDUPE_ACTIVATION_HEIGHT: Option<u32> = None;
+
+/// Whether a reorg whose branch starts at `fork_start` is subject to
+/// [`REORG_TX_DEDUPE_ACTIVATION_HEIGHT`] enforcement (rather than logging).
+pub fn reorg_tx_dedupe_enforced_at(fork_start: u32) -> bool {
+    REORG_TX_DEDUPE_ACTIVATION_HEIGHT.is_some_and(|activation| fork_start >= activation)
+}
 /// Frontier window (blocks) for the periodic in-persist integrity check. 256
 /// blocks ≈ 21 minutes of history at the 5s target — far deeper than any live
 /// reorg surface (reorgs at/below the trusted checkpoint are rejected outright)
@@ -1709,10 +1715,11 @@ pub struct WalletBalanceBreakdown {
 /// Every `save_block` persists a `{height, hash}` tip pointer in the chain_meta
 /// tree; when that pointer names a stored block whose hash matches, it is the
 /// answer. Otherwise (fresh DB, crash between the block write and the pointer
-/// write, hand-edited store) fall back to [`highest_block_index_in`]. The
-/// previous implementation scanned every `block_` entry — keys AND multi-KB
-/// bodies — on every boot, which at 1.8M blocks was minutes of I/O that the
-/// external watchdog read as a hung process (10-24, 10-28 publisher outages).
+/// write, hand-edited store) fall back to [`highest_block_index_in`], a key walk
+/// that copies no bodies. The previous implementation scanned every `block_`
+/// entry — keys AND multi-KB bodies — on every boot, which at 1.8M blocks was
+/// minutes of I/O that the external watchdog read as a hung process (10-24,
+/// 10-28 publisher outages).
 pub fn local_tip_height_in(db: &Store) -> Option<u32> {
     persisted_tip_height_in(db).or_else(|| highest_block_index_in(db))
 }
@@ -1729,41 +1736,29 @@ fn persisted_tip_height_in(db: &Store) -> Option<u32> {
     (block.hash == tip.hash).then_some(tip.height)
 }
 
-/// Greatest `block_<n>` index in `db`, in at most 33 point lookups.
+/// Greatest `block_<n>` index in `db` by walking every `block_` key.
 ///
-/// The canonical slots are downward-closed: `save_block` appends at tip+1 and
-/// the only deletion anywhere is the reorg's atomic drop of stale heights ABOVE
-/// the adopted branch tip. So "is `block_h` present" is monotone in `h`, and a
-/// binary search over existence finds the tip in O(log u32) B-tree lookups —
-/// no key order assumptions (keys are decimal, so bytewise order is not numeric
-/// order) and no value is ever read. A store read error falls back to the
-/// exhaustive scan rather than trusting a half-finished search.
+/// This is the authoritative form and the only one that is correct for ANY
+/// store shape: block keys are decimal without leading zeros, so bytewise order
+/// is not numeric order and no single range probe can answer this, and a
+/// store is not guaranteed downward-closed (tests and tooling seed sparse
+/// chains; a crash-recovery walk must still fail closed on a missing genesis).
+/// It is the fallback behind the validated tip pointer, which every
+/// `save_block` maintains, so a healthy node never pays for it at boot. When
+/// it does run it reads keys through the engine's page cursor without copying
+/// a single block body out — the old scan materialised every value.
 pub fn highest_block_index_in(db: &Store) -> Option<u32> {
-    match bisect_highest_block_index(db) {
-        Ok(found) => found,
+    let mut highest: Option<u32> = None;
+    let walked = db.for_each_prefix(b"block_", |key, _value| {
+        if let Some(index) = Blockchain::block_index_from_key(key) {
+            highest = Some(highest.map_or(index, |h| h.max(index)));
+        }
+        true
+    });
+    match walked {
+        Ok(()) => highest,
         Err(_) => highest_block_index_scan_in(db),
     }
-}
-
-fn bisect_highest_block_index(db: &Store) -> Result<Option<u32>, store::StoreError> {
-    let present = |height: u32| db.contains_key(format!("block_{height}").as_bytes());
-    if !present(0)? {
-        return Ok(None);
-    }
-    if present(u32::MAX)? {
-        return Ok(Some(u32::MAX));
-    }
-    // Invariant: present(lo) && !present(hi).
-    let (mut lo, mut hi) = (0u32, u32::MAX);
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if present(mid)? {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo))
 }
 
 /// `ALPHANUMERIC_VERIFY_FULL_CHAIN=true`: walk the canonical rows from genesis on
@@ -1777,8 +1772,8 @@ fn full_chain_walk_forced() -> bool {
     })
 }
 
-/// The exhaustive form: every `block_` key, numeric max. Reads values too, so it
-/// is minutes on a large chain — the probe above is the normal path.
+/// The original paged scan (keys AND values copied out), kept as the last
+/// resort if the streaming walk above errors mid-way.
 fn highest_block_index_scan_in(db: &Store) -> Option<u32> {
     db.scan_prefix("block_")
         .filter_map(|entry| entry.ok().and_then(|(k, _)| Blockchain::block_index_from_key(&k)))
@@ -4599,7 +4594,7 @@ impl Blockchain {
         let branch_tip_index = branch.last().map(|b| b.index).unwrap_or(fork_start);
         let branch_tx_ids = match Self::branch_regular_tx_ids(&branch) {
             Ok(ids) => ids,
-            Err((height, tx_id)) if fork_start >= REORG_TX_DEDUPE_ACTIVATION_HEIGHT => {
+            Err((height, tx_id)) if reorg_tx_dedupe_enforced_at(fork_start) => {
                 warn!(
                     "Reorg rejected: branch {}..={} confirms tx {} twice (again at block {})",
                     fork_start, branch_tip_index, tx_id, height
@@ -5809,7 +5804,7 @@ impl Blockchain {
     /// per-sender lookup is byte-identical to the per-tx scan while turning a full block's
     /// O(tx x MATURITY) block reads into O(MATURITY), keeping the gates well under the miner's
     /// solve-validation timeout as blocks fill.
-    fn immature_rewards_by_recipient(
+    pub(crate) fn immature_rewards_by_recipient(
         &self,
         transactions: &[Transaction],
         spend_height: u32,
@@ -9879,14 +9874,17 @@ mod tests {
     }
 
     #[test]
-    fn highest_block_index_probe_matches_exhaustive_scan() {
+    fn highest_block_index_walk_matches_exhaustive_scan() {
         // Contiguous prefixes whose tips straddle every digit-length boundary
-        // (bytewise and numeric order disagree there). Sparse sets are outside
-        // the contract: canonical slots are always downward-closed.
-        let cases: &[u32] = &[0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 1023, 1024, 4095];
-        let cases: Vec<Vec<u32>> = std::iter::once(Vec::new())
-            .chain(cases.iter().map(|&tip| (0..=tip).collect()))
+        // (bytewise and numeric order disagree there), plus sparse stores: the
+        // walk must be exact for any shape, including a missing genesis.
+        let tips: &[u32] = &[0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 1023, 1024, 4095];
+        let mut cases: Vec<Vec<u32>> = std::iter::once(Vec::new())
+            .chain(tips.iter().map(|&tip| (0..=tip).collect()))
             .collect();
+        cases.push(vec![1_000]);
+        cases.push(vec![1, 2, 3, 4]); // genesis deleted
+        cases.push(vec![5, 50, 500, 5_000, 1_848_429, 4_294_967_295]);
         for heights in &cases {
             let db = store::Store::temporary().unwrap();
             for &h in heights.iter() {
@@ -11798,7 +11796,10 @@ mod tests {
             Blockchain::branch_regular_tx_ids(&[b4, b5, b6]),
             Err((6, replay))
         );
-        assert!(REORG_TX_DEDUPE_ACTIVATION_HEIGHT == u32::MAX, "staged: not yet activated");
+        // Staged: no fork point is enforced yet, so the replay above is logged,
+        // not rejected, on every reorg.
+        assert!(!reorg_tx_dedupe_enforced_at(0), "staged: not yet activated");
+        assert!(!reorg_tx_dedupe_enforced_at(u32::MAX), "staged: not yet activated");
     }
 
     #[test]
@@ -15444,7 +15445,7 @@ mod tests {
     async fn duplicate_transaction_admission_is_idempotent() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_000).await;
+        let tx = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs()).await;
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
 
         blockchain
@@ -15475,7 +15476,7 @@ mod tests {
     async fn concurrent_duplicate_admission_has_exactly_one_insertion() {
         let blockchain = Arc::new(test_blockchain());
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"cc".repeat(20), 1.0, 10_000).await;
+        let tx = signed_transfer(&wallet, &"cc".repeat(20), 1.0, Blockchain::now_unix_secs()).await;
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
         let chain_a = Arc::clone(&blockchain);
         let chain_b = Arc::clone(&blockchain);
@@ -15505,7 +15506,7 @@ mod tests {
     async fn durable_pending_row_is_classified_and_rehydrated() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"dd".repeat(20), 1.0, 10_001).await;
+        let tx = signed_transfer(&wallet, &"dd".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
         let tx_id = tx.get_tx_id();
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
         assert_eq!(
@@ -15531,7 +15532,7 @@ mod tests {
     async fn confirmed_transaction_returns_its_atomic_outcome() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"ee".repeat(20), 1.0, 10_002).await;
+        let tx = signed_transfer(&wallet, &"ee".repeat(20), 1.0, Blockchain::now_unix_secs() + 2).await;
         blockchain
             .open_confirmed_tx_tree()
             .unwrap()
@@ -15548,8 +15549,8 @@ mod tests {
     async fn concurrent_same_sender_admission_respects_pending_debits() {
         let blockchain = Arc::new(test_blockchain());
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx1 = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_001).await;
-        let tx2 = signed_transfer(&wallet, &"cc".repeat(20), 1.0, 10_002).await;
+        let tx1 = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
+        let tx2 = signed_transfer(&wallet, &"cc".repeat(20), 1.0, Blockchain::now_unix_secs() + 2).await;
         set_confirmed_balance(&blockchain, &wallet.address, tx1.total_debit_units());
 
         let chain1 = Arc::clone(&blockchain);
@@ -15587,8 +15588,8 @@ mod tests {
         // Asymmetric amounts (delta_a < delta_b) so the pre-fix double-subtract lands on a specific
         // non-saturated value (delta_b - delta_a), not merely the saturating floor of 0 — the debit
         // assertion then pins "cleared exactly once" precisely.
-        let tx_a = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 20_001).await;
-        let tx_b = signed_transfer(&wallet, &"cc".repeat(20), 2.0, 20_002).await;
+        let tx_a = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 11).await;
+        let tx_b = signed_transfer(&wallet, &"cc".repeat(20), 2.0, Blockchain::now_unix_secs() + 12).await;
         let delta_a = tx_a.total_debit_units();
         let delta_b = tx_b.total_debit_units();
 
@@ -15635,7 +15636,7 @@ mod tests {
         let sender = Wallet::new(None).expect("sender wallet should build");
         let recipient = Wallet::new(None).expect("recipient wallet should build");
 
-        let tx = signed_transfer(&sender, &recipient.address, 1.75, 10_000).await;
+        let tx = signed_transfer(&sender, &recipient.address, 1.75, Blockchain::now_unix_secs()).await;
         set_confirmed_balance(&bc, &sender.address, tx.total_debit_units());
         bc.add_transaction(tx.clone()).await.expect("tx admitted");
 
@@ -17273,7 +17274,7 @@ mod tests {
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
 
         // amount 0.01 -> percentage fee 0.00000563 (563 units), under the 10_000-unit floor.
-        let low = signed_transfer(&wallet, &"bb".repeat(20), 0.01, 10_000).await;
+        let low = signed_transfer(&wallet, &"bb".repeat(20), 0.01, Blockchain::now_unix_secs()).await;
         assert!(low.fee_units < MIN_RELAY_FEE_UNITS);
         let err = blockchain
             .add_transaction(low)
@@ -17282,7 +17283,7 @@ mod tests {
         assert!(matches!(err, BlockchainError::FeeBelowRelayFloor));
 
         // amount 1.0 -> percentage fee 0.000563 (56_306 units) clears the floor.
-        let ok = signed_transfer(&wallet, &"bb".repeat(20), 1.0, 10_001).await;
+        let ok = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
         assert!(ok.fee_units >= MIN_RELAY_FEE_UNITS);
         blockchain
             .add_transaction(ok)
