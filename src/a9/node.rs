@@ -19876,7 +19876,11 @@ impl Node {
         if Some(claimed) == local_parent_hash {
             return None;
         }
-        let next = if rewind == 0 { 1 } else { rewind.checked_mul(2)? };
+        let next = if rewind == 0 {
+            1
+        } else {
+            rewind.checked_mul(2)?
+        };
         if next > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN {
             return None;
         }
@@ -22061,16 +22065,30 @@ mod tests {
         assert_eq!(rewind(97, Some(theirs), Some(ours), 4, 40), Some((93, 8)));
         assert_eq!(rewind(93, Some(theirs), Some(ours), 8, 40), Some((85, 16)));
         assert_eq!(rewind(85, Some(theirs), Some(ours), 16, 40), Some((69, 32)));
-        assert_eq!(rewind(69, Some(theirs), Some(ours), 32, 40), Some((40, 64)), "clamped to floor");
-        assert_eq!(rewind(40, Some(theirs), Some(ours), 64, 40), None, "window exhausted");
+        assert_eq!(
+            rewind(69, Some(theirs), Some(ours), 32, 40),
+            Some((40, 64)),
+            "clamped to floor"
+        );
+        assert_eq!(
+            rewind(40, Some(theirs), Some(ours), 64, 40),
+            None,
+            "window exhausted"
+        );
 
         // Floor reached early: no further rewind once start sits on it.
-        assert_eq!(rewind(101, Some(theirs), Some(ours), 0, 100), Some((100, 1)));
+        assert_eq!(
+            rewind(101, Some(theirs), Some(ours), 0, 100),
+            Some((100, 1))
+        );
         assert_eq!(rewind(100, Some(theirs), Some(ours), 1, 100), None);
         // Fresh chain with nothing held at start-1 still steps back.
         assert_eq!(rewind(5, Some(theirs), None, 0, 1), Some((4, 1)));
         // No arithmetic surprises at the top of the range.
-        assert_eq!(rewind(u32::MAX, Some(theirs), Some(ours), 0, 1), Some((u32::MAX - 1, 1)));
+        assert_eq!(
+            rewind(u32::MAX, Some(theirs), Some(ours), 0, 1),
+            Some((u32::MAX - 1, 1))
+        );
     }
 
     #[test]

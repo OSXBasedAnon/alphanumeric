@@ -1776,7 +1776,11 @@ fn full_chain_walk_forced() -> bool {
 /// resort if the streaming walk above errors mid-way.
 fn highest_block_index_scan_in(db: &Store) -> Option<u32> {
     db.scan_prefix("block_")
-        .filter_map(|entry| entry.ok().and_then(|(k, _)| Blockchain::block_index_from_key(&k)))
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|(k, _)| Blockchain::block_index_from_key(&k))
+        })
         .max()
 }
 
@@ -9922,14 +9926,22 @@ mod tests {
 
         // Pointer names a block whose stored hash differs: ignored, probe wins.
         let meta = bc.open_chain_meta_tree().unwrap();
-        let forged = ChainTipMetadata { height: 10, hash: [0xEE; 32] };
-        meta.insert(CHAIN_TIP_KEY, codec::serialize(&forged).unwrap()).unwrap();
+        let forged = ChainTipMetadata {
+            height: 10,
+            hash: [0xEE; 32],
+        };
+        meta.insert(CHAIN_TIP_KEY, codec::serialize(&forged).unwrap())
+            .unwrap();
         assert_eq!(persisted_tip_height_in(&db), None);
         assert_eq!(local_tip_height_in(&db), Some(11));
 
         // Pointer names a height that no longer exists: same fallback.
-        let gone = ChainTipMetadata { height: 500, hash: [0u8; 32] };
-        meta.insert(CHAIN_TIP_KEY, codec::serialize(&gone).unwrap()).unwrap();
+        let gone = ChainTipMetadata {
+            height: 500,
+            hash: [0u8; 32],
+        };
+        meta.insert(CHAIN_TIP_KEY, codec::serialize(&gone).unwrap())
+            .unwrap();
         assert_eq!(local_tip_height_in(&db), Some(11));
 
         // Undecodable pointer bytes: same fallback.
@@ -11712,19 +11724,42 @@ mod tests {
     fn pending_timestamp_window_matches_template_and_block_rules() {
         let now = 1_700_000_000u64;
         assert!(Blockchain::pending_timestamp_is_confirmable(now, now));
-        assert!(Blockchain::pending_timestamp_is_confirmable(now + MAX_BLOCK_FUTURE_TIME, now));
-        assert!(!Blockchain::pending_timestamp_is_confirmable(now + MAX_BLOCK_FUTURE_TIME + 1, now));
-        assert!(!Blockchain::pending_timestamp_is_confirmable(now * 1000, now)); // milliseconds
-        assert!(Blockchain::pending_timestamp_is_confirmable(now - MAX_TX_AGE_SECS, now));
-        assert!(!Blockchain::pending_timestamp_is_confirmable(now - MAX_TX_AGE_SECS - 1, now));
+        assert!(Blockchain::pending_timestamp_is_confirmable(
+            now + MAX_BLOCK_FUTURE_TIME,
+            now
+        ));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(
+            now + MAX_BLOCK_FUTURE_TIME + 1,
+            now
+        ));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(
+            now * 1000,
+            now
+        )); // milliseconds
+        assert!(Blockchain::pending_timestamp_is_confirmable(
+            now - MAX_TX_AGE_SECS,
+            now
+        ));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(
+            now - MAX_TX_AGE_SECS - 1,
+            now
+        ));
         assert!(Blockchain::pending_timestamp_is_confirmable(0, 10)); // early clock, no underflow
 
         // Prune: an unconfirmable row goes even with the TTL disabled; the TTL
         // (when set) additionally bounds stale-but-confirmable rows.
         assert!(Blockchain::pending_row_is_expired(now * 1000, now, None));
         assert!(!Blockchain::pending_row_is_expired(now - 3_000, now, None));
-        assert!(Blockchain::pending_row_is_expired(now - 3_000, now, Some(2_000)));
-        assert!(!Blockchain::pending_row_is_expired(now - 1_000, now, Some(2_000)));
+        assert!(Blockchain::pending_row_is_expired(
+            now - 3_000,
+            now,
+            Some(2_000)
+        ));
+        assert!(!Blockchain::pending_row_is_expired(
+            now - 1_000,
+            now,
+            Some(2_000)
+        ));
     }
 
     #[tokio::test]
@@ -11735,18 +11770,36 @@ mod tests {
         let now = Blockchain::now_unix_secs();
 
         let future = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now * 1000).await;
-        let err = bc.admit_transaction(future).await.expect_err("ms timestamp refused");
-        assert!(matches!(err, BlockchainError::TransactionTimestampOutOfWindow), "{err:?}");
+        let err = bc
+            .admit_transaction(future)
+            .await
+            .expect_err("ms timestamp refused");
+        assert!(
+            matches!(err, BlockchainError::TransactionTimestampOutOfWindow),
+            "{err:?}"
+        );
 
-        let stale = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now - MAX_TX_AGE_SECS - 60).await;
-        let err = bc.admit_transaction(stale).await.expect_err("expired timestamp refused");
-        assert!(matches!(err, BlockchainError::TransactionTimestampOutOfWindow), "{err:?}");
+        let stale =
+            signed_transfer(&wallet, &"ee".repeat(20), 1.0, now - MAX_TX_AGE_SECS - 60).await;
+        let err = bc
+            .admit_transaction(stale)
+            .await
+            .expect_err("expired timestamp refused");
+        assert!(
+            matches!(err, BlockchainError::TransactionTimestampOutOfWindow),
+            "{err:?}"
+        );
 
         // Nothing was reserved for either.
-        assert_eq!(bc.get_pending_debit_units(&wallet.address).await.unwrap(), 0);
+        assert_eq!(
+            bc.get_pending_debit_units(&wallet.address).await.unwrap(),
+            0
+        );
 
         let fresh = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now).await;
-        bc.admit_transaction(fresh).await.expect("a current timestamp is admitted");
+        bc.admit_transaction(fresh)
+            .await
+            .expect("a current timestamp is admitted");
     }
 
     #[test]
@@ -11773,9 +11826,18 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(bc.prune_pending_transactions().unwrap(), 1);
-        assert!(pending.get(far_future.get_tx_id().as_bytes()).unwrap().is_none());
-        assert!(pending.get(near_future.get_tx_id().as_bytes()).unwrap().is_some());
-        assert!(pending.get(current.get_tx_id().as_bytes()).unwrap().is_some());
+        assert!(pending
+            .get(far_future.get_tx_id().as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(pending
+            .get(near_future.get_tx_id().as_bytes())
+            .unwrap()
+            .is_some());
+        assert!(pending
+            .get(current.get_tx_id().as_bytes())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -11785,7 +11847,10 @@ mod tests {
         let b5 = test_block_with_txs(5, b4.hash, "miner5", 10.0, &[("carol", "dave", 2.0)]);
         let ids = Blockchain::branch_regular_tx_ids(&[b4.clone(), b5.clone()]).expect("distinct");
         assert_eq!(ids.len(), 2);
-        assert!(!ids.contains(&b4.transactions[0].get_tx_id()), "coinbase ids are not tracked");
+        assert!(
+            !ids.contains(&b4.transactions[0].get_tx_id()),
+            "coinbase ids are not tracked"
+        );
 
         // The same payment confirmed again two blocks later: reported at the
         // LATER height, by id.
@@ -11799,7 +11864,10 @@ mod tests {
         // Staged: no fork point is enforced yet, so the replay above is logged,
         // not rejected, on every reorg.
         assert!(!reorg_tx_dedupe_enforced_at(0), "staged: not yet activated");
-        assert!(!reorg_tx_dedupe_enforced_at(u32::MAX), "staged: not yet activated");
+        assert!(
+            !reorg_tx_dedupe_enforced_at(u32::MAX),
+            "staged: not yet activated"
+        );
     }
 
     #[test]
@@ -12315,7 +12383,10 @@ mod tests {
         let err = bc
             .validate_canonical_chain_structure_from_mark(false)
             .expect_err("tampering above the mark fails closed");
-        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 17, .. }), "{err:?}");
+        assert!(
+            matches!(err, BlockchainError::CanonicalCorruption { height: 17, .. }),
+            "{err:?}"
+        );
         // A failed walk leaves the mark where it was.
         assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 12);
 
@@ -12326,7 +12397,8 @@ mod tests {
             prev = b.hash;
             insert_raw_block(&bc, &b);
         }
-        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .unwrap();
         assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 20);
 
         // Tamper BELOW the mark: by contract the incremental walk trusts the
@@ -12339,7 +12411,10 @@ mod tests {
         let err = bc
             .validate_canonical_chain_structure_from_mark(true)
             .expect_err("a forced full walk re-reads every row");
-        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }), "{err:?}");
+        assert!(
+            matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }),
+            "{err:?}"
+        );
 
         // Rewriting the attested row itself invalidates the mark: full walk,
         // which now also sees the deep fault.
@@ -12350,7 +12425,10 @@ mod tests {
         let err = bc
             .validate_canonical_chain_structure_from_mark(false)
             .expect_err("a rewritten attested row discards the mark");
-        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }), "{err:?}");
+        assert!(
+            matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }),
+            "{err:?}"
+        );
     }
 
     /// The reorg path retracts the mark below the first rewritten slot, and a
@@ -12359,7 +12437,8 @@ mod tests {
     fn structure_mark_is_lowered_before_slots_are_rewritten() {
         let bc = test_blockchain();
         raw_chain_to(&bc, 10, &"88".repeat(20));
-        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .unwrap();
         assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 10);
 
         bc.lower_structure_mark_below(11).unwrap(); // nothing at or above 11
@@ -12374,13 +12453,15 @@ mod tests {
         assert!(bc.read_structure_mark().unwrap().is_none());
 
         // A mark above the tip never resumes anything.
-        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .unwrap();
         for h in 8..=10 {
             delete_raw_block(&bc, h);
         }
         bc.rebuild_chain_tip_metadata().unwrap(); // raw deletes bypass the tip bump
         assert!(bc.structure_mark_resume_point(7).is_none());
-        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .unwrap();
         assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 7);
     }
 
@@ -15514,7 +15595,13 @@ mod tests {
     async fn durable_pending_row_is_classified_and_rehydrated() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"dd".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
+        let tx = signed_transfer(
+            &wallet,
+            &"dd".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 1,
+        )
+        .await;
         let tx_id = tx.get_tx_id();
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
         assert_eq!(
@@ -15540,7 +15627,13 @@ mod tests {
     async fn confirmed_transaction_returns_its_atomic_outcome() {
         let blockchain = test_blockchain();
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx = signed_transfer(&wallet, &"ee".repeat(20), 1.0, Blockchain::now_unix_secs() + 2).await;
+        let tx = signed_transfer(
+            &wallet,
+            &"ee".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 2,
+        )
+        .await;
         blockchain
             .open_confirmed_tx_tree()
             .unwrap()
@@ -15557,8 +15650,20 @@ mod tests {
     async fn concurrent_same_sender_admission_respects_pending_debits() {
         let blockchain = Arc::new(test_blockchain());
         let wallet = Wallet::new(None).expect("test wallet should build");
-        let tx1 = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
-        let tx2 = signed_transfer(&wallet, &"cc".repeat(20), 1.0, Blockchain::now_unix_secs() + 2).await;
+        let tx1 = signed_transfer(
+            &wallet,
+            &"bb".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 1,
+        )
+        .await;
+        let tx2 = signed_transfer(
+            &wallet,
+            &"cc".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 2,
+        )
+        .await;
         set_confirmed_balance(&blockchain, &wallet.address, tx1.total_debit_units());
 
         let chain1 = Arc::clone(&blockchain);
@@ -15596,8 +15701,20 @@ mod tests {
         // Asymmetric amounts (delta_a < delta_b) so the pre-fix double-subtract lands on a specific
         // non-saturated value (delta_b - delta_a), not merely the saturating floor of 0 — the debit
         // assertion then pins "cleared exactly once" precisely.
-        let tx_a = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 11).await;
-        let tx_b = signed_transfer(&wallet, &"cc".repeat(20), 2.0, Blockchain::now_unix_secs() + 12).await;
+        let tx_a = signed_transfer(
+            &wallet,
+            &"bb".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 11,
+        )
+        .await;
+        let tx_b = signed_transfer(
+            &wallet,
+            &"cc".repeat(20),
+            2.0,
+            Blockchain::now_unix_secs() + 12,
+        )
+        .await;
         let delta_a = tx_a.total_debit_units();
         let delta_b = tx_b.total_debit_units();
 
@@ -15644,7 +15761,13 @@ mod tests {
         let sender = Wallet::new(None).expect("sender wallet should build");
         let recipient = Wallet::new(None).expect("recipient wallet should build");
 
-        let tx = signed_transfer(&sender, &recipient.address, 1.75, Blockchain::now_unix_secs()).await;
+        let tx = signed_transfer(
+            &sender,
+            &recipient.address,
+            1.75,
+            Blockchain::now_unix_secs(),
+        )
+        .await;
         set_confirmed_balance(&bc, &sender.address, tx.total_debit_units());
         bc.add_transaction(tx.clone()).await.expect("tx admitted");
 
@@ -17218,7 +17341,8 @@ mod tests {
             pub_key: Some("cd".repeat(10)),
             sig_hash: Some(sig_hash),
         });
-        competitor.merkle_root = Blockchain::calculate_merkle_root(&competitor.transactions).unwrap();
+        competitor.merkle_root =
+            Blockchain::calculate_merkle_root(&competitor.transactions).unwrap();
         competitor.hash = competitor.calculate_hash_for_block();
         let mut truncated = competitor.clone();
         truncated.transactions[1].signature = Some(full_sig[..128].to_string());
@@ -17282,7 +17406,8 @@ mod tests {
         set_confirmed_balance(&blockchain, &wallet.address, Transaction::to_units(10.0));
 
         // amount 0.01 -> percentage fee 0.00000563 (563 units), under the 10_000-unit floor.
-        let low = signed_transfer(&wallet, &"bb".repeat(20), 0.01, Blockchain::now_unix_secs()).await;
+        let low =
+            signed_transfer(&wallet, &"bb".repeat(20), 0.01, Blockchain::now_unix_secs()).await;
         assert!(low.fee_units < MIN_RELAY_FEE_UNITS);
         let err = blockchain
             .add_transaction(low)
@@ -17291,7 +17416,13 @@ mod tests {
         assert!(matches!(err, BlockchainError::FeeBelowRelayFloor));
 
         // amount 1.0 -> percentage fee 0.000563 (56_306 units) clears the floor.
-        let ok = signed_transfer(&wallet, &"bb".repeat(20), 1.0, Blockchain::now_unix_secs() + 1).await;
+        let ok = signed_transfer(
+            &wallet,
+            &"bb".repeat(20),
+            1.0,
+            Blockchain::now_unix_secs() + 1,
+        )
+        .await;
         assert!(ok.fee_units >= MIN_RELAY_FEE_UNITS);
         blockchain
             .add_transaction(ok)

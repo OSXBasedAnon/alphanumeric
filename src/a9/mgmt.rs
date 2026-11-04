@@ -3853,9 +3853,15 @@ mod tests {
         let loaded_plain_only: HashSet<&str> = ["plain"].into_iter().collect();
         let loaded_both: HashSet<&str> = ["plain", "vault"].into_iter().collect();
         assert!(!session_passphrase_is_proven(&stored, &HashSet::new()));
-        assert!(!session_passphrase_is_proven(&stored, &loaded_plain_only), "a plaintext wallet proves nothing");
+        assert!(
+            !session_passphrase_is_proven(&stored, &loaded_plain_only),
+            "a plaintext wallet proves nothing"
+        );
         assert!(session_passphrase_is_proven(&stored, &loaded_both));
-        assert!(!session_passphrase_is_proven(&[], &loaded_both), "no stored records, nothing proven");
+        assert!(
+            !session_passphrase_is_proven(&[], &loaded_both),
+            "no stored records, nothing proven"
+        );
     }
 
     use super::*;
