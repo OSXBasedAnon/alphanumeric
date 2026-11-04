@@ -627,12 +627,30 @@ fn is_recall_line(command: &str, editor_present: bool) -> bool {
     !editor_present && matches!(command, "\u{1b}[A" | "\u{1b}OA")
 }
 
+/// The effective log directive list: ERROR by default so the interactive UI
+/// stays clean, `RUST_LOG` layered on top so field diagnostics stay possible,
+/// and `webrtc_ice` pinned to ERROR unless `RUST_LOG` names it. The ICE
+/// gatherer warns on every STUN lookup on an IPv4-only host ("No available
+/// ipv6 IP address found"), several lines per peer per cycle; with the usual
+/// `RUST_LOG=info`/`warn` of a service file that is most of the log, and in a
+/// terminal it draws over the prompt. A module directive outranks the bare
+/// level in env_logger, so this only touches that one crate.
+fn log_filter_spec(rust_log: Option<&str>) -> String {
+    let mut spec = String::from("error");
+    let rust_log = rust_log.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(r) = rust_log {
+        spec.push(',');
+        spec.push_str(r);
+    }
+    if !rust_log.is_some_and(|r| r.contains("webrtc_ice")) {
+        spec.push_str(",webrtc_ice=error");
+    }
+    spec
+}
+
 async fn async_main() -> Result<()> {
-    // Initialize logging with ERROR level during startup to avoid UI interference.
-    // RUST_LOG still wins when set so field diagnostics stay possible.
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Error)
-        .parse_default_env()
+        .parse_filters(&log_filter_spec(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     print_ascii_intro();
@@ -8583,6 +8601,22 @@ impl WhisperAccum {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_filter_pins_ice_noise_unless_rust_log_names_it() {
+        assert_eq!(log_filter_spec(None), "error,webrtc_ice=error");
+        assert_eq!(log_filter_spec(Some("")), "error,webrtc_ice=error");
+        assert_eq!(log_filter_spec(Some("info")), "error,info,webrtc_ice=error");
+        assert_eq!(
+            log_filter_spec(Some("warn,alphanumeric::a9::node=info")),
+            "error,warn,alphanumeric::a9::node=info,webrtc_ice=error"
+        );
+        // An operator who asks for the ICE agent keeps it.
+        assert_eq!(
+            log_filter_spec(Some("info,webrtc_ice=debug")),
+            "error,info,webrtc_ice=debug"
+        );
+    }
+
     #[test]
     fn export_space_guard_and_backoff_are_pure_and_bounded() {
         let gib = 1u64 << 30;
