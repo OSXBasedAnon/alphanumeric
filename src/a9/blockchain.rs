@@ -98,6 +98,19 @@ pub const MINING_REWARD_MATURITY: u32 = 100;
 /// new-binary node produces and converge normally; only an old miner that itself
 /// spends an immature reward gets that block orphaned and self-heals via convergence.
 pub const MATURITY_ACTIVATION_HEIGHT: u32 = 1500;
+/// Activation height for rejecting a reorg branch that confirms the same
+/// non-coinbase transaction id in two of its own blocks.
+///
+/// The linear tip path already rejects that (`block_has_replayed_tx`), so the
+/// same two blocks are valid or invalid today depending only on whether a node
+/// saw them one at a time or as a branch. Enforcing it on the reorg path is a
+/// strict tightening (soft fork) that converges the two paths — but a node that
+/// enforces it before the rest of the network does can refuse a branch the
+/// network adopts. Until this height the branch is accepted and the replay is
+/// logged at error level so operators can see whether it ever happens live.
+/// Staged exactly like MATURITY_ACTIVATION_HEIGHT: set it when the network's
+/// miners run a build that carries this rule.
+pub const REORG_TX_DEDUPE_ACTIVATION_HEIGHT: u32 = u32::MAX;
 /// Frontier window (blocks) for the periodic in-persist integrity check. 256
 /// blocks ≈ 21 minutes of history at the 5s target — far deeper than any live
 /// reorg surface (reorgs at/below the trusted checkpoint are rejected outright)
@@ -1100,6 +1113,10 @@ pub enum BlockchainError {
     InvalidTransaction,
     InvalidBlockHeader,
     InvalidBlockTimestamp,
+    /// Mempool policy: a transaction stamped outside the window a block could
+    /// ever confirm it in (more than MAX_BLOCK_FUTURE_TIME ahead, or already
+    /// older than MAX_TX_AGE_SECS).
+    TransactionTimestampOutOfWindow,
     InvalidTransactionAmount,
     InvalidTransactionSignature,
     InvalidBlockKeys(String),
@@ -1151,6 +1168,12 @@ impl fmt::Display for BlockchainError {
             BlockchainError::InvalidTransaction => write!(f, "Transaction is invalid"),
             BlockchainError::InvalidBlockHeader => write!(f, "Block header is invalid"),
             BlockchainError::InvalidBlockTimestamp => write!(f, "Timestamp is invalid"),
+            BlockchainError::TransactionTimestampOutOfWindow => write!(
+                f,
+                "Transaction timestamp is outside the confirmable window (seconds since the \
+                 Unix epoch; at most {} s ahead, at most {} s behind)",
+                MAX_BLOCK_FUTURE_TIME, MAX_TX_AGE_SECS
+            ),
             BlockchainError::InvalidTransactionAmount => {
                 write!(f, "Transaction amount is invalid or negative")
             }
@@ -4556,33 +4579,48 @@ impl Blockchain {
         // transaction from the range it replaces, but it must not replay one that is
         // confirmed BELOW the fork point (in the history the branch keeps). Reject a
         // branch that does — this closes replay via a crafted reorg.
-        for b in &branch {
-            for tx in &b.transactions {
-                if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
-                    continue;
-                }
-                if let Some(idx) = self.confirmed_tx_index(&tx.get_tx_id()) {
-                    if idx < fork_start {
-                        debug!(
-                            "Reorg rejected: branch replays tx confirmed at {} (below fork {})",
-                            idx, fork_start
-                        );
-                        return Ok(false);
-                    }
+        //
+        // The same pass collects the branch's own non-coinbase ids (used below to
+        // decide which reverted payments go back to the mempool) and so also sees a
+        // tx confirmed TWICE WITHIN the branch — the one replay the linear path
+        // rejects and this path, until REORG_TX_DEDUPE_ACTIVATION_HEIGHT, did not.
+        let branch_tip_index = branch.last().map(|b| b.index).unwrap_or(fork_start);
+        let branch_tx_ids = match Self::branch_regular_tx_ids(&branch) {
+            Ok(ids) => ids,
+            Err((height, tx_id)) if fork_start >= REORG_TX_DEDUPE_ACTIVATION_HEIGHT => {
+                warn!(
+                    "Reorg rejected: branch {}..={} confirms tx {} twice (again at block {})",
+                    fork_start, branch_tip_index, tx_id, height
+                );
+                return Ok(false);
+            }
+            Err((height, tx_id)) => {
+                error!(
+                    "Reorg branch {}..={} confirms tx {} twice (again at block {}); accepted \
+                     until REORG_TX_DEDUPE_ACTIVATION_HEIGHT — the payer is charged twice",
+                    fork_start, branch_tip_index, tx_id, height
+                );
+                branch
+                    .iter()
+                    .flat_map(|b| b.transactions.iter())
+                    .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+                    .map(|tx| tx.get_tx_id())
+                    .collect()
+            }
+        };
+        for id in &branch_tx_ids {
+            if let Some(idx) = self.confirmed_tx_index(id) {
+                if idx < fork_start {
+                    debug!(
+                        "Reorg rejected: branch replays tx confirmed at {} (below fork {})",
+                        idx, fork_start
+                    );
+                    return Ok(false);
                 }
             }
         }
 
         self.mark_chain_state_dirty(branch[0].index, "orphan_branch_reorg")?;
-
-        // Transactions the new branch (re-)confirms, so we do not return them to the
-        // mempool as if they were dropped.
-        let branch_tx_ids: std::collections::HashSet<String> = branch
-            .iter()
-            .flat_map(|b| b.transactions.iter())
-            .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
-            .map(|tx| tx.get_tx_id())
-            .collect();
 
         // Read the canonical blocks being reverted BEFORE they are overwritten:
         // unregister their transactions from the replay registry, and remember the
@@ -5201,22 +5239,35 @@ impl Blockchain {
         }
     }
 
+    /// Whether a pending transaction stamped `timestamp` could still land in a
+    /// block assembled at `now`: not further ahead than a block may be, and not
+    /// yet past the consensus freshness window. Pure; shared by admission and
+    /// the prune so the two can never disagree.
+    pub fn pending_timestamp_is_confirmable(timestamp: u64, now: u64) -> bool {
+        timestamp <= now.saturating_add(MAX_BLOCK_FUTURE_TIME)
+            && timestamp.saturating_add(MAX_TX_AGE_SECS) >= now
+    }
+
+    /// Prune rule for one pending row. A row that can never be confirmed again
+    /// goes regardless of the operator TTL (its debit reservation is the cost of
+    /// keeping it); the TTL, when set, additionally bounds how long a merely
+    /// unmined row is kept.
+    fn pending_row_is_expired(timestamp: u64, now: u64, ttl_secs: Option<u64>) -> bool {
+        !Self::pending_timestamp_is_confirmable(timestamp, now)
+            || ttl_secs.is_some_and(|ttl| now.saturating_sub(timestamp) > ttl)
+    }
+
     fn prune_pending_transactions(&self) -> Result<usize, BlockchainError> {
-        let Some(ttl_secs) = Self::pending_tx_ttl_secs() else {
-            return Ok(0);
-        };
+        let ttl_secs = Self::pending_tx_ttl_secs();
         let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
         let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = Self::now_unix_secs();
 
         let mut removed = 0usize;
         for result in pending_tree.iter() {
             let (key, tx_bytes) = result?;
             let remove = match deserialize_transaction(&tx_bytes) {
-                Ok(tx) => now.saturating_sub(tx.timestamp) > ttl_secs,
+                Ok(tx) => Self::pending_row_is_expired(tx.timestamp, now, ttl_secs),
                 Err(_) => true,
             };
             if remove {
@@ -6695,6 +6746,25 @@ impl Blockchain {
         hash_int <= target
     }
 
+    /// The non-coinbase transaction ids a candidate branch confirms, or the
+    /// first `(height, tx_id)` it confirms a second time. Pure and order-stable:
+    /// blocks ascend by height, so the reported height is the LATER inclusion.
+    fn branch_regular_tx_ids(branch: &[Block]) -> Result<HashSet<String>, (u32, String)> {
+        let mut ids = HashSet::new();
+        for block in branch {
+            for tx in &block.transactions {
+                if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                    continue;
+                }
+                let id = tx.get_tx_id();
+                if !ids.insert(id.clone()) {
+                    return Err((block.index, id));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// True if `transactions` repeats a non-coinbase transaction id. Coinbase (`MINING_REWARDS`)
     /// entries are exempt — single-coinbase positioning and reward correctness are enforced
     /// separately.
@@ -7163,6 +7233,18 @@ impl Blockchain {
 
         if !transaction.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
+        }
+
+        // Confirmable-window gate, mempool admission ONLY (block validation keeps
+        // its own freshness rules; this never touches block validity). A tx stamped
+        // beyond MAX_BLOCK_FUTURE_TIME is refused by every template
+        // (is_template_candidate) and, until the matching prune rule, was never
+        // dropped either — so its pending-debit reservation held the sender's
+        // funds for as long as the row lived. A millisecond timestamp from a
+        // payout script was enough. A tx already past MAX_TX_AGE_SECS is the
+        // mirror case: unmineable on arrival.
+        if !Self::pending_timestamp_is_confirmable(transaction.timestamp, Self::now_unix_secs()) {
+            return Err(BlockchainError::TransactionTimestampOutOfWindow);
         }
 
         // RELAY-POLICY fee floor (anti-spam). Like the self-transfer guard below,
@@ -11598,6 +11680,97 @@ mod tests {
             !bc.block_has_replayed_tx(&b6),
             "after revert the transaction is no longer a replay"
         );
+    }
+
+    #[test]
+    fn pending_timestamp_window_matches_template_and_block_rules() {
+        let now = 1_700_000_000u64;
+        assert!(Blockchain::pending_timestamp_is_confirmable(now, now));
+        assert!(Blockchain::pending_timestamp_is_confirmable(now + MAX_BLOCK_FUTURE_TIME, now));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(now + MAX_BLOCK_FUTURE_TIME + 1, now));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(now * 1000, now)); // milliseconds
+        assert!(Blockchain::pending_timestamp_is_confirmable(now - MAX_TX_AGE_SECS, now));
+        assert!(!Blockchain::pending_timestamp_is_confirmable(now - MAX_TX_AGE_SECS - 1, now));
+        assert!(Blockchain::pending_timestamp_is_confirmable(0, 10)); // early clock, no underflow
+
+        // Prune: an unconfirmable row goes even with the TTL disabled; the TTL
+        // (when set) additionally bounds stale-but-confirmable rows.
+        assert!(Blockchain::pending_row_is_expired(now * 1000, now, None));
+        assert!(!Blockchain::pending_row_is_expired(now - 3_000, now, None));
+        assert!(Blockchain::pending_row_is_expired(now - 3_000, now, Some(2_000)));
+        assert!(!Blockchain::pending_row_is_expired(now - 1_000, now, Some(2_000)));
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_a_transaction_stamped_outside_the_window() {
+        let bc = test_blockchain();
+        let wallet = Wallet::new(None).expect("wallet builds");
+        set_confirmed_balance(&bc, &wallet.address, Transaction::to_units(1_000.0));
+        let now = Blockchain::now_unix_secs();
+
+        let future = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now * 1000).await;
+        let err = bc.admit_transaction(future).await.expect_err("ms timestamp refused");
+        assert!(matches!(err, BlockchainError::TransactionTimestampOutOfWindow), "{err:?}");
+
+        let stale = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now - MAX_TX_AGE_SECS - 60).await;
+        let err = bc.admit_transaction(stale).await.expect_err("expired timestamp refused");
+        assert!(matches!(err, BlockchainError::TransactionTimestampOutOfWindow), "{err:?}");
+
+        // Nothing was reserved for either.
+        assert_eq!(bc.get_pending_debit_units(&wallet.address).await.unwrap(), 0);
+
+        let fresh = signed_transfer(&wallet, &"ee".repeat(20), 1.0, now).await;
+        bc.admit_transaction(fresh).await.expect("a current timestamp is admitted");
+    }
+
+    #[test]
+    fn prune_drops_unconfirmable_pending_rows() {
+        let bc = test_blockchain();
+        let now = Blockchain::now_unix_secs();
+        let pending = bc.db.open_tree(PENDING_TRANSACTIONS_TREE).unwrap();
+        let row = |ts: u64| Transaction {
+            sender: "aa".repeat(20),
+            recipient: "bb".repeat(20),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: ts,
+            signature: Some("cc".repeat(100)),
+            pub_key: None,
+            sig_hash: None,
+        };
+        let far_future = row(now * 1000);
+        let near_future = row(now + MAX_BLOCK_FUTURE_TIME - 5);
+        let current = row(now);
+        for tx in [&far_future, &near_future, &current] {
+            pending
+                .insert(tx.get_tx_id().as_bytes(), codec::serialize(tx).unwrap())
+                .unwrap();
+        }
+        assert_eq!(bc.prune_pending_transactions().unwrap(), 1);
+        assert!(pending.get(far_future.get_tx_id().as_bytes()).unwrap().is_none());
+        assert!(pending.get(near_future.get_tx_id().as_bytes()).unwrap().is_some());
+        assert!(pending.get(current.get_tx_id().as_bytes()).unwrap().is_some());
+    }
+
+    #[test]
+    fn branch_regular_tx_ids_reports_the_second_inclusion() {
+        let prev = [0u8; 32];
+        let b4 = test_block_with_txs(4, prev, "miner4", 10.0, &[("alice", "bob", 1.0)]);
+        let b5 = test_block_with_txs(5, b4.hash, "miner5", 10.0, &[("carol", "dave", 2.0)]);
+        let ids = Blockchain::branch_regular_tx_ids(&[b4.clone(), b5.clone()]).expect("distinct");
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&b4.transactions[0].get_tx_id()), "coinbase ids are not tracked");
+
+        // The same payment confirmed again two blocks later: reported at the
+        // LATER height, by id.
+        let mut b6 = test_block_with_txs(6, b5.hash, "miner6", 10.0, &[]);
+        b6.transactions.push(b4.transactions[1].clone());
+        let replay = b4.transactions[1].get_tx_id();
+        assert_eq!(
+            Blockchain::branch_regular_tx_ids(&[b4, b5, b6]),
+            Err((6, replay))
+        );
+        assert!(REORG_TX_DEDUPE_ACTIVATION_HEIGHT == u32::MAX, "staged: not yet activated");
     }
 
     #[test]
