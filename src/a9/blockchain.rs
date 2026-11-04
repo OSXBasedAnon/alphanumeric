@@ -110,6 +110,11 @@ const ORPHAN_INDEX_TREE: &str = "orphan_index";
 const CHAIN_META_TREE: &str = "chain_meta";
 const BALANCES_HEIGHT_KEY: &[u8] = b"__height";
 const CHAIN_TIP_KEY: &[u8] = b"tip";
+/// Durable attestation that canonical rows `0..=height` were authenticated as a
+/// chain by `validate_canonical_chain_structure`, keyed to the hash the row at
+/// `height` carried when the attestation was written. See that fn for the
+/// invariant and when the mark is lowered.
+const STRUCTURE_VERIFIED_KEY: &[u8] = b"structure_verified";
 const CHAIN_STATE_DIRTY_KEY: &[u8] = b"state_dirty";
 
 /// True once the operator has asked this process to stop — the typed `exit`, Ctrl-C,
@@ -1668,6 +1673,87 @@ pub struct WalletBalanceBreakdown {
     pub as_of_height: u64,
 }
 
+/// Height of the chain tip held in `db`, found WITHOUT reading block bodies.
+///
+/// Every `save_block` persists a `{height, hash}` tip pointer in the chain_meta
+/// tree; when that pointer names a stored block whose hash matches, it is the
+/// answer. Otherwise (fresh DB, crash between the block write and the pointer
+/// write, hand-edited store) fall back to [`highest_block_index_in`]. The
+/// previous implementation scanned every `block_` entry — keys AND multi-KB
+/// bodies — on every boot, which at 1.8M blocks was minutes of I/O that the
+/// external watchdog read as a hung process (10-24, 10-28 publisher outages).
+pub fn local_tip_height_in(db: &Store) -> Option<u32> {
+    persisted_tip_height_in(db).or_else(|| highest_block_index_in(db))
+}
+
+/// The persisted tip pointer, validated against the block it names. `None`
+/// when absent, undecodable, or when the named block is missing or has a
+/// different hash — every case the full-scan path must decide instead.
+fn persisted_tip_height_in(db: &Store) -> Option<u32> {
+    let meta = db.open_tree(CHAIN_META_TREE).ok()?;
+    let raw = meta.get(CHAIN_TIP_KEY).ok()??;
+    let tip: ChainTipMetadata = codec::deserialize(&raw).ok()?;
+    let body = db.get(format!("block_{}", tip.height).as_bytes()).ok()??;
+    let block = deserialize_block(&body).ok()?;
+    (block.hash == tip.hash).then_some(tip.height)
+}
+
+/// Greatest `block_<n>` index in `db`, in at most 33 point lookups.
+///
+/// The canonical slots are downward-closed: `save_block` appends at tip+1 and
+/// the only deletion anywhere is the reorg's atomic drop of stale heights ABOVE
+/// the adopted branch tip. So "is `block_h` present" is monotone in `h`, and a
+/// binary search over existence finds the tip in O(log u32) B-tree lookups —
+/// no key order assumptions (keys are decimal, so bytewise order is not numeric
+/// order) and no value is ever read. A store read error falls back to the
+/// exhaustive scan rather than trusting a half-finished search.
+pub fn highest_block_index_in(db: &Store) -> Option<u32> {
+    match bisect_highest_block_index(db) {
+        Ok(found) => found,
+        Err(_) => highest_block_index_scan_in(db),
+    }
+}
+
+fn bisect_highest_block_index(db: &Store) -> Result<Option<u32>, store::StoreError> {
+    let present = |height: u32| db.contains_key(format!("block_{height}").as_bytes());
+    if !present(0)? {
+        return Ok(None);
+    }
+    if present(u32::MAX)? {
+        return Ok(Some(u32::MAX));
+    }
+    // Invariant: present(lo) && !present(hi).
+    let (mut lo, mut hi) = (0u32, u32::MAX);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if present(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(Some(lo))
+}
+
+/// `ALPHANUMERIC_VERIFY_FULL_CHAIN=true`: walk the canonical rows from genesis on
+/// this boot regardless of the structure mark (a storage audit). Read once.
+fn full_chain_walk_forced() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ALPHANUMERIC_VERIFY_FULL_CHAIN")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The exhaustive form: every `block_` key, numeric max. Reads values too, so it
+/// is minutes on a large chain — the probe above is the normal path.
+fn highest_block_index_scan_in(db: &Store) -> Option<u32> {
+    db.scan_prefix("block_")
+        .filter_map(|entry| entry.ok().and_then(|(k, _)| Blockchain::block_index_from_key(&k)))
+        .max()
+}
+
 impl Blockchain {
     fn block_index_from_key(key: &[u8]) -> Option<u32> {
         let key_str = std::str::from_utf8(key).ok()?;
@@ -1676,10 +1762,7 @@ impl Blockchain {
     }
 
     fn highest_block_index_scan(&self) -> Option<u32> {
-        self.db
-            .scan_prefix("block_")
-            .filter_map(|entry| entry.ok().and_then(|(k, _)| Self::block_index_from_key(&k)))
-            .max()
+        highest_block_index_in(&self.db)
     }
 
     fn highest_block_index(&self) -> Option<u32> {
@@ -2917,18 +3000,144 @@ impl Blockchain {
         Ok(block)
     }
 
-    /// Authenticate the complete canonical row sequence before a clean node begins
-    /// trusting persisted derived state. The O(chain) startup cost is deliberate:
-    /// decodable corruption must not remain latent behind a valid-looking tip row.
+    /// Authenticate the canonical row sequence before a clean node begins trusting
+    /// persisted derived state — incrementally.
+    ///
+    /// Rows are immutable once written except through the reorg slot rewrite, so a
+    /// row authenticated once stays authenticated until something rewrites it.
+    /// The walk therefore resumes from the durable `STRUCTURE_VERIFIED_KEY` mark —
+    /// `{height, hash}` of the last row the previous walk reached — after
+    /// re-authenticating that one row and checking its hash still matches. Any
+    /// mismatch (slot rewritten, mark from a different store, decode failure)
+    /// discards the mark and walks from genesis, exactly as before. The reorg path
+    /// lowers the mark below `fork_start` BEFORE it rewrites slots, and dirty
+    /// recovery (which walks everything while rebuilding the derived indexes)
+    /// re-stamps it at the tip, so the mark can never vouch for a rewritten row.
+    ///
+    /// Why: the unconditional from-genesis walk was ~11 minutes at 1.8M blocks
+    /// (10-21, `load_structurally_valid_canonical_block` in every sample), during
+    /// which the node answered nothing — long enough for the external watchdog to
+    /// read a healthy restart as a hang and kill it into a loop. A node that shut
+    /// down cleanly now re-walks only what it appended since the last boot.
+    /// `ALPHANUMERIC_VERIFY_FULL_CHAIN=true` forces the from-genesis walk for an
+    /// operator who wants a storage audit.
     fn validate_canonical_chain_structure(&self) -> Result<(), BlockchainError> {
+        self.validate_canonical_chain_structure_from_mark(full_chain_walk_forced())
+    }
+
+    fn validate_canonical_chain_structure_from_mark(
+        &self,
+        force_full_walk: bool,
+    ) -> Result<(), BlockchainError> {
         let Some(tip) = self.highest_block_index() else {
             return Ok(());
         };
-        let mut previous: Option<Block> = None;
-        for height in 0..=tip {
+        let resume = if force_full_walk {
+            None
+        } else {
+            self.structure_mark_resume_point(tip)
+        };
+        let (start, mut previous) = match resume {
+            Some(block) => (block.index.saturating_add(1), Some(block)),
+            None => (0, None),
+        };
+
+        let span = tip.saturating_sub(start).saturating_add(1);
+        // A long walk is normal after a bootstrap, a dirty stop, or a forced audit;
+        // it is not a hang. Say so once, at a level the default filter shows.
+        const LONG_WALK_NOTICE_BLOCKS: u32 = 50_000;
+        if start <= tip && span >= LONG_WALK_NOTICE_BLOCKS {
+            warn!(
+                "verifying stored chain structure for {} block(s) ({}..={}) — can take minutes \
+                 on a large chain, do NOT kill the process",
+                span, start, tip
+            );
+        }
+        let mut last_bucket = u32::MAX;
+        for height in start..=tip {
             self.note_chain_progress();
             let block = self.load_structurally_valid_canonical_block(height, previous.as_ref())?;
+            if span >= LONG_WALK_NOTICE_BLOCKS {
+                let bucket = (height - start) / span.div_ceil(10);
+                if bucket != last_bucket {
+                    last_bucket = bucket;
+                    log::info!("chain structure walk: {}%", bucket * 10);
+                }
+            }
             previous = Some(block);
+        }
+        if let Some(reached) = previous.as_ref() {
+            self.write_structure_mark(reached)?;
+        }
+        Ok(())
+    }
+
+    /// The row the durable structure mark vouches for, re-authenticated and
+    /// re-matched by hash, when it still lies at or below `tip`. `None` means
+    /// "walk from genesis".
+    fn structure_mark_resume_point(&self, tip: u32) -> Option<Block> {
+        let mark = self.read_structure_mark().ok()??;
+        if mark.height > tip {
+            return None;
+        }
+        let block = self
+            .load_structurally_valid_canonical_block(mark.height, None)
+            .ok()?;
+        (block.hash == mark.hash).then_some(block)
+    }
+
+    fn read_structure_mark(&self) -> Result<Option<ChainTipMetadata>, BlockchainError> {
+        let meta = self.open_chain_meta_tree()?;
+        let Some(raw) = meta.get(STRUCTURE_VERIFIED_KEY)? else {
+            return Ok(None);
+        };
+        Ok(codec::deserialize(&raw).ok())
+    }
+
+    fn write_structure_mark(&self, reached: &Block) -> Result<(), BlockchainError> {
+        let meta = self.open_chain_meta_tree()?;
+        let mark = ChainTipMetadata {
+            height: reached.index,
+            hash: reached.hash,
+        };
+        meta.insert(STRUCTURE_VERIFIED_KEY, codec::serialize(&mark)?)?;
+        meta.flush()?;
+        Ok(())
+    }
+
+    /// Retract the structure mark so it vouches for nothing at or above
+    /// `rewrite_from`. Must run — durably — BEFORE any canonical slot at or above
+    /// that height is rewritten; a crash in between merely costs a longer walk.
+    fn lower_structure_mark_below(&self, rewrite_from: u32) -> Result<(), BlockchainError> {
+        let Some(mark) = self.read_structure_mark()? else {
+            return Ok(());
+        };
+        if mark.height < rewrite_from {
+            return Ok(());
+        }
+        let meta = self.open_chain_meta_tree()?;
+        match rewrite_from.checked_sub(1).map(|h| self.get_block(h)) {
+            Some(Ok(kept)) => {
+                let lowered = ChainTipMetadata {
+                    height: kept.index,
+                    hash: kept.hash,
+                };
+                meta.insert(STRUCTURE_VERIFIED_KEY, codec::serialize(&lowered)?)?;
+            }
+            _ => {
+                meta.remove(STRUCTURE_VERIFIED_KEY)?;
+            }
+        }
+        meta.flush()?;
+        Ok(())
+    }
+
+    /// After a walk that authenticated every row (dirty recovery rebuilds both
+    /// derived indexes from a from-genesis structural replay), vouch for the tip.
+    fn stamp_structure_mark_at_tip(&self) -> Result<(), BlockchainError> {
+        if let Some(tip) = self.highest_block_index() {
+            let block = self.get_block(tip)?;
+            self.write_structure_mark(&block)?;
         }
         Ok(())
     }
@@ -4406,6 +4615,9 @@ impl Blockchain {
         // any now-stale higher slots in a single batch, so a crash can never leave a
         // half-rewritten chain. The dirty marker (above) + startup recovery re-derive
         // balances if we crash after this point.
+        // The structure mark must stop vouching for the slots about to change
+        // before they change (durable; see validate_canonical_chain_structure).
+        self.lower_structure_mark_below(fork_start)?;
         let mut slot_batch = store::Batch::default();
         for b in &branch {
             let key = format!("block_{}", b.index);
@@ -5687,7 +5899,12 @@ impl Blockchain {
         // canonical chain, and clears the marker last. Non-dirty startup just ensures the balances
         // index is current.
         match dirty_state.as_ref() {
-            Some(marker) => self.recover_dirty_chain_state(marker, true).await?,
+            Some(marker) => {
+                self.recover_dirty_chain_state(marker, true).await?;
+                // Recovery authenticated every canonical row on its way through the
+                // two index rebuilds; the next clean boot may resume from the tip.
+                self.stamp_structure_mark_at_tip()?;
+            }
             None => self.ensure_balances_index().await?,
         }
         // Build the address history index on first run under this feature, rebuild
@@ -9457,6 +9674,90 @@ mod tests {
         )
     }
 
+    /// A minimal stored block at `index` with a distinguishable hash, written
+    /// straight to the `block_` keyspace the way `save_block` lays it out.
+    fn put_raw_block(db: &store::Store, index: u32) -> Block {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&index.to_be_bytes());
+        let block = Block {
+            index,
+            previous_hash: [0u8; 32],
+            timestamp: 1,
+            transactions: Vec::new(),
+            nonce: 0,
+            difficulty: 1,
+            hash,
+            merkle_root: [0u8; 32],
+        };
+        db.insert(
+            format!("block_{index}").as_bytes(),
+            codec::serialize(&block).expect("block encodes"),
+        )
+        .expect("block stored");
+        block
+    }
+
+    #[test]
+    fn highest_block_index_probe_matches_exhaustive_scan() {
+        // Contiguous prefixes whose tips straddle every digit-length boundary
+        // (bytewise and numeric order disagree there). Sparse sets are outside
+        // the contract: canonical slots are always downward-closed.
+        let cases: &[u32] = &[0, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 1023, 1024, 4095];
+        let cases: Vec<Vec<u32>> = std::iter::once(Vec::new())
+            .chain(cases.iter().map(|&tip| (0..=tip).collect()))
+            .collect();
+        for heights in &cases {
+            let db = store::Store::temporary().unwrap();
+            for &h in heights.iter() {
+                put_raw_block(&db, h);
+            }
+            // Neighbouring key families that share the prefix must not confuse
+            // the probe: non-numeric suffixes sort above every digit.
+            db.insert(b"block_hash_index", b"x").unwrap();
+            db.insert(b"block_time", b"y").unwrap();
+            assert_eq!(
+                highest_block_index_in(&db),
+                highest_block_index_scan_in(&db),
+                "heights {heights:?}"
+            );
+            assert_eq!(highest_block_index_in(&db), heights.iter().max().copied());
+        }
+    }
+
+    #[test]
+    fn local_tip_height_prefers_a_valid_pointer_and_survives_a_stale_one() {
+        let bc = test_blockchain();
+        let db = bc.db.clone();
+        for h in 0u32..=11 {
+            put_raw_block(&db, h);
+        }
+        // No pointer at all: the probe answers.
+        assert_eq!(local_tip_height_in(&db), Some(11));
+
+        // A valid pointer is authoritative, even when it names a lower height
+        // (the probe would say 11; the pointer says what the chain believes).
+        let ten = bc.get_block(10).unwrap();
+        bc.write_chain_tip_metadata(&ten).unwrap();
+        assert_eq!(persisted_tip_height_in(&db), Some(10));
+        assert_eq!(local_tip_height_in(&db), Some(10));
+
+        // Pointer names a block whose stored hash differs: ignored, probe wins.
+        let meta = bc.open_chain_meta_tree().unwrap();
+        let forged = ChainTipMetadata { height: 10, hash: [0xEE; 32] };
+        meta.insert(CHAIN_TIP_KEY, codec::serialize(&forged).unwrap()).unwrap();
+        assert_eq!(persisted_tip_height_in(&db), None);
+        assert_eq!(local_tip_height_in(&db), Some(11));
+
+        // Pointer names a height that no longer exists: same fallback.
+        let gone = ChainTipMetadata { height: 500, hash: [0u8; 32] };
+        meta.insert(CHAIN_TIP_KEY, codec::serialize(&gone).unwrap()).unwrap();
+        assert_eq!(local_tip_height_in(&db), Some(11));
+
+        // Undecodable pointer bytes: same fallback.
+        meta.insert(CHAIN_TIP_KEY, b"garbage").unwrap();
+        assert_eq!(local_tip_height_in(&db), Some(11));
+    }
+
     // Fee-accounting probes: a regular (non-coinbase) transaction carrying `fee`.
     /// GOLDEN BYTES — the consensus serialization contract.
     ///
@@ -11712,6 +12013,104 @@ mod tests {
     /// gate that refuses intact chains would take the node down on a healthy database.
     /// Also asserts the read-only gate leaves no dirty marker behind: a clean start
     /// that marked itself dirty would force a full rebuild on every subsequent boot.
+    /// The structure mark resumes the walk above the last attested row, never
+    /// vouches for a row that was rewritten, and a forced full walk ignores it.
+    #[test]
+    fn canonical_structure_walk_resumes_from_a_valid_mark_only() {
+        let bc = test_blockchain();
+        let miner = "77".repeat(20);
+        raw_chain_to(&bc, 12, &miner);
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .expect("intact chain passes");
+        let mark = bc.read_structure_mark().unwrap().expect("mark stamped");
+        assert_eq!(mark.height, 12);
+        assert_eq!(mark.hash, bc.get_block(12).unwrap().hash);
+
+        // Append rows 13..=20 and corrupt one ABOVE the mark: the incremental
+        // walk must still catch it, attributed to the right height.
+        let mut prev = bc.get_block(12).unwrap().hash;
+        for h in 13..=20 {
+            let b = metadata_test_block(h, prev, &miner, 1.0);
+            prev = b.hash;
+            insert_raw_block(&bc, &b);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap(); // raw inserts bypass the tip bump
+        let mut bad = bc.get_block(17).unwrap();
+        bad.merkle_root = [7u8; 32];
+        bad.hash = bad.calculate_hash_for_block();
+        insert_raw_block(&bc, &bad);
+        let err = bc
+            .validate_canonical_chain_structure_from_mark(false)
+            .expect_err("tampering above the mark fails closed");
+        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 17, .. }), "{err:?}");
+        // A failed walk leaves the mark where it was.
+        assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 12);
+
+        // Repair 17 by re-linking the suffix; the walk advances the mark to 20.
+        let mut prev = bc.get_block(16).unwrap().hash;
+        for h in 17..=20 {
+            let b = metadata_test_block(h, prev, &miner, 1.0);
+            prev = b.hash;
+            insert_raw_block(&bc, &b);
+        }
+        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 20);
+
+        // Tamper BELOW the mark: by contract the incremental walk trusts the
+        // attested prefix, the forced full walk does not.
+        let mut deep = bc.get_block(5).unwrap();
+        deep.hash[0] ^= 1;
+        insert_raw_block(&bc, &deep);
+        bc.validate_canonical_chain_structure_from_mark(false)
+            .expect("rows below a valid mark are attested, not re-read");
+        let err = bc
+            .validate_canonical_chain_structure_from_mark(true)
+            .expect_err("a forced full walk re-reads every row");
+        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }), "{err:?}");
+
+        // Rewriting the attested row itself invalidates the mark: full walk,
+        // which now also sees the deep fault.
+        let mut top = bc.get_block(20).unwrap();
+        top.nonce ^= 1;
+        top.hash = top.calculate_hash_for_block();
+        insert_raw_block(&bc, &top);
+        let err = bc
+            .validate_canonical_chain_structure_from_mark(false)
+            .expect_err("a rewritten attested row discards the mark");
+        assert!(matches!(err, BlockchainError::CanonicalCorruption { height: 5, .. }), "{err:?}");
+    }
+
+    /// The reorg path retracts the mark below the first rewritten slot, and a
+    /// mark above the tip (slots dropped) is ignored.
+    #[test]
+    fn structure_mark_is_lowered_before_slots_are_rewritten() {
+        let bc = test_blockchain();
+        raw_chain_to(&bc, 10, &"88".repeat(20));
+        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 10);
+
+        bc.lower_structure_mark_below(11).unwrap(); // nothing at or above 11
+        assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 10);
+
+        bc.lower_structure_mark_below(7).unwrap();
+        let mark = bc.read_structure_mark().unwrap().unwrap();
+        assert_eq!(mark.height, 6);
+        assert_eq!(mark.hash, bc.get_block(6).unwrap().hash);
+
+        bc.lower_structure_mark_below(0).unwrap(); // genesis itself rewritten
+        assert!(bc.read_structure_mark().unwrap().is_none());
+
+        // A mark above the tip never resumes anything.
+        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        for h in 8..=10 {
+            delete_raw_block(&bc, h);
+        }
+        bc.rebuild_chain_tip_metadata().unwrap(); // raw deletes bypass the tip bump
+        assert!(bc.structure_mark_resume_point(7).is_none());
+        bc.validate_canonical_chain_structure_from_mark(false).unwrap();
+        assert_eq!(bc.read_structure_mark().unwrap().unwrap().height, 7);
+    }
+
     #[test]
     fn canonical_structure_accepts_an_intact_chain() {
         let bc = test_blockchain();

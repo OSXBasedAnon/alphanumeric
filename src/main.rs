@@ -6973,15 +6973,11 @@ fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, for
 }
 
 /// Highest block index present in the local DB, or None if unreadable/empty.
+/// Reads the persisted tip pointer (validated) rather than scanning the chain,
+/// so a boot is not minutes of block-body I/O before the first log line.
 fn local_tip_height(db_path: &str) -> Option<u32> {
     let db = open_chain_db_aux(db_path).ok()?;
-    db.scan_prefix(b"block_")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .and_then(|(k, _)| bootstrap_block_index_from_key(&k))
-        })
-        .max()
+    alphanumeric::a9::blockchain::local_tip_height_in(&db)
 }
 
 /// Best-effort canonical anchor at-or-below `local_tip`: the highest header from
