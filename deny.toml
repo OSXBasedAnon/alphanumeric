@@ -31,6 +31,17 @@ ignore = [
   # Reviewed 2026-08-13.
   "RUSTSEC-2026-0253",
 
+  # crypto-bigint 0.5.5 — timing variability in operations meant to be constant-time.
+  # Reaches us ONLY through the WebRTC DTLS handshake: webrtc 0.17 → dtls 0.17 → p256/p384
+  # 0.13 → ecdsa 0.16 → elliptic-curve 0.13, which pins crypto-bigint 0.5; the fix is in
+  # 0.7.6, a major the 0.13 curve crates cannot take, so only a webrtc major bump clears
+  # it. Exposure: the key it operates on is the per-peer-connection self-signed DTLS
+  # certificate (RTCConfiguration leaves `certificates` default, so webrtc mints a fresh
+  # P-256 key for every connection) — a handful of signatures per key, over a network,
+  # which is far below what a timing side channel on ECDSA needs. Consensus signatures
+  # are ML-DSA and never touch this crate. Re-review on any webrtc bump. Reviewed 2026-11-04.
+  "RUSTSEC-2026-0387",
+
 ]
 
 # NOT ignored, recorded so it is not re-investigated from scratch: yamux 0.12.1 carries
@@ -64,8 +75,6 @@ allow = [
   # Community Data License Agreement Permissive 2.0 — the licence Mozilla ships the
   # CA root certificate DATA under, via webpki-root-certs. Data, not code.
   "CDLA-Permissive-2.0",
-  # The bzip2 licence (BSD-style, permissive), via libbz2-rs-sys behind zip.
-  "bzip2-1.0.6",
 ]
 confidence-threshold = 0.9
 

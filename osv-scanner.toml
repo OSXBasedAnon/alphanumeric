@@ -30,3 +30,8 @@ reason = "lru 0.7.8/0.8.1 pop() UAF requires a cache KEY whose Drop panics, caug
 id = "GHSA-vxx9-2994-q338"
 ignoreUntil = 2027-01-31
 reason = "yamux 0.12.1 remote-panic path is unreachable: runtime uses fixed 0.13.10 backend and Kademlia fallback is opt-in/off by default. Re-review on any libp2p change. Reviewed 2026-07-31."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-02-28
+reason = "crypto-bigint 0.5.5 timing variability: reachable only via webrtc 0.17 -> dtls -> p256/p384 0.13 -> elliptic-curve 0.13 (pins 0.5; fix is 0.7.6, a major only a webrtc bump can take). The key is the per-peer-connection ephemeral self-signed DTLS cert (RTCConfiguration.certificates left default), a handful of signatures per key over a network. Consensus uses ML-DSA, never this crate. Re-review on any webrtc bump. Reviewed 2026-11-04."
