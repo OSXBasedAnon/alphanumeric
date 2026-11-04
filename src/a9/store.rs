@@ -45,15 +45,72 @@ macro_rules! from_err {
         }
     )+};
 }
-from_err!(
-    redb::DatabaseError,
-    redb::TransactionError,
-    redb::TableError,
-    redb::StorageError,
-    redb::CommitError,
-    redb::SetDurabilityError,
-    std::io::Error
-);
+// Open-time and non-engine errors keep the plain conversion; everything that can
+// carry a runtime `StorageError` routes through `classify_storage_error` so the
+// engine's "dead until reopened" state is recognised exactly once, here.
+from_err!(redb::DatabaseError, redb::SetDurabilityError, std::io::Error);
+
+impl From<redb::StorageError> for StoreError {
+    fn from(e: redb::StorageError) -> Self {
+        StoreError(classify_storage_error(&e))
+    }
+}
+impl From<redb::TransactionError> for StoreError {
+    fn from(e: redb::TransactionError) -> Self {
+        match &e {
+            redb::TransactionError::Storage(inner) => StoreError(classify_storage_error(inner)),
+            _ => StoreError(e.to_string()),
+        }
+    }
+}
+impl From<redb::TableError> for StoreError {
+    fn from(e: redb::TableError) -> Self {
+        match &e {
+            redb::TableError::Storage(inner) => StoreError(classify_storage_error(inner)),
+            _ => StoreError(e.to_string()),
+        }
+    }
+}
+impl From<redb::CommitError> for StoreError {
+    fn from(e: redb::CommitError) -> Self {
+        match &e {
+            redb::CommitError::Storage(inner) => StoreError(classify_storage_error(inner)),
+            _ => StoreError(e.to_string()),
+        }
+    }
+}
+
+/// Errors after which the engine refuses every further operation until the
+/// process reopens the file carry this prefix. redb latches an internal
+/// `io_failed` flag on ANY backend read/write/sync failure (a full disk is the
+/// usual one) and answers every later call with `PreviousIo`; a poisoned
+/// internal lock is the same dead end. Nothing in-process can clear it, so the
+/// only correct response is a restart — which the runtime watchdog performs for
+/// a headless node (see `store_poisoned`). Before this classification existed
+/// a node in that state ran on indefinitely, failing every block (the explorer
+/// did so for ~2 h on 10-17).
+pub const FATAL_IO_MARKER: &str = "FATAL_IO:";
+
+static STORE_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Process-wide: has any store reported an unrecoverable I/O state? Latched;
+/// only a process restart (which reopens the file) resets it.
+pub fn store_poisoned() -> bool {
+    STORE_POISONED.load(Ordering::Acquire)
+}
+
+fn classify_storage_error(e: &redb::StorageError) -> String {
+    match e {
+        redb::StorageError::PreviousIo
+        | redb::StorageError::Io(_)
+        | redb::StorageError::LockPoisoned(_) => {
+            STORE_POISONED.store(true, Ordering::Release);
+            format!("{FATAL_IO_MARKER} {e}")
+        }
+        redb::StorageError::Corrupted(_) => format!("{CORRUPTION_MARKER} {e}"),
+        _ => e.to_string(),
+    }
+}
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub type KvPair = (Vec<u8>, Vec<u8>);
@@ -168,6 +225,11 @@ pub const CORRUPTION_MARKER: &str = "CORRUPTION:";
 impl StoreError {
     pub fn is_corruption(&self) -> bool {
         self.0.starts_with(CORRUPTION_MARKER)
+    }
+
+    /// The engine is dead until the file is reopened (see `FATAL_IO_MARKER`).
+    pub fn is_fatal_io(&self) -> bool {
+        self.0.starts_with(FATAL_IO_MARKER)
     }
 }
 
@@ -808,6 +870,26 @@ impl Iterator for LazyScanRev {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_storage_errors_are_classified_once_at_the_conversion() {
+        let fatal: StoreError = redb::StorageError::PreviousIo.into();
+        assert!(fatal.is_fatal_io());
+        assert!(!fatal.is_corruption());
+        let io: StoreError = redb::TransactionError::Storage(redb::StorageError::Io(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        ))
+        .into();
+        assert!(io.is_fatal_io());
+        let corrupt: StoreError =
+            redb::CommitError::Storage(redb::StorageError::Corrupted("x".into())).into();
+        assert!(corrupt.is_corruption());
+        assert!(!corrupt.is_fatal_io());
+        let benign: StoreError = redb::TableError::TableDoesNotExist("t".into()).into();
+        assert!(!benign.is_fatal_io() && !benign.is_corruption());
+        // The process-wide latch was set by the fatal conversions above.
+        assert!(store_poisoned());
+    }
 
     #[test]
     fn roundtrip_returns_previous_values() {

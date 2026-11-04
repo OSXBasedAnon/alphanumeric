@@ -11006,8 +11006,33 @@ impl Node {
                 .name("runtime-watchdog".into())
                 .spawn(move || {
                     let mut stale_strikes: u32 = 0;
+                    let mut poison_reported = false;
                     loop {
                         std::thread::sleep(Duration::from_secs(30));
+                        // A store that has reported an unrecoverable I/O state (disk
+                        // full, device error) fails every later read and write until
+                        // the file is reopened, and nothing in-process can do that.
+                        // Headless: exit with a distinct status so the supervisor
+                        // restarts us; interactive: say so once and leave the
+                        // operator in charge. Checked here because this thread keeps
+                        // running even when the async runtime is wedged.
+                        if store::store_poisoned() && !poison_reported {
+                            poison_reported = true;
+                            eprintln!(
+                                "storage watchdog: the chain store reported an unrecoverable I/O \
+                                 error (disk full? device fault?) — every further read/write \
+                                 fails until the process restarts"
+                            );
+                            if headless {
+                                crate::a9::blockchain::OPERATOR_SHUTDOWN
+                                    .store(true, Ordering::Release);
+                                eprintln!(
+                                    "storage watchdog: exiting with status 4 so the supervisor \
+                                     restarts and reopens the store"
+                                );
+                                std::process::exit(4);
+                            }
+                        }
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
