@@ -311,7 +311,8 @@ Credit rules and reorg handling are covered in
 ## Running a node
 
 **The node deliberately terminates itself and must run under a supervisor.** Several
-recovery paths call `exit(3)` expecting an external supervisor to restart the process, for
+recovery paths call `exit(3)` (and `exit(4)` when the storage engine reports an
+unrecoverable I/O state such as a full disk) expecting an external supervisor to restart the process, for
 example when the local chain has fallen too far behind to catch up incrementally and needs
 to re-bootstrap. Under `nohup` or a bare container with no restart policy, the node stays
 down. Use systemd, Docker `restart: always`, launchd `KeepAlive`, or equivalent.
@@ -334,8 +335,8 @@ its own.
 | Capability | Status |
 |---|---|
 | Memo / destination tag | **None.** Use one deposit address per user; there is no shared-address tagging. |
-| Batch withdrawal (one transaction, many recipients) | **None.** Send N separate transactions; the miner template drains many transactions per sender per block, so this works, subject to the 100-pending cap. |
-| Fee bump / RBF | **None.** A stuck transaction is replaced by signing a distinct one (different timestamp or fee). |
+| Batch withdrawal (one transaction, many recipients) | **None.** Send N separate transactions; the miner template drains many transactions per sender per block, so this works, subject to the 250-pending-per-address cap. |
+| Fee bump / RBF | **None, and no replacement either.** A pending transaction cannot be cancelled or superseded: if you sign a second payment for the same withdrawal, BOTH are valid and both can confirm. Treat a submitted transaction as spent until it confirms or the node reports it gone (pending rows expire after the node's TTL, 2 h by default, and are never mineable past 6 h from their timestamp). Resubmit the SAME signed transaction, never a re-signed copy. |
 | Mempool acceptance query | **None.** Submission response is the acceptance signal. |
 | Block or deposit webhooks | No per-address webhooks and no outbound HTTP from the node. There IS a tip push: `ALPHANUMERIC_BLOCKNOTIFY="/path/to/script %s %h"` runs your command on every new tip (`%s` hash, `%h` height) — Bitcoin Core's `-blocknotify` contract. When a program path or argument contains spaces, use structured argv, for example `ALPHANUMERIC_BLOCKNOTIFY_ARGV='["C:\\Program Files\\Pool\\notify.exe","%s","%h"]'`; it takes precedence over the legacy variable and still executes directly without a shell. Built for pools, but it suits a deposit scanner just as well: trigger a block-walk on the hook instead of polling `/explorer/tip`. Single-flight, coalesces under load, killed after 10 s. |
 | HD derivation standard | **None** published. Post-quantum keys do not use BIP32-style derivation. |
