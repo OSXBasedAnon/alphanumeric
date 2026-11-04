@@ -5338,6 +5338,15 @@ fn quarantine_db(path: &str) -> std::io::Result<()> {
                 .is_some_and(|name| name.starts_with(&prefix))
         });
         if already_held {
+            // Deliberate (see above): a second quarantine would double the disk
+            // cost of a fault that is almost always a repeat. Say so at a level
+            // the default filter shows — a silent delete is how 10-20 was read as
+            // "the DB vanished".
+            error!(
+                "quarantine already holds an earlier copy next to {}; DELETING this one \
+                 instead of keeping a second multi-GB copy",
+                path
+            );
             std::fs::remove_dir_all(dir)?;
             return Ok(());
         }
@@ -6098,6 +6107,19 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 );
                 remove_local_db(db_path).await?;
             }
+            LaunchDbStatus::OpenFailed(err) => {
+                // Not corruption, so not ours to set aside: a lock held by another
+                // instance, a read-only or full disk, a permission problem. Every one
+                // of those is fixed by the operator, not by replacing gigabytes of
+                // valid chain data with a fresh download (10-20: a full disk turned
+                // into a deleted store and a 23 h outage). Stop here, say why.
+                return Err(format!(
+                    "local database could not be opened ({err}); leaving it untouched. \
+                     Fix the cause (another node holding the lock? disk full? permissions?) \
+                     or set ALPHANUMERIC_FORCE_BOOTSTRAP=true to replace it deliberately."
+                )
+                .into());
+            }
             LaunchDbStatus::Unreadable(err) => {
                 // SET ASIDE, don't destroy. Every sled open failure lands here — a lock held
                 // by another instance, a transient I/O error, a genuinely corrupt page — and
@@ -6599,7 +6621,13 @@ enum LaunchDbStatus {
     Missing,
     Empty,
     WrongGenesis(String),
+    /// The content is readable but wrong: no genesis, undecodable genesis, a
+    /// store the engine itself classifies as corrupt. Set aside and re-bootstrap.
     Unreadable(String),
+    /// The store could not be opened for a reason that is NOT corruption — a
+    /// lock held by another process, a permission or disk error. The bytes are
+    /// presumed intact; booting stops and nothing is moved or deleted.
+    OpenFailed(String),
 }
 
 fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
@@ -6613,7 +6641,10 @@ fn local_launch_db_status(db_path: &str) -> LaunchDbStatus {
 
     let db = match open_chain_db_aux(db_path) {
         Ok(db) => db,
-        Err(e) => return LaunchDbStatus::Unreadable(format!("database open failed: {}", e)),
+        Err(e) if e.is_corruption() => {
+            return LaunchDbStatus::Unreadable(format!("database open failed: {}", e))
+        }
+        Err(e) => return LaunchDbStatus::OpenFailed(e.to_string()),
     };
 
     let genesis_raw = match db.get(b"block_0") {
@@ -7128,6 +7159,91 @@ fn has_local_block_data(db_path: &str) -> bool {
     db.scan_prefix("block_").next().is_some()
 }
 
+/// Marker prefix for a publish that was refused BEFORE anything was written
+/// because the temp volume cannot hold the export.
+#[cfg_attr(not(feature = "bootstrap_publisher"), allow(dead_code))]
+const EXPORT_NO_SPACE_PREFIX: &str = "bootstrap export skipped: ";
+
+/// Free-space guard for one snapshot export. The export is a clone of the store
+/// file plus the zip of it plus headroom, so it needs about store + store/8 +
+/// 256 MiB. Returns `(needed, free)` when `free` is known and short. `None` for
+/// free space (unreadable mount table) is treated as "unknown, proceed", which
+/// is today's behaviour.
+#[cfg_attr(not(feature = "bootstrap_publisher"), allow(dead_code))]
+fn export_space_shortfall(store_bytes: u64, free: Option<u64>) -> Option<(u64, u64)> {
+    const HEADROOM: u64 = 256 * 1024 * 1024;
+    let needed = store_bytes
+        .saturating_add(store_bytes / 8)
+        .saturating_add(HEADROOM);
+    match free {
+        Some(free) if free < needed => Some((needed, free)),
+        _ => None,
+    }
+}
+
+/// Retry delay after a failed publish: 10 min for an auth/redirect
+/// misconfiguration, otherwise 2 min doubling with each consecutive failure up
+/// to 1 h. A flat 2 min retry re-ran a full store clone every cycle against a
+/// disk that was already full — the hammer that poisoned the store on 10-22.
+#[cfg_attr(not(feature = "bootstrap_publisher"), allow(dead_code))]
+fn publish_retry_backoff_secs(error_text: &str, consecutive_failures: u32) -> u64 {
+    const MAX_BACKOFF_SECS: u64 = 3_600;
+    let base = if error_text.contains("redirected")
+        || error_text.contains("401")
+        || error_text.contains("unauthorized")
+    {
+        600u64
+    } else {
+        120u64
+    };
+    base.saturating_mul(1u64 << consecutive_failures.min(5))
+        .min(MAX_BACKOFF_SECS)
+}
+
+/// The pid embedded in one of the publisher's temp artifact names —
+/// `alphanumeric-bootstrap-<h>-<ts>-<pid>.zip` or
+/// `alphanumeric-bootstrap-export-<h>-<ts>-<pid>` — or `None` for anything else.
+#[cfg_attr(not(feature = "bootstrap_publisher"), allow(dead_code))]
+fn bootstrap_temp_artifact_pid(name: &str) -> Option<u32> {
+    let stem = name.strip_prefix("alphanumeric-bootstrap-")?;
+    let stem = stem.strip_suffix(".zip").unwrap_or(stem);
+    stem.rsplit('-').next()?.parse().ok()
+}
+
+/// Remove publisher temp artifacts left by processes that no longer exist. The
+/// RAII cleanup inside `publish_bootstrap_snapshot` covers every normal exit,
+/// but `process::exit` (the watchdogs) and SIGKILL skip `Drop`, and the
+/// abandoned clone is a full store-sized file on the volume the live chain
+/// shares. Our own pid's artifacts and those of any live process are left alone.
+#[cfg_attr(not(feature = "bootstrap_publisher"), allow(dead_code))]
+fn sweep_abandoned_bootstrap_exports(tmp: &Path) -> usize {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(bootstrap_temp_artifact_pid) else {
+            continue;
+        };
+        if pid == me || is_process_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let gone = if path.is_dir() {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            std::fs::remove_file(&path).is_ok()
+        };
+        if gone {
+            warn!("removed abandoned bootstrap export artifact {} (pid {} is gone)", path.display(), pid);
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(feature = "bootstrap_publisher")]
 async fn bootstrap_publish_loop(
     db_path: String,
@@ -7143,6 +7259,8 @@ async fn bootstrap_publish_loop(
     let mut last_tip_hash: Option<String> = None;
     let mut last_tip_change = Instant::now();
     let mut next_attempt_at: u64 = 0;
+    let mut consecutive_failures: u32 = 0;
+    sweep_abandoned_bootstrap_exports(&std::env::temp_dir());
 
     loop {
         // Sample every ~3s, NOT every 30s. Tip stability is measured off last_tip_change,
@@ -7231,23 +7349,18 @@ async fn bootstrap_publish_loop(
         )
         .await
         {
-            error!("bootstrap publish failed: {}", e);
-            // Backoff: avoid spamming the endpoint if configuration is wrong or transient errors occur.
-            // - Redirect/auth errors: 10 minutes
-            // - Other errors: 2 minutes
             let msg = e.to_string();
-            let backoff = if msg.contains("redirected")
-                || msg.contains("401")
-                || msg.contains("unauthorized")
-            {
-                600u64
-            } else {
-                120u64
-            };
+            let backoff = publish_retry_backoff_secs(&msg, consecutive_failures);
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            error!(
+                "bootstrap publish failed (attempt {}, next in {}s): {}",
+                consecutive_failures, backoff, msg
+            );
             next_attempt_at = now_secs.saturating_add(backoff);
             continue;
         }
 
+        consecutive_failures = 0;
         last_published_height = height;
         last_published_at = now_secs;
         last_published_network_id = Some(network_id_hex.clone());
@@ -7381,6 +7494,23 @@ async fn publish_bootstrap_snapshot(
     }
 
     let tmp = std::env::temp_dir();
+    // Refuse before writing a byte when the temp volume cannot hold the export:
+    // the clone + zip of a multi-GB store on a nearly-full disk is what filled it
+    // on 10-22 and poisoned the live store next to it. Nothing to clean up here.
+    let store_bytes = db.size_on_disk()?;
+    if let Some((needed, free)) =
+        export_space_shortfall(store_bytes, available_disk_space_for_path(&tmp))
+    {
+        return Err(format!(
+            "{EXPORT_NO_SPACE_PREFIX}{} free in {}, need at least {} for a {}-byte store \
+             (clone + zip + headroom); nothing written",
+            free,
+            tmp.display(),
+            needed,
+            store_bytes
+        )
+        .into());
+    }
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -8443,6 +8573,56 @@ impl WhisperAccum {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn export_space_guard_and_backoff_are_pure_and_bounded() {
+        let gib = 1u64 << 30;
+        // 2 GiB store needs 2 + 0.25 + 0.25 GiB; 3 GiB free is fine, 2 GiB is not.
+        assert_eq!(super::export_space_shortfall(2 * gib, Some(3 * gib)), None);
+        let (needed, free) = super::export_space_shortfall(2 * gib, Some(2 * gib)).unwrap();
+        assert_eq!(free, 2 * gib);
+        assert_eq!(needed, 2 * gib + gib / 4 + 256 * 1024 * 1024);
+        assert_eq!(super::export_space_shortfall(2 * gib, None), None, "unknown = proceed");
+
+        assert_eq!(super::publish_retry_backoff_secs("boom", 0), 120);
+        assert_eq!(super::publish_retry_backoff_secs("boom", 1), 240);
+        assert_eq!(super::publish_retry_backoff_secs("boom", 4), 1_920);
+        assert_eq!(super::publish_retry_backoff_secs("boom", 5), 3_600);
+        assert_eq!(super::publish_retry_backoff_secs("boom", 40), 3_600, "capped, no overflow");
+        assert_eq!(super::publish_retry_backoff_secs("HTTP 401 unauthorized", 0), 600);
+        assert_eq!(super::publish_retry_backoff_secs("redirected", 3), 3_600);
+    }
+
+    #[test]
+    fn bootstrap_temp_artifact_names_yield_their_pid_only() {
+        use super::bootstrap_temp_artifact_pid as pid_of;
+        assert_eq!(pid_of("alphanumeric-bootstrap-1848429-1793803839-85402.zip"), Some(85402));
+        assert_eq!(pid_of("alphanumeric-bootstrap-export-1848429-1793803839-85402"), Some(85402));
+        assert_eq!(pid_of("alphanumeric-bootstrap-export-1848429-1793803839-"), None);
+        assert_eq!(pid_of("alphanumeric-bootstrap-notes.txt"), None);
+        assert_eq!(pid_of("blockchain.db.bootstrap_tmp_123"), None, "client extraction dirs are not ours");
+        assert_eq!(pid_of("com.apple.launchd.xyz"), None);
+    }
+
+    #[test]
+    fn abandoned_export_sweep_skips_live_and_foreign_entries() {
+        let dir = std::env::temp_dir().join(format!("a9-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        // Ours (live), a dead pid (u32::MAX is never a live pid), and a foreign file.
+        std::fs::create_dir_all(dir.join(format!("alphanumeric-bootstrap-export-1-2-{me}"))).unwrap();
+        std::fs::write(dir.join("alphanumeric-bootstrap-1-2-4294967295.zip"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("alphanumeric-bootstrap-export-1-2-4294967295")).unwrap();
+        std::fs::write(dir.join("unrelated.zip"), b"x").unwrap();
+
+        assert_eq!(super::sweep_abandoned_bootstrap_exports(&dir), 2);
+        assert!(dir.join(format!("alphanumeric-bootstrap-export-1-2-{me}")).exists());
+        assert!(dir.join("unrelated.zip").exists());
+        assert!(!dir.join("alphanumeric-bootstrap-1-2-4294967295.zip").exists());
+        assert!(!dir.join("alphanumeric-bootstrap-export-1-2-4294967295").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     // The sled caches are now explicit and operator-tunable rather than sled's implicit 1 GiB
