@@ -41,6 +41,15 @@ migration, no wallet migration, no resync.
   servers close connections that never finish their headers.
 - **Wallet `new`** asks for (and confirms) a passphrase when the session's
   passphrase was never proven against an existing encrypted wallet.
+- **Hashrate is measured from the work miners reveal, not only the work the
+  chain demanded.** The largest block hash in the 32-block window pins the
+  target the miners really searched against; the headline `hashrate_ths` is the
+  larger of that and the difficulty-derived figure. `/stats` now also carries
+  `hashrate_declared_ths` (the chain's actual security), `hashrate_revealed_ths`
+  and `pow_margin_bits`. A margin that stays above zero means a miner is burning
+  work the chain never receives — on 2026-11-04 the pool's share target sat ~5
+  bits above the block target, so the chain saw 1/32 of its hashing and the
+  site read 0.3 GH/s against a real ~7–12. Display only.
 - **Reorg replay detection (staged).** A branch that confirms the same
   transaction twice is now detected and logged; rejection is scheduled behind
   `REORG_TX_DEDUPE_ACTIVATION_HEIGHT` and activates in a later release once
