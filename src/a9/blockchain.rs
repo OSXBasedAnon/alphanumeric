@@ -536,10 +536,9 @@ pub struct WorkEstimate {
     pub declared_ths: f64,
     /// Expected hashes per second from the work the miners *revealed*. A block
     /// hash is uniform on `[0, target_used]`, where `target_used` is whatever
-    /// the miner was really searching against, so the largest hash in the
-    /// window pins that target from below: `target_used ≈ max_hash · (n+1)/n`
-    /// (the unbiased maximum estimator for a uniform sample), and the work per
-    /// block is `2^256 / target_used`.
+    /// the miner was really searching against, so the window's median hash
+    /// pins that target: `target_used ≈ 2 · median` (unbiased for a uniform
+    /// sample), and the work per block is `2^256 / target_used`.
     pub revealed_ths: f64,
     /// `log2(revealed / declared)`, clamped at 0: how many bits harder than
     /// the chain demanded the miners actually searched. ~0 when miners mine at
@@ -568,11 +567,16 @@ impl WorkEstimate {
 /// while all 100 recent pool blocks had 35–43: declared read 0.3 GH/s,
 /// revealed 7.
 ///
-/// The maximum is used instead of the mean of `2^256 / hash` because that mean
-/// is dominated by one lucky small hash (its expectation diverges); the maximum
-/// of `n` uniforms is tightly concentrated near the true target. When miners
-/// mine at the chain target, revealed ≈ declared within ~1/n and the floor
-/// takes over.
+/// The median is the estimator because the window is a mixture in practice:
+/// live on 2026-11-04 about one block in six came from a miner at the chain
+/// target while the rest carried the pool's 5-bit margin. The sample maximum
+/// then belongs to the at-target minority and reads the margin as zero; the
+/// mean of `2^256 / hash` is dominated by one lucky small hash (its
+/// expectation diverges); the mean of the hashes is dominated by the minority's
+/// large ones. The median sits inside whichever population mined most of the
+/// blocks, and the total work of a mixture is, to first order, that
+/// population's work — which is what the chain actually received. When miners
+/// mine at the chain target, revealed ≈ declared and the floor takes over.
 pub(crate) fn revealed_work_estimate(samples: &[([u8; 32], u64)], span_secs: u64) -> WorkEstimate {
     if samples.is_empty() || span_secs == 0 {
         return WorkEstimate::default();
@@ -589,14 +593,18 @@ pub(crate) fn revealed_work_estimate(samples: &[([u8; 32], u64)], span_secs: u64
             max_target / target.max(1.0)
         })
         .sum();
-    let max_hash = samples
+    let mut hashes: Vec<f64> = samples
         .iter()
-        .map(|(hash, _)| BigUint::from_bytes_be(hash))
-        .max()
-        .and_then(|h| h.to_f64())
-        .unwrap_or(0.0);
-    let revealed = if max_hash > 0.0 {
-        let target_used = max_hash * (n + 1.0) / n;
+        .map(|(hash, _)| BigUint::from_bytes_be(hash).to_f64().unwrap_or(0.0))
+        .collect();
+    hashes.sort_by(f64::total_cmp);
+    let median = if hashes.len().is_multiple_of(2) {
+        (hashes[hashes.len() / 2 - 1] + hashes[hashes.len() / 2]) / 2.0
+    } else {
+        hashes[hashes.len() / 2]
+    };
+    let revealed = if median > 0.0 {
+        let target_used = 2.0 * median;
         n * 2f64.powi(256) / target_used
     } else {
         0.0
@@ -14151,37 +14159,40 @@ mod tests {
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
     }
 
-    /// A window's samples at exactly `margin_bits` below the chain target for
-    /// `difficulty` (all hashes equal: the maximum is then the exact target the
-    /// miner used, modulo the (n+1)/n correction).
+    /// `n` samples spread evenly over `[0, target_used]` — the shape of a
+    /// uniform draw without its noise — where `target_used` is the chain target
+    /// for `difficulty` shifted `margin_bits` harder.
     fn work_samples(n: usize, difficulty: u64, margin_bits: u32) -> Vec<([u8; 32], u64)> {
         let target_used = pow_target_from_difficulty(difficulty) >> (margin_bits as usize);
-        let hash = pow_target_bytes(&target_used);
-        vec![(hash, difficulty); n]
+        (0..n)
+            .map(|i| {
+                let hash =
+                    &target_used * BigUint::from(2 * i as u64 + 1) / BigUint::from(2 * n as u64);
+                (pow_target_bytes(&hash), difficulty)
+            })
+            .collect()
     }
 
     #[test]
     fn revealed_work_matches_declared_when_miners_mine_at_the_chain_target() {
-        // Hashes right at the target: revealed = declared·n/(n+1), so the
-        // declared floor wins and the margin is zero.
         let est = revealed_work_estimate(&work_samples(32, 497, 0), 160);
         let expected = 32.0 * 2f64.powi(31) / 160.0 / 1e12;
         assert!((est.declared_ths - expected).abs() / expected < 1e-9);
-        assert!(est.revealed_ths < est.declared_ths);
-        assert_eq!(est.margin_bits, 0.0);
-        assert_eq!(est.hashrate_ths(), est.declared_ths);
+        assert!((est.revealed_ths - est.declared_ths).abs() / expected < 1e-6);
+        assert!(est.margin_bits < 1e-6, "margin {}", est.margin_bits);
+        assert_eq!(est.hashrate_ths(), est.declared_ths.max(est.revealed_ths));
     }
 
     #[test]
     fn revealed_work_sees_the_margin_a_miner_over_delivers() {
-        // The 2026-11-04 live shape: difficulty 497 (31 bits) while every hash
-        // clears ~36 — the pool's share target sat 5 bits above the block
+        // The 2026-11-04 live shape: difficulty 497 (31 bits) while the hashes
+        // clear ~36 — the pool's share target sat 5 bits above the block
         // target. Declared reads 2^31 per block; revealed 2^36.
         let est = revealed_work_estimate(&work_samples(32, 497, 5), 160);
         let ratio = est.revealed_ths / est.declared_ths;
-        assert!(ratio > 31.0 && ratio < 32.0, "ratio {ratio}");
+        assert!((ratio - 32.0).abs() < 1e-6, "ratio {ratio}");
         assert!(
-            (est.margin_bits - 5.0).abs() < 0.05,
+            (est.margin_bits - 5.0).abs() < 1e-6,
             "margin {}",
             est.margin_bits
         );
@@ -14189,15 +14200,29 @@ mod tests {
     }
 
     #[test]
+    fn revealed_work_survives_a_minority_mining_at_the_chain_target() {
+        // Live 21:04Z: 7 of 41 blocks at the chain target, the rest 5 bits over.
+        // A maximum-based estimate reads such a window as margin 0; the median
+        // stays inside the majority population.
+        let mut samples = work_samples(26, 497, 5);
+        samples.extend(work_samples(6, 497, 0));
+        let est = revealed_work_estimate(&samples, 160);
+        assert!(
+            est.margin_bits > 4.0 && est.margin_bits <= 5.0,
+            "margin {}",
+            est.margin_bits
+        );
+    }
+
+    #[test]
     fn revealed_work_is_not_swayed_by_one_lucky_hash() {
         // The mean of 2^256/hash would explode on a single near-zero hash; the
-        // maximum-based estimate ignores it entirely.
+        // median barely moves.
         let mut samples = work_samples(32, 497, 0);
         samples[7].0 = [0u8; 32];
         samples[7].0[31] = 1;
         let est = revealed_work_estimate(&samples, 160);
-        assert_eq!(est.margin_bits, 0.0);
-        assert_eq!(est.hashrate_ths(), est.declared_ths);
+        assert!(est.margin_bits < 0.1, "margin {}", est.margin_bits);
     }
 
     #[test]
