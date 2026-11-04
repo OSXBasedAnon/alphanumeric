@@ -42,8 +42,9 @@ migration, no wallet migration, no resync.
 - **Wallet `new`** asks for (and confirms) a passphrase when the session's
   passphrase was never proven against an existing encrypted wallet.
 - **Hashrate is measured from the work miners reveal, not only the work the
-  chain demanded.** The largest block hash in the 32-block window pins the
-  target the miners really searched against; the headline `hashrate_ths` is the
+  chain demanded.** The median block hash in the 32-block window pins the
+  target the miners really searched against (robust to a minority of blocks
+  mined at the chain target, which the live window contained); the headline `hashrate_ths` is the
   larger of that and the difficulty-derived figure. `/stats` now also carries
   `hashrate_declared_ths` (the chain's actual security), `hashrate_revealed_ths`
   and `pow_margin_bits`. A margin that stays above zero means a miner is burning
