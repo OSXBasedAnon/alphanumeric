@@ -129,11 +129,44 @@ pub fn build_api(include_loopback: bool) -> Result<API, webrtc::Error> {
         }
         !is_lan_or_local(ip)
     }));
+    settings.set_network_types(host_ice_network_types());
     Ok(APIBuilder::new()
         .with_media_engine(media)
         .with_interceptor_registry(registry)
         .with_setting_engine(settings)
         .build())
+}
+
+/// The ICE network families this host can actually use, from its interface addresses.
+///
+/// The agent's default is UDP over both IPv4 and IPv6, and server-reflexive gathering resolves
+/// every STUN server once per family. A host with no routable IPv6 — most home networks, this
+/// Mac included — then fails the IPv6 branch on every gather ("No available ipv6 IP address
+/// found"), two warnings per STUN server per peer connection: ~100k lines in the publisher's
+/// 8.0.1 log, and a few hundred per hour of a doomed resolve/bind cycle. Gathering only on the
+/// families that exist removes the attempt, not just the line. IPv4 is always offered (the node
+/// is IPv4-first and a dual-stack peer still reaches it); IPv6 is added when a global address is
+/// present. Loopback and link/unique-local addresses do not count: the ip filter above drops
+/// them from candidates anyway, so they could never carry a connection.
+fn ice_network_types(
+    host_addrs: &[std::net::IpAddr],
+) -> Vec<webrtc::ice::network_type::NetworkType> {
+    use webrtc::ice::network_type::NetworkType;
+    let has_global_v6 = host_addrs
+        .iter()
+        .any(|ip| ip.is_ipv6() && !ip.is_loopback() && !is_lan_or_local(*ip));
+    if has_global_v6 {
+        vec![NetworkType::Udp4, NetworkType::Udp6]
+    } else {
+        vec![NetworkType::Udp4]
+    }
+}
+
+fn host_ice_network_types() -> Vec<webrtc::ice::network_type::NetworkType> {
+    let addrs: Vec<std::net::IpAddr> = if_addrs::get_if_addrs()
+        .map(|ifs| ifs.into_iter().map(|i| i.addr.ip()).collect())
+        .unwrap_or_default();
+    ice_network_types(&addrs)
 }
 
 /// STUN configuration: the public servers a node uses to discover its server-reflexive (public)
@@ -1755,6 +1788,29 @@ mod tests {
     // M3 companion: is_lan_or_local must fold an IPv4-mapped IPv6 address before classifying, so a
     // remote peer cannot smuggle ::ffff:<internal-ipv4> past the SDP candidate strip (an SSRF probe
     // toward internal/metadata hosts).
+    #[test]
+    fn ice_families_follow_the_host_addresses() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use webrtc::ice::network_type::NetworkType;
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 4, 65));
+        let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let link6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1c, 0x2d, 0x3e, 0x4f));
+        let ula6 = IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1));
+        let global6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x41d0, 0x1004, 0x33d4, 0, 0, 0, 1));
+        // IPv4-only home network (this Mac): no IPv6 gathering at all.
+        assert_eq!(
+            ice_network_types(&[v4, lo6, link6, ula6]),
+            vec![NetworkType::Udp4]
+        );
+        // A routable IPv6 address enables the family.
+        assert_eq!(
+            ice_network_types(&[v4, link6, global6]),
+            vec![NetworkType::Udp4, NetworkType::Udp6]
+        );
+        // No addresses at all still offers IPv4 — the node cannot run without it anyway.
+        assert_eq!(ice_network_types(&[]), vec![NetworkType::Udp4]);
+    }
+
     #[test]
     fn is_lan_or_local_folds_ipv4_mapped_ipv6() {
         use std::net::{IpAddr, Ipv4Addr};
