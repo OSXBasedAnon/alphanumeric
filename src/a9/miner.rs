@@ -534,6 +534,13 @@ impl MiningManager {
                 // `sender_debits`; selection order and outcomes are byte-identical
                 // to the per-candidate version.
                 let mut confirmed_cache: HashMap<String, i128> = HashMap::new();
+                // Coinbase maturity (M06) as the consensus writer applies it at this
+                // height: a sender whose confirmed balance is partly still-immature
+                // reward cannot spend that part, and finalize rejects the block if
+                // the template pretends otherwise — a burned solve. Same helper the
+                // validators use, so selection and the authority cannot disagree.
+                let immature_by_sender = blockchain_lock
+                    .immature_rewards_by_recipient(&live_transactions, header.number);
                 let mut template_bytes: usize = 0;
                 let activated_shape_rules = header.number >= FEE_SYSTEM_ACTIVATION_HEIGHT;
                 let mut consensus_template_weight = if activated_shape_rules {
@@ -574,8 +581,16 @@ impl MiningManager {
                         .copied()
                         .unwrap_or_default();
                     let required_units = transaction.total_debit_units();
+                    let immature_units = immature_by_sender
+                        .get(&transaction.sender)
+                        .copied()
+                        .unwrap_or(0);
 
-                    if confirmed_units.saturating_sub(already_selected) >= required_units {
+                    if confirmed_units
+                        .saturating_sub(already_selected)
+                        .saturating_sub(immature_units)
+                        >= required_units
+                    {
                         // Relayability cap (MAX_TEMPLATE_TX_BYTES): continue, not
                         // break — fee-desc order still packs any smaller txs that
                         // fit under the remaining budget.
