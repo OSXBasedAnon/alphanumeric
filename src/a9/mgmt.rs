@@ -345,6 +345,17 @@ fn validate_wallet_transaction_addresses(
     Ok(())
 }
 
+/// Whether the passphrase the session holds has been proven correct: it is,
+/// exactly when at least one stored wallet that is encrypted loaded with it.
+pub fn session_passphrase_is_proven(
+    stored: &[WalletKeyData],
+    loaded_names: &HashSet<&str>,
+) -> bool {
+    stored
+        .iter()
+        .any(|record| record.is_encrypted && loaded_names.contains(record.wallet_name.as_str()))
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WalletKeyData {
     pub wallet_name: String,
@@ -816,6 +827,39 @@ impl Mgmt {
         let existing_keys = serde_json::from_str::<Vec<WalletKeyData>>(&existing_data)?;
         validate_unique_wallet_names(&existing_keys)?;
 
+        // The session passphrase is typed ONCE at startup, unconfirmed. It is proven
+        // only by having decrypted a stored encrypted wallet; if nothing proved it
+        // (every stored wallet is plaintext, or the startup entry was a typo and no
+        // wallet loaded), encrypting a brand-new key with it would bind funds to a
+        // string nobody has checked. Ask again, with confirmation, in that case.
+        let confirmed_passphrase: Option<Zeroizing<Vec<u8>>> = match passphrase {
+            Some(p)
+                if !p.is_empty()
+                    && !session_passphrase_is_proven(
+                        &existing_keys,
+                        &wallets.keys().map(String::as_str).collect(),
+                    ) =>
+            {
+                let typed = Password::new(
+                    "Passphrase for the new wallet (asked twice; Enter for no encryption):",
+                )
+                .with_display_mode(PasswordDisplayMode::Masked)
+                .prompt()
+                .map_err(|e| {
+                    format!(
+                        "passphrase prompt failed ({}); aborting so the wallet is not created \
+                         with an unverified passphrase",
+                        e
+                    )
+                })?;
+                Some(Zeroizing::new(typed.trim().as_bytes().to_vec()))
+            }
+            _ => None,
+        };
+        let passphrase: Option<&[u8]> = match confirmed_passphrase.as_deref() {
+            Some(bytes) => Some(bytes),
+            None => passphrase,
+        };
         let is_encrypted = passphrase.map(|p| !p.is_empty()).unwrap_or(false);
 
         // Resolve against the durable file, not only the successfully decrypted in-memory subset.
@@ -3793,6 +3837,27 @@ impl Mgmt {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_passphrase_counts_as_proven_only_by_a_decrypted_encrypted_wallet() {
+        use super::{session_passphrase_is_proven, WalletKeyData};
+        use std::collections::HashSet;
+        let record = |name: &str, encrypted: bool| WalletKeyData {
+            wallet_name: name.to_string(),
+            wallet_address: "aa".repeat(20),
+            private_key: None,
+            last_sync_timestamp: 0,
+            is_encrypted: encrypted,
+            key_verification_hash: Vec::new(),
+        };
+        let stored = vec![record("plain", false), record("vault", true)];
+        let loaded_plain_only: HashSet<&str> = ["plain"].into_iter().collect();
+        let loaded_both: HashSet<&str> = ["plain", "vault"].into_iter().collect();
+        assert!(!session_passphrase_is_proven(&stored, &HashSet::new()));
+        assert!(!session_passphrase_is_proven(&stored, &loaded_plain_only), "a plaintext wallet proves nothing");
+        assert!(session_passphrase_is_proven(&stored, &loaded_both));
+        assert!(!session_passphrase_is_proven(&[], &loaded_both), "no stored records, nothing proven");
+    }
+
     use super::*;
     use crate::a9::blockchain::AddressTxEntry;
     use crate::a9::blockchain::{ADDRESS_TX_FLAG_RECIPIENT, ADDRESS_TX_FLAG_SENDER};

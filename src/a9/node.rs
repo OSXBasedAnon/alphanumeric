@@ -107,6 +107,10 @@ const MAX_PEERS_PER_SUBNET: usize = 3;
 // lockstep). Bounds the per-request disk reads on the event loop and the reply size. 256 =
 // 4x the 64-aligned convergence window, so it never throttles catch-up.
 pub const MAX_GETBLOCKS_SPAN: u32 = 256;
+/// How long the opt-in HTTP servers (stats, explorer) wait for a client to
+/// finish sending request headers before closing the connection. Without it an
+/// idle half-open connection costs a slot indefinitely (slowloris).
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Max connected peers a single sync_full_history_from_peer call will probe for a fresh
 // height before giving up. Each probe is bounded by the message timeouts (5s connect /
 // 30s response worst case against a half-open post-sleep socket), so this also bounds
@@ -7504,6 +7508,9 @@ impl Node {
         tokio::spawn(async move {
             match axum::Server::from_tcp(listener) {
                 Ok(server) => {
+                    // A client that opens a connection and never finishes its
+                    // request headers must not hold a slot forever.
+                    let server = server.http1_header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
                     if let Err(e) = server.serve(app.into_make_service()).await {
                         error!("Stats server error: {}", e);
                     }
@@ -7683,6 +7690,9 @@ impl Node {
     async fn explorer_status_handler(
         State(state): State<ExplorerState>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -7736,6 +7746,9 @@ impl Node {
     }
 
     async fn explorer_tip_handler(State(state): State<ExplorerState>) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -7760,6 +7773,9 @@ impl Node {
         State(state): State<ExplorerState>,
         AxumPath(height): AxumPath<u32>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -7782,6 +7798,9 @@ impl Node {
         State(state): State<ExplorerState>,
         AxumPath((height, position)): AxumPath<(u32, u32)>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         let Ok(chain) = timeout(Duration::from_secs(3), state.blockchain.read()).await else {
             return Self::explorer_busy();
         };
@@ -7826,6 +7845,9 @@ impl Node {
         State(state): State<ExplorerState>,
         Query(query): Query<ExplorerTxIdQuery>,
     ) -> (StatusCode, Json<Value>) {
+        if !Self::allow_explorer_read(&state) {
+            return Self::explorer_err(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
         // Bound the id: a real get_tx_id is well under 512 chars
         // (two 40-hex addresses + amounts + a timestamp). Reject empty/oversized
         // before any tree scan.
@@ -9135,6 +9157,7 @@ impl Node {
         tokio::spawn(async move {
             match axum::Server::from_tcp(listener) {
                 Ok(server) => {
+                    let server = server.http1_header_read_timeout(HTTP_HEADER_READ_TIMEOUT);
                     if let Err(e) = server.serve(app.into_make_service()).await {
                         error!("Explorer API server error: {}", e);
                     }
