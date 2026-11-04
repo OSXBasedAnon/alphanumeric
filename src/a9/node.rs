@@ -7363,7 +7363,7 @@ impl Node {
             .map(|b| b.timestamp)
             .unwrap_or(0);
         let difficulty = blockchain.get_tip_difficulty().await;
-        let hashrate_ths = blockchain.calculate_network_hashrate().await;
+        let work = blockchain.network_work_estimate().await;
         drop(blockchain);
 
         let peers = state.peers.read().await.len();
@@ -7416,7 +7416,15 @@ impl Node {
                 "network_id": hex::encode(state.network_id),
                 "height": height,
                 "difficulty": difficulty,
-                "hashrate_ths": hashrate_ths,
+                "hashrate_ths": work.hashrate_ths(),
+                // Diagnostic pair behind the headline: declared = the chain's
+                // security (expected work at the blocks' difficulty), revealed =
+                // the work the miners actually searched. pow_margin_bits > 0 for
+                // any length of time means miners burn work the chain never
+                // receives (a pool share target above the block target).
+                "hashrate_declared_ths": work.declared_ths,
+                "hashrate_revealed_ths": work.revealed_ths,
+                "pow_margin_bits": work.margin_bits,
                 "last_block_time": last_block_time,
                 "peers": peers,
                 "version": format!("rust-{}", NETWORK_VERSION),

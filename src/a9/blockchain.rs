@@ -526,6 +526,96 @@ pub(crate) fn pow_target_bytes(target: &BigUint) -> [u8; 32] {
     bytes
 }
 
+/// Network work over a window of blocks, measured two ways. Display only:
+/// nothing here is consensus.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorkEstimate {
+    /// Expected hashes per second from each block's *declared* difficulty
+    /// (`MAX_TARGET / target`, summed, over the span). A floor: a block cannot
+    /// be found with less expected work than its target implies.
+    pub declared_ths: f64,
+    /// Expected hashes per second from the work the miners *revealed*. A block
+    /// hash is uniform on `[0, target_used]`, where `target_used` is whatever
+    /// the miner was really searching against, so the largest hash in the
+    /// window pins that target from below: `target_used ≈ max_hash · (n+1)/n`
+    /// (the unbiased maximum estimator for a uniform sample), and the work per
+    /// block is `2^256 / target_used`.
+    pub revealed_ths: f64,
+    /// `log2(revealed / declared)`, clamped at 0: how many bits harder than
+    /// the chain demanded the miners actually searched. ~0 when miners mine at
+    /// the chain target; a steady positive margin means work is being burned
+    /// that never reaches the chain (a pool whose share target exceeds the
+    /// block target, for instance), and the chain's security is only the
+    /// declared figure.
+    pub margin_bits: f64,
+}
+
+impl WorkEstimate {
+    /// The headline network hashrate (TH/s): the larger of the two estimates.
+    pub fn hashrate_ths(&self) -> f64 {
+        self.revealed_ths.max(self.declared_ths)
+    }
+}
+
+/// [`WorkEstimate`] for `samples` of (proof-of-work digest, declared
+/// difficulty) found within `span_secs`.
+///
+/// Why the revealed figure matters: a miner working against a harder target
+/// than the chain demands still produces blocks on cadence — the retarget only
+/// sees timing — so the declared estimate under-reads the true rate by exactly
+/// the margin the miner over-delivers, while every hash it publishes carries
+/// that margin. 2026-11-04 the live chain sat at difficulty 497 (31 zero bits)
+/// while all 100 recent pool blocks had 35–43: declared read 0.3 GH/s,
+/// revealed 7.
+///
+/// The maximum is used instead of the mean of `2^256 / hash` because that mean
+/// is dominated by one lucky small hash (its expectation diverges); the maximum
+/// of `n` uniforms is tightly concentrated near the true target. When miners
+/// mine at the chain target, revealed ≈ declared within ~1/n and the floor
+/// takes over.
+pub(crate) fn revealed_work_estimate(samples: &[([u8; 32], u64)], span_secs: u64) -> WorkEstimate {
+    if samples.is_empty() || span_secs == 0 {
+        return WorkEstimate::default();
+    }
+    let n = samples.len() as f64;
+    let span = span_secs as f64;
+    let max_target = MAX_TARGET.to_f64().unwrap_or(0.0);
+    let declared: f64 = samples
+        .iter()
+        .map(|(_, difficulty)| {
+            let target = pow_target_from_difficulty(*difficulty)
+                .to_f64()
+                .unwrap_or(1.0);
+            max_target / target.max(1.0)
+        })
+        .sum();
+    let max_hash = samples
+        .iter()
+        .map(|(hash, _)| BigUint::from_bytes_be(hash))
+        .max()
+        .and_then(|h| h.to_f64())
+        .unwrap_or(0.0);
+    let revealed = if max_hash > 0.0 {
+        let target_used = max_hash * (n + 1.0) / n;
+        n * 2f64.powi(256) / target_used
+    } else {
+        0.0
+    };
+    const TH: f64 = 1_000_000_000_000.0;
+    let declared_ths = declared / span / TH;
+    let revealed_ths = revealed / span / TH;
+    let margin_bits = if declared > 0.0 && revealed > declared {
+        (revealed / declared).log2()
+    } else {
+        0.0
+    };
+    WorkEstimate {
+        declared_ths,
+        revealed_ths,
+        margin_bits,
+    }
+}
+
 static FINALIZE_STAGE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn current_finalize_stage() -> usize {
@@ -8305,34 +8395,37 @@ impl Blockchain {
     }
 
     // Network hashrate
-    pub async fn calculate_network_hashrate(&self) -> f64 {
+    pub async fn network_work_estimate(&self) -> WorkEstimate {
         // Windowed estimate over the last 32 intervals. The old 2-block sample
         // broke down at a fast block time: consecutive blocks routinely share a
         // 1-second timestamp, so time_diff was 0 and the reported hashrate was a
         // hard 0 even while difficulty climbed past 550 (the "hashrate 0 but
         // difficulty rising" confusion) — and when it did fire, one noisy interval
-        // swung it wildly. Sum expected work per block and divide by the span.
+        // swung it wildly. The work itself is measured by revealed_work_estimate:
+        // from the hashes the miners actually produced, not only from the
+        // difficulty they were required to meet.
         const WINDOW: u32 = 32;
         let Some(tip) = self.get_last_block() else {
-            return 0.0;
+            return WorkEstimate::default();
         };
         let start_index = tip.index.saturating_sub(WINDOW);
         let Ok(start_block) = self.get_block(start_index) else {
-            return 0.0;
+            return WorkEstimate::default();
         };
         let span = tip.timestamp.saturating_sub(start_block.timestamp);
         if span == 0 || tip.index == start_index {
-            return 0.0;
+            return WorkEstimate::default();
         }
-        let mut expected_hashes = 0.0f64;
-        for h in (start_index + 1)..=tip.index {
-            if let Ok(b) = self.get_block(h) {
-                let target = pow_target_from_difficulty(b.difficulty);
-                expected_hashes +=
-                    MAX_TARGET.to_f64().unwrap_or(0.0) / target.to_f64().unwrap_or(1.0);
-            }
-        }
-        (expected_hashes / span as f64) / 1_000_000_000_000.0 // TH/s
+        let samples: Vec<([u8; 32], u64)> = ((start_index + 1)..=tip.index)
+            .filter_map(|h| self.get_block(h).ok())
+            .map(|b| (b.calculate_hash_for_block(), b.difficulty))
+            .collect();
+        revealed_work_estimate(&samples, span)
+    }
+
+    /// Headline network hashrate (TH/s): see [`Blockchain::network_work_estimate`].
+    pub async fn calculate_network_hashrate(&self) -> f64 {
+        self.network_work_estimate().await.hashrate_ths()
     }
 
     /// Seconds between each of the last `window` consecutive blocks, oldest
@@ -14056,6 +14149,64 @@ mod tests {
     fn pow_target_saturates_to_zero_for_large_difficulty() {
         // 4096 / 16 == 256 -> shifted past full 256-bit target width.
         assert_eq!(pow_target_from_difficulty(4096), BigUint::from(0u8));
+    }
+
+    /// A window's samples at exactly `margin_bits` below the chain target for
+    /// `difficulty` (all hashes equal: the maximum is then the exact target the
+    /// miner used, modulo the (n+1)/n correction).
+    fn work_samples(n: usize, difficulty: u64, margin_bits: u32) -> Vec<([u8; 32], u64)> {
+        let target_used = pow_target_from_difficulty(difficulty) >> (margin_bits as usize);
+        let hash = pow_target_bytes(&target_used);
+        vec![(hash, difficulty); n]
+    }
+
+    #[test]
+    fn revealed_work_matches_declared_when_miners_mine_at_the_chain_target() {
+        // Hashes right at the target: revealed = declared·n/(n+1), so the
+        // declared floor wins and the margin is zero.
+        let est = revealed_work_estimate(&work_samples(32, 497, 0), 160);
+        let expected = 32.0 * 2f64.powi(31) / 160.0 / 1e12;
+        assert!((est.declared_ths - expected).abs() / expected < 1e-9);
+        assert!(est.revealed_ths < est.declared_ths);
+        assert_eq!(est.margin_bits, 0.0);
+        assert_eq!(est.hashrate_ths(), est.declared_ths);
+    }
+
+    #[test]
+    fn revealed_work_sees_the_margin_a_miner_over_delivers() {
+        // The 2026-11-04 live shape: difficulty 497 (31 bits) while every hash
+        // clears ~36 — the pool's share target sat 5 bits above the block
+        // target. Declared reads 2^31 per block; revealed 2^36.
+        let est = revealed_work_estimate(&work_samples(32, 497, 5), 160);
+        let ratio = est.revealed_ths / est.declared_ths;
+        assert!(ratio > 31.0 && ratio < 32.0, "ratio {ratio}");
+        assert!(
+            (est.margin_bits - 5.0).abs() < 0.05,
+            "margin {}",
+            est.margin_bits
+        );
+        assert_eq!(est.hashrate_ths(), est.revealed_ths);
+    }
+
+    #[test]
+    fn revealed_work_is_not_swayed_by_one_lucky_hash() {
+        // The mean of 2^256/hash would explode on a single near-zero hash; the
+        // maximum-based estimate ignores it entirely.
+        let mut samples = work_samples(32, 497, 0);
+        samples[7].0 = [0u8; 32];
+        samples[7].0[31] = 1;
+        let est = revealed_work_estimate(&samples, 160);
+        assert_eq!(est.margin_bits, 0.0);
+        assert_eq!(est.hashrate_ths(), est.declared_ths);
+    }
+
+    #[test]
+    fn revealed_work_is_zero_without_samples_or_span() {
+        assert_eq!(revealed_work_estimate(&[], 10), WorkEstimate::default());
+        assert_eq!(
+            revealed_work_estimate(&work_samples(4, 497, 0), 0),
+            WorkEstimate::default()
+        );
     }
 
     // (G) The witness-blocked memo: record arms the backoff + stores R's fetch
