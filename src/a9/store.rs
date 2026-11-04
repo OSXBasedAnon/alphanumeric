@@ -48,7 +48,11 @@ macro_rules! from_err {
 // Open-time and non-engine errors keep the plain conversion; everything that can
 // carry a runtime `StorageError` routes through `classify_storage_error` so the
 // engine's "dead until reopened" state is recognised exactly once, here.
-from_err!(redb::DatabaseError, redb::SetDurabilityError, std::io::Error);
+from_err!(
+    redb::DatabaseError,
+    redb::SetDurabilityError,
+    std::io::Error
+);
 
 impl From<redb::StorageError> for StoreError {
     fn from(e: redb::StorageError) -> Self {
@@ -1260,4 +1264,3 @@ mod tests {
         assert!(!path.exists(), "temp store file removed on drop");
     }
 }
-
