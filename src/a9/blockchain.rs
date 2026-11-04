@@ -552,7 +552,15 @@ pub fn finalize_stage_name(stage: usize) -> &'static str {
     FINALIZE_STAGES.get(stage).copied().unwrap_or("unknown")
 }
 
-#[derive(Eq, PartialEq)]
+/// Output of `plan_transactions_batch`: the balances a block apply starts from
+/// and the exact deltas it will write. Pure data; holds no store handles.
+#[derive(Debug)]
+struct TxBatchPlan {
+    current_balances: HashMap<String, i128>,
+    balance_changes: HashMap<String, i128>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransactionContext {
     BlockValidation,
     ReceiptValidation,
@@ -5025,15 +5033,21 @@ impl Blockchain {
             return Err(BlockchainError::InvalidBlockHeader);
         }
 
-        self.mark_chain_state_dirty(block.index, "persist_block")?;
-
-        // Process transactions with BlockValidation context
+        // Plan (pure checks: witnesses, affordability) BEFORE the dirty marker, so
+        // a block that fails here — an overspend is one PoW solve away for anyone —
+        // is rejected without leaving the marker that forces a full rebuild.
         let tx_context = match sig_mode {
             SignatureValidationMode::RequireFull => TransactionContext::BlockValidation,
             SignatureValidationMode::AllowTruncatedStored => TransactionContext::ReceiptValidation,
         };
+        let plan = self
+            .plan_transactions_batch(&block.transactions, tx_context, block.index as u64)
+            .await?;
+
+        self.mark_chain_state_dirty(block.index, "persist_block")?;
+
         if let Err(err) = self
-            .process_transactions_batch(&block.transactions, tx_context, block.index as u64)
+            .apply_transactions_batch(plan, &block.transactions, tx_context, block.index as u64)
             .await
         {
             warn!(
@@ -6240,11 +6254,21 @@ impl Blockchain {
         set_finalize_stage(3);
         trace_step("validate_batch");
 
+        // Plan before the marker (see persist_validated_block_with_mode).
+        let plan = self
+            .plan_transactions_batch(
+                &block.transactions,
+                TransactionContext::BlockValidation,
+                block.index as u64,
+            )
+            .await?;
+
         self.mark_chain_state_dirty(block.index, "finalize_block")?;
 
         // Process transactions atomically
         if let Err(err) = self
-            .process_transactions_batch(
+            .apply_transactions_batch(
+                plan,
                 &block.transactions,
                 TransactionContext::BlockValidation,
                 block.index as u64,
@@ -8527,18 +8551,40 @@ impl Blockchain {
 
     // Temporal Provenance with Causal Linking
     // Add to handle distributions
+    /// Apply a block's transactions to the ledger: plan (pure checks) then apply
+    /// (writes). Kept as one call for the tests; the block-apply paths call the
+    /// two halves separately so the dirty marker is written only once every
+    /// check has passed — see `plan_transactions_batch`.
     pub async fn process_transactions_batch(
         &self,
         transactions: &[Transaction],
         context: TransactionContext,
         confirm_height: u64,
     ) -> Result<(), BlockchainError> {
-        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
-        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
-        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
-        let pending_debits_tree = self.open_pending_debits_tree()?;
-        let pending_credits_tree = self.open_pending_credits_tree()?;
+        let plan = self
+            .plan_transactions_batch(transactions, context, confirm_height)
+            .await?;
+        self.apply_transactions_batch(plan, transactions, context, confirm_height)
+            .await
+    }
 
+    /// The read-only half of a block apply: every signature / receipt check and
+    /// the affordability fold, producing the exact balance deltas the apply half
+    /// will write. Nothing here mutates canonical state, so a failure (an
+    /// overspending block, a bad witness, a store read error) leaves no trace.
+    ///
+    /// That is the point of the split. The dirty marker used to be written BEFORE
+    /// this ran, so a single cheap-to-mine overspending block left the marker set
+    /// and forced the next apply through the full derived-state rebuild (~52 s at
+    /// 1.8M blocks, under the state lock) — a repeatable stall on every receiving
+    /// node. Callers now plan, mark dirty, apply. Acceptance is unchanged: the
+    /// same checks run in the same order with the same inputs.
+    async fn plan_transactions_batch(
+        &self,
+        transactions: &[Transaction],
+        context: TransactionContext,
+        confirm_height: u64,
+    ) -> Result<TxBatchPlan, BlockchainError> {
         // Track cumulative balance changes
         let mut balance_changes: HashMap<String, i128> = HashMap::new();
         let mut current_balances: HashMap<String, i128> = HashMap::new();
@@ -8626,6 +8672,31 @@ impl Blockchain {
                 }
             }
         }
+
+        Ok(TxBatchPlan {
+            current_balances,
+            balance_changes,
+        })
+    }
+
+    /// The write half of a block apply. Must run inside the caller's dirty-marker
+    /// window: the first statement below is the first canonical mutation.
+    async fn apply_transactions_batch(
+        &self,
+        plan: TxBatchPlan,
+        transactions: &[Transaction],
+        context: TransactionContext,
+        confirm_height: u64,
+    ) -> Result<(), BlockchainError> {
+        let TxBatchPlan {
+            current_balances,
+            balance_changes,
+        } = plan;
+        let balances_tree = self.db.open_tree(BALANCES_TREE)?;
+        let pending_tree = self.db.open_tree(PENDING_TRANSACTIONS_TREE)?;
+        let full_sigs_tree = self.db.open_tree(PENDING_FULL_SIGNATURES_TREE)?;
+        let pending_debits_tree = self.open_pending_debits_tree()?;
+        let pending_credits_tree = self.open_pending_credits_tree()?;
 
         // Apply all changes atomically — the balance deltas AND the advanced index
         // marker land in ONE batch, so the (content, marker) pair can never tear.
@@ -16880,6 +16951,42 @@ mod tests {
             .get_orphan_block_by_hash(&future.hash)
             .unwrap()
             .is_some());
+    }
+
+    /// An overspending block's ledger plan must fail closed WITHOUT touching
+    /// state or the dirty marker: the affordability check is pure, so nothing
+    /// needs recovery afterwards. Before the plan/apply split, one such block
+    /// (one PoW solve) forced the next apply through the full derived-state
+    /// rebuild.
+    #[tokio::test]
+    async fn overspending_block_plan_fails_closed_without_a_dirty_marker() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        insert_raw_block(&blockchain, &block0);
+        blockchain.rebuild_chain_tip_metadata().unwrap();
+        assert!(blockchain.chain_state_dirty().unwrap().is_none());
+
+        // A real, verifiable spend from a wallet that holds nothing.
+        let wallet = Wallet::new(None).expect("wallet builds");
+        let mut spend = signed_transfer(&wallet, &"ee".repeat(20), 10.0, 1_001).await;
+        let sig_bytes = hex::decode(spend.signature.as_ref().unwrap()).unwrap();
+        spend.sig_hash = Some(Transaction::signature_hash_hex(&sig_bytes));
+
+        // Direct: the plan half fails closed and touches nothing.
+        let err = blockchain
+            .plan_transactions_batch(
+                std::slice::from_ref(&spend),
+                TransactionContext::BlockValidation,
+                1,
+            )
+            .await
+            .expect_err("unfunded spend must not plan");
+        assert!(matches!(err, BlockchainError::InsufficientFunds), "{err:?}");
+        assert!(blockchain.chain_state_dirty().unwrap().is_none());
+
+        // (A tip extension needs real PoW at NETWORK_MIN_DIFFICULTY, so the
+        // persist-level ordering — plan, then mark, then apply — is covered by
+        // construction in persist_validated_block_with_mode / finalize_block.)
     }
 
     #[test]
