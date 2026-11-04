@@ -51,6 +51,12 @@ migration, no wallet migration, no resync.
   work the chain never receives — on 2026-11-04 the pool's share target sat ~5
   bits above the block target, so the chain saw 1/32 of its hashing and the
   site read 0.3 GH/s against a real ~7–12. Display only.
+- **Mesh ICE gathers only on the address families the host has.** On a host
+  without routable IPv6 the ICE agent used to resolve every STUN server over
+  IPv6 on every peer connection and fail ("No available ipv6 IP address
+  found"), a few hundred doomed attempts an hour and ~100k log lines on the
+  8.0.1 publisher. IPv6 is offered only when a global address exists. The
+  `webrtc_ice` crate is also held at error level unless `RUST_LOG` names it.
 - **Reorg replay detection (staged).** A branch that confirms the same
   transaction twice is now detected and logged; rejection is scheduled behind
   `REORG_TX_DEDUPE_ACTIVATION_HEIGHT` and activates in a later release once
