@@ -3847,8 +3847,20 @@ impl Blockchain {
         let orphan_index = self.open_orphan_index_tree()?;
         let hash_key = Self::orphan_hash_key(&block.hash);
 
-        if orphan_blocks.get(hash_key.as_bytes())?.is_some() {
-            return Ok(());
+        if let Some(raw) = orphan_blocks.get(hash_key.as_bytes())? {
+            // Same block already parked. Keep whichever copy carries full
+            // witnesses: adopt_branch_if_valid re-verifies every signature above
+            // the verification floor, and a 64-byte receipt can never pass that,
+            // so a truncated copy of a competing branch is a branch that can never
+            // be adopted. A verified full-witness copy arriving later (the peer
+            // sync path hydrates before parking) upgrades the body in place; the
+            // index key is identical, so only the body changes.
+            let existing_is_full = codec::deserialize::<OrphanStoredBlock>(&raw)
+                .map(|entry| Self::block_carries_full_witnesses(&entry.block))
+                .unwrap_or(false);
+            if existing_is_full || !Self::block_carries_full_witnesses(block) {
+                return Ok(());
+            }
         }
 
         let received_at = Self::now_unix_secs();
@@ -9139,6 +9151,22 @@ impl Blockchain {
                 .map(|bytes| bytes.len() > 64)
                 .unwrap_or(false)
         })
+    }
+
+    /// Every non-coinbase transaction carries a full signature rather than a
+    /// 64-byte stored receipt. Structural only — no verification happens here;
+    /// `block_signatures_fully_verified` is the gate that verifies.
+    pub fn block_carries_full_witnesses(block: &Block) -> bool {
+        block
+            .transactions
+            .iter()
+            .filter(|tx| !SYSTEM_ADDRESSES.contains(&tx.sender.as_str()))
+            .all(|tx| {
+                tx.signature
+                    .as_ref()
+                    .and_then(|s| hex::decode(s).ok())
+                    .is_some_and(|b| b.len() > 64)
+            })
     }
 
     pub fn block_signatures_fully_verified(&self, block: &Block) -> bool {
@@ -17152,6 +17180,72 @@ mod tests {
         // (A tip extension needs real PoW at NETWORK_MIN_DIFFICULTY, so the
         // persist-level ordering — plan, then mark, then apply — is covered by
         // construction in persist_validated_block_with_mode / finalize_block.)
+    }
+
+    /// A parked competitor keeps the better-witnessed body: a full-witness copy
+    /// replaces a truncated one, and a truncated copy never displaces a full one.
+    #[test]
+    fn parked_orphan_upgrades_to_a_full_witness_copy() {
+        let blockchain = test_blockchain();
+        let block0 = metadata_test_block(0, [0u8; 32], "miner0", 1.0);
+        let block1 = metadata_test_block(1, block0.hash, "miner1", 1.0);
+        insert_raw_block(&blockchain, &block0);
+        insert_raw_block(&blockchain, &block1);
+        blockchain.rebuild_chain_tip_metadata().unwrap();
+
+        // A competing block at height 1 carrying one user payment. The merkle
+        // leaf normalises the signature to its hash, so the truncated copy has
+        // the same merkle root and block hash as the full one.
+        let full_sig = "ab".repeat(2_000);
+        let sig_hash = Transaction::signature_hash_hex(&hex::decode(&full_sig).unwrap());
+        let mut competitor = test_block_with_txs(1, block0.hash, "miner1b", 1.0, &[]);
+        competitor.transactions.push(Transaction {
+            sender: "aa".repeat(20),
+            recipient: "bb".repeat(20),
+            fee_units: Transaction::to_units(NETWORK_FEE),
+            amount_units: Transaction::to_units(1.0),
+            timestamp: 1_001,
+            signature: Some(full_sig.clone()),
+            pub_key: Some("cd".repeat(10)),
+            sig_hash: Some(sig_hash),
+        });
+        competitor.merkle_root = Blockchain::calculate_merkle_root(&competitor.transactions).unwrap();
+        competitor.hash = competitor.calculate_hash_for_block();
+        let mut truncated = competitor.clone();
+        truncated.transactions[1].signature = Some(full_sig[..128].to_string());
+        assert_eq!(
+            Blockchain::calculate_merkle_root(&truncated.transactions).unwrap(),
+            competitor.merkle_root,
+            "truncation must not change the commitment"
+        );
+        assert!(Blockchain::block_carries_full_witnesses(&competitor));
+        assert!(!Blockchain::block_carries_full_witnesses(&truncated));
+
+        let stored_sig_len = |bc: &Blockchain| {
+            bc.get_orphan_block_by_hash(&competitor.hash)
+                .unwrap()
+                .expect("parked")
+                .transactions[1]
+                .signature
+                .as_ref()
+                .map(|s| s.len())
+                .unwrap()
+        };
+
+        // Truncated first, full second: upgraded in place.
+        blockchain.store_orphan_block(&truncated).unwrap();
+        assert_eq!(stored_sig_len(&blockchain), 128);
+        blockchain.store_orphan_block(&competitor).unwrap();
+        assert_eq!(stored_sig_len(&blockchain), full_sig.len());
+        // A truncated copy arriving afterwards never downgrades it.
+        blockchain.store_orphan_block(&truncated).unwrap();
+        assert_eq!(stored_sig_len(&blockchain), full_sig.len());
+        // Exactly one index entry either way.
+        assert_eq!(
+            blockchain.orphan_children_of(&block0.hash).unwrap().len(),
+            1,
+            "re-storing the same block must not duplicate its index entry"
+        );
     }
 
     #[test]

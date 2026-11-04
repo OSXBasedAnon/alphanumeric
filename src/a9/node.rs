@@ -12078,12 +12078,41 @@ impl Node {
                 block.index
             )));
         }
+        // Park (or apply) the block WITH the witnesses just verified. A tip
+        // extension is truncated again at persist, so nothing changes there; a
+        // block parked as a competing branch keeps full signatures, which is
+        // what adopt_branch_if_valid's witness gate needs to ever adopt it.
+        let hydrated = self.hydrate_block_witnesses(block);
         self.blockchain
             .write()
             .await
-            .save_receipt_verified_block(block)
+            .save_receipt_verified_block(hydrated.as_ref().unwrap_or(block))
             .await
             .map_err(|e| NodeError::Blockchain(e.to_string()))
+    }
+
+    /// `block` with each non-coinbase signature replaced by the verified full
+    /// witness the cache holds for it. `None` if any witness is no longer
+    /// cached — the caller then keeps the body exactly as received. Only
+    /// meaningful right after `verify_block_with_witness` returned true for
+    /// this block (that is the one writer of the cache). The transaction id and
+    /// the merkle leaf both normalise the signature to its hash, so the
+    /// hydrated block commits to the same root and hash.
+    fn hydrate_block_witnesses(&self, block: &Block) -> Option<Block> {
+        let mut hydrated = block.clone();
+        let mut cache = self.tx_witness_cache.lock();
+        for tx in hydrated.transactions.iter_mut() {
+            if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                continue;
+            }
+            let full = cache.get(&tx.get_tx_id())?;
+            tx.signature = full.signature.clone();
+            tx.sig_hash = full.sig_hash.clone();
+            if tx.pub_key.is_none() {
+                tx.pub_key = full.pub_key.clone();
+            }
+        }
+        Some(hydrated)
     }
 
     async fn remove_outbound_connection(&self, addr: SocketAddr) {
@@ -19799,6 +19828,40 @@ impl Node {
         peer_heights.iter().any(|(_, h)| *h > current_height)
     }
 
+    /// Where the peer sync loop should re-request from after a batch starting
+    /// at `start` applied nothing.
+    ///
+    /// `first_prev_hash` is the parent the peer's lowest block names;
+    /// `local_parent_hash` is what we hold at `start - 1`. If they agree the
+    /// batch linked and merely failed verification — no rewind helps. If they
+    /// differ we hold a different block at `start - 1`: a lost race, and a loop
+    /// that only ever asks for `tip + 1` onward can never see the competing
+    /// sibling (the 11-02 outage: 817 rounds of "Saved 0/256", 1.5 h). Each call
+    /// widens the window below the ORIGINAL start by doubling — 1, 2, 4 …
+    /// CHECKPOINT_REORG_MARGIN — never below `floor`, so the batch carries the
+    /// sibling(s) and the ordinary orphan/reorg path adopts the heavier branch.
+    /// Returns the new `(start, rewind)`, or `None` to give up on this peer.
+    /// Pure: which blocks are ACCEPTED is unchanged, only which are asked for.
+    fn sync_rewind_after_empty_batch(
+        start: u32,
+        first_prev_hash: Option<[u8; 32]>,
+        local_parent_hash: Option<[u8; 32]>,
+        rewind: u32,
+        floor: u32,
+    ) -> Option<(u32, u32)> {
+        let claimed = first_prev_hash?;
+        if Some(claimed) == local_parent_hash {
+            return None;
+        }
+        let next = if rewind == 0 { 1 } else { rewind.checked_mul(2)? };
+        if next > crate::a9::blockchain::CHECKPOINT_REORG_MARGIN {
+            return None;
+        }
+        let origin = start.checked_add(rewind)?;
+        let rewound = origin.saturating_sub(next).max(floor);
+        (rewound < start).then_some((rewound, next))
+    }
+
     pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_MS: u64 = 1000;
@@ -19946,6 +20009,9 @@ impl Node {
 
                 // Sync in smaller batches
                 let mut start = current_sync_height.saturating_add(1);
+                // How far below the original start this peer is currently being
+                // asked to serve (see sync_rewind_after_empty_batch).
+                let mut rewind: u32 = 0;
 
                 while start <= *peer_height {
                     let end = std::cmp::min(
@@ -19996,6 +20062,8 @@ impl Node {
                                         })
                                         .ok()
                                 };
+                                let first_prev_hash =
+                                    candidate_blocks.first().map(|b| b.previous_hash);
                                 for block in candidate_blocks {
                                     let before = {
                                         self.blockchain.read().await.get_latest_block_index() as u32
@@ -20020,9 +20088,15 @@ impl Node {
                                                     .get_latest_block_index()
                                                     as u32
                                             };
+                                            // A reorg onto a heavier-but-shorter branch can
+                                            // LOWER the tip; the cursor must follow it either
+                                            // way, or the next batch is asked for from a
+                                            // height we no longer hold.
+                                            if after != before {
+                                                current_sync_height = after;
+                                            }
                                             if after > before {
                                                 saved_count += after.saturating_sub(before);
-                                                current_sync_height = after;
                                                 if block.index >= verify_from {
                                                     // Frontier block verified against peer
                                                     // witnesses; trail the checkpoint behind
@@ -20064,8 +20138,39 @@ impl Node {
 
                                 blocks_synced += saved_count;
                                 if saved_count == 0 {
-                                    break;
+                                    let (local_parent_hash, floor) = {
+                                        let bc = self.blockchain.read().await;
+                                        let parent = start
+                                            .checked_sub(1)
+                                            .and_then(|h| bc.get_block(h).ok())
+                                            .map(|b| b.hash);
+                                        (parent, bc.verification_floor().saturating_add(1))
+                                    };
+                                    match Self::sync_rewind_after_empty_batch(
+                                        start,
+                                        first_prev_hash,
+                                        local_parent_hash,
+                                        rewind,
+                                        floor,
+                                    ) {
+                                        Some((rewound_start, next_rewind)) => {
+                                            info!(
+                                                "Sync: batch at {} does not link onto our block {}; \
+                                                 re-requesting from {} (rewind {}) so a competing \
+                                                 branch can be adopted",
+                                                start,
+                                                start.saturating_sub(1),
+                                                rewound_start,
+                                                next_rewind
+                                            );
+                                            rewind = next_rewind;
+                                            start = rewound_start;
+                                            continue;
+                                        }
+                                        None => break,
+                                    }
                                 }
+                                rewind = 0;
                             } else {
                                 warn!("No valid blocks received for range {}-{}", start, end);
                                 break; // Try next peer
@@ -21915,6 +22020,36 @@ mod tests {
     // sync_with_network must not cry wolf: with zero blocks synced from peers, a relay-fallback
     // error is a real "failed to sync" ONLY when a peer is genuinely ahead. No peer ahead == caught
     // up to the peer frontier == a transient relay blip is benign (report success, retry later).
+    #[test]
+    fn sync_rewind_doubles_below_the_original_start_and_stops_at_the_floor() {
+        let ours = [1u8; 32];
+        let theirs = [2u8; 32];
+        let rewind = Node::sync_rewind_after_empty_batch;
+
+        // Linked batch: the failure is not a fork, never rewind.
+        assert_eq!(rewind(101, Some(ours), Some(ours), 0, 40), None);
+        // Empty batch: nothing to judge.
+        assert_eq!(rewind(101, None, Some(ours), 0, 40), None);
+
+        // Lost race at 100: 1, 2, 4 … 64 below the original start, then stop.
+        assert_eq!(rewind(101, Some(theirs), Some(ours), 0, 40), Some((100, 1)));
+        assert_eq!(rewind(100, Some(theirs), Some(ours), 1, 40), Some((99, 2)));
+        assert_eq!(rewind(99, Some(theirs), Some(ours), 2, 40), Some((97, 4)));
+        assert_eq!(rewind(97, Some(theirs), Some(ours), 4, 40), Some((93, 8)));
+        assert_eq!(rewind(93, Some(theirs), Some(ours), 8, 40), Some((85, 16)));
+        assert_eq!(rewind(85, Some(theirs), Some(ours), 16, 40), Some((69, 32)));
+        assert_eq!(rewind(69, Some(theirs), Some(ours), 32, 40), Some((40, 64)), "clamped to floor");
+        assert_eq!(rewind(40, Some(theirs), Some(ours), 64, 40), None, "window exhausted");
+
+        // Floor reached early: no further rewind once start sits on it.
+        assert_eq!(rewind(101, Some(theirs), Some(ours), 0, 100), Some((100, 1)));
+        assert_eq!(rewind(100, Some(theirs), Some(ours), 1, 100), None);
+        // Fresh chain with nothing held at start-1 still steps back.
+        assert_eq!(rewind(5, Some(theirs), None, 0, 1), Some((4, 1)));
+        // No arithmetic surprises at the top of the range.
+        assert_eq!(rewind(u32::MAX, Some(theirs), Some(ours), 0, 1), Some((u32::MAX - 1, 1)));
+    }
+
     #[test]
     fn any_peer_ahead_flags_only_a_genuinely_higher_peer() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
