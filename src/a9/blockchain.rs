@@ -69,6 +69,9 @@ pub const MAX_TX_AGE_SECS: u64 = 21_600; // 6 hours
 /// How many blocks past confirmation a transaction's full witness is retained so
 /// it remains verifiable during near-tip sync. No consensus impact.
 pub const WITNESS_RETENTION_BLOCKS: u64 = 256;
+/// Every this-many witness prunes is a full sweep of the witness store; the rest
+/// only visit the rows that just left the retention window.
+const WITNESS_FULL_SWEEP_EVERY: u64 = 64;
 /// How far behind the fully-verified frontier the trusted checkpoint trails.
 /// Blocks at/below the checkpoint are final: signature-trusted (not re-verified)
 /// and not reorgable. The margin preserves normal PoW reorg depth above the
@@ -163,6 +166,9 @@ const MONEY_SCALE_I128: i128 = 100_000_000;
 const MONEY_SCALE_F64: f64 = MONEY_SCALE_I128 as f64;
 const MIN_TRANSACTION_AMOUNT_UNITS: i128 = 564;
 const ORPHAN_MAX_COUNT: usize = 10_000;
+/// Byte budget for parked orphan bodies. Honest forks are a few blocks of ordinary
+/// size; the count cap alone allowed ~40 GB of maximum-size parentless blocks.
+const ORPHAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const ORPHAN_TTL_SECS: u64 = 6 * 60 * 60;
 pub const ORPHAN_REORG_DEPTH: u32 = 1024;
 const ORPHAN_BRANCH_SEARCH_LIMIT: usize = 4_096;
@@ -1250,6 +1256,26 @@ pub enum BlockchainError {
     BatchValidationFailed(Vec<usize>),
 }
 
+impl BlockchainError {
+    /// A failure that depends on this node's own state at the time (storage, wall
+    /// clock, local limits) rather than on the block, so the same block may pass later.
+    pub fn is_circumstantial(&self) -> bool {
+        matches!(
+            self,
+            BlockchainError::DatabaseError(_)
+                | BlockchainError::IoError(_)
+                | BlockchainError::FlushError(_)
+                | BlockchainError::RateLimitExceeded(_)
+                | BlockchainError::CanonicalCorruption { .. }
+                | BlockchainError::SerializationError(_)
+                | BlockchainError::CodecError(_)
+                | BlockchainError::MiningError(_)
+                | BlockchainError::InvalidBlockTimestamp
+                | BlockchainError::TransactionTimestampOutOfWindow
+        )
+    }
+}
+
 impl fmt::Display for BlockchainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2012,12 +2038,26 @@ impl Blockchain {
     /// Entries written before this existed have an empty value and decode to None; the
     /// caller falls back to reading that one block and rewrites the value, so the pool heals
     /// itself as it turns over rather than needing a migration.
-    fn orphan_index_value(received_at: u64) -> [u8; 8] {
-        received_at.to_be_bytes()
+    ///
+    /// The stored body's size follows it, for the pool's byte budget. An 8-byte value
+    /// (written before the size was) reads as size unknown and is backfilled the same way.
+    fn orphan_index_value(received_at: u64, body_bytes: u64) -> [u8; 16] {
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&received_at.to_be_bytes());
+        value[8..].copy_from_slice(&body_bytes.to_be_bytes());
+        value
     }
 
     fn parse_orphan_index_received_at(value: &[u8]) -> Option<u64> {
-        let bytes: [u8; 8] = value.try_into().ok()?;
+        if value.len() != 8 && value.len() != 16 {
+            return None;
+        }
+        let bytes: [u8; 8] = value[..8].try_into().ok()?;
+        Some(u64::from_be_bytes(bytes))
+    }
+
+    fn parse_orphan_index_body_bytes(value: &[u8]) -> Option<u64> {
+        let bytes: [u8; 8] = value.get(8..16)?.try_into().ok()?;
         Some(u64::from_be_bytes(bytes))
     }
 
@@ -2081,6 +2121,14 @@ impl Blockchain {
     ) -> Result<(), BlockchainError> {
         // Basic header checks include hash self-consistency + PoW proof.
         block.validate_header()?;
+        // The same consensus bounds the attached path enforces, checked before any
+        // signature work: a parentless block that fails them can never be adopted, so
+        // parking it would only spend the orphan pool on it. (The PoW floor is applied
+        // where peer blocks enter, in request_blocks and the gossip handlers.)
+        if block.transactions.len() > MAX_BLOCK_TX_COUNT {
+            return Err(BlockchainError::BlockTransactionCountExceeded);
+        }
+        Self::validate_block_shape_rules_at(block, sig_mode, FEE_SYSTEM_ACTIVATION_HEIGHT)?;
 
         // Merkle must match the normalized tx encoding.
         let expected_root = Blockchain::calculate_merkle_root(&block.transactions)?;
@@ -2996,12 +3044,17 @@ impl Blockchain {
     /// retain an extra MAX_BLOCK_FUTURE_TIME of history so an entry is never pruned
     /// while a block could still legitimately replay it (which would silently reopen
     /// the double-spend the registry exists to close).
-    fn prune_confirmed_txs(&self, tip_timestamp: u64) -> Result<(), BlockchainError> {
+    ///
+    /// `reference_timestamp` must be that of the LOWEST block a reorg could still fork
+    /// above (replay_prune_reference_timestamp), never the tip's: a fork's blocks may be
+    /// stamped as early as their fork point, so pruning against the tip left the newest
+    /// prunable entry replayable by a two-block fork one block deep.
+    fn prune_confirmed_txs(&self, reference_timestamp: u64) -> Result<(), BlockchainError> {
         let horizon = MAX_TX_AGE_SECS.saturating_add(MAX_BLOCK_FUTURE_TIME);
-        if tip_timestamp <= horizon {
+        if reference_timestamp <= horizon {
             return Ok(());
         }
-        let cutoff = tip_timestamp - horizon;
+        let cutoff = reference_timestamp - horizon;
         let tree = self.open_confirmed_tx_tree()?;
         let index = self.db.open_tree(CONFIRMED_TX_TS_INDEX)?;
         let upper = cutoff.to_be_bytes().to_vec();
@@ -3022,6 +3075,27 @@ impl Blockchain {
             }
         }
         Ok(())
+    }
+
+    /// Timestamp of the lowest block a reorg could still fork above at `tip_index`: the
+    /// trusted checkpoint, or, if a branch could reach further down, the deepest point
+    /// an orphan branch can fork from. Block timestamps never decrease along a chain, so
+    /// every block a reorg could add is stamped at or after this; an entry whose replay
+    /// window closed before it can never be replayed. 0 (prune nothing) if unreadable.
+    fn replay_prune_reference_timestamp(&self, tip_index: u32, tip_timestamp: u64) -> u64 {
+        let deepest_fork = tip_index.saturating_sub(ORPHAN_REORG_DEPTH.saturating_mul(2));
+        let floor = self
+            .trusted_checkpoint_height()
+            .max(deepest_fork)
+            .min(tip_index);
+        self.get_block(floor)
+            .map(|b| b.timestamp.min(tip_timestamp))
+            .unwrap_or(0)
+    }
+
+    fn prune_confirmed_txs_for_tip(&self, tip_index: u32, tip_timestamp: u64) {
+        let reference = self.replay_prune_reference_timestamp(tip_index, tip_timestamp);
+        let _ = self.prune_confirmed_txs(reference);
     }
 
     /// True if the block replays a non-system transaction already confirmed at a
@@ -3295,6 +3369,13 @@ impl Blockchain {
             let mut batch = store::Batch::default();
             let mut index_batch = store::Batch::default();
             let mut previous: Option<Block> = None;
+            // Only entries the prune below would keep are collected: the scan still walks
+            // (and checks) every height, but memory stays bounded by the replay window
+            // instead of every transaction the chain ever confirmed.
+            let keep_from_ts = self.get_block(tip).ok().map_or(0, |tip_block| {
+                self.replay_prune_reference_timestamp(tip_block.index, tip_block.timestamp)
+                    .saturating_sub(MAX_TX_AGE_SECS.saturating_add(MAX_BLOCK_FUTURE_TIME))
+            });
             for h in 0..=tip {
                 // Heartbeat: this loop can hold the chain lock for a long time on a large
                 // chain, and a watchdog probing lock acquirability cannot otherwise tell
@@ -3318,7 +3399,9 @@ impl Blockchain {
                 let idx = block.index.to_le_bytes().to_vec();
                 let ts_prefix = block.timestamp.to_be_bytes();
                 for tx in &block.transactions {
-                    if SYSTEM_ADDRESSES.contains(&tx.sender.as_str()) {
+                    if block.timestamp < keep_from_ts
+                        || SYSTEM_ADDRESSES.contains(&tx.sender.as_str())
+                    {
                         continue;
                     }
                     let tx_id = tx.get_tx_id();
@@ -3329,22 +3412,25 @@ impl Blockchain {
                 }
                 previous = Some(block);
             }
-            // Scan proved contiguous — only now discard the old registry.
-            tree.clear()?;
+            // Scan proved contiguous — only now discard the old registry. The timestamp
+            // index is cleared first and refilled last: ensure_confirmed_tx_index treats
+            // a non-empty index as a built registry, so it must never outlive the tree it
+            // describes across a crash between these commits.
             index.clear()?;
+            tree.clear()?;
             tree.apply_batch(batch)?;
             index.apply_batch(index_batch)?;
             tree.flush()?;
             index.flush()?;
             // Drop anything already beyond the freshness window on this first build.
             if let Some(tip_block) = self.get_last_block() {
-                let _ = self.prune_confirmed_txs(tip_block.timestamp);
+                self.prune_confirmed_txs_for_tip(tip_block.index, tip_block.timestamp);
             }
         } else {
             // No blocks at all: nothing to derive, so the registry must end up empty.
             // Kept explicit because the clear above now sits behind the contiguity scan.
-            tree.clear()?;
             index.clear()?;
+            tree.clear()?;
         }
         // Stamp the completion marker unconditionally — even for a chain with no blocks or no
         // indexable txs — so ensure_confirmed_tx_index does not re-derive on every startup. New
@@ -3776,6 +3862,55 @@ impl Blockchain {
             })
     }
 
+    /// Height of the block in which `sender` paid exactly this transaction (the fields a tx id
+    /// is made of), read from the permanent address index. The replay registry forgets a
+    /// transaction once its validity window closes; this answers for any age. `Ok(None)`: the
+    /// index is current and holds no such payment. `Err`: the index cannot answer right now.
+    pub fn confirmed_payment_height(
+        &self,
+        sender: &str,
+        recipient: &str,
+        amount_units: i128,
+        fee_units: i128,
+        timestamp: u64,
+    ) -> Result<Option<u32>, BlockchainError> {
+        let indexed_tip = self.address_index_meta()?.map(|(height, _)| height);
+        let chain_tip = self.highest_block_index();
+        if indexed_tip.is_none() || indexed_tip < chain_tip {
+            return Err(Self::derived_index_error(
+                ADDRESS_TX_TREE,
+                "the address index is not current with the chain tip",
+            ));
+        }
+        let tree = self.open_address_tx_tree()?;
+        let prefix = Self::address_tx_prefix(sender);
+        // Newest first. A block that could hold this transaction is stamped no earlier than
+        // timestamp - MAX_BLOCK_FUTURE_TIME, and block times never decrease with height, so
+        // once an entry's own transaction is far enough older than that, nothing below it can
+        // match and the walk stops instead of reading the sender's whole history.
+        let stop_below = timestamp.saturating_sub(
+            MAX_TX_AGE_SECS
+                .saturating_add(MAX_BLOCK_FUTURE_TIME.saturating_mul(2))
+                .saturating_add(3_600),
+        );
+        for item in tree.scan_prefix(&prefix).rev() {
+            let (key, value) = item?;
+            let entry = Self::decode_address_tx_entry(prefix.len(), &key, &value)?;
+            if entry.timestamp < stop_below {
+                break;
+            }
+            if entry.flags & ADDRESS_TX_FLAG_SENDER != 0
+                && entry.counterparty == recipient
+                && entry.amount_units == amount_units
+                && entry.fee_units == fee_units
+                && entry.timestamp == timestamp
+            {
+                return Ok(Some(entry.height));
+            }
+        }
+        Ok(None)
+    }
+
     /// Sum of all positive confirmed balances — the actual circulating supply.
     /// Replaces the old "sum every transaction amount in every block" estimate,
     /// which double-counted transfers (a mined 50 sent onward counted as 100) and
@@ -3971,11 +4106,12 @@ impl Blockchain {
         // an index entry with no body — which the dangling sweep in prune_orphans already
         // collects. The reverse would leave a body no index references, and since pruning now
         // reaches its verdict from the index alone, nothing would ever reclaim it.
+        let body = codec::serialize(&orphan_entry)?;
         orphan_index.insert(
             Self::orphan_index_key(&block.previous_hash, block.index, &block.hash).as_bytes(),
-            Self::orphan_index_value(received_at),
+            Self::orphan_index_value(received_at, body.len() as u64),
         )?;
-        orphan_blocks.insert(hash_key.as_bytes(), codec::serialize(&orphan_entry)?)?;
+        orphan_blocks.insert(hash_key.as_bytes(), body)?;
         orphan_blocks.flush()?;
         orphan_index.flush()?;
         self.prune_orphans()?;
@@ -4381,37 +4517,66 @@ impl Blockchain {
         }
         let mut candidates = Vec::new();
 
-        for item in orphan_blocks.iter() {
-            let (_, raw) = item?;
+        // Select from the INDEX keys (`{prev_hash}:{index}:{hash}` carries every field the
+        // filter reads) and decode only the bodies that pass: a full pool used to be decoded
+        // in its entirety on every applied block, under the write lock. Canonical hashes are
+        // memoised per height, since competing orphans pile up on the same few heights.
+        let orphan_index = self.open_orphan_index_tree()?;
+        let mut canonical_hash: HashMap<u32, Option<[u8; 32]>> = HashMap::new();
+        let mut canonical_hash_at = |height: u32| -> Option<[u8; 32]> {
+            *canonical_hash
+                .entry(height)
+                .or_insert_with(|| self.get_block(height).ok().map(|b| b.hash))
+        };
+        for item in orphan_index.iter() {
+            let (key, _) = item?;
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                continue;
+            };
+            let mut parts = key_str.splitn(3, ':');
+            let (Some(prev_hex), Some(index_str), Some(hash_hex)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(index), Some(prev_hash), Some(hash)) = (
+                index_str.parse::<u32>(),
+                hex::decode(prev_hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()),
+                hex::decode(hash_hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()),
+            ) else {
+                continue;
+            };
+
+            if index > tip.index {
+                continue;
+            }
+            if index == 0 {
+                if prev_hash != [0u8; 32] {
+                    continue;
+                }
+            } else if canonical_hash_at(index - 1) != Some(prev_hash) {
+                continue;
+            }
+            match canonical_hash_at(index) {
+                Some(existing) if existing != hash => {}
+                _ => continue,
+            }
+
+            let Some(raw) = orphan_blocks.get(hash_hex.as_bytes())? else {
+                continue;
+            };
             let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) else {
                 continue;
             };
             let b = entry.block;
-
-            if b.index > tip.index {
+            // The key is only a claim about the body; select on the body's own fields.
+            if b.index != index || b.previous_hash != prev_hash || b.hash != hash {
                 continue;
             }
-
-            if b.index == 0 {
-                if b.previous_hash != [0u8; 32] {
-                    continue;
-                }
-            } else {
-                let Ok(parent) = self.get_block(b.index.saturating_sub(1)) else {
-                    continue;
-                };
-                if parent.hash != b.previous_hash {
-                    continue;
-                }
-            }
-
-            let Ok(existing) = self.get_block(b.index) else {
-                continue;
-            };
-            if existing.hash == b.hash {
-                continue;
-            }
-
             candidates.push(b);
         }
 
@@ -4798,7 +4963,7 @@ impl Blockchain {
         for b in &branch {
             self.record_confirmed_txs(b)?;
         }
-        let _ = self.prune_confirmed_txs(branch_tip.timestamp);
+        self.prune_confirmed_txs_for_tip(branch_tip.index, branch_tip.timestamp);
 
         // Balances after the reorg, in O(reorg span): the fork-boundary values
         // (already reverted to fork_start-1 for every touched address) commit
@@ -4930,6 +5095,28 @@ impl Blockchain {
         Ok(true)
     }
 
+    /// The retained orphans to drop, oldest first, until the pool is within both
+    /// ORPHAN_MAX_COUNT and ORPHAN_MAX_BYTES.
+    fn orphan_overflow(mut retained: Vec<(u64, [u8; 32], u64)>) -> Vec<[u8; 32]> {
+        let total_bytes: u64 = retained.iter().map(|(_, _, bytes)| *bytes).sum();
+        if retained.len() <= ORPHAN_MAX_COUNT && total_bytes <= ORPHAN_MAX_BYTES {
+            return Vec::new();
+        }
+        retained.sort_unstable_by_key(|(received_at, hash, _)| (*received_at, *hash));
+        let mut count = retained.len();
+        let mut bytes = total_bytes;
+        let mut drop = Vec::new();
+        for (_, hash, size) in retained {
+            if count <= ORPHAN_MAX_COUNT && bytes <= ORPHAN_MAX_BYTES {
+                break;
+            }
+            drop.push(hash);
+            count -= 1;
+            bytes = bytes.saturating_sub(size);
+        }
+        drop
+    }
+
     fn prune_orphans(&self) -> Result<(), BlockchainError> {
         let orphan_blocks = self.open_orphan_blocks_tree()?;
         let orphan_index = self.open_orphan_index_tree()?;
@@ -4947,8 +5134,8 @@ impl Blockchain {
         // single stored block — this used to deserialize every one of them (up to
         // ORPHAN_MAX_COUNT megabyte-scale blocks) to read three small fields, on a path that
         // runs per applied block and per stored orphan, under the chain write lock.
-        let mut retained: Vec<(u64, [u8; 32])> = Vec::new();
-        let mut backfill: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut retained: Vec<(u64, [u8; 32], u64)> = Vec::new();
+        let mut backfill: Vec<(Vec<u8>, u64, u64)> = Vec::new();
         let checkpoint = self.trusted_checkpoint_height();
         for item in orphan_index.iter() {
             let (key, value) = item?;
@@ -4961,20 +5148,25 @@ impl Blockchain {
             else {
                 continue;
             };
-            // Pre-existing entries carry an empty value. Read that one body to recover its
-            // arrival time and queue the value for rewrite, so the pool converges on the
-            // cheap path as it turns over instead of needing a migration.
-            let received_at = match Self::parse_orphan_index_received_at(&value) {
-                Some(ts) => ts,
-                None => {
+            // Older entries carry an empty value, or an arrival time without the size.
+            // Read that one body to recover both and queue the value for rewrite, so the
+            // pool converges on the cheap path as it turns over instead of needing a
+            // migration.
+            let (received_at, body_bytes) = match (
+                Self::parse_orphan_index_received_at(&value),
+                Self::parse_orphan_index_body_bytes(&value),
+            ) {
+                (Some(ts), Some(bytes)) => (ts, bytes),
+                _ => {
                     let Some(raw) = orphan_blocks.get(hash_hex.as_bytes())? else {
                         continue; // dangling; the sweep below removes it
                     };
                     let Ok(entry) = codec::deserialize::<OrphanStoredBlock>(&raw) else {
                         continue;
                     };
-                    backfill.push((key.clone(), entry.received_at));
-                    entry.received_at
+                    let bytes = raw.len() as u64;
+                    backfill.push((key.clone(), entry.received_at, bytes));
+                    (entry.received_at, bytes)
                 }
             };
             {
@@ -4995,26 +5187,18 @@ impl Blockchain {
                 if expired || stale_height || finalized_below {
                     remove_hashes.push(hash);
                 } else {
-                    retained.push((received_at, hash));
+                    retained.push((received_at, hash, body_bytes));
                 }
             }
         }
 
         // Rewrite the values recovered from bodies above, so each old entry pays that cost
         // once rather than on every prune.
-        for (key, received_at) in backfill {
-            orphan_index.insert(key, Self::orphan_index_value(received_at))?;
+        for (key, received_at, bytes) in backfill {
+            orphan_index.insert(key, Self::orphan_index_value(received_at, bytes))?;
         }
 
-        if retained.len() > ORPHAN_MAX_COUNT {
-            let overflow = retained.len().saturating_sub(ORPHAN_MAX_COUNT);
-            // Only the oldest `overflow` are needed and their order among themselves is
-            // irrelevant, so select rather than sort.
-            retained.select_nth_unstable_by_key(overflow, |(received_at, _)| *received_at);
-            for (_, hash) in retained.into_iter().take(overflow) {
-                remove_hashes.push(hash);
-            }
-        }
+        remove_hashes.extend(Self::orphan_overflow(retained));
 
         for hash in remove_hashes {
             self.remove_orphan_by_hash(&hash)?;
@@ -5064,7 +5248,7 @@ impl Blockchain {
                 if orphan_index.get(index_key.as_bytes())?.is_none() {
                     orphan_index.insert(
                         index_key.as_bytes(),
-                        Self::orphan_index_value(entry.received_at),
+                        Self::orphan_index_value(entry.received_at, raw.len() as u64),
                     )?;
                     repaired += 1;
                 }
@@ -5233,7 +5417,7 @@ impl Blockchain {
             );
             return Err(err);
         }
-        let _ = self.prune_confirmed_txs(block.timestamp);
+        self.prune_confirmed_txs_for_tip(block.index, block.timestamp);
 
         // Store block with truncated signatures to reduce chain size
         let storage_block = Self::to_storage_block(block);
@@ -5318,10 +5502,13 @@ impl Blockchain {
                         progressed = true;
                         break;
                     }
-                    Err(_) => {
-                        // Invalid child can never attach.
+                    // A child the rules reject can never attach. A failure of our own
+                    // (store, clock) says nothing about the block: keep it for the next
+                    // pass instead of deleting it and re-downloading it later.
+                    Err(e) if !e.is_circumstantial() => {
                         let _ = self.remove_orphan_by_hash(&candidate.hash);
                     }
+                    Err(_) => {}
                 }
             }
 
@@ -6500,7 +6687,7 @@ impl Blockchain {
             );
             return Err(err);
         }
-        let _ = self.prune_confirmed_txs(block.timestamp);
+        self.prune_confirmed_txs_for_tip(block.index, block.timestamp);
         self.clear_chain_state_dirty()?;
 
         self.notify_tip_changed(&block);
@@ -7333,13 +7520,6 @@ impl Blockchain {
             return Ok(TransactionAdmissionOutcome::AlreadyConfirmed(height));
         }
 
-        // Rate limit check
-        if !self.rate_limiter.check_limit(&transaction.sender) {
-            return Err(BlockchainError::RateLimitExceeded(
-                "Too many requests".into(),
-            ));
-        }
-
         if !transaction.has_valid_regular_amounts() {
             return Err(BlockchainError::InvalidTransactionAmount);
         }
@@ -7450,6 +7630,15 @@ impl Blockchain {
         let derived_addr = hex::encode(&hasher.finalize()[..20]);
         if derived_addr != transaction.sender {
             return Err(BlockchainError::InvalidTransactionSignature);
+        }
+
+        // Per-sender rate limit, counted only once the sender is proven: before the
+        // signature check anyone could spend a victim address's allowance with
+        // forgeries in its name and lock its real payments out.
+        if !self.rate_limiter.check_limit(&transaction.sender) {
+            return Err(BlockchainError::RateLimitExceeded(
+                "Too many requests".into(),
+            ));
         }
 
         let sig_hash = Transaction::signature_hash_hex(&sig_bytes);
@@ -8945,7 +9134,19 @@ impl Blockchain {
             // runs inside the block-apply dirty window, which both persist tails
             // close with one authoritative db.flush(). Five redundant whole-DB
             // fsyncs per applied block deleted.
-            self.prune_confirmed_witnesses(confirm_height)?;
+            //
+            // Per block, only the rows that just aged out are visited; the full sweep
+            // (which reads every stored witness) runs on every WITNESS_FULL_SWEEP_EVERY-th
+            // call to reclaim objects a reorg left unpinned.
+            static PRUNE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let call = PRUNE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::manual_is_multiple_of)] // MSRV 1.89
+            let full_sweep = call % WITNESS_FULL_SWEEP_EVERY == 0;
+            if full_sweep {
+                self.prune_confirmed_witnesses(confirm_height)?;
+            } else {
+                self.prune_aged_witnesses(confirm_height)?;
+            }
         }
 
         Ok(())
@@ -9081,6 +9282,47 @@ impl Blockchain {
     /// Remove retained confirmed-transaction witnesses older than the retention
     /// window. Index keys are height-big-endian prefixed, so a byte range prunes
     /// everything confirmed at or below `tip_height - WITNESS_RETENTION_BLOCKS`.
+    /// The per-block part of `prune_confirmed_witnesses`: drop the occurrence rows at or below
+    /// the retention cutoff (a range read of the height-prefixed index) and release the objects
+    /// they named unless a row still inside the window pins them. Objects a reorg left with no
+    /// row at all are left to the full sweep; over-retention is the safe direction.
+    fn prune_aged_witnesses(&self, tip_height: u64) -> Result<(), BlockchainError> {
+        if tip_height <= WITNESS_RETENTION_BLOCKS {
+            return Ok(());
+        }
+        let cutoff = tip_height - WITNESS_RETENTION_BLOCKS;
+        let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
+        let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
+        let in_window_start = cutoff.saturating_add(1).to_be_bytes().to_vec();
+
+        let mut stale_rows: Vec<Vec<u8>> = Vec::new();
+        for item in cw_index.range(..in_window_start.clone()) {
+            let (key, _) = item?;
+            stale_rows.push(key.to_vec());
+        }
+        if stale_rows.is_empty() {
+            return Ok(());
+        }
+        for row in &stale_rows {
+            let _ = cw_index.remove(row);
+        }
+        let mut released: HashSet<Vec<u8>> = stale_rows
+            .iter()
+            .filter(|key| key.len() > 8)
+            .map(|key| key[8..].to_vec())
+            .collect();
+        for item in cw_index.range(in_window_start..) {
+            let (key, _) = item?;
+            if key.len() > 8 {
+                released.remove(&key[8..]);
+            }
+        }
+        for tx_id in released {
+            let _ = cw_tree.remove(&tx_id);
+        }
+        Ok(())
+    }
+
     fn prune_confirmed_witnesses(&self, tip_height: u64) -> Result<(), BlockchainError> {
         let cw_tree = self.db.open_tree(CONFIRMED_WITNESSES_TREE)?;
         let cw_index = self.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE)?;
@@ -11112,6 +11354,46 @@ mod tests {
             bc.get_confirmed_witness_tx(tx_id).is_none(),
             "with no in-window occurrence left, the shared object is released"
         );
+    }
+
+    #[test]
+    fn aged_witness_prune_matches_the_full_sweep_for_aged_rows() {
+        let bc = test_blockchain();
+        let cw_tree = bc.db.open_tree(CONFIRMED_WITNESSES_TREE).unwrap();
+        let cw_index = bc.db.open_tree(CONFIRMED_WITNESS_INDEX_TREE).unwrap();
+        let tx = metadata_test_block(1, [0u8; 32], "bob", 1.0)
+            .transactions
+            .remove(0);
+        let bytes = codec::serialize(&tx).unwrap();
+        let row = |height: u64, tx_id: &str| {
+            let mut key = height.to_be_bytes().to_vec();
+            key.extend_from_slice(tx_id.as_bytes());
+            cw_index.insert(key, b"" as &[u8]).unwrap();
+        };
+        for tx_id in ["aged", "shared", "recent", "unpinned"] {
+            cw_tree.insert(tx_id.as_bytes(), &bytes[..]).unwrap();
+        }
+        row(10, "aged");
+        row(20, "shared");
+        row(300, "shared");
+        row(300, "recent");
+
+        // Below the window: nothing happens.
+        bc.prune_aged_witnesses(100).unwrap();
+        assert_eq!(cw_index.iter().filter_map(Result::ok).count(), 4);
+
+        // Tip 400 -> cutoff 144.
+        bc.prune_aged_witnesses(400).unwrap();
+        assert!(bc.get_confirmed_witness_tx("aged").is_none());
+        assert!(bc.get_confirmed_witness_tx("shared").is_some());
+        assert!(bc.get_confirmed_witness_tx("recent").is_some());
+        // An object with no row at all is the full sweep's to reclaim, not this pass's.
+        assert!(bc.get_confirmed_witness_tx("unpinned").is_some());
+        assert_eq!(cw_index.iter().filter_map(Result::ok).count(), 2);
+
+        bc.prune_confirmed_witnesses(400).unwrap();
+        assert!(bc.get_confirmed_witness_tx("unpinned").is_none());
+        assert!(bc.get_confirmed_witness_tx("shared").is_some());
     }
 
     // A witness whose only in-window occurrence is removed by a reorg revert becomes orphaned and is
@@ -15447,16 +15729,47 @@ mod tests {
         assert_eq!(index, 517_583);
         assert_eq!(hash_hex, hex::encode(hash));
 
-        let value = Blockchain::orphan_index_value(1_700_000_042);
+        let value = Blockchain::orphan_index_value(1_700_000_042, 4_096);
         assert_eq!(
             Blockchain::parse_orphan_index_received_at(&value),
             Some(1_700_000_042)
         );
+        assert_eq!(
+            Blockchain::parse_orphan_index_body_bytes(&value),
+            Some(4_096)
+        );
+        // The 8-byte shape written before the size: time readable, size unknown.
+        let legacy = 1_700_000_042u64.to_be_bytes();
+        assert_eq!(
+            Blockchain::parse_orphan_index_received_at(&legacy),
+            Some(1_700_000_042)
+        );
+        assert_eq!(Blockchain::parse_orphan_index_body_bytes(&legacy), None);
 
         // The pre-existing on-disk shape: an empty value. It must decode to None so the
         // caller knows to recover the timestamp from the body rather than reading garbage.
         assert_eq!(Blockchain::parse_orphan_index_received_at(&[]), None);
         assert_eq!(Blockchain::parse_orphan_index_received_at(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn orphan_pool_drops_oldest_until_within_count_and_bytes() {
+        let entry = |age: u64, tag: u8, bytes: u64| (age, [tag; 32], bytes);
+        // Within both bounds: nothing goes.
+        assert!(Blockchain::orphan_overflow(vec![entry(1, 1, 10), entry(2, 2, 10)]).is_empty());
+        // Over the byte budget: the oldest go first, only as many as needed.
+        let big = ORPHAN_MAX_BYTES / 2;
+        let dropped = Blockchain::orphan_overflow(vec![
+            entry(30, 3, big),
+            entry(10, 1, big),
+            entry(20, 2, big),
+        ]);
+        assert_eq!(dropped, vec![[1u8; 32]]);
+        // Over the count cap with tiny bodies: exactly the overflow goes.
+        let many: Vec<_> = (0..ORPHAN_MAX_COUNT as u64 + 3)
+            .map(|i| (i, [0u8; 32], 1))
+            .collect();
+        assert_eq!(Blockchain::orphan_overflow(many).len(), 3);
     }
 
     // A body with NO index entry — the residue of the previous write order — is invisible to
@@ -18106,6 +18419,43 @@ mod tests {
             bc.address_history_summary("anyone").unwrap(),
             None,
             "an unbuilt index must read as unavailable, not as zero activity"
+        );
+    }
+
+    #[test]
+    fn a_payment_older_than_the_replay_window_is_still_found() {
+        let bc = test_blockchain();
+        assert!(
+            bc.confirmed_payment_height("alice", "bob", 1, 1, 1)
+                .is_err(),
+            "an unbuilt index cannot say a payment never happened"
+        );
+        let mut block = metadata_test_block(5, [0u8; 32], "miner", 2.0);
+        block.transactions.push(user_tx("alice", "bob", 2.5, 5_000));
+        bc.record_confirmed_txs(&block).unwrap();
+        let paid = &bc.address_recent_txs("alice", 1, None).unwrap()[0];
+        let (amount, fee) = (paid.amount_units, paid.fee_units);
+
+        assert_eq!(
+            bc.confirmed_payment_height("alice", "bob", amount, fee, 5_000)
+                .unwrap(),
+            Some(5)
+        );
+        // Any field off: a different transaction, not this one.
+        assert_eq!(
+            bc.confirmed_payment_height("alice", "bob", amount, fee, 5_001)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            bc.confirmed_payment_height("alice", "carol", amount, fee, 5_000)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            bc.confirmed_payment_height("bob", "alice", amount, fee, 5_000)
+                .unwrap(),
+            None
         );
     }
 

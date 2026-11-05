@@ -162,12 +162,57 @@ const BEACON_POLL_INTERVAL_SECS: u64 = 3;
 /// value out. 10 min gives >20x margin; post-regression recovery is bounded by this
 /// window plus the gateway's beacon TTL (~5 min), i.e. ~15 min, versus FOREVER before.
 const BEACON_HIGH_WATER_WINDOW_SECS: u64 = 600;
-/// beacon_follow_live: the beacon counts as reachable while a verified read is at most
+/// beacon_follow_state: the beacon counts as reachable while a verified read is at most
 /// this old (5 client polls), and as moving while its height advanced within
-/// BEACON_FROZEN_SECS (~11 blocks at the ~5.5 s block time). Outside either bound the
-/// node follows the chain from its peers.
-const BEACON_LIVE_SECS: u64 = 15;
-const BEACON_FROZEN_SECS: u64 = 60;
+/// BEACON_FROZEN_SECS (12 target block times). Outside either bound the node follows the
+/// chain from its peers. "Moving" measures the chain as much as the gateway: a chain
+/// that goes a full minute without a block also reads as frozen, and peer follow then
+/// idles at a few cheap height queries per round, so the bound only has to stay well
+/// above the block time (asserted below), never tight.
+const BEACON_LIVE_SECS: u64 = 5 * BEACON_POLL_INTERVAL_SECS;
+const BEACON_FROZEN_SECS: u64 = 12 * crate::a9::blockchain::TARGET_BLOCK_TIME;
+// The verdict looks for the window maximum's first sighting inside the high-water
+// window, so "frozen" must be judged well inside it; and a frozen bound near the block
+// time would flip healthy nodes into peer follow on every slow block.
+const _: () = assert!(BEACON_FROZEN_SECS < BEACON_HIGH_WATER_WINDOW_SECS);
+const _: () = assert!(BEACON_FROZEN_SECS >= 10 * crate::a9::blockchain::TARGET_BLOCK_TIME);
+const _: () = assert!(BEACON_LIVE_SECS >= 3 * BEACON_POLL_INTERVAL_SECS);
+/// How far a node may sit below the freshest trusted network height and still mine or
+/// count as current: a same-height or next-height race, not staleness. Shared by the
+/// mine-prep ghost guard and the monitor's "behind a live beacon" test.
+pub const BEACON_RACE_TOLERANCE_BLOCKS: u32 = 2;
+/// Per-peer height query timeout of one sync_with_network round. Fresh connections pay a
+/// TCP + handshake first and see 100-250 ms RTTs on real links; the old 50/500 ms fan-out
+/// timed out on healthy peers and left a gateway-less node with no candidates at all.
+const NETWORK_SYNC_PEER_TIMEOUT_MS: u64 = 5_000;
+const _: () = assert!(NETWORK_SYNC_PEER_TIMEOUT_MS >= 2_000);
+/// Wall-clock budget of one sync_with_network call, checked between blocks and batches
+/// (never by cancelling a batch mid-commit). One peer serving a slow trickle of valid
+/// blocks under a huge claimed height used to hold the call, and its single-flight latch,
+/// for as long as it liked while the chain ran away; the caller simply runs again.
+const NETWORK_SYNC_CALL_BUDGET: Duration = Duration::from_secs(120);
+/// Budget per candidate peer inside one call, so a slow or lying first candidate cannot
+/// spend the whole call and the honest peers below it still get asked.
+const NETWORK_SYNC_CANDIDATE_BUDGET: Duration = Duration::from_secs(40);
+/// Candidates tried per call, highest reported height first, after struck peers are set
+/// aside. Wider than the old 3 so three peers reporting a taller chain that they never
+/// serve (liars, or honest peers stuck on a fork we reject) cannot take every slot.
+const NETWORK_SYNC_MAX_CANDIDATES: usize = 8;
+/// A peer that claimed to be ahead and then served something we reject (an empty reply, a
+/// failed request, a rejected block, or a branch that cannot link above our floor) sits out
+/// of candidate selection for this long, doubling per repeat strike up to the cap. Progress
+/// clears it, and a peer that stays clean for the cap starts over at one strike.
+const NETWORK_SYNC_STRIKE_BASE_SECS: u64 = 30;
+const NETWORK_SYNC_STRIKE_MAX_SECS: u64 = 30 * 60;
+/// Bound on the strike map (one entry per misbehaving address).
+const NETWORK_SYNC_STRIKE_CAP: usize = 1024;
+/// A candidate is only started with at least this much of the call budget left: one that
+/// gets a sliver of time applies nothing through no fault of its own.
+const NETWORK_SYNC_MIN_CANDIDATE_BUDGET: Duration = Duration::from_secs(10);
+/// A catch-up of at most this many blocks logs at debug: about one 5 s follow round's
+/// worth plus slack, so a node following its peers does not write info lines per block,
+/// while a backoff-sized gap still logs at info.
+const QUIET_CATCHUP_MAX_BLOCKS: u32 = 8;
 
 /// Ed25519 public key(s) authorised to sign the tip beacon. A beacon's
 /// `public_key`/`node_id` must be one of these AND its signature must verify over the
@@ -206,6 +251,39 @@ struct TipBeaconInfo {
 struct RelayHeadInfo {
     height: u32,
     hash: [u8; 32],
+}
+
+/// Whether the signed gateway beacon can be followed right now (Node::beacon_follow_state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeaconFollow {
+    /// A verified read is fresh and its height moved recently: follow the beacon.
+    Live,
+    /// No verified read in the observation window (fresh process, gateway down since
+    /// boot or for over 10 minutes, or every read failing verification).
+    NeverSeen,
+    /// The newest verified read is older than BEACON_LIVE_SECS: the gateway stopped
+    /// answering, or its answers stopped verifying.
+    Unreachable,
+    /// Reads are fresh, but this process has not yet seen the height move and its first
+    /// reading is under BEACON_FROZEN_SECS old (every start, for about a block). Not live:
+    /// a beacon frozen for hours looks exactly like this until the bound passes.
+    Warming,
+    /// Reads are fresh but the height has not moved within BEACON_FROZEN_SECS: a stuck
+    /// publisher, or no blocks being found.
+    Frozen,
+}
+
+impl BeaconFollow {
+    /// Short operator-facing reason, for logs and status lines.
+    pub fn describe(self) -> &'static str {
+        match self {
+            BeaconFollow::Live => "is live",
+            BeaconFollow::NeverSeen => "has no verified reading",
+            BeaconFollow::Unreachable => "is unreachable",
+            BeaconFollow::Warming => "is not confirmed moving yet",
+            BeaconFollow::Frozen => "is not moving",
+        }
+    }
 }
 
 /// Outcome of a single always-converge attempt toward the signed beacon tip.
@@ -408,6 +486,13 @@ const EVENT_BROADCAST_CAPACITY: usize = 1000;
 /// Correlation window for our own outbound GetBlocks solicitations: an inbound
 /// ChainResponse is accepted only from a peer we asked this recently.
 const SOLICIT_TTL: Duration = Duration::from_secs(120);
+/// Peer-table slots inbound connections cannot fill (see `inbound_peer_limit`).
+const OUTBOUND_RESERVED_SLOTS: usize = 8;
+/// How long a connection handler waits for room in the event queue before it drops
+/// the event: a backed-up pump must not park every peer's reader indefinitely.
+const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Wall-clock budget for applying one solicited `Blocks` push in the event pump.
+const CHAIN_RESPONSE_APPLY_BUDGET: Duration = Duration::from_secs(60);
 /// Hard entry cap for the solicitation map. Entries are created only by our own
 /// outbound requests — never by inbound traffic — so the live population is the
 /// catch-up fanout, tens at most. The cap turns that emergent bound into a
@@ -464,6 +549,10 @@ const TX_RELAY_PENDING_REQUEST_TTL: Duration = Duration::from_secs(60);
 const EXPLORER_BATCH_BODY_MAX_BYTES: usize = MAX_MESSAGE_SIZE;
 const EXPLORER_BATCH_CONCURRENCY: usize = 1;
 const VALIDATION_CACHE_TTL_SECS: u64 = 3600;
+/// A rejection can be circumstantial (a block a little ahead of our clock, a store
+/// hiccup, a balance that a parent block will fund), so it is only remembered long
+/// enough to absorb a burst of resends.
+const NEGATIVE_VALIDATION_CACHE_TTL_SECS: u64 = 60;
 const VALIDATION_CACHE_MAX_ENTRIES: usize = 50_000;
 /// Level the validation cache is pruned back to once it crosses its ceiling. The gap is what
 /// makes eviction amortised: pruning to the ceiling itself meant every insert past saturation
@@ -2334,6 +2423,14 @@ pub struct Node {
     /// nine GetBlocks plus a reported failure (11-05 site-down test, at boot). An
     /// overlapping call returns Ok at once: the running sync is doing the work.
     network_sync_in_flight: Arc<AtomicBool>,
+    /// Peers that claimed to be ahead in a sync_with_network round but led to no accepted
+    /// block: address -> (consecutive strikes, sit out until). See NETWORK_SYNC_STRIKE_*.
+    network_sync_strikes: Arc<PLMutex<HashMap<IpAddr, (u32, Instant)>>>,
+    /// Highest height reported by a peer that was eligible to serve in the most recent
+    /// sync_with_network round (struck peers excluded; 0 when none reported). The
+    /// monitor's follow loop uses it to tell "nothing to fetch" from "a peer is ahead but
+    /// served nothing". Self-reported, never used for trust.
+    network_sync_best_reported: Arc<AtomicU64>,
     /// ~1s TTL memo of the last successfully fetched signed tip beacon
     /// (fetch_tip_beacon): dedups same-second fetch bursts across the many
     /// beacon consumers without changing any staleness guarantee.
@@ -2822,7 +2919,9 @@ struct MeshTransactionOutboundReservation {
 #[derive(Debug, Clone, Default)]
 struct OutboundCircuitState {
     consecutive_failures: u32,
-    open_until: Option<u64>,
+    /// Monotonic, so an NTP step backwards cannot hold a circuit open for the size of
+    /// the step (a wall-clock deadline did, with nothing to clear it).
+    open_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3205,6 +3304,8 @@ impl Node {
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             full_sync_in_flight: Arc::new(AtomicBool::new(false)),
             network_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            network_sync_strikes: Arc::new(PLMutex::new(HashMap::new())),
+            network_sync_best_reported: Arc::new(AtomicU64::new(0)),
             beacon_memo: Arc::new(PLMutex::new(None)),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
@@ -4450,9 +4551,55 @@ impl Node {
     /// clears the guard once the old height ages out; the beacon-unreachable fail-open
     /// arm passes the forever-monotonic high-water instead (no fresh read to confirm a
     /// regression). Fires only when behind (known_tip > local); a node at or ahead of
-    /// the tip always mines. The +2 tolerance matches the BeaconStale racing distance.
-    fn stale_tip_mine_refused(local_tip: u32, known_tip: u32) -> bool {
-        known_tip > local_tip.saturating_add(2)
+    /// the tip always mines. The tolerance is ghost_guard_tolerance: the BeaconStale
+    /// racing distance while the beacon is live.
+    fn stale_tip_mine_refused_within(local_tip: u32, known_tip: u32, tolerance: u32) -> bool {
+        known_tip > local_tip.saturating_add(tolerance)
+    }
+
+    /// The tolerance the ghost guard applies: the race distance, unless the beacon is
+    /// STUCK, i.e. still served at its window maximum, which it first reached more than
+    /// BEACON_FROZEN_SECS ago. A publisher stuck on a taller-but-lighter branch keeps
+    /// refreshing that height in the rolling window, and the race tolerance would then
+    /// refuse mining on every client, so the heavier chain could never pass it; while
+    /// stuck, the guard uses the reorg margin, as the unreachable arm does. Anything short
+    /// of that (a fresh process's first reads, or one stale CDN edge answering below the
+    /// maximum, the 2026-07-11 ghost-block pattern) keeps the race tolerance.
+    fn ghost_guard_tolerance(beacon_stuck: bool) -> u32 {
+        if beacon_stuck {
+            crate::a9::blockchain::CHECKPOINT_REORG_MARGIN
+        } else {
+            BEACON_RACE_TOLERANCE_BLOCKS
+        }
+    }
+
+    /// See ghost_guard_tolerance.
+    fn beacon_stuck_at_max(
+        obs: &std::collections::VecDeque<(Instant, u32)>,
+        now: Instant,
+        frozen_secs: u64,
+    ) -> bool {
+        let (Some(&(_, newest)), Some(max)) = (obs.back(), obs.iter().map(|(_, h)| *h).max())
+        else {
+            return false;
+        };
+        newest == max
+            && obs
+                .iter()
+                .find(|(_, h)| *h == max)
+                .is_some_and(|(t, _)| now.saturating_duration_since(*t).as_secs() > frozen_secs)
+    }
+
+    /// Mine-prep ghost guard: Some(known network height) when mining `local_tip` would
+    /// mint a stale block (see stale_tip_mine_refused_within and ghost_guard_tolerance).
+    fn mine_stale_tip_guard(&self, local_tip: u32) -> Option<u32> {
+        let known_tip = self.beacon_high_water_height();
+        let stuck = {
+            let obs = self.beacon_high_water.lock();
+            Self::beacon_stuck_at_max(&obs, Instant::now(), BEACON_FROZEN_SECS)
+        };
+        let tolerance = Self::ghost_guard_tolerance(stuck);
+        Self::stale_tip_mine_refused_within(local_tip, known_tip, tolerance).then_some(known_tip)
     }
 
     /// Record a network_id-matched beacon height observation into the rolling
@@ -4493,28 +4640,12 @@ impl Node {
         Self::window_high_water(&obs, now, BEACON_HIGH_WATER_WINDOW_SECS)
     }
 
-    /// Whether the signed gateway beacon is currently good enough to follow: a VERIFIED
-    /// read landed within BEACON_LIVE_SECS (clients poll every BEACON_POLL_INTERVAL_SECS,
-    /// so that is several missed polls) AND its height moved within BEACON_FROZEN_SECS.
-    /// False means the main monitor follows the chain from peers instead (see its sync
-    /// arm): gateway unreachable, beacon failing verification, a publisher that never
-    /// reads its own beacon, or a beacon frozen while the chain moves (2026-07-08). The
-    /// old test, "no observation in the 600s high-water window", left a node whose gateway
-    /// went down mid-run frozen for up to ten minutes before the peer path engaged.
-    /// Highest height reported by a peer heard from at or after `since_unix_secs` (the
-    /// height queries of a sync round stamp `last_seen`), so stale reports from peers that
-    /// went quiet do not count. Self-reported and unverified: used only to tell "nothing
-    /// to fetch" from "a peer is ahead but served nothing we accept" when pacing the peer
-    /// follow, never for trust.
-    pub async fn best_peer_height_reported_since(&self, since_unix_secs: u64) -> u32 {
-        self.peers
-            .read()
-            .await
-            .values()
-            .filter(|p| p.last_seen >= since_unix_secs)
-            .map(|p| p.blocks)
-            .max()
-            .unwrap_or(0)
+    /// The highest height reported, in the most recent sync_with_network round, by a peer
+    /// that was eligible to serve it (0 if none). Self-reported and unverified: used only
+    /// to tell "nothing to fetch" from "a peer is ahead but served nothing we accept" when
+    /// pacing the peer follow, never for trust.
+    pub fn network_sync_best_reported(&self) -> u32 {
+        self.network_sync_best_reported.load(Ordering::Acquire) as u32
     }
 
     /// The local tip as (height, hash); ([0; 32] hash when the chain is empty).
@@ -4530,12 +4661,31 @@ impl Node {
         self.network_sync_in_flight.load(Ordering::Acquire)
     }
 
+    /// True while a bulk peer delta-sync (sync_full_history_from_peer) is streaming.
+    pub fn full_sync_in_flight(&self) -> bool {
+        self.full_sync_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Whether the signed gateway beacon is currently good enough to follow (see
+    /// beacon_follow_state). False means the main monitor follows the chain from peers
+    /// instead (see its sync arm). The old test, "no observation in the 600 s high-water
+    /// window", left a node whose gateway went down mid-run frozen for up to ten minutes
+    /// before the peer path engaged.
     pub fn beacon_follow_live(&self) -> bool {
+        self.beacon_follow_state() == BeaconFollow::Live
+    }
+
+    /// Why the beacon is or is not followable right now: a VERIFIED read landed within
+    /// BEACON_LIVE_SECS (clients poll every BEACON_POLL_INTERVAL_SECS, so that is several
+    /// missed polls) AND its height moved within BEACON_FROZEN_SECS. Anything else
+    /// (gateway unreachable, beacon failing verification, a publisher that never reads its
+    /// own beacon, a beacon frozen while the chain moves, 2026-07-08) is not live.
+    pub fn beacon_follow_state(&self) -> BeaconFollow {
         let obs = self.beacon_high_water.lock();
         Self::beacon_follow_verdict(&obs, Instant::now(), BEACON_LIVE_SECS, BEACON_FROZEN_SECS)
     }
 
-    /// Pure verdict behind beacon_follow_live. Live iff the newest observation is at most
+    /// Pure verdict behind beacon_follow_state. Live iff the newest observation is at most
     /// `live_secs` old and the window's maximum height was REACHED, i.e. first observed
     /// after a lower read, at most `frozen_secs` ago (a beacon re-read at the same height
     /// every poll is still frozen). A single sighting is not evidence of movement: a fresh
@@ -4552,21 +4702,42 @@ impl Node {
         now: Instant,
         live_secs: u64,
         frozen_secs: u64,
-    ) -> bool {
+    ) -> BeaconFollow {
         let Some(&(newest, _)) = obs.back() else {
-            return false;
+            return BeaconFollow::NeverSeen;
         };
         if now.saturating_duration_since(newest).as_secs() > live_secs {
-            return false;
+            return BeaconFollow::Unreachable;
         }
         let Some(max) = obs.iter().map(|(_, h)| *h).max() else {
-            return false;
+            return BeaconFollow::NeverSeen;
         };
         // Index 0 = the max was the first thing we saw: no observed increase yet.
         match obs.iter().position(|(_, h)| *h == max) {
-            Some(i) if i > 0 => now.saturating_duration_since(obs[i].0).as_secs() <= frozen_secs,
-            _ => false,
+            Some(i)
+                if i > 0 && now.saturating_duration_since(obs[i].0).as_secs() <= frozen_secs =>
+            {
+                BeaconFollow::Live
+            }
+            Some(0) if now.saturating_duration_since(obs[0].0).as_secs() <= frozen_secs => {
+                BeaconFollow::Warming
+            }
+            _ => BeaconFollow::Frozen,
         }
+    }
+
+    /// The converge guard for a node above a frozen beacon: with no common ancestor in
+    /// range, a VERIFIED beacon that is not live does not prove our taller chain lost, so
+    /// the node keeps its chain (AtTipAhead) instead of re-bootstrapping onto the beacon's
+    /// branch. An unverified beacon never gets here with authority (see
+    /// unverified_beacon_verdict), and a live one keeps the old bootstrap answer.
+    fn frozen_beacon_holds_tip(
+        beacon_verified: bool,
+        tip: u32,
+        beacon_height: u32,
+        beacon_live: bool,
+    ) -> bool {
+        beacon_verified && tip > beacon_height && !beacon_live
     }
 
     /// Pure max-height-in-window (does not depend on prior pruning): the highest
@@ -4848,6 +5019,12 @@ impl Node {
         Ok(())
     }
 
+    /// Whether a raw /api/tip body carries a valid signature from a pinned publisher key
+    /// (the boot reconcile's check before it lets a beacon height drive a re-bootstrap).
+    pub fn tip_beacon_verified(body: &serde_json::Value) -> bool {
+        Self::verify_tip_beacon_signature(body)
+    }
+
     /// Reconstruct the exact canonical message the publisher signed over the served
     /// beacon fields and verify its Ed25519 signature against a pinned key. True only
     /// when every signed field is present and well-typed, `node_id == public_key`,
@@ -4939,6 +5116,7 @@ impl Node {
                 return Some(memo);
             }
         }
+        let mut unverified: Option<TipBeaconInfo> = None;
         for url in Self::discovery_tip_urls() {
             let Ok(res) = self.http_client.get(&url).send().await else {
                 continue;
@@ -5022,10 +5200,19 @@ impl Node {
                 version,
                 verified,
             };
+            // A later source may carry the signed reading this one lacks; an
+            // unverified answer is only the fallback when none does.
+            if !verified {
+                unverified.get_or_insert(info);
+                continue;
+            }
             *self.beacon_memo.lock() = Some((Instant::now(), info));
             return Some(info);
         }
-        None
+        if let Some(info) = unverified {
+            *self.beacon_memo.lock() = Some((Instant::now(), info));
+        }
+        unverified
     }
 
     /// Current signed network beacon height, if reachable. Public accessor for
@@ -5042,8 +5229,11 @@ impl Node {
     /// catch an out-extended (taller-but-losing) fork. Mining never calls this;
     /// it is behaviour-neutral for the mining path.
     pub async fn network_beacon_tip(&self) -> Option<(u32, String)> {
+        // Signed readings only: the caller turns a hash mismatch into a fork
+        // verdict that restarts the node onto a fresh snapshot.
         self.fetch_tip_beacon()
             .await
+            .filter(|b| b.verified)
             .map(|b| (b.height, hex::encode(b.hash)))
     }
 
@@ -5304,7 +5494,12 @@ impl Node {
                     // (or a live one we are genuinely forked from) still escalates.
                     // Signed beacons only: the publisher's unsigned relay candidates
                     // (verified = false) keep their old NeedsBootstrap semantics.
-                    if beacon.verified && tip > beacon.height && !self.beacon_follow_live() {
+                    if Self::frozen_beacon_holds_tip(
+                        beacon.verified,
+                        tip,
+                        beacon.height,
+                        self.beacon_follow_live(),
+                    ) {
                         debug!(
                             "converge: beacon {} is frozen and below our tip {} with no shared \
                              ancestor above the floor; following peers, not re-bootstrapping",
@@ -5634,8 +5829,30 @@ impl Node {
     /// as `BeaconStale` (never a hard stop).
     pub async fn sync_to_beacon(&self) -> Converge {
         match self.fetch_tip_beacon().await {
-            Some(beacon) => self.converge_to_canonical(&beacon).await,
+            Some(beacon) => self.converge_to_beacon(&beacon).await,
             None => Converge::BeaconStale,
+        }
+    }
+
+    /// converge_to_canonical for a beacon fetched from the gateway, with
+    /// unverified_beacon_verdict applied. Every client-side caller goes through this; only
+    /// the publisher's own relay-candidate converge calls converge_to_canonical directly.
+    async fn converge_to_beacon(&self, beacon: &TipBeaconInfo) -> Converge {
+        Self::unverified_beacon_verdict(beacon.verified, self.converge_to_canonical(beacon).await)
+    }
+
+    /// An UNVERIFIED beacon (bad signature, unpinned signer, missing fields) is never
+    /// grounds to throw local state away. Whoever answers for the gateway's domain can
+    /// serve any height, and the stall watchdog would turn an impossible one into
+    /// NeedsBootstrap, then two strikes, a re-bootstrap marker and a deleted chain. Read
+    /// against an unverified beacon, NeedsBootstrap becomes BeaconStale: the node keeps
+    /// its chain and keeps following its peers (an unverified beacon is never live), and
+    /// only the pinned publisher key can still push it onto a snapshot.
+    fn unverified_beacon_verdict(beacon_verified: bool, verdict: Converge) -> Converge {
+        if !beacon_verified && verdict == Converge::NeedsBootstrap {
+            Converge::BeaconStale
+        } else {
+            verdict
         }
     }
 
@@ -6941,7 +7158,7 @@ impl Node {
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_secs(2))
                 .min(Duration::from_secs(20));
-            let round = match timeout(round_cap, self.converge_to_canonical(&beacon)).await {
+            let round = match timeout(round_cap, self.converge_to_beacon(&beacon)).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     warn!("Converge round timed out; retrying against a fresh beacon");
@@ -6968,8 +7185,7 @@ impl Node {
                     // instant we legitimately reach the tip. Refusing is the safe failure —
                     // worse case a miner idles briefly; the alternative is orphan spam.
                     let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
-                    let known_tip = self.beacon_high_water_height();
-                    if Self::stale_tip_mine_refused(local_tip, known_tip) {
+                    if let Some(known_tip) = self.mine_stale_tip_guard(local_tip) {
                         return Err(NodeError::Retryable(format!(
                             "network has reached {} but we are at {} ({} behind) and cannot fetch the gap yet; not mining a stale tip",
                             known_tip,
@@ -7007,8 +7223,7 @@ impl Node {
                             // Same ghost-block guard as the Converged arm: one stale
                             // beacon read must not let us mine below the freshest
                             // height the network is known to have reached.
-                            let known_tip = self.beacon_high_water_height();
-                            if Self::stale_tip_mine_refused(tip_after, known_tip) {
+                            if let Some(known_tip) = self.mine_stale_tip_guard(tip_after) {
                                 return Err(NodeError::Retryable(format!(
                                     "caught up to {} via a peer but the network has reached {}; not mining a stale tip",
                                     tip_after, known_tip
@@ -7138,6 +7353,19 @@ impl Node {
                             let bc = self.blockchain.read().await;
                             bc.get_latest_block_index() as u32
                         };
+                        // An unsigned reading's height decides nothing here: no
+                        // re-bootstrap, no "behind" verdict. Only the verified
+                        // high-water may hold mining back.
+                        if !beacon.verified {
+                            if let Some(known_tip) = self.mine_stale_tip_guard(local_tip) {
+                                return Err(NodeError::Retryable(format!(
+                                    "network tip {} is {} blocks ahead; not mining a stale tip",
+                                    known_tip,
+                                    known_tip.saturating_sub(local_tip)
+                                )));
+                            }
+                            return Ok(());
+                        }
                         if beacon.height > local_tip.saturating_add(64) {
                             // Before conceding to a restart, try the bulk peer
                             // delta-sync once (same heal as the NeedsBootstrap arm):
@@ -7152,8 +7380,7 @@ impl Node {
                                 self.blockchain.read().await.get_latest_block_index() as u32;
                             match healed {
                                 Converge::Converged | Converge::AtTipAhead => {
-                                    let known_tip = self.beacon_high_water_height();
-                                    if Self::stale_tip_mine_refused(tip_now, known_tip) {
+                                    if let Some(known_tip) = self.mine_stale_tip_guard(tip_now) {
                                         return Err(NodeError::Retryable(format!(
                                             "caught up to {} via a peer but the network has reached {}; not mining a stale tip",
                                             tip_now, known_tip
@@ -7249,8 +7476,7 @@ impl Node {
                 // the live network (2026-07-11), poisoning the relay head for everyone.
                 Converge::BranchInvalid => {
                     let local_tip = self.blockchain.read().await.get_latest_block_index() as u32;
-                    let known_tip = self.beacon_high_water_height();
-                    if Self::stale_tip_mine_refused(local_tip, known_tip) {
+                    if let Some(known_tip) = self.mine_stale_tip_guard(local_tip) {
                         return Err(NodeError::Retryable(format!(
                             "canonical candidate failed validation while the network is at {} and we are at {} ({} behind); not mining a stale tip",
                             known_tip,
@@ -8593,6 +8819,29 @@ impl Node {
         }
     }
 
+    /// `confirmed_payment_height` for a ledger entry, bounded like the presence read.
+    /// None: no answer (index not current, unreadable, or timed out).
+    async fn explorer_v2_confirmed_payment_height(
+        state: &ExplorerState,
+        entry: &LedgerEntry,
+    ) -> Option<Option<u32>> {
+        timeout(Duration::from_secs(3), async {
+            let chain = state.blockchain.read().await;
+            chain
+                .confirmed_payment_height(
+                    &entry.tuple.sender,
+                    &entry.tuple.recipient,
+                    entry.tuple.amount_units,
+                    entry.tuple.fee_units,
+                    entry.timestamp,
+                )
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     fn explorer_v2_known_transaction(
         idempotency_key: &str,
         tx_id: &str,
@@ -8818,6 +9067,48 @@ impl Node {
                     );
                 }
                 TransactionPresence::Absent => {
+                    // The replay registry only spans the validity window. A payment it no
+                    // longer lists may have been mined long ago — and "expired" for a paid
+                    // withdrawal invites paying it twice — so ask the permanent address
+                    // index before answering from the ledger's own memory.
+                    if matches!(
+                        entry.state,
+                        EntryState::Confirmed { .. } | EntryState::Expired
+                    ) {
+                        match Self::explorer_v2_confirmed_payment_height(state, entry).await {
+                            Some(Some(height)) => {
+                                let _ = Self::explorer_v2_update_ledger_state(
+                                    ledger,
+                                    &tx_id,
+                                    EntryState::Confirmed { height },
+                                    now,
+                                )
+                                .await;
+                                return (
+                                    Self::explorer_v2_known_transaction(
+                                        idempotency_key,
+                                        &tx_id,
+                                        TransactionPresence::Confirmed(height),
+                                        true,
+                                    ),
+                                    false,
+                                );
+                            }
+                            Some(None) => {}
+                            _ if matches!(entry.state, EntryState::Expired) => {
+                                return (
+                                    Self::explorer_v2_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        idempotency_key,
+                                        "canonical_state_unavailable",
+                                        "could not establish whether this expired payment was mined; retry shortly",
+                                    ),
+                                    false,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     if let EntryState::Confirmed { height } = &entry.state {
                         return (
                             Self::explorer_v2_historical_outcome_unknown(
@@ -10318,23 +10609,27 @@ impl Node {
         // fast: it keeps its original interval via the tick counter (post storms
         // are the known failure mode there, 2026-07-08).
         let node_clone = node.clone();
-        spawn_logged("discovery-announce", async move {
-            let relay_every = (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
-            let mut tick: u64 = 0;
-            let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_RETRY_SECS));
-            announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            loop {
-                announce_interval.tick().await;
-                // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
-                #[allow(clippy::manual_is_multiple_of)]
-                if tick % relay_every == 0 {
-                    if let Err(e) = node_clone.ensure_public_tip_relayed().await {
-                        debug!("Public relay tip refresh failed: {}", e);
+        spawn_supervised("discovery-announce", move || {
+            let node_clone = node_clone.clone();
+            async move {
+                let relay_every =
+                    (Self::announce_interval_secs() / ANNOUNCE_RETRY_SECS.max(1)).max(1);
+                let mut tick: u64 = 0;
+                let mut announce_interval = interval(Duration::from_secs(ANNOUNCE_RETRY_SECS));
+                announce_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    announce_interval.tick().await;
+                    // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
+                    #[allow(clippy::manual_is_multiple_of)]
+                    if tick % relay_every == 0 {
+                        if let Err(e) = node_clone.ensure_public_tip_relayed().await {
+                            debug!("Public relay tip refresh failed: {}", e);
+                        }
                     }
-                }
-                tick = tick.wrapping_add(1);
-                if let Err(e) = node_clone.announce_to_discovery().await {
-                    debug!("Announce error: {}", e);
+                    tick = tick.wrapping_add(1);
+                    if let Err(e) = node_clone.announce_to_discovery().await {
+                        debug!("Announce error: {}", e);
+                    }
                 }
             }
         });
@@ -10445,100 +10740,114 @@ impl Node {
         // outage. Live peers keep priority in the 200-slot file; PEX entries fill
         // the remainder.
         let node_clone = node.clone();
-        spawn_logged("peer-cache-pex", async move {
-            let mut cache_interval = interval(Duration::from_secs(120));
-            cache_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            let mut save_failure_logged = false;
-            loop {
+        spawn_supervised("peer-cache-pex", move || {
+            let node_clone = node_clone.clone();
+            async move {
+                let mut cache_interval = interval(Duration::from_secs(120));
+                cache_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // A tokio interval fires at once. At startup no peer has connected and the
+                // PEX book is empty, so that first save wrote an empty list over the cache
+                // before discovery could read it, and a restart during a gateway outage was
+                // left with the DNS seed alone. Start one period in.
                 cache_interval.tick().await;
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                // Age out stale PEX entries FIRST so the book can never freeze at
-                // the cap holding dead/rotated addresses forever.
-                {
-                    let mut book = node_clone.pex_addr_book.write().await;
-                    book.retain(|_, learned| now.saturating_sub(*learned) < PEX_ADDR_TTL_SECS);
-                }
-                let pex_targets: Vec<SocketAddr> = {
-                    let peers = node_clone.peers.read().await;
-                    peers.keys().copied().take(2).collect()
-                };
-                if !pex_targets.is_empty() {
-                    let allow_private = Self::private_discovery_peers_allowed();
-                    for target in pex_targets {
-                        // Outer timeout: send_message_with_response can take 30s x 2
-                        // attempts; this tick runs every 120s and must not serialize
-                        // behind half-dead peers.
-                        let Ok(Ok(list)) = tokio::time::timeout(
-                            Duration::from_secs(PEX_REQUEST_TIMEOUT_SECS),
-                            node_clone.request_peer_list(target),
-                        )
-                        .await
-                        else {
-                            continue;
-                        };
+                let mut save_failure_logged = false;
+                loop {
+                    cache_interval.tick().await;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Age out stale PEX entries FIRST so the book can never freeze at
+                    // the cap holding dead/rotated addresses forever.
+                    {
                         let mut book = node_clone.pex_addr_book.write().await;
-                        let mut inserted = 0usize;
-                        for addr in list {
-                            if inserted >= PEX_MAX_ADDRS_PER_RESPONSE {
+                        book.retain(|_, learned| now.saturating_sub(*learned) < PEX_ADDR_TTL_SECS);
+                    }
+                    let pex_targets: Vec<SocketAddr> = {
+                        let peers = node_clone.peers.read().await;
+                        peers.keys().copied().take(2).collect()
+                    };
+                    if !pex_targets.is_empty() {
+                        let allow_private = Self::private_discovery_peers_allowed();
+                        for target in pex_targets {
+                            // Outer timeout: send_message_with_response can take 30s x 2
+                            // attempts; this tick runs every 120s and must not serialize
+                            // behind half-dead peers.
+                            let Ok(Ok(list)) = tokio::time::timeout(
+                                Duration::from_secs(PEX_REQUEST_TIMEOUT_SECS),
+                                node_clone.request_peer_list(target),
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+                            let mut book = node_clone.pex_addr_book.write().await;
+                            let mut inserted = 0usize;
+                            for addr in list {
+                                if inserted >= PEX_MAX_ADDRS_PER_RESPONSE {
+                                    break;
+                                }
+                                if addr == node_clone.bind_addr
+                                    || !Self::is_dialable_discovery_addr(&addr, allow_private)
+                                {
+                                    continue;
+                                }
+                                // At cap, evict the oldest entry — the book rolls
+                                // instead of freezing.
+                                if !book.contains_key(&addr) && book.len() >= PEX_ADDR_BOOK_CAP {
+                                    if let Some(oldest) = book
+                                        .iter()
+                                        .min_by_key(|(_, learned)| **learned)
+                                        .map(|(a, _)| *a)
+                                    {
+                                        book.remove(&oldest);
+                                    }
+                                }
+                                book.insert(addr, now);
+                                inserted += 1;
+                            }
+                        }
+                    }
+                    let mut peers: Vec<SocketAddr> = {
+                        let peers = node_clone.peers.read().await;
+                        let mut scored: Vec<(SocketAddr, f64)> = peers
+                            .iter()
+                            .map(|(addr, info)| (*addr, Self::score_peer_for_cache(info, now)))
+                            .filter(|(_, score)| *score >= -5.0)
+                            .collect();
+                        scored.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        scored.into_iter().take(200).map(|(addr, _)| addr).collect()
+                    };
+                    {
+                        let book = node_clone.pex_addr_book.read().await;
+                        for addr in book.keys() {
+                            if peers.len() >= 200 {
                                 break;
                             }
-                            if addr == node_clone.bind_addr
-                                || !Self::is_dialable_discovery_addr(&addr, allow_private)
-                            {
-                                continue;
+                            if !peers.contains(addr) {
+                                peers.push(*addr);
                             }
-                            // At cap, evict the oldest entry — the book rolls
-                            // instead of freezing.
-                            if !book.contains_key(&addr) && book.len() >= PEX_ADDR_BOOK_CAP {
-                                if let Some(oldest) = book
-                                    .iter()
-                                    .min_by_key(|(_, learned)| **learned)
-                                    .map(|(a, _)| *a)
-                                {
-                                    book.remove(&oldest);
-                                }
-                            }
-                            book.insert(addr, now);
-                            inserted += 1;
                         }
                     }
-                }
-                let mut peers: Vec<SocketAddr> = {
-                    let peers = node_clone.peers.read().await;
-                    let mut scored: Vec<(SocketAddr, f64)> = peers
-                        .iter()
-                        .map(|(addr, info)| (*addr, Self::score_peer_for_cache(info, now)))
-                        .filter(|(_, score)| *score >= -5.0)
-                        .collect();
-                    scored
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    scored.into_iter().take(200).map(|(addr, _)| addr).collect()
-                };
-                {
-                    let book = node_clone.pex_addr_book.read().await;
-                    for addr in book.keys() {
-                        if peers.len() >= 200 {
-                            break;
-                        }
-                        if !peers.contains(addr) {
-                            peers.push(*addr);
-                        }
+                    // Never replace a cache with nothing: a node that is briefly peerless (a
+                    // network drop, a suspend) still needs yesterday's addresses to come back.
+                    if peers.is_empty() {
+                        continue;
                     }
-                }
-                match node_clone.save_peer_cache(&peers) {
-                    Ok(()) => save_failure_logged = false,
-                    Err(e) => {
-                        // warn ONCE per failure streak — a broken cache silently
-                        // no-ops the reboot-resilience fix, but a warn every 120s
-                        // would be log spam.
-                        if !save_failure_logged {
-                            warn!("Peer cache save failing (address book will not survive restarts): {}", e);
-                            save_failure_logged = true;
-                        } else {
-                            debug!("Peer cache save error: {}", e);
+                    match node_clone.save_peer_cache(&peers) {
+                        Ok(()) => save_failure_logged = false,
+                        Err(e) => {
+                            // warn ONCE per failure streak — a broken cache silently
+                            // no-ops the reboot-resilience fix, but a warn every 120s
+                            // would be log spam.
+                            if !save_failure_logged {
+                                warn!("Peer cache save failing (address book will not survive restarts): {}", e);
+                                save_failure_logged = true;
+                            } else {
+                                debug!("Peer cache save error: {}", e);
+                            }
                         }
                     }
                 }
@@ -10710,32 +11019,35 @@ impl Node {
         // idempotent: receivers suppress exact accepted transaction keys, duplicate mempool adds
         // are classified without a re-relay, and the mesh send is a no-op with no links up.
         let regossip_node = node.clone();
-        spawn_logged("pending-regossip", async move {
-            let mut regossip_interval = interval(Duration::from_secs(45));
-            regossip_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            regossip_interval.tick().await; // consume the immediate first tick
-            loop {
-                regossip_interval.tick().await;
-                let pending = {
-                    let bc = regossip_node.blockchain.read().await;
-                    // Never re-announce a tx that already confirmed: re-gossiping one
-                    // refills every peer's mempool with a replay-guard poison pill
-                    // (each peer then wastes a full solve per mined block until their
-                    // mempool cleans up). Evict instead — this loop is exactly where
-                    // stale entries would otherwise get a megaphone.
-                    let _ = bc.drop_confirmed_mempool_txs().await;
-                    // Re-announce the FULL-signature form: the persisted pending records carry a
-                    // truncated signature, and gossiping those makes peers defer the tx (they can't
-                    // verify it) — the truncated-witness pathology. This accessor reads the mempool's
-                    // full-signature copy (skipping any tx whose full signature is unavailable).
-                    bc.get_pending_transactions_with_full_signatures()
-                        .await
-                        .unwrap_or_default()
-                };
-                // Small cap: the mempool is tiny on this network, and a pathological
-                // backlog must not turn this loop into its own gossip storm.
-                for tx in pending.into_iter().take(8) {
-                    regossip_node.gossip_transaction(&tx).await;
+        spawn_supervised("pending-regossip", move || {
+            let regossip_node = regossip_node.clone();
+            async move {
+                let mut regossip_interval = interval(Duration::from_secs(45));
+                regossip_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                regossip_interval.tick().await; // consume the immediate first tick
+                loop {
+                    regossip_interval.tick().await;
+                    let pending = {
+                        let bc = regossip_node.blockchain.read().await;
+                        // Never re-announce a tx that already confirmed: re-gossiping one
+                        // refills every peer's mempool with a replay-guard poison pill
+                        // (each peer then wastes a full solve per mined block until their
+                        // mempool cleans up). Evict instead — this loop is exactly where
+                        // stale entries would otherwise get a megaphone.
+                        let _ = bc.drop_confirmed_mempool_txs().await;
+                        // Re-announce the FULL-signature form: the persisted pending records carry a
+                        // truncated signature, and gossiping those makes peers defer the tx (they can't
+                        // verify it) — the truncated-witness pathology. This accessor reads the mempool's
+                        // full-signature copy (skipping any tx whose full signature is unavailable).
+                        bc.get_pending_transactions_with_full_signatures()
+                            .await
+                            .unwrap_or_default()
+                    };
+                    // Small cap: the mempool is tiny on this network, and a pathological
+                    // backlog must not turn this loop into its own gossip storm.
+                    for tx in pending.into_iter().take(8) {
+                        regossip_node.gossip_transaction(&tx).await;
+                    }
                 }
             }
         });
@@ -10763,7 +11075,7 @@ impl Node {
             // client, keeping propagation under the block time so miners converge
             // instead of forking. A plain client is driven by the beacon and only
             // does a rare safety pull, so it never blind-polls the relay.
-            let is_publisher = Self::public_header_snapshots_enabled();
+            let is_publisher = Self::follows_relay_as_publisher();
             let tick_secs = if is_publisher {
                 1
             } else {
@@ -10976,7 +11288,7 @@ impl Node {
                             // Nothing here advances the checkpoint. Finality trails history
                             // this node has actually applied; a height alone never moves it
                             // (see raise_trusted_checkpoint's tip clamp).
-                            match node_clone.converge_to_canonical(&b).await {
+                            match node_clone.converge_to_beacon(&b).await {
                                 Converge::Converged | Converge::AtTipAhead => {}
                                 Converge::Progressed => {
                                     debug!("Live sync: progressed toward beacon {}", b.height);
@@ -11629,9 +11941,11 @@ impl Node {
 
                 for (addr, info) in subnet_peers {
                     // Calculate a quality score
-                    // Lower is better: latency (ms) - blocks (importance) + age (seconds)
-                    let score = info.latency as i64 - (info.blocks as i64)
-                        + (now.saturating_sub(info.last_seen) as i64) / 60;
+                    // Lower is better: latency (ms) + age (minutes). The peer's claimed
+                    // height is left out: it is the peer's own word, and a liar would
+                    // otherwise outrank every honest neighbour in its subnet.
+                    let score =
+                        info.latency as i64 + (now.saturating_sub(info.last_seen) as i64) / 60;
 
                     // Fixed: Don't double-dereference the address
                     peer_ratings.push((*addr, score));
@@ -11994,10 +12308,7 @@ impl Node {
         // a dropped closed breaker merely resets a failure count we no longer care
         // about.
         {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now = Instant::now();
             let mut breakers = self.outbound_circuit_breakers.write().await;
             breakers.retain(|addr, state| {
                 state.open_until.is_some_and(|until| until > now) || active_peers.contains(addr)
@@ -12179,9 +12490,30 @@ impl Node {
     /// Request-correlation for inbound block responses: true only if we sent this
     /// peer a GetBlocks recently. Opportunistically prunes stale entries so the
     /// set cannot grow unbounded.
-    fn is_solicited_block_source(&self, addr: SocketAddr) -> bool {
+    /// Peer-table size at which inbound handshakes are refused, keeping
+    /// OUTBOUND_RESERVED_SLOTS (at most half the table) for peers we dial.
+    fn inbound_peer_limit(max_peers: usize) -> usize {
+        max_peers.saturating_sub(OUTBOUND_RESERVED_SLOTS.min(max_peers / 2))
+    }
+
+    /// Whether we asked `addr` for blocks within SOLICIT_TTL, using the solicitation
+    /// up: one pushed `Blocks` frame per request we made, not a 120 s window of them.
+    fn take_solicited_block_source(&self, addr: SocketAddr) -> bool {
         Self::bound_solicited_block_peers_in(&self.solicited_block_peers, Instant::now());
-        self.solicited_block_peers.contains_key(&addr)
+        self.solicited_block_peers.remove(&addr).is_some()
+    }
+
+    async fn send_event_bounded(
+        tx: &mpsc::Sender<NetworkEvent>,
+        event: NetworkEvent,
+    ) -> Result<(), NodeError> {
+        match tokio::time::timeout(EVENT_SEND_TIMEOUT, tx.send(event)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(NodeError::Network(format!("event queue closed: {}", e))),
+            Err(_) => Err(NodeError::Retryable(
+                "event queue busy; event dropped".into(),
+            )),
+        }
     }
 
     /// Enforce both invariants of the solicitation map — the TTL window and the
@@ -12290,10 +12622,7 @@ impl Node {
     }
 
     async fn check_outbound_circuit(&self, addr: SocketAddr) -> Result<(), NodeError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = Instant::now();
         let breakers = self.outbound_circuit_breakers.read().await;
         if let Some(state) = breakers.get(&addr) {
             if let Some(until) = state.open_until {
@@ -12301,7 +12630,7 @@ impl Node {
                     return Err(NodeError::Network(format!(
                         "Outbound circuit open for {} (retry in {}s)",
                         addr,
-                        until.saturating_sub(now)
+                        until.saturating_duration_since(now).as_secs()
                     )));
                 }
             }
@@ -12310,15 +12639,12 @@ impl Node {
     }
 
     async fn record_outbound_failure(&self, addr: SocketAddr) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = Instant::now();
         let mut breakers = self.outbound_circuit_breakers.write().await;
         let state = breakers.entry(addr).or_default();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.consecutive_failures >= OUTBOUND_CIRCUIT_FAILURE_THRESHOLD {
-            state.open_until = Some(now.saturating_add(OUTBOUND_CIRCUIT_OPEN_SECS));
+            state.open_until = Some(now + Duration::from_secs(OUTBOUND_CIRCUIT_OPEN_SECS));
         }
     }
 
@@ -15354,8 +15680,13 @@ impl Node {
     }
 
     fn is_validation_cache_entry_fresh(entry: &ValidationCacheEntry, now: SystemTime) -> bool {
+        let ttl = if entry.valid {
+            VALIDATION_CACHE_TTL_SECS
+        } else {
+            NEGATIVE_VALIDATION_CACHE_TTL_SECS
+        };
         now.duration_since(entry.timestamp)
-            .map(|age| age.as_secs() < VALIDATION_CACHE_TTL_SECS)
+            .map(|age| age.as_secs() < ttl)
             .unwrap_or(false)
     }
 
@@ -15956,17 +16287,28 @@ impl Node {
                 // consumed inline by send_message_with_response and never reach
                 // this event, so unsolicited pushes are dropped without touching
                 // state. This closes the "any peer feeds a forged block" vector.
-                if !self.is_solicited_block_source(sender) {
-                    debug!(
-                        "Ignoring unsolicited ChainResponse ({} blocks) from {}",
-                        blocks.len(),
-                        sender
-                    );
-                    return Ok(());
-                }
+                // The ingress already used the solicitation up (one push per
+                // request), so the gate is checked there, not here.
+                //
+                // One frame can repeat a block or carry ones we hold: apply each
+                // hash once, skip what is already canonical, and stop at a wall-clock
+                // budget so a single push cannot hold the pump for its witness waits.
+                let budget_end = Instant::now() + CHAIN_RESPONSE_APPLY_BUDGET;
+                let mut seen: HashSet<[u8; 32]> = HashSet::new();
                 for block in blocks {
-                    if block.calculate_hash_for_block() != block.hash
+                    if Instant::now() >= budget_end {
+                        debug!(
+                            "ChainResponse from {}: apply budget spent; dropping the rest",
+                            sender
+                        );
+                        break;
+                    }
+                    if !seen.insert(block.hash)
+                        || block.calculate_hash_for_block() != block.hash
                         || !block.verify_pow_meets_floor()
+                        || self
+                            .canonical_block_hash_matches(block.index, &block.hash)
+                            .await
                     {
                         continue;
                     }
@@ -16327,13 +16669,14 @@ impl Node {
                         // Execute broadcasts and notifications concurrently
                         let broadcast_fut =
                             self.broadcast_transaction(Arc::clone(&tx_ref), addr, selected_peers);
-                        let notify_fut = tx.send(NetworkEvent::NewTransaction((*tx_ref).clone()));
+                        let notify_fut = Self::send_event_bounded(
+                            tx,
+                            NetworkEvent::NewTransaction((*tx_ref).clone()),
+                        );
 
                         let (broadcast_res, notify_res) = tokio::join!(broadcast_fut, notify_fut);
                         broadcast_res?;
-                        notify_res.map_err(|e| {
-                            NodeError::Network(format!("Notification error: {}", e))
-                        })?;
+                        notify_res?;
                     }
                 }
             }
@@ -16746,11 +17089,8 @@ impl Node {
                     self.publish_discovery_state("Accepted block").await;
 
                     // Send network event
-                    tx.send(NetworkEvent::NewBlock(Arc::clone(&block_ref)))
-                        .await
-                        .map_err(|e| {
-                            NodeError::Network(format!("Failed to send block event: {}", e))
-                        })?;
+                    Self::send_event_bounded(tx, NetworkEvent::NewBlock(Arc::clone(&block_ref)))
+                        .await?;
 
                     // Post-accept relay, made exactly-once: fire only if the early path did NOT
                     // already relay this block AND we win the relay claim. Covers blocks that did not
@@ -16797,14 +17137,16 @@ impl Node {
                 let response_channel = Arc::new(tokio::sync::Mutex::new(Some(response_tx)));
 
                 // Send request event
-                tx.send(NetworkEvent::ChainRequest {
-                    start,
-                    end,
-                    requester: addr,
-                    response_channel,
-                })
-                .await
-                .map_err(|e| NodeError::Network(format!("Failed to send chain request: {}", e)))?;
+                Self::send_event_bounded(
+                    tx,
+                    NetworkEvent::ChainRequest {
+                        start,
+                        end,
+                        requester: addr,
+                        response_channel,
+                    },
+                )
+                .await?;
 
                 // Wait for response and return it to the active connection writer.
                 // BOUNDED: an unbounded await here parked this connection's reader
@@ -16832,19 +17174,19 @@ impl Node {
                 // and starve legitimate events (NewBlock, ChainRequest, …). Dropping here, before the
                 // enqueue, keeps unsolicited pushes out of the queue entirely. Legitimate sync
                 // responses are consumed inline by send_message_with_response and never reach this
-                // handler; a genuinely solicited late reply still passes (same 120s-TTL predicate the
-                // event handler re-checks).
-                if !self.is_solicited_block_source(addr) {
+                // handler; a genuinely solicited late reply still passes, once: the
+                // solicitation is used up here, so one request admits one push.
+                if !self.take_solicited_block_source(addr) {
                     return Ok(None);
                 }
-                tx.send(NetworkEvent::ChainResponse {
-                    blocks,
-                    sender: addr,
-                })
-                .await
-                .map_err(|e| {
-                    NodeError::Network(format!("Failed to send chain response event: {}", e))
-                })?;
+                Self::send_event_bounded(
+                    tx,
+                    NetworkEvent::ChainResponse {
+                        blocks,
+                        sender: addr,
+                    },
+                )
+                .await?;
             }
 
             NetworkMessage::GetBlockHeight => {
@@ -18862,8 +19204,9 @@ impl Node {
     ) -> Result<(), NodeError> {
         let socket_addr = addr;
 
-        // Rate limit handshake attempts per IP
-        let rate_key = format!("handshake_{}", socket_addr.ip());
+        // Rate limit handshake attempts per host (IPv6 per /64: see host_key)
+        let host = Self::host_key(socket_addr.ip());
+        let rate_key = format!("handshake_{}", host);
         if !self.rate_limiter.check_limit(&rate_key) {
             return Err(NodeError::RateLimit("Handshake rate limit exceeded".into()));
         }
@@ -18875,7 +19218,7 @@ impl Node {
                 .unwrap_or_default()
                 .as_secs();
             let mut attempts = self.inbound_attempts.write().await;
-            let entry = attempts.entry(socket_addr.ip()).or_insert((0, now));
+            let entry = attempts.entry(host).or_insert((0, now));
             // The timestamp marks when this window OPENED, and is written only by the reset
             // below. Refreshing it per attempt turned the window into a quiet-period cooldown:
             // a peer that kept retrying pushed the start forward with every rejected attempt,
@@ -18930,7 +19273,9 @@ impl Node {
         // Verify peer slots and subnet diversity
         {
             let mut peers = self.peers.write().await;
-            if peers.len() >= self.max_peers {
+            // Inbound stops short of max_peers: the last slots are only ever taken by
+            // peers we dial, so connections others open can never crowd them all out.
+            if peers.len() >= Self::inbound_peer_limit(self.max_peers) {
                 return Err(NodeError::Network("Maximum peers reached".into()));
             }
 
@@ -19954,7 +20299,7 @@ impl Node {
         // never raise finality on its own. And the beacon HEIGHT may raise finality only when
         // the beacon is AUTHENTICATED: an unverified anchor never moves the checkpoint (a
         // network-reported height vouches for no particular history — see finality invariant).
-        let outcome = self.converge_to_canonical(&beacon).await;
+        let outcome = self.converge_to_beacon(&beacon).await;
         if beacon.verified && matches!(outcome, Converge::Converged | Converge::AtTipAhead) {
             let _ = self
                 .blockchain
@@ -20013,6 +20358,118 @@ impl Node {
         (rewound < start).then_some((rewound, next))
     }
 
+    /// How long a peer sits out of sync candidate selection after its `strikes`-th
+    /// consecutive strike: NETWORK_SYNC_STRIKE_BASE_SECS doubling, capped.
+    fn sync_strike_cooldown(strikes: u32) -> Duration {
+        let factor = 1u64 << strikes.saturating_sub(1).min(16);
+        Duration::from_secs(
+            NETWORK_SYNC_STRIKE_BASE_SECS
+                .saturating_mul(factor)
+                .min(NETWORK_SYNC_STRIKE_MAX_SECS),
+        )
+    }
+
+    /// `peer_heights` minus the peers still sitting out a strike at `now`.
+    fn without_struck_sync_peers(
+        &self,
+        peer_heights: Vec<(SocketAddr, u32)>,
+        now: Instant,
+    ) -> Vec<(SocketAddr, u32)> {
+        let strikes = self.network_sync_strikes.lock();
+        Self::filter_struck(peer_heights, &strikes, now)
+    }
+
+    fn filter_struck(
+        peer_heights: Vec<(SocketAddr, u32)>,
+        strikes: &HashMap<IpAddr, (u32, Instant)>,
+        now: Instant,
+    ) -> Vec<(SocketAddr, u32)> {
+        peer_heights
+            .into_iter()
+            .filter(|(addr, _)| {
+                strikes
+                    .get(&Self::sync_strike_key(addr))
+                    .is_none_or(|(_, until)| *until <= now)
+            })
+            .collect()
+    }
+
+    /// Strikes follow the host, not the advertised port (a peer names its own listen
+    /// port, so a fresh port would otherwise be a fresh identity).
+    fn sync_strike_key(addr: &SocketAddr) -> IpAddr {
+        Self::host_key(addr.ip())
+    }
+
+    /// The unit per-host limits count against: the IPv4 address, or the IPv6 /64 (the
+    /// block one host is normally handed, so rotating within it is not a new host).
+    fn host_key(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => {
+                    let s = v6.segments();
+                    IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+                }
+            },
+        }
+    }
+
+    /// Record that `addr` claimed to be ahead and led to no accepted block.
+    fn strike_sync_peer(&self, addr: SocketAddr, now: Instant) {
+        let mut strikes = self.network_sync_strikes.lock();
+        Self::record_strike(&mut strikes, addr, now);
+    }
+
+    fn record_strike(
+        strikes: &mut HashMap<IpAddr, (u32, Instant)>,
+        addr: SocketAddr,
+        now: Instant,
+    ) {
+        let key = Self::sync_strike_key(&addr);
+        if !strikes.contains_key(&key) && strikes.len() >= NETWORK_SYNC_STRIKE_CAP {
+            // Forget entries whose sit-out has passed; their counts only lengthen a
+            // repeat offender's next cooldown.
+            strikes.retain(|_, (_, until)| *until > now);
+            if strikes.len() >= NETWORK_SYNC_STRIKE_CAP {
+                return;
+            }
+        }
+        let entry = strikes.entry(key).or_insert((0, now));
+        // Clean for a full cap since the last sit-out ended: start over.
+        if now.saturating_duration_since(entry.1)
+            > Duration::from_secs(NETWORK_SYNC_STRIKE_MAX_SECS)
+        {
+            entry.0 = 0;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now + Self::sync_strike_cooldown(entry.0);
+        debug!(
+            "sync_with_network: {} claimed a taller chain and served nothing we accept; \
+             sitting it out {}s (strike {})",
+            addr,
+            Self::sync_strike_cooldown(entry.0).as_secs(),
+            entry.0
+        );
+    }
+
+    fn clear_sync_strike(&self, addr: &SocketAddr) {
+        self.network_sync_strikes
+            .lock()
+            .remove(&Self::sync_strike_key(addr));
+    }
+
+    /// Debug for a catch-up of at most QUIET_CATCHUP_MAX_BLOCKS (the steady state of the
+    /// peer follow), info for anything larger or unknown.
+    fn sync_log_level(best_reported: Option<u32>, current_height: u32) -> log::Level {
+        match best_reported {
+            Some(best) if best.saturating_sub(current_height) <= QUIET_CATCHUP_MAX_BLOCKS => {
+                log::Level::Debug
+            }
+            _ => log::Level::Info,
+        }
+    }
+
     pub async fn sync_with_network(&self) -> Result<(), NodeError> {
         // SINGLE-FLIGHT (see network_sync_in_flight). Drop-guard, not a tail store: the
         // future can be cancelled at any await point and the flag must never stay latched.
@@ -20034,7 +20491,9 @@ impl Node {
 
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_MS: u64 = 1000;
-        const PEER_TIMEOUT_MS: u64 = 5000;
+        let call_deadline = Instant::now() + NETWORK_SYNC_CALL_BUDGET;
+        // Nothing reported yet this round; set from the eligible candidates below.
+        self.network_sync_best_reported.store(0, Ordering::Release);
         // Full server span: GetBlocks serving caps at MAX_GETBLOCKS_SPAN and
         // request_blocks re-batches at the same size, so asking for less (the old
         // 50) just multiplied round-trips 5x on every p2p catch-up. Short replies
@@ -20083,7 +20542,9 @@ impl Node {
         let peer_ips: Vec<_> = peers.keys().cloned().collect();
         drop(peers); // Release lock before making network requests
 
-        let mut peer_heights = self.query_peer_heights(peer_ips, PEER_TIMEOUT_MS).await;
+        let mut peer_heights = self
+            .query_peer_heights(peer_ips, NETWORK_SYNC_PEER_TIMEOUT_MS)
+            .await;
 
         if peer_heights.is_empty() {
             if let Err(e) = self.connect_discovery_peers(8).await {
@@ -20092,13 +20553,16 @@ impl Node {
             let peers = self.peers.read().await;
             let peer_ips: Vec<_> = peers.keys().cloned().collect();
             drop(peers);
-            peer_heights = self.query_peer_heights(peer_ips, PEER_TIMEOUT_MS).await;
+            peer_heights = self
+                .query_peer_heights(peer_ips, NETWORK_SYNC_PEER_TIMEOUT_MS)
+                .await;
         }
 
         // Reliability fallback: the GetBlockHeight RPC can miss responses, but the
         // handshake always exchanges chain heights. Use the height each peer reported
         // at connect time for any peer that is ahead of us, so a behind node still
         // knows who to sync from instead of giving up.
+        let heights_from_rpc = !peer_heights.is_empty();
         if peer_heights.is_empty() {
             let peers = self.peers.read().await;
             let mut handshake_heights: Vec<(SocketAddr, u32)> = peers
@@ -20117,19 +20581,33 @@ impl Node {
                 peer_heights = handshake_heights;
             }
         }
+        // Peers that recently claimed to be ahead and then led to nothing we accept sit
+        // out (network_sync_strikes): otherwise three of them reporting a taller chain
+        // they never serve hold the top candidate slots every round and the honest peers
+        // below them are never asked. Their claimed heights do not count as "a peer is
+        // ahead" either, so a struck liar cannot keep the follow loop in its stuck pacing.
+        let all_reported = peer_heights.len();
+        peer_heights = self.without_struck_sync_peers(peer_heights, Instant::now());
+        // Connect-time heights can be hours old; only a fresh answer says a peer is ahead.
+        let best_eligible = if heights_from_rpc {
+            peer_heights.first().map(|(_, h)| *h).unwrap_or(0)
+        } else {
+            0
+        };
+        self.network_sync_best_reported
+            .store(best_eligible as u64, Ordering::Release);
         debug!(
-            "sync_with_network: local={} candidates={}",
+            "sync_with_network: local={} candidates={} (of {} reporting)",
             current_height,
-            peer_heights.len()
+            peer_heights.len(),
+            all_reported
         );
 
         // A small catch-up is the steady state of the gateway-independent follow (one
         // block every few seconds); log it at debug so a node following its peers does
         // not write five info lines per block. A real catch-up stays at info.
-        let catchup_level = match peer_heights.first() {
-            Some((_, best)) if best.saturating_sub(current_height) <= 8 => log::Level::Debug,
-            _ => log::Level::Info,
-        };
+        let catchup_level =
+            Self::sync_log_level(peer_heights.first().map(|(_, h)| *h), current_height);
 
         // IMPROVEMENT: Check if we already have the latest blocks
         if let Some((_, best_height)) = peer_heights.first() {
@@ -20147,6 +20625,11 @@ impl Node {
                 current_height,
                 best_height
             );
+        } else if all_reported > 0 {
+            // Every peer that answered is sitting out a strike: nothing eligible to
+            // fetch from this round, and nothing a relay backfill would change.
+            debug!("sync_with_network: every reporting peer is struck; waiting them out");
+            return Ok(());
         } else {
             debug!("No peers reported their height");
             return self
@@ -20161,9 +20644,12 @@ impl Node {
                 });
         }
 
-        // 4. IMPROVEMENT: Try multiple peers for sync
-        // Use up to 3 best peers for sync
-        let sync_candidates = peer_heights.iter().take(3).cloned().collect::<Vec<_>>();
+        // 4. Try the best NETWORK_SYNC_MAX_CANDIDATES eligible peers, highest first.
+        let sync_candidates = peer_heights
+            .iter()
+            .take(NETWORK_SYNC_MAX_CANDIDATES)
+            .cloned()
+            .collect::<Vec<_>>();
 
         if sync_candidates.is_empty() {
             return Err(NodeError::Network("No suitable peers for sync".to_string()));
@@ -20171,14 +20657,32 @@ impl Node {
 
         let mut blocks_synced = 0;
         let mut current_sync_height = current_height;
+        // Candidates already struck in this call are not retried by the later attempts.
+        let mut struck_this_call: HashSet<SocketAddr> = HashSet::new();
 
-        // 5. IMPROVEMENT: Process blocks in smaller batches with parallel validation
+        // 5. Batches of up to MAX_BATCH_SIZE, applied in order under one durability window
         'outer: for sync_attempt in 0..MAX_RETRIES {
             // Try each candidate in order
             for (candidate_idx, (peer_addr, peer_height)) in sync_candidates.iter().enumerate() {
-                if current_sync_height >= *peer_height {
+                if call_deadline.saturating_duration_since(Instant::now())
+                    < NETWORK_SYNC_MIN_CANDIDATE_BUDGET
+                {
+                    debug!("sync_with_network: call budget spent; the next round resumes");
+                    break 'outer;
+                }
+                if current_sync_height >= *peer_height || struck_this_call.contains(peer_addr) {
                     continue;
                 }
+                let candidate_deadline =
+                    (Instant::now() + NETWORK_SYNC_CANDIDATE_BUDGET).min(call_deadline);
+                // Whether anything this peer served moved our tip (up, or onto a
+                // heavier-but-shorter branch); a peer that did is never struck.
+                let mut candidate_moved_tip = false;
+                // Evidence for a strike: something this peer served was refused. Running
+                // out of time, or serving only blocks we already hold (gossip delivered
+                // them first), is not evidence.
+                let mut candidate_misbehaved = false;
+                let mut candidate_out_of_time = false;
 
                 log::log!(
                     catchup_level,
@@ -20197,12 +20701,34 @@ impl Node {
                 let mut rewind: u32 = 0;
 
                 while start <= *peer_height {
+                    if Instant::now() >= candidate_deadline {
+                        debug!(
+                            "sync_with_network: candidate {} budget spent at {}; moving on",
+                            peer_addr, current_sync_height
+                        );
+                        candidate_out_of_time = true;
+                        break;
+                    }
                     let end = std::cmp::min(
                         start.saturating_add(MAX_BATCH_SIZE.saturating_sub(1)),
                         *peer_height,
                     );
 
-                    match self.request_blocks(*peer_addr, start, end).await {
+                    // Bounded by this candidate's budget: request_blocks retries
+                    // internally, and a peer that accepts the request and never
+                    // answers must not hold the whole call.
+                    let request = tokio::time::timeout(
+                        candidate_deadline.saturating_duration_since(Instant::now()),
+                        self.request_blocks(*peer_addr, start, end),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(NodeError::Network(format!(
+                            "no answer within the candidate budget for blocks {}-{}",
+                            start, end
+                        )))
+                    });
+                    match request {
                         Ok(blocks) => {
                             let mut candidate_blocks: Vec<_> = blocks
                                 .into_iter()
@@ -20248,6 +20774,24 @@ impl Node {
                                 let first_prev_hash =
                                     candidate_blocks.first().map(|b| b.previous_hash);
                                 for block in candidate_blocks {
+                                    // Checked per block, not only per batch: each block
+                                    // can wait out a witness deadline, and a batch of
+                                    // them would otherwise run for hours. Leaving early
+                                    // still commits the window below.
+                                    if Instant::now() >= candidate_deadline {
+                                        candidate_out_of_time = true;
+                                        break;
+                                    }
+                                    // A block we already hold (the shared prefix of a
+                                    // rewound batch) needs no witnesses and changes
+                                    // nothing; skip it before the expensive checks.
+                                    let held = {
+                                        let bc = self.blockchain.read().await;
+                                        matches!(bc.get_block(block.index), Ok(b) if b.hash == block.hash)
+                                    };
+                                    if held {
+                                        continue;
+                                    }
                                     let before = {
                                         self.blockchain.read().await.get_latest_block_index() as u32
                                     };
@@ -20277,6 +20821,7 @@ impl Node {
                                             // height we no longer hold.
                                             if after != before {
                                                 current_sync_height = after;
+                                                candidate_moved_tip = true;
                                             }
                                             if after > before {
                                                 saved_count += after.saturating_sub(before);
@@ -20293,7 +20838,15 @@ impl Node {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Failed to accept block {}: {}", block.index, e)
+                                            // The batch is in index order, so nothing after
+                                            // a rejected block can link either; stop rather
+                                            // than verify (and warn about) every later one.
+                                            warn!(
+                                                "Failed to accept block {} from {}: {}",
+                                                block.index, peer_addr, e
+                                            );
+                                            candidate_misbehaved = true;
+                                            break;
                                         }
                                     }
                                 }
@@ -20351,12 +20904,25 @@ impl Node {
                                             start = rewound_start;
                                             continue;
                                         }
-                                        None => break,
+                                        None => {
+                                            // A batch that does not link even at the widest
+                                            // rewind is a branch forking at or below our floor:
+                                            // nothing this peer serves can be adopted. One that
+                                            // links but applied nothing held only blocks we
+                                            // already have (or a failure already counted above).
+                                            if first_prev_hash.is_none()
+                                                || first_prev_hash != local_parent_hash
+                                            {
+                                                candidate_misbehaved = true;
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                                 rewind = 0;
                             } else {
                                 warn!("No valid blocks received for range {}-{}", start, end);
+                                candidate_misbehaved = true;
                                 break; // Try next peer
                             }
 
@@ -20368,6 +20934,9 @@ impl Node {
                                 "Failed to get blocks {}-{} from peer {}: {}",
                                 start, end, peer_addr, e
                             );
+                            // Retryable is our own outbound queue (full / expired),
+                            // not the peer's doing.
+                            candidate_misbehaved = !matches!(e, NodeError::Retryable(_));
 
                             // Add short delay before retry
                             tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
@@ -20382,9 +20951,24 @@ impl Node {
                             "Sync complete to height {}",
                             current_sync_height
                         );
+                        self.clear_sync_strike(peer_addr);
                         break 'outer;
                     }
                 }
+                if candidate_moved_tip {
+                    self.clear_sync_strike(peer_addr);
+                } else if candidate_misbehaved && !candidate_out_of_time {
+                    // The REAL tip, not this call's cursor: gossip or another path may
+                    // have delivered the blocks meanwhile, and then the peer was right.
+                    let tip_now = self.blockchain.read().await.get_latest_block_index() as u32;
+                    if tip_now < *peer_height {
+                        self.strike_sync_peer(*peer_addr, Instant::now());
+                        struck_this_call.insert(*peer_addr);
+                    }
+                }
+            }
+            if Instant::now() >= call_deadline {
+                break;
             }
 
             // If we've tried all peers without success, delay before next attempt
@@ -20411,8 +20995,8 @@ impl Node {
             // treat a relay error as a REAL sync failure when a peer is genuinely ahead of us. If no
             // known peer is ahead, zero-from-peers means we are caught up to the peer frontier, so a
             // transient relay-backfill hiccup is not a failure: log it quietly and report success
-            // (the periodic beacon-driven converge loop still pulls us to the relay head if anything
-            // is actually behind). This stops an at-tip miner from repeatedly logging "failed to
+            // (the beacon-driven converge loop, or with the gateway down the monitor's peer follow,
+            // still pulls us forward if anything is actually behind). This stops an at-tip miner from repeatedly logging "failed to
             // sync" on benign relay blips while keeping the error meaningful for a stuck node.
             match self.sync_with_block_relay(current_height).await {
                 Ok(_) => Ok(()),
@@ -25657,6 +26241,15 @@ mod tests {
         );
     }
 
+    /// The ghost guard as applied while the beacon is live (race tolerance).
+    fn refused_live(local_tip: u32, known_tip: u32) -> bool {
+        Node::stale_tip_mine_refused_within(
+            local_tip,
+            known_tip,
+            Node::ghost_guard_tolerance(false),
+        )
+    }
+
     // Ghost-block guard: a node mines only when at/ahead of the best-known network
     // tip or within a same/next-height race; a node that KNOWS it is meaningfully
     // behind (a higher beacon was seen) refuses, even if a momentarily-stale beacon
@@ -25665,16 +26258,16 @@ mod tests {
     #[test]
     fn stale_tip_mine_guard_refuses_when_known_behind_but_mines_at_or_ahead() {
         // Genuinely behind by more than a race -> refuse.
-        assert!(Node::stale_tip_mine_refused(41370, 41395));
-        assert!(Node::stale_tip_mine_refused(41370, 41373)); // exactly 3 behind
-                                                             // Same/next-height race (<=2) -> mine.
-        assert!(!Node::stale_tip_mine_refused(41395, 41395)); // at tip
-        assert!(!Node::stale_tip_mine_refused(41395, 41396)); // 1-block race
-        assert!(!Node::stale_tip_mine_refused(41395, 41397)); // 2-block race (edge)
-                                                              // Legitimately AHEAD of the last-seen beacon (we mined faster) -> mine.
-        assert!(!Node::stale_tip_mine_refused(41397, 41395));
+        assert!(refused_live(41370, 41395));
+        assert!(refused_live(41370, 41373)); // exactly 3 behind
+                                             // Same/next-height race (<=2) -> mine.
+        assert!(!refused_live(41395, 41395)); // at tip
+        assert!(!refused_live(41395, 41396)); // 1-block race
+        assert!(!refused_live(41395, 41397)); // 2-block race (edge)
+                                              // Legitimately AHEAD of the last-seen beacon (we mined faster) -> mine.
+        assert!(!refused_live(41397, 41395));
         // No beacon ever seen (known_tip 0) -> never refuses.
-        assert!(!Node::stale_tip_mine_refused(41395, 0));
+        assert!(!refused_live(41395, 0));
     }
 
     // The rolling beacon high-water must (a) keep a stale-LOW read from ever becoming
@@ -25697,10 +26290,7 @@ mod tests {
         obs.push_back((now - Duration::from_secs(5), 41370)); // stale CDN copy
         obs.push_back((now - Duration::from_secs(1), 41395));
         assert_eq!(Node::window_high_water(&obs, now, W), 41395);
-        assert!(Node::stale_tip_mine_refused(
-            41370,
-            Node::window_high_water(&obs, now, W)
-        ));
+        assert!(refused_live(41370, Node::window_high_water(&obs, now, W)));
 
         // (b) REGRESSION RECOVERY: the old high 41395 is now OUTSIDE the window; only a
         // fresh regressed height 41380 remains in-window -> max drops to 41380, so a node
@@ -25710,7 +26300,7 @@ mod tests {
         regressed.push_back((now - Duration::from_secs(30), 41380)); // fresh, regressed
         regressed.push_back((now - Duration::from_secs(2), 41380));
         assert_eq!(Node::window_high_water(&regressed, now, W), 41380);
-        assert!(!Node::stale_tip_mine_refused(
+        assert!(!refused_live(
             41380,
             Node::window_high_water(&regressed, now, W)
         ));
@@ -25726,59 +26316,77 @@ mod tests {
     fn beacon_follow_verdict_live_only_when_fresh_and_moving() {
         use std::collections::VecDeque;
         use std::time::Duration;
-        const LIVE: u64 = 15;
-        const FROZEN: u64 = 60;
-        let now = Instant::now();
+        // The production bounds, so retuning them re-runs every case below.
+        const LIVE: u64 = BEACON_LIVE_SECS;
+        const FROZEN: u64 = BEACON_FROZEN_SECS;
+        assert_eq!(
+            (LIVE, FROZEN),
+            (15, 60),
+            "re-check the cases below after retuning"
+        );
+        // A synthetic "now" in the future, so subtracting never underflows the monotonic
+        // clock on a freshly booted CI machine.
+        let now = Instant::now() + Duration::from_secs(1_000);
         let at = |secs: u64| now - Duration::from_secs(secs);
+        let verdict =
+            |obs: &VecDeque<(Instant, u32)>| Node::beacon_follow_verdict(obs, now, LIVE, FROZEN);
 
         // Never observed (gateway down since boot, or a publisher): not live.
-        assert!(!Node::beacon_follow_verdict(
-            &VecDeque::new(),
-            now,
-            LIVE,
-            FROZEN
-        ));
+        assert_eq!(verdict(&VecDeque::new()), BeaconFollow::NeverSeen);
 
         // Healthy: reads every 3 s, height advancing.
         let healthy: VecDeque<(Instant, u32)> =
             [(at(9), 100), (at(6), 101), (at(3), 101), (at(0), 102)]
                 .into_iter()
                 .collect();
-        assert!(Node::beacon_follow_verdict(&healthy, now, LIVE, FROZEN));
+        assert_eq!(verdict(&healthy), BeaconFollow::Live);
 
         // Gateway went down mid-run: the newest verified read is 20 s old. The old
         // high-water test kept this "alive" for the whole 600 s window.
         let gone: VecDeque<(Instant, u32)> = [(at(26), 100), (at(23), 101), (at(20), 102)]
             .into_iter()
             .collect();
-        assert!(!Node::beacon_follow_verdict(&gone, now, LIVE, FROZEN));
+        assert_eq!(verdict(&gone), BeaconFollow::Unreachable);
         // ...exactly at the bound still counts as live.
         let edge: VecDeque<(Instant, u32)> = [(at(18), 101), (at(15), 102)].into_iter().collect();
-        assert!(Node::beacon_follow_verdict(&edge, now, LIVE, FROZEN));
+        assert_eq!(verdict(&edge), BeaconFollow::Live);
 
         // Restart: one or many sightings of a single height with nothing lower before it
         // prove no movement, however fresh the reads (the beacon may be frozen for hours).
+        // While the first sighting is younger than the frozen bound this is Warming (not
+        // live either), after it Frozen.
         let one: VecDeque<(Instant, u32)> = [(at(1), 700)].into_iter().collect();
-        assert!(!Node::beacon_follow_verdict(&one, now, LIVE, FROZEN));
+        assert_eq!(verdict(&one), BeaconFollow::Warming);
         let same: VecDeque<(Instant, u32)> =
             [(at(9), 700), (at(6), 700), (at(3), 700), (at(0), 700)]
                 .into_iter()
                 .collect();
-        assert!(!Node::beacon_follow_verdict(&same, now, LIVE, FROZEN));
+        assert_eq!(verdict(&same), BeaconFollow::Warming);
+        let restarted_on_frozen: VecDeque<(Instant, u32)> =
+            [(at(FROZEN + 1), 700), (at(3), 700), (at(0), 700)]
+                .into_iter()
+                .collect();
+        assert_eq!(verdict(&restarted_on_frozen), BeaconFollow::Frozen);
         // ...and the first observed increase makes it live.
         let moved: VecDeque<(Instant, u32)> = [(at(9), 700), (at(6), 700), (at(3), 701)]
             .into_iter()
             .collect();
-        assert!(Node::beacon_follow_verdict(&moved, now, LIVE, FROZEN));
+        assert_eq!(verdict(&moved), BeaconFollow::Live);
 
         // Frozen beacon (2026-07-08): read every 3 s but stuck at one height for 90 s.
         let frozen: VecDeque<(Instant, u32)> = (0..=30).rev().map(|i| (at(i * 3), 500)).collect();
-        assert!(!Node::beacon_follow_verdict(&frozen, now, LIVE, FROZEN));
+        assert_eq!(verdict(&frozen), BeaconFollow::Frozen);
         // Reached 500 45 s ago and re-read since: still live (blocks can be a minute apart).
         let mut slow: VecDeque<(Instant, u32)> = VecDeque::new();
         slow.push_back((at(48), 499));
         slow.extend((0..=15).rev().map(|i| (at(i * 3), 500)));
-        assert!(Node::beacon_follow_verdict(&slow, now, LIVE, FROZEN));
+        assert_eq!(verdict(&slow), BeaconFollow::Live);
+        // ...and one second past the frozen bound it is not.
+        let stale_move: VecDeque<(Instant, u32)> =
+            [(at(FROZEN + 4), 499), (at(FROZEN + 1), 500), (at(0), 500)]
+                .into_iter()
+                .collect();
+        assert_eq!(verdict(&stale_move), BeaconFollow::Frozen);
 
         // Regression: the max (900) was first seen 120 s ago and fresh reads say 880.
         // The beacon is not tracking a moving canonical tip, so peers take over.
@@ -25786,7 +26394,323 @@ mod tests {
             [(at(120), 900), (at(6), 880), (at(3), 880), (at(0), 880)]
                 .into_iter()
                 .collect();
-        assert!(!Node::beacon_follow_verdict(&regressed, now, LIVE, FROZEN));
+        assert_eq!(verdict(&regressed), BeaconFollow::Frozen);
+    }
+
+    /// A genesis-only Node on loopback with no seeds, no ledger and no data dir.
+    async fn hermetic_test_node() -> (Node, Arc<RwLock<Blockchain>>) {
+        use crate::a9::blockchain::FEE_PERCENTAGE;
+        use ring::rand::SystemRandom;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let db = store::Store::temporary().expect("temporary hermetic database");
+        let blockchain = Blockchain::new(
+            db.clone(),
+            FEE_PERCENTAGE,
+            50.0,
+            100,
+            5,
+            Arc::new(RateLimiter::new(60, 10_000)),
+            Arc::new(Mutex::new(0)),
+        );
+        blockchain
+            .create_genesis_block()
+            .await
+            .expect("hermetic genesis");
+        blockchain.initialize().await.expect("hermetic init");
+        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("handshake key")
+            .as_ref()
+            .to_vec();
+        let blockchain = Arc::new(RwLock::new(blockchain));
+        let node = Node::new(
+            Arc::new(db),
+            Arc::clone(&blockchain),
+            key,
+            NodeRuntimeConfig {
+                bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                velocity_enabled: false,
+                max_peers: 4,
+                max_connections: 8,
+                seed_nodes: Vec::new(),
+                data_dir: None,
+                ledger: None,
+            },
+        )
+        .await
+        .expect("hermetic node");
+        (node, blockchain)
+    }
+
+    // The node-level accessor wires the production bounds into the verdict (a swapped or
+    // retuned argument would pass the pure test above).
+    #[tokio::test]
+    async fn beacon_follow_state_uses_production_bounds() {
+        let (node, _bc) = hermetic_test_node().await;
+        assert_eq!(node.beacon_follow_state(), BeaconFollow::NeverSeen);
+        let now = Instant::now();
+        {
+            let mut obs = node.beacon_high_water.lock();
+            // Moved and read just now: live under any sane bounds; the next case pins
+            // which bound is which.
+            obs.push_back((now, 100));
+            obs.push_back((now, 101));
+        }
+        assert!(node.beacon_follow_live());
+        {
+            let mut obs = node.beacon_high_water.lock();
+            obs.clear();
+            // Newest read 30 s old: Unreachable under LIVE = 15; Frozen if the bounds
+            // were swapped, Live if LIVE were widened past 30.
+            // The monotonic clock can be younger than 30 s right after boot; then this
+            // case cannot be built, and the pure test above still covers the bounds.
+            let Some(then) = now.checked_sub(Duration::from_secs(30)) else {
+                return;
+            };
+            obs.push_back((then, 100));
+            obs.push_back((then, 101));
+        }
+        assert_eq!(node.beacon_follow_state(), BeaconFollow::Unreachable);
+    }
+
+    #[test]
+    fn frozen_beacon_holds_tip_only_for_a_verified_frozen_beacon_below_us() {
+        // Verified, frozen, our tip above it: keep the chain.
+        assert!(Node::frozen_beacon_holds_tip(true, 200, 100, false));
+        // Unverified, at or below the beacon, or a live beacon: the old answer.
+        assert!(!Node::frozen_beacon_holds_tip(false, 200, 100, false));
+        assert!(!Node::frozen_beacon_holds_tip(true, 100, 100, false));
+        assert!(!Node::frozen_beacon_holds_tip(true, 99, 100, false));
+        assert!(!Node::frozen_beacon_holds_tip(true, 200, 100, true));
+    }
+
+    #[test]
+    fn frozen_beacon_guard_is_wired_into_the_no_ancestor_arm() {
+        let src = include_str!("node.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let arm = prod
+            .split("Ancestor::NoneBelowFloor | Ancestor::NeedsBootstrap =>")
+            .nth(1)
+            .expect("no-ancestor arm present");
+        let arm = &arm[..arm.find("Ancestor::Transient").expect("arm end")];
+        assert!(arm.contains("Self::frozen_beacon_holds_tip("));
+    }
+
+    #[test]
+    fn unverified_beacon_never_yields_a_bootstrap() {
+        use Converge::*;
+        for v in [
+            Converged,
+            AtTipAhead,
+            Progressed,
+            BeaconStale,
+            BranchInvalid,
+        ] {
+            assert_eq!(Node::unverified_beacon_verdict(false, v), v);
+            assert_eq!(Node::unverified_beacon_verdict(true, v), v);
+        }
+        assert_eq!(
+            Node::unverified_beacon_verdict(false, NeedsBootstrap),
+            BeaconStale
+        );
+        assert_eq!(
+            Node::unverified_beacon_verdict(true, NeedsBootstrap),
+            NeedsBootstrap
+        );
+    }
+
+    #[test]
+    fn client_converge_paths_all_apply_the_unverified_beacon_rule() {
+        let src = include_str!("node.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        // The only direct converge_to_canonical calls left are the definition, the
+        // wrapper and the publisher's own unsigned relay candidates.
+        let direct: Vec<_> = prod.match_indices(".converge_to_canonical(").collect();
+        assert_eq!(
+            direct.len(),
+            2,
+            "a new client caller must use converge_to_beacon"
+        );
+        assert!(prod.contains("self.converge_to_canonical(&target)"));
+        assert!(prod.contains("Self::unverified_beacon_verdict(beacon.verified, self.converge_to_canonical(beacon).await)"));
+    }
+
+    #[test]
+    fn ghost_guard_tolerance_widens_only_while_the_beacon_is_stuck() {
+        use std::collections::VecDeque;
+        let margin = crate::a9::blockchain::CHECKPOINT_REORG_MARGIN;
+        assert_eq!(
+            Node::ghost_guard_tolerance(false),
+            BEACON_RACE_TOLERANCE_BLOCKS
+        );
+        assert_eq!(Node::ghost_guard_tolerance(true), margin);
+        // Stuck publisher on a taller-but-lighter branch 10 above our heavier tip: a moving
+        // beacon would refuse, a stuck one must not stop the heavier chain.
+        assert!(Node::stale_tip_mine_refused_within(
+            1000,
+            1010,
+            Node::ghost_guard_tolerance(false)
+        ));
+        assert!(!Node::stale_tip_mine_refused_within(
+            1000,
+            1010,
+            Node::ghost_guard_tolerance(true)
+        ));
+        // Far behind a stuck beacon still refuses.
+        assert!(Node::stale_tip_mine_refused_within(
+            1000,
+            1000 + margin + 1,
+            Node::ghost_guard_tolerance(true)
+        ));
+
+        let now = Instant::now() + Duration::from_secs(1_000);
+        let at = |secs: u64| now - Duration::from_secs(secs);
+        let stuck = |obs: &VecDeque<(Instant, u32)>| {
+            Node::beacon_stuck_at_max(obs, now, BEACON_FROZEN_SECS)
+        };
+        assert!(!stuck(&VecDeque::new()));
+        // Served at the same max for 90 s: stuck.
+        let frozen: VecDeque<(Instant, u32)> = (0..=30).rev().map(|i| (at(i * 3), 500)).collect();
+        assert!(stuck(&frozen));
+        // A fresh process's first minute of reads: not yet.
+        let fresh: VecDeque<(Instant, u32)> = [(at(9), 500), (at(0), 500)].into_iter().collect();
+        assert!(!stuck(&fresh));
+        // 2026-07-11: the max was seen, then a stale edge answers lower. Not stuck, so a node
+        // at the stale height keeps the race tolerance and does not mine a ghost block.
+        let ghost: VecDeque<(Instant, u32)> = [(at(90), 41395), (at(3), 41370), (at(0), 41370)]
+            .into_iter()
+            .collect();
+        assert!(!stuck(&ghost));
+        // A moving beacon is never stuck.
+        let moving: VecDeque<(Instant, u32)> = [(at(9), 100), (at(0), 101)].into_iter().collect();
+        assert!(!stuck(&moving));
+    }
+
+    #[test]
+    fn sync_strikes_cool_down_exponentially_and_filter_candidates() {
+        use std::collections::HashMap;
+        assert_eq!(Node::sync_strike_cooldown(1), Duration::from_secs(30));
+        assert_eq!(Node::sync_strike_cooldown(2), Duration::from_secs(60));
+        assert_eq!(Node::sync_strike_cooldown(4), Duration::from_secs(240));
+        assert_eq!(Node::sync_strike_cooldown(7), Duration::from_secs(1800));
+        assert_eq!(
+            Node::sync_strike_cooldown(u32::MAX),
+            Duration::from_secs(1800)
+        );
+
+        let now = Instant::now();
+        let liar: SocketAddr = "10.0.0.1:7177".parse().unwrap();
+        let honest: SocketAddr = "10.0.0.2:7177".parse().unwrap();
+        let mut strikes = HashMap::new();
+        let liar_ip = liar.ip();
+        Node::record_strike(&mut strikes, liar, now);
+        assert_eq!(strikes[&liar_ip].0, 1);
+        // A new advertised port is the same host.
+        Node::record_strike(&mut strikes, "10.0.0.1:9999".parse().unwrap(), now);
+        assert_eq!(strikes[&liar_ip], (2, now + Duration::from_secs(60)));
+        // Clean for longer than the cap after its sit-out: the count starts over.
+        let mut decay = strikes.clone();
+        let much_later = now + Duration::from_secs(60 + NETWORK_SYNC_STRIKE_MAX_SECS + 1);
+        Node::record_strike(&mut decay, liar, much_later);
+        assert_eq!(decay[&liar_ip].0, 1);
+
+        // The liar's taller claim is set aside; the honest peer is the candidate.
+        let heights = vec![(liar, u32::MAX), (honest, 500)];
+        assert_eq!(
+            Node::filter_struck(heights.clone(), &strikes, now),
+            vec![(honest, 500)]
+        );
+        // After the sit-out it is eligible again.
+        let later = now + Duration::from_secs(61);
+        assert_eq!(Node::filter_struck(heights, &strikes, later).len(), 2);
+
+        // The map is bounded: at the cap, expired entries are forgotten first and a new
+        // address is dropped rather than grown past it.
+        let mut full: HashMap<IpAddr, (u32, Instant)> = (0..NETWORK_SYNC_STRIKE_CAP)
+            .map(|i| {
+                let ip = IpAddr::from([10, 1, (i >> 8) as u8, i as u8]);
+                (ip, (1, now + Duration::from_secs(30)))
+            })
+            .collect();
+        Node::record_strike(&mut full, honest, now);
+        assert_eq!(full.len(), NETWORK_SYNC_STRIKE_CAP);
+        assert!(!full.contains_key(&honest.ip()));
+        Node::record_strike(&mut full, honest, now + Duration::from_secs(31));
+        assert_eq!(full.len(), 1);
+        assert!(full.contains_key(&honest.ip()));
+
+        // IPv6 hosts are keyed by /64; v4-mapped addresses by their IPv4.
+        let a: SocketAddr = "[2001:db8:1:2::5]:7177".parse().unwrap();
+        let b: SocketAddr = "[2001:db8:1:2:ffff::9]:8000".parse().unwrap();
+        let c: SocketAddr = "[2001:db8:1:3::5]:7177".parse().unwrap();
+        assert_eq!(Node::sync_strike_key(&a), Node::sync_strike_key(&b));
+        assert_ne!(Node::sync_strike_key(&a), Node::sync_strike_key(&c));
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:7177".parse().unwrap();
+        assert_eq!(Node::sync_strike_key(&mapped), liar_ip);
+    }
+
+    #[test]
+    fn rejections_are_remembered_briefly_and_acceptances_long() {
+        let now = SystemTime::now();
+        let at = |valid, age| ValidationCacheEntry {
+            valid,
+            timestamp: now - Duration::from_secs(age),
+        };
+        assert!(Node::is_validation_cache_entry_fresh(&at(false, 59), now));
+        assert!(!Node::is_validation_cache_entry_fresh(&at(false, 61), now));
+        assert!(Node::is_validation_cache_entry_fresh(&at(true, 3_599), now));
+        assert!(!Node::is_validation_cache_entry_fresh(
+            &at(true, 3_601),
+            now
+        ));
+    }
+
+    #[test]
+    fn inbound_peers_leave_outbound_slots_free() {
+        assert_eq!(Node::inbound_peer_limit(50), 42);
+        assert_eq!(Node::inbound_peer_limit(16), 8);
+        assert_eq!(Node::inbound_peer_limit(4), 2);
+        assert_eq!(Node::inbound_peer_limit(1), 1);
+    }
+
+    #[test]
+    fn sync_log_level_is_quiet_only_for_small_catch_ups() {
+        assert_eq!(Node::sync_log_level(Some(108), 100), log::Level::Debug);
+        assert_eq!(Node::sync_log_level(Some(109), 100), log::Level::Info);
+        assert_eq!(Node::sync_log_level(Some(90), 100), log::Level::Debug);
+        assert_eq!(Node::sync_log_level(None, 100), log::Level::Info);
+    }
+
+    // The peer round must stay bounded and wide: a per-call budget checked between
+    // blocks, more than three candidates, and the 5 s height-query timeout (the 50/500 ms
+    // fan-out it replaced timed out on healthy peers).
+    #[test]
+    fn sync_with_network_stays_bounded_and_wide() {
+        let src = include_str!("node.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = prod
+            .split("pub async fn sync_with_network(&self)")
+            .nth(1)
+            .expect("sync_with_network present");
+        let body = &body[..body.find("async fn perform_handshake(").expect("fn end")];
+        assert!(body.contains("NETWORK_SYNC_CALL_BUDGET"));
+        assert!(body.contains("if Instant::now() >= candidate_deadline"));
+        assert!(body.contains(".take(NETWORK_SYNC_MAX_CANDIDATES)"));
+        assert!(!body.contains(".take(3)"));
+        assert!(body.contains("without_struck_sync_peers("));
+        assert!(body.contains("query_peer_heights(peer_ips, NETWORK_SYNC_PEER_TIMEOUT_MS)"));
+        const _: () = assert!(NETWORK_SYNC_MAX_CANDIDATES > 3);
+    }
+
+    // A single-flight latch already held makes sync_with_network a no-op, and does not
+    // release the holder's latch on the way out.
+    #[tokio::test]
+    async fn sync_with_network_skips_while_latched() {
+        let (node, _bc) = hermetic_test_node().await;
+        node.network_sync_in_flight.store(true, Ordering::Release);
+        assert!(node.sync_with_network().await.is_ok());
+        assert!(node.network_sync_in_flight());
+        node.network_sync_in_flight.store(false, Ordering::Release);
     }
 
     // Stall watchdog: only zero-progress calls beyond the reorg margin count;

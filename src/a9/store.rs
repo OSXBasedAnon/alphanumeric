@@ -178,6 +178,9 @@ struct Inner {
     path: PathBuf,
     write_lock: Mutex<()>,
     temporary: bool,
+    /// Tables this handle has already created. open_tree runs on read paths, and
+    /// creating means a write transaction behind the global writer lock.
+    created: Mutex<HashSet<&'static str>>,
 }
 
 impl Drop for Inner {
@@ -299,6 +302,7 @@ impl Store {
                 path,
                 write_lock: Mutex::new(()),
                 temporary: false,
+                created: Mutex::new(HashSet::new()),
             }),
             default_tree: OnceLock::new(),
         };
@@ -326,6 +330,7 @@ impl Store {
                 path,
                 write_lock: Mutex::new(()),
                 temporary: true,
+                created: Mutex::new(HashSet::new()),
             }),
             default_tree: OnceLock::new(),
         };
@@ -338,8 +343,10 @@ impl Store {
         let name = String::from_utf8_lossy(name.as_ref()).into_owned();
         let def_name = interned(&name);
         // Create the table eagerly so `tree_names`/readers see it immediately,
-        // matching sled's open_tree side effect.
-        {
+        // matching sled's open_tree side effect. Once per table per handle: readers
+        // already treat a missing table as empty, writers create it in their own
+        // transaction, and `clear` recreates it.
+        if !self.inner.created.lock().contains(def_name) {
             let _guard = self.inner.write_lock.lock();
             let mut txn = self.inner.db.begin_write()?;
             txn.set_durability(Durability::None)?;
@@ -348,6 +355,7 @@ impl Store {
                 txn.open_table(def)?;
             }
             txn.commit()?;
+            self.inner.created.lock().insert(def_name);
         }
         Ok(Tree {
             store: self.clone(),

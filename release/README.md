@@ -248,8 +248,9 @@ node-to-node and catch-up is much faster. As of v7.6.1 the mesh is **on by defau
 nothing to configure.
 
 It falls back to the normal gateway relay automatically for any peer it cannot
-reach directly, and a node with no mesh peers continues on the relay path. If
-you want to turn the mesh off:
+reach directly, and a node with no mesh peers continues on the relay path (or, with the
+gateway down, on its direct TCP peers; see Troubleshooting). If you want to turn the mesh
+off:
 
 ```bash
 ALPHANUMERIC_WEBRTC_MESH=false ./alphanumeric
@@ -300,6 +301,27 @@ the client, a transient disk error, a damaged page — the directory is renamed 
 `blockchain.db.corrupt.<timestamp>` beside it and a fresh copy is fetched, so nothing is
 destroyed while a cause is still unknown. Only one such copy is kept. Your keys are in
 `private.key` and are never touched by any of this.
+
+### When alphanumeric.blue is down
+
+A running node does not need the website to stay on the chain. While the signed tip
+beacon from alphanumeric.blue is live, the node follows it. When the beacon is unreachable,
+fails its signature check, or stops moving, the node follows the chain from its direct
+peers instead: about every 5 seconds it asks them for their heights, pulls new blocks, and
+checks each one exactly as it would any other block. It switches back by itself when the
+beacon is healthy again. `--status` shows the current source on its `Chain source` line, and
+`--sync` falls back to the same peer sync when the beacon is unavailable.
+
+Limits while the site is down:
+
+- The node needs at least one direct peer. It finds them through its saved peer list and the
+  DNS seed, so a node that has run before usually reconnects on its own.
+- Catching up over peers works for gaps the peers still hold full signatures for (recent
+  blocks). A node that was switched off for a long time, or a brand-new install, still needs
+  the signed beacon or a signed snapshot, so it waits until the site (or its snapshot mirror)
+  is back.
+- New nodes behind a home router find each other through the site; without it they connect
+  only to peers with an open port.
 
 If you intentionally want to force bootstrap while keeping the same folder:
 

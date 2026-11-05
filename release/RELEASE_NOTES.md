@@ -18,9 +18,15 @@ migration, no wallet migration, no resync.
   blocked (from boot, across a restart, and again mid-run) stayed within 4 blocks
   of the network, about 1 on average. A node that follows
   its peers past a frozen beacon is not re-bootstrapped back onto it, overlapping
-  peer syncs no longer race each other, and small catch-ups log at debug. Bootstrap
-  (CDN mirror) and peer discovery (seed DNS, peer cache) already worked without the
-  site. The publisher keeps following the relay as before.
+  peer syncs no longer race each other, and small catch-ups log at debug. Each peer
+  round is time-boxed, tries up to eight peers, and sets aside for a while any peer
+  that claims a taller chain it never serves, so a few bad or forked peers cannot
+  stall it. A stuck beacon no longer stops mining, only data signed by the pinned
+  publisher key can make a node replace its chain, the saved peer list is no longer
+  emptied at every start, `--sync` falls back to peers, and `--status` shows which
+  source the node is following (mode changes are logged once at info). Bootstrap
+  (CDN mirror) and the DNS seed already worked without the site. The publisher keeps
+  following the relay as before.
 - **Boots in seconds, not minutes.** The tip is read from the persisted tip
   pointer (validated) instead of a scan that copied every block body, and the start-up
   structural walk resumes from a durable mark instead of re-reading the chain
@@ -53,6 +59,19 @@ migration, no wallet migration, no resync.
   processes.
 - **Explorer API:** every read endpoint shares the read budget and the HTTP
   servers close connections that never finish their headers.
+- **A re-bootstrap keeps the old database until the new one verifies.** A failed
+  or interrupted snapshot download now leaves the existing chain in place
+  (unless the disk cannot hold both, in which case the old copy goes first as
+  before), and a node that already holds the newer signed tip is no longer
+  sent to re-download a snapshot that captured the losing side of a race.
+- **Hardening across peer networking and storage.** Tighter bounds on what a
+  single peer can make the node do or store, outbound peer slots that inbound
+  connections cannot take, peer sync limits that follow the host rather than
+  its advertised port, cheaper orphan and witness bookkeeping per block, and
+  background loops that restart after a fault instead of stopping.
+- **Explorer API: an idempotent retry of a long-past payment** is answered from
+  the permanent address index, so a withdrawal mined outside the 6 h replay
+  window reads as confirmed rather than expired.
 - **Wallet `new`** asks for (and confirms) a passphrase when the session's
   passphrase was never proven against an existing encrypted wallet.
 - **Hashrate is measured from the work miners reveal, not only the work the

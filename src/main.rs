@@ -1,6 +1,7 @@
+use futures::FutureExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{Password, PasswordDisplayMode};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
 use rustyline::{error::ReadlineError, ColorMode, Config, DefaultEditor};
@@ -35,7 +36,7 @@ use alphanumeric::a9::{
     miner::{Miner, MiningManager},
     node::{
         force_rebootstrap_marker_path, rebootstrap_cooldown_path, rebootstrap_hard_cooldown_active,
-        Converge, Node, NodeError, NodeRuntimeConfig,
+        BeaconFollow, Converge, Node, NodeError, NodeRuntimeConfig, BEACON_RACE_TOLERANCE_BLOCKS,
     },
     oracle::DifficultyOracle,
     ui::{
@@ -1111,11 +1112,10 @@ async fn async_main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
 
     local.spawn_local(async move {
-        const RECOVERY_LATENCY: u64 = 500;        // 500ms acceptable during network stress
         const MIN_VIABLE_PEERS: usize = 3;        // Minimum peers for operation
         const HEALTH_CHECK_INTERVAL: u64 = 1000;  // 1s health checks
         const SYNC_CHECK_INTERVAL: u64 = 2000;    // 2s sync checks
-        const SLEEP_THRESHOLD: u64 = 10;          // 10s threshold for sleep detection
+        const SLEEP_THRESHOLD: u64 = MONITOR_SLEEP_THRESHOLD_SECS;
         const MAX_BLOCK_AGE: u64 = 2;            // Maximum acceptable block age deviation
         const MAX_DISCOVERY_ATTEMPTS: u32 = 5;    // Maximum discovery retry attempts
 
@@ -1164,10 +1164,7 @@ async fn async_main() -> Result<()> {
                 let mut block_times = VecDeque::with_capacity(50);
                 let mut discovery_failures: u32 = 0;
                 // Gateway-independent follow state (see the sync arm below).
-                let mut p2p_follow_failures: u32 = 0;
-                let mut p2p_follow_next = tokio::time::Instant::now();
-                // (since, gap then): when the node stopped closing its gap to a live beacon.
-                let mut p2p_behind_live_since: Option<(tokio::time::Instant, u32)> = None;
+                let mut follow = P2pFollow::new(tokio::time::Instant::now());
 
                 loop {
                     tokio::select! {
@@ -1188,9 +1185,7 @@ async fn async_main() -> Result<()> {
                             if now.saturating_sub(last) > SLEEP_THRESHOLD {
                                 debug!("Sleep detected, resetting network state");
                                 // Reset all counters
-                                p2p_follow_failures = 0;
-                                p2p_follow_next = tokio::time::Instant::now();
-                                p2p_behind_live_since = None;
+                                follow.reset(tokio::time::Instant::now());
                                 discovery_failures = 0;
                                 block_times.clear();
 
@@ -1263,112 +1258,91 @@ async fn async_main() -> Result<()> {
                                 }
                                 let tip_before = node.blockchain.read().await.get_latest_block_index() as u32;
                                 let now_i = tokio::time::Instant::now();
-                                let follow = if node.beacon_follow_live() {
-                                    // A live, moving beacon normally means converge is landing
-                                    // blocks. If the node nonetheless stays more than 2 behind it
-                                    // for P2P_FOLLOW_BEHIND_LIVE_SECS (relay 429/5xx while the
-                                    // edge-cached tip is fine, or a beacon branch this client
-                                    // rejects), follow the peers too instead of drifting toward
-                                    // the 64-block reorg margin on gossip alone.
-                                    // "Not closing the gap", not merely "behind": an ordinary
-                                    // long converge catch-up shrinks the gap and restarts the
-                                    // clock each time it does, while a converge that lands
-                                    // blocks slower than the chain grows still trips it.
-                                    let beacon_hw = node.beacon_high_water_height();
-                                    if beacon_hw > tip_before.saturating_add(2) {
-                                        let gap = beacon_hw - tip_before;
-                                        let since = match p2p_behind_live_since {
-                                            Some((since, gap_then)) if gap >= gap_then => since,
-                                            _ => {
-                                                p2p_behind_live_since = Some((now_i, gap));
-                                                now_i
-                                            }
-                                        };
-                                        now_i.duration_since(since)
-                                            >= Duration::from_secs(P2P_FOLLOW_BEHIND_LIVE_SECS)
-                                    } else {
-                                        p2p_behind_live_since = None;
-                                        false
-                                    }
+                                let beacon_state = node.beacon_follow_state();
+                                let beacon_hw = if beacon_state == BeaconFollow::Live {
+                                    node.beacon_high_water_height()
                                 } else {
-                                    p2p_behind_live_since = None;
-                                    true
+                                    0
                                 };
-                                if !follow {
-                                    p2p_follow_failures = 0;
-                                    p2p_follow_next = now_i;
-                                    continue;
+                                // Another sync (the startup sync, bPoS, a bulk peer
+                                // delta-sync after a wake) is already pulling from the
+                                // peers: let it finish rather than stream the same span
+                                // twice or read its no-op Ok as a stuck round.
+                                let busy = node.network_sync_in_flight() || node.full_sync_in_flight();
+                                let (gate, announce) =
+                                    follow.gate(now_i, beacon_state, beacon_hw, tip_before, busy);
+                                match announce {
+                                    Some(FollowMode::Peers(reason)) => info!(
+                                        "Gateway beacon {}; following the chain from peers (tip {})",
+                                        reason.describe(),
+                                        tip_before
+                                    ),
+                                    Some(FollowMode::BehindLiveBeacon { gap }) => info!(
+                                        "Not closing the {}-block gap to the live gateway beacon for {} s; also following peers (tip {})",
+                                        gap, P2P_FOLLOW_BEHIND_LIVE_SECS, tip_before
+                                    ),
+                                    Some(FollowMode::Beacon) => info!(
+                                        "Gateway beacon live and current again; peer follow idle (tip {})",
+                                        tip_before
+                                    ),
+                                    None => {}
                                 }
-                                if now_i < p2p_follow_next {
-                                    continue;
-                                }
-                                // Another sync (the startup sync, bPoS) is already pulling from
-                                // the peers: let it finish rather than read its no-op Ok as a
-                                // stuck round.
-                                if node.network_sync_in_flight() {
+                                if gate != FollowGate::Run {
                                     continue;
                                 }
                                 let wall_before = SystemTime::now();
-                                let round_start = wall_before
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
                                 let tip_id_before = node.local_tip_id().await;
-                                let result = node.sync_with_network().await;
+                                // A panic deep in sync, witness or reorg code must not end
+                                // this task: it also owns sleep detection and emergency
+                                // discovery, and nothing restarts it. The single-flight
+                                // latch is a drop guard, so it is released on unwind.
+                                let result = match std::panic::AssertUnwindSafe(node.sync_with_network())
+                                    .catch_unwind()
+                                    .await
+                                {
+                                    Ok(result) => result.map_err(|e| e.to_string()),
+                                    Err(_) => Err("peer sync panicked (see the panic message above)".to_string()),
+                                };
                                 let tip_id_after = node.local_tip_id().await;
-                                let best_peer = node.best_peer_height_reported_since(round_start).await;
+                                let best_peer = node.network_sync_best_reported();
                                 let tip_after = tip_id_after.0;
                                 let outcome =
                                     classify_p2p_follow(result.is_ok(), tip_id_before, tip_id_after, best_peer);
-                                let cap_secs = match outcome {
-                                    P2pFollowOutcome::Progressed | P2pFollowOutcome::Idle => {
-                                        p2p_follow_failures = 0;
-                                        P2P_FOLLOW_MAX_BACKOFF_SECS
-                                    }
-                                    P2pFollowOutcome::Stuck | P2pFollowOutcome::Failed => {
-                                        p2p_follow_failures = p2p_follow_failures.saturating_add(1);
-                                        let detail = match &result {
-                                            Err(e) => e.to_string(),
-                                            Ok(()) => format!(
-                                                "a peer reports height {} but the tip stayed at {}",
+                                match follow.record(tokio::time::Instant::now(), outcome) {
+                                    FollowNote::Quiet => {}
+                                    FollowNote::Recovered(rounds) => info!(
+                                        "Peer follow progressing again after {} round(s) without progress (tip {})",
+                                        rounds, tip_after
+                                    ),
+                                    FollowNote::NoProgress { failures, warn } => {
+                                        let detail = match (&result, outcome) {
+                                            (_, P2pFollowOutcome::Stuck) => format!(
+                                                "a peer reports height {} but nothing it served was accepted; the tip stayed at {}",
                                                 best_peer, tip_after
                                             ),
+                                            (Err(e), _) => e.clone(),
+                                            (Ok(()), _) => format!("the tip stayed at {}", tip_after),
                                         };
-                                        // Warn on the first failure, then every 12th; debug between.
-                                        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
-                                        #[allow(clippy::manual_is_multiple_of)]
-                                        if p2p_follow_failures == 1 || p2p_follow_failures % 12 == 0 {
+                                        if warn {
                                             warn!(
                                                 "Peer follow made no progress {} time(s) in a row: {}",
-                                                p2p_follow_failures, detail
+                                                failures, detail
                                             );
                                         } else {
                                             debug!("Peer follow made no progress: {}", detail);
                                         }
-                                        // A peer that is "ahead" yet serves nothing we accept (a
-                                        // rejected branch, or a lying height) backs off only to
-                                        // 20 s, so new honest blocks are still picked up promptly;
-                                        // hard errors back off to the full minute.
-                                        if outcome == P2pFollowOutcome::Stuck {
-                                            P2P_FOLLOW_STUCK_BACKOFF_SECS
-                                        } else {
-                                            P2P_FOLLOW_MAX_BACKOFF_SECS
-                                        }
                                     }
-                                };
-                                p2p_follow_next = tokio::time::Instant::now()
-                                    + p2p_follow_delay(p2p_follow_failures, cap_secs);
+                                }
                                 // A long catch-up is activity, not a suspend: stamp the clock
                                 // after it so the next tick's sleep detector does not read the
-                                // sync's own duration as a wake from sleep. But Instant does not
-                                // advance across an OS suspend (macOS/Linux) while the wall clock
-                                // does: when the machine slept DURING the sync, leave the stamp so
-                                // the next tick still sees the gap and resets the pool.
+                                // sync's own duration as a wake from sleep. But when the machine
+                                // slept DURING the sync, leave the stamp so the next tick still
+                                // sees the gap and resets the pool.
                                 let wall_elapsed = SystemTime::now()
                                     .duration_since(wall_before)
                                     .unwrap_or_default();
                                 let mono_elapsed = tokio::time::Instant::now().duration_since(now_i);
-                                if wall_elapsed.saturating_sub(mono_elapsed).as_secs() <= SLEEP_THRESHOLD {
+                                if !suspended_during(wall_elapsed, mono_elapsed) {
                                     activity_time.store(
                                         SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
@@ -1390,6 +1364,8 @@ async fn async_main() -> Result<()> {
                                     Duration::from_secs(1)
                                 };
 
+                                let (wall_before, mono_before) =
+                                    (SystemTime::now(), tokio::time::Instant::now());
                                 tokio::time::sleep(backoff_delay).await;
 
                                 match node.discover_network_nodes().await {
@@ -1401,6 +1377,9 @@ async fn async_main() -> Result<()> {
                                         discovery_failures = discovery_failures.saturating_add(1);
                                     }
                                 }
+                                // The backoff plus discovery can outlast the sleep threshold
+                                // on their own; that is not a wake from sleep.
+                                stamp_activity_unless_suspended(&activity_time, wall_before, mono_before);
                             }
                         }
 
@@ -1445,15 +1424,15 @@ async fn async_main() -> Result<()> {
                                     // Decide whether to rediscover under a short peers guard,
                                     // then release it before the discovery await (same lock-
                                     // across-await hazard as above).
-                                    let need_discovery = {
-                                        let peers = node.peers.read().await;
-                                        peers.len() < MIN_VIABLE_PEERS
-                                            || peers.values().all(|p| p.latency > RECOVERY_LATENCY)
-                                    };
+                                    let need_discovery =
+                                        node.peers.read().await.len() < MIN_VIABLE_PEERS;
                                     if need_discovery {
+                                        let (wall_before, mono_before) =
+                                            (SystemTime::now(), tokio::time::Instant::now());
                                         if let Err(e) = node.discover_network_nodes().await {
                                             error!("Failed to discover peers during health check: {}", e);
                                         }
+                                        stamp_activity_unless_suspended(&activity_time, wall_before, mono_before);
                                     }
                                 }
 
@@ -1805,224 +1784,195 @@ async fn async_main() -> Result<()> {
             let shutdown_recon = shutdown_requested.clone();
             let db_path_recon = db_path.clone();
             let db_for_recon = db.clone();
-            // spawn_logged: a panic in this loop previously died silently — the node
-            // kept running with no background reconciliation at all.
-            alphanumeric::a9::node::spawn_logged("runtime-reconcile", async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(20));
-                // Wake-from-sleep: where Instant advances across an OS suspend
-                // (Windows), the default Burst behavior replays every slept-through
-                // tick back-to-back — two NeedsBootstrap iterations (= two strikes,
-                // marker + exit) could fire within seconds of waking, before
-                // discovery had re-dialed a single live peer. Delay ticks once
-                // immediately, then resumes the 20s cadence, so the wake-recovery
-                // delta-sync gets its chance and strikes stay >= 20s apart.
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut strikes = 0u32;
+            // Supervised: a panic in this loop used to leave the node running with no
+            // background reconciliation at all; now it is reported and re-armed.
+            alphanumeric::a9::node::spawn_supervised("runtime-reconcile", move || {
+                let node_recon = node_recon.clone();
+                let shutdown_recon = shutdown_recon.clone();
+                let db_path_recon = db_path_recon.clone();
+                let db_for_recon = db_for_recon.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(20));
+                    // Wake-from-sleep: where Instant advances across an OS suspend
+                    // (Windows), the default Burst behavior replays every slept-through
+                    // tick back-to-back — two NeedsBootstrap iterations (= two strikes,
+                    // marker + exit) could fire within seconds of waking, before
+                    // discovery had re-dialed a single live peer. Delay ticks once
+                    // immediately, then resumes the 20s cadence, so the wake-recovery
+                    // delta-sync gets its chance and strikes stay >= 20s apart.
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut strikes = 0u32;
 
-                let mut progress_resets = 0;
-                let mut cooldown_logged = false;
-                let mut behind_logged = false;
-                loop {
-                    ticker.tick().await;
-                    if shutdown_recon.load(Ordering::Acquire) {
-                        return;
-                    }
-                    match node_recon.sync_to_beacon().await {
-                        Converge::Converged => {
-                            strikes = 0;
-                            // PROVEN convergence invalidates any stale marker: a node
-                            // that recovered in place during a fail-open (gateway-down)
-                            // boot must not get its now-healthy chain wiped at the next
-                            // gateway-up restart (review finding, 2026-07-11). Every
-                            // Converged tick, not once: mine-prep can write a marker at
-                            // any later moment (transient fork-storm NeedsBootstrap),
-                            // and a one-shot cleanup left that marker to wipe a chain
-                            // that then converged healthily for hours (audit finding).
-                            // Cost: one unlink of a usually-absent path per 20s tick.
-                            let _ = std::fs::remove_file(force_rebootstrap_marker_path(
-                                &db_path_recon,
-                            ));
-                            behind_logged = false;
+                    let mut progress_resets = 0;
+                    let mut cooldown_logged = false;
+                    let mut behind_logged = false;
+                    loop {
+                        ticker.tick().await;
+                        if shutdown_recon.load(Ordering::Acquire) {
+                            return;
                         }
-                        Converge::AtTipAhead
-                        | Converge::Progressed
-                        | Converge::BeaconStale
-                        | Converge::BranchInvalid => {
-                            strikes = 0;
-                            behind_logged = false;
-                        }
-                        Converge::NeedsBootstrap => {
-                            // RESILIENT SERVICE CLIENTS (exchange / explorer /
-                            // web-wallet API): a NeedsBootstrap from an idle node
-                            // is almost always a FALSE POSITIVE — the node mints
-                            // nothing, so it is a canonical PREFIX (not a fork),
-                            // just behind and momentarily unable to fetch the
-                            // intervening bodies (relay holes / thin mesh /
-                            // partition). The old code escalated that to a process
-                            // exit every ~minute, taking the SERVICE down and
-                            // thinning the mesh. Only a genuine "fallen more than
-                            // ORPHAN_REORG_DEPTH behind" (bodies aged out, snapshot
-                            // is the only cure) warrants the disruptive exit +
-                            // re-bootstrap. Below that, STAY UP and keep serving —
-                            // the in-place converge / Tier-2 peer-sync / gossip
-                            // loops recover the node, and if it never catches up it
-                            // crosses the threshold on its own and re-bootstraps
-                            // then. Read-only + mining-neutral: mine-prep still
-                            // re-checks convergence and writes its own marker
-                            // (schedule_force_rebootstrap_hard) untouched.
-                            let (genuinely_too_far, forked) = {
-                                let local_tip = node_recon
-                                    .blockchain
-                                    .read()
+                        match node_recon.sync_to_beacon().await {
+                            Converge::Converged => {
+                                strikes = 0;
+                                // PROVEN convergence invalidates any stale marker: a node
+                                // that recovered in place during a fail-open (gateway-down)
+                                // boot must not get its now-healthy chain wiped at the next
+                                // gateway-up restart (review finding, 2026-07-11). Every
+                                // Converged tick, not once: mine-prep can write a marker at
+                                // any later moment (transient fork-storm NeedsBootstrap),
+                                // and a one-shot cleanup left that marker to wipe a chain
+                                // that then converged healthily for hours (audit finding).
+                                // Cost: one unlink of a usually-absent path per 20s tick.
+                                let _ = std::fs::remove_file(force_rebootstrap_marker_path(
+                                    &db_path_recon,
+                                ));
+                                behind_logged = false;
+                            }
+                            Converge::AtTipAhead
+                            | Converge::Progressed
+                            | Converge::BeaconStale
+                            | Converge::BranchInvalid => {
+                                strikes = 0;
+                                behind_logged = false;
+                            }
+                            Converge::NeedsBootstrap => {
+                                // RESILIENT SERVICE CLIENTS (exchange / explorer /
+                                // web-wallet API): a NeedsBootstrap from an idle node
+                                // is almost always a FALSE POSITIVE — the node mints
+                                // nothing, so it is a canonical PREFIX (not a fork),
+                                // just behind and momentarily unable to fetch the
+                                // intervening bodies (relay holes / thin mesh /
+                                // partition). The old code escalated that to a process
+                                // exit every ~minute, taking the SERVICE down and
+                                // thinning the mesh. Only a genuine "fallen more than
+                                // ORPHAN_REORG_DEPTH behind" (bodies aged out, snapshot
+                                // is the only cure) warrants the disruptive exit +
+                                // re-bootstrap. Below that, STAY UP and keep serving —
+                                // the in-place converge / Tier-2 peer-sync / gossip
+                                // loops recover the node, and if it never catches up it
+                                // crosses the threshold on its own and re-bootstraps
+                                // then. Read-only + mining-neutral: mine-prep still
+                                // re-checks convergence and writes its own marker
+                                // (schedule_force_rebootstrap_hard) untouched.
+                                let (genuinely_too_far, forked) = {
+                                    let local_tip = node_recon
+                                        .blockchain
+                                        .read()
+                                        .await
+                                        .get_latest_block_index()
+                                        as u32;
+                                    // FORK vs BEHIND: NeedsBootstrap is overloaded. A
+                                    // genuine FORK (our tip is not on canonical) can
+                                    // have a small — or even negative — height gap, so
+                                    // gap alone would leave a forked service node
+                                    // serving wrong-chain data. Re-derive the two fork
+                                    // checks the boot reconcile uses, read through the
+                                    // OPEN handle (no DB re-open), touching nothing on
+                                    // the mine path:
+                                    let beacon = node_recon.network_beacon_tip().await;
+                                    //  (B) anchor at-or-below our tip: fetch a signed
+                                    //      canonical header <= local_tip and compare its
+                                    //      hash to the block we hold there. Catches a
+                                    //      fork whose divergence point is at/below our
+                                    //      tip and below the beacon.
+                                    let mut forked = match fetch_canonical_anchor_at_or_below(
+                                        local_tip,
+                                    )
                                     .await
-                                    .get_latest_block_index()
-                                    as u32;
-                                // FORK vs BEHIND: NeedsBootstrap is overloaded. A
-                                // genuine FORK (our tip is not on canonical) can
-                                // have a small — or even negative — height gap, so
-                                // gap alone would leave a forked service node
-                                // serving wrong-chain data. Re-derive the two fork
-                                // checks the boot reconcile uses, read through the
-                                // OPEN handle (no DB re-open), touching nothing on
-                                // the mine path:
-                                let beacon = node_recon.network_beacon_tip().await;
-                                //  (B) anchor at-or-below our tip: fetch a signed
-                                //      canonical header <= local_tip and compare its
-                                //      hash to the block we hold there. Catches a
-                                //      fork whose divergence point is at/below our
-                                //      tip and below the beacon.
-                                let mut forked = match fetch_canonical_anchor_at_or_below(
-                                    local_tip,
-                                )
-                                .await
-                                {
-                                    Some((anchor_h, anchor_hash)) if anchor_h <= local_tip => {
-                                        match node_recon
-                                            .blockchain
-                                            .read()
-                                            .await
-                                            .get_block(anchor_h)
-                                        {
-                                            Ok(b) => !hex::encode(b.hash)
-                                                .eq_ignore_ascii_case(&anchor_hash),
-                                            Err(_) => false,
-                                        }
-                                    }
-                                    _ => false,
-                                };
-                                //  (A) at the beacon tip: when we are AT/ABOVE the
-                                //      beacon height, compare our block at the beacon
-                                //      height to the signed beacon hash. Catches an
-                                //      out-extended taller-but-losing fork (gap<=0),
-                                //      which check (B)'s anchor — landing on the
-                                //      shared fork point — would miss.
-                                if !forked {
-                                    if let Some((bh, bhash)) = &beacon {
-                                        if local_tip >= *bh {
-                                            if let Ok(b) = node_recon
+                                    {
+                                        Some((anchor_h, anchor_hash)) if anchor_h <= local_tip => {
+                                            match node_recon
                                                 .blockchain
                                                 .read()
                                                 .await
-                                                .get_block(*bh)
+                                                .get_block(anchor_h)
                                             {
-                                                forked = !hex::encode(b.hash)
-                                                    .eq_ignore_ascii_case(bhash);
+                                                Ok(b) => !hex::encode(b.hash)
+                                                    .eq_ignore_ascii_case(&anchor_hash),
+                                                Err(_) => false,
+                                            }
+                                        }
+                                        _ => false,
+                                    };
+                                    //  (A) at the beacon tip: when we are AT/ABOVE the
+                                    //      beacon height, compare our block at the beacon
+                                    //      height to the signed beacon hash. Catches an
+                                    //      out-extended taller-but-losing fork (gap<=0),
+                                    //      which check (B)'s anchor — landing on the
+                                    //      shared fork point — would miss.
+                                    if !forked {
+                                        if let Some((bh, bhash)) = &beacon {
+                                            if local_tip >= *bh {
+                                                if let Ok(b) = node_recon
+                                                    .blockchain
+                                                    .read()
+                                                    .await
+                                                    .get_block(*bh)
+                                                {
+                                                    forked = !hex::encode(b.hash)
+                                                        .eq_ignore_ascii_case(bhash);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                let beacon_height = beacon.as_ref().map(|(h, _)| *h);
-                                (
-                                    idle_reconcile_needs_snapshot(local_tip, beacon_height, forked),
-                                    forked,
-                                )
-                            };
-                            if !genuinely_too_far {
-                                strikes = 0;
-                                if !behind_logged {
-                                    notify_async("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string()).await;
-                                    behind_logged = true;
-                                }
-                                continue;
-                            }
-                            // Genuinely too far, but NOT forked: an on-canonical prefix
-                            // that has simply fallen far behind (> ORPHAN_REORG_DEPTH).
-                            // Before escalating to a full-snapshot re-bootstrap (marker +
-                            // exit + ~885 MB download + a BLOATED bulk-imported DB), try to
-                            // close the gap with a bulk P2P delta-sync from any full-history
-                            // peer — seeds OR already-connected peers (include_connected_peers
-                            // = true). This keeps the node UP, keeps its sled DB COMPACT
-                            // (incremental append vs bulk import), and only re-bootstraps
-                            // when no peer can actually serve the range. A genuine FORK still
-                            // escalates immediately (skipped here). If the delta-sync can't
-                            // proceed — no full-history peer, aged-out span, or a stall — we
-                            // fall straight through to the existing strike/snapshot path, so
-                            // the snapshot stays the guaranteed escape and no forked or truly
-                            // stranded node is left behind. Source-independent safety: the
-                            // sync's STEP-2 tip probe pins the tip to the gateway-signed
-                            // beacon hash and every block is validated on ingest, so a lying
-                            // or off-canonical peer cannot advance us (returns NeedsBootstrap
-                            // -> falls through). Mining-neutral: read-only convergence, no
-                            // marker written, mine-prep's own reconcile untouched.
-                            if !forked {
-                                // Tip before this converge cycle, for the progress check in
-                                // the fallthrough arm. Guard is a temporary — dropped at the
-                                // semicolon, never held across the sync await.
-                                let tip_before = node_recon
-                                    .blockchain
-                                    .read()
-                                    .await
-                                    .get_latest_block_index()
-                                    as u32;
-                                match node_recon.sync_full_history_from_peer(true).await {
-                                    verdict @ (Converge::Converged
-                                    | Converge::AtTipAhead
-                                    | Converge::Progressed) => {
-                                        // Converged/AtTipAhead prove this generation reached
-                                        // the tip: the incident is over, so a FUTURE deep gap
-                                        // starts a fresh respawn budget. Progressed is still
-                                        // mid-heal and deliberately does not count.
-                                        if !matches!(verdict, Converge::Progressed) {
-                                            LINEAGE_HEALED.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
-                                            progress_resets = 0;
-                                        }
-                                        strikes = 0;
-                                        if !behind_logged {
-                                            notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
-                                            behind_logged = true;
-                                        }
-                                        continue;
+                                    let beacon_height = beacon.as_ref().map(|(h, _)| *h);
+                                    (
+                                        idle_reconcile_needs_snapshot(local_tip, beacon_height, forked),
+                                        forked,
+                                    )
+                                };
+                                if !genuinely_too_far {
+                                    strikes = 0;
+                                    if !behind_logged {
+                                        notify_async("Behind the network tip; catching up in the background. The node stays up and keeps serving.".to_string()).await;
+                                        behind_logged = true;
                                     }
-                                    _ => {
-                                        // A failed VERDICT is not a failed HEAL: the bounded
-                                        // converge reports NeedsBootstrap for ANY residual gap,
-                                        // including the cycle that just applied thousands of
-                                        // blocks and ran out of deadline (expiry keeps a
-                                        // consistent prefix; the next cycle resumes from the
-                                        // advanced tip). Striking on that verdict killed nodes
-                                        // 5-10 minutes into a working catch-up. So the fuse
-                                        // resets on measured PROGRESS — the same rule mine-prep
-                                        // uses — and only a cycle that moved the tip nowhere
-                                        // counts toward the snapshot escape.
-                                        let tip_now = node_recon
-                                            .blockchain
-                                            .read()
-                                            .await
-                                            .get_latest_block_index()
-                                            as u32;
-                                        // Bounded: an eclipse peer could drip just enough
-                                        // real blocks to keep resetting the fuse while the
-                                        // node never actually gains on the network. The
-                                        // largest legitimate runtime heal is one keep-band
-                                        // (8192 blocks) plus slow pre-mesh retries — well
-                                        // inside 60 cycles — so past the budget the drip
-                                        // stops counting as health and the snapshot escape
-                                        // proceeds. Reset on any proven arrival at the tip.
-                                        if tip_now > tip_before && progress_resets < 60 {
-                                            progress_resets += 1;
+                                    continue;
+                                }
+                                // Genuinely too far, but NOT forked: an on-canonical prefix
+                                // that has simply fallen far behind (> ORPHAN_REORG_DEPTH).
+                                // Before escalating to a full-snapshot re-bootstrap (marker +
+                                // exit + ~885 MB download + a BLOATED bulk-imported DB), try to
+                                // close the gap with a bulk P2P delta-sync from any full-history
+                                // peer — seeds OR already-connected peers (include_connected_peers
+                                // = true). This keeps the node UP, keeps its sled DB COMPACT
+                                // (incremental append vs bulk import), and only re-bootstraps
+                                // when no peer can actually serve the range. A genuine FORK still
+                                // escalates immediately (skipped here). If the delta-sync can't
+                                // proceed — no full-history peer, aged-out span, or a stall — we
+                                // fall straight through to the existing strike/snapshot path, so
+                                // the snapshot stays the guaranteed escape and no forked or truly
+                                // stranded node is left behind. Source-independent safety: the
+                                // sync's STEP-2 tip probe pins the tip to the gateway-signed
+                                // beacon hash and every block is validated on ingest, so a lying
+                                // or off-canonical peer cannot advance us (returns NeedsBootstrap
+                                // -> falls through). Mining-neutral: read-only convergence, no
+                                // marker written, mine-prep's own reconcile untouched.
+                                if !forked {
+                                    // Tip before this converge cycle, for the progress check in
+                                    // the fallthrough arm. Guard is a temporary — dropped at the
+                                    // semicolon, never held across the sync await.
+                                    let tip_before = node_recon
+                                        .blockchain
+                                        .read()
+                                        .await
+                                        .get_latest_block_index()
+                                        as u32;
+                                    match node_recon.sync_full_history_from_peer(true).await {
+                                        verdict @ (Converge::Converged
+                                        | Converge::AtTipAhead
+                                        | Converge::Progressed) => {
+                                            // Converged/AtTipAhead prove this generation reached
+                                            // the tip: the incident is over, so a FUTURE deep gap
+                                            // starts a fresh respawn budget. Progressed is still
+                                            // mid-heal and deliberately does not count.
+                                            if !matches!(verdict, Converge::Progressed) {
+                                                LINEAGE_HEALED.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                progress_resets = 0;
+                                            }
                                             strikes = 0;
                                             if !behind_logged {
                                                 notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
@@ -2030,96 +1980,131 @@ async fn async_main() -> Result<()> {
                                             }
                                             continue;
                                         }
+                                        _ => {
+                                            // A failed VERDICT is not a failed HEAL: the bounded
+                                            // converge reports NeedsBootstrap for ANY residual gap,
+                                            // including the cycle that just applied thousands of
+                                            // blocks and ran out of deadline (expiry keeps a
+                                            // consistent prefix; the next cycle resumes from the
+                                            // advanced tip). Striking on that verdict killed nodes
+                                            // 5-10 minutes into a working catch-up. So the fuse
+                                            // resets on measured PROGRESS — the same rule mine-prep
+                                            // uses — and only a cycle that moved the tip nowhere
+                                            // counts toward the snapshot escape.
+                                            let tip_now = node_recon
+                                                .blockchain
+                                                .read()
+                                                .await
+                                                .get_latest_block_index()
+                                                as u32;
+                                            // Bounded: an eclipse peer could drip just enough
+                                            // real blocks to keep resetting the fuse while the
+                                            // node never actually gains on the network. The
+                                            // largest legitimate runtime heal is one keep-band
+                                            // (8192 blocks) plus slow pre-mesh retries — well
+                                            // inside 60 cycles — so past the budget the drip
+                                            // stops counting as health and the snapshot escape
+                                            // proceeds. Reset on any proven arrival at the tip.
+                                            if tip_now > tip_before && progress_resets < 60 {
+                                                progress_resets += 1;
+                                                strikes = 0;
+                                                if !behind_logged {
+                                                    notify_async("Behind the network tip; catching up from a peer in the background. The node stays up and keeps serving.".to_string()).await;
+                                                    behind_logged = true;
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                            behind_logged = false;
-                            strikes += 1;
-                            if strikes >= 2 {
-                                // Bootstrap-cycle cooldown: on a genuinely shattered
-                                // network this exit repeats; without a floor the old
-                                // cheap ~21s crash-loop becomes a snapshot-download
-                                // loop. This verdict is a PROVEN below-finality
-                                // divergence against the signed beacon, so it uses the
-                                // HARD (short) window: suppressing it for the generic
-                                // 30 minutes left a node that knew it was stranded
-                                // sitting stale doing nothing (2026-07-11). Within the
-                                // short window, stay up and keep retrying converge —
-                                // same eventual recovery, bounded cost.
-                                if rebootstrap_hard_cooldown_active(&db_path_recon) {
-                                    if !cooldown_logged {
-                                        notify_async("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string()).await;
-                                        cooldown_logged = true;
+                                behind_logged = false;
+                                strikes += 1;
+                                if strikes >= 2 {
+                                    // Bootstrap-cycle cooldown: on a genuinely shattered
+                                    // network this exit repeats; without a floor the old
+                                    // cheap ~21s crash-loop becomes a snapshot-download
+                                    // loop. This verdict is a PROVEN below-finality
+                                    // divergence against the signed beacon, so it uses the
+                                    // HARD (short) window: suppressing it for the generic
+                                    // 30 minutes left a node that knew it was stranded
+                                    // sitting stale doing nothing (2026-07-11). Within the
+                                    // short window, stay up and keep retrying converge —
+                                    // same eventual recovery, bounded cost.
+                                    if rebootstrap_hard_cooldown_active(&db_path_recon) {
+                                        if !cooldown_logged {
+                                            notify_async("Chain cannot converge, but a forced re-bootstrap ran recently; staying up and retrying until the cooldown passes".to_string()).await;
+                                            cooldown_logged = true;
+                                        }
+                                        strikes = 0;
+                                        continue;
                                     }
-                                    strikes = 0;
-                                    continue;
-                                }
-                                // Drop the force-rebootstrap marker BEFORE exiting: the
-                                // boot-time manifest comparison lags its publish cadence,
-                                // so a fork AT tip height read as "in sync" at boot and
-                                // this exit crash-looped ~21s at a time until the manifest
-                                // caught up (observed 7x back-to-back, 2026-07-10). The
-                                // marker makes the next boot re-bootstrap unconditionally
-                                // — the live loop has PROVEN convergence is impossible,
-                                // which outranks any boot-time guess.
-                                let marker = force_rebootstrap_marker_path(&db_path_recon);
-                                // Durable (fsync'd): this marker exists to break a
-                                // crash loop, so it must survive the power cut /
-                                // kernel panic that may follow the exit below.
-                                if let Err(e) = alphanumeric::a9::node::write_durable(
-                                    &marker,
-                                    b"runtime too-far-behind exit\n",
-                                ) {
-                                    eprintln!(
-                                        "Warning: could not write re-bootstrap marker {}: {}",
-                                        marker.display(),
-                                        e
-                                    );
-                                }
-                                // Interactive sessions never die into a dead terminal:
-                                // the marker above already guarantees the next boot
-                                // re-bootstraps, so hand this same terminal a next boot.
-                                // Exec does not run Drop — identical semantics to the
-                                // exit(3) below, which is the point: the durable marker,
-                                // not teardown, is the recovery contract. Headless nodes
-                                // keep exit(3) byte-for-byte: supervisors depend on it,
-                                // and the other watchdogs already draw this same
-                                // interactive/headless line.
-                                let interactive = !env_flag_enabled("ALPHANUMERIC_HEADLESS")
-                                    && std::io::IsTerminal::is_terminal(&std::io::stdin());
-                                if interactive {
+                                    // Drop the force-rebootstrap marker BEFORE exiting: the
+                                    // boot-time manifest comparison lags its publish cadence,
+                                    // so a fork AT tip height read as "in sync" at boot and
+                                    // this exit crash-looped ~21s at a time until the manifest
+                                    // caught up (observed 7x back-to-back, 2026-07-10). The
+                                    // marker makes the next boot re-bootstrap unconditionally
+                                    // — the live loop has PROVEN convergence is impossible,
+                                    // which outranks any boot-time guess.
+                                    let marker = force_rebootstrap_marker_path(&db_path_recon);
+                                    // Durable (fsync'd): this marker exists to break a
+                                    // crash loop, so it must survive the power cut /
+                                    // kernel panic that may follow the exit below.
+                                    if let Err(e) = alphanumeric::a9::node::write_durable(
+                                        &marker,
+                                        b"runtime too-far-behind exit\n",
+                                    ) {
+                                        eprintln!(
+                                            "Warning: could not write re-bootstrap marker {}: {}",
+                                            marker.display(),
+                                            e
+                                        );
+                                    }
+                                    // Interactive sessions never die into a dead terminal:
+                                    // the marker above already guarantees the next boot
+                                    // re-bootstraps, so hand this same terminal a next boot.
+                                    // Exec does not run Drop — identical semantics to the
+                                    // exit(3) below, which is the point: the durable marker,
+                                    // not teardown, is the recovery contract. Headless nodes
+                                    // keep exit(3) byte-for-byte: supervisors depend on it,
+                                    // and the other watchdogs already draw this same
+                                    // interactive/headless line.
+                                    let interactive = !env_flag_enabled("ALPHANUMERIC_HEADLESS")
+                                        && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                                    if interactive {
+                                        println!(
+                                            "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
+                                            alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
+                                        );
+                                        alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                                        let _ = db_for_recon.flush();
+                                        let _ = remove_db_lock(&format!(
+                                            "{}.lock",
+                                            db_path_recon
+                                        ));
+                                        let _ = remove_instance_lock();
+                                        let err = restart_in_place();
+                                        eprintln!(
+                                            "In-place restart unavailable ({}); exiting — relaunch the app to finish the re-bootstrap.",
+                                            err
+                                        );
+                                        std::process::exit(3);
+                                    }
                                     println!(
-                                        "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; restarting in place to pull a fresh verified snapshot...",
+                                        "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
                                         alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
                                     );
-                                    alphanumeric::a9::blockchain::OPERATOR_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                                    // Flush before exit like every other exit path:
+                                    // the store buffers non-durable writes between periodic flushes, and discarding them
+                                    // here costs a derived-state rebuild on the next
+                                    // boot — on the very path whose job is recovery.
                                     let _ = db_for_recon.flush();
-                                    let _ = remove_db_lock(&format!(
-                                        "{}.lock",
-                                        db_path_recon
-                                    ));
-                                    let _ = remove_instance_lock();
-                                    let err = restart_in_place();
-                                    eprintln!(
-                                        "In-place restart unavailable ({}); exiting — relaunch the app to finish the re-bootstrap.",
-                                        err
-                                    );
+                                    // Nonzero: this exit exists to BE re-launched (the marker written
+                                    // above makes the next boot re-bootstrap). exit(0) reads as success,
+                                    // so systemd Restart=on-failure / docker restart:on-failure would
+                                    // leave the stranded node dead instead of restarting it.
                                     std::process::exit(3);
                                 }
-                                println!(
-                                    "Node is on a fork or has fallen too far behind (>{} blocks) to catch up incrementally; re-bootstrapping from a fresh snapshot. Run under a supervisor (systemd/docker restart) so the service comes back automatically.",
-                                    alphanumeric::a9::blockchain::ORPHAN_REORG_DEPTH
-                                );
-                                // Flush before exit like every other exit path:
-                                // the store buffers non-durable writes between periodic flushes, and discarding them
-                                // here costs a derived-state rebuild on the next
-                                // boot — on the very path whose job is recovery.
-                                let _ = db_for_recon.flush();
-                                // Nonzero: this exit exists to BE re-launched (the marker written
-                                // above makes the next boot re-bootstrap). exit(0) reads as success,
-                                // so systemd Restart=on-failure / docker restart:on-failure would
-                                // leave the stranded node dead instead of restarting it.
-                                std::process::exit(3);
                             }
                         }
                     }
@@ -4810,8 +4795,32 @@ async fn handle_chain_sync(
             Ok(())
         }
         Converge::BeaconStale => {
-            status_pb
-                .finish_with_message("Network tip beacon unavailable; try --sync again shortly");
+            // No usable beacon (gateway down, or not verifying): sync from the peers
+            // directly, the same round the background follow runs.
+            if node.network_sync_in_flight() {
+                status_pb.finish_with_message(
+                    "Network tip beacon unavailable; a peer sync is already running in the background",
+                );
+                return Ok(());
+            }
+            status_pb.set_message("Network tip beacon unavailable; syncing from peers...");
+            let result = node.sync_with_network().await;
+            let tip_after = { node.blockchain.read().await.get_latest_block_index() as u32 };
+            let message = match result {
+                Ok(()) if tip_after > tip_now => format!(
+                    "Gateway beacon unavailable; synced from peers {} -> {} (the node keeps following peers in the background)",
+                    tip_now, tip_after
+                ),
+                Ok(()) => format!(
+                    "Gateway beacon unavailable; no peer is ahead of {} (the node keeps following peers in the background)",
+                    tip_after
+                ),
+                Err(e) => format!(
+                    "Gateway beacon unavailable and peer sync made no progress ({}); the node keeps retrying in the background",
+                    e
+                ),
+            };
+            status_pb.finish_with_message(message);
             Ok(())
         }
         Converge::BranchInvalid => {
@@ -4869,6 +4878,19 @@ async fn handle_network_commands(
                 }
             );
             println!("Direct P2P peers: {}", peers.len());
+            // Which source the node is following the chain from right now: the signed
+            // gateway beacon, or (while that is not live) its peers.
+            println!(
+                "Chain source: {}",
+                if Node::follows_relay_as_publisher() {
+                    "the block relay (beacon publisher)".to_string()
+                } else {
+                    match node.beacon_follow_state() {
+                        BeaconFollow::Live => "gateway beacon (live)".to_string(),
+                        other => format!("peers (gateway beacon {})", other.describe()),
+                    }
+                }
+            );
             println!("Node Address: {}", node.get_public_key());
             // The port actually BOUND, not the compile-time default — this line
             // is read while debugging NAT/firewall issues, which is exactly when an
@@ -5811,7 +5833,20 @@ fn nearest_existing_path(path: &Path) -> Option<std::path::PathBuf> {
 
     loop {
         if candidate.exists() {
-            return std::fs::canonicalize(&candidate).ok();
+            let canonical = std::fs::canonicalize(&candidate).ok()?;
+            // Windows canonical paths carry the verbatim `\\?\` prefix, which no disk
+            // mount point does, so the disk lookup never matched and the preflight was
+            // silently skipped there.
+            #[cfg(windows)]
+            let canonical = {
+                let stripped: Option<std::path::PathBuf> = canonical
+                    .to_str()
+                    .and_then(|text| text.strip_prefix(r"\\?\"))
+                    .filter(|rest| !rest.starts_with(r"UNC\"))
+                    .map(std::path::PathBuf::from);
+                stripped.unwrap_or(canonical)
+            };
+            return Some(canonical);
         }
         if !candidate.pop() {
             return None;
@@ -6118,7 +6153,7 @@ fn fmt_thousands(n: u64) -> String {
 async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Result<()> {
     let force_bootstrap = env_flag_enabled("ALPHANUMERIC_FORCE_BOOTSTRAP");
     // Whether this run was demanded by the runtime divergence marker — captured
-    // before the decision (remove_local_db deletes the marker with the dir), so
+    // before the decision (the snapshot swap replaces the marker with the dir), so
     // a successful restore can stamp the bootstrap-cycle cooldown.
     let was_marker_forced = force_rebootstrap_marker_path(db_path).exists();
 
@@ -6156,7 +6191,7 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                 // Best-effort live tip beacon: the freshest canonical height for the
                 // behind/in-sync decision (the manifest can lag by its publish
                 // cadence — or by hours when snapshot publishing is broken).
-                let live_beacon_height: Option<u32> = async {
+                let live_beacon: Option<(u32, String)> = async {
                     let client = reqwest::Client::builder()
                         .timeout(Duration::from_millis(2500))
                         .build()
@@ -6172,11 +6207,21 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                     if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                         return None;
                     }
-                    body.get("height")
+                    // Signed by a pinned publisher key, or ignored: this height can
+                    // decide "too far behind, delete the chain and re-download", and
+                    // whoever answers for the domain could otherwise name any height.
+                    if !Node::tip_beacon_verified(&body) {
+                        return None;
+                    }
+                    let height = body
+                        .get("height")
                         .and_then(|v| v.as_u64())
-                        .and_then(|h| u32::try_from(h).ok())
+                        .and_then(|h| u32::try_from(h).ok())?;
+                    let hash = body.get("hash").and_then(|v| v.as_str())?.to_string();
+                    Some((height, hash))
                 }
                 .await;
+                let live_beacon_height = live_beacon.as_ref().map(|(height, _)| *height);
                 // Canonical anchor at-or-below our tip: only needed (and only
                 // fetched) when we are behind the manifest height, i.e. when the
                 // manifest-height hash comparison inside the decision can't run.
@@ -6199,6 +6244,25 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                     canonical_anchor,
                     boot_local_tip,
                 ) {
+                    // The snapshot manifest is a point-in-time reading: a block it named
+                    // can lose a race moments later. When we already hold the newer signed
+                    // tip itself, our chain is the network's chain, whatever the manifest
+                    // saw; replacing it would install the losing block. A runtime
+                    // divergence marker still forces the restore.
+                    CanonicalReconcile::Diverged { .. }
+                        if !was_marker_forced
+                            && local_holds_beacon_tip(db_path, live_beacon.as_ref()) =>
+                    {
+                        boot_note(
+                            status.as_ref(),
+                            "local chain holds the live network tip".to_string(),
+                        );
+                        log::info!(
+                            "bootstrap skipped: local DB holds the signed live tip {:?}",
+                            live_beacon
+                        );
+                        return Ok(());
+                    }
                     CanonicalReconcile::InSyncOrUnknown => {
                         boot_note(
                             status.as_ref(),
@@ -6233,7 +6297,8 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                             &canonical_hash[..canonical_hash.len().min(16)],
                             local
                         );
-                        remove_local_db(db_path).await?;
+                        // The local DB stays until a verified snapshot replaces it
+                        // (the swap below): a failed download keeps the old chain.
                     }
                 }
             }
@@ -6243,7 +6308,6 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                     status.as_ref(),
                     format!("replacing local database (wrong genesis {})", actual),
                 );
-                remove_local_db(db_path).await?;
             }
             LaunchDbStatus::OpenFailed(err) => {
                 // Not corruption, so not ours to set aside: a lock held by another
@@ -6293,7 +6357,6 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
             status.as_ref(),
             "forcing bootstrap download (ALPHANUMERIC_FORCE_BOOTSTRAP=true)".to_string(),
         );
-        remove_local_db(db_path).await?;
     }
 
     let (
@@ -6365,11 +6428,29 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
         }
     }
 
-    ensure_bootstrap_disk_space(
+    // The old DB is only replaced after the new snapshot verifies, so both sit on
+    // disk during extraction. When that does not fit, give up the old copy first
+    // (the pre-swap behaviour) rather than refuse the bootstrap outright.
+    if let Err(e) = ensure_bootstrap_disk_space(
         std::path::Path::new(db_path),
         expected_compressed_bytes,
         expected_extracted_bytes,
-    )?;
+    ) {
+        if !std::path::Path::new(db_path).exists() {
+            return Err(e);
+        }
+        boot_note(
+            status.as_ref(),
+            "not enough disk space to keep the old database during the download; removing it first"
+                .to_string(),
+        );
+        remove_local_db(db_path).await?;
+        ensure_bootstrap_disk_space(
+            std::path::Path::new(db_path),
+            expected_compressed_bytes,
+            expected_extracted_bytes,
+        )?;
+    }
 
     let zip_path = format!("{}.zip", db_path);
     let download_client = bootstrap_download_http_client()?;
@@ -6621,10 +6702,15 @@ async fn ensure_bootstrap_db(db_path: &str, status: Option<ProgressBar>) -> Resu
                     .map_err(|e| format!("Unreadable bootstrap archive entry name: {}", e))?
                     .into_owned();
                 let relative = std::path::Path::new(&entry_name);
+                // Plain names only: a Windows drive prefix (`C:x`) or root is not
+                // "absolute" on every platform, but join() would still escape.
                 if relative.is_absolute()
-                    || relative
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    || relative.components().any(|c| {
+                        !matches!(
+                            c,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
                 {
                     return Err(format!(
                         "Unsafe bootstrap archive entry path: {}",
@@ -6933,6 +7019,14 @@ enum CanonicalReconcile {
 /// height, so without the anchor a forked node reads as merely behind, tries to
 /// stream forever, and never recovers (the stale-client trap seen live
 /// 2026-07-11). The anchor hash-compare catches the fork and re-bootstraps.
+/// Whether the local DB holds the block a verified live beacon names, at its height.
+fn local_holds_beacon_tip(db_path: &str, beacon: Option<&(u32, String)>) -> bool {
+    let Some((height, hash)) = beacon else {
+        return false;
+    };
+    local_block_hash_at(db_path, *height).is_some_and(|local| local.eq_ignore_ascii_case(hash))
+}
+
 fn canonical_reconcile_decision(
     db_path: &str,
     manifest: &Result<BootstrapManifestPointer>,
@@ -6974,8 +7068,8 @@ fn canonical_reconcile_decision(
     // re-bootstrap, and stayed stranded. The live tip beacon is the freshest signed
     // canonical height (~1-2s), so use it for the AM-I-TOO-FAR-BEHIND decision; the
     // manifest keeps the checkpoint-hash comparison at ITS height (the snapshot is
-    // what we would download). A wrong/poisoned beacon can at worst trigger one
-    // unnecessary re-bootstrap whose snapshot manifest is still signature-verified.
+    // what we would download). The caller only passes a beacon whose signature
+    // verified against a pinned publisher key; an unsigned one is ignored.
     let live_height = live_beacon_height.unwrap_or(0).max(canonical_height);
 
     // Already holding the canonical tip block (or ahead of it on the same chain)?
@@ -7148,22 +7242,63 @@ fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, for
 }
 
 /// Gateway-independent follow cadence (the main monitor's sync arm, used while the gateway
-/// beacon is not live): one full peer sync per ~block interval while it succeeds; each
-/// consecutive failure doubles the wait (5, 10, 20, 40 s) up to `cap_secs`, so a dead or
-/// unreachable peer set keeps being retried without being hammered. Never gives up.
-const P2P_FOLLOW_INTERVAL_SECS: u64 = 5;
+/// beacon is not live): one full peer sync per block interval while rounds succeed. The
+/// monitor ticks every 2 s, so the real cadence is this rounded up to the next tick plus the
+/// round's own duration (about 6 s plus the round).
+const P2P_FOLLOW_INTERVAL_SECS: u64 = alphanumeric::a9::blockchain::TARGET_BLOCK_TIME;
 /// Backoff cap after hard errors (no peer answered, every request failed).
 const P2P_FOLLOW_MAX_BACKOFF_SECS: u64 = 60;
 /// Backoff cap when a peer claims to be ahead but nothing it serves is accepted (a
 /// branch this client rejects, or a lying height): short enough that honest new
 /// blocks still land within a few block times.
 const P2P_FOLLOW_STUCK_BACKOFF_SECS: u64 = 20;
-/// With a live beacon, follow peers as well once the node has stayed more than 2
-/// blocks behind that beacon for this long (converge is not landing blocks).
+/// With a live beacon, follow peers as well once the node has stopped closing its gap
+/// to that beacon (more than a race distance behind) for this long.
 const P2P_FOLLOW_BEHIND_LIVE_SECS: u64 = 20;
+/// No-progress rounds warn on the first and then on every this-many-th (about every
+/// 12 min at the 60 s cap, every 4 min at the 20 s cap); the rest log at debug.
+const P2P_FOLLOW_WARN_EVERY: u32 = 12;
+/// The monitor reads a wall-clock jump this much larger than its tick as a suspend.
+const MONITOR_SLEEP_THRESHOLD_SECS: u64 = 10;
+
+/// Delay before the next follow round after `consecutive_failures` no-progress rounds:
+/// the base cadence doubled per failure, capped at `cap_secs`. The counter is bumped
+/// before this is computed, so a failing peer set is retried after 10, 20, 40, 60, 60 s
+/// (hard errors) or 10, 20, 20 s (stuck); the 5 s base is the success cadence.
 fn p2p_follow_delay(consecutive_failures: u32, cap_secs: u64) -> Duration {
     let factor = 1u64 << consecutive_failures.min(4);
     Duration::from_secs((P2P_FOLLOW_INTERVAL_SECS * factor).min(cap_secs))
+}
+
+/// True when the wall clock ran ahead of the monotonic clock by more than the sleep
+/// threshold over a span: the machine was suspended inside it (macOS and Linux
+/// monotonic clocks stop across a suspend; a wall clock stepped BACK reads as no
+/// suspend).
+/// After a long await in the monitor: record it as activity, so the next tick's sleep
+/// detector does not mistake the await for a suspend, unless the machine really slept
+/// during it (then the stamp is left for the detector to see).
+fn stamp_activity_unless_suspended(
+    activity: &AtomicU64,
+    wall_before: SystemTime,
+    mono_before: tokio::time::Instant,
+) {
+    let wall_elapsed = SystemTime::now()
+        .duration_since(wall_before)
+        .unwrap_or_default();
+    let mono_elapsed = tokio::time::Instant::now().duration_since(mono_before);
+    if !suspended_during(wall_elapsed, mono_elapsed) {
+        activity.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Release,
+        );
+    }
+}
+
+fn suspended_during(wall_elapsed: Duration, mono_elapsed: Duration) -> bool {
+    wall_elapsed.saturating_sub(mono_elapsed).as_secs() > MONITOR_SLEEP_THRESHOLD_SECS
 }
 
 /// What one gateway-independent follow round achieved.
@@ -7171,12 +7306,13 @@ fn p2p_follow_delay(consecutive_failures: u32, cap_secs: u64) -> Duration {
 enum P2pFollowOutcome {
     /// The tip changed (advanced, or reorged onto a heavier branch).
     Progressed,
-    /// Nothing to do: no peer is ahead of us.
+    /// Nothing to do: no eligible peer is ahead of us.
     Idle,
-    /// A peer is ahead, yet the round applied nothing (sync_with_network can still
-    /// report Ok here, e.g. via a reachable relay that had nothing new).
+    /// An eligible peer is ahead, yet the round applied nothing. With the gateway down
+    /// the call usually also reports an error (its relay fallback cannot be reached);
+    /// that is still this case, not Failed, so it keeps the short stuck backoff.
     Stuck,
-    /// The sync itself failed.
+    /// The sync failed with no peer known to be ahead (no peer answered at all).
     Failed,
 }
 
@@ -7190,12 +7326,180 @@ fn classify_p2p_follow(
     // branch lowers the height yet is real work.
     if tip_after.1 != tip_before.1 {
         P2pFollowOutcome::Progressed
-    } else if !ok {
-        P2pFollowOutcome::Failed
     } else if best_peer > tip_after.0 {
         P2pFollowOutcome::Stuck
+    } else if !ok {
+        P2pFollowOutcome::Failed
     } else {
         P2pFollowOutcome::Idle
+    }
+}
+
+/// Where the node is taking the chain from, as announced in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowMode {
+    /// The live gateway beacon (beacon-watch converge); the peer follow idles.
+    Beacon,
+    /// Peers, because the beacon is not live (the reason rides along for the log).
+    Peers(BeaconFollow),
+    /// Peers as well as a live beacon the node has stopped closing its gap to.
+    BehindLiveBeacon { gap: u32 },
+}
+
+impl FollowMode {
+    /// What the log distinguishes: the beacon, peers while the beacon is still warming
+    /// up after a start, peers for any other reason, peers alongside a live beacon.
+    fn kind(self) -> u8 {
+        match self {
+            FollowMode::Beacon => 0,
+            FollowMode::Peers(BeaconFollow::Warming) => 1,
+            FollowMode::Peers(_) => 2,
+            FollowMode::BehindLiveBeacon { .. } => 3,
+        }
+    }
+}
+
+/// This tick's decision for the follow round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowGate {
+    /// The beacon is driving; no peer round.
+    Idle,
+    /// Peer follow is on, but backing off or another sync is already pulling.
+    Wait,
+    /// Run a peer round now.
+    Run,
+}
+
+/// What the monitor should log about a finished round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowNote {
+    Quiet,
+    /// Progress after this many no-progress rounds.
+    Recovered(u32),
+    /// A no-progress round; `warn` on the first and every P2P_FOLLOW_WARN_EVERY-th.
+    NoProgress {
+        failures: u32,
+        warn: bool,
+    },
+}
+
+/// The gateway-independent follow's pacing state, pure over its inputs so every rule
+/// is unit-tested; the monitor arm gathers the inputs, runs the round and logs.
+#[derive(Debug)]
+struct P2pFollow {
+    failures: u32,
+    next: tokio::time::Instant,
+    /// (since, gap then): when the node stopped closing its gap to a live beacon. Only
+    /// a gap BELOW the starting one restarts the clock: an ordinary converge catch-up
+    /// shrinks the gap, while a converge landing blocks slower than the chain grows
+    /// does not and still trips it.
+    behind_live_since: Option<(tokio::time::Instant, u32)>,
+    mode: Option<FollowMode>,
+}
+
+impl P2pFollow {
+    fn new(now: tokio::time::Instant) -> Self {
+        P2pFollow {
+            failures: 0,
+            next: now,
+            behind_live_since: None,
+            mode: None,
+        }
+    }
+
+    /// Decide this tick. Returns the gate and, when the follow mode changed kind, the
+    /// new mode to announce. A start with a healthy gateway announces nothing: the first
+    /// decisions are Beacon or the beacon's warm-up, and warm-up into Beacon is quiet.
+    fn gate(
+        &mut self,
+        now: tokio::time::Instant,
+        beacon: BeaconFollow,
+        beacon_high_water: u32,
+        tip: u32,
+        another_sync_running: bool,
+    ) -> (FollowGate, Option<FollowMode>) {
+        let mode = if beacon == BeaconFollow::Live {
+            if beacon_high_water > tip.saturating_add(BEACON_RACE_TOLERANCE_BLOCKS) {
+                let gap = beacon_high_water - tip;
+                let since = match self.behind_live_since {
+                    Some((since, gap_then)) if gap >= gap_then => since,
+                    _ => {
+                        self.behind_live_since = Some((now, gap));
+                        now
+                    }
+                };
+                if now.duration_since(since) >= Duration::from_secs(P2P_FOLLOW_BEHIND_LIVE_SECS) {
+                    FollowMode::BehindLiveBeacon { gap }
+                } else {
+                    FollowMode::Beacon
+                }
+            } else {
+                self.behind_live_since = None;
+                FollowMode::Beacon
+            }
+        } else {
+            self.behind_live_since = None;
+            FollowMode::Peers(beacon)
+        };
+        let warming = FollowMode::Peers(BeaconFollow::Warming);
+        let announce = match self.mode {
+            Some(prev) if prev.kind() == mode.kind() => None,
+            None if mode == FollowMode::Beacon || mode == warming => None,
+            Some(prev) if prev == warming && mode == FollowMode::Beacon => None,
+            _ => Some(mode),
+        };
+        self.mode = Some(mode);
+        if mode == FollowMode::Beacon {
+            self.failures = 0;
+            self.next = now;
+            return (FollowGate::Idle, announce);
+        }
+        if now < self.next || another_sync_running {
+            return (FollowGate::Wait, announce);
+        }
+        (FollowGate::Run, announce)
+    }
+
+    /// Account a finished round: reset or bump the failure count and schedule the next.
+    fn record(&mut self, now: tokio::time::Instant, outcome: P2pFollowOutcome) -> FollowNote {
+        let (note, cap) = match outcome {
+            P2pFollowOutcome::Progressed | P2pFollowOutcome::Idle => {
+                let note = if outcome == P2pFollowOutcome::Progressed && self.failures > 0 {
+                    FollowNote::Recovered(self.failures)
+                } else {
+                    FollowNote::Quiet
+                };
+                self.failures = 0;
+                (note, P2P_FOLLOW_MAX_BACKOFF_SECS)
+            }
+            P2pFollowOutcome::Stuck | P2pFollowOutcome::Failed => {
+                self.failures = self.failures.saturating_add(1);
+                // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
+                #[allow(clippy::manual_is_multiple_of)]
+                let warn = self.failures == 1 || self.failures % P2P_FOLLOW_WARN_EVERY == 0;
+                let cap = if outcome == P2pFollowOutcome::Stuck {
+                    P2P_FOLLOW_STUCK_BACKOFF_SECS
+                } else {
+                    P2P_FOLLOW_MAX_BACKOFF_SECS
+                };
+                (
+                    FollowNote::NoProgress {
+                        failures: self.failures,
+                        warn,
+                    },
+                    cap,
+                )
+            }
+        };
+        self.next = now + p2p_follow_delay(self.failures, cap);
+        note
+    }
+
+    /// After a detected suspend: retry at once with a clean slate.
+    fn reset(&mut self, now: tokio::time::Instant) {
+        self.failures = 0;
+        self.next = now;
+        self.behind_live_since = None;
     }
 }
 
@@ -9889,6 +10193,26 @@ mod tests {
         })
     }
 
+    // A manifest that captured a block which then lost a race reads our (winning) block
+    // as a fork; holding the newer signed tip itself is what tells the two apart.
+    #[test]
+    fn a_local_chain_holding_the_signed_tip_outranks_an_older_manifest() {
+        let db = reconcile_test_db("beacon_tip", &[(100, 8), (101, 9)]);
+        let m = manifest_at(100, 7);
+        assert!(matches!(
+            canonical_reconcile_decision(&db, &m, Some(101), None, None),
+            CanonicalReconcile::Diverged { .. }
+        ));
+        let tip = |tag: u8| Some((101u32, hex::encode([tag; 32])));
+        assert!(local_holds_beacon_tip(&db, tip(9).as_ref()));
+        assert!(!local_holds_beacon_tip(&db, tip(7).as_ref()));
+        assert!(!local_holds_beacon_tip(
+            &db,
+            Some(&(102, hex::encode([9u8; 32])))
+        ));
+        assert!(!local_holds_beacon_tip(&db, None));
+    }
+
     // In sync: we hold the canonical block at the manifest height -> keep the DB.
     #[test]
     fn reconcile_in_sync_when_local_holds_canonical_tip_hash() {
@@ -9900,7 +10224,7 @@ mod tests {
         ));
     }
 
-    // The gateway-independent follow never gives up: failures back off 5 -> 60 s and a
+    // The gateway-independent follow never gives up: failures back off 10 -> 60 s and a
     // success returns to the 5 s cadence (the old arm stopped for good after 3 failures).
     #[test]
     fn p2p_follow_delay_backs_off_to_its_cap_and_never_stops() {
@@ -9956,14 +10280,260 @@ mod tests {
             classify_p2p_follow(true, tip(100, 1), tip(100, 1), u32::MAX),
             Stuck
         );
+        // A peer ahead that served nothing, with the relay fallback also unreachable
+        // (the gateway-down case): still Stuck, so it keeps the short backoff.
         assert_eq!(
             classify_p2p_follow(false, tip(100, 1), tip(100, 1), 105),
-            Failed
+            Stuck
         );
         assert_eq!(
             classify_p2p_follow(false, tip(100, 1), tip(100, 1), 0),
             Failed
         );
+    }
+
+    fn follow_at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn follow_gate_idles_on_a_live_beacon_and_clears_backoff() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        // First decision into Beacon announces nothing.
+        assert_eq!(
+            f.gate(t0, BeaconFollow::Live, 102, 100, false),
+            (FollowGate::Idle, None)
+        );
+        // A failed peer round, then the beacon comes back: backoff is cleared.
+        f.mode = Some(FollowMode::Peers(BeaconFollow::Unreachable));
+        f.record(t0, P2pFollowOutcome::Failed);
+        assert_eq!(f.failures, 1);
+        let t1 = follow_at(t0, 1);
+        assert_eq!(
+            f.gate(t1, BeaconFollow::Live, 100, 100, false),
+            (FollowGate::Idle, Some(FollowMode::Beacon))
+        );
+        assert_eq!((f.failures, f.next), (0, t1));
+    }
+
+    #[test]
+    fn follow_start_with_a_healthy_gateway_logs_nothing() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        let warming = BeaconFollow::Warming;
+        // Warm-up still follows peers (a frozen beacon looks the same), but quietly...
+        assert_eq!(f.gate(t0, warming, 0, 100, false), (FollowGate::Run, None));
+        // ...and so does the beacon confirming it moves.
+        assert_eq!(
+            f.gate(follow_at(t0, 5), BeaconFollow::Live, 101, 101, false),
+            (FollowGate::Idle, None)
+        );
+        // A warm-up that ends Frozen is announced.
+        let mut g = P2pFollow::new(t0);
+        g.gate(t0, warming, 0, 100, false);
+        assert_eq!(
+            g.gate(follow_at(t0, 61), BeaconFollow::Frozen, 0, 100, false)
+                .1,
+            Some(FollowMode::Peers(BeaconFollow::Frozen))
+        );
+    }
+
+    #[test]
+    fn follow_gate_runs_at_once_when_the_beacon_goes_dark() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        f.gate(t0, BeaconFollow::Live, 100, 100, false);
+        let t1 = follow_at(t0, 1);
+        for reason in [
+            BeaconFollow::Unreachable,
+            BeaconFollow::Frozen,
+            BeaconFollow::NeverSeen,
+        ] {
+            let mut g = P2pFollow::new(t0);
+            g.gate(t0, BeaconFollow::Live, 100, 100, false);
+            assert_eq!(
+                g.gate(t1, reason, 0, 100, false),
+                (FollowGate::Run, Some(FollowMode::Peers(reason)))
+            );
+        }
+        // A change of reason alone is not re-announced.
+        assert!(f
+            .gate(t1, BeaconFollow::Unreachable, 0, 100, false)
+            .1
+            .is_some());
+        assert_eq!(f.gate(t1, BeaconFollow::NeverSeen, 0, 100, false).1, None);
+    }
+
+    #[test]
+    fn follow_gate_trips_after_20s_without_closing_the_gap() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        assert_eq!(
+            f.gate(t0, BeaconFollow::Live, 105, 100, false).0,
+            FollowGate::Idle
+        );
+        assert_eq!(
+            f.gate(follow_at(t0, 19), BeaconFollow::Live, 105, 100, false)
+                .0,
+            FollowGate::Idle
+        );
+        // Gap grew to 6 at 20 s: not closing it, follow peers too.
+        assert_eq!(
+            f.gate(follow_at(t0, 20), BeaconFollow::Live, 106, 100, false),
+            (
+                FollowGate::Run,
+                Some(FollowMode::BehindLiveBeacon { gap: 6 })
+            )
+        );
+        // Within the race tolerance the clock clears.
+        assert_eq!(
+            f.gate(follow_at(t0, 21), BeaconFollow::Live, 102, 100, false)
+                .0,
+            FollowGate::Idle
+        );
+        assert_eq!(f.behind_live_since, None);
+    }
+
+    #[test]
+    fn follow_gate_shrinking_gap_restarts_the_clock() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        f.gate(t0, BeaconFollow::Live, 110, 100, false); // gap 10
+        f.gate(follow_at(t0, 15), BeaconFollow::Live, 109, 100, false); // gap 9: restart
+        assert_eq!(
+            f.gate(follow_at(t0, 34), BeaconFollow::Live, 109, 100, false)
+                .0,
+            FollowGate::Idle
+        );
+        assert_eq!(
+            f.gate(follow_at(t0, 35), BeaconFollow::Live, 109, 100, false)
+                .0,
+            FollowGate::Run
+        );
+    }
+
+    #[test]
+    fn follow_gate_waits_for_backoff_and_for_another_sync_without_counting() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        assert_eq!(
+            f.gate(t0, BeaconFollow::Unreachable, 0, 100, true).0,
+            FollowGate::Wait
+        );
+        assert_eq!((f.failures, f.next), (0, t0));
+        assert_eq!(
+            f.gate(t0, BeaconFollow::Unreachable, 0, 100, false).0,
+            FollowGate::Run
+        );
+        f.record(t0, P2pFollowOutcome::Failed);
+        assert_eq!(
+            f.gate(follow_at(t0, 9), BeaconFollow::Unreachable, 0, 100, false)
+                .0,
+            FollowGate::Wait
+        );
+        assert_eq!(
+            f.gate(follow_at(t0, 10), BeaconFollow::Unreachable, 0, 100, false)
+                .0,
+            FollowGate::Run
+        );
+    }
+
+    #[test]
+    fn follow_record_backoff_sequence_and_recovery() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        let mut delays = Vec::new();
+        for _ in 0..5 {
+            f.record(t0, P2pFollowOutcome::Failed);
+            delays.push(f.next.duration_since(t0).as_secs());
+        }
+        assert_eq!(delays, vec![10, 20, 40, 60, 60]);
+        assert_eq!(
+            f.record(t0, P2pFollowOutcome::Progressed),
+            FollowNote::Recovered(5)
+        );
+        assert_eq!(f.next.duration_since(t0).as_secs(), 5);
+        assert_eq!(
+            f.record(t0, P2pFollowOutcome::Progressed),
+            FollowNote::Quiet
+        );
+        for _ in 0..4 {
+            f.record(t0, P2pFollowOutcome::Failed);
+        }
+        f.record(t0, P2pFollowOutcome::Stuck);
+        assert_eq!(f.next.duration_since(t0).as_secs(), 20);
+        // Idle clears failures without announcing a recovery.
+        assert_eq!(f.record(t0, P2pFollowOutcome::Idle), FollowNote::Quiet);
+        assert_eq!(f.failures, 0);
+    }
+
+    #[test]
+    fn follow_never_gives_up() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        for _ in 0..10_000 {
+            f.record(t0, P2pFollowOutcome::Failed);
+        }
+        assert_eq!(f.next.duration_since(t0).as_secs(), 60);
+        assert_eq!(
+            f.gate(follow_at(t0, 61), BeaconFollow::Unreachable, 0, 100, false)
+                .0,
+            FollowGate::Run
+        );
+    }
+
+    #[test]
+    fn follow_warns_on_the_first_and_every_twelfth_no_progress_round() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        let warned: Vec<u32> = (1..=25)
+            .filter_map(|_| match f.record(t0, P2pFollowOutcome::Stuck) {
+                FollowNote::NoProgress {
+                    failures,
+                    warn: true,
+                } => Some(failures),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warned, vec![1, 12, 24]);
+    }
+
+    #[test]
+    fn follow_reset_after_sleep_retries_at_once() {
+        let t0 = tokio::time::Instant::now();
+        let mut f = P2pFollow::new(t0);
+        f.gate(t0, BeaconFollow::Live, 110, 100, false);
+        f.record(t0, P2pFollowOutcome::Failed);
+        let t1 = follow_at(t0, 3);
+        f.reset(t1);
+        assert_eq!((f.failures, f.next, f.behind_live_since), (0, t1, None));
+    }
+
+    #[test]
+    fn suspend_is_wall_time_the_monotonic_clock_did_not_see() {
+        let s = Duration::from_secs;
+        assert!(!suspended_during(s(100), s(100)));
+        assert!(!suspended_during(s(110), s(100)));
+        assert!(suspended_during(s(111), s(100)));
+        assert!(suspended_during(s(100), s(5)));
+        // Wall clock stepped back: no suspend.
+        assert!(!suspended_during(s(0), s(100)));
+    }
+
+    // The monitor must keep using the bounded peer sync and the tested pacing, not grow
+    // a second, ad-hoc height fan-out again (the 50/500 ms one froze site-down nodes).
+    #[test]
+    fn monitor_follow_uses_the_tested_pacing() {
+        let src = include_str!("main.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(prod.len() < src.len(), "test module marker moved");
+        assert!(!prod.contains("request_peer_height("));
+        assert!(!prod.contains("from_millis(target_latency"));
+        assert!(prod.contains("follow.gate(now_i, beacon_state, beacon_hw, tip_before, busy)"));
+        assert!(prod.contains("follow.record(tokio::time::Instant::now(), outcome)"));
+        assert!(prod.contains("AssertUnwindSafe(node.sync_with_network())"));
+        assert!(prod.contains("if !suspended_during(wall_elapsed, mono_elapsed)"));
     }
 
     // The idle-reconcile snapshot gate: a SERVICE node (exchange/explorer/
