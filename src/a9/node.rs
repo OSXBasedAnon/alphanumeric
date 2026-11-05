@@ -162,6 +162,12 @@ const BEACON_POLL_INTERVAL_SECS: u64 = 3;
 /// value out. 10 min gives >20x margin; post-regression recovery is bounded by this
 /// window plus the gateway's beacon TTL (~5 min), i.e. ~15 min, versus FOREVER before.
 const BEACON_HIGH_WATER_WINDOW_SECS: u64 = 600;
+/// beacon_follow_live: the beacon counts as reachable while a verified read is at most
+/// this old (5 client polls), and as moving while its height advanced within
+/// BEACON_FROZEN_SECS (~11 blocks at the ~5.5 s block time). Outside either bound the
+/// node follows the chain from its peers.
+const BEACON_LIVE_SECS: u64 = 15;
+const BEACON_FROZEN_SECS: u64 = 60;
 
 /// Ed25519 public key(s) authorised to sign the tip beacon. A beacon's
 /// `public_key`/`node_id` must be one of these AND its signature must verify over the
@@ -2321,6 +2327,13 @@ pub struct Node {
     /// wake-from-sleep); overlapping calls return immediately instead of
     /// double-streaming the same span. See sync_full_history_from_peer_bounded.
     full_sync_in_flight: Arc<AtomicBool>,
+    /// True while sync_with_network runs. Its callers (the startup sync, the main
+    /// monitor's gateway-independent follow, the publisher's p2p gap-fill, bPoS) can
+    /// overlap; a second run reads the tip mid-way through the first one's batch apply,
+    /// re-requests blocks it already holds, gets "Saved 0" from every peer and burns
+    /// nine GetBlocks plus a reported failure (11-05 site-down test, at boot). An
+    /// overlapping call returns Ok at once: the running sync is doing the work.
+    network_sync_in_flight: Arc<AtomicBool>,
     /// ~1s TTL memo of the last successfully fetched signed tip beacon
     /// (fetch_tip_beacon): dedups same-second fetch bursts across the many
     /// beacon consumers without changing any staleness guarantee.
@@ -3191,6 +3204,7 @@ impl Node {
             converge_stall_last_ms: Arc::new(AtomicU64::new(0)),
             converge_stall_cycles: Arc::new(AtomicU64::new(0)),
             full_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            network_sync_in_flight: Arc::new(AtomicBool::new(false)),
             beacon_memo: Arc::new(PLMutex::new(None)),
             beacon_high_water: Arc::new(PLMutex::new(std::collections::VecDeque::new())),
             last_seen_beacon_height: Arc::new(AtomicU64::new(0)),
@@ -3456,6 +3470,13 @@ impl Node {
     fn public_header_snapshots_enabled() -> bool {
         Self::public_discovery_publish_enabled()
             && Self::env_flag_enabled("ALPHANUMERIC_ENABLE_HEADER_SNAPSHOTS")
+    }
+
+    /// True on the beacon publisher (the same test beacon-watch uses for `is_publisher`):
+    /// it follows the relay on its own fast converge rather than the beacon, so the main
+    /// monitor's gateway-independent peer follow stays off there.
+    pub fn follows_relay_as_publisher() -> bool {
+        Self::public_header_snapshots_enabled()
     }
 
     fn public_stats_snapshots_enabled() -> bool {
@@ -4472,6 +4493,82 @@ impl Node {
         Self::window_high_water(&obs, now, BEACON_HIGH_WATER_WINDOW_SECS)
     }
 
+    /// Whether the signed gateway beacon is currently good enough to follow: a VERIFIED
+    /// read landed within BEACON_LIVE_SECS (clients poll every BEACON_POLL_INTERVAL_SECS,
+    /// so that is several missed polls) AND its height moved within BEACON_FROZEN_SECS.
+    /// False means the main monitor follows the chain from peers instead (see its sync
+    /// arm): gateway unreachable, beacon failing verification, a publisher that never
+    /// reads its own beacon, or a beacon frozen while the chain moves (2026-07-08). The
+    /// old test, "no observation in the 600s high-water window", left a node whose gateway
+    /// went down mid-run frozen for up to ten minutes before the peer path engaged.
+    /// Highest height reported by a peer heard from at or after `since_unix_secs` (the
+    /// height queries of a sync round stamp `last_seen`), so stale reports from peers that
+    /// went quiet do not count. Self-reported and unverified: used only to tell "nothing
+    /// to fetch" from "a peer is ahead but served nothing we accept" when pacing the peer
+    /// follow, never for trust.
+    pub async fn best_peer_height_reported_since(&self, since_unix_secs: u64) -> u32 {
+        self.peers
+            .read()
+            .await
+            .values()
+            .filter(|p| p.last_seen >= since_unix_secs)
+            .map(|p| p.blocks)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The local tip as (height, hash); ([0; 32] hash when the chain is empty).
+    pub async fn local_tip_id(&self) -> (u32, [u8; 32]) {
+        let bc = self.blockchain.read().await;
+        let height = bc.get_latest_block_index() as u32;
+        let hash = bc.get_last_block().map(|b| b.hash).unwrap_or([0u8; 32]);
+        (height, hash)
+    }
+
+    /// True while a sync_with_network run holds the single-flight latch.
+    pub fn network_sync_in_flight(&self) -> bool {
+        self.network_sync_in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn beacon_follow_live(&self) -> bool {
+        let obs = self.beacon_high_water.lock();
+        Self::beacon_follow_verdict(&obs, Instant::now(), BEACON_LIVE_SECS, BEACON_FROZEN_SECS)
+    }
+
+    /// Pure verdict behind beacon_follow_live. Live iff the newest observation is at most
+    /// `live_secs` old and the window's maximum height was REACHED, i.e. first observed
+    /// after a lower read, at most `frozen_secs` ago (a beacon re-read at the same height
+    /// every poll is still frozen). A single sighting is not evidence of movement: a fresh
+    /// process (empty window) would otherwise call an hour-frozen beacon live for its first
+    /// minute, and the frozen-beacon converge guard would not hold across a restart. A
+    /// healthy beacon shows its next height within about one block time.
+    /// A height regression keeps the older maximum, so it also reads as frozen and the
+    /// peer path engages, which is what a regressed beacon calls for; it reads as live
+    /// again once the beacon climbs past that old maximum or the maximum ages out of the
+    /// 600 s window. Following peers meanwhile is redundant but safe (acceptance is
+    /// work-based either way).
+    fn beacon_follow_verdict(
+        obs: &std::collections::VecDeque<(Instant, u32)>,
+        now: Instant,
+        live_secs: u64,
+        frozen_secs: u64,
+    ) -> bool {
+        let Some(&(newest, _)) = obs.back() else {
+            return false;
+        };
+        if now.saturating_duration_since(newest).as_secs() > live_secs {
+            return false;
+        }
+        let Some(max) = obs.iter().map(|(_, h)| *h).max() else {
+            return false;
+        };
+        // Index 0 = the max was the first thing we saw: no observed increase yet.
+        match obs.iter().position(|(_, h)| *h == max) {
+            Some(i) if i > 0 => now.saturating_duration_since(obs[i].0).as_secs() <= frozen_secs,
+            _ => false,
+        }
+    }
+
     /// Pure max-height-in-window (does not depend on prior pruning): the highest
     /// beacon height observed no more than `window_secs` ago. This is what makes the
     /// guard ghost-safe AND regression-recoverable: a stale-low read is never the max
@@ -5196,7 +5293,26 @@ impl Node {
             {
                 Ancestor::Found(a, canon) => (a, canon),
                 Ancestor::NoneBelowFloor | Ancestor::NeedsBootstrap => {
-                    return Converge::NeedsBootstrap
+                    // A FROZEN beacon (not moving for BEACON_FROZEN_SECS, see
+                    // beacon_follow_live) that we are already ABOVE is not evidence to
+                    // wipe the chain. While it is frozen the node follows the heaviest
+                    // chain from its peers, and the checkpoint trails that chain's tip; once
+                    // the node is ~64 past the point where the beacon's branch left it, the
+                    // walk down from the beacon reaches our floor before any shared block.
+                    // Escalating would re-bootstrap onto the frozen publisher's snapshot,
+                    // follow peers again and repeat. Stay put; a beacon that moves again
+                    // (or a live one we are genuinely forked from) still escalates.
+                    // Signed beacons only: the publisher's unsigned relay candidates
+                    // (verified = false) keep their old NeedsBootstrap semantics.
+                    if beacon.verified && tip > beacon.height && !self.beacon_follow_live() {
+                        debug!(
+                            "converge: beacon {} is frozen and below our tip {} with no shared \
+                             ancestor above the floor; following peers, not re-bootstrapping",
+                            beacon.height, tip
+                        );
+                        return Converge::AtTipAhead;
+                    }
+                    return Converge::NeedsBootstrap;
                 }
                 Ancestor::Transient => return Converge::BeaconStale,
             };
@@ -19898,6 +20014,24 @@ impl Node {
     }
 
     pub async fn sync_with_network(&self) -> Result<(), NodeError> {
+        // SINGLE-FLIGHT (see network_sync_in_flight). Drop-guard, not a tail store: the
+        // future can be cancelled at any await point and the flag must never stay latched.
+        struct InFlight<'a>(&'a AtomicBool);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .network_sync_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            debug!("sync_with_network: another peer sync is already running; skipping");
+            return Ok(());
+        }
+        let _in_flight = InFlight(&self.network_sync_in_flight);
+
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_MS: u64 = 1000;
         const PEER_TIMEOUT_MS: u64 = 5000;
@@ -19989,17 +20123,30 @@ impl Node {
             peer_heights.len()
         );
 
+        // A small catch-up is the steady state of the gateway-independent follow (one
+        // block every few seconds); log it at debug so a node following its peers does
+        // not write five info lines per block. A real catch-up stays at info.
+        let catchup_level = match peer_heights.first() {
+            Some((_, best)) if best.saturating_sub(current_height) <= 8 => log::Level::Debug,
+            _ => log::Level::Info,
+        };
+
         // IMPROVEMENT: Check if we already have the latest blocks
         if let Some((_, best_height)) = peer_heights.first() {
             if *best_height <= current_height {
-                info!(
+                debug!(
                     "Already at best height ({}/{})",
                     current_height, best_height
                 );
                 return Ok(());
             }
 
-            info!("Syncing from height {} to {}", current_height, best_height);
+            log::log!(
+                catchup_level,
+                "Syncing from height {} to {}",
+                current_height,
+                best_height
+            );
         } else {
             debug!("No peers reported their height");
             return self
@@ -20033,7 +20180,8 @@ impl Node {
                     continue;
                 }
 
-                info!(
+                log::log!(
+                    catchup_level,
                     "Sync attempt {}/{} using peer {} ({}/{})",
                     sync_attempt + 1,
                     MAX_RETRIES,
@@ -20161,7 +20309,8 @@ impl Node {
                                     }
                                 }
 
-                                info!(
+                                log::log!(
+                                    catchup_level,
                                     "Saved {}/{} blocks ({}-{}), now at {}/{}",
                                     saved_count,
                                     actual_count,
@@ -20228,7 +20377,11 @@ impl Node {
 
                     // Check if we're done
                     if current_sync_height >= *peer_height {
-                        info!("Sync complete to height {}", current_sync_height);
+                        log::log!(
+                            catchup_level,
+                            "Sync complete to height {}",
+                            current_sync_height
+                        );
                         break 'outer;
                     }
                 }
@@ -20245,9 +20398,11 @@ impl Node {
 
         // 6. IMPROVEMENT: Report success even with partial progress
         if blocks_synced > 0 {
-            info!(
+            log::log!(
+                catchup_level,
                 "Blockchain synchronized: added {} blocks to height {}",
-                blocks_synced, current_sync_height
+                blocks_synced,
+                current_sync_height
             );
             self.publish_discovery_state("Post-sync").await;
             Ok(())
@@ -25562,6 +25717,76 @@ mod tests {
 
         // Empty / nothing in-window -> 0 (fail-open, never pins).
         assert_eq!(Node::window_high_water(&VecDeque::new(), now, W), 0);
+    }
+
+    // beacon_follow_live decides whether the main monitor follows the chain from peers
+    // (gateway-independent follow). Live = a verified read within LIVE secs whose height
+    // advanced within FROZEN secs; anything else hands catch-up to the peers.
+    #[test]
+    fn beacon_follow_verdict_live_only_when_fresh_and_moving() {
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        const LIVE: u64 = 15;
+        const FROZEN: u64 = 60;
+        let now = Instant::now();
+        let at = |secs: u64| now - Duration::from_secs(secs);
+
+        // Never observed (gateway down since boot, or a publisher): not live.
+        assert!(!Node::beacon_follow_verdict(
+            &VecDeque::new(),
+            now,
+            LIVE,
+            FROZEN
+        ));
+
+        // Healthy: reads every 3 s, height advancing.
+        let healthy: VecDeque<(Instant, u32)> =
+            [(at(9), 100), (at(6), 101), (at(3), 101), (at(0), 102)]
+                .into_iter()
+                .collect();
+        assert!(Node::beacon_follow_verdict(&healthy, now, LIVE, FROZEN));
+
+        // Gateway went down mid-run: the newest verified read is 20 s old. The old
+        // high-water test kept this "alive" for the whole 600 s window.
+        let gone: VecDeque<(Instant, u32)> = [(at(26), 100), (at(23), 101), (at(20), 102)]
+            .into_iter()
+            .collect();
+        assert!(!Node::beacon_follow_verdict(&gone, now, LIVE, FROZEN));
+        // ...exactly at the bound still counts as live.
+        let edge: VecDeque<(Instant, u32)> = [(at(18), 101), (at(15), 102)].into_iter().collect();
+        assert!(Node::beacon_follow_verdict(&edge, now, LIVE, FROZEN));
+
+        // Restart: one or many sightings of a single height with nothing lower before it
+        // prove no movement, however fresh the reads (the beacon may be frozen for hours).
+        let one: VecDeque<(Instant, u32)> = [(at(1), 700)].into_iter().collect();
+        assert!(!Node::beacon_follow_verdict(&one, now, LIVE, FROZEN));
+        let same: VecDeque<(Instant, u32)> =
+            [(at(9), 700), (at(6), 700), (at(3), 700), (at(0), 700)]
+                .into_iter()
+                .collect();
+        assert!(!Node::beacon_follow_verdict(&same, now, LIVE, FROZEN));
+        // ...and the first observed increase makes it live.
+        let moved: VecDeque<(Instant, u32)> = [(at(9), 700), (at(6), 700), (at(3), 701)]
+            .into_iter()
+            .collect();
+        assert!(Node::beacon_follow_verdict(&moved, now, LIVE, FROZEN));
+
+        // Frozen beacon (2026-07-08): read every 3 s but stuck at one height for 90 s.
+        let frozen: VecDeque<(Instant, u32)> = (0..=30).rev().map(|i| (at(i * 3), 500)).collect();
+        assert!(!Node::beacon_follow_verdict(&frozen, now, LIVE, FROZEN));
+        // Reached 500 45 s ago and re-read since: still live (blocks can be a minute apart).
+        let mut slow: VecDeque<(Instant, u32)> = VecDeque::new();
+        slow.push_back((at(48), 499));
+        slow.extend((0..=15).rev().map(|i| (at(i * 3), 500)));
+        assert!(Node::beacon_follow_verdict(&slow, now, LIVE, FROZEN));
+
+        // Regression: the max (900) was first seen 120 s ago and fresh reads say 880.
+        // The beacon is not tracking a moving canonical tip, so peers take over.
+        let regressed: VecDeque<(Instant, u32)> =
+            [(at(120), 900), (at(6), 880), (at(3), 880), (at(0), 880)]
+                .into_iter()
+                .collect();
+        assert!(!Node::beacon_follow_verdict(&regressed, now, LIVE, FROZEN));
     }
 
     // Stall watchdog: only zero-progress calls beyond the reorg margin count;

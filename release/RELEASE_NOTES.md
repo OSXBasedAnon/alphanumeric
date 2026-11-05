@@ -7,6 +7,20 @@ migration, no wallet migration, no resync.
 
 ## What you get
 
+- **Keeps following the chain when alphanumeric.blue is down.** The site's signed
+  tip beacon and block relay stay the fast path, but they are no longer required.
+  When the beacon is unreachable, fails verification, or stops moving for a minute
+  while the chain moves, the node follows its peers instead: one full peer sync
+  every ~5 s, each block validated exactly as before, backing off when peers have
+  nothing it accepts and never giving up. 8.0.1 synced once at boot and then froze
+  with the site down (the fallback asked WAN peers for their height with a 50 ms
+  timeout and stopped after three failures); on 2026-11-05 a node with the site
+  blocked (from boot, across a restart, and again mid-run) stayed within 4 blocks
+  of the network, about 1 on average. A node that follows
+  its peers past a frozen beacon is not re-bootstrapped back onto it, overlapping
+  peer syncs no longer race each other, and small catch-ups log at debug. Bootstrap
+  (CDN mirror) and peer discovery (seed DNS, peer cache) already worked without the
+  site. The publisher keeps following the relay as before.
 - **Boots in seconds, not minutes.** The tip is read from the persisted tip
   pointer (validated) instead of a scan that copied every block body, and the start-up
   structural walk resumes from a durable mark instead of re-reading the chain

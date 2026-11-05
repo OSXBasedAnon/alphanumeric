@@ -1111,16 +1111,12 @@ async fn async_main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
 
     local.spawn_local(async move {
-        const FAST_SYNC_LATENCY: u64 = 50;       // 50ms target latency
         const RECOVERY_LATENCY: u64 = 500;        // 500ms acceptable during network stress
         const MIN_VIABLE_PEERS: usize = 3;        // Minimum peers for operation
-        const MAX_SYNC_ATTEMPTS: u32 = 3;         // Maximum sync retries before backing off
         const HEALTH_CHECK_INTERVAL: u64 = 1000;  // 1s health checks
         const SYNC_CHECK_INTERVAL: u64 = 2000;    // 2s sync checks
         const SLEEP_THRESHOLD: u64 = 10;          // 10s threshold for sleep detection
         const MAX_BLOCK_AGE: u64 = 2;            // Maximum acceptable block age deviation
-        const MIN_PEER_LATENCY: u64 = 10;        // Minimum acceptable peer latency
-        const RECENT_PEER_THRESHOLD: u64 = 300;   // Peer considered recent within 300s
         const MAX_DISCOVERY_ATTEMPTS: u32 = 5;    // Maximum discovery retry attempts
 
         // Track last activity time for sleep detection
@@ -1166,8 +1162,12 @@ async fn async_main() -> Result<()> {
                 sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut block_times = VecDeque::with_capacity(50);
-                let mut sync_attempts: u32 = 0;
                 let mut discovery_failures: u32 = 0;
+                // Gateway-independent follow state (see the sync arm below).
+                let mut p2p_follow_failures: u32 = 0;
+                let mut p2p_follow_next = tokio::time::Instant::now();
+                // (since, gap then): when the node stopped closing its gap to a live beacon.
+                let mut p2p_behind_live_since: Option<(tokio::time::Instant, u32)> = None;
 
                 loop {
                     tokio::select! {
@@ -1188,7 +1188,9 @@ async fn async_main() -> Result<()> {
                             if now.saturating_sub(last) > SLEEP_THRESHOLD {
                                 debug!("Sleep detected, resetting network state");
                                 // Reset all counters
-                                sync_attempts = 0;
+                                p2p_follow_failures = 0;
+                                p2p_follow_next = tokio::time::Instant::now();
+                                p2p_behind_live_since = None;
                                 discovery_failures = 0;
                                 block_times.clear();
 
@@ -1224,107 +1226,156 @@ async fn async_main() -> Result<()> {
                             activity_time.store(now, Ordering::Release);
 
                             // Network state check. Snapshot under a short-lived guard:
-                            // holding this read lock across the sleeps/discovery/sync
-                            // awaits below deadlocks every peers.write() in verify_peer.
-                            let (active_peers, target_latency, available_peers) = {
-                                let peers = node.peers.read().await;
-                                let active_peers = peers.len();
-
-                                // Calculate network health with safe division
-                                let avg_latency = peers.iter()
-                                    .filter(|(_, info)| info.latency >= MIN_PEER_LATENCY)
-                                    .map(|(_, info)| info.latency)
-                                    .sum::<u64>()
-                                    .checked_div(active_peers.max(1) as u64)
-                                    .unwrap_or(RECOVERY_LATENCY);
-
-                                let target_latency = if avg_latency > FAST_SYNC_LATENCY {
-                                    RECOVERY_LATENCY
-                                } else {
-                                    FAST_SYNC_LATENCY
-                                };
-
-                                // Efficient peer selection with latency filtering
-                                let available_peers: Vec<_> = peers.iter()
-                                    .filter(|(_, info)| {
-                                        info.latency <= target_latency &&
-                                        now.saturating_sub(info.last_seen) <= RECENT_PEER_THRESHOLD
-                                    })
-                                    .map(|(addr, _)| *addr)
-                                    .collect();
-
-                                (active_peers, target_latency, available_peers)
-                            };
+                            // holding this read lock across the discovery/sync awaits
+                            // below deadlocks every peers.write() in verify_peer.
+                            let active_peers = node.peers.read().await.len();
 
                             if active_peers > 0 {
-                                // P2P height fan-out ONLY when the gateway beacon is
-                                // dark: with a live beacon the converge loops already
-                                // own catch-up, and this arm burned a GetBlockHeight
-                                // round-trip per eligible peer every 2s (~240 RPC/min
-                                // at the tip) with 50-500ms timeouts — the main
-                                // producer of cancelled mid-exchange requests. A
-                                // beacon observed within the rolling window means the
-                                // gateway path is alive; this fan-out is the
-                                // gateway-outage fallback, its one unique job.
-                                let beacon_dark = node.beacon_high_water_height() == 0;
-                                if !available_peers.is_empty() {
-                                    if !beacon_dark {
-                                        // Beacon alive: nothing for this arm to do —
-                                        // and no discovery either (peers are fine).
-                                        continue;
+                                // GATEWAY-INDEPENDENT FOLLOW. While the signed gateway
+                                // beacon is live and moving, the beacon-watch converge
+                                // owns catch-up and this arm stays idle. When it is not
+                                // (gateway unreachable, beacon failing verification, or
+                                // frozen while the chain moves: node.beacon_follow_live),
+                                // the node follows the chain from its peers instead: a
+                                // full sync_with_network on a steady cadence. That sync
+                                // asks every peer its height with a WAN-sized timeout,
+                                // walks back below a lost race so the heavier branch is
+                                // adopted, and validates every block exactly as any other
+                                // ingest. The gateway stays an accelerator, never a
+                                // dependency.
+                                //
+                                // This replaced a 2s GetBlockHeight fan-out with 50/500ms
+                                // timeouts on fresh connections to peers 100-250ms away:
+                                // nearly every request was cancelled, so a node with the
+                                // gateway down synced once at boot and then froze (11-05
+                                // site-down test: 31 blocks behind in 3 min, 522 of 547
+                                // height requests cancelled). It also stopped trying for
+                                // good after three failed syncs; failures now back off
+                                // and keep retrying.
+                                //
+                                // The publisher is excluded: it is the beacon's SOURCE, follows
+                                // the relay on its own 1 s converge and already pulls relay gaps
+                                // from peers (beacon-watch). Pulling peer blocks ahead of the
+                                // relay would make it sign beacons for blocks clients cannot
+                                // fetch from the relay yet.
+                                if Node::follows_relay_as_publisher() {
+                                    continue;
+                                }
+                                let tip_before = node.blockchain.read().await.get_latest_block_index() as u32;
+                                let now_i = tokio::time::Instant::now();
+                                let follow = if node.beacon_follow_live() {
+                                    // A live, moving beacon normally means converge is landing
+                                    // blocks. If the node nonetheless stays more than 2 behind it
+                                    // for P2P_FOLLOW_BEHIND_LIVE_SECS (relay 429/5xx while the
+                                    // edge-cached tip is fine, or a beacon branch this client
+                                    // rejects), follow the peers too instead of drifting toward
+                                    // the 64-block reorg margin on gossip alone.
+                                    // "Not closing the gap", not merely "behind": an ordinary
+                                    // long converge catch-up shrinks the gap and restarts the
+                                    // clock each time it does, while a converge that lands
+                                    // blocks slower than the chain grows still trips it.
+                                    let beacon_hw = node.beacon_high_water_height();
+                                    if beacon_hw > tip_before.saturating_add(2) {
+                                        let gap = beacon_hw - tip_before;
+                                        let since = match p2p_behind_live_since {
+                                            Some((since, gap_then)) if gap >= gap_then => since,
+                                            _ => {
+                                                p2p_behind_live_since = Some((now_i, gap));
+                                                now_i
+                                            }
+                                        };
+                                        now_i.duration_since(since)
+                                            >= Duration::from_secs(P2P_FOLLOW_BEHIND_LIVE_SECS)
+                                    } else {
+                                        p2p_behind_live_since = None;
+                                        false
                                     }
-                                    // Check chain state with safe conversion
-                                    let local_height = {
-                                        let blockchain = node.blockchain.read().await;
-                                        match u32::try_from(blockchain.get_latest_block_index()) {
-                                            Ok(height) => height,
-                                            Err(e) => {
-                                                error!("Error converting block height: {}", e);
-                                                return;
-                                            }
+                                } else {
+                                    p2p_behind_live_since = None;
+                                    true
+                                };
+                                if !follow {
+                                    p2p_follow_failures = 0;
+                                    p2p_follow_next = now_i;
+                                    continue;
+                                }
+                                if now_i < p2p_follow_next {
+                                    continue;
+                                }
+                                // Another sync (the startup sync, bPoS) is already pulling from
+                                // the peers: let it finish rather than read its no-op Ok as a
+                                // stuck round.
+                                if node.network_sync_in_flight() {
+                                    continue;
+                                }
+                                let wall_before = SystemTime::now();
+                                let round_start = wall_before
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let tip_id_before = node.local_tip_id().await;
+                                let result = node.sync_with_network().await;
+                                let tip_id_after = node.local_tip_id().await;
+                                let best_peer = node.best_peer_height_reported_since(round_start).await;
+                                let tip_after = tip_id_after.0;
+                                let outcome =
+                                    classify_p2p_follow(result.is_ok(), tip_id_before, tip_id_after, best_peer);
+                                let cap_secs = match outcome {
+                                    P2pFollowOutcome::Progressed | P2pFollowOutcome::Idle => {
+                                        p2p_follow_failures = 0;
+                                        P2P_FOLLOW_MAX_BACKOFF_SECS
+                                    }
+                                    P2pFollowOutcome::Stuck | P2pFollowOutcome::Failed => {
+                                        p2p_follow_failures = p2p_follow_failures.saturating_add(1);
+                                        let detail = match &result {
+                                            Err(e) => e.to_string(),
+                                            Ok(()) => format!(
+                                                "a peer reports height {} but the tip stayed at {}",
+                                                best_peer, tip_after
+                                            ),
+                                        };
+                                        // Warn on the first failure, then every 12th; debug between.
+                                        // `is_multiple_of` requires a newer compiler than the crate's Rust 1.89 MSRV.
+                                        #[allow(clippy::manual_is_multiple_of)]
+                                        if p2p_follow_failures == 1 || p2p_follow_failures % 12 == 0 {
+                                            warn!(
+                                                "Peer follow made no progress {} time(s) in a row: {}",
+                                                p2p_follow_failures, detail
+                                            );
+                                        } else {
+                                            debug!("Peer follow made no progress: {}", detail);
                                         }
-                                    };
-
-                                    // Parallel height checks with timeout handling
-                                    let heights = futures::future::join_all(
-                                        available_peers.iter().map(|&peer| {
-                                            let node = node.clone();
-                                            async move {
-                                                match tokio::time::timeout(
-                                                    Duration::from_millis(target_latency),
-                                                    node.request_peer_height(peer)
-                                                ).await {
-                                                    Ok(Ok(height)) => Some(height),
-                                                    _ => None
-                                                }
-                                            }
-                                        })
-                                    ).await;
-
-                                    // Process height differences with backoff
-                                    if let Some(&max_height) = heights.iter().flatten().max() {
-                                        if max_height > local_height {
-                                            sync_attempts = sync_attempts.saturating_add(1);
-                                            if sync_attempts < MAX_SYNC_ATTEMPTS {
-                                                match node.sync_with_network().await {
-                                                    Ok(_) => {
-                                                        if let Err(e) = node.publish_local_tip().await {
-                                                            warn!("Post-sync publish failed: {}", e);
-                                                        }
-                                                        sync_attempts = 0;
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Chain sync failed (attempt {}/{}): {}", 
-                                                            sync_attempts, MAX_SYNC_ATTEMPTS, e);
-                                                        if sync_attempts == MAX_SYNC_ATTEMPTS - 1 {
-                                                            warn!("Max sync attempts reached, backing off");
-                                                            tokio::time::sleep(Duration::from_secs(5)).await;
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                        // A peer that is "ahead" yet serves nothing we accept (a
+                                        // rejected branch, or a lying height) backs off only to
+                                        // 20 s, so new honest blocks are still picked up promptly;
+                                        // hard errors back off to the full minute.
+                                        if outcome == P2pFollowOutcome::Stuck {
+                                            P2P_FOLLOW_STUCK_BACKOFF_SECS
+                                        } else {
+                                            P2P_FOLLOW_MAX_BACKOFF_SECS
                                         }
                                     }
+                                };
+                                p2p_follow_next = tokio::time::Instant::now()
+                                    + p2p_follow_delay(p2p_follow_failures, cap_secs);
+                                // A long catch-up is activity, not a suspend: stamp the clock
+                                // after it so the next tick's sleep detector does not read the
+                                // sync's own duration as a wake from sleep. But Instant does not
+                                // advance across an OS suspend (macOS/Linux) while the wall clock
+                                // does: when the machine slept DURING the sync, leave the stamp so
+                                // the next tick still sees the gap and resets the pool.
+                                let wall_elapsed = SystemTime::now()
+                                    .duration_since(wall_before)
+                                    .unwrap_or_default();
+                                let mono_elapsed = tokio::time::Instant::now().duration_since(now_i);
+                                if wall_elapsed.saturating_sub(mono_elapsed).as_secs() <= SLEEP_THRESHOLD {
+                                    activity_time.store(
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        Ordering::Release,
+                                    );
                                 }
                             } else {
                                 // Emergency peer discovery with exponential backoff
@@ -7027,6 +7078,58 @@ fn idle_reconcile_needs_snapshot(local_tip: u32, beacon_height: Option<u32>, for
     }
 }
 
+/// Gateway-independent follow cadence (the main monitor's sync arm, used while the gateway
+/// beacon is not live): one full peer sync per ~block interval while it succeeds; each
+/// consecutive failure doubles the wait (5, 10, 20, 40 s) up to `cap_secs`, so a dead or
+/// unreachable peer set keeps being retried without being hammered. Never gives up.
+const P2P_FOLLOW_INTERVAL_SECS: u64 = 5;
+/// Backoff cap after hard errors (no peer answered, every request failed).
+const P2P_FOLLOW_MAX_BACKOFF_SECS: u64 = 60;
+/// Backoff cap when a peer claims to be ahead but nothing it serves is accepted (a
+/// branch this client rejects, or a lying height): short enough that honest new
+/// blocks still land within a few block times.
+const P2P_FOLLOW_STUCK_BACKOFF_SECS: u64 = 20;
+/// With a live beacon, follow peers as well once the node has stayed more than 2
+/// blocks behind that beacon for this long (converge is not landing blocks).
+const P2P_FOLLOW_BEHIND_LIVE_SECS: u64 = 20;
+fn p2p_follow_delay(consecutive_failures: u32, cap_secs: u64) -> Duration {
+    let factor = 1u64 << consecutive_failures.min(4);
+    Duration::from_secs((P2P_FOLLOW_INTERVAL_SECS * factor).min(cap_secs))
+}
+
+/// What one gateway-independent follow round achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum P2pFollowOutcome {
+    /// The tip changed (advanced, or reorged onto a heavier branch).
+    Progressed,
+    /// Nothing to do: no peer is ahead of us.
+    Idle,
+    /// A peer is ahead, yet the round applied nothing (sync_with_network can still
+    /// report Ok here, e.g. via a reachable relay that had nothing new).
+    Stuck,
+    /// The sync itself failed.
+    Failed,
+}
+
+fn classify_p2p_follow(
+    ok: bool,
+    tip_before: (u32, [u8; 32]),
+    tip_after: (u32, [u8; 32]),
+    best_peer: u32,
+) -> P2pFollowOutcome {
+    // Progress = the tip CHANGED, not just rose: a reorg onto a heavier but shorter
+    // branch lowers the height yet is real work.
+    if tip_after.1 != tip_before.1 {
+        P2pFollowOutcome::Progressed
+    } else if !ok {
+        P2pFollowOutcome::Failed
+    } else if best_peer > tip_after.0 {
+        P2pFollowOutcome::Stuck
+    } else {
+        P2pFollowOutcome::Idle
+    }
+}
+
 /// Highest block index present in the local DB, or None if unreadable/empty.
 /// Reads the persisted tip pointer (validated) rather than scanning the chain,
 /// so a boot is not minutes of block-body I/O before the first log line.
@@ -9726,6 +9829,72 @@ mod tests {
             canonical_reconcile_decision(&db, &m, Some(100), None, None),
             CanonicalReconcile::InSyncOrUnknown
         ));
+    }
+
+    // The gateway-independent follow never gives up: failures back off 5 -> 60 s and a
+    // success returns to the 5 s cadence (the old arm stopped for good after 3 failures).
+    #[test]
+    fn p2p_follow_delay_backs_off_to_its_cap_and_never_stops() {
+        let hard = |n| p2p_follow_delay(n, P2P_FOLLOW_MAX_BACKOFF_SECS).as_secs();
+        assert_eq!(hard(0), 5);
+        assert_eq!(hard(1), 10);
+        assert_eq!(hard(2), 20);
+        assert_eq!(hard(3), 40);
+        assert_eq!(hard(4), 60);
+        assert_eq!(hard(5), 60);
+        assert_eq!(hard(u32::MAX), 60);
+        // "Stuck" (a peer ahead that serves nothing we accept) never waits past 20 s.
+        let stuck = |n| p2p_follow_delay(n, P2P_FOLLOW_STUCK_BACKOFF_SECS).as_secs();
+        assert_eq!(stuck(1), 10);
+        assert_eq!(stuck(2), 20);
+        assert_eq!(stuck(u32::MAX), 20);
+    }
+
+    // A round counts as progress only if the tip moved; an Ok sync with a peer still
+    // ahead and the tip unmoved is Stuck (backs off), never a silent success.
+    #[test]
+    fn classify_p2p_follow_separates_progress_idle_stuck_failed() {
+        use P2pFollowOutcome::*;
+        let tip = |h: u32, tag: u8| (h, [tag; 32]);
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(103, 2), 103),
+            Progressed
+        );
+        // Progress wins even if the call reported an error part-way.
+        assert_eq!(
+            classify_p2p_follow(false, tip(100, 1), tip(101, 2), 103),
+            Progressed
+        );
+        // A reorg onto a heavier but SHORTER branch is progress, with taller peers about.
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(99, 3), 101),
+            Progressed
+        );
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(100, 1), 100),
+            Idle
+        );
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(100, 1), 99),
+            Idle
+        );
+        assert_eq!(classify_p2p_follow(true, tip(100, 1), tip(100, 1), 0), Idle);
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(100, 1), 105),
+            Stuck
+        );
+        assert_eq!(
+            classify_p2p_follow(true, tip(100, 1), tip(100, 1), u32::MAX),
+            Stuck
+        );
+        assert_eq!(
+            classify_p2p_follow(false, tip(100, 1), tip(100, 1), 105),
+            Failed
+        );
+        assert_eq!(
+            classify_p2p_follow(false, tip(100, 1), tip(100, 1), 0),
+            Failed
+        );
     }
 
     // The idle-reconcile snapshot gate: a SERVICE node (exchange/explorer/
