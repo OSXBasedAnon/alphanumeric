@@ -35,3 +35,8 @@ reason = "yamux 0.12.1 remote-panic path is unreachable: runtime uses fixed 0.13
 id = "RUSTSEC-2026-0387"
 ignoreUntil = 2027-02-28
 reason = "crypto-bigint 0.5.5 timing variability: reachable only via webrtc 0.17 -> dtls -> p256/p384 0.13 -> elliptic-curve 0.13 (pins 0.5; fix is 0.7.6, a major only a webrtc bump can take). The key is the per-peer-connection ephemeral self-signed DTLS cert (RTCConfiguration.certificates left default), a handful of signatures per key over a network. Consensus uses ML-DSA, never this crate. Re-review on any webrtc bump. Reviewed 2026-11-04."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0441"
+ignoreUntil = 2027-02-28
+reason = "pin-utils 0.1.0 is UNMAINTAINED (upstream archived 2026-10-01), not vulnerable: a stack-pinning macro with no I/O or parsing. Reachable only via webrtc 0.17 -> webrtc-util 0.17 -> nix 0.26 (webrtc-util 0.17.2, the latest, still pins nix 0.26); only a webrtc bump clears it. Re-review on any webrtc bump. Reviewed 2026-11-05."
