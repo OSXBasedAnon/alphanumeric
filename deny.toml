@@ -42,6 +42,13 @@ ignore = [
   # are ML-DSA and never touch this crate. Re-review on any webrtc bump. Reviewed 2026-11-04.
   "RUSTSEC-2026-0387",
 
+  # pin-utils 0.1.0 — unmaintained (upstream archived 2026-10-01; `pin_mut!` is now
+  # `std::pin::pin!`). No vulnerability: a stack-pinning macro with no I/O or parsing.
+  # Reaches us only through webrtc 0.17 → webrtc-util 0.17 → nix 0.26 (webrtc-util 0.17.2,
+  # the latest, still pins nix 0.26), so only a webrtc bump clears it. Re-review on any
+  # webrtc bump. Reviewed 2026-11-05.
+  "RUSTSEC-2026-0441",
+
 ]
 
 # NOT ignored, recorded so it is not re-investigated from scratch: yamux 0.12.1 carries
