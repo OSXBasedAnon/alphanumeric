@@ -53,8 +53,9 @@ subset tests in `src/a9/blockchain.rs`.
 8. Large full-witness blocks losing propagation races.
 Control: activation-gated deterministic full-witness-equivalent block weight;
 the WebRTC mesh sends a compact commitment first and the unchanged full block
-immediately afterward on the ordered channel. TCP continues to use full-block
-delivery in this release.
+immediately afterward on the ordered channel. Over TCP, peers that negotiate
+compact v2 exchange a compact announcement with body recovery, and every failure
+path falls back to the unchanged full-block message.
 Coverage: shape/weight invariance, compact commitment, frame ordering, and
 full-fallback dedup tests.
 
@@ -64,12 +65,44 @@ historical reward calculation and transaction wire format. Operators must still
 upgrade before the published activation height; safe activation depends on
 majority enforcement, not merely on wire compatibility.
 
+10. Gateway unavailable, frozen, or answering with data it cannot prove.
+Control: the gateway is an accelerator, not a dependency. A node follows the
+signed tip beacon only while a verified read is fresh and its height is moving
+(`beacon_follow_state`); otherwise the main monitor follows the chain from its
+peers with a bounded, single-flight `sync_with_network` round (per-call and
+per-candidate time budgets, up to eight candidates, and a sit-out with backoff
+for peers that served something refused while claiming a taller chain). Every
+block taken that way passes the same validation and witness checks as any other.
+A beacon whose signature does not verify against a pinned publisher key cannot
+produce a runtime re-bootstrap verdict, and the boot-time "too far behind" check
+ignores an unsigned tip height. A verified but frozen beacon below the local tip
+does not force a re-bootstrap onto its branch, and the mine-prep stale-tip guard
+widens to the reorg margin only while the beacon is stuck at its maximum, so a
+stuck publisher cannot stop mining while a stale cache edge still cannot launder
+a ghost block.
+Coverage: `beacon_follow_verdict_live_only_when_fresh_and_moving`,
+`beacon_follow_state_uses_production_bounds`,
+`frozen_beacon_holds_tip_only_for_a_verified_frozen_beacon_below_us`,
+`unverified_beacon_never_yields_a_bootstrap`,
+`client_converge_paths_all_apply_the_unverified_beacon_rule`,
+`ghost_guard_tolerance_widens_only_while_the_beacon_is_stuck`,
+`sync_strikes_cool_down_exponentially_and_filter_candidates`,
+`sync_with_network_stays_bounded_and_wide`, and the `follow_*` pacing tests in
+`src/main.rs`.
+
 ## Residual Risks
 - Multi-node adversarial integration coverage is still limited compared with mature L1 test harnesses.
 - Some consensus-adjacent modules still contain inactive/dead paths that increase audit surface.
-- TCP compact pull/proxy transport remains disabled pending integrated
-  acknowledgement, retry, and source-failure testing.
+- The older TCP compact v1 pull/proxy transport remains disabled pending integrated
+  acknowledgement, retry, and source-failure testing (compact v2 is the one in use).
 - Signed official bootstraps remain compatible with older manifests that do not yet include size metadata; those should be republished with current publisher tooling.
+- Without the gateway, catch-up over peers is limited to the span peers still hold full
+  transaction witnesses for; a node offline for longer, or a new node, needs a signed beacon
+  or a signed snapshot. Peer-only finality also trails the local tip by the reorg margin, so
+  a partition outlasting it does not heal without the beacon.
+- Some boot-time and reconcile fork checks still consult gateway data that is
+  consistency-checked but not publisher-signed; moving them onto signed data is
+  open work.
 
 ## Test And Control Mapping
 - Unit tests are embedded in consensus modules for deterministic math, thresholding behavior, and compatibility conversions.
