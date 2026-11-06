@@ -15,6 +15,10 @@
 //!   the balances-plus-marker write depends on.
 //! - Writers are serialized through one mutex (redb is single-writer; the lock
 //!   makes contention explicit and fair instead of implicit inside redb).
+//! - Waiting for that mutex never parks an async worker: a contended wait on a
+//!   tokio worker hands the worker's slot back to the runtime first
+//!   (`Store::with_writer`), so one long write can never freeze the runtime
+//!   behind it.
 
 use parking_lot::Mutex;
 use redb::{
@@ -339,6 +343,39 @@ impl Store {
         Ok(store)
     }
 
+    /// Runs `f` holding the writer mutex.
+    ///
+    /// A `parking_lot` wait blocks the OS thread. On a tokio worker that is one
+    /// of the runtime's few workers gone; with every store writer in the node
+    /// contending the same mutex, one long holder (a derived-state rebuild
+    /// writes for minutes) took ALL of them, the heartbeat went stale, and the
+    /// runtime watchdog killed the publisher mid-rebuild — which queued the same
+    /// rebuild for the next start (the 2026-10/11 restart clusters). So the
+    /// uncontended path runs inline, and a contended wait on a runtime worker
+    /// thread goes through `block_in_place`, which moves the worker's
+    /// scheduling slot to another thread before this one parks. Every other
+    /// thread locks directly — the main `block_on` thread (startup, the REPL's
+    /// `LocalSet`), the blocking pool, plain OS threads, current-thread test
+    /// runtimes: `block_in_place` panics inside a `LocalSet` and would be
+    /// pointless elsewhere, and none of those threads is one the runtime needs
+    /// back.
+    fn with_writer<R>(&self, f: impl FnOnce() -> R) -> R {
+        if let Some(guard) = self.inner.write_lock.try_lock() {
+            let out = f();
+            drop(guard);
+            return out;
+        }
+        if on_runtime_worker_thread() {
+            tokio::task::block_in_place(|| {
+                let _guard = self.inner.write_lock.lock();
+                f()
+            })
+        } else {
+            let _guard = self.inner.write_lock.lock();
+            f()
+        }
+    }
+
     pub fn open_tree(&self, name: impl AsRef<[u8]>) -> Result<Tree> {
         let name = String::from_utf8_lossy(name.as_ref()).into_owned();
         let def_name = interned(&name);
@@ -347,14 +384,16 @@ impl Store {
         // already treat a missing table as empty, writers create it in their own
         // transaction, and `clear` recreates it.
         if !self.inner.created.lock().contains(def_name) {
-            let _guard = self.inner.write_lock.lock();
-            let mut txn = self.inner.db.begin_write()?;
-            txn.set_durability(Durability::None)?;
-            {
-                let def = TableDefinition::<&[u8], &[u8]>::new(def_name);
-                txn.open_table(def)?;
-            }
-            txn.commit()?;
+            self.with_writer(|| -> Result<()> {
+                let mut txn = self.inner.db.begin_write()?;
+                txn.set_durability(Durability::None)?;
+                {
+                    let def = TableDefinition::<&[u8], &[u8]>::new(def_name);
+                    txn.open_table(def)?;
+                }
+                txn.commit()?;
+                Ok(())
+            })?;
             self.inner.created.lock().insert(def_name);
         }
         Ok(Tree {
@@ -381,13 +420,14 @@ impl Store {
     /// in O(1) instead of walking the whole file's checksums — the difference
     /// between milliseconds and minutes at multi-GB scale).
     pub fn flush(&self) -> Result<()> {
-        let _guard = self.inner.write_lock.lock();
-        let mut txn = self.inner.db.begin_write()?;
-        txn.set_durability(Durability::Immediate)?;
-        txn.set_two_phase_commit(true);
-        txn.set_quick_repair(true);
-        txn.commit()?;
-        Ok(())
+        self.with_writer(|| -> Result<()> {
+            let mut txn = self.inner.db.begin_write()?;
+            txn.set_durability(Durability::Immediate)?;
+            txn.set_two_phase_commit(true);
+            txn.set_quick_repair(true);
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     pub fn size_on_disk(&self) -> Result<u64> {
@@ -400,16 +440,17 @@ impl Store {
     /// (the file only shrinks on clean close).
     pub fn space_stats(&self) -> Result<SpaceStats> {
         let file_bytes = std::fs::metadata(&self.inner.path)?.len();
-        let _guard = self.inner.write_lock.lock();
-        let txn = self.inner.db.begin_write()?;
-        let stats = txn.stats()?;
-        let out = SpaceStats {
-            file_bytes,
-            stored_bytes: stats.stored_bytes() + stats.metadata_bytes(),
-            fragmented_bytes: stats.fragmented_bytes(),
-        };
-        txn.abort()?;
-        Ok(out)
+        self.with_writer(|| -> Result<SpaceStats> {
+            let txn = self.inner.db.begin_write()?;
+            let stats = txn.stats()?;
+            let out = SpaceStats {
+                file_bytes,
+                stored_bytes: stats.stored_bytes() + stats.metadata_bytes(),
+                fragmented_bytes: stats.fragmented_bytes(),
+            };
+            txn.abort()?;
+            Ok(out)
+        })
     }
 
     /// Consistent point-in-time copy of the database file for snapshot
@@ -419,19 +460,34 @@ impl Store {
     /// the file). On APFS the copy is a clonefile — effectively instant — so
     /// the writer pause is milliseconds regardless of database size.
     pub fn snapshot_file_to(&self, dest: &Path) -> Result<()> {
-        let _guard = self.inner.write_lock.lock();
-        let mut txn = self.inner.db.begin_write()?;
-        txn.set_durability(Durability::Immediate)?;
-        txn.set_two_phase_commit(true);
-        txn.set_quick_repair(true);
-        txn.commit()?;
-        std::fs::copy(&self.inner.path, dest)?;
-        Ok(())
+        self.with_writer(|| -> Result<()> {
+            let mut txn = self.inner.db.begin_write()?;
+            txn.set_durability(Durability::Immediate)?;
+            txn.set_two_phase_commit(true);
+            txn.set_quick_repair(true);
+            txn.commit()?;
+            std::fs::copy(&self.inner.path, dest)?;
+            Ok(())
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
+}
+
+/// Name of the node runtime's worker threads. `main` sets it explicitly when it
+/// builds the runtime, so the match below is a contract, not a coincidence
+/// (it happens to be tokio 1.53's default; earlier releases used another).
+pub const RUNTIME_WORKER_THREAD_NAME: &str = "tokio-rt-worker";
+
+/// True on a worker thread of a multi-thread tokio runtime — the one place a
+/// contended wait should hand the thread back through `block_in_place`.
+fn on_runtime_worker_thread() -> bool {
+    std::thread::current().name() == Some(RUNTIME_WORKER_THREAD_NAME)
+        && tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false)
 }
 
 /// A batch of writes applied in one all-or-nothing transaction.
@@ -491,50 +547,53 @@ impl Tree {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<Option<Vec<u8>>> {
-        let _guard = self.store.inner.write_lock.lock();
-        let mut txn = self.store.inner.db.begin_write()?;
-        txn.set_durability(Durability::None)?;
-        let mut table = txn.open_table(self.def())?;
-        let guard = table.insert(key.as_ref(), value.as_ref())?;
-        let prev = guard.map(|g| g.value().to_vec());
-        drop(table);
-        txn.commit()?;
-        Ok(prev)
+        self.store.with_writer(|| -> Result<Option<Vec<u8>>> {
+            let mut txn = self.store.inner.db.begin_write()?;
+            txn.set_durability(Durability::None)?;
+            let mut table = txn.open_table(self.def())?;
+            let guard = table.insert(key.as_ref(), value.as_ref())?;
+            let prev = guard.map(|g| g.value().to_vec());
+            drop(table);
+            txn.commit()?;
+            Ok(prev)
+        })
     }
 
     /// Remove, returning the previous value (sled parity).
     pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        let _guard = self.store.inner.write_lock.lock();
-        let mut txn = self.store.inner.db.begin_write()?;
-        txn.set_durability(Durability::None)?;
-        let mut table = txn.open_table(self.def())?;
-        let guard = table.remove(key.as_ref())?;
-        let prev = guard.map(|g| g.value().to_vec());
-        drop(table);
-        txn.commit()?;
-        Ok(prev)
+        self.store.with_writer(|| -> Result<Option<Vec<u8>>> {
+            let mut txn = self.store.inner.db.begin_write()?;
+            txn.set_durability(Durability::None)?;
+            let mut table = txn.open_table(self.def())?;
+            let guard = table.remove(key.as_ref())?;
+            let prev = guard.map(|g| g.value().to_vec());
+            drop(table);
+            txn.commit()?;
+            Ok(prev)
+        })
     }
 
     /// All operations land in one transaction: all-or-nothing under crash.
     pub fn apply_batch(&self, batch: Batch) -> Result<()> {
-        let _guard = self.store.inner.write_lock.lock();
-        let mut txn = self.store.inner.db.begin_write()?;
-        txn.set_durability(Durability::None)?;
-        {
-            let mut table = txn.open_table(self.def())?;
-            for (key, value) in &batch.ops {
-                match value {
-                    Some(v) => {
-                        table.insert(key.as_slice(), v.as_slice())?;
-                    }
-                    None => {
-                        table.remove(key.as_slice())?;
+        self.store.with_writer(|| -> Result<()> {
+            let mut txn = self.store.inner.db.begin_write()?;
+            txn.set_durability(Durability::None)?;
+            {
+                let mut table = txn.open_table(self.def())?;
+                for (key, value) in &batch.ops {
+                    match value {
+                        Some(v) => {
+                            table.insert(key.as_slice(), v.as_slice())?;
+                        }
+                        None => {
+                            table.remove(key.as_slice())?;
+                        }
                     }
                 }
             }
-        }
-        txn.commit()?;
-        Ok(())
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     /// Full-store durable commit; identical cost/semantics to `Store::flush`
@@ -624,13 +683,14 @@ impl Tree {
     /// Delete every entry (sled `Tree::clear` parity): one transaction that
     /// drops and recreates the table.
     pub fn clear(&self) -> Result<()> {
-        let _guard = self.store.inner.write_lock.lock();
-        let mut txn = self.store.inner.db.begin_write()?;
-        txn.set_durability(Durability::None)?;
-        txn.delete_table(self.def())?;
-        txn.open_table(self.def())?;
-        txn.commit()?;
-        Ok(())
+        self.store.with_writer(|| -> Result<()> {
+            let mut txn = self.store.inner.db.begin_write()?;
+            txn.set_durability(Durability::None)?;
+            txn.delete_table(self.def())?;
+            txn.open_table(self.def())?;
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     /// One page of `start..end` (end exclusive; `None` = open), at most `limit`
@@ -751,23 +811,24 @@ impl Tree {
         mut f: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
-        let _guard = self.store.inner.write_lock.lock();
-        let mut txn = self.store.inner.db.begin_write()?;
-        txn.set_durability(Durability::None)?;
-        let mut table = txn.open_table(self.def())?;
-        let current = table.get(key)?.map(|g| g.value().to_vec());
-        let next = f(current.as_deref());
-        match &next {
-            Some(v) => {
-                table.insert(key, v.as_slice())?;
+        self.store.with_writer(|| -> Result<Option<Vec<u8>>> {
+            let mut txn = self.store.inner.db.begin_write()?;
+            txn.set_durability(Durability::None)?;
+            let mut table = txn.open_table(self.def())?;
+            let current = table.get(key)?.map(|g| g.value().to_vec());
+            let next = f(current.as_deref());
+            match &next {
+                Some(v) => {
+                    table.insert(key, v.as_slice())?;
+                }
+                None => {
+                    table.remove(key)?;
+                }
             }
-            None => {
-                table.remove(key)?;
-            }
-        }
-        drop(table);
-        txn.commit()?;
-        Ok(next)
+            drop(table);
+            txn.commit()?;
+            Ok(next)
+        })
     }
 }
 
@@ -882,6 +943,126 @@ impl Iterator for LazyScanRev {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `block_in_place` is only legal on a runtime worker thread. The REPL runs
+    /// on a `LocalSet` over the main thread, startup writes come from the
+    /// `block_on` thread, and snapshot sealing runs on the blocking pool: each
+    /// must wait for a contended lock inline rather than panic.
+    #[test]
+    fn contended_writes_off_the_worker_threads_lock_inline() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name(RUNTIME_WORKER_THREAD_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = Store::temporary().unwrap();
+            let tree = store.open_tree("t").unwrap();
+            // Holds the writer lock for 400 ms from the blocking pool.
+            let hold = |tree: Tree| {
+                tokio::task::spawn_blocking(move || {
+                    tree.update_and_fetch(b"k", |_| {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        Some(b"v".to_vec())
+                    })
+                    .unwrap()
+                })
+            };
+            let settle = || tokio::time::sleep(std::time::Duration::from_millis(50));
+
+            let holder = hold(tree.clone());
+            settle().await;
+            tree.insert(b"block_on", b"1").unwrap();
+            holder.await.unwrap();
+
+            let holder = hold(tree.clone());
+            settle().await;
+            let local = tokio::task::LocalSet::new();
+            let t = tree.clone();
+            local
+                .run_until(async move {
+                    tokio::task::spawn_local(async move { t.insert(b"local", b"1").unwrap() })
+                        .await
+                        .unwrap();
+                })
+                .await;
+            holder.await.unwrap();
+
+            let holder = hold(tree.clone());
+            settle().await;
+            let t = tree.clone();
+            tokio::task::spawn_blocking(move || t.insert(b"blocking", b"1").unwrap())
+                .await
+                .unwrap();
+            holder.await.unwrap();
+
+            for key in [&b"block_on"[..], b"local", b"blocking"] {
+                assert_eq!(tree.get(key).unwrap(), Some(b"1".to_vec()));
+            }
+        });
+    }
+
+    /// Two workers queued behind a slow holder used to leave the runtime no
+    /// thread to run anything else — the publisher's heartbeat went stale
+    /// behind a rebuild and the watchdog killed it. The holder sits on the
+    /// blocking pool, both workers queue inserts behind it, and a timer task
+    /// must keep ticking the whole time.
+    #[test]
+    fn a_contended_writer_lock_never_pins_the_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name(RUNTIME_WORKER_THREAD_NAME)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = Store::temporary().unwrap();
+            let tree = store.open_tree("t").unwrap();
+            let ticks = Arc::new(AtomicU64::new(0));
+            let ticker = {
+                let ticks = Arc::clone(&ticks);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            };
+            let holder = {
+                let tree = tree.clone();
+                tokio::task::spawn_blocking(move || {
+                    tree.update_and_fetch(b"k", |_| {
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                        Some(b"v".to_vec())
+                    })
+                    .unwrap()
+                })
+            };
+            // Let the holder take the mutex before the workers queue behind it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let before = ticks.load(Ordering::Relaxed);
+            let waiters: Vec<_> = (0..2)
+                .map(|i| {
+                    let tree = tree.clone();
+                    tokio::spawn(async move { tree.insert(format!("w{i}"), b"x").unwrap() })
+                })
+                .collect();
+            holder.await.unwrap();
+            let during = ticks.load(Ordering::Relaxed) - before;
+            for waiter in waiters {
+                waiter.await.unwrap();
+            }
+            ticker.abort();
+            // ~700 ms of contention at 20 ms per tick; a pinned runtime shows ~0.
+            assert!(
+                during >= 15,
+                "timer ticked {during} times while two workers waited on the writer lock"
+            );
+            assert_eq!(tree.get(b"w0").unwrap(), Some(b"x".to_vec()));
+            assert_eq!(tree.get(b"k").unwrap(), Some(b"v".to_vec()));
+        });
+    }
 
     #[test]
     fn runtime_storage_errors_are_classified_once_at_the_conversion() {

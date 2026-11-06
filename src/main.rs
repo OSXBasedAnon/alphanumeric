@@ -602,6 +602,9 @@ fn main() -> Result<()> {
         .spawn(|| -> std::result::Result<(), String> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
+                // The store hands a contended worker thread back to the runtime
+                // only when it can recognise one (see Store::with_writer).
+                .thread_name(store::RUNTIME_WORKER_THREAD_NAME)
                 .thread_stack_size(WORKER_THREAD_STACK_BYTES)
                 .enable_all()
                 .build()

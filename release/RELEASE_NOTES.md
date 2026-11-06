@@ -69,6 +69,16 @@ migration, no wallet migration, no resync.
   connections cannot take, peer sync limits that follow the host rather than
   its advertised port, cheaper orphan and witness bookkeeping per block, and
   background loops that restart after a fault instead of stopping.
+- **A long storage job can no longer freeze the node.** Store writers waiting
+  for the writer lock used to park the async runtime's worker threads, so a
+  derived-state rebuild (minutes at mainnet height) could stall every other
+  task, trip the runtime watchdog, and queue the same rebuild for the next
+  start — the publisher's restart clusters since late October. Waiting writers
+  now hand their thread back to the runtime first. While a rebuild runs the
+  node reports it as `maintenance` on `/stats` and in `maintenance.json`
+  beside the chain file, with a step counter supervisors can read as progress,
+  and a watchdog that does restart the node first writes a native stack
+  sample (`runtime-pin-*.txt` / `lock-wedge-*.txt`) beside the chain file.
 - **Explorer API: an idempotent retry of a long-past payment** is answered from
   the permanent address index, so a withdrawal mined outside the 6 h replay
   window reads as confirmed rather than expired.
