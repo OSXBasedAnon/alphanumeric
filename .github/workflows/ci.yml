@@ -37,9 +37,10 @@ jobs:
 
   # GPU code is shipped only from gpu-mining and requires Apple's Metal toolchain to lint. Keep it
   # out of the Linux common job, but make the branch-specific gate equally mandatory.
+  # macos-14 was retired by GitHub on 2026-11-02 ("macos-14-arm64-us-default is not supported").
   gpu-clippy:
     if: github.ref_name == 'gpu-mining' || github.base_ref == 'gpu-mining'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: "1.93.1"
