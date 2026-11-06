@@ -40,6 +40,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -7771,6 +7772,17 @@ impl Node {
                 "peers": peers,
                 "version": format!("rust-{}", NETWORK_VERSION),
                 "uptime_secs": uptime_secs,
+                // A derived-state rebuild in progress, with its step counter; a
+                // supervisor that sees it advancing is looking at work, not a wedge.
+                "maintenance": crate::a9::blockchain::maintenance_in_progress().map_or(
+                    Value::Null,
+                    |job| json!({
+                        "job": job.job,
+                        "started_unix": job.started_unix,
+                        "updated_unix": job.updated_unix,
+                        "steps": job.steps,
+                    }),
+                ),
                 "outbound_relay": {
                     "scheduler_enabled": outbound.enabled,
                     "global_queue_capacity_bytes": outbound.global_queue_capacity_bytes,
@@ -11339,6 +11351,17 @@ impl Node {
         #[cfg(feature = "webrtc_mesh")]
         self.spawn_webrtc_mesh();
 
+        // Where a watchdog about to restart the node leaves its evidence: beside the
+        // chain file, where an operator already looks.
+        let pin_dump_dir: PathBuf = {
+            let bc = self.blockchain.read().await;
+            bc.db
+                .path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+
         // LOCK WATCHDOG. Two distinct forever-wedges shipped in this codebase before
         // being found (peers guard held across a join_all fan-out; an as-yet-unlocated
         // blockchain-lock holder on 2026-07-08 that froze the publisher hourly). Each
@@ -11351,6 +11374,7 @@ impl Node {
         // the breadcrumb for root-causing any holder we haven't found yet.
         {
             let wd = self.clone();
+            let pin_dump_dir = pin_dump_dir.clone();
             let headless = std::env::var("ALPHANUMERIC_HEADLESS")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false);
@@ -11358,6 +11382,7 @@ impl Node {
             // death would remove the safety net without anyone noticing.
             spawn_supervised("lock-watchdog", move || {
                 let wd = wd.clone();
+                let pin_dump_dir = pin_dump_dir.clone();
                 async move {
                     let mut strikes: u32 = 0;
                     // Taken ONCE, before anything can wedge: an Arc to the chain's liveness
@@ -11401,6 +11426,18 @@ impl Node {
                         );
                         if strikes >= 2 {
                             if headless {
+                                match crate::a9::blockchain::capture_native_stack(
+                                    &pin_dump_dir,
+                                    "lock-wedge",
+                                ) {
+                                    Some(path) => error!(
+                                        "lock watchdog: native stack written to {}",
+                                        path.display()
+                                    ),
+                                    None => error!(
+                                        "lock watchdog: no native stack captured (no sampler available)"
+                                    ),
+                                }
                                 error!(
                                     "lock watchdog: restarting to self-heal (supervisor respawns)"
                                 );
@@ -11507,6 +11544,18 @@ impl Node {
                             stale, stale_strikes
                         );
                         if stale_strikes >= 2 && headless {
+                            match crate::a9::blockchain::capture_native_stack(
+                                &pin_dump_dir,
+                                "runtime-pin",
+                            ) {
+                                Some(path) => eprintln!(
+                                    "runtime watchdog: native stack written to {}",
+                                    path.display()
+                                ),
+                                None => eprintln!(
+                                    "runtime watchdog: no native stack captured (no sampler available)"
+                                ),
+                            }
                             eprintln!("runtime watchdog: restarting to self-heal (supervisor respawns)");
                             std::process::exit(3);
                         }

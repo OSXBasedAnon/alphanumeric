@@ -15,9 +15,10 @@ use std::error::Error as StdError;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::a9::codec;
@@ -25,6 +26,205 @@ use crate::a9::mempool::Mempool;
 use crate::a9::mldsa;
 use crate::a9::oracle::DifficultyOracle;
 use crate::a9::wallet::Wallet;
+
+// ---------------------------------------------------------------------------
+// Operator breadcrumbs for the watchdogs.
+//
+// A derived-state rebuild walks the whole chain and runs for minutes at
+// mainnet height. It is work, not a wedge, but from outside the two look the
+// same: the chain lock is held, the height does not move, and at startup not
+// even the stats endpoint listens yet. That ambiguity restarted the publisher
+// mid-rebuild and sent the next start straight back into the same rebuild. So
+// a long job announces itself here with a step counter that advances while it
+// works, and the watchdogs — in-process through `/stats`, out-of-process
+// through `maintenance.json` beside the chain file — treat advancing work as
+// alive.
+// ---------------------------------------------------------------------------
+
+/// A long derived-state job in progress, with its step counter advancing.
+#[derive(Clone, Debug)]
+pub struct MaintenanceProgress {
+    pub job: &'static str,
+    pub started_unix: u64,
+    pub updated_unix: u64,
+    pub steps: u64,
+}
+
+struct MaintenanceState {
+    progress: MaintenanceProgress,
+    file: Option<PathBuf>,
+    last_write: Instant,
+}
+
+static MAINTENANCE: PLMutex<Option<MaintenanceState>> = PLMutex::new(None);
+/// Written beside the chain file while a job runs; removed when it ends.
+pub const MAINTENANCE_FILE: &str = "maintenance.json";
+/// The file is rewritten at most this often, and only while steps advance, so
+/// a fresh mtime is itself the liveness signal.
+const MAINTENANCE_FILE_REFRESH: Duration = Duration::from_secs(5);
+
+/// The job currently running, if any.
+pub fn maintenance_in_progress() -> Option<MaintenanceProgress> {
+    MAINTENANCE
+        .lock()
+        .as_ref()
+        .map(|state| state.progress.clone())
+}
+
+/// Registers a job for its lifetime. Only the outermost guard owns the
+/// registration: a rebuild inside a recovery rides the recovery's entry.
+struct MaintenanceGuard {
+    owner: bool,
+}
+
+impl MaintenanceGuard {
+    fn begin(job: &'static str, dir: Option<&Path>) -> Self {
+        let mut slot = MAINTENANCE.lock();
+        if slot.is_some() {
+            return MaintenanceGuard { owner: false };
+        }
+        let now = Blockchain::now_unix_secs();
+        let progress = MaintenanceProgress {
+            job,
+            started_unix: now,
+            updated_unix: now,
+            steps: 0,
+        };
+        let file = dir.map(|dir| dir.join(MAINTENANCE_FILE));
+        if let Some(path) = &file {
+            write_maintenance_file(path, &progress);
+        }
+        *slot = Some(MaintenanceState {
+            progress,
+            file,
+            last_write: Instant::now(),
+        });
+        MaintenanceGuard { owner: true }
+    }
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        if let Some(state) = MAINTENANCE.lock().take() {
+            if let Some(path) = state.file {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// One unit of work done by the running job (a no-op when none is running).
+fn note_maintenance_step() {
+    let mut slot = MAINTENANCE.lock();
+    let Some(state) = slot.as_mut() else {
+        return;
+    };
+    state.progress.steps += 1;
+    if state.last_write.elapsed() < MAINTENANCE_FILE_REFRESH {
+        return;
+    }
+    state.progress.updated_unix = Blockchain::now_unix_secs();
+    state.last_write = Instant::now();
+    if let Some(path) = &state.file {
+        write_maintenance_file(path, &state.progress);
+    }
+}
+
+/// Best effort: a breadcrumb must never fail the job it describes.
+fn write_maintenance_file(path: &Path, progress: &MaintenanceProgress) {
+    let body = format!(
+        "{{\"job\":\"{}\",\"started_unix\":{},\"updated_unix\":{},\"steps\":{}}}\n",
+        progress.job, progress.started_unix, progress.updated_unix, progress.steps
+    );
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Native stack of this process, for a watchdog about to restart it: the only
+/// evidence a whole-runtime pin leaves behind. macOS `sample`; on Linux
+/// `eu-stack`, then `gdb`. A sampler that is missing, fails or overruns the
+/// cap just means no file. Returns the file written.
+pub fn capture_native_stack(dir: &Path, tag: &str) -> Option<PathBuf> {
+    const CAP: Duration = Duration::from_secs(25);
+    let pid = std::process::id().to_string();
+    let out = dir.join(format!("{}-{}.txt", tag, Blockchain::now_unix_secs()));
+    // (program, args, writes `out` itself rather than to stdout)
+    let samplers: Vec<(&str, Vec<String>, bool)> = if cfg!(target_os = "macos") {
+        vec![(
+            "/usr/bin/sample",
+            vec![
+                pid,
+                "5".into(),
+                "-file".into(),
+                out.to_string_lossy().into_owned(),
+            ],
+            true,
+        )]
+    } else {
+        vec![
+            ("eu-stack", vec!["-p".into(), pid.clone()], false),
+            (
+                "gdb",
+                vec![
+                    "-p".into(),
+                    pid,
+                    "-batch".into(),
+                    "-ex".into(),
+                    "thread apply all bt".into(),
+                ],
+                false,
+            ),
+        ]
+    };
+    for (program, args, writes_file) in samplers {
+        let stdout = if writes_file {
+            std::process::Stdio::null()
+        } else {
+            match std::fs::File::create(&out) {
+                Ok(file) => std::process::Stdio::from(file),
+                Err(_) => return None,
+            }
+        };
+        let Ok(mut child) = std::process::Command::new(program)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let deadline = Instant::now() + CAP;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let wrote = std::fs::metadata(&out)
+                        .map(|meta| meta.len() > 0)
+                        .unwrap_or(false);
+                    if status.success() && wrote {
+                        return Some(out);
+                    }
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    None
+}
 
 const BALANCES_TREE: &str = "balances";
 const PENDING_DEBITS_TREE: &str = "pending_debits";
@@ -1960,6 +2160,7 @@ impl Blockchain {
     /// staleness only delays a suppression by a cycle — it can never fabricate progress.
     fn note_chain_progress(&self) {
         self.chain_progress.fetch_add(1, Ordering::Relaxed);
+        note_maintenance_step();
     }
 
     pub fn tip_change_counter_handle(&self) -> Arc<AtomicU64> {
@@ -2523,6 +2724,8 @@ impl Blockchain {
         at_startup: bool,
     ) -> Result<(), BlockchainError> {
         let started = Instant::now();
+        let _maintenance =
+            MaintenanceGuard::begin("recover_dirty_chain_state", self.db.path().parent());
         if !at_startup {
             // LIVE: a running node is stalling RIGHT NOW, and the operator needs that before
             // the work finishes, not after. error-level because the default field log filter
@@ -3352,6 +3555,8 @@ impl Blockchain {
     /// must rederive the registry from the (now-consistent) canonical blocks. O(chain),
     /// but only on the rare recovery path.
     pub fn rebuild_confirmed_tx_index(&self) -> Result<(), BlockchainError> {
+        let _maintenance =
+            MaintenanceGuard::begin("rebuild_confirmed_tx_index", self.db.path().parent());
         // Un-stamp readiness BEFORE anything is cleared, exactly as rebuild_address_tx_index
         // does for its own key. From here until the re-stamp at the end, the registry is or may
         // be EMPTY, and a miss there reads as "this transaction is not confirmed" — which for a
